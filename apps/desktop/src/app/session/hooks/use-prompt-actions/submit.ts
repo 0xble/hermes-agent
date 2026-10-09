@@ -166,7 +166,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
   return useCallback(
     async (rawText: string, options?: SubmitTextOptions): Promise<SubmitTextResult> => {
       const tokenPayload = Boolean(options?.moaToken)
-      const visibleText = tokenPayload ? rawText : sanitizeComposerInput(rawText).trim()
       const usingComposerAttachments = !options?.attachments && !tokenPayload
 
       // Drop undefined/null holes a session switch or draft restore can leave in
@@ -182,7 +181,35 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         a => typeof a.titlePreview === 'string' && a.titlePreview.trim()
       )?.titlePreview
 
-      const terminalContextBlocks = tokenPayload ? '' : terminalContextBlocksFromDraft(rawText).join('\n\n')
+      // Freeze `@terminal:` chips into transport text before send. Queue drains
+      // already carry frozen transport (tokens stripped at enqueue) — never
+      // re-resolve against the live selection map, or a later Cmd+L that reused
+      // the same shell:row label silently injects unrelated output (#77078).
+      // A MoA token payload is opaque gateway-minted text: send it verbatim.
+      let transportRaw = rawText
+      let bubbleOverride = options?.displayText
+
+      if (!options?.fromQueue && !tokenPayload) {
+        const frozen = freezeComposerTransportPayload(rawText)
+
+        if (frozen.missingLabels.length > 0) {
+          notify({
+            kind: 'warning',
+            title: translateNow('composer.terminalSelectionMissingTitle'),
+            message: translateNow('composer.terminalSelectionMissingBody')
+          })
+
+          return false
+        }
+
+        transportRaw = frozen.transportText
+
+        if (!bubbleOverride && frozen.displayText !== frozen.transportText) {
+          bubbleOverride = frozen.displayText
+        }
+      }
+
+      const visibleText = tokenPayload ? rawText : sanitizeComposerInput(transportRaw).trim()
       const hasImage = attachments.some(a => a.kind === 'image')
 
       // Refs are recomputed after sync (file.attach rewrites @file: refs to
