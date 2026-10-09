@@ -3815,6 +3815,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             # Every request to a chat (raw do_api_request included) spends that chat's one budget.
             # PTB builder setters mutate in place, so the rebuild-on-retry path keeps the limiter.
             builder.rate_limiter(self._chat_rate_limiter())
+            # PTB's default processor awaits each update inline, so one slow turn deafens every chat.
+            # Concurrent across chats, FIFO within a chat; the builder keeps this instance, so the
+            # connect-retry rebuild in _initialize_app_with_retries gets it too.
+            builder = builder.concurrent_updates(build_update_processor(self.config.extra, self.name))
             self._app = builder.build()
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
