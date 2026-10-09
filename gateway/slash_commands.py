@@ -73,8 +73,11 @@ output_path, exit_code_path, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
 env = dict(os.environ, PYTHONUNBUFFERED="1")
 with open(output_path, "wb") as f:
     rc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env).wait(timeout=3600)
-with open(exit_code_path, "w", encoding="utf-8") as f:
+# Publish atomically: readers poll for existence, so the marker must never be visible empty.
+temporary = exit_code_path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as f:
     f.write(str(rc))
+os.replace(temporary, exit_code_path)
 """.strip()
 
 
@@ -164,12 +167,16 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+    process_exit = exit_code_path.parent / ".update_process_exit_code"
+    process_exit_tmp = shlex.quote(str(process_exit) + ".tmp")
     update_cmd = (
         f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
-        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path.parent / '.update_process_exit_code'))}; "
+        # Write then rename: a `>` redirect creates the marker empty before printf fills it, and
+        # readers poll for existence, so publish the marker only once it is complete.
+        f"rc=$?; printf '%s' \"$rc\" > {process_exit_tmp}; mv -f {process_exit_tmp} {shlex.quote(str(process_exit))}; "
         f"rm -f {shlex.quote(str(exit_code_path))}")
     # Preferred: setsid creates a new session, fully detached; fallback start_new_session=True
     # calls os.setsid() in the child.
