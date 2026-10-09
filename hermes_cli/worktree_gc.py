@@ -70,22 +70,27 @@ class ExternalTreeRecord:
 
 
 def _git(args: list, cwd: str, timeout: int = 15, *, binary: bool = False) -> subprocess.CompletedProcess:
-    """Run git with host-wide config and excludes disabled.
+    """Run git with host-wide config and excludes disabled; timeouts become returncode 124.
 
     Worktree cleanup must see files that a user's global ignore rules hide; local
     repository excludes still apply, because they are part of the repository's
     own policy and ``--ignored`` below makes those files visible to the safety
     check as well. Every verdict fails safe toward "keep" on nonzero, so a slow
     ``git cherry`` on a huge repo degrades to keep instead of aborting the audit
-    mid-list.
-"""
-    env = os.environ.copy()
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    mid-list. Uses :func:`noninteractive_repo_git_env` (which also drops global and
+    system config) because ``status`` executes the repo's ``core.fsmonitor`` and clean
+    filters (GHSA-7x36-8jrh-v4pw).
+    """
+    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    argv = ["git", "-c", "core.excludesFile=", *args]
+    env = noninteractive_repo_git_env(cwd)
+    if env is None:
+        return subprocess.CompletedProcess(args=argv, returncode=1, stdout=b"" if binary else "",
+                                           stderr=FILTER_DISCOVERY_FAILED)
     try:
-        return _run(["git", "-c", "core.excludesFile=", *args], timeout, cwd, env=env, binary=binary)
+        return _run(argv, timeout, cwd, env=env, binary=binary)
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(args=["git", "-c", "core.excludesFile=", *args], returncode=124,
+        return subprocess.CompletedProcess(args=argv, returncode=124,
                                            stdout=b"" if binary else "", stderr=f"timeout after {timeout}s")
 
 
