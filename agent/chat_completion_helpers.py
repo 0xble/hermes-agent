@@ -1832,6 +1832,42 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
+def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_model, fb_provider):
+    """Choose the user notice for a fallback switch.
+
+    Returns ``(use_generic, notice)``: ``use_generic`` selects the pre-existing generic notice;
+    otherwise ``notice`` is the shared outage notice, or None to stay silent. Silence is
+    reserved for switches the user was already told about: a session adopting a shared outage,
+    or a re-arm of the same outage that lands on the model the claimed notice already
+    announced. Missing shared state (a failed write) or a move to a different model than the
+    one announced keeps a notice.
+    """
+    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        return True, None
+    if shared_adoption:
+        return False, None  # one notice per outage: another session already announced it
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if not isinstance(record, dict) or not record.get("outage_id"):
+        return True, None  # shared state unavailable; never drop the notice
+    target = (str(fb_model), str(fb_provider or "").strip().lower())
+    try:
+        from agent.shared_primary_cooldown import announced_fallback, claim_outage_notice, route_from_record
+        route = route_from_record(record)
+        outage_id = str(record["outage_id"])
+        if claim_outage_notice(route, outage_id, fallback=target):
+            try:
+                reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
+            except (KeyError, TypeError, ValueError, OSError):
+                reset_label = "the cooldown expiry"
+            return False, f"⚠️ {old_model} is rate-limited until {reset_label}; using {fb_model} via {fb_provider} until then."
+        if announced_fallback(route, outage_id) == target:
+            return False, None
+    except Exception:
+        logger.debug("Shared outage notice claim failed; using the generic notice", exc_info=True)
+    return True, None
+
+
 def try_activate_fallback(
     agent, reason: "FailoverReason | None" = None, reset_at=None, *,
     _shared_cooldown_record=None,
@@ -1931,26 +1967,9 @@ def try_activate_fallback(
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-            notice = None
-            from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-            if reason in _RATE_LIMIT_FAILOVER_REASONS:
-                record = getattr(agent, "_shared_primary_cooldown_record", None)
-                claimed = False
-                if isinstance(record, dict) and not shared_adoption:
-                    with contextlib.suppress(Exception):
-                        from agent.shared_primary_cooldown import claim_outage_notice, route_from_record
-                        route = route_from_record(record)
-                        claimed = claim_outage_notice(route, str(record.get("outage_id", "")))
-                if claimed:
-                    try:
-                        reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
-                    except (KeyError, TypeError, ValueError, OSError):
-                        reset_label = "the cooldown expiry"
-                    notice = (
-                        f"⚠️ {old_model} is rate-limited until {reset_label}; "
-                        f"using {fb_model} via {fb_provider} until then."
-                    )
-            else:
+            use_generic_notice, notice = _rate_limit_fallback_notice(
+                agent, reason, shared_adoption, old_model, fb_model, fb_provider)
+            if use_generic_notice:
                 notice = (
                     f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
                     f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."

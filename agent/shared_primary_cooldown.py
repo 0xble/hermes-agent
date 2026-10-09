@@ -61,6 +61,15 @@ def route_from_agent(agent: Any) -> tuple[str, str, str]:
     )
 
 
+def live_route_from_agent(agent: Any) -> tuple[str, str, str]:
+    """The route the agent is sending requests to right now (not its configured primary)."""
+    return (
+        str(getattr(agent, "provider", "") or "").strip().lower(),
+        normalize_route_base_url(getattr(agent, "base_url", "") or ""),
+        str(getattr(agent, "model", "") or "").strip(),
+    )
+
+
 def _route_fields(route: tuple[str, str, str]) -> dict[str, str]:
     provider, base_url, model = route
     return {"provider": provider, "base_url": base_url, "model": model}
@@ -193,8 +202,14 @@ def arm_cooldown(
         return None
 
 
-def claim_outage_notice(route: tuple[str, str, str], outage_id: str) -> bool:
-    """Atomically claim the sole user-facing outage notice for an outage."""
+def claim_outage_notice(
+    route: tuple[str, str, str], outage_id: str, *, fallback: tuple[str, str] | None = None,
+) -> bool:
+    """Atomically claim the sole user-facing outage notice for an outage.
+
+    ``fallback`` is the (model, provider) the notice announces, so later switches can tell
+    whether the user was already told about the model they are moving to.
+    """
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
         with _locked_state() as (path, state):
@@ -204,6 +219,8 @@ def claim_outage_notice(route: tuple[str, str, str], outage_id: str) -> bool:
             if entry.get("notice_claimed"):
                 return False
             entry["notice_claimed"] = True
+            if fallback is not None:
+                entry["notice_fallback"] = [str(fallback[0]), str(fallback[1]).strip().lower()]
             state["routes"][key] = entry
             _write_state(path, state)
             return True
@@ -297,13 +314,33 @@ def is_active(entry: dict[str, Any] | None) -> bool:
     return _active(entry)
 
 
+def announced_fallback(route: tuple[str, str, str], outage_id: str) -> tuple[str, str] | None:
+    """The (model, provider) already announced for this outage, or None when unannounced."""
+    entry = get_cooldown(route)
+    if not isinstance(entry, dict) or str(entry.get("outage_id")) != str(outage_id):
+        return None
+    if not entry.get("notice_claimed"):
+        return None
+    announced = entry.get("notice_fallback")
+    if isinstance(announced, (list, tuple)) and len(announced) == 2:
+        return str(announced[0]), str(announced[1]).strip().lower()
+    return None
+
+
 def complete_primary_recovery(agent) -> bool:
-    """Clear a shared outage after a successful primary response and emit one recovery notice."""
+    """Clear a shared outage after a successful primary response and emit one recovery notice.
+
+    Request wrappers call this after every successful response, so it must prove the response
+    came from the cooled primary: the agent's LIVE route (not its ``_primary_runtime`` snapshot)
+    must equal the record's route and no fallback may be active. A fallback reply never clears.
+    """
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not isinstance(record, dict):
         return False
-    route = route_from_agent(agent)
-    if route != route_from_record(record):
+    if getattr(agent, "_fallback_activated", False):
+        return False
+    route = route_from_record(record)
+    if live_route_from_agent(agent) != route:
         return False
     outage_id = str(record.get("outage_id") or "")
     if not outage_id or not clear_if_current(route, outage_id):
@@ -315,8 +352,11 @@ def complete_primary_recovery(agent) -> bool:
             f"{record.get('provider') or route[0]}; fallback is no longer active."
         )
     return True
+
+
 __all__ = [
-    "active_cooldown", "arm_cooldown", "claim_outage_notice", "clear_cooldowns", "clear_if_current",
-    "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns", "release_for_recovery", "route_from_agent", "route_from_record", "route_key",
+    "active_cooldown", "announced_fallback", "arm_cooldown", "claim_outage_notice", "clear_cooldowns",
+    "clear_if_current", "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns",
+    "live_route_from_agent", "release_for_recovery", "route_from_agent", "route_from_record", "route_key",
 ]
 
