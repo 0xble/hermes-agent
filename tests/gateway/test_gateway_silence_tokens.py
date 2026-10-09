@@ -35,8 +35,9 @@ def _event(*, internal: bool = False, reply_expected=None):
     )
 
 
-def _relay_text(body="please handle this"):
-    return f"[relay from=agent@example.com receipt=receipt-1 task=task-1]\n{body}"
+def _relay_text(body="please handle this", *, header_last=False):
+    header = "[relay from=agent@example.com receipt=receipt-1 task=task-1]"
+    return f"{body}\n\n{header}" if header_last else f"{header}\n{body}"
 
 
 def _relay_event(*, text=None, reply_expected=None):
@@ -112,13 +113,14 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
 
 
 @pytest.mark.parametrize("command", ["/queue", "/steer"])
-def test_idle_queue_or_steer_relay_payload_is_marked_unaddressed(command):
+@pytest.mark.parametrize("header_last", [False, True], ids=["header-first", "header-last"])
+def test_idle_queue_or_steer_relay_payload_is_marked_unaddressed(command, header_last):
     # Relay always sends "/queue <header>" or "/steer <header>". On an idle session, admission
     # sees the command prefix, so the stripped payload must be judged when the prefix is removed.
-    event = _relay_event(text=f"{command} {_relay_text()}")
+    event = _relay_event(text=f"{command} {_relay_text(header_last=header_last)}")
     handled, reply = gateway_run.GatewayRunner._hm_send_payload_as_turn(event, "usage")
     assert (handled, reply) == (False, None)
-    assert event.text == _relay_text()
+    assert event.text == _relay_text(header_last=header_last)
     assert event.reply_expected is False
 
 
@@ -170,6 +172,36 @@ async def test_relay_header_turn_answered_no_reply_stays_silent_on_normal_path(m
 
     assert response == ""
     assert not any("silence marker rejected" in record.message for record in caplog.records)
+    assert not any("unexpected_silence" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_bottom_header_relay_turn_answered_no_reply_stays_silent(monkeypatch, tmp_path, caplog):
+    """A formatted relay with its machine header on the final line remains unaddressed."""
+    runner = _runner(monkeypatch, tmp_path)
+    event = _relay_event(text=_relay_text(header_last=True))
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda current, source: current)
+    runner._is_user_authorized_for_source = lambda *_args, **_kwargs: True
+    runner._admit_bot_message_for_source = lambda source: True
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "NO_REPLY",
+        "messages": [
+            {"role": "user", "content": event.text},
+            {"role": "assistant", "content": "NO_REPLY"},
+        ],
+        "tools": [], "history_offset": 0, "last_prompt_tokens": 0,
+        "api_calls": 1, "failed": False,
+    })
+
+    assert await runner._hm_admit_event(event)
+    assert event.reply_expected is False
+    with caplog.at_level("DEBUG"):
+        response = await runner._handle_message_with_agent(
+            event, event.source, "agent:main:telegram:group:-1001:12345", 1
+        )
+
+    assert response == ""
     assert not any("unexpected_silence" in record.message for record in caplog.records)
 
 

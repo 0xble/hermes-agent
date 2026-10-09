@@ -10,21 +10,27 @@ import re
 import unicodedata
 from typing import Any, Optional
 
-# First-line headers that mark an inbound message as sent by another agent session, not typed by
-# the user. Such a message may end in a bare silence marker. Relay's own parser uses the same
-# value class (``[^\s\]]+``), so both sides agree on what a header is.
+# Edge headers that mark an inbound message as sent by another agent session, not typed by the
+# user. Such a message may end in a bare silence marker. Relay's own parser uses the same value
+# class (``[^\s\]]+``), so both sides agree on what a header is.
 _AGENT_ORIGIN_HEADERS = (
     re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]"),
 )
 
 
 def is_agent_origin_text(text: Any) -> bool:
-    """True when the first non-blank line is a complete registered agent-origin header."""
-    stripped = text.lstrip() if isinstance(text, str) else ""
-    if not stripped:
+    """True when the first or last non-blank line is a complete agent-origin header."""
+    if not isinstance(text, str):
         return False
-    first_line = stripped.splitlines()[0].rstrip()
-    return any(pattern.fullmatch(first_line) for pattern in _AGENT_ORIGIN_HEADERS)
+    non_blank_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not non_blank_lines:
+        return False
+    edge_lines = (non_blank_lines[0], non_blank_lines[-1])
+    return any(
+        pattern.fullmatch(line)
+        for line in edge_lines
+        for pattern in _AGENT_ORIGIN_HEADERS
+    )
 
 
 def apply_agent_origin_reply_expectation(event: Any) -> Any:
