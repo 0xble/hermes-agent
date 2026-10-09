@@ -478,6 +478,15 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
     return cleaned or None
 
 
+def sanitize_reasoning_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Canonical ``/reasoning`` session pick (``{"enabled": False}`` or ``{"enabled": True, "effort": str}``),
+    or ``None`` when the value is not a recognizable reasoning config."""
+    if not isinstance(override, dict):
+        return None
+    from hermes_constants import parse_reasoning_effort
+    return parse_reasoning_effort(override)
+
+
 @dataclass
 class SessionEntry:
     """Routing-index entry: maps a session key to its current session ID and metadata."""
@@ -544,6 +553,8 @@ class SessionEntry:
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
+    # Session-scoped /reasoning pick, persisted like model_override so a restart keeps the effort.
+    reasoning_override: Optional[Dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
     # what says which bot may deliver to it. None = unknown (row predates the field, or standalone).
@@ -592,6 +603,8 @@ class SessionEntry:
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.reasoning_override:
+            result["reasoning_override"] = sanitize_reasoning_override(self.reasoning_override)
         if self.prompt_pin:
             # Same defence-in-depth: routing JSON must never preserve malformed pin state.
             if pin := sanitize_prompt_pin(self.prompt_pin):
@@ -659,6 +672,7 @@ class SessionEntry:
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
             model_override=sanitize_model_override(data.get("model_override")),
+            reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             **plain,
@@ -1159,6 +1173,27 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
+    def set_reasoning_override(self, session_key: str, override: Optional[Dict[str, Any]]) -> None:
+        """Persist (or clear, with ``None``) the session's /reasoning pick."""
+        from dataclasses import replace
+
+        cleaned = sanitize_reasoning_override(override)
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or entry.reasoning_override == cleaned:
+                return
+            data, generation = self._snapshot_routing_locked()
+            entry = self._entries[session_key]
+            data[session_key] = replace(entry, reasoning_override=cleaned).to_dict()
+            self._persist_routing_data(data, generation)
+            entry.reasoning_override = cleaned
+
+    def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Return the persisted /reasoning pick for *session_key*, if any."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            return dict(entry.reasoning_override) if entry and entry.reasoning_override else None
+
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         with self._lock:
@@ -1299,6 +1334,7 @@ class SessionStore(
             new_entry = self._replace_route_locked(
                 session_key, old_entry, target_session_id, _now(),
                 display_name=old_entry.display_name, model_override=old_entry.model_override,
+                reasoning_override=old_entry.reasoning_override,
                 prompt_pin=(
                     dict(old_entry.prompt_pin)
                     if preserve_prompt_pin and old_entry.prompt_pin is not None else None
