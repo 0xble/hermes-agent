@@ -14,13 +14,13 @@ def item(item_id="item-a", vault: object = "vault-a"):
 
 @pytest.fixture
 def later(monkeypatch):
-    """Advance past the per-fill listing reuse window, as a separate later fill would."""
+    """Keep a deterministic clock for callers that assert display-cache freshness."""
     from agent.vault_backends import onepassword
     now = [1000.0]
     monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
 
     def advance():
-        now[0] += onepassword._FRESH_LISTING_REUSE_SECONDS + 1
+        now[0] += onepassword._LISTING_TTL_SECONDS + 1
     return advance
 
 
@@ -40,14 +40,14 @@ def test_legacy_handles_resolve_each_items_vault(backend, later, method, flags, 
     records = [item(), item("item-b", "vault-b")]
     backend._run.return_value = json.dumps(records)
     assert [m.id for m in backend.list_items()] == ["op:item-a", "op:item-b"]
+    backend._run.side_effect = [json.dumps(item("item-b", "vault-b"))]
     assert backend.get_meta("op:item-b").origin == "https://example.com"
     for item_id, vault_id in [("item-a", "vault-a"), ("item-b", "vault-b")]:
-        later()
         backend._run.reset_mock()
-        backend._run.side_effect = [json.dumps(records), value + "\r\n"]
+        backend._run.side_effect = [json.dumps(item(item_id, vault_id)), value + "\r\n"]
         assert getattr(backend, method)("op:" + item_id) == value
         assert backend._run.call_args_list[0].args == (
-            "item", "list", "--categories", "Login,Credit Card", "--format", "json")
+            "item", "get", item_id, "--format", "json")
         assert backend._run.call_args_list[1].args == (
             "item", "get", item_id, "--vault", vault_id, *flags)
 
@@ -65,7 +65,7 @@ def test_missing_or_ambiguous_metadata_never_reads_secret(backend, records, meth
             backend.resolve_password("op:item-a")
     else:
         assert backend.resolve_otp("op:item-a") is None
-    assert all(c.args[:2] != ("item", "get") for c in backend._run.call_args_list)
+    assert all(c.args[:2] == ("item", "get") and "--reveal" not in c.args for c in backend._run.call_args_list)
 
 
 @pytest.mark.parametrize("method", ["resolve_password", "resolve_otp"])
@@ -80,7 +80,7 @@ def test_refresh_failure_does_not_reuse_old_vault(backend, method, failure):
             backend.resolve_password("op:item-a")
     else:
         assert backend.resolve_otp("op:item-a") is None
-    assert all(c.args[:2] != ("item", "get") for c in backend._run.call_args_list)
+    assert all(c.args[:2] == ("item", "get") and "--reveal" not in c.args for c in backend._run.call_args_list)
 
 
 @pytest.mark.parametrize("handle", ["bw:item-a", "op:", "op:--help", "op:vault-a:item-a"])
@@ -93,13 +93,13 @@ def test_invalid_handles_fail_before_cli(backend, handle):
 
 def test_personal_session_without_vault_keeps_unscoped_read(backend):
     backend._service_token = ""
-    backend._run.side_effect = [json.dumps([item(vault="")]), "dummy-password\n"]
+    backend._run.side_effect = [json.dumps(item(vault="")), "dummy-password\n"]
     assert backend.resolve_password("op:item-a") == "dummy-password"
     assert backend._run.call_args.args == (
         "item", "get", "item-a", "--fields", "label=password", "--reveal")
 
 
 def test_fresh_backend_does_not_depend_on_listing_cache(backend):
-    backend._run.side_effect = [json.dumps([item(vault="vault-new")]), "dummy-password\n"]
+    backend._run.side_effect = [json.dumps(item(vault="vault-new")), "dummy-password\n"]
     assert backend.resolve_password("op:item-a") == "dummy-password"
     assert backend._run.call_args.args[3:5] == ("--vault", "vault-new")

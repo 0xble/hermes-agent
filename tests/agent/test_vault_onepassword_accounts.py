@@ -34,6 +34,11 @@ item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
+elif args == ["item", "get", item[0], "--format", "json"]:
+    print(json.dumps({"id": item[0], "title": account, "category": "LOGIN", "state": "ACTIVE",
+                      "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
+                      "additional_information": account + "@example.com",
+                      "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
 elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
     print("dummy-" + account + "-password")
 else:
@@ -107,7 +112,7 @@ def test_business_handle_cannot_resolve_personal_item(env):
     business = backend_for_handle("op@business:item-p")
     with pytest.raises(RuntimeError):
         business.resolve_password("op@business:item-p")
-    assert all(c["argv"][:2] != ["item", "get"] for c in calls())
+    assert all(c["argv"][:2] == ["item", "get"] and "--reveal" not in c["argv"] for c in calls())
 
 
 def test_missing_token_is_reported_and_never_falls_back(env, monkeypatch):
