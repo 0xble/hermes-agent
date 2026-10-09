@@ -1,6 +1,7 @@
 """Detached Desktop/TUI turns use child-owned activity, not process heartbeats."""
 
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -88,16 +89,30 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
         assert server._ws_orphan_turn_activity_is_fresh(session) is (mode == "fresh")
         monkeypatch.setattr(server.threading, "Timer", _Timer)
         server._schedule_ws_orphan_reap(sid)
-        server._pending_ws_reaps[sid].callback()
-        assert bool(session.get("_client_gone_interrupt_requested")) is (mode != "fresh")
-        assert server._pending_ws_reaps[sid].delay == (
-            20.0 if mode == "fresh" else server._WS_ORPHAN_INTERRUPT_REAP_POLL_S)
-        assert not any(m.get("method") == "compute_host.activity" for m in forwarded)
+        interrupt_reply: queue.Queue[dict] | None = None
+        interrupt_request_id = f"client-gone-{sid}"
         if mode != "fresh":
-            deadline = time.monotonic() + 5
-            while session["running"] and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert not session["running"], "stale child must receive and settle the real interrupt"
+            interrupt_reply = queue.Queue(maxsize=1)
+            with supervisor._lock:
+                supervisor._pending_controls[interrupt_request_id] = interrupt_reply
+        try:
+            server._pending_ws_reaps[sid].callback()
+            assert bool(session.get("_client_gone_interrupt_requested")) is (mode != "fresh")
+            assert server._pending_ws_reaps[sid].delay == (
+                20.0 if mode == "fresh" else server._WS_ORPHAN_INTERRUPT_REAP_POLL_S)
+            assert not any(m.get("method") == "compute_host.activity" for m in forwarded)
+            if interrupt_reply is not None:
+                reply = interrupt_reply.get(timeout=10)
+                assert reply["type"] == "interrupt.ack"
+                assert reply["request_id"] == interrupt_request_id
+                assert reply["applied"] is True
+                deadline = time.monotonic() + 5
+                while session["running"] and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                assert not session["running"], "acknowledged interrupt must settle the real child turn"
+        finally:
+            with supervisor._lock:
+                supervisor._pending_controls.pop(interrupt_request_id, None)
         if mode == "fresh":
             old_token = session["_compute_host_turn_id"]
             old_request = next(iter(supervisor._pending_turns))

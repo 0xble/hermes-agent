@@ -630,11 +630,18 @@ def _inflight_home_path(home_key: str) -> Path:
 # ids so host-wide consumers (shutdown drain, idle-exit, metrics) see the union across profiles.
 _running_job_ids: set = set()
 _running_fire_owners: dict[tuple, dict[object, tuple[Optional[str], Path]]] = {}
-# Parent gateway threads synchronously waiting on restart-safe scope workers.
-# Shutdown must not misclassify these as ownerless in-process runs: the tool
-# process sweep cannot reach the worker's transient scope.
+# Parent gateway threads synchronously waiting on external workers.  This set is
+# intentionally broader than the restart-safe set: degraded workers are external
+# but remain inside the gateway's cgroup and must still count as active during a
+# restart drain.
 _restart_safe_waiter_job_ids: set = set()
-# in-flight key -> pid of the restart-safe external worker executing it (absent for in-process
+# Only acknowledged workers launched in a mode that survives a gateway restart
+# belong here.  A dispatch is not restart-safe merely because it is external.
+_restart_safe_external_worker_job_ids: set = set()
+# in-flight key -> dispatch mode recorded before the external worker starts.  The
+# mode, not merely "external", decides whether the worker survives a gateway restart.
+_external_worker_modes: dict[tuple, str] = {}
+# in-flight key -> pid of the external worker executing it (absent for in-process
 # runs), so a drain observer can name the process holding the gateway open.
 _running_worker_pids: dict[tuple, int] = {}
 _running_lock = threading.Lock()
@@ -704,7 +711,11 @@ def get_running_job_ids() -> "frozenset[str]":
     entirely outside that dict, so without this the drain is structurally blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(key[1] for key in _running_job_ids | _running_fire_owners.keys())
+        # Pending handoffs and acknowledged external workers both remain visible.
+        # Waiter/worker sets are populated together after ack, so neither filters
+        # this general liveness snapshot (or the restart drain).
+        active = _running_job_ids | _running_fire_owners.keys()
+        return frozenset(key[1] for key in active)
 
 
 def get_running_job_details() -> list[dict]:
@@ -712,12 +723,25 @@ def get_running_job_details() -> list[dict]:
     runs). The drain wait publishes this so ``hermes update`` can say WHICH job it is waiting on."""
     now = time.time()
     with _running_lock:
+        active = _running_job_ids | _running_fire_owners.keys()
         return [
             {"job_id": key[1],
              "elapsed_s": round(now - _running_since[key], 1) if key in _running_since else None,
              "worker_pid": _running_worker_pids.get(key)}
-            for key in sorted(_running_job_ids | _running_fire_owners.keys())
+            for key in sorted(active)
         ]
+
+
+def get_shutdown_drain_job_ids() -> "frozenset[str]":
+    """Host-wide cron jobs considered by the gateway restart shutdown drain.
+
+    Keep this accessor separate so shutdown accounting can evolve without changing
+    the general liveness and observability contract. It intentionally preserves
+    acknowledged restart-safe workers in the drain snapshot.
+    """
+    # Route through the public general accessor so test seams and callers that
+    # replace that snapshot continue to observe the same host-wide ledger.
+    return get_running_job_ids()
 
 
 def get_wedged_job_ids() -> "frozenset[str]":
@@ -815,6 +839,7 @@ def release_running_job(job_id: str, home: Optional[Union[Path, str]] = None) ->
         _running_allowance_s.pop(key, None)
         _running_futures.pop(key, None)
         _running_worker_pids.pop(key, None)
+        _external_worker_modes.pop(key, None)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1068,17 +1093,26 @@ def mark_running_jobs_interrupted(
 ) -> list:
     """Best-effort: mark every in-flight cron job interrupted; returns the job IDs marked.
 
-    Called by gateway shutdown right after ``process_registry.kill_all()``: a job whose tool was
-    killed must never report success. ``only_owners`` (``(job_id, fire_owner)`` pairs) restricts
-    marking. Tokens go into ``_interrupted_job_ids`` BEFORE ``last_status`` is written so
+    Called by gateway shutdown before ``process_registry.kill_all()``: a job whose tool is
+    about to be killed must never report success. ``only_owners`` (``(job_id, fire_owner)`` pairs)
+    restricts marking. Tokens go into ``_interrupted_job_ids`` BEFORE ``last_status`` is written so
     ``run_one_job`` sees them.
     """
     with _running_lock:
-        restart_safe_waiters = set(_restart_safe_waiter_job_ids)
+        restart_safe_waiters = set(_restart_safe_external_worker_job_ids) | set(_restart_safe_waiter_job_ids)
+        # A scoped/detached dispatch is restart-safe even before its ready ack arrives:
+        # the worker may already own the durable execution while the parent is still
+        # polling for acknowledgement. Keep it in the drain, but never mark it
+        # interrupted or send the interrupted notice from this path.
+        restart_safe_modes = {
+            key for key, mode in _external_worker_modes.items()
+            if mode in {"scoped", "detached"}
+        }
+        restart_safe_for_interrupt = restart_safe_waiters | restart_safe_modes
         active_fires = [
             (token, key, owner, profile_home)
             for key, executions in _running_fire_owners.items()
-            if key not in restart_safe_waiters
+            if key not in restart_safe_for_interrupt
             for token, (owner, profile_home) in executions.items()
         ]
         if only_owners is not None:
@@ -1091,7 +1125,7 @@ def mark_running_jobs_interrupted(
             active_fires.extend(
                 (None, key, None, _inflight_home_path(key[0]))
                 for key in (
-                    _running_job_ids - registered_keys - restart_safe_waiters
+                    _running_job_ids - registered_keys - restart_safe_for_interrupt
                 )
             )
         _interrupted_job_ids.update(
@@ -3606,7 +3640,17 @@ def _wait_for_external_cron_worker(
     finally:
         if job_id is not None:
             with _running_lock:
-                _restart_safe_waiter_job_ids.discard(_inflight_key(job_id))
+                key = _inflight_key(job_id)
+                _restart_safe_waiter_job_ids.discard(key)
+                _restart_safe_external_worker_job_ids.discard(key)
+                _external_worker_modes.pop(key, None)
+                # If the waiter observed a dead worker before the outer run released
+                # its claim, do not attribute that dead PID to the still-visible job.
+                # A terminal worker that is still reaping may keep its PID until the
+                # normal release path clears it.
+                with contextlib.suppress(Exception):
+                    if process.poll() is not None:
+                        _running_worker_pids.pop(key, None)
         # The execution is terminal or its worker is dead: nobody will read a
         # payload or acknowledgement left behind by a late/unread handoff.
         for stale in handoff_files:
@@ -3759,10 +3803,13 @@ def _launch_external_cron_worker(job: dict) -> bool:
         stderr_path.unlink(missing_ok=True)
         raise
 
+    # Until the worker acknowledges, the gateway still owns an uncertain handoff and
+    # shutdown must count it as active. Record the dispatch mode before waiting for
+    # acknowledgement: degraded workers remain inside the gateway cgroup and must
+    # never be treated as restart-safe merely because they are external.
+    worker_key = _inflight_key(job_id)
     with _running_lock:
-        _restart_safe_waiter_job_ids.add(_inflight_key(job_id))
-
-    # Same window the dead-owner recovery ledger grants a pending handoff: a cold
+        _external_worker_modes[worker_key] = dispatch.mode
     # worker start (imports + secret hydration) measures ~10-12s in the field, and
     # a dispatch deadline shorter than the adoption grace made the two guards
     # around one handoff disagree.
@@ -3809,8 +3856,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 execution_id,
             )
             with _running_lock, contextlib.suppress(TypeError, ValueError):
-                _running_worker_pids[_inflight_key(job_id)] = int(
-                    acknowledgement.get("pid") or process.pid)
+                worker_pid = int(acknowledgement.get("pid") or process.pid)
+                _running_worker_pids[worker_key] = worker_pid
+                if _external_worker_modes.get(worker_key) in {"scoped", "detached"} and worker_pid > 0:
+                    _restart_safe_external_worker_job_ids.add(worker_key)
+                    _restart_safe_waiter_job_ids.add(worker_key)
             return _wait_for_external_cron_worker(
                 process,
                 execution_id=execution_id,
@@ -3821,7 +3871,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
         returncode = process.poll()
         if returncode is not None:
             with _running_lock:
-                _restart_safe_waiter_job_ids.discard(_inflight_key(job_id))
+                _restart_safe_waiter_job_ids.discard(worker_key)
+                _restart_safe_external_worker_job_ids.discard(worker_key)
+                _external_worker_modes.pop(worker_key, None)
+                _running_worker_pids.pop(worker_key, None)
             payload_path.unlink(missing_ok=True)
             from cron.scheduler_diagnostics import external_worker_stderr_tail
             stderr_tail = external_worker_stderr_tail(stderr_path)

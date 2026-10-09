@@ -224,7 +224,7 @@ def _arm_api(gw):
         def active_agent_work_count(self):
             return 1
 
-    async def _teardown(adapter, platform, *, profile=None):
+    async def _teardown(adapter, platform, *, profile=None, deadline=None):
         pass  # the run keeps going on the default executor after the transport is torn down
 
     gw.adapters[Platform.API_SERVER] = _ApiAdapter()

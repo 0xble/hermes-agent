@@ -278,6 +278,31 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
     assert extras.legacy_selection(tmp_path / "no-venv") == ["all"]
 
 
+
+
+def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_path):
+    """Core fastapi/Pillow in a payload must not manufacture web/vision selections."""
+    site = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
+    (site / "fastapi").mkdir(parents=True)
+    (site / "PIL").mkdir()
+    pillow_info = site / "Pillow-1.0.dist-info"
+    pillow_info.mkdir()
+    (pillow_info / "METADATA").write_text("Name: Pillow\n", encoding="utf-8")
+    (pillow_info / "top_level.txt").write_text("PIL\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\ndependencies = [\"fastapi==1\", \"Pillow==1\"]\n"
+        "[project.optional-dependencies]\nweb = [\"fastapi==1\"]\nvision = []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(extras, "_PLATFORM_GATES", {})
+    monkeypatch.setattr("pm.environments.base_venv", lambda _root: tmp_path / "venv")
+    monkeypatch.setattr("pm.environments.site_packages", lambda _venv: site)
+
+    assert "web" not in extras.installed_selection(tmp_path)
+    assert "vision" not in extras.installed_selection(tmp_path)
+    assert extras.legacy_selection(tmp_path) == ["all"]
+
+
 def test_runtime_marker_evaluation_answers_for_the_given_environment():
     """The delegate really evaluates the marker (in PM's runtime interpreter)."""
     import subprocess

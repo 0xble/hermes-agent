@@ -48,7 +48,11 @@ async def test_gateway_titles_original_request_without_changing_model_input(tmp_
     runner._hmwa_acquire_turn_lease = AsyncMock()
     runner._mark_durable_active_turn = AsyncMock()
     runner.session_store = object()
-    runner._async_session_store = SimpleNamespace(_store=runner.session_store, load_transcript=AsyncMock(return_value=[]))
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        load_transcript=AsyncMock(return_value=[]),
+        get_resume_pending_marker=lambda _key: None,
+    )
     runner._hmwa_run_session_hygiene = AsyncMock(return_value=[])
     runner._hmwa_first_contact_notes = AsyncMock()
     runner._voice_channel_sidecar_note = lambda *args: None

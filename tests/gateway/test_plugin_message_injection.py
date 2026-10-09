@@ -44,7 +44,9 @@ def _runner(entry: SessionEntry | None, adapter=None) -> GatewayRunner:
     runner = object.__new__(GatewayRunner)
     runner.session_store = SimpleNamespace()
     runner._async_session_store = SimpleNamespace(
-        _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry)
+        _store=runner.session_store,
+        lookup_by_session_key=AsyncMock(return_value=entry),
+        get_resume_pending_marker=lambda _key: None,
     )
     runner.adapters = {Platform.TELEGRAM: adapter} if adapter else {}
     runner._profile_adapters = {}

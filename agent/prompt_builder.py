@@ -1418,6 +1418,7 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
 def _render_skills_index(
     skills_by_category: dict[str, list[tuple[str, str]]], category_descriptions: dict[str, str],
     compact_categories: "frozenset[str] | None", available_tools: "set[str] | None",
+    external_dirs_configured: bool = False,
 ) -> str:
     """Render the ## Skills block; "" when there is nothing to list."""
     if not skills_by_category:
@@ -1452,6 +1453,17 @@ def _render_skills_index(
             + "\n<available_skills>\n" + "\n".join(index_lines) + "\n</available_skills>"
             + hidden_note
         )
+    maintenance_guidance = (
+        "For locally owned skills, if a skill has issues, fix it with skill_manage(action='patch').\n"
+        "Skills from skills.external_dirs are read-only installs: do not change them with skill_manage; "
+        "change them at their source in the owning repository.\n"
+        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
+        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+    ) if external_dirs_configured else (
+        "If a skill has issues, fix it with skill_manage(action='patch').\n"
+        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
+        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
+    )
     return (
         "## Skills\n"
         "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
@@ -1463,10 +1475,8 @@ def _render_skills_index(
         "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
         "code review, planning, and testing — load them even for tasks you already know how to do, because "
         "the skill defines how it should be done here.\n"
-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
-        "\n"
+        + maintenance_guidance
+        + "\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
         "</available_skills>\n\n"
@@ -1557,7 +1567,10 @@ def _build_skills_system_prompt_inner(
         for cat, cat_desc in _read_category_descriptions(ext_dir, "Could not read external skill description %s: %s").items():
             category_descriptions.setdefault(cat, cat_desc)
 
-    result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
+    result = _render_skills_index(
+        skills_by_category, category_descriptions, compact_categories, available_tools,
+        external_dirs_configured=bool(external_dirs),
+    )
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
