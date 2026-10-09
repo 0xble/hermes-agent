@@ -106,9 +106,6 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     env = LocalEnvironment(cwd="/tmp")
     try:
         result_holder = {}
-        proc_holder = {}
-        started = threading.Event()
-        raise_at = [None]  # set by the main thread to tell worker when
 
         # Drive execute() on a separate thread so we can SIGNAL-interrupt it
         # via a thread-targeted exception without killing our test process.

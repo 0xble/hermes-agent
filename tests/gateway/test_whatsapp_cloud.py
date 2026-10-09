@@ -189,7 +189,6 @@ class TestSendText:
         # At least 2 POST calls
         assert adapter._http_client.post.call_count >= 2
         # Second call should NOT have context (only first chunk gets reply_to)
-        first_call = adapter._http_client.post.call_args_list[0]
         second_call = adapter._http_client.post.call_args_list[1]
         # No reply_to passed → no context anywhere, but verify structure anyway
         assert "context" not in second_call.kwargs["json"]

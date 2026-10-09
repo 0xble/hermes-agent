@@ -243,7 +243,6 @@ class TestRealProfileCdpLaunch:
         """
         import tools.browser_tool as bt
         self._reset()
-        proc = Mock(return_value=None, returncode=0, stdout="", stderr="")
         captured = {}
 
         def fake_agent_browser_spawn(argv, env, socket_dir, tag):

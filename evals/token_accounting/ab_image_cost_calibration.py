@@ -124,7 +124,6 @@ def run(out_path: str) -> dict:
     cc.context_length = CONTEXT_LENGTH
     cc.threshold_tokens = THRESHOLD
     compress_calls: list[dict] = []
-    original = agent._compress_context
 
     def counting(messages, system_message, **kw):
         # Real compaction would need a summarizer; drop everything but the last 2 rows like one.

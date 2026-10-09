@@ -231,7 +231,7 @@ def test_edit_swap_image(deck, workdir):
         "YPj/HwADAgH/p5UronAAAAAASUVORK5CYII=")
     blue_path = workdir / "blue.png"
     blue_path.write_bytes(blue)
-    outline = run("pptx_read.py", deck)
+    run("pptx_read.py", deck)
     # find picture shape name via python-pptx directly
     sys.path.insert(0, SCRIPTS)
     from pptx import Presentation

@@ -129,7 +129,6 @@ def radon(files):
     R = shutil.which("radon") or os.path.join(os.path.dirname(sys.executable), "radon")
     import tempfile
     out = {}
-    lst = "\n".join(files)
     # radon can't take a list file; run per-directory roots instead
     roots = sorted({os.path.relpath(f, TREE).split(os.sep)[0] if os.sep in os.path.relpath(f, TREE) else os.path.relpath(f, TREE) for f in files})
     roots = [r for r in roots if r != "tests"]

@@ -61,9 +61,6 @@ class Peer(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         requests.append({"path": self.path, "body": body})
-        users = [
-            m.get("content") for m in body.get("messages", []) if m["role"] == "user"
-        ]
         fail = fault == "http400"
         if fail:
             data = {

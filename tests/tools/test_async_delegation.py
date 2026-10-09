@@ -816,7 +816,6 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     assert "finished cleanly" in text
     assert "cut off mid-work" in text
     # ...but the banner is tied to the truncated task, not the clean one.
-    trunc_pos = text.index("cut off mid-work")
     clean_pos = text.index("finished cleanly")
     banner_pos = text.index("TRUNCATED")
     # The header banner for task 2 appears after task 1's summary.
