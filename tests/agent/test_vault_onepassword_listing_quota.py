@@ -46,13 +46,19 @@ if account == "personal" and (root / "fresh-url").exists():
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
-elif args == ["item", "get", item[0], "--format", "json"]:
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json"]:
     print(json.dumps({"id": item[0], "title": account, "category": "LOGIN", "state": "ACTIVE",
                       "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
                       "additional_information": account + "@example.com",
                       "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
 elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
     print("dummy-" + account + "-password")
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", item[0]]:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown item", file=sys.stderr)
     sys.exit(2)
@@ -125,8 +131,8 @@ def test_one_fill_reads_fresh_item_metadata_without_listing(env):
     _op, calls = env
     out = _fill("op:item-p", "https://personal.example")
     assert out["success"] is True and "dummy-personal-password" not in json.dumps(out)
-    assert [c["argv"][:2] for c in calls()] == [["item", "get"], ["item", "get"]]
-    assert calls()[0]["argv"] == ["item", "get", "item-p", "--format", "json"]
+    assert [c["argv"][:2] for c in calls()] == [["item", "list"], ["item", "get"], ["item", "get"]]
+    assert calls()[1]["argv"] == ["item", "get", "item-p", "--vault", "vault-p", "--format", "json"]
 
 
 def test_stale_display_url_cannot_authorize_fill(env):
@@ -209,7 +215,7 @@ def test_concurrent_item_metadata_reads_share_one_op_call(env):
     for t in threads:
         t.join(10)
     assert results == ["https://personal.example"] * 3
-    assert len(calls("list")) == 0
+    assert len(calls("list")) == 1
     assert len([row for row in calls() if row["argv"][:2] == ["item", "get"]]) == 1
 
 
@@ -238,7 +244,7 @@ def test_failed_listing_is_never_cached(env, clock):
     op.with_name("fail").unlink()
     assert [m.id for m in backend.list_items()] == ["op:item-p"]  # (e)
     assert backend.get_meta("op:item-p") is not None
-    assert len(calls("list")) == 2
+    assert len(calls("list")) == 3
 
 
 def test_accounts_and_credentials_never_share_listings(env, monkeypatch):

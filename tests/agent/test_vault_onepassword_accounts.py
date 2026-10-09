@@ -34,18 +34,23 @@ item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
-elif args == ["item", "get", item[0], "--format", "json"]:
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json"]:
     print(json.dumps({"id": item[0], "title": account, "category": "LOGIN", "state": "ACTIVE",
                       "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
                       "additional_information": account + "@example.com",
                       "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
 elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
     print("dummy-" + account + "-password")
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", item[0]]:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown item", file=sys.stderr)
     sys.exit(2)
 '''
-
 
 def _write_config(home: Path, op: Path, accounts) -> None:
     lines = ["vault:", "  onepassword:", f"    binary_path: {op}", "    accounts:"]
@@ -112,7 +117,8 @@ def test_business_handle_cannot_resolve_personal_item(env):
     business = backend_for_handle("op@business:item-p")
     with pytest.raises(RuntimeError):
         business.resolve_password("op@business:item-p")
-    assert all(c["argv"][:2] == ["item", "get"] and "--reveal" not in c["argv"] for c in calls())
+    assert all("--reveal" not in c["argv"] for c in calls())
+    assert any(c["argv"][:2] == ["item", "list"] for c in calls())
 
 
 def test_missing_token_is_reported_and_never_falls_back(env, monkeypatch):

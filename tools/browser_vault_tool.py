@@ -636,10 +636,17 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 ),
             }
         )
+
+    def _discard_fill_metadata() -> None:
+        discard = getattr(backend, "discard_fill_metadata", None)
+        if callable(discard):
+            discard(handle)
     if meta.kind == "protected_field" and (refusal := _private_protected_field_refusal(effective_task_id, browser_key)):
+        _discard_fill_metadata()
         return refusal
     if meta.kind != "login" and not meta.origin:
         if meta.kind != "payment" or not backend.binds_cards_to_page:
+            _discard_fill_metadata()
             return json.dumps({"success": False, "error_type": "no_origin",
                                "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
         # A password manager's card has no site of its own. Bind it to the checkout tab (the supervisor's
@@ -649,6 +656,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         _focus_bound_origin(browser_key, "", "payment")
         page_origin = _current_page_origin(browser_key)
         if not page_origin:
+            _discard_fill_metadata()
             return json.dumps({"success": False, "error": "Could not determine the current page origin. Navigate to the checkout page first."})
         meta = replace(meta, origin=page_origin, allowed_origins=(page_origin,))
 
@@ -665,10 +673,12 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             break
     page_origin = page_origin or _current_page_origin(browser_key)
     if not page_origin:
+        _discard_fill_metadata()
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
     if page_origin not in allowed:
+        _discard_fill_metadata()
         return json.dumps(
             {
                 "success": False,
@@ -686,19 +696,37 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
         alias_key = _alias_fill_key(effective_task_id, handle, page_origin)
         decision = _alias_fill_decision(alias_key)
         if decision == "refused":
+            _discard_fill_metadata()
             return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
                                "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
         if decision is None:
+            prompt_started = time.monotonic()
             decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
             if decision != "accept":
                 _record_alias_fill_decision(alias_key, "refused")
-            elif refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
-                # The prompt can wait for hours (approvals.timeout); `allowed` above predates it.
-                # Nothing is cached, so a re-added alias asks again instead of reusing this acceptance.
-                return refusal
             else:
+                if time.monotonic() - prompt_started > 30.0:
+                    refresh = getattr(backend, "refresh_fill_metadata", None)
+                    refreshed = refresh(handle) if callable(refresh) else None
+                    if refreshed is None:
+                        discard = getattr(backend, "discard_fill_metadata", None)
+                        if callable(discard):
+                            discard(handle)
+                        return json.dumps({"success": False, "error_type": "metadata_changed",
+                                           "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
+                    raw_meta = refreshed
+                    saved_origins = tuple(refreshed.allowed_origins) or ((str(refreshed.origin),) if refreshed.origin else ())
+                    meta = refreshed
+                    from agent.vault_origin_aliases import apply_origin_aliases
+                    meta = apply_origin_aliases([meta])[0]
+                if refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
+                    # The prompt can wait for hours (approvals.timeout). Re-read both the item
+                    # metadata and the alias config before allowing the write.
+                    _discard_fill_metadata()
+                    return refusal
                 _record_alias_fill_decision(alias_key, "accept")
         if decision != "accept":
+            _discard_fill_metadata()
             return json.dumps({"success": False,
                                "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
                                "error": ("The user declined this alias-origin login fill." if decision == "decline" else
@@ -706,6 +734,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                         " Do not retry; ask the user to fill the login."})
     retry_key = _payment_retry_key(effective_task_id, page_origin) if meta.kind == "payment" else None
     if retry_key is not None and _payment_retry_blocked(retry_key):
+        _discard_fill_metadata()
         return json.dumps({"success": False, "error_type": "payment_retry_refused",
                            "error": "Card confirmation was declined or unanswered on this origin. Do not retry; hand card entry to the user."})
 
@@ -749,16 +778,30 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     inspected = _inspect_page()
     if isinstance(inspected, str):
+        _discard_fill_metadata()
         return inspected
     if meta.kind == "payment":
         # Ask only once the page is known to hold a card-number target on the bound origin: a prompt for a
         # fill that cannot succeed spends the user's attention for nothing. That inspection is advisory; the
         # prompt can wait minutes, so after consent the page is inspected again with a fresh nonce and only
         # that inspection's targets are written (the fill script also re-checks the origin at write time).
+        prompt_started = time.monotonic()
         decision = _confirm_payment_fill(meta.label, page_origin)
+        if decision == "accept" and time.monotonic() - prompt_started > 30.0:
+            refresh = getattr(backend, "refresh_fill_metadata", None)
+            refreshed = refresh(handle) if callable(refresh) else None
+            if refreshed is None:
+                discard = getattr(backend, "discard_fill_metadata", None)
+                if callable(discard):
+                    discard(handle)
+                return json.dumps({"success": False, "error_type": "metadata_changed",
+                                   "error": "The vault item changed while confirmation was pending. Nothing was written; retry the fill."})
+            from dataclasses import replace
+            meta = replace(refreshed, origin=page_origin, allowed_origins=(page_origin,))
         if decision != "accept":
             assert retry_key is not None
             _payment_retry_blocked(retry_key, refuse=True)
+            _discard_fill_metadata()
             return json.dumps({"success": False,
                                "error_type": "payment_declined" if decision == "decline" else "payment_prompt_unanswered",
                                "error": ("The user declined this payment card." if decision == "decline" else
@@ -766,6 +809,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                         " Do not retry; hand card entry to the user."})
         inspected = _inspect_page()
         if isinstance(inspected, str):
+            _discard_fill_metadata()
             return inspected
     nonce, classified = inspected
     # ── Resolve secret and fill (secret never enters any logged string) ─────
