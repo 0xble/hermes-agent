@@ -13,6 +13,18 @@ def item(item_id="item-a", vault: object = "vault-a"):
 
 
 @pytest.fixture
+def later(monkeypatch):
+    """Advance past the per-fill listing reuse window, as a separate later fill would."""
+    from agent.vault_backends import onepassword
+    now = [1000.0]
+    monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
+
+    def advance():
+        now[0] += onepassword._FRESH_LISTING_REUSE_SECONDS + 1
+    return advance
+
+
+@pytest.fixture
 def backend():
     with patch("agent.secret_scope.get_secret", return_value="dummy-service-token"):
         backend = OnePasswordLoginBackend()
@@ -24,12 +36,13 @@ def backend():
     ("resolve_password", ("--fields", "label=password", "--reveal"), "dummy-password"),
     ("resolve_otp", ("--otp",), "123456"),
 ])
-def test_legacy_handles_resolve_each_items_vault(backend, method, flags, value):
+def test_legacy_handles_resolve_each_items_vault(backend, later, method, flags, value):
     records = [item(), item("item-b", "vault-b")]
     backend._run.return_value = json.dumps(records)
     assert [m.id for m in backend.list_items()] == ["op:item-a", "op:item-b"]
     assert backend.get_meta("op:item-b").origin == "https://example.com"
     for item_id, vault_id in [("item-a", "vault-a"), ("item-b", "vault-b")]:
+        later()
         backend._run.reset_mock()
         backend._run.side_effect = [json.dumps(records), value + "\r\n"]
         assert getattr(backend, method)("op:" + item_id) == value
