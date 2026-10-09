@@ -106,6 +106,59 @@ def test_heartbeat_due_at_exit_cannot_arrive_after_completion(tmp_path, monkeypa
     assert [event["type"] for event in _drain(registry.completion_queue)] == ["completion"]
 
 
+def test_a_tick_with_no_new_output_queues_nothing():
+    """Every queued heartbeat costs the owning session a full model turn, so a quiet tick is
+    skipped rather than delivered as "(no new output)"; the next tick with output still carries
+    exactly the delta and the sequence counts delivered beats only."""
+    registry = ProcessRegistry()
+    session = pr.ProcessSession(id="proc_quiet", command="sleep 600", notify_on_complete=True)
+    session._heartbeat_last = 0.0
+    # Heartbeats are emitted only for live registered sessions.
+    registry._running[session.id] = session
+
+    registry._emit_heartbeat(session, now=100.0)
+    registry._emit_heartbeat(session, now=200.0)
+    assert _drain(registry.completion_queue) == []
+    assert session._heartbeat_last == 200.0 and session._heartbeat_seq == 0
+
+    session.output_buffer += "first line\n"
+    session.total_output_chars += len("first line\n")
+    registry._emit_heartbeat(session, now=300.0)
+    (beat,) = _drain(registry.completion_queue)
+    assert beat["type"] == "heartbeat" and beat["seq"] == 1 and beat["output"] == "first line\n"
+
+    registry._emit_heartbeat(session, now=400.0)
+    assert _drain(registry.completion_queue) == []
+
+
+def test_schema_minimum_heartbeat_is_disabled_for_foreground(monkeypatch):
+    from tools import terminal_tool as tt
+
+    captured = {}
+
+    def fake_terminal_tool(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"output": "Background process started", "session_id": "proc_x", "exit_code": 0})
+
+    monkeypatch.setattr(tt, "terminal_tool", fake_terminal_tool)
+    heartbeat_schema = tt.TERMINAL_SCHEMA["parameters"]["properties"]["heartbeat"]
+    generated = {
+        "command": "pwd",
+        "background": False,
+        "timeout": 20,
+        "pty": False,
+        "notify": False,
+        "heartbeat": heartbeat_schema["minimum"],
+    }
+
+    result = json.loads(tt._handle_terminal(generated))
+
+    assert not result.get("error")
+    assert captured["background"] is False
+    assert captured["heartbeat"] == 0
+    assert captured["notify_on_complete"] is False
+
+
 @pytest.mark.platforms("linux")
 def test_first_heartbeat_carries_output_produced_before_arming(tmp_path, monkeypatch):
     """The terminal tool arms the heartbeat after its spawn bookkeeping; whatever the process
