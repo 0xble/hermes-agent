@@ -236,7 +236,7 @@ def cmd_fallback_clear(args) -> None:  # noqa: ARG001
 
 
 def cmd_fallback_status(args) -> None:  # noqa: ARG001
-    """Show active shared primary-model cooldowns."""
+    """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
     from datetime import datetime
     from agent.shared_primary_cooldown import list_cooldowns
     records = list_cooldowns()
@@ -256,18 +256,39 @@ def cmd_fallback_status(args) -> None:  # noqa: ARG001
     print()
 
 
-def cmd_fallback_clear_cooldown(args) -> None:
-    """Clear a shared cooldown, optionally restricted to a model/provider substring."""
+def cmd_fallback_cooldowns_clear(args) -> None:
+    """Clear shared primary cooldowns: ``--all``, or one exact ``provider/model`` or model.
+
+    Never touches the configured fallback chain (that is ``hermes fallback clear``). Running
+    agents pick the change up at their next turn start, which re-reads the shared record.
+    """
     from agent.shared_primary_cooldown import clear_cooldowns
-    removed = clear_cooldowns(getattr(args, "model", None))
-    print(f"\n  Cleared {removed} shared primary cooldown{'s' if removed != 1 else ''}.\n")
+    target = str(getattr(args, "target", None) or "").strip()
+    clear_all = bool(getattr(args, "all", False))
+    if clear_all == bool(target):
+        print("\n  Specify exactly one of --all or an exact provider/model (or model) to clear.")
+        print("  Run `hermes fallback cooldowns` to list active cooldowns.\n")
+        raise SystemExit(2)
+    try:
+        removed = clear_cooldowns(target or None, all_routes=clear_all)
+    except OSError as exc:
+        print(f"\n  Could not update the shared cooldown state: {exc}\n")
+        raise SystemExit(1) from exc
+    print()
+    if not removed:
+        print(f"  No shared primary cooldown matches {target!r}.\n" if target else "  No shared primary cooldowns to clear.\n")
+        return
+    for record in removed:
+        print(f"  Cleared: {record.get('model', '?')} via {record.get('provider', '?')}")
+    print("\n  Running agents retry the primary at their next turn start.\n")
 
 
-def cmd_fallback_clear_or_chain(args) -> None:
-    if getattr(args, "model", None):
-        cmd_fallback_clear_cooldown(args)
+def cmd_fallback_cooldowns(args) -> None:
+    """Dispatch ``hermes fallback cooldowns [clear]``; listing is the default."""
+    if getattr(args, "cooldowns_command", None) == "clear":
+        cmd_fallback_cooldowns_clear(args)
     else:
-        cmd_fallback_clear(args)
+        cmd_fallback_status(args)
 
 
 def cmd_fallback(args) -> None:
@@ -275,13 +296,13 @@ def cmd_fallback(args) -> None:
     handler = _SUBCOMMANDS.get(sub)
     if handler is None:
         print(f"Unknown fallback subcommand: {sub}")
-        print("Use one of: list, add, remove, clear")
+        print("Use one of: list, add, remove, clear, status, cooldowns")
         raise SystemExit(2)
     handler(args)
 
 
 _SUBCOMMANDS = {
     **dict.fromkeys((None, "", "list", "ls"), cmd_fallback_list), "add": cmd_fallback_add,
-    **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear_or_chain,
-    "status": cmd_fallback_status,
+    **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear,
+    "status": cmd_fallback_status, "cooldowns": cmd_fallback_cooldowns,
 }
