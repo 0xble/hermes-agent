@@ -9,6 +9,10 @@ from agent.error_classifier import FailoverReason
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
+# Reasons that arm the shared primary cooldown. An overloaded primary (529, or 503 with an
+# overload body) is as unusable for the next minutes as a rate-limited one, so it takes the same
+# shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
+_SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
 
 
 def _provider_reset_epoch(reset_at) -> float | None:
@@ -61,7 +65,7 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return None
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()

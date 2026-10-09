@@ -1954,8 +1954,8 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
     """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
     short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
     context across every provider again."""
-    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-    if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS
+    if agent._fallback_chain and reason not in _SHARED_COOLDOWN_REASONS:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
     return False
@@ -2119,8 +2119,8 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
     announced. Missing shared state (a failed write) or a move to a different model than the
     one announced keeps a notice.
     """
-    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return True, None
     if shared_adoption:
         return False, None  # one notice per outage: another session already announced it
@@ -2135,9 +2135,10 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
         if claim_outage_notice(route, outage_id, fallback=target):
             try:
                 reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
-            except (KeyError, TypeError, ValueError, OSError):
+            except (KeyError, TypeError, ValueError, OSError, OverflowError):
                 reset_label = "the cooldown expiry"
-            return False, f"⚠️ {old_model} is rate-limited until {reset_label}; using {fb_model} via {fb_provider} until then."
+            state = "overloaded" if record.get("reason") == FailoverReason.overloaded.value else "rate-limited"
+            return False, f"⚠️ {old_model} is {state} until {reset_label}; using {fb_model} via {fb_provider} until then."
         if announced_fallback(route, outage_id) == target:
             return False, None
     except Exception:

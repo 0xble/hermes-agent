@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -141,14 +142,22 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
             path.unlink()
 
 
+def _finite_float(value: Any) -> float | None:
+    """``float(value)`` when it is a finite number, else None (NaN, ±Infinity and junk are malformed)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _stale(entry: Any, now: float) -> bool:
-    """True when an expired record is past its grace and no longer describes the current outage."""
+    """True when a record is malformed, or expired past its grace and no longer the current outage."""
     if not isinstance(entry, dict):
         return True
-    try:
-        reset_at = float(entry.get("reset_at", 0))
-        recorded_at = float(entry.get("recorded_at", reset_at))
-    except (TypeError, ValueError):
+    reset_at = _finite_float(entry.get("reset_at", 0))
+    recorded_at = _finite_float(entry.get("recorded_at", reset_at)) if reset_at is not None else None
+    if reset_at is None or recorded_at is None:
         return True
     window = min(max(0.0, reset_at - recorded_at), float(_MAX_BACKOFF_SECONDS))
     return now > reset_at + max(float(_STALE_GRACE_FLOOR_SECONDS), window)
@@ -167,10 +176,8 @@ def _prune_stale(state: dict[str, Any], now: float) -> bool:
 def _active(entry: Any, now: float | None = None) -> bool:
     if not isinstance(entry, dict):
         return False
-    try:
-        return float(entry.get("reset_at", 0)) > (time.time() if now is None else now)
-    except (TypeError, ValueError):
-        return False
+    reset_at = _finite_float(entry.get("reset_at", 0))
+    return reset_at is not None and reset_at > (time.time() if now is None else now)
 
 
 def read_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
@@ -210,10 +217,7 @@ def arm_cooldown(
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record."""
     now = time.time()
-    try:
-        requested_reset = float(reset_at) if reset_at is not None else 0.0
-    except (TypeError, ValueError):
-        requested_reset = 0.0
+    requested_reset = (_finite_float(reset_at) or 0.0) if reset_at is not None else 0.0
     if requested_reset <= now:
         requested_reset = 0.0
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
