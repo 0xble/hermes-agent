@@ -382,6 +382,16 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         try:
             from agent.vault_origin_aliases import apply_origin_aliases
             metas = apply_origin_aliases(backend.list_items())
+            # A cached 1Password display listing can hide an item added by the user moments ago.
+            # An origin-filtered miss is the one case where freshness is worth another op call;
+            # matching cached logins, other filters, and unfiltered listings keep the quota-saving path.
+            if (origin is not None and kind in (None, "login")
+                    and (backend.name == "onepassword" or backend.name.startswith("onepassword@"))
+                    and not any(meta.kind == "login" and origin in (meta.allowed_origins or (meta.origin,))
+                                for meta in metas)):
+                from agent.vault_backends.onepassword import OnePasswordLoginBackend
+                if isinstance(backend, OnePasswordLoginBackend):
+                    metas = apply_origin_aliases(backend.list_items(fresh=True))
         except Exception as exc:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue

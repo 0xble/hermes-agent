@@ -39,6 +39,8 @@ if delay.exists():
     time.sleep(float(delay.read_text()))
 item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
         "business": ("item-b", "vault-b", "https://business.example/login")}[account]
+if account == "personal" and (root / "new-item").exists():
+    item = ("item-new", "vault-new", "https://new.personal.example/login")
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
@@ -117,6 +119,39 @@ def test_one_fill_lists_the_account_once(env):
     out = _fill("op:item-p", "https://personal.example")
     assert out["success"] is True and "dummy-personal-password" not in json.dumps(out)
     assert [c["argv"][:2] for c in calls()] == [["item", "list"], ["item", "get"]]
+
+
+def test_origin_filtered_cache_miss_refetches_once_and_finds_new_item(env):
+    from tools.browser_vault_tool import browser_vault_list
+    op, calls = env
+    backend = backend_for_handle("op:item-p")
+    with patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+        assert json.loads(browser_vault_list())["items"][0]["handle"] == "op:item-p"
+        op.with_name("new-item").write_text("")
+        listed = json.loads(browser_vault_list(origin="https://new.personal.example"))
+    assert [item["handle"] for item in listed["items"]] == ["op:item-new"]
+    assert len(calls("list")) == 2
+
+
+def test_origin_filtered_cache_hit_makes_no_extra_call(env):
+    from tools.browser_vault_tool import browser_vault_list
+    _op, calls = env
+    backend = backend_for_handle("op:item-p")
+    with patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+        browser_vault_list()
+        listed = json.loads(browser_vault_list(origin="https://personal.example"))
+    assert [item["handle"] for item in listed["items"]] == ["op:item-p"]
+    assert len(calls("list")) == 1
+
+
+def test_unfiltered_list_makes_no_extra_call(env):
+    from tools.browser_vault_tool import browser_vault_list
+    _op, calls = env
+    backend = backend_for_handle("op:item-p")
+    with patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+        browser_vault_list()
+        browser_vault_list()
+    assert len(calls("list")) == 1
 
 
 def test_concurrent_display_listings_share_one_op_call(env):
