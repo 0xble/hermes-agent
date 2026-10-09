@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from hermes_cli.update_handoff import post_swap_child_env, write_handoff
+from hermes_cli.update_handoff import handoff_path, post_swap_child_env, write_handoff
 
 
 def detach_update_receipt() -> dict | None:
@@ -16,6 +16,23 @@ def detach_update_receipt() -> dict | None:
     data = deepcopy(current.data)
     update_receipt._current.reset(current.current_token)
     return data
+
+
+def reclaim_handoff() -> bool:
+    """Whether the post-swap child left this process's hand-off unclaimed.
+
+    The child unlinks the hand-off as it takes the receipt and the Windows resume, so a file
+    still on disk after it exits means both stayed with the parent. The file is removed so
+    nothing resumes that receipt a second time.
+    """
+    path = handoff_path()
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return True
 
 
 def continue_update_in_fresh_interpreter(payload: dict, *, argv_tail: list[str]) -> int | None:
