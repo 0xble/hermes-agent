@@ -281,8 +281,9 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     # writers may retain that home in a context variable, so a plain mkdir here
     # would resurrect the profile before the write can fail.
     if path.name == "config.yaml":
-        # Every atomic writer funnels here, so one check covers config set, save_config,
-        # import-agent and any direct writer. See hermes_cli/release_config_owner.py.
+        # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
+        # all funnel here, so one check stops a newer-schema build stamping a release-managed
+        # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
         from hermes_cli.release_config_owner import ensure_release_owns_config_write
         ensure_release_owns_config_write(path)
     from hermes_constants import mkdir_under_hermes_home

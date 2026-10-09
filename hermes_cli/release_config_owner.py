@@ -3,9 +3,10 @@
 A Hermes home on immutable releases runs whatever ``<root>/current`` names. A dev worktree or
 sync candidate can carry a newer config schema; its config writes stamp ``_config_version`` past
 the live release and block the next ``hermes update`` (``config ... is newer than this release``).
-Every ``config.yaml`` write through utils' atomic writer (``_atomic_write``, behind config set,
-``save_config``, ``import-agent`` and direct writers) calls :func:`ensure_release_owns_config_write`
-first.
+Hermes's own ``config.yaml`` writers (config set/unset, ``save_config``, ``migrate_config``,
+``import-agent``) go through utils' ``_atomic_write``, which calls
+:func:`ensure_release_owns_config_write` first. The agent file tool writes text a model authored,
+never a schema stamp, so it is deliberately outside this guard.
 
 A previously-live release still running after promotion (an open CLI, a gateway awaiting restart,
 a pinned worker) has an older or equal schema and keeps writing: ``migrate_config`` only stamps
