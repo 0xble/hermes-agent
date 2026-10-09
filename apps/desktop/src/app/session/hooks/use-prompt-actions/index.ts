@@ -634,21 +634,24 @@ export function usePromptActions({
       const visibleText = tokenPayload ? rawText : sanitizeComposerInput(rawText).trim()
       const attachments = tokenPayload ? (options?.attachments ?? []) : (options?.attachments ?? $composerAttachments.get())
 
+      // A slash command can't carry attachments: warn instead of silently
+      // running the text as a prompt (#81798). Token payloads are opaque.
+      if (!tokenPayload && attachments.length && isSlashCommandText(visibleText)) {
+        notify({
+          kind: 'warning',
+          title: copy.slashCommandIgnoredTitle,
+          message: copy.slashCommandIgnoredBody
+        })
+
+        return false
+      }
+
       if (
         shouldUseSlashCommandShortcut(visibleText, {
           hasAttachments: attachments.length > 0,
           moaToken: options?.moaToken
-        })) {
-        if (attachments.length) {
-          notify({
-            kind: 'warning',
-            title: copy.slashCommandIgnoredTitle,
-            message: copy.slashCommandIgnoredBody
-          })
-
-          return false
-        }
-
+        })
+      ) {
         triggerHaptic('selection')
         // Forward the explicit target (background queue drain, tile) — dropping
         // it ran the command against whatever chat happened to be in front.

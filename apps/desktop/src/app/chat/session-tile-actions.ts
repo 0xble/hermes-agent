@@ -327,7 +327,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       listTileSession(visibleText)
 
-      if (!tokenPayload && !attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+      if (!tokenPayload && isSlashCommandText(visibleText)) {
         if (attachments.length) {
           notify({
             kind: 'warning',

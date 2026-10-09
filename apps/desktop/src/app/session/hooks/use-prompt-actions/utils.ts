@@ -1,8 +1,9 @@
 import type { AppendMessage } from '@assistant-ui/react'
-import { JsonRpcGatewayError, SLASH_COMMAND_RE } from '@hermes/shared'
+import { JsonRpcGatewayError } from '@hermes/shared'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
+import { isSlashCommandText } from '@/lib/chat-runtime'
 import { isReadFileErrorResult } from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
@@ -765,5 +766,5 @@ export function shouldUseSlashCommandShortcut(
   visibleText: string,
   options: { hasAttachments: boolean; moaToken?: string }
 ): boolean {
-  return !options.hasAttachments && !options.moaToken && SLASH_COMMAND_RE.test(visibleText)
+  return !options.hasAttachments && !options.moaToken && isSlashCommandText(visibleText)
 }
