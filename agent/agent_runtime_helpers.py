@@ -1261,10 +1261,37 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
+def _adopt_shared_primary_cooldown(agent) -> bool:
+    """Start a fresh agent on the configured fallback when another process armed the primary route."""
+    try:
+        from agent.shared_primary_cooldown import active_cooldown, get_cooldown, route_from_agent
+        route = route_from_agent(agent)
+        record = active_cooldown(route)
+        if record is None:
+            # Preserve an expired record as a recovery probe. The first successful primary request
+            # clears it atomically and owns the sole recovery notice.
+            expired = get_cooldown(route)
+            if isinstance(expired, dict):
+                agent._shared_primary_cooldown_record = expired
+            return False
+        from agent.error_classifier import FailoverReason
+        try:
+            reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
+        except ValueError:
+            reason = FailoverReason.rate_limit
+        from agent.chat_completion_helpers import try_activate_fallback
+        return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
+    except Exception:
+        logger.debug("Shared primary cooldown adoption failed; using normal runtime", exc_info=True)
+        return False
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
     if not agent._fallback_activated:
+        if _adopt_shared_primary_cooldown(agent):
+            return False
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks.
         agent._fallback_index = 0
@@ -1371,7 +1398,8 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        if provider_fallback_active:
+        shared_record = getattr(agent, "_shared_primary_cooldown_record", None)
+        if provider_fallback_active and not isinstance(shared_record, dict):
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(

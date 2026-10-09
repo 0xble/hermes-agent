@@ -235,8 +235,42 @@ def cmd_fallback_clear(args) -> None:  # noqa: ARG001
     print("\n  Fallback chain cleared.\n")
 
 
+def cmd_fallback_status(args) -> None:  # noqa: ARG001
+    """Show active shared primary-model cooldowns."""
+    from datetime import datetime
+    from agent.shared_primary_cooldown import list_cooldowns
+    records = list_cooldowns()
+    print()
+    if not records:
+        print("  No primary-model cooldowns active.\n")
+        return
+    print("  Shared primary-model cooldowns:\n")
+    for record in records:
+        reset_at = float(record.get("reset_at", 0) or 0)
+        reset = datetime.fromtimestamp(reset_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        print(
+            f"  {record.get('model', '?')} via {record.get('provider', '?')} "
+            f"(reset {reset}; reason {record.get('reason', '?')}; "
+            f"backoff {record.get('backoff_count', 0)})"
+        )
+    print()
+
+
+def cmd_fallback_clear_cooldown(args) -> None:
+    """Clear a shared cooldown, optionally restricted to a model/provider substring."""
+    from agent.shared_primary_cooldown import clear_cooldowns
+    removed = clear_cooldowns(getattr(args, "model", None))
+    print(f"\n  Cleared {removed} shared primary cooldown{'s' if removed != 1 else ''}.\n")
+
+
+def cmd_fallback_clear_or_chain(args) -> None:
+    if getattr(args, "model", None):
+        cmd_fallback_clear_cooldown(args)
+    else:
+        cmd_fallback_clear(args)
+
+
 def cmd_fallback(args) -> None:
-    """Top-level dispatcher for ``hermes fallback [subcommand]``."""
     sub = getattr(args, "fallback_command", None)
     handler = _SUBCOMMANDS.get(sub)
     if handler is None:
@@ -248,5 +282,6 @@ def cmd_fallback(args) -> None:
 
 _SUBCOMMANDS = {
     **dict.fromkeys((None, "", "list", "ls"), cmd_fallback_list), "add": cmd_fallback_add,
-    **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear,
+    **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear_or_chain,
+    "status": cmd_fallback_status,
 }
