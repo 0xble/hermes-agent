@@ -33,10 +33,16 @@ def _reset_cron_running_set():
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._restart_safe_waiter_job_ids.clear()
+    sched._restart_safe_external_worker_job_ids.clear()
+    sched._external_worker_modes.clear()
     yield
     sched._running_job_ids.clear()
     sched._running_fire_owners.clear()
     sched._interrupted_job_ids.clear()
+    sched._restart_safe_waiter_job_ids.clear()
+    sched._restart_safe_external_worker_job_ids.clear()
+    sched._external_worker_modes.clear()
 
 
 def _make_async_noop():
@@ -85,6 +91,7 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         runner, adapter = make_restart_runner()
         runner._restart_drain_timeout = 0.01  # force the timeout path
         runner._cron_drain_timeout = 0.01  # ...past the cron floor too (#82161)
+        runner._restart_shutdown_bound = lambda: 0.05
         adapter.disconnect = _make_async_noop()
 
         sched._running_job_ids.add(sched._inflight_key("job-1"))
@@ -92,7 +99,11 @@ class TestKillToolSubprocessesMarksCronInterrupted:
             object(): ("owner-1", sched._get_hermes_home().resolve())
         }
 
-        monkeypatch.setattr(_pr.process_registry, "kill_all", lambda task_id=None: 1)
+        def _blocking_kill_all(task_id=None, **kwargs):
+            kwargs["stop_event"].wait(30)
+            return 1
+
+        monkeypatch.setattr(_pr.process_registry, "kill_all", _blocking_kill_all)
         monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
         monkeypatch.setattr(terminal_tool_lifecycle, "cleanup_all_environments", lambda: None)
         monkeypatch.setattr(bt_lifecycle, "cleanup_all_browsers", lambda: None)
@@ -113,3 +124,46 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
+
+
+
+def test_degraded_external_worker_remains_active_during_shutdown():
+    """External does not imply restart-safe: degraded workers stay in the drain set."""
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("degraded-worker")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        sched._running_worker_pids[key] = 4321
+    try:
+        assert sched.get_running_job_ids() == frozenset({"degraded-worker"})
+        assert sched.get_running_job_details() == [
+            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321}
+        ]
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._running_worker_pids.pop(key, None)
+
+
+def test_acknowledged_restart_safe_worker_remains_in_ids_and_details():
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("restart-safe")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        # The production acknowledgement path registers both sets together.
+        sched._restart_safe_waiter_job_ids.add(key)
+        sched._restart_safe_external_worker_job_ids.add(key)
+        sched._running_worker_pids[key] = 4321
+    try:
+        assert sched.get_running_job_ids() == frozenset({"restart-safe"})
+        assert sched.get_running_job_details() == [
+            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321}
+        ]
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._restart_safe_waiter_job_ids.discard(key)
+            sched._restart_safe_external_worker_job_ids.discard(key)
+            sched._running_worker_pids.pop(key, None)
