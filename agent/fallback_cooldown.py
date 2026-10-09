@@ -11,10 +11,18 @@ logger = logging.getLogger(__name__)
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
 
 
-def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+def _provider_reset_epoch(reset_at) -> float | None:
+    """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""
     from agent.credential_pool import _parse_absolute_timestamp
     parsed = _parse_absolute_timestamp(reset_at)
+    if parsed is not None and math.isfinite(parsed) and parsed > time.time():
+        return float(parsed)
+    return None
+
+
+def _provider_reset_delay(reset_at) -> float | None:
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+    parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
     if delay is not None and math.isfinite(delay) and delay > 0:
         return delay
@@ -69,9 +77,29 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
     agent._rate_limited_until = time.monotonic() + backoff_seconds
+    # The in-memory fields remain the hot-path cache, while this record is the source of truth
+    # across gateway agent eviction, delegated children, cron workers and restarts.
+    agent._shared_primary_cooldown_record = None
+    try:
+        from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+        record = arm_cooldown(
+            route_from_agent(agent), reason=reason,
+            reset_at=_provider_reset_epoch(reset_at),
+            backoff_count=backoff_count,
+        )
+    except Exception:
+        record = None
+        logger.debug("Shared primary cooldown write failed", exc_info=True)
+    if record:
+        agent._shared_primary_cooldown_record = record
+        backoff_seconds = max(0, math.ceil(float(record["reset_at"]) - time.time()))
+        agent._rate_limited_until = time.monotonic() + backoff_seconds
+        agent._rate_limit_backoff_count = int(record.get("backoff_count", backoff_count + 1) or 0)
+        source = "provider reset" if record.get("source") == "provider_reset" else "exponential fallback"
     logging.info(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
-        backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
+        max(0, agent._rate_limit_backoff_count - 1), backoff_seconds, backoff_seconds / 60,
+        agent._rate_limit_backoff_count, source,
     )
     return backoff_seconds
 

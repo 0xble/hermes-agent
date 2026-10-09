@@ -282,4 +282,7 @@ class _NonStreamRequest:
         # Success — the provider proved responsive: clear the breaker (#58962).
         if self.result["response"] is not None:
             h._reset_stale_streak(agent)
+            with h.contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import complete_primary_recovery
+                complete_primary_recovery(agent)
         return self.result["response"]

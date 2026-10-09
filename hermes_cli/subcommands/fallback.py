@@ -21,5 +21,7 @@ def build_fallback_parser(subparsers) -> None:
         help="Pick a provider + model (same picker as `hermes model`) and append to the chain")
     fallback_subparsers.add_parser(
         "remove", aliases=["rm"], help="Pick an entry to delete from the chain")
-    fallback_subparsers.add_parser("clear", help="Remove all fallback entries")
+    fallback_subparsers.add_parser("status", help="Show shared primary-model cooldowns")
+    clear_parser = fallback_subparsers.add_parser("clear", help="Clear a shared primary cooldown, or the fallback chain when no model is given")
+    clear_parser.add_argument("model", nargs="?", help="Primary model to clear; omit to clear the configured fallback chain")
     fallback_parser.set_defaults(func=cmd_fallback)
