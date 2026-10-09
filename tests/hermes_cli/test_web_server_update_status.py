@@ -7,6 +7,11 @@ import pytest
 import hermes_cli.web_server_gateway as _web_server_gateway
 
 
+# Exit code a dashboard reports from THIS action's own receipt once its process is gone. A failed
+# run maps to 1 like the CLI, so a client polling after the dashboard restarted stops waiting.
+_RECEIPT_EXIT_CODES = {None: None, "failed": 1, "success": 0}
+
+
 class TestUpdateStatusRootLog:
     @pytest.fixture(autouse=True)
     def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
@@ -127,7 +132,7 @@ class TestUpdateStatusRootLog:
         data = self.client.get("/api/actions/hermes-update/status?lines=2000").json()
 
         assert data["running"] is False
-        assert data["exit_code"] == (0 if b_outcome == "success" else None)
+        assert data["exit_code"] == _RECEIPT_EXIT_CODES[b_outcome]
         assert data.get("action_id") == (b_id if b_outcome == "success" else None)
         assert data["receipt"]["action_id"] == (b_id if b_outcome else a_id)
 
@@ -158,7 +163,7 @@ class TestUpdateStatusRootLog:
 
         data = self.client.get("/api/actions/hermes-update/status?lines=2000").json()
 
-        assert data["exit_code"] == (0 if b_outcome == "success" else None)
+        assert data["exit_code"] == _RECEIPT_EXIT_CODES[b_outcome]
         assert "action_id" not in data  # A's root completion marker is not B's
         # The attached receipt names its writer: B's own when it exists, else A's (never B's).
         assert data["receipt"]["action_id"] == (b_id if b_outcome else a_id)
