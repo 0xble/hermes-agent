@@ -142,10 +142,32 @@ def reinstall_primary_runtime(
 ) -> None:
     """Put ``agent`` back on its ``_primary_runtime`` snapshot ``rt`` and clear the fallback state."""
     from agent.agent_runtime_helpers import _rebind_primary_credential_pool
+    # A marker is a live pick only while it equals the level it was set with
+    # (explicit_parent_reasoning's rule); read it BEFORE the snapshot overwrites that level.
+    live_pick = getattr(agent, "reasoning_override", None)
+    if live_pick != getattr(agent, "reasoning_config", None):
+        live_pick = None
     reinstall_runtime_snapshot(agent, rt)
     _rebind_primary_credential_pool(
         agent, primary_provider, primary_model, matches_primary, load_primary_pool, prefetched_pool, prefetched
     )
+    # Older snapshots have no reasoning_config; an explicit None is a saved default.
+    if "reasoning_config" in rt:
+        saved_reasoning = rt["reasoning_config"]
+        agent.reasoning_config = dict(saved_reasoning) if isinstance(saved_reasoning, dict) else saved_reasoning
+        # The explicit pick travels with the level it describes. Fallback activation cleared the
+        # marker and set a valid pick aside; a pick re-marked since then (the gateway does every
+        # turn) is newer and wins. The primary snapshot can predate either (a live /reasoning,
+        # an init-time snapshot), so restore the pick as BOTH level and marker rather than
+        # pairing it with the snapshot's stale level.
+        saved_pick = getattr(agent, "_pre_fallback_reasoning_override", None)
+        pick = live_pick if isinstance(live_pick, dict) else saved_pick
+        if isinstance(pick, dict):
+            agent.reasoning_config = dict(pick)
+            agent.reasoning_override = dict(pick)
+        else:
+            agent.reasoning_override = None
+    agent._pre_fallback_reasoning_override = None
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
