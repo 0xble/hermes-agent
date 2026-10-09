@@ -2209,9 +2209,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         previous_kill_deadline = session._kill_deadline
         session._kill_deadline = deadline
         if session.exited:
-            # A double-forked descendant may still be alive in the systemd scope even
-            # though the main process exited — stop the scope to reap survivors.
-            # See #70716.
             # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
             # double-forked descendants that were reparented inside the scope and survived the PID signal
             # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
@@ -2229,8 +2226,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 self._completion_consumed.add(session_id)
             session._kill_deadline = previous_kill_deadline
             return result
+        # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
+        bounded = {} if deadline is None else {"deadline": deadline}
         try:
-            early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
+            early = self._signal_kill(session, session_id, consume_output, **bounded)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2245,7 +2244,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 signal_race_exited = session.exited
             # A reader that finalised the session mid-signal already proved
             # real exit; only a still-running session needs tree-death proof.
-            survivors = [] if signal_race_exited else self._post_kill_survivors(session, deadline=deadline)
+            survivors = [] if signal_race_exited else self._post_kill_survivors(session, **bounded)
             if survivors:
                 alive = ", ".join(map(str, survivors))
                 logger.warning(
