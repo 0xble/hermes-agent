@@ -47,6 +47,8 @@ export interface EnqueueQueuedPromptPayload {
   displayKind?: 'hidden'
   /** Fenced `@terminal` transport. Runtime-only; never written to localStorage. */
   frozenTransport?: string
+  /** Backend identity for a deferred one-shot (see `QueuedPromptEntry.moaToken`). */
+  moaToken?: string
 }
 
 export type ResolvedQueuedPromptTransport =
@@ -323,13 +325,7 @@ export const withQueueDrainClaim = <T>(sid: string, task: (queue: QueuedPromptEn
 
 export const enqueueQueuedPrompt = (
   key: string | null | undefined,
-  payload: {
-    text: string
-    attachments: ComposerAttachment[]
-    displayText?: string
-    displayKind?: 'hidden'
-    moaToken?: string
-  }
+  payload: EnqueueQueuedPromptPayload
 ): null | QueuedPromptEntry => {
   const sid = sidOf(key)
 
