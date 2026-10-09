@@ -64,6 +64,9 @@ class CLIChatTurnMixin:
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
         self._last_turn_interrupted = False
+        # Heartbeat and /loop wakeups may end with a bare [SILENT]; that turn renders nothing.
+        from hermes_cli.loops import is_quiet_wakeup_prompt
+        self._quiet_wakeup_turn = is_quiet_wakeup_prompt(message)
 
         if not self._ensure_runtime_credentials():
             return None
@@ -126,6 +129,7 @@ class CLIChatTurnMixin:
                 return None
             finally:
                 self._chat_release_turn_audio(turn)
+                self._quiet_wakeup_turn = False
 
     def _chat_release_turn_audio(self, turn):
         """Every exit path: stop the thinking sound, send the TTS sentinel, cut TTS only if abnormal."""
@@ -294,11 +298,24 @@ class CLIChatTurnMixin:
             # Barge-in paths (voice key, full-duplex listener) cut playback via this event.
             self._voice_tts_stop = turn.stop_event
 
-            def stream_callback(delta: str):
+            def speak(delta: str):
                 turn.text_queue.put(delta)
                 # Track what is being spoken so a playback-phase barge capture can be
                 # checked against it (echo guard).
                 self._voice_last_tts_text = (self._voice_last_tts_text or "") + delta
+
+            # TTS gets raw deltas, not _stream_delta's display hold: a wakeup turn's bare
+            # [SILENT] must not be spoken either (the held tail settles in _chat_settle_turn).
+            if getattr(self, "_quiet_wakeup_turn", False):
+                turn.silence_hold = {"buf": "", "held": ""}
+
+            def stream_callback(delta: str):
+                if turn.silence_hold is not None and isinstance(delta, str):
+                    from gateway.response_filters import hold_silence_delta
+                    delta = hold_silence_delta(turn.silence_hold, delta)
+                if delta:
+                    speak(delta)
+            turn.speak = speak
             turn.stream_callback = stream_callback
 
         # API-call-local only — run_conversation persists the original clean user message.
@@ -488,6 +505,12 @@ class CLIChatTurnMixin:
             pass
         self._flush_stream()
         if turn.use_streaming_tts and turn.text_queue is not None:
+            # A held bare silence marker is dropped; a prefix that never completed one is speech.
+            held = turn.silence_hold["held"] if turn.silence_hold else ""
+            if held and turn.speak is not None:
+                from gateway.response_filters import is_intentional_silence_response
+                if not is_intentional_silence_response(held):
+                    turn.speak(held)
             turn.text_queue.put(None)  # end-of-text sentinel
             if turn.tts_thread is not None:
                 turn.tts_thread.join(timeout=120)
@@ -533,6 +556,11 @@ class CLIChatTurnMixin:
             if self._voice_continuous:
                 self._voice_continuous = False
                 _cprint(f"\n{_DIM}{t('cli.chat.continuous_voice_stopped')}{_RST}")
+
+        if getattr(self, "_quiet_wakeup_turn", False):
+            from gateway.response_filters import is_intentional_silence_agent_result
+            if is_intentional_silence_agent_result(turn.result, response):
+                response = ""  # quiet no-change tick: no panel, no speech; history keeps the row
 
         pending_message, _show_interrupt_marker = self._chat_resolve_interrupt(
             turn, agent_thread, interrupt_msg, response)

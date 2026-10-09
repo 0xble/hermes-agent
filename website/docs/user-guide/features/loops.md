@@ -6,7 +6,7 @@ description: "Re-run a prompt on a recurring interval inside your session — He
 
 # Recurring Loops (`/loop`)
 
-`/loop` re-runs a prompt (or a slash command) on a recurring cadence **inside your current session**. Each wakeup is a real agent turn: Hermes reads the current state fresh — the latest CI result, the newest queue depth, the file as it is now — does the work, reports back, and goes quiet until the next tick.
+`/loop` re-runs a prompt (or a slash command) on a recurring cadence **inside your current session**. Each wakeup is a real agent turn: Hermes reads the current state fresh — the latest CI result, the newest queue depth, the file as it is now — does the work, and speaks up only when something new needs you. When nothing new and material happened (including a plain acknowledgement or a "still waiting" check), the wakeup prompt asks for a bare `[SILENT]`; a reply that does have news is one or two short lines: that tick shows nothing in the CLI, TUI, Desktop or messaging chat (the turn stays in the transcript), and a `--until` loop skips the judge call for it.
 
 It's Hermes' take on **Claude Code's `/loop`** (and its `/proactive` alias, which works here too). Where [`/goal`](./goals.md) is judge-driven — "keep working until this objective is achieved" — `/loop` is timer-driven: "do this again every N minutes (or whenever it makes sense) until something says stop."
 
