@@ -210,6 +210,23 @@ def claim_outage_notice(route: tuple[str, str, str], outage_id: str) -> bool:
         return False
 
 
+def release_for_recovery(route: tuple[str, str, str], outage_id: str) -> bool:
+    """Mark a durable outage eligible for a primary probe without losing its recovery identity."""
+    key = route_key(provider=route[0], base_url=route[1], model=route[2])
+    try:
+        with _locked_state() as (path, state):
+            entry = state["routes"].get(key)
+            if not isinstance(entry, dict) or str(entry.get("outage_id")) != str(outage_id):
+                return False
+            entry["reset_at"] = time.time() - 1
+            entry["recovery_probe"] = True
+            state["routes"][key] = entry
+            _write_state(path, state)
+            return True
+    except OSError as exc:
+        logger.debug("Could not release primary cooldown for recovery: %s", exc)
+        return False
+
 def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool:
     """Clear only the outage this agent observed; return true for the recovery-notice owner."""
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -298,6 +315,6 @@ def complete_primary_recovery(agent) -> bool:
     return True
 __all__ = [
     "active_cooldown", "arm_cooldown", "claim_outage_notice", "clear_cooldowns", "clear_if_current",
-    "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns", "route_from_agent", "route_from_record", "route_key",
+    "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns", "release_for_recovery", "route_from_agent", "route_from_record", "route_key",
 ]
 

@@ -24,6 +24,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolated_shared_primary_cooldown(monkeypatch, tmp_path):
+    """Keep file-backed cooldown state isolated between unit tests."""
+    from agent import shared_primary_cooldown
+    monkeypatch.setattr(
+        shared_primary_cooldown,
+        "_state_path",
+        lambda: tmp_path / "state" / "model_cooldowns.json",
+    )
+
+@pytest.fixture(autouse=True)
 def _fast_retry_backoff(request, monkeypatch):
     """Short-circuit retry backoff for all tests in this directory.
 
