@@ -20,6 +20,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -392,9 +393,14 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     row_display: Dict[str, Any] = {}
     if data.get("internal") is True:
         from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+        from gateway.warning_notifications import diagnostic_metadata
         row_display["display_kind"] = INTERNAL_NOTIFICATION_DISPLAY_KIND
+        row_display["display_metadata"] = diagnostic_metadata(
+            SimpleNamespace(internal=True, metadata=data.get("metadata")))
     if isinstance(data.get("reply_expected"), bool):
-        row_display["display_metadata"] = {"reply_expected": data["reply_expected"]}
+        row_display.setdefault("display_metadata", {})["reply_expected"] = data["reply_expected"]
+    if not row_display.get("display_metadata"):
+        row_display.pop("display_metadata", None)
     target_db.append_message(session_id=session_id, role="user", content=text,
                              timestamp=payload.get("ts", int(time.time())), **row_display)
     return True

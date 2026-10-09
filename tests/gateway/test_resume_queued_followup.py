@@ -640,7 +640,8 @@ def test_shutdown_spool_keeps_machinery_silence_contract(tmp_path, monkeypatch, 
         text="[INTERNAL NOTIFICATION] proc exited" if kind == "internal" else "typed by a person",
         source=source, user_id="u1", internal=kind == "internal",
         reply_expected=False if kind == "reply_not_expected" else None,
-        metadata={"notification_origin": "process_registry_synthetic"} if kind == "internal" else {},
+        metadata={"notification_origin": "process_registry_synthetic",
+                  "notification_category": "diagnostic"} if kind == "internal" else {},
     )
     assert flush_pending_to_file({key: event}, reason="shutdown") == 1
     assert recover_pending_shutdown_flush(runner) == 1
@@ -660,4 +661,6 @@ def test_shutdown_spool_keeps_machinery_silence_contract(tmp_path, monkeypatch, 
         display_kind = row.get("display_kind")
         assert display_kind == (INTERNAL_NOTIFICATION_DISPLAY_KIND if kind == "internal" else None)
         reply_expected = (row.get("display_metadata") or {}).get("reply_expected")
+        if kind == "internal":  # diagnostic muting reads the persisted category after a crash
+            assert row["display_metadata"] == {"notification_category": "diagnostic"}
         assert silence_allowed(display_kind, reply_expected) is expect_silent
