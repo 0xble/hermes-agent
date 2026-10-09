@@ -125,3 +125,50 @@ def test_chat_completions_inline_reasoning_promotion_is_unchanged(loop_agent):
 
     assert result["final_response"] == answer
     assert loop_agent.client.chat.completions.create.call_count == 1
+
+
+def test_responses_visible_reply_on_non_reply_turn_is_kept(loop_agent):
+    """Goal wakes and relays set reply_expected=False; real visible text is still the reply."""
+    result = _run(
+        loop_agent,
+        [_response(content="Progress: PR #390 merged.")],
+        display_metadata={"reply_expected": False},
+    )
+
+    assert result["final_response"] == "Progress: PR #390 merged."
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "codex_items", "expected"),
+    [
+        ("codex_responses", [], True),
+        ("chat_completions", [ENCRYPTED_ITEM], True),
+        ("chat_completions", [], False),
+        ("anthropic_messages", None, False),
+    ],
+)
+def test_responses_summary_detection_covers_api_mode_and_carrier(api_mode, codex_items, expected):
+    from agent.reasoning_summaries import is_responses_reasoning_summary
+
+    agent = SimpleNamespace(api_mode=api_mode)
+    message = SimpleNamespace(codex_reasoning_items=codex_items)
+    assert is_responses_reasoning_summary(agent, message) is expected
+
+
+def test_folded_human_message_reaches_the_running_agent():
+    """A typed message folded into a relay turn must lift the agent's silence permission too."""
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run_busy import GatewayBusySessionMixin
+
+    relay = MessageEvent(text="[relay from=session/child receipt=r]\nFYI", message_type=MessageType.TEXT)
+    relay.reply_expected = False
+    typed = MessageEvent(text="status?", message_type=MessageType.TEXT)
+    typed.reply_expected = True
+    agent = SimpleNamespace(_turn_reply_expected=False)
+    turn = SimpleNamespace(agent=agent, event=relay, ctx=SimpleNamespace(reply_expected=False))
+    runner = SimpleNamespace(_session_state=lambda _key: SimpleNamespace(turn=turn))
+
+    fold = GatewayBusySessionMixin._fold_into_running_turn
+    assert fold(runner, agent, "k", typed) is turn  # type: ignore[arg-type]
+    assert turn.ctx.reply_expected is True
+    assert agent._turn_reply_expected is True

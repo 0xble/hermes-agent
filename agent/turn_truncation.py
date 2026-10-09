@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.error_classifier import FailoverReason
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
+from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.repetition_guard import is_repetition_dominated
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
@@ -710,9 +711,7 @@ def handle_content_policy_refusal(
     _refusal_result = normalize_response_for_agent(agent, response)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
     # A Responses reasoning summary is not a refusal explanation; never surface it as one.
-    if not _refusal_text and not (
-        agent.api_mode == "codex_responses" or getattr(_refusal_result, "codex_reasoning_items", None)
-    ):
+    if not _refusal_text and not is_responses_reasoning_summary(agent, _refusal_result):
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),
     # not in a content block — without it a classifier halt reads as "(no text)" (#113689).

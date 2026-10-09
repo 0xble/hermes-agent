@@ -14,7 +14,23 @@ from typing import Any
 
 from agent.message_content import flatten_message_text
 
-__all__ = ["append_streamed_reasoning_detail", "separate_glued_reasoning_blocks"]
+__all__ = [
+    "append_streamed_reasoning_detail",
+    "is_responses_reasoning_summary",
+    "separate_glued_reasoning_blocks",
+]
+
+
+def is_responses_reasoning_summary(agent: Any, message: Any) -> bool:
+    """True when *message*'s reasoning is a Responses/Codex summary: provider metadata (a bolded
+    title plus summary paragraphs), never answer text, a draft preview or a refusal reason.
+
+    Chat-completions parsers that file the whole answer as reasoning (vLLM's Nemotron route)
+    carry no ``codex_reasoning_items`` and run outside ``codex_responses``, so they stay False.
+    """
+    return getattr(agent, "api_mode", None) == "codex_responses" or bool(
+        getattr(message, "codex_reasoning_items", None)
+    )
 
 
 def separate_glued_reasoning_blocks(previous: str, delta: Any) -> str:

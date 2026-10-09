@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
+from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import recover_empty_response
@@ -24,14 +25,6 @@ _REPETITION_STOPPED = repetition_copy(
     "; refusing to return a",
 )
 logger = logging.getLogger("agent.conversation_loop")
-
-
-def _is_responses_reasoning_summary(agent: Any, assistant_message: Any) -> bool:
-    """Responses/Codex reasoning summaries are provider metadata, never answer text."""
-    return (
-        getattr(agent, "api_mode", None) == "codex_responses"
-        or bool(getattr(assistant_message, "codex_reasoning_items", None))
-    )
 
 
 def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
@@ -137,13 +130,13 @@ def finish_text_response(
     # answer. The encrypted item and its summary are retained for replay, but must never enter
     # final_response or api_content. Chat-completions parsers (including vLLM's Nemotron route)
     # have no codex_reasoning_items carrier and keep the legacy promotion behavior.
-    _responses_reasoning_summary = _is_responses_reasoning_summary(agent, assistant_message)
-    if (
+    _responses_reasoning_summary = is_responses_reasoning_summary(agent, assistant_message)
+    _contentless_stop = (
         finish_reason == "stop"
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
-        and not _responses_reasoning_summary
-    ):
+    )
+    if _contentless_stop and not _responses_reasoning_summary:
         _promoted = agent._extract_reasoning(assistant_message) or None
         if _promoted:
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
@@ -158,7 +151,12 @@ def finish_text_response(
     # A gateway turn that explicitly does not expect a reply treats a contentless Responses
     # reasoning summary like the ordinary silence token. Keep the assistant row's visible content
     # empty and never copy the summary into api_content; the gateway suppresses [SILENT].
-    if _responses_reasoning_summary and getattr(agent, "_turn_reply_expected", None) is False:
+    # Only a contentless stop qualifies: visible text on a goal wake or relay turn is a real reply.
+    if (
+        _contentless_stop
+        and _responses_reasoning_summary
+        and getattr(agent, "_turn_reply_expected", None) is False
+    ):
         final_response = "[SILENT]"
     # Interactive gateway replies may contain a control marker on a final standalone line after
     # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook

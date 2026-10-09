@@ -712,6 +712,10 @@ class GatewayBusySessionMixin:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+            # The agent read reply_expected at turn start; a folded-in human message must reach
+            # its final-response recovery too, or a contentless stop resolves to silence.
+            if hasattr(running_agent, "_turn_reply_expected"):
+                running_agent._turn_reply_expected = turn.event.reply_expected
         return turn
 
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
