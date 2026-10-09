@@ -262,7 +262,7 @@ def test_detached_grandchild_is_killed_by_runner(tmp_path: Path) -> None:
         [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
          "--paths", str(probe_dir), "-j", "1", "--file-timeout", "30"],
         cwd=probe_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        encoding="utf-8", errors="replace", timeout=60,
+        encoding="utf-8", errors="replace", timeout=60, check=False,
     )
     pid = json.loads(handoff.read_text(encoding="utf-8-sig"))["pid"]
     deadline = time.monotonic() + 5.0

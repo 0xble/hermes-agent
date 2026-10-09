@@ -133,7 +133,7 @@ def test_pinned_fresh_clone_never_materializes_the_branch_tip(tmp_path):
 def test_pinned_fresh_clone_publishes_nothing_when_the_pin_is_refused(tmp_path):
     origin, _, off_branch = _pin_fixture(tmp_path)
     home = tmp_path / "home"
-    result, frame = _stage(origin, home, "-Commit", off_branch)
+    _, frame = _stage(origin, home, "-Commit", off_branch)
     assert frame["ok"] is False
     assert "is not on branch main" in frame["reason"]
     assert not (home / "hermes-agent").exists()
