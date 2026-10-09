@@ -6,6 +6,8 @@ The maintenance unit identity is ``auto-recovery-ladder-notice``.
 
 `auto-recovery-ladder-notice`.
 
+Fork-Patch-Backfill: 54ced3c54159aef6ec64691781641d174045b28d; auto-recovery-ladder-notice
+
 ## Required behavior
 
 The post-exhaustion provider-recovery ladder must keep the countdown notice out of
