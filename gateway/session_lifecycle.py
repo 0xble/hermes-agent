@@ -120,12 +120,13 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
+    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at, *, human: bool = True) -> None:
         """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
         neither leak an unowned token nor drop a live one. Lock held."""
         candidate = entry.to_dict()
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
+        candidate["active_turn_human"] = bool(human)
         touched = _now() if started_at is not None else None
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
@@ -134,10 +135,11 @@ class SessionLifecycleMixin:
         self._save_entry(session_key, entry_data=candidate, lock_held=True)
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
+        entry.active_turn_human = bool(human)
         if touched is not None:
             entry.updated_at = touched
 
-    def mark_turn_active(self, session_key: str) -> Optional[str]:
+    def mark_turn_active(self, session_key: str, *, human: bool = True) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
         unwind cannot clear a newer turn."""
@@ -148,7 +150,7 @@ class SessionLifecycleMixin:
                 return None
             # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
             # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc))
+            self._set_turn_marker_locked(session_key, entry, token, datetime.now(timezone.utc), human=human)
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
@@ -179,13 +181,33 @@ class SessionLifecycleMixin:
             )
             if not marker_is_stale and not entry.suspended:
                 if entry.resume_pending:
-                    # A drain-timeout marker is more specific; keep it.
-                    if entry.last_resume_marked_at is None:
+                    # A drain-timeout marker is more specific when it belongs to this same turn.
+                    # An auto-resumed successor owns a new active token, so it needs its own
+                    # append-only interruption marker while the predecessor's note remains intact.
+                    same_turn = (
+                        entry.resume_turn_id is None
+                        or entry.resume_turn_id == entry.active_turn_token
+                    )
+                    if same_turn:
+                        if entry.last_resume_marked_at is None:
+                            entry.last_resume_marked_at = now
+                    else:
+                        entry.resume_reason = "restart_interrupted"
+                        entry.resume_marker_token = uuid.uuid4().hex
+                        entry.resume_turn_id = entry.active_turn_token
+                        entry.resume_human = bool(entry.active_turn_human)
+                        entry.restart_note_reconcile_attempts = 0
                         entry.last_resume_marked_at = now
+                        promoted += 1
                 else:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_turn_id = entry.active_turn_token
+                    entry.resume_human = bool(entry.active_turn_human)
+                    # Notes are append-only: a newly discovered interruption gets a new marker
+                    # and never reuses, clears, or replaces a predecessor's visible note.
+                    entry.restart_note_reconcile_attempts = 0
                     entry.last_resume_marked_at = now  # freshness starts at discovery
                     promoted += 1
             entry.active_turn_token = None
@@ -205,16 +227,25 @@ class SessionLifecycleMixin:
             return True
         return self._update_all_entries_locked(_discard)
 
-    def mark_resume_pending(self, session_key: str, reason: str = "restart_timeout") -> bool:
+    def mark_resume_pending(
+        self, session_key: str, reason: str = "restart_timeout", *,
+        turn_id: Optional[str] = None, human: bool = True,
+    ) -> bool:
         """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). True if marked."""
+        unlike ``suspend_session``). A repeated shutdown pass for the same durable turn preserves
+        its marker token and note id so it cannot post a duplicate note."""
         def _apply(entry: SessionEntry):
             if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
                 return False
+            same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
             entry.resume_pending = True
             entry.resume_reason = reason
-            entry.resume_marker_token = uuid.uuid4().hex
-            entry.last_resume_marked_at = _now()
+            entry.resume_human = bool(human)
+            if not same_turn:
+                entry.resume_marker_token = uuid.uuid4().hex
+                entry.resume_turn_id = turn_id
+                # A successor owns a new note record; predecessor records remain durable and visible.
+                entry.last_resume_marked_at = _now()
         return self._update_entry(session_key, _apply)
 
     def get_resume_pending_marker(self, session_key: str) -> Optional[tuple]:
@@ -225,20 +256,254 @@ class SessionLifecycleMixin:
                 return None
             return (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
 
-    def clear_resume_pending(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
-        """Clear the resume-pending flag after a successful resumed turn; True if cleared."""
+    def _note_records_locked(self, entry: SessionEntry) -> list[dict]:
+        """Return append-only note records, migrating the pre-policy single-note fields."""
+        records = getattr(entry, "restart_notes", None)
+        if not isinstance(records, list):
+            records = []
+            entry.restart_notes = records
+        if not records and entry.restart_note_message_id and entry.restart_note_marker_token:
+            records.append({
+                "session_id": entry.session_id,
+                "marker_token": entry.restart_note_marker_token,
+                "turn_id": entry.restart_note_turn_id,
+                "marked_at": entry.restart_note_marked_at or entry.last_resume_marked_at,
+                "message_id": entry.restart_note_message_id,
+            })
+        return records
+
+    @staticmethod
+    def _note_tuple(entry: SessionEntry, record: dict) -> tuple:
+        return (
+            entry.session_id,
+            record.get("marker_token"),
+            record.get("marked_at"),
+            record.get("message_id"),
+        )
+
+    def _sync_legacy_note_fields(self, entry: SessionEntry) -> None:
+        """Keep old single-note attributes as a read-compatible view of the newest record."""
+        records = self._note_records_locked(entry)
+        if not records:
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            return
+        latest = records[-1]
+        entry.restart_note_message_id = latest.get("message_id")
+        entry.restart_note_marker_token = latest.get("marker_token")
+        entry.restart_note_turn_id = latest.get("turn_id")
+        entry.restart_note_marked_at = latest.get("marked_at")
+
+    def _find_note_record_locked(self, entry: SessionEntry, marker: Optional[tuple]) -> Optional[dict]:
+        records = self._note_records_locked(entry)
+        if marker is None:
+            return records[-1] if records else None
+        for record in reversed(records):
+            if self._note_tuple(entry, record)[:3] == tuple(marker[:3]):
+                return record
+        return None
+
+    def claim_restart_note(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        reclaim_pending: bool = False,
+    ) -> bool:
+        """Atomically reserve one note send for an interruption marker.
+
+        A missing record is claimed as ``pending:<token>``.  A pending claim may be
+        reclaimed only when ``reclaim_pending`` is true, because no send has started
+        yet.  ``sending:<token>`` and real message ids are terminal: the transport may
+        have seen the request, so neither may be reclaimed or sent again.
+        """
         def _apply(entry: SessionEntry):
             if not entry.resume_pending:
                 return False
-            if expected_marker is not None and expected_marker != (
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            marker = expected_marker or current
+            if marker != current:
+                return False
+            record = self._find_note_record_locked(entry, marker)
+            if record is not None:
+                message_id = str(record.get("message_id") or "")
+                if message_id.startswith("sending:"):
+                    logger.warning(
+                        "Not reclaiming interrupted-turn note for %s: send is already in progress or ambiguous",
+                        session_key,
+                    )
+                    return False
+                if message_id and not (reclaim_pending and message_id.startswith("pending:")):
+                    return False
+            records = self._note_records_locked(entry)
+            if record is None:
+                record = {
+                    "session_id": entry.session_id,
+                    "marker_token": marker[1],
+                    "turn_id": entry.resume_turn_id,
+                    "marked_at": marker[2],
+                    "message_id": f"pending:{entry.resume_marker_token or uuid.uuid4().hex}",
+                }
+                records.append(record)
+            else:
+                record["message_id"] = f"pending:{entry.resume_marker_token or uuid.uuid4().hex}"
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def mark_restart_note_sending(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Atomically mark a claimed note as having entered the ambiguous send phase."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
                 entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("pending:"):
+                return False
+            token = str(record["message_id"])[len("pending:"):]
+            record["message_id"] = f"sending:{token}"
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def release_restart_note_claim(self, session_key: str, *, expected_marker: Optional[tuple] = None) -> bool:
+        """Release only an unposted pending claim; visible note records are never removed."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("pending:"):
+                return False
+            self._note_records_locked(entry).remove(record)
+            # Clear the legacy compatibility view before syncing. Otherwise an empty record list
+            # re-migrates the just-released pending claim as a legacy record.
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def release_restart_note_after_failed_send(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Release a send marker after the adapter explicitly reports a failed send."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker or (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            )
+            record = self._find_note_record_locked(entry, marker)
+            if record is None or not str(record.get("message_id", "")).startswith("sending:"):
+                return False
+            self._note_records_locked(entry).remove(record)
+            entry.restart_note_message_id = None
+            entry.restart_note_marker_token = None
+            entry.restart_note_turn_id = None
+            entry.restart_note_marked_at = None
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def set_restart_note_message_id(
+        self, session_key: str, message_id: str, *, expected_marker: Optional[tuple] = None,
+    ) -> bool:
+        """Persist a visible note id for its marker, even if a successor is now current."""
+        def _apply(entry: SessionEntry):
+            marker = expected_marker
+            if marker is None and entry.resume_pending:
+                marker = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            record = self._find_note_record_locked(entry, marker)
+            records = self._note_records_locked(entry)
+            if record is None:
+                if marker is None or not marker[1]:
+                    return False
+                record = {
+                    "session_id": entry.session_id,
+                    "marker_token": marker[1],
+                    "turn_id": entry.resume_turn_id,
+                    "marked_at": marker[2],
+                    "message_id": None,
+                }
+                records.append(record)
+            existing = record.get("message_id")
+            if existing and not (
+                str(existing).startswith("pending:") or str(existing).startswith("sending:")
+            ):
+                return False
+            record["message_id"] = str(message_id)
+            self._sync_legacy_note_fields(entry)
+            return True
+        return self._update_entry(session_key, _apply)
+
+    def get_restart_note(self, session_key: str) -> Optional[tuple]:
+        """Return the current marker's note, or the newest durable note after it resumes."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return None
+            marker = (
+                entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at,
+            ) if entry.resume_pending else None
+            record = self._find_note_record_locked(entry, marker)
+            if record is None:
+                return None
+            return self._note_tuple(entry, record)
+
+    def claim_restart_note_reconciliation(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: S2 notes are append-only and are never reconciled."""
+        return False
+
+    def release_restart_note_reconciliation(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: S2 notes are append-only and are never reconciled."""
+        return False
+
+    def clear_restart_note(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: visible S2 notes are never deleted or cleared."""
+        return False
+
+    def record_restart_note_reconcile_failure(self, *args, **kwargs) -> bool:
+        """Compatibility no-op: a failed answer never removes the interruption note."""
+        return False
+
+    def clear_resume_pending(
+        self, session_key: str, *, expected_marker: Optional[tuple] = None,
+        expected_turn_id: Optional[str] = None,
+    ) -> bool:
+        """Clear the resume-pending flag after a successful resumed turn; True if cleared.
+
+        A shutdown drain may re-mark the same turn with a fresh marker after the turn
+        started. ``expected_turn_id`` permits that owner to clear its replacement
+        marker while still refusing a marker belonging to a later turn.
+        """
+        def _apply(entry: SessionEntry):
+            if not entry.resume_pending:
+                return False
+            current = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
+            if expected_marker is not None and expected_marker != current:
+                if expected_turn_id is None or entry.resume_turn_id != expected_turn_id:
+                    return False
+            # A normal turn may have no snapshot marker, but it still carries its own active-turn
+            # token. Never let it clear a newer interruption marker that names a different turn.
+            # Legacy markers with no owner token remain clearable: they predate the ownership CAS
+            # and are not eligible for an S2 note, so retaining them would strand a stale resume.
+            if (
+                expected_marker is None
+                and expected_turn_id is not None
+                and entry.resume_turn_id is not None
+                and entry.resume_turn_id != expected_turn_id
             ):
                 return False
             entry.resume_pending = False
             entry.resume_reason = None
             entry.resume_marker_token = None
+            entry.resume_turn_id = None
+            entry.resume_human = True
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)
+
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop routing entries idle (by ``updated_at``) for more than max_age_days; suspended

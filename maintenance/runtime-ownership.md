@@ -31,8 +31,10 @@ When `<profile>/scripts` is a real directory, it preserves the existing flat
 entrypoint paths. When it is a symlink to a source-controlled scripts checkout,
 the installer refuses before writing; generated files do not belong in that checkout.
 Versioned thin entrypoints and cron path changes must be prepared separately before cutover.
-They execute procedures in `<profile>/hermes-agent/scripts`, so native promotion
-updates their implementation too. Profile plugin source is maintained in the external
+They execute `<home>/current/scripts/*` with the active release's
+`<home>/current/.venv` interpreter, so native promotion updates their implementation too.
+They refuse homes without a `current` release symlink, including legacy homes that still
+have a checkout under `<profile>/hermes-agent`. Profile plugin source is maintained in the external
 `agents` repository. Review
 source revision, installed entry points, actual arguments, and receipts together.
 The personal wrapper uses the permanent source checkout's `.venv` for tests. Its

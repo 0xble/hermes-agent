@@ -30,7 +30,9 @@ class ProcessTerminationMixin:
             return False
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None, *, deadline: Optional[float] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
@@ -48,14 +50,24 @@ class ProcessTerminationMixin:
                 "PID was recycled onto an unrelated process.", pid)
             return
 
+        def _deadline_active() -> bool:
+            return deadline is None or time.monotonic() < deadline
+
         def _sigterm_quietly():
+            if not _deadline_active():
+                return
             with suppress(OSError, ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGTERM)
         if _IS_WINDOWS:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
-                    encoding='utf-8', errors='replace', timeout=10, creationflags=windows_hide_flags(),
+                    encoding='utf-8', errors='replace',
+                    timeout=remaining if remaining is not None else 10,
+                    creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL)
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 _sigterm_quietly()
@@ -79,6 +91,8 @@ class ProcessTerminationMixin:
         # Let self-managing parents (notably Chromium/Electron) shut down their
         # tree before touching children. Killing their zygotes first can turn a
         # graceful browser shutdown into a crash dump.
+        if not _deadline_active():
+            return
         with suppress(gone):
             parent.terminate()
 
@@ -87,12 +101,16 @@ class ProcessTerminationMixin:
         def _wait_for_exit(targets) -> None:
             if grace <= 0:
                 return
-            deadline = time.monotonic() + grace
-            while time.monotonic() < deadline and any(cls._proc_alive(p) for p in targets):
+            wait_deadline = time.monotonic() + grace
+            if deadline is not None:
+                wait_deadline = min(wait_deadline, deadline)
+            while time.monotonic() < wait_deadline and any(cls._proc_alive(p) for p in targets):
                 time.sleep(0.05)
 
         # Preserve descendants during the parent's configured shutdown window.
         _wait_for_exit([parent])
+        if not _deadline_active():
+            return
 
         # The snapshot is an anti-orphan guarantee: only descendants still alive
         # after the parent had its chance are asked to terminate themselves.
@@ -100,6 +118,8 @@ class ProcessTerminationMixin:
             proc for proc in descendants if cls._proc_alive(proc)
         ]
         for proc in remaining:
+            if not _deadline_active():
+                return
             with suppress(gone):
                 proc.terminate()
 
@@ -115,6 +135,8 @@ class ProcessTerminationMixin:
         if grace <= 0:
             return
         _wait_for_exit(targets)
+        if not _deadline_active():
+            return
         # A parent that ignored SIGTERM (the interactive ``bash -lic`` wrapper does) keeps
         # running its script through both grace windows and can spawn children the first
         # snapshot never saw. Re-snapshot while it is still alive: once it is SIGKILLed
@@ -124,6 +146,8 @@ class ProcessTerminationMixin:
                 known = {proc.pid for proc in targets}
                 targets.extend(p for p in parent.children(recursive=True) if p.pid not in known)
         for proc in targets:
+            if not _deadline_active():
+                return
             with suppress(gone):
                 if cls._proc_alive(proc):
                     proc.kill()  # SIGKILL on POSIX
@@ -146,19 +170,28 @@ class ProcessTerminationMixin:
     # escalated kill as incomplete.
     _KILL_SETTLE_SECONDS = 1.0
 
-    def _post_kill_survivors(self, session: "ProcessSession") -> List[int]:
+    def _post_kill_survivors(
+        self, session: "ProcessSession", deadline: Optional[float] = None,
+    ) -> List[int]:
         """Host PIDs still alive once the kill signals have had time to land (#115490).
 
         Fail-closed: anything unverifiable counts as a survivor, so a kill
         that leaves a live tree can never write a killed receipt. Sandbox
         (env) sessions have no host-visible tree and are unverifiable by
-        design — they return no survivors, preserving existing behavior."""
-        deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
+        design — they return no survivors, preserving existing behavior.
+
+        A bounded caller owns the full kill budget: the settle probe may use the
+        shorter of the normal settle window and that caller's deadline, but it
+        never extends the operation past the deadline.
+        """
+        settle_deadline = time.monotonic() + self._KILL_SETTLE_SECONDS
+        if deadline is not None:
+            settle_deadline = min(settle_deadline, deadline)
         while True:
             survivors = self._probe_survivors(session)
-            if not survivors or time.monotonic() >= deadline:
+            if not survivors or time.monotonic() >= settle_deadline:
                 return survivors
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, settle_deadline - time.monotonic())))
 
     def _probe_survivors(self, session: "ProcessSession") -> List[int]:
         survivors: List[int] = []

@@ -4622,7 +4622,9 @@ class BasePlatformAdapter(ABC):
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
+                resume_marker=getattr(event, "_restart_note_expected_marker", None),
+                resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -4769,6 +4771,41 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
+    async def _capture_restart_note_marker(self, event: MessageEvent, session_key: str) -> None:
+        """Capture the resume marker for lanes that synthesize their delivery event.
+
+        Older lightweight runners may not expose the marker API; those lanes retain their historical
+        fail-open reconciliation behavior.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        store = getattr(runner, "async_session_store", None)
+        reader = getattr(store, "get_resume_pending_marker", None)
+        if not callable(reader):
+            event._restart_note_marker_api_available = False
+            return
+        try:
+            marker = reader(session_key)
+            event._restart_note_expected_marker = (
+                await marker if inspect.isawaitable(marker) else marker
+            )
+            get_note = getattr(store, "get_restart_note", None)
+            if callable(get_note):
+                note_result = get_note(session_key)
+                event._restart_note_expected = (
+                    await note_result if inspect.isawaitable(note_result) else note_result
+                )
+            event._restart_note_marker_api_available = True
+        except Exception:
+            event._restart_note_marker_api_available = False
+
+    async def _reconcile_restart_note(self, event: MessageEvent, session_key: str) -> None:
+        """Compatibility entry point for callers that already confirmed delivery."""
+        await self._reconcile_restart_note_after_delivery(event, session_key)
+
+    async def _reconcile_restart_note_after_delivery(self, event: MessageEvent, session_key: str) -> None:
+        """Compatibility no-op: interrupted-turn notes are append-only and remain visible."""
+        return
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable,
@@ -4782,7 +4819,9 @@ class BasePlatformAdapter(ABC):
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 
-    async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
+    async def _notify_turn_error(
+        self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
+    ) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
         _thread_metadata = None
@@ -4798,7 +4837,10 @@ class BasePlatformAdapter(ABC):
                     logical_platform=event.source.platform, chat_id=event.source.chat_id, metadata=_thread_metadata)
             if content is None:
                 return _thread_metadata
-            await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            send_result = await self.send(chat_id=event.source.chat_id, content=content, metadata=_thread_metadata)
+            if (getattr(send_result, "success", False) and session_key and not event.is_command()
+                    and hasattr(self, "_reconcile_restart_note_after_delivery")):
+                await self._reconcile_restart_note_after_delivery(event, session_key)
         except Exception as notify_err:
             logger.error(
                 "[%s] Failed to send error notification to user: %s", self.name, notify_err, exc_info=True)
@@ -4806,19 +4848,29 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable, session_key: Optional[str] = None,
+                                   is_ephemeral_response: bool = False) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
         human_delay = self._get_human_delay()
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
+        attachment_delivered = False
+
+        def _record_attachment(result):
+            nonlocal attachment_delivered
+            record_delivery(result)
+            attachment_delivered = attachment_delivered or bool(getattr(result, "success", False))
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
-            await self._send_image_batch(event, images, metadata, human_delay, record_delivery)
+            await self._send_image_batch(event, images, metadata, human_delay, _record_attachment)
         await self._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+            human_delay=human_delay, metadata=metadata, record_delivery=_record_attachment)
+        if (attachment_delivered and session_key and not is_ephemeral_response and not event.is_command()
+                and hasattr(self, "_reconcile_restart_note_after_delivery")):
+            await self._reconcile_restart_note_after_delivery(event, session_key)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -5041,7 +5093,8 @@ class BasePlatformAdapter(ABC):
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                    record_delivery=_record_delivery, session_key=session_key,
+                    is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -5080,7 +5133,7 @@ class BasePlatformAdapter(ABC):
             bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
+            _thread_metadata = (await self._notify_turn_error(event, e, session_key)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise

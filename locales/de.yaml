@@ -842,6 +842,7 @@ gateway:
     cron_interrupted: "⚠️ Der geplante Job '{job}' wurde abgebrochen, weil Hermes gerade {action}; kein Ergebnis in diesem Lauf. Er läuft wieder nach Zeitplan, oder Sie starten ihn mit `hermes cron run {job}`, sobald Hermes zurück ist."
     notice_shutdown: "⚠️ Hermes wird heruntergefahren — Ihre aktuelle Aufgabe wird unterbrochen. Sobald Hermes wieder online ist, senden Sie eine beliebige Nachricht und ich versuche, dort weiterzumachen, wo wir aufgehört haben."
     notice_restart: "⚠️ Hermes wird neu gestartet — Ihre aktuelle Aufgabe wird unterbrochen. Senden Sie nach dem Neustart eine beliebige Nachricht und ich versuche, dort weiterzumachen, wo Sie aufgehört haben."
+    interrupted_turn: "↻ Unterbrochen, weil Hermes angehalten wurde. Ich fahre hier automatisch fort, sobald Hermes wieder da ist."
   startup:
     handoff_thread_title: "Hermes — {title}"
     restarted: "♻ Gateway erfolgreich neu gestartet. Ihre Sitzung wird fortgesetzt."

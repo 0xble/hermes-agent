@@ -1562,14 +1562,10 @@ class GatewayTurnMixin:
             time.time() - _msg_start_time, agent_result.get("api_calls", 0), len(response),
         )
 
-        # Successful turn: clear the consecutive-restart stuck-loop counter and resume_pending (set
-        # by drain-timeout shutdown) so later messages don't get the restart-interruption note.
+        # Successful turns clear the restart-failure escalation state before final delivery. The visible
+        # interruption note has its own durable record and remains available until delivery deletes it.
         if session_key and _should_clear_resume_pending_after_turn(agent_result):
             await self._clear_restart_failure_count(session_key)
-            try:
-                await self.async_session_store.clear_resume_pending(session_key)
-            except Exception as _e:
-                logger.debug("clear_resume_pending failed for %s: %s", session_key, _e)
 
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
@@ -1963,14 +1959,28 @@ class GatewayTurnMixin:
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
+            media_delivered = False
             if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
+                media_delivered = bool(await self._deliver_media_from_response(response, event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
+            # Reconcile the restart note only on a confirmed answer: streamed visible text, or a
+            # confirmed upload for an attachment-only answer. A failed upload keeps the note so a
+            # later delivery can still reconcile it (the queued lane reconciles its own uploads).
+            if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
+                streamed_text = False
+                if response:
+                    try:
+                        from gateway.run import _strip_response_attachments_for_direct_send
+                        streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
+                    except Exception:
+                        streamed_text = True  # fail open to the historical unconditional reconcile
+                if streamed_text or media_delivered:
+                    await adapter._reconcile_restart_note_after_delivery(event, session_key)
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
@@ -2191,6 +2201,28 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        # Snapshot the interruption marker before preparation/delivery can yield to a successor turn.
+        _resume_pending_marker = None
+        _resume_marker_reader = None
+        try:
+            # Lightweight runners (tests, plugins) may have no session store at all; the
+            # ``async_session_store`` property itself raises AttributeError then.
+            _resume_marker_reader = getattr(self.async_session_store, "get_resume_pending_marker", None)
+        except AttributeError:
+            pass
+        _resume_marker_reader_available = callable(_resume_marker_reader)
+        if _resume_marker_reader_available:
+            try:
+                _resume_pending_marker = _resume_marker_reader(session_key)
+                if inspect.isawaitable(_resume_pending_marker):
+                    _resume_pending_marker = await _resume_pending_marker
+            except Exception as _e:
+                # Lightweight runners and plugins may expose only the older store surface. Keep
+                # their historical unconditional clear rather than making marker lookup required.
+                _resume_marker_reader_available = False
+                logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
+        event._restart_note_marker_api_available = _resume_marker_reader_available
+        event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2313,6 +2345,18 @@ class GatewayTurnMixin:
             )
             from gateway.run import _should_clear_resume_pending_after_turn
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
+            if event._agent_turn_succeeded:
+                try:
+                    if _resume_marker_reader_available:
+                        _clear_kwargs = {"expected_marker": _resume_pending_marker}
+                        _own_turn_token = getattr(event, "_gateway_active_turn_token", None)
+                        if _own_turn_token is not None:
+                            _clear_kwargs["expected_turn_id"] = _own_turn_token
+                        await self.async_session_store.clear_resume_pending(session_key, **_clear_kwargs)
+                    else:
+                        await self.async_session_store.clear_resume_pending(session_key)
+                except Exception as _e:
+                    logger.debug("clear_resume_pending after delivery failed for %s: %s", session_key, _e)
             return delivered_response
 
         except Exception as e:

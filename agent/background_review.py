@@ -501,7 +501,9 @@ _SKILL_REVIEW_PROMPT = (
     "'how to do this class of task for this user'. When they complain about how you handled a "
     "task, the skill that governs that task needs to carry the lesson.\n\n"
     "If you notice two existing skills that overlap, note it in your reply — the background "
-    "curator handles consolidation at scale. Never delete a skill here.\n\n"
+    "curator handles consolidation at scale. Never delete a skill here.\n"
+    "Skills in skills.external_dirs are externally owned and read-only installs. Do not change "
+    "them with skill_manage; change them at their source in the owning repository.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
     "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
     "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
@@ -554,7 +556,9 @@ _COMBINED_REVIEW_PROMPT = (
     "owns — never both. Duplicating it is how a memory file ends up restating SKILL.md until both "
     "hit their size limits.\n\n"
     "If you notice overlapping existing skills, mention it — the background curator handles "
-    "consolidation. Never delete a skill here.\n\n"
+    "consolidation. Never delete a skill here.\n"
+    "Skills in skills.external_dirs are externally owned and read-only installs. Do not change "
+    "them with skill_manage; change them at their source in the owning repository.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
     "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
     "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."

@@ -19,7 +19,7 @@ source_repo="$HOME/Repos/hermes-agent"
 worktree="$source_repo/.worktrees/fork-sync"
 export HERMES_PYTHON="$source_repo/.venv/bin/python"
 export PATH="$source_repo/.venv/bin:$PATH"
-runtime_python="$profile_home/hermes-agent/venv/bin/python"
+runtime_python="$profile_home/current/.venv/bin/python"
 common_dir="$(git -C "$source_repo" rev-parse --path-format=absolute --git-common-dir)"
 receipt_dir="$profile_home/maintenance/fork-sync"
 publish=(--publish)

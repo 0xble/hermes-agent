@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import shlex
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import Context
 from pathlib import Path
@@ -28,10 +30,34 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from agent.async_utils import consume_detached_task_result
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Non-restart wait for the post-interrupt cron mark. The marker is normally a local jobs-store write;
+# this short, non-zero bound (never above the restart-path bound) collects its result for the
+# interrupted-cron notice without letting a held fire fence stall ordinary teardown.
+_NONRESTART_CRON_MARK_BOUND_S = 0.5
+
+async def _cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
+    """Cancel ``task`` and wait only a short grace before detaching it.
+
+    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
+    without a bound wedges restart recovery forever; a task that misses the grace is detached
+    and its result is consumed when it eventually finishes.
+    """
+    task.cancel()
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=grace)
+    except asyncio.CancelledError:
+        task.add_done_callback(consume_detached_task_result)
+        raise
+    if task not in done:
+        task.add_done_callback(consume_detached_task_result)
+        return False
+    return True
 
 
 def _exit_with_failure_verdict(runner) -> bool:
@@ -168,6 +194,14 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
+def _persist_shutdown_pending_messages(runner):
+    """Invoke the shutdown queue spool even on lightweight GatewayRunner test doubles."""
+    method = getattr(runner, "_persist_shutdown_pending_messages", None)
+    if callable(method):
+        return method()
+    return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
+
+
 class GatewayShutdownMixin:
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
@@ -226,7 +260,8 @@ class GatewayShutdownMixin:
         a minimal test double for this class).
         """
         try:
-            return self._running_cron_job_count()
+            from cron.scheduler import get_shutdown_drain_job_ids
+            return len(get_shutdown_drain_job_ids())
         except Exception:
             return 0
 
@@ -903,7 +938,14 @@ class GatewayShutdownMixin:
             if _agent is _AGENT_PENDING_SENTINEL:
                 continue
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
-                await self.async_session_store.mark_resume_pending(_sk, reason)
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_sk)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
+                _entry = getattr(self.session_store, "_entries", {}).get(_sk)
+                _turn_id = getattr(_entry, "active_turn_token", None)
+                await self.async_session_store.mark_resume_pending(
+                    _sk, reason, turn_id=_turn_id, human=_human,
+                )
                 marked.append(_sk)
         return marked
 
@@ -923,6 +965,284 @@ class GatewayShutdownMixin:
             "Shutdown notification suppressed for %s: %s has gateway_restart_notification=false", what, platform.value,
         )
         return False
+
+    async def _send_interrupted_turn_notes(
+        self, session_keys, *, reclaim_pending: bool = False,
+        cancel_on_timeout: bool = False, timeout: float = 2.0,
+        shutdown_fallback_keys=None,
+    ) -> int:
+        """Ensure one visible note for each interrupted human turn.
+
+        This deliberately bypasses ``gateway_restart_notification``: that flag controls broadcast
+        noise, not the per-turn recovery contract. The session row is the durable deduplication latch.
+        Sends run concurrently behind one hard deadline so a slow transport cannot delay agent
+        interruption; unfinished claims remain reclaimable by startup recovery.
+        """
+        async def _send_one(session_key) -> int:
+            marker = None
+            send_started = False
+            claim_kept = False
+            release_claim = None
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
+            entry_snapshot = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+            claim_token = (
+                getattr(entry_snapshot, "resume_marker_token", None),
+                getattr(entry_snapshot, "last_resume_marked_at", None),
+            )
+            existing_claim = note_claims.get(session_key)
+            if existing_claim in (claim_token, ("fallback",)):
+                return 0
+            # This in-memory claim fences the late note task against the ordinary shutdown fallback.
+            # It is taken before the first await, so a fallback that wins the race prevents a late
+            # transport completion from posting a second visible notice.
+            note_claims[session_key] = claim_token
+            try:
+                entry = self.session_store._entries.get(session_key)
+                if entry is None or not getattr(entry, "resume_pending", False) or not getattr(entry, "resume_human", True):
+                    return 0
+                marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                async def release_claim():
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                note = await self.async_session_store.get_restart_note(session_key)
+                # A visible note is terminal. A pending claim is reclaimable only during startup
+                # recovery; a sending marker is ambiguous and must never be retried or converted
+                # into an ordinary notice.
+                if note and note[3]:
+                    note_id = str(note[3])
+                    if not (reclaim_pending and note_id.startswith("pending:")):
+                        if note_id.startswith("sending:"):
+                            logger.warning(
+                                "Not retrying interrupted-turn note for %s: durable send is ambiguous",
+                                session_key,
+                            )
+                            return 0
+                        getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                        return 0
+                target = await self._shutdown_notification_target(session_key)
+                if note_claims.get(session_key) == ("fallback",):
+                    return 0
+                if target is None:
+                    note_failed.add(session_key)
+                    return 0
+                source, platform_str, chat_id, thread_id, profile = target
+                platform = Platform(platform_str)
+                adapter = self._delivery_adapter_for(source) if source is not None else None
+                if adapter is None:
+                    adapter = self._authorization_adapter(platform, profile)
+                if adapter is None:
+                    note_failed.add(session_key)
+                    return 0
+                if not await self.async_session_store.claim_restart_note(
+                    session_key, expected_marker=marker, reclaim_pending=reclaim_pending,
+                ):
+                    return 0
+                if note_claims.get(session_key) == ("fallback",):
+                    await self.async_session_store.release_restart_note_claim(
+                        session_key, expected_marker=marker,
+                    )
+                    return 0
+                metadata = self._thread_metadata_for_target(
+                    platform, chat_id, thread_id, chat_type=getattr(source, "chat_type", None),
+                    reply_to_message_id=getattr(source, "message_id", None), adapter=adapter,
+                )
+                from gateway.run import _async_profile_runtime_scope, resolve_restart_resume_policy
+                profile_home = None
+                if source is not None:
+                    resolve_home = getattr(self, "_resolve_profile_home_for_source", None)
+                    if callable(resolve_home):
+                        with suppress(Exception):
+                            profile_home = resolve_home(source)
+                scope = (_async_profile_runtime_scope(profile_home) if profile_home else nullcontext())
+                async with scope:
+                    policy = resolve_restart_resume_policy(self.config, adapter)
+                    text = t(
+                        "gateway.shutdown.interrupted_turn" if policy == "continue"
+                        else ("gateway.shutdown.notice_restart" if (reclaim_pending
+                              or getattr(self, "_restart_requested", False))
+                              else "gateway.shutdown.notice_shutdown")
+                    )
+                    send_started = await self.async_session_store.mark_restart_note_sending(
+                        session_key, expected_marker=marker,
+                    )
+                    if not send_started:
+                        return 0
+                    if note_claims.get(session_key) == ("fallback",):
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
+                        return 0
+                    result = await adapter.send(
+                        chat_id, text,
+                        metadata={**(metadata or {}), "_interim_send": True},
+                    )
+
+                if not result or not getattr(result, "success", False):
+                    note_failed.add(session_key)
+                    if send_started:
+                        await self.async_session_store.release_restart_note_after_failed_send(
+                            session_key, expected_marker=marker,
+                        )
+                    elif callable(release_claim):
+                        await release_claim()
+                    return 0
+                note_id = getattr(result, "message_id", None) or "sent:no-id"
+                if await self.async_session_store.set_restart_note_message_id(
+                    session_key, str(note_id), expected_marker=marker,
+                ):
+                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                    claim_kept = True
+                    return 1
+                # The transport accepted the note but the local record could not be updated. Keep
+                # the claim and never retry: an ambiguous send is safer as one possible note than a
+                # duplicate visible note.
+                claim_kept = True
+                return 0
+            except asyncio.CancelledError:
+                if send_started:
+                    # The transport may have accepted the request; keep the terminal sending marker.
+                    claim_kept = True
+                else:
+                    # Cancellation before the transport boundary leaves a reclaimable pending claim.
+                    if callable(release_claim):
+                        try:
+                            await asyncio.wait_for(asyncio.shield(release_claim()), timeout=0.5)
+                        except Exception:
+                            pass
+                raise
+            except Exception:
+                if send_started:
+                    # An adapter exception is ambiguous: the request may have reached the transport.
+                    claim_kept = True
+                    logger.warning(
+                        "Interrupted-turn note send became ambiguous for %s; preserving terminal sending claim",
+                        session_key,
+                        exc_info=True,
+                    )
+                else:
+                    note_failed.add(session_key)
+                    if callable(release_claim):
+                        try:
+                            await release_claim()
+                        except Exception:
+                            pass
+                    logger.warning("Interrupted-turn note failed for %s", session_key, exc_info=True)
+                return 0
+            finally:
+                if not claim_kept:
+                    note_claims.pop(session_key, None)
+
+        unique_keys = list(dict.fromkeys(session_keys or ()))
+        if not unique_keys:
+            return 0
+
+        async def _record_shutdown_misses(candidate_keys):
+            """Fence and record shutdown lanes whose note never entered ``sending:``.
+
+            The batch may be detached after cancellation, so task-local ``CancelledError`` handling
+            is not sufficient evidence. Read the durable claim state after the batch deadline instead:
+            a real id is delivered, ``sending:`` is ambiguous and terminal, and anything else is a
+            pre-send miss eligible for the one ordinary shutdown fallback.
+            """
+            note_claims = getattr(self, "_s2_note_claimed_keys", None)
+            if note_claims is None:
+                note_claims = self._s2_note_claimed_keys = {}
+            note_failed = getattr(self, "_s2_note_failed_keys", None)
+            if note_failed is None:
+                note_failed = self._s2_note_failed_keys = set()
+            delivered = getattr(self, "_s2_note_delivered_keys", None)
+            if delivered is None:
+                delivered = self._s2_note_delivered_keys = set()
+            for session_key in dict.fromkeys(candidate_keys or ()):
+                if session_key in delivered or note_claims.get(session_key) == ("fallback",):
+                    continue
+                try:
+                    note = await self.async_session_store.get_restart_note(session_key)
+                except Exception:
+                    note = None
+                note_id = str(note[3]) if note and note[3] else ""
+                if note_id.startswith("sending:"):
+                    continue
+                if note_id and not note_id.startswith("pending:"):
+                    delivered.add(session_key)
+                    continue
+                note_claims[session_key] = ("fallback",)
+                note_failed.add(session_key)
+                if note_id.startswith("pending:"):
+                    with suppress(Exception):
+                        marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                        await self.async_session_store.release_restart_note_claim(
+                            session_key, expected_marker=marker,
+                        )
+
+        async def _send_batch():
+            return await asyncio.gather(*(_send_one(key) for key in unique_keys), return_exceptions=True)
+
+        batch_task = asyncio.create_task(_send_batch())
+        if cancel_on_timeout:
+            # Startup/reconnect resume is ordered after this call whenever the transport honours
+            # cancellation within the short grace. A transport that ignores cancellation is detached
+            # so recovery never hangs; its note may then arrive after the resumed answer.
+            try:
+                wait_timeout = None if timeout <= 0 else timeout
+                done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
+                completed = batch_task in done
+                if not completed:
+                    cancelled_in_grace = await _cancel_task_with_grace(batch_task)
+                    if cancelled_in_grace:
+                        logger.warning(
+                            "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
+                            timeout,
+                        )
+                    else:
+                        logger.warning(
+                            "Interrupted-turn note task detached for sessions %s after %.1fs timeout; "
+                            "note may arrive after the resumed answer",
+                            unique_keys,
+                            timeout,
+                        )
+                    if shutdown_fallback_keys is not None:
+                        await _record_shutdown_misses(shutdown_fallback_keys)
+                    return 0
+            except asyncio.CancelledError:
+                await _cancel_task_with_grace(batch_task)
+                raise
+        else:
+            # A transport may accept a send just before the local 2s deadline while the durable claim
+            # remains pending; startup recovery can then post one duplicate note. This late-note window
+            # applies whether the configured waiter detaches or the fallback path cancels the batch.
+            wait_or_detach = getattr(self, "_wait_or_detach", None)
+            if callable(wait_or_detach):
+                completed = await wait_or_detach(batch_task, timeout)
+            else:
+                done, _pending = await asyncio.wait({batch_task}, timeout=timeout)
+                completed = batch_task in done
+                if not completed:
+                    batch_task.cancel()
+
+                    def _consume(task):
+                        with suppress(asyncio.CancelledError, Exception):
+                            task.exception()
+
+                    batch_task.add_done_callback(_consume)
+            if not completed:
+                logger.warning("Interrupted-turn notes exceeded %.1fs total; continuing agent interruption", timeout)
+                if shutdown_fallback_keys is not None:
+                    await _record_shutdown_misses(shutdown_fallback_keys)
+                return 0
+        results = batch_task.result()
+        if shutdown_fallback_keys is not None:
+            await _record_shutdown_misses(shutdown_fallback_keys)
+        sent = sum(result for result in results if isinstance(result, int))
+        if sent:
+            logger.info("Shutdown: delivered %d interrupted human-turn note(s)", sent)
+        return sent
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died; returns notices sent.
@@ -1042,10 +1362,13 @@ class GatewayShutdownMixin:
             return False
         return True
 
-    async def _notify_active_sessions_of_shutdown(self) -> None:
+    async def _notify_active_sessions_of_shutdown(
+        self, session_keys=None, *, include_home_channels: bool = True,
+    ) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
+        A targeted call is used after S2 note delivery to notify only lanes whose note was not sent.
         """
         from gateway.update_notifications import notice, read_pending
         update_record = read_pending(self._update_paths().pending.parent) if self._restart_requested else None
@@ -1095,7 +1418,38 @@ class GatewayShutdownMixin:
                     str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id"),
                     profile=update_profile,
                 ))
-        for session_key in self._snapshot_running_agents():
+        for session_key in (self._snapshot_running_agents() if session_keys is None else list(session_keys)):
+            if session_key in getattr(self, "_s2_note_session_keys", set()):
+                # Reserve the S2 note's destination in the same dedup set used by the
+                # home-channel pass. The note is sent after a timed-out drain; without this
+                # reservation an active session that is also the home channel receives the
+                # ordinary broadcast before the S2 note. A failed S2 send clears this fence by
+                # replacing _s2_note_session_keys with the delivered set before the fallback pass.
+                target = await self._shutdown_notification_target(session_key)
+                if target is None:
+                    continue
+                if len(target) == 4:
+                    source, platform_str, chat_id, thread_id = target
+                    profile = None
+                else:
+                    source, platform_str, chat_id, thread_id, profile = target
+                try:
+                    platform = Platform(platform_str)
+                    adapter = self._delivery_adapter_for(source) if source is not None else None
+                    if adapter is None:
+                        adapter = self._authorization_adapter(platform, profile)
+                    if adapter is None:
+                        continue
+                    _, delivery_profile = self._owning_profile(adapter, platform)
+                    notified.add(_delivery_target_key(
+                        platform_str, chat_id, thread_id, profile=delivery_profile,
+                    ))
+                    if (platform == Platform.TELEGRAM and thread_id is not None
+                            and getattr(source, "chat_type", None) in {"dm", "private"}):
+                        private_topic_parents.add((id(adapter), str(chat_id)))
+                except Exception as e:
+                    logger.debug("Failed to reserve S2 shutdown target for %s: %s", session_key, e)
+                continue
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
@@ -1149,6 +1503,8 @@ class GatewayShutdownMixin:
                 presented = await present_notification(_send_active, platform=platform, diagnostic=restart_key != dedup_key)
             if not presented:
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
+        if not include_home_channels:
+            return
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
@@ -1243,15 +1599,60 @@ class GatewayShutdownMixin:
                 from gateway.shutdown_flush import flush_agent_history_to_file
                 flush_agent_history_to_file(getattr(agent, "session_id", None), _session_messages)
 
-    async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for session_key, agent in active_agents.items():
+    def _flush_shutdown_agent_transcripts(self, active_agents: Mapping[str, Any]) -> None:
+        """Flush every interrupted transcript before running any bounded cleanup hook."""
+        for agent in active_agents.values():
             self._flush_agent_transcript_at_shutdown(agent)
+
+    async def _finalize_shutdown_agents(
+        self, active_agents: Dict[str, Any], *, interrupted: bool = False,
+        stop_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
+        if stop_event is None:
+            stop_event = getattr(self, "_shutdown_finalize_stop_event", None)
+        # The transcript pass must precede every hook and deadline check. The outer
+        # restart path repeats this pass before creating its cancellable task; this
+        # copy keeps direct callers safe and makes the ordering explicit here.
+        if interrupted:
+            self._flush_shutdown_agent_transcripts(active_agents)
+        for session_key, agent in active_agents.items():
+            # A timed-out restart may detach this phase. Stop before starting another
+            # agent's hooks so the following DB/adaptor teardown has exclusive ownership.
+            if stop_event is not None and stop_event.is_set():
+                return
+            if not interrupted:
+                self._flush_agent_transcript_at_shutdown(agent)
+            if interrupted:
+                logger.warning(
+                    "Skipping blocking shutdown cleanup for interrupted agent %s; "
+                    "running bounded memory flush/finalize hooks only. Transcript persistence "
+                    "was attempted before bounded cleanup; provider on_session_end/close work "
+                    "may still be lost",
+                    session_key,
+                )
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                await self._finalize_session_off_loop(
+                    session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
+                    session_key=session_key, timeout=remaining,
+                )
+                if stop_event is not None and stop_event.is_set():
+                    return
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                await self._flush_agent_memory_off_loop(agent, session_key=session_key, timeout=remaining)
+                continue
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
             # (e.g. a full-session trace export) — same hang class as the memory provider below.
             await self._finalize_session_off_loop(
                 session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                 session_key=session_key,
             )
+            if stop_event is not None and stop_event.is_set():
+                return
             # Off-loop + bounded: a wedged memory provider here used to hang the whole shutdown so
             # SIGTERM never completed.
             await self._cleanup_agent_resources_off_loop(agent, context="shutdown finalize", session_key=session_key)
@@ -1299,8 +1700,46 @@ class GatewayShutdownMixin:
             tasks = self._deferred_agent_cleanup_tasks = set()
         self._track_task_in(tasks, asyncio.create_task(_cleanup_when_done()))
 
+    async def _flush_agent_memory_off_loop(
+        self, agent: Any, *, session_key: Optional[str] = None, timeout: Optional[float] = None,
+    ) -> None:
+        """Flush queued memory writes without running blocking resource teardown.
+
+        Timed-out restarts intentionally skip ``shutdown_memory_provider``/``close``. The
+        memory manager's barrier is still worth attempting because it is the durable handoff
+        for writes already accepted by the turn; anything still queued after this bound may be
+        recovered only from the interrupted transcript (or lost if the provider has no durable
+        queue).
+        """
+        manager = getattr(agent, "_memory_manager", None)
+        flush_pending = getattr(manager, "flush_pending", None)
+        if not callable(flush_pending):
+            return
+        budget = 10.0 if timeout is None else max(0.0, timeout)
+        if budget <= 0:
+            return
+
+        def _flush() -> None:
+            flush_pending(timeout=budget)
+
+        try:
+            await asyncio.wait_for(
+                self._run_housekeeping_in_executor(
+                    self._run_release_in_profile_scope, _flush, (), session_key,
+                ),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Interrupted-agent memory flush exceeded %.2fs; queued provider writes may be lost",
+                budget,
+            )
+        except Exception as flush_exc:
+            logger.debug("Interrupted-agent memory flush failed: %s", flush_exc)
+
     async def _finalize_session_off_loop(
-        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None, **extra: Any,
+        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None,
+        timeout: Optional[float] = None, **extra: Any,
     ) -> None:
         """Run hermes_cli.lifecycle.finalize_session off-loop, bounded; on timeout the worker is left alone.
         ``session_key`` lets an unscoped caller (shutdown) enter the owning profile's scope: plugin
@@ -1314,12 +1753,13 @@ class GatewayShutdownMixin:
         try:
             await asyncio.wait_for(
                 self._run_housekeeping_in_executor(self._run_release_in_profile_scope, _call, (), session_key),
-                timeout=self._FINALIZE_TIMEOUT_S,
+                timeout=self._FINALIZE_TIMEOUT_S if timeout is None else max(0.0, timeout),
             )
         except asyncio.TimeoutError:
             logger.warning(
                 "Session finalize hooks (%s, reason=%s) exceeded %ss; proceeding without blocking the event loop "
-                "(the worker thread is left to finish on its own).", session_id, reason, self._FINALIZE_TIMEOUT_S,
+                "(the worker thread is left to finish on its own).", session_id, reason,
+                self._FINALIZE_TIMEOUT_S if timeout is None else timeout,
             )
         except Exception as finalize_exc:
             logger.debug("Session finalize hooks (%s, reason=%s) failed: %s", session_id, reason, finalize_exc)
@@ -1876,24 +2316,37 @@ class GatewayShutdownMixin:
     # stop() phases. Invoked as ``GatewayRunner._stop_<phase>(self, ctx)`` so shutdown-path tests
     # can drive them from bare doubles that are not GatewayRunner instances.
     @staticmethod
-    def _quiet_step(label: str, fn: Callable[[], Any]) -> Any:
-        """Run one best-effort teardown step; a failure is debug-logged as ``"<label>: <exc>"``."""
+    def _quiet_step(label: str, fn: Callable[[], Any], *, level: int = logging.DEBUG) -> Any:
+        """Run one best-effort teardown step and log failures at the requested level."""
         try:
             return fn()
         except Exception as _e:
-            logger.debug("%s: %s", label, _e)
+            logger.log(level, "%s: %s", label, _e)
             return None
 
     @staticmethod
-    def _stop_kill_tool_subprocesses(phase: str) -> list:
+    def _stop_kill_tool_subprocesses(
+        phase: str, *, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
+    ) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
         Called twice: after a drain timeout (reclaim children before systemd SIGKILLs) and as a final
-        catch-all. Best-effort; one failing subsystem cannot block the rest.
+        catch-all. Best-effort; one failing subsystem cannot block the rest. A restart deadline is
+        checked between targets and before every later cleanup step so a worker detached at the bound
+        cannot continue mutating the process registry or writing checkpoints.
         """
 
+        def _expired() -> bool:
+            return (stop_event is not None and stop_event.is_set()) or (
+                deadline is not None and time.monotonic() >= deadline
+            )
+
         def _step(label: str, fn: Callable[[], Any]) -> Any:
-            return GatewayShutdownMixin._quiet_step(f"{label} ({phase}) error", fn)
+            if _expired():
+                return None
+            return GatewayShutdownMixin._quiet_step(
+                f"{label} ({phase}) error", fn, level=logging.WARNING,
+            )
 
         def _count_step(fmt: str, fn: Callable[[], int]) -> None:
             n = fn()
@@ -1904,16 +2357,18 @@ class GatewayShutdownMixin:
             from tools.process_registry import process_registry
             # Host shutdown: kill even persist_on_release jobs or they become
             # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
+            kill_kwargs: dict[str, Any] = {"source": "gateway_shutdown"}
+            if deadline is not None:
+                kill_kwargs["deadline"] = deadline
+            if stop_event is not None:
+                kill_kwargs["stop_event"] = stop_event
             _count_step(
                 "Shutdown (%s): killed %d tool subprocess(es)",
-                lambda: process_registry.kill_all(source="gateway_shutdown"))
+                lambda: process_registry.kill_all(**kill_kwargs))
 
         def _mark_cron_interrupted() -> list:
             # kill_all() is global: a cron job mid-dispatch lost its tool subprocess and its agent thread may
             # still emit a plausible response from truncated output — mark it interrupted, never success.
-            # Any cron job still dispatched at this instant just had its tool subprocess killed above
-            # (kill_all() has no per-job-ID targeting — it's a global sweep). No-op when no cron job is in
-            # flight. See #60432.
             from cron.scheduler import mark_running_jobs_interrupted
             _interrupted = mark_running_jobs_interrupted(
                 f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished."
@@ -1932,9 +2387,24 @@ class GatewayShutdownMixin:
                 lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
             )
 
+        def _kill_foreground_processes() -> None:
+            from tools.environments.base import kill_live_foreground_processes
+            # Only the bounded sweep (deadline/stop_event) skips TERM-wait-KILL; an ordinary graceful
+            # stop keeps the SIGTERM grace so foreground command trees can unwind cleanly.
+            if deadline is not None or stop_event is not None:
+                kill_live_foreground_processes(now=True)
+            else:
+                kill_live_foreground_processes()
+
+        # On the bounded path this signal-only sweep must run before the potentially blocked
+        # registry sweep; unlike the shared deadline it is safe and bounded after expiry.
+        GatewayShutdownMixin._quiet_step(
+            "kill_live_foreground_processes", _kill_foreground_processes, level=logging.WARNING,
+        )
         _step("process_registry.kill_all", _kill_processes)
         _marked_cron_jobs = _step("mark_running_jobs_interrupted", _mark_cron_interrupted) or []
         _step("async interrupt_all", _interrupt_delegations)
+
         def _cleanup_environments() -> None:
             from tools.terminal_tool_lifecycle import cleanup_all_environments
             cleanup_all_environments()
@@ -1948,22 +2418,34 @@ class GatewayShutdownMixin:
         return _marked_cron_jobs
 
     @staticmethod
-    async def _stop_kill_tool_subprocesses_off_loop(phase: str) -> list:
-        """Run _stop_kill_tool_subprocesses in a worker thread; returns cron job IDs marked interrupted.
+    async def _stop_kill_tool_subprocesses_off_loop(
+        phase: str, *, timeout: Optional[float] = None,
+    ) -> list:
+        """Run the shutdown kill sweep off-loop with a cooperative deadline.
 
-        ``kill_all`` fans out into per-target ``kill_process`` calls that do blocking work
-        (registry checkpoint disk I/O, ``subprocess.run`` for systemd scopes, sandbox exec),
-        so running the sweep inline would monopolize the gateway event loop (#116327).
-        Offloaded with ``asyncio.to_thread`` — the loop's default executor, deliberately NOT
-        the gateway-owned ``self._executor``, which ``_stop_quiesce_and_close_session_dbs``
-        drains right after this phase. Phase order is preserved: callers await this before
-        cron notices / adapter teardown. If the surrounding stop task is cancelled while the
-        worker runs, the thread is left to finish on its own; the thread-based shutdown
-        watchdog remains the hard backstop.
+        The worker receives the same deadline used by the awaiter. If one target blocks past it,
+        cancellation only detaches the thread after its registry hooks have stopped issuing kills and
+        checkpoint writes; it is therefore safe for the successor gateway to proceed.
         """
-        return await asyncio.to_thread(
-            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
-        )
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        stop_event = threading.Event() if timeout is not None else None
+        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline}
+        if stop_event is not None:
+            kill_kwargs["stop_event"] = stop_event
+        task = asyncio.create_task(asyncio.to_thread(
+            GatewayShutdownMixin._stop_kill_tool_subprocesses,
+            **kill_kwargs,
+        ))
+        if timeout is None:
+            return await task
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            return await task
+        assert stop_event is not None
+        stop_event.set()
+        task.cancel()
+        logger.warning("Shutdown phase: %s exceeded %.1fs; detaching cooperative cleanup", phase, timeout)
+        return []
 
     async def _stop_begin_teardown(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
@@ -1990,6 +2472,17 @@ class GatewayShutdownMixin:
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
+        # A timed-out human turn gets the S2 interruption note after the drain. Suppress the
+        # earlier per-session broadcast for those lanes so restart notifications do not duplicate it.
+        self._s2_note_session_keys = set()
+        for _session_key in list(getattr(self, "_running_agents", {}).keys()):
+            try:
+                _state = getattr(self, "_peek_session_state", lambda _key: None)(_session_key)
+                _event = getattr(getattr(_state, "turn", None), "event", None)
+                if _event is not None and getattr(self, "_is_user_turn_event", lambda event: not event.internal)(_event):
+                    self._s2_note_session_keys.add(_session_key)
+            except Exception:
+                continue
         # Network sends are best-effort; a slow Telegram request must not consume launchd's stop leash.
         # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
         from gateway.run import GatewayRunner
@@ -2062,7 +2555,34 @@ class GatewayShutdownMixin:
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
-        await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        _marked_keys = await GatewayRunner._mark_running_sessions_resume_pending(self, "mark_resume_pending")
+        # This is the last transport-connected phase for the interrupted human turn. It is intentionally
+        # independent of the ordinary restart-notification opt-out and is durable/deduplicated by the row.
+        # Only turns still marked resume-pending after the drain can need an interruption note. A
+        # human turn may finish during the graceful drain and be removed from _running_agents before
+        # the timeout phase; do not resurrect the pre-drain candidate as a fallback notice.
+        _s2_candidates = set(getattr(self, "_s2_note_session_keys", set())) & set(_marked_keys)
+        self._s2_note_delivered_keys = set()
+        self._s2_note_failed_keys = set()
+        self._s2_note_claimed_keys = {}
+        if _s2_candidates:
+            await self._send_interrupted_turn_notes(
+                _marked_keys, shutdown_fallback_keys=_s2_candidates,
+            )
+        else:
+            await self._send_interrupted_turn_notes(_marked_keys)
+        # S2 note misses need the ordinary shutdown notice, but only after the note sender has
+        # returned: delivered lanes remain fenced so no session can receive both messages.
+        self._s2_note_session_keys = set(self._s2_note_delivered_keys)
+        _s2_note_misses = _s2_candidates & set(getattr(self, "_s2_note_failed_keys", set()))
+        if _s2_note_misses:
+            fallback_task = asyncio.create_task(self._notify_active_sessions_of_shutdown(
+                _s2_note_misses, include_home_channels=False,
+            ))
+            if not await GatewayRunner._wait_or_detach(fallback_task, 3.0):
+                logger.warning("Fallback shutdown notices for missed interrupted-turn notes exceeded 3s")
+            else:
+                await fallback_task
         reason = GatewayRunner._shutdown_interrupt_reason(self)
         self._interrupt_running_agents(reason)
         interrupt_grace_timeout = GatewayRunner._post_interrupt_grace_timeout(self)
@@ -2082,9 +2602,77 @@ class GatewayShutdownMixin:
         if _work_live():
             self._interrupt_running_agents(reason)
             logger.debug("Re-signaled interrupt for work still live at settle-window exit")
-        # Kill tool subprocesses NOW: deferring past adapter/DB teardown risks the systemd cgroup SIGKILL.
-        # Off-loop: the sweep does blocking kills that must not monopolize the event loop (#116327).
-        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
+        # A turn admitted in the race between the drain snapshot and the admission gate is part of
+        # the interrupted set even though it was absent from ctx.active_agents. Keep it in the context
+        # used by transcript flush/finalization; _stop_release_runtime_state clears the live slot later.
+        snapshot_running_agents = getattr(self, "_snapshot_running_agents", None)
+        if callable(snapshot_running_agents):
+            ctx.active_agents.update(snapshot_running_agents())
+        # Record interrupted cron runs independently of the tool sweep. A blocked registry kill must not
+        # turn a truncated cron run into a plausible success or lose its interruption notice.
+        from cron.scheduler import mark_running_jobs_interrupted
+        _mark_task = asyncio.create_task(asyncio.to_thread(
+            GatewayRunner._quiet_step,
+            "mark_running_jobs_interrupted (post-interrupt) error",
+            lambda: mark_running_jobs_interrupted(
+                "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
+            ),
+            level=logging.WARNING,
+        ))
+        # One clock (time.monotonic) for every deadline below. The non-restart mark gets its own short,
+        # non-zero bound: the post-interrupt grace has already expired whenever a stuck agent outlived it,
+        # and a zero wait would drop the marked IDs (the sweep's second mark then loses the
+        # expected_fire_owner race and returns []), silently losing the #82232 notice.
+        _restart_deadline = None
+        if self._restart_requested:
+            _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
+            _mark_deadline = _restart_deadline
+        else:
+            # Unused post-interrupt grace (converted off loop.time into a duration), floored at the
+            # short non-zero bound and capped by the restart-path bound: never longer than either the
+            # previous wait or the restart handoff.
+            _grace_left = max(0.0, interrupt_deadline - loop.time())
+            _mark_deadline = time.monotonic() + min(
+                self._restart_shutdown_bound(), max(_NONRESTART_CRON_MARK_BOUND_S, _grace_left),
+            )
+        _mark_done, _pending = await asyncio.wait(
+            {_mark_task}, timeout=max(0.0, _mark_deadline - time.monotonic())
+        )
+        _mark_collected = _mark_task in _mark_done
+        if _mark_collected:
+            _interrupted_cron_jobs = await _mark_task or []
+        else:
+            # Do not cancel the worker: it may be waiting on a fire fence and must finish its
+            # durable mark when the in-flight delivery releases it. Any execution rows it has
+            # not reached remain recoverable by recover_interrupted_executions() on next boot.
+            logger.warning(
+                "Shutdown phase: mark_running_jobs_interrupted exceeded its shutdown deadline; "
+                "leaving the worker detached so unmarked execution rows can be recovered on next boot"
+            )
+            _interrupted_cron_jobs = []
+        _sweep_timeout = None
+        if _restart_deadline is not None:
+            _sweep_timeout = min(
+                2.0,
+                self._restart_shutdown_bound(),
+                max(0.0, _restart_deadline - time.monotonic()),
+            )
+        if _sweep_timeout is None:
+            # Preserve the unbounded graceful-path call shape for lightweight runners and
+            # test doubles. Restart cleanup always takes the bounded branch above.
+            _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
+        else:
+            _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
+                "post-interrupt", timeout=_sweep_timeout,
+            )
+        if _swept_cron_jobs:
+            _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + _swept_cron_jobs))
+        # The detached mark may have finished during the sweep. It won the expected_fire_owner race, so
+        # the sweep's own mark returned nothing for those jobs: merge its result before notices go out.
+        if not _mark_collected and _mark_task.done() and not _mark_task.cancelled():
+            _late_marked = _mark_task.result() or []
+            if _late_marked:
+                _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + list(_late_marked)))
         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
         # Last window with the transport up (the cron worker's own notice arrives after teardown).
         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):
@@ -2108,43 +2696,210 @@ class GatewayShutdownMixin:
                 return flush_overflow_to_file({session_key: value}, reason=reason)
             return flush_pending_to_file({session_key: value}, reason=reason)
 
-    async def _stop_finalize_agents_and_adapters(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    def _persist_shutdown_pending_messages(self) -> int:
+        """Durably spool every queued inbound before cancellable shutdown cleanup starts.
+
+        This is deliberately synchronous and called before the bounded finalization task: a timed-out
+        restart may cancel all best-effort cleanup, but it must not cancel the only copy of a user
+        follow-up. Successfully spooled slots are removed by identity so later fallback phases do not
+        replay them; failed slots remain available to a subsequent best-effort pass.
+        """
+        persisted = 0
+
+        def _slot(mapping, key, value, *, source_value=None, overflow: bool = False) -> None:
+            nonlocal persisted
+            try:
+                if self._flush_owned_pending(
+                    key, value, reason="shutdown", overflow=overflow,
+                ):
+                    current = mapping.get(key)
+                    expected = value if source_value is None else source_value
+                    # SessionFieldView is a live Mapping, not a dict. Remove only the
+                    # exact slot we flushed; a concurrent replacement must survive.
+                    if current is expected:
+                        remover = getattr(mapping, "pop", None)
+                        if callable(remover):
+                            remover(key, None)
+                    persisted += 1
+            except Exception:
+                logger.exception("Failed to durably spool shutdown-pending message for %s", key)
+
+        pending = getattr(self, "_pending_messages", None)
+        if isinstance(pending, Mapping):
+            for key, value in list(pending.items()):
+                _slot(pending, key, value)
+
+        queued_events = getattr(self, "_queued_events", None)
+        if isinstance(queued_events, Mapping):
+            for key, events in list(queued_events.items()):
+                if events:
+                    _slot(queued_events, key, list(events), source_value=events, overflow=True)
+
+        profile_adapters = getattr(self, "_profile_adapters", {})
+        adapters = [*list(getattr(self, "adapters", {}).items())]
+        adapters.extend(
+            (platform, adapter)
+            for amap in profile_adapters.values()
+            for platform, adapter in list(amap.items())
+        )
+        for platform, adapter in adapters:
+            adapter_pending = getattr(adapter, "_pending_messages", None)
+            if not isinstance(adapter_pending, Mapping):
+                continue
+            for key, value in list(adapter_pending.items()):
+                _slot(adapter_pending, key, value)
+
+        startup_queue = getattr(self, "_startup_restore_queue", None)
+        if isinstance(startup_queue, list):
+            for event in list(startup_queue):
+                spool = getattr(event, "_hermes_recovery_spool", None)
+                if spool is not None and spool.exists():
+                    continue
+                try:
+                    key = self._session_key_for_source(event.source)
+                    if self._flush_owned_pending(key, event, reason="restore_shutdown"):
+                        for index, current in enumerate(startup_queue):
+                            if current is event:
+                                del startup_queue[index]
+                                break
+                        persisted += 1
+                except Exception:
+                    logger.exception("Failed to preserve startup-restore queued event during shutdown")
+        if persisted:
+            logger.info("Shutdown phase: durably spooled %d queued inbound message(s) before cleanup", persisted)
+        return persisted
+
+    def _restart_shutdown_bound(self) -> float:
+        """Keep restart-only post-interrupt cleanup within a short successor handoff bound."""
+        launchd_budget = getattr(self, "_launchd_exit_timeout_s", None)
+        if isinstance(launchd_budget, (int, float)) and launchd_budget > 0:
+            return max(1.0, min(3.0, float(launchd_budget) - 1.0))
+        return 3.0
+
+    def _restart_agent_finalize_bound(self, bound: float) -> float:
+        """Reserve the final restart slice for adapter/token teardown."""
+        return max(0.1, bound - min(1.0, max(0.5, bound / 3.0)))
+
+    async def _stop_finalize_agents_and_adapters(
+        self, ctx: "GatewayShutdownMixin._StopContext",
+        *, stop_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
+        agent_deadline: Optional[float] = None,
+    ) -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
+        if stop_event is not None and stop_event.is_set():
+            return
+        # Keep direct phase callers safe too. _stop_impl performs the same spool before creating this
+        # cancellable task, so a timed-out restart never relies on this coroutine reaching its first await.
+        _persist_shutdown_pending_messages(self)
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
-        await self._finalize_shutdown_agents(ctx.active_agents)
+        if stop_event is not None and stop_event.is_set():
+            return
+        _profile_adapters = getattr(self, "_profile_adapters", {})
+        adapters = [(platform, adapter, None) for platform, adapter in list(self.adapters.items())]
+        adapters.extend(
+            (platform, adapter, profile)
+            for profile, amap in list(_profile_adapters.items())
+            for platform, adapter in list(amap.items())
+        )
+        pre_teardown_cancelled = False
+        try:
+            finalize = self._finalize_shutdown_agents
+            try:
+                parameters = inspect.signature(finalize).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            finalize_kwargs = {}
+            if "interrupted" in parameters and self._restart_requested and ctx.timed_out:
+                finalize_kwargs["interrupted"] = True
+            if "stop_event" in parameters:
+                finalize_kwargs["stop_event"] = stop_event
+            if "deadline" in parameters:
+                finalize_kwargs["deadline"] = agent_deadline if agent_deadline is not None else deadline
+            await finalize(ctx.active_agents, **finalize_kwargs)
+            if stop_event is not None and stop_event.is_set():
+                return
+        except asyncio.CancelledError:
+            if stop_event is None:
+                raise
+            pre_teardown_cancelled = True
+            logger.warning("Shutdown pre-teardown was cancelled; proceeding to adapter teardown")
         # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
-        if _cache_lock is not None and _cache is not None:
+        # Idle cached agents are best-effort after a timed-out finalize hook. They may
+        # consume the adapter teardown slice (memory providers can take seconds), so
+        # skip them after cancellation and go straight to transport/token release.
+        if not pre_teardown_cancelled and _cache_lock is not None and _cache is not None:
             with _cache_lock:
                 _idle_agents = list(_cache.items())
                 _cache.clear()
             for _key, _entry in _idle_agents:
-                # Bounded + off-loop: a wedged memory provider here once made SIGTERM hang forever.
-                await self._cleanup_agent_resources_off_loop(
-                    _entry[0] if isinstance(_entry, tuple) else _entry, context="shutdown idle-cache",
-                    session_key=_key,
+                if stop_event is not None and stop_event.is_set():
+                    return
+                # The normal cleanup helper has a generous per-agent bound, but a timed-out
+                # restart must reserve the rest of the agent slice for adapter disconnect.
+                _remaining = None if agent_deadline is None else agent_deadline - time.monotonic()
+                if _remaining is not None and _remaining <= 0:
+                    pre_teardown_cancelled = True
+                    logger.warning("Shutdown idle-cache cleanup reached its agent deadline")
+                    break
+                _cleanup = self._cleanup_agent_resources_off_loop(
+                    _entry[0] if isinstance(_entry, tuple) else _entry,
+                    context="shutdown idle-cache", session_key=_key,
                 )
+                try:
+                    if _remaining is None:
+                        await _cleanup
+                    else:
+                        await asyncio.wait_for(_cleanup, timeout=_remaining)
+                except asyncio.TimeoutError:
+                    pre_teardown_cancelled = True
+                    logger.warning("Shutdown idle-cache cleanup reached its agent deadline")
+                    break
+                except asyncio.CancelledError:
+                    if stop_event is None:
+                        raise
+                    pre_teardown_cancelled = True
+                    logger.warning("Shutdown pre-teardown was cancelled; proceeding to adapter teardown")
+                    break
+        if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
+            return
         # Settle completion flush tasks while adapters are alive so every watcher gets a retryable result.
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
-        if cancel_completion_batches is not None:
-            await cancel_completion_batches()
+        preserve_held_completion_batches = getattr(
+            self, "_preserve_held_process_completion_batches", None,
+        )
+        if pre_teardown_cancelled:
+            if callable(preserve_held_completion_batches):
+                preserve_held_completion_batches()
+        elif cancel_completion_batches is not None:
+            try:
+                await cancel_completion_batches()
+            except asyncio.CancelledError:
+                if stop_event is None:
+                    raise
+                pre_teardown_cancelled = True
+                logger.warning("Shutdown pre-teardown was cancelled; proceeding to adapter teardown")
+                if callable(preserve_held_completion_batches):
+                    preserve_held_completion_batches()
+        if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
+            return
         # Preserve each adapter's queue BEFORE any cancellable background-task cleanup. The
         # adapter normally flushes after its drain loop, but a slow unwind can outlast that
         # loop's timeout and skip the flush. Remove only successfully spooled slots so its
         # later flush cannot replay duplicates; failed slots remain available for retry.
-        _profile_adapters = getattr(self, "_profile_adapters", {})
-        adapters = [(platform, adapter, None) for platform, adapter in list(self.adapters.items())]
-        adapters.extend((platform, adapter, profile)
-                        for profile, amap in list(_profile_adapters.items())
-                        for platform, adapter in list(amap.items()))
         for platform, adapter, profile in adapters:
+            if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
+                return
             pending = getattr(adapter, "_pending_messages", None)
-            if not isinstance(pending, dict) or not pending:
+            if not isinstance(pending, Mapping) or not pending:
                 continue
             for key, value in list(pending.items()):
+                if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
+                    return
                 try:
                     if self._flush_owned_pending(key, value, reason="adapter_shutdown"):
                         if pending.get(key) is value:
@@ -2153,9 +2908,24 @@ class GatewayShutdownMixin:
                     logger.exception("Failed to preserve %s adapter pending message for %s", platform.value, key)
         # Only network notices share the 3s budget. Adapter teardown has its own bounded
         # per-operation timeouts and must run through disconnect (token-lock release).
+        if stop_event is not None and stop_event.is_set() and not pre_teardown_cancelled:
+            return
         if adapters:
-            await asyncio.gather(*(self._bounded_adapter_teardown(adapter, platform, profile=profile)
-                                   for platform, adapter, profile in adapters))
+            try:
+                await asyncio.gather(*(self._bounded_adapter_teardown(
+                    adapter, platform, profile=profile, deadline=deadline
+                ) for platform, adapter, profile in adapters))
+            except asyncio.CancelledError:
+                if stop_event is None:
+                    raise
+                # _stop_impl cancels the coordinator at the agent bound. Clear that one-shot
+                # cancellation so the coordinator can still finish the mandatory token release.
+                current_task = asyncio.current_task()
+                if current_task is not None:
+                    current_task.uncancel()
+                await asyncio.gather(*(self._bounded_adapter_teardown(
+                    adapter, platform, profile=profile, deadline=deadline
+                ) for platform, adapter, profile in adapters))
         for _amap in _profile_adapters.values():
             _amap.clear()
         _profile_adapters.clear()
@@ -2208,7 +2978,10 @@ class GatewayShutdownMixin:
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
-        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
+        await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
+            "final-cleanup",
+            timeout=min(2.0, self._restart_shutdown_bound()) if self._restart_requested else None,
+        )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
@@ -2417,7 +3190,48 @@ class GatewayShutdownMixin:
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
-            await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
+            # This spool and transcript pass are intentionally outside the cancellable finalization bound:
+            # they are the successor's only durable copies of queued follow-ups and interrupted turns.
+            _persist_shutdown_pending_messages(self)
+            if ctx.timed_out:
+                self._flush_shutdown_agent_transcripts(ctx.active_agents)
+            _finalize_stop_event = threading.Event()
+            self._shutdown_finalize_stop_event = _finalize_stop_event
+            _finalize_bound = self._restart_shutdown_bound() if ctx.timed_out and self._restart_requested else None
+            _finalize_started = time.monotonic()
+            _finalize_deadline = None if _finalize_bound is None else _finalize_started + _finalize_bound
+            _agent_finalize_bound = None if _finalize_bound is None else self._restart_agent_finalize_bound(_finalize_bound)
+            _agent_finalize_deadline = None if _agent_finalize_bound is None else _finalize_started + _agent_finalize_bound
+            _finalize_task = asyncio.create_task(
+                GatewayRunner._stop_finalize_agents_and_adapters(
+                    self, ctx, stop_event=_finalize_stop_event,
+                    deadline=_finalize_deadline, agent_deadline=_agent_finalize_deadline,
+                )
+            )
+            if _finalize_bound is not None:
+                if not await GatewayRunner._wait_or_detach(_finalize_task, _agent_finalize_bound):
+                    # Do not leave finalization touching adapters or profile DBs while the
+                    # following phases release/close them. The event stops between-agent
+                    # work; cancellation stops the asyncio coordinator immediately.
+                    _finalize_stop_event.set()
+                    _finalize_task.cancel()
+                    # The coordinator converts this one-shot cancellation into the reserved adapter
+                    # teardown slice. Give it only the rest of the restart bound; if it swallows
+                    # cancellation or is still blocked, detach instead of awaiting it unbounded.
+                    _remaining = max(0.0, _finalize_started + _finalize_bound - time.monotonic())
+                    _done, _pending = await asyncio.wait({_finalize_task}, timeout=_remaining)
+                    if _finalize_task not in _done:
+                        from agent.async_utils import consume_detached_task_result
+                        _finalize_task.add_done_callback(consume_detached_task_result)
+                    else:
+                        with suppress(asyncio.CancelledError):
+                            await _finalize_task
+                    logger.warning(
+                        "Shutdown finalization exceeded %.1fs; cancelling remaining cleanup",
+                        _finalize_bound,
+                    )
+            else:
+                await _finalize_task
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)

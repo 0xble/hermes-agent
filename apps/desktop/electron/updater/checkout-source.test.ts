@@ -292,8 +292,19 @@ it('carries each install channel from Python publication checks into the source 
       server.listen(0, '127.0.0.1', resolve)
     })
     const address: AddressInfo = server.address() as AddressInfo
-    // Redirect only network transport. Selection, config, tag validation and Git are real.
-    fs.cpSync(path.join(repository, 'hermes_cli'), path.join(root, 'hermes_cli'), { recursive: true })
+    // Keep the target checkout boundary while avoiding a recursive copy of the
+    // whole CLI package for every test run. The source probe is the target-owned
+    // file; its imports resolve from the immutable repository fixture.
+    fs.mkdirSync(path.join(root, 'hermes_cli'))
+    fs.copyFileSync(path.join(repository, 'hermes_cli', '__init__.py'), path.join(root, 'hermes_cli', '__init__.py'))
+    fs.appendFileSync(
+      path.join(root, 'hermes_cli', '__init__.py'),
+      `\n__path__.append(${JSON.stringify(path.join(repository, 'hermes_cli'))})\n`
+    )
+    fs.copyFileSync(
+      path.join(repository, 'hermes_cli', 'source_check.py'),
+      path.join(root, 'hermes_cli', 'source_check.py')
+    )
     fs.writeFileSync(
       path.join(root, 'transport.py'),
       `import sys, os
@@ -361,6 +372,28 @@ urllib.request.build_opener = local_build
         )
     )
 
+    // The Python probe is a process boundary with real Git and publication
+    // validation. Each hand-off assertion below exercises the strategy, not a
+    // second identical probe; replay the validated snapshot until the fixture
+    // changes state. State transitions clear this snapshot before probing.
+    let replayedSourceUpdate: SourceUpdate | null | undefined
+
+    const runSourceUpdate = (install: string, opts: { force?: boolean }): Promise<SourceUpdate | null> =>
+      readSourceUpdate({
+        python,
+        git: 'git',
+        updateRoot: install,
+        hermesHome: home,
+        force: opts.force
+      })
+
+    const replaySourceUpdate = (status: SourceUpdate | null): void => {
+      replayedSourceUpdate = status
+    }
+
+    const readSourceUpdateForStrategy = (install: string, opts: { force?: boolean }): Promise<SourceUpdate | null> =>
+      replayedSourceUpdate === undefined ? runSourceUpdate(install, opts) : Promise.resolve(replayedSourceUpdate)
+
     const deps: CheckoutStrategyDeps = {
       hermesHome: home,
       isWindows: process.platform === 'win32',
@@ -369,14 +402,7 @@ urllib.request.build_opener = local_build
       updateHandoffDwellMs: 0,
       handoffClaimTimeoutMs: 2000,
       resolveUpdateRoot: (): string => root,
-      readSourceUpdate: (install: string, opts: { force?: boolean }): Promise<SourceUpdate | null> =>
-        readSourceUpdate({
-          python,
-          git: 'git',
-          updateRoot: install,
-          hermesHome: home,
-          force: opts.force
-        }),
+      readSourceUpdate: readSourceUpdateForStrategy,
       resolveUpdaterBinary: (): null => null,
       remoteGatewayActive: (): boolean => false,
 
@@ -413,15 +439,17 @@ urllib.request.build_opener = local_build
     fs.writeFileSync(path.join(root, '.hermes', 'bin', 'hermes.exe'), '')
 
     for (const channel of ['stable', 'canary'] as const) {
+      replayedSourceUpdate = undefined
       await setChannel(channel)
       const sha: string = commits[channel === 'stable' ? 1 : 2]
-      const checked: unknown = await strategy.check()
+      const checked: SourceUpdate = await strategy.check()
       expect(checked, JSON.stringify({ checked, requests })).toMatchObject({
         supported: true,
         channel,
         targetSha: sha,
         updateAvailable: true
       })
+      replaySourceUpdate(checked)
       fs.rmSync(scriptDirectory, { recursive: true, force: true })
       expect(await strategy.apply()).toMatchObject({ manual: true, command: `hermes update --channel ${channel}` })
       deps.resolveUpdaterBinary = (): string => path.join(temporary, 'frozen-updater')
@@ -429,6 +457,8 @@ urllib.request.build_opener = local_build
       expect(spawned).toHaveLength(0)
       fs.mkdirSync(scriptDirectory, { recursive: true })
       fs.writeFileSync(script, '')
+      // The hand-off itself re-resolves through the real forced Python probe, not the replay.
+      replayedSourceUpdate = undefined
       expect(await strategy.apply()).toMatchObject({ ok: true, handedOff: true })
       const handoff: (typeof spawned)[number] | undefined = spawned.pop()
       // The update ran and released its claim; the next apply starts clean.
@@ -447,6 +477,7 @@ urllib.request.build_opener = local_build
       deps.resolveUpdaterBinary = (): null => null
       expect(git(['rev-parse', 'HEAD'], root)).toBe(commits[3])
       git(['checkout', '--detach', sha], root)
+      replayedSourceUpdate = undefined
       expect(await strategy.check()).toMatchObject({ targetSha: sha, updateAvailable: false })
       git(['checkout', 'feature/gui'], root)
     }
@@ -454,6 +485,7 @@ urllib.request.build_opener = local_build
     // The R2 record, not GitHub metadata, decides availability: retire the
     // canary object and the resolver must fail closed before any handoff.
     responses.delete(`/releases/channels/canary.json`)
+    replayedSourceUpdate = undefined
     vi.mocked(deps.stopBackendsForUpdate).mockClear()
     expect(await strategy.apply()).toMatchObject({ ok: false, error: 'release-unavailable' })
     expect(deps.stopBackendsForUpdate).not.toHaveBeenCalled()

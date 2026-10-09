@@ -23,6 +23,7 @@ import re
 import stat
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 def _resolve_repo() -> Path:
@@ -92,8 +93,18 @@ def _git(*args: str) -> str:
     return subprocess.run(["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
 
 
+def _git_raw(*args: str) -> str:
+    return subprocess.run(["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+
+
 def _is_git_checkout() -> bool:
     return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+
+
+def _has_revision(revision: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(REPO), "cat-file", "-e", f"{revision}^{{commit}}"], capture_output=True,
+    ).returncode == 0
 
 
 def _maintenance_texts(revision: str = "HEAD") -> list[str]:
@@ -128,15 +139,33 @@ def _owned_identities(revision: str = "HEAD") -> set[str] | None:
 
 
 def _recorded_baseline(revision: str | None = None) -> str | None:
-    """The accepted baseline recorded at ``revision`` (default: the working tree), when the checkout ships the shared reader."""
+    """Read the baseline helper from the same revision as an immutable release.
+
+    The source checkout can predate the release and therefore lack the helper
+    entirely. Loading it through ``git show`` keeps the baseline and ancestry
+    decision bound to the release contract rather than to stale source files.
+    """
     reader = REPO / "scripts/ci/release_baseline.py"
-    if not reader.is_file():
-        return None
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("release_baseline", reader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.accepted_release_baseline(REPO, revision)
+    if revision is None or revision == "HEAD":
+        if not reader.is_file():
+            return None
+        source = reader.read_text(encoding="utf-8-sig")
+        helper_revision = None
+    else:
+        try:
+            source = _git_raw("show", f"{revision}:scripts/ci/release_baseline.py")
+        except subprocess.CalledProcessError:
+            return None
+        helper_revision = revision
+    module = types.ModuleType("release_baseline")
+    exec(compile(source, f"{revision or 'working tree'}:scripts/ci/release_baseline.py", "exec"), module.__dict__)
+    try:
+        return module.accepted_release_baseline(REPO, helper_revision)
+    except TypeError:
+        try:
+            return module.accepted_release_baseline(REPO)
+        except TypeError:
+            return DEFAULT_BASELINE
 
 
 def _verification_revision(home: Path) -> tuple[str, str, str | None]:
@@ -168,10 +197,9 @@ def _resolve_floor(floor: str, baseline: str, subject: str | None, revision: str
     if _is_ancestor(floor, revision):
         return floor, None
     if subject:
-        by_subject = [
-            sha for sha in _git("rev-list", "--reverse", f"{baseline}..{revision}").split()
-            if _git("log", "-1", "--format=%s", sha) == subject
-        ]
+        records = _git_raw("log", "--reverse", "--format=%H%x00%s%x00", f"{baseline}..{revision}").rstrip("\n")
+        fields = records.split("\0") if records else []
+        by_subject = [sha.lstrip("\n") for sha, commit_subject in zip(fields[0::2], fields[1::2]) if commit_subject == subject]
         if len(by_subject) == 1:
             return by_subject[0], None
     return None, (
@@ -202,9 +230,15 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             backfills[patch_id] = identity.strip()
     # Classify fork commits after the floor, excluding the verified upstream release
     # ancestry. A release merge introduces upstream commits without fork trailers.
-    for sha in _git("rev-list", "--reverse", "--no-merges", revision, f"^{start}", f"^{baseline}").split():
+    raw = _git_raw("log", "--reverse", "--no-merges", "--format=%H%x00%s%x00%B%x00",
+                   revision, f"^{start}", f"^{baseline}").rstrip("\n")
+    fields = raw.split("\0") if raw else []
+    if fields and fields[-1] == "":
+        fields.pop()
+    records = zip(fields[0::3], fields[1::3], fields[2::3])
+    for sha, subject, body in records:
+        sha = sha.lstrip("\n")
         short = sha[:12]
-        body = _git("log", "-1", "--format=%B", sha)
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
         if not identities and backfills:
             patch = _git("show", "--pretty=format:", "--no-ext-diff", sha)
@@ -213,7 +247,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             if result and result[0] in backfills:
                 identities = [backfills[result[0]]]
         if not identities:
-            failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) has no Fork-Patch trailer")
+            failures.append(f"commit {short} ({subject}) has no Fork-Patch trailer")
             continue
         for identity in identities:
             if identity in RECORD_IDENTITIES or identity in owned:
@@ -235,9 +269,13 @@ def check_extensions(home: Path) -> list[str]:
         "import hermes_cli.plugins as pm; pm.discover_plugins(force=True); from tools.registry import registry; "
         "import json; print(json.dumps({t: bool(registry.get_entry(t)) for t in %r}))" % (EXTENSION_TOOLS,)
     )
-    env = {**os.environ, "HERMES_HOME": str(home)}
-    env.pop("PYTHONPATH", None)
-    run = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    context = _runtime_context(home)
+    if isinstance(context, str):
+        return [context]
+    python, code_root = context
+    env = _runtime_env(home, code_root)
+    run = subprocess.run([str(python), "-c", probe], cwd=str(code_root), env=env,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
     if run.returncode != 0:
         return [f"plugin discovery probe failed: {run.stderr.strip()[-400:]}"]
     try:
@@ -250,10 +288,13 @@ def check_extensions(home: Path) -> list[str]:
 
 def check_config(home: Path) -> list[str]:
     failures: list[str] = []
-    env = {**os.environ, "HERMES_HOME": str(home)}
-    env.pop("PYTHONPATH", None)
+    context = _runtime_context(home)
+    if isinstance(context, str):
+        return [context]
+    python, code_root = context
+    env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
-        run = subprocess.run([sys.executable, "-m", "hermes_cli.main", "config", "get", key], cwd=str(REPO), env=env,
+        run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         value = (run.stdout.strip().splitlines() or [""])[-1].strip()
         if expected is None:
@@ -262,6 +303,22 @@ def check_config(home: Path) -> list[str]:
         elif value.lower() != expected.lower():
             failures.append(f"config {key} = {value!r}, expected {expected!r}")
     return failures
+
+
+def _runtime_context(home: Path) -> tuple[Path, Path] | str:
+    """Return the interpreter and import root for the code being verified."""
+    current = home / "current"
+    if current.is_symlink():
+        release = current.resolve()
+        python = release / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if not python.is_file():
+            return f"release interpreter {python} is missing"
+        return python, release
+    return Path(sys.executable), REPO
+
+
+def _runtime_env(home: Path, code_root: Path) -> dict[str, str]:
+    return {**os.environ, "HERMES_HOME": str(home), "PYTHONPATH": str(code_root)}
 
 
 def _newest_update_receipt(home: Path) -> Path | None:
@@ -425,6 +482,11 @@ def main(argv: list[str] | None = None) -> int:
     # The subject fallback belongs to the default floor only; a custom --trailer-floor must resolve as given.
     floor_subject = DEFAULT_TRAILER_FLOOR_SUBJECT if args.trailer_floor == DEFAULT_TRAILER_FLOOR else None
     revision, target, pointer_failure = _verification_revision(args.home) if not args.source_only else ("HEAD", "checkout", None)
+    if not pointer_failure and target == "release" and not _has_revision(revision):
+        pointer_failure = (
+            f"release {revision} is not present in source checkout {REPO}; "
+            "pass --repo to a checkout containing the live release SHA"
+        )
     # An immutable release is judged by the maintenance contract it shipped with. The source
     # checkout's working tree can lag the release by many commits, so its units would not
     # own identities added since. Legacy checkouts keep reading the working tree.
@@ -440,7 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         failures += check_receipt(args.home)
     for line in failures:
         print(f"FAIL {line}")
-    print(f"{'OK' if not failures else 'FAILED'}: {len(failures)} problem(s); checkout {_git('rev-parse', '--short=12', 'HEAD')} home {args.home}")
+    checked = revision[:12] if target == "release" else _git("rev-parse", "--short=12", "HEAD")
+    print(f"{'OK' if not failures else 'FAILED'}: {len(failures)} problem(s); {target} {checked} home {args.home}")
     return 1 if failures else 0
 
 

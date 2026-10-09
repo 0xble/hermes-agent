@@ -16,6 +16,28 @@ from gateway.run_pending_recovery import recover_pending_shutdown_flush
 from gateway.shutdown_flush import flush_pending_to_file
 
 
+def test_shutdown_spools_real_runner_session_views(tmp_path, monkeypatch):
+    """Runner legacy attributes are SessionFieldView mappings, not plain dicts."""
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._sessions = {}
+    runner._primary_profile_name = "default"
+    runner._served_profile_homes = {"default": tmp_path}
+    key = "agent:main:telegram:dm:real-runner"
+    runner._session_state(key)
+    runner._pending_messages[key] = "pending"
+    runner._queued_events[key] = ["queued"]
+    flushed = []
+    monkeypatch.setattr(
+        runner, "_flush_owned_pending",
+        lambda session_key, value, **kwargs: flushed.append((session_key, value, kwargs)) or 1,
+    )
+
+    assert runner._persist_shutdown_pending_messages() == 2
+    assert [value for _key, value, _kwargs in flushed] == ["pending", ["queued"]]
+    assert dict(runner._pending_messages) == {}
+    assert dict(runner._queued_events) == {}
+
+
 def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, monkeypatch):
     primary = tmp_path / "primary"
     secondary = tmp_path / "secondary"

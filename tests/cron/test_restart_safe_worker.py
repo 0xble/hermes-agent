@@ -25,6 +25,26 @@ def execution_ledger(tmp_path, monkeypatch):
     return executions
 
 
+def test_pre_ack_scoped_worker_stays_active_but_is_not_interrupted(monkeypatch):
+    import cron.scheduler as sched
+
+    key = sched._inflight_key("pre-ack-scoped")
+    with sched._running_lock:
+        sched._running_job_ids.add(key)
+        sched._external_worker_modes[key] = "scoped"
+        sched._running_fire_owners[key] = {object(): ("owner", sched._get_hermes_home().resolve())}
+    monkeypatch.setattr(sched, "mark_job_run", lambda *args, **kwargs: pytest.fail("safe worker marked"))
+    try:
+        assert sched.get_shutdown_drain_job_ids() == frozenset({"pre-ack-scoped"})
+        assert sched.mark_running_jobs_interrupted("shutdown") == []
+        assert key not in sched._interrupted_job_ids
+    finally:
+        with sched._running_lock:
+            sched._running_job_ids.discard(key)
+            sched._running_fire_owners.pop(key, None)
+            sched._external_worker_modes.pop(key, None)
+
+
 def test_execution_owner_moves_to_external_worker_before_running(
     execution_ledger, monkeypatch
 ):
@@ -424,6 +444,42 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert payloads[0]["multiplex_active"] is True
     # Once the attempt is terminal the parent reaps its own handoff artifacts.
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
+
+
+def test_degraded_worker_remains_active_and_is_marked_interrupted(tmp_path, monkeypatch):
+    """The real external handoff path must not hide a degraded worker from restart drain."""
+    import cron.scheduler as scheduler
+    from tools.process_registry import GatewayChildDispatch
+
+    job = {"id": "job-degraded", "execution_id": "exec-1", "prompt": "work"}
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    key = scheduler._inflight_key(job["id"])
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_kw: GatewayChildDispatch("degraded", command),
+    )
+    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    prior_worker_pids = dict(scheduler._running_worker_pids)
+    with scheduler._running_lock:
+        scheduler._running_job_ids.add(key)
+        scheduler._running_since[key] = time.time()
+    try:
+        assert scheduler._launch_external_cron_worker(job) is True
+        assert scheduler.get_running_job_ids() == frozenset({"job-degraded"})
+        assert scheduler._running_worker_pids.get(key) == 4321
+        assert scheduler.get_running_job_details()[0]["worker_pid"] == 4321
+        assert scheduler.mark_running_jobs_interrupted("gateway restart") == ["job-degraded"]
+        assert scheduler._is_interrupted("job-degraded")
+        assert spawned
+    finally:
+        scheduler.release_running_job("job-degraded")
+        with scheduler._running_lock:
+            scheduler._running_worker_pids.clear()
+            scheduler._running_worker_pids.update(prior_worker_pids)
+            scheduler._interrupted_job_ids.clear()
+            scheduler._external_worker_modes.clear()
+            scheduler._restart_safe_waiter_job_ids.clear()
+            scheduler._restart_safe_external_worker_job_ids.clear()
 
 
 def test_launch_external_worker_honors_ack_within_adoption_grace(

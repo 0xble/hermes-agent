@@ -926,6 +926,35 @@ class TestExternalSkillMutations:
         # No duplicate in local
         assert not (local / "ext-skill").exists()
 
+    def test_background_external_refusal_names_source_repository(self, tmp_path):
+        from tools.skill_manager_guards import mark_background_review_skill_read
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        local = tmp_path / "local"
+        external = tmp_path / "vault"
+        local.mkdir(); external.mkdir()
+        skill_dir = _write_external_skill(external)
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with (
+                _two_roots(local, external),
+                patch("agent.skill_utils.get_external_skills_dirs", return_value=[external]),
+            ):
+                mark_background_review_skill_read(skill_dir / "SKILL.md")
+                result = json.loads(skill_manage(
+                    action="patch", name="ext-skill", old_string="OLD_MARKER", new_string="NEW_MARKER",
+                ))
+        finally:
+            reset_current_write_origin(token)
+
+        assert result["success"] is False
+        assert "read-only" in result["error"]
+        assert "owning repository" in result["error"]
+
 
     def test_background_review_improves_any_skill_but_deletes_only_managed_ones(self, tmp_path):
         """#134289: the review fork improves every skill it learns from (user-owned with no usage
