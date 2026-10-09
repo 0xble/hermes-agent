@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -191,7 +192,10 @@ CONTINUATION_PROMPT_TEMPLATE = (
 CONTINUATION_REVISIONS_TEMPLATE = (
     "\n\nThis goal has been revised. Each earlier requirement listed below still "
     "binds you unless the user message cited for that revision plainly instructs "
-    "that specific change. When in doubt, honor the earlier requirement.\n"
+    "that specific change, or the revision records concrete evidence that the "
+    "requirement is obsolete or impossible. An evidence-backed change counts "
+    "only if your recorded tool results support that evidence. "
+    "When in doubt, honor the earlier requirement.\n"
     "{revision_lines}"
 )
 
@@ -375,11 +379,17 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
 # Judge prompt block for the goal's revision history (empty without revisions).
 JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "Revision history (the goal and criteria above are the CURRENT version). "
-    "A revision may clarify or restructure, but only the user can lower the "
-    "bar. For each earlier requirement a revision dropped or weakened: it is "
+    "A revision may clarify or restructure. On the objective, outcome, "
+    "constraints, boundaries or stop condition, only the user can lower the bar; the "
+    "agent may retire an obsolete verification criterion or subgoal only with "
+    "recorded evidence. For each earlier requirement a revision dropped or weakened: it is "
     "superseded only when the cited user message plainly instructs that "
-    "specific change; otherwise, including every revision with no user "
-    "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
+    "specific change, or when the revision includes concrete evidence that the "
+    "requirement became impossible or irrelevant. An evidence-backed drop is "
+    "superseded only when the recorded tool results support that evidence; "
+    "unsupported or contradicted evidence does not lower the bar. Otherwise, "
+    "including every revision with no user authority or evidence, "
+    "hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
 JUDGE_USER_PROMPT_TEMPLATE = (
@@ -684,8 +694,8 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
-    # Versioned revisions of the goal/contract/subgoals: {at, actor, reason, user_quote, before, after}.
-    # Shown to the judge and continuation so superseded wording stops binding. Old rows load as [].
+    # Versioned revisions of the goal/contract/subgoals. Records also carry ``authority`` (user_quote,
+    # evidence, or empty), optional ``evidence`` and ``kind=replace`` for audit/read-back.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     # Comma-joined ids of recorded results cited during the current dispute streak; a dispute that
     # cites none beyond these counts toward the stall breaker.
@@ -755,16 +765,21 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
     def render_revisions_block(self) -> str:
-        """Every revision with every requirement it replaced, in full; empty without revisions.
+        """Every non-replacement revision with every requirement it replaced, in full.
 
-        Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
-        instructs the change, so dropping it from the prompt would silently lower the bar."""
+        Replacement records are intentionally rendered separately for the judge: they are audit
+        records for a fresh goal, not binding continuation history, but the judge must still see and
+        validate the authority that supposedly authorized the replacement.
+        """
         lines = []
-        for i, rev in enumerate(self.revisions, start=1):
+        binding_revisions = [rev for rev in self.revisions if rev.get("kind") != "replace"]
+        for i, rev in enumerate(binding_revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
             if quote:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
+            elif rev.get("authority") == "evidence" and str(rev.get("evidence") or "").strip():
+                authority = f'evidence: {_truncate(str(rev.get("evidence")), 300)}'
             else:
                 authority = "agent, no user authority"
             before, after = rev.get("before") or {}, rev.get("after") or {}
@@ -779,6 +794,52 @@ class GoalState:
                     if dropped:
                         lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
+
+    def render_replacement_authority_block(self) -> str:
+        """Render the deterministic replacement audit and restrictions carried forward."""
+        replacements = [rev for rev in self.revisions if rev.get("kind") == "replace"]
+        if not replacements:
+            return ""
+        lines = [
+            "Replacement authority audit (deterministic pre-activation check passed):",
+            "The replacement was activated only because the quoted text is a verbatim substring of "
+            "the latest recorded typed user message in this session, and that message plainly instructs "
+            "changing, replacing, or re-scoping the goal. This is not inferred from tool output or assistant text.",
+        ]
+        for rev in replacements:
+            before = rev.get("before") or {}
+            lines.extend([
+                f"- Replaced goal: {str(before.get('goal') or '(empty)')}",
+                f"  User quote: {str(rev.get('user_quote') or '(missing)')}",
+                f"  Full source user message: {str(rev.get('user_message') or '(missing)')}",
+                f"  User message id: {rev.get('user_message_id')}",
+            ])
+            carried = rev.get("carried_remaining_turns")
+            if rev.get("carried_gates"):
+                gate_count = len(before.get("gates") or [])
+                lines.append(f"  Carried quality gates: {gate_count}")
+                for gate in before.get("gates") or []:
+                    if isinstance(gate, dict):
+                        lines.append(f"    - ${gate.get('command', '')}")
+            else:
+                lines.append("  Quality gates explicitly removed by the authorizing user message")
+            if "turn_budget" in (rev.get("removed_restrictions") or []):
+                lines.append("  Turn budget explicitly removed by the authorizing user message")
+            else:
+                lines.append(f"  Carried remaining turn budget: {carried}")
+            for key in ("outcome", "verification", "constraints", "boundaries", "stop_when"):
+                value = str(before.get(key) or "").strip()
+                if value:
+                    lines.append(f"  Replaced goal's earlier {key}: {value}")
+            for subgoal in before.get("subgoals") or []:
+                lines.append(f"  Replaced goal's earlier subgoal: {subgoal}")
+        return "\n".join(lines)
+
+    def render_judge_revisions_block(self) -> str:
+        """Render all revision context the judge must inspect, including replacement authority."""
+        return "\n\n".join(
+            block for block in (self.render_revisions_block(), self.render_replacement_authority_block()) if block
+        )
 
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
@@ -2067,6 +2128,182 @@ _REVISION_QUOTE_MIN_CHARS = 12
 # Longest user message a revision may cite. The judge decides authority from the complete message,
 # so a longer one is refused rather than excerpted: an excerpt can drop the context that negates it.
 _REVISION_SOURCE_MAX_CHARS = 4000
+# Replacement authority is deliberately narrower than ordinary revision authority. The requested
+# replacement itself must be present in the recorded user message; a generic "change the scope" is
+# not authorization for an agent-invented objective. Matching is deterministic and punctuation-safe.
+_REPLACEMENT_ACTION_RE = re.compile(
+    r"\b(?:replace|replac(?:e|ing|ed)|change|chang(?:e|ing|ed)|re[- ]?scope|switch)\b"
+    r".{0,40}\b(?:goal|objective|scope|direction|task)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_REPLACEMENT_GATE_REMOVE_RE = re.compile(
+    r"(?:\b(?:remove|clear|drop|delete|disable)\b.{0,60}\b(?:quality )?gates?\b|"
+    r"\b(?:quality )?gates?\b.{0,60}\b(?:remove|clear|drop|delete|disable)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REPLACEMENT_BUDGET_REMOVE_RE = re.compile(
+    r"(?:\b(?:remove|clear|drop|delete|disable|reset)\b.{0,60}"
+    r"\b(?:turn|turns|budget|limit)\b|\b(?:turn|turns|budget|limit)\b.{0,60}"
+    r"\b(?:remove|clear|drop|delete|disable|reset)\b|\bturn\s+budget\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REPLACEMENT_NEGATION_RE = re.compile(r"\b(?:do\s+not|don't|dont|never|not)\b", re.IGNORECASE)
+_AUTHORITY_PRESERVE_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|never|not|keep|preserve|retain|leave|without\s+removing|"
+    r"without\s+dropping|without\s+clearing)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_authority_text(text: Any) -> str:
+    """Normalize recorded text for safe authority matching, not for semantic inference."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    chars = [" " if ch.isspace() or unicodedata.category(ch).startswith("P") else ch
+             for ch in normalized]
+    return " ".join("".join(chars).split())
+
+
+def _authority_units(text: str) -> List[str]:
+    """Return sentence/clause-sized units so cues cannot authorize a neighboring clause."""
+    return [part for part in re.split(r"[.!?;]+", text or "") if part.strip()]
+
+
+def _replacement_goal_is_negated(unit: str, goal: str) -> bool:
+    unit_norm = _normalize_authority_text(unit)
+    target = _normalize_authority_text(goal)
+    target_at = unit_norm.find(target)
+    if target_at < 0:
+        return False
+    for cue in _AUTHORITY_PRESERVE_RE.finditer(unit_norm):
+        if cue.start() >= target_at and cue.end() <= target_at + len(target):
+            continue
+        if cue.end() <= target_at:
+            return True
+    return False
+
+
+def _replacement_action_is_authorized(source: str, goal: str) -> bool:
+    """Require an un-negated replacement instruction in the same clause as the new goal."""
+    for unit in _authority_units(source):
+        action = _REPLACEMENT_ACTION_RE.search(unit)
+        if not action or not _recorded_text_contains(goal, unit):
+            continue
+        prefix = unit[:action.start()]
+        if _REPLACEMENT_NEGATION_RE.search(prefix):
+            continue
+        if re.search(r"\b(?:keep|preserve|retain|leave)\b.{0,24}\b(?:goal|objective)\b", prefix,
+                     re.IGNORECASE | re.DOTALL):
+            continue
+        if not _replacement_goal_is_negated(unit, goal):
+            return True
+    return False
+
+
+def _explicit_restriction_removals(source: str) -> Tuple[bool, bool]:
+    """Find only un-negated, explicit gate/budget removal instructions.
+
+    A preservation or negation cue anywhere in the same sentence/clause wins. Anything not matching
+    an explicit removal verb is intentionally preserved, including ``no gates`` and ``without gates``.
+    """
+    remove_gates = remove_budget = False
+    for unit in _authority_units(source):
+        if _AUTHORITY_PRESERVE_RE.search(unit):
+            continue
+        remove_gates |= bool(_REPLACEMENT_GATE_REMOVE_RE.search(unit))
+        remove_budget |= bool(_REPLACEMENT_BUDGET_REMOVE_RE.search(unit))
+    return remove_gates, remove_budget
+
+
+def _recorded_text_contains(needle: str, source: str) -> bool:
+    """Match substantive text in recorded content after whitespace/case/punctuation normalization."""
+    needle_norm = _normalize_authority_text(needle)
+    source_norm = _normalize_authority_text(source)
+    return bool(needle_norm and needle_norm in source_norm)
+
+
+def _contains_negated_text(source: str, text: str) -> bool:
+    """Whether a cited phrase is inside a unit with an explicit preservation/negation cue."""
+    target = _normalize_authority_text(text)
+    if not target:
+        return False
+    for unit in _authority_units(source):
+        unit_norm = _normalize_authority_text(unit)
+        target_at = unit_norm.find(target)
+        if target_at < 0:
+            continue
+        target_end = target_at + len(target)
+        for cue in _AUTHORITY_PRESERVE_RE.finditer(unit_norm):
+            # A criterion can legitimately begin with "never" or "not"; that word is part of the
+            # cited text, not a negation of it. Cues outside the cited span still win.
+            if cue.start() >= target_at and cue.end() <= target_end:
+                continue
+            return True
+    return False
+
+
+def _substantive_tokens(text: Any) -> List[str]:
+    """Words useful for binding a short removal instruction to a recorded criterion."""
+    stop = {"the", "a", "an", "and", "or", "to", "of", "for", "with", "this", "that", "must",
+            "should", "will", "also", "keep", "goal", "objective", "rule", "requirement", "criterion",
+            "criteria", "subgoal", "subgoals"}
+    return [token for token in _normalize_authority_text(text).split() if len(token) >= 4 and token not in stop]
+
+
+def _change_text_bound(source: str, field: str, before: Any, after: Any) -> bool:
+    """Require the requested revision text, or its explicit removal target, in the user message."""
+    after_text = str(after or "").strip()
+    if after_text:
+        return _recorded_text_contains(after_text, source) and not _contains_negated_text(source, after_text)
+    old_text = str(before or "").strip()
+    aliases = {
+        "goal": "goal|objective|direction|task",
+        "outcome": "outcome|result",
+        "constraints": "constraint|restriction|rule|limit",
+        "boundaries": "boundary|scope",
+        "stop_when": "stop|condition",
+        "verification": "verification|check|test|proof",
+        "subgoals": "subgoal|criterion|criteria",
+    }
+    removal = re.search(r"\b(?:remove|drop|clear|delete|disable|skip|relax|lift|waive|"
+                        r"no\s+longer\s+appl(?:y|ies)|stop\s+requiring)\b", source, re.IGNORECASE)
+    if not removal:
+        return False
+    target_bound = (_recorded_text_contains(old_text, source) if old_text else False)
+    if not target_bound:
+        target_bound = bool(re.search(rf"\b(?:{aliases.get(field, field)})\b", source, re.IGNORECASE))
+    return target_bound and not (old_text and _contains_negated_text(source, old_text))
+
+
+def _dropped_text_bound(source: str, text: str) -> bool:
+    """Bind a dropped criterion to a user removal instruction without semantic guessing."""
+    if _contains_negated_text(source, text):
+        return False
+    tokens = _substantive_tokens(text)
+    normalized_source = _normalize_authority_text(source)
+    return bool(tokens and any(token in normalized_source for token in tokens) and
+                re.search(r"\b(?:remove|drop|clear|delete|disable|skip|relax|lift|waive|"
+                          r"no\s+longer\s+appl(?:y|ies)|stop\s+requiring)\b", source, re.IGNORECASE))
+
+
+def _typed_user_message_records_since(session_id: Optional[str], since: float = 0.0,
+                                      limit: int = 500) -> List[Dict[str, Any]]:
+    """Newest-first typed user rows, preserving ids for deterministic authority audits."""
+    db = _get_session_db()
+    reader = getattr(db, "messages_by_role", None) if db is not None else None
+    if not session_id or reader is None:
+        return []
+    try:
+        rows = reader(session_id, "user", since=since, limit=limit)
+    except Exception as exc:
+        logger.debug("goal revise: user message read failed: %s", exc)
+        return []
+    return [row for row in rows if _is_user_typed(row)]
+
+
+def _typed_user_message_text(row: Dict[str, Any]) -> str:
+    """Return only the user's text, excluding a client-provided assistant quote header."""
+    content = row.get("content")
+    return _REPLY_QUOTE_RE.sub("", content, count=1) if isinstance(content, str) else ""
 
 
 def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
@@ -2266,20 +2503,194 @@ class GoalManager:
 
     # --- revisions ------------------------------------------------------
 
-    # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
-    # and changing constraints. Other contract fields may be restructured by the agent; the judge
-    # still holds an unauthorized revision to any earlier requirement it weakened.
-    _AUTHORITY_FIELDS = ("goal", "constraints")
+    # Changes that need an identifiable user instruction: the objective itself, hard limits,
+    # boundaries, stop conditions, and dropped criteria. Verification may be superseded by
+    # concrete evidence that it is obsolete or impossible; the judge still holds an unauthorized
+    # revision to any earlier requirement it weakened.
+    _AUTHORITY_FIELDS = ("goal", "outcome", "constraints", "boundaries", "stop_when")
+
+    def _quote_source(self, quote: str, state: GoalState, user_messages: Optional[List[str]] = None) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+        """Validate a user quote and return its normalized source message."""
+        quote = " ".join((quote or "").split())
+        if len(quote) < _REVISION_QUOTE_MIN_CHARS:
+            return "", "", {"error_code": "user_quote_too_short",
+                              "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
+        rows = _typed_user_message_records_since(self.session_id, state.created_at)
+        sources = [_typed_user_message_text(row) for row in rows if _recorded_text_contains(quote, _typed_user_message_text(row))]
+        if not sources:
+            return "", "", {"error_code": "user_quote_not_found",
+                              "error": "user_quote must match a recorded typed user message sent since the goal was set"}
+        source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
+        if not source:
+            return "", "", {"error_code": "user_message_too_long",
+                              "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
+                                       "long to judge whether it authorizes this change; ask the user to state the "
+                                       "change in a short message and quote that"}
+        if _contains_negated_text(source, quote):
+            return "", "", {"error_code": "user_authority_negated",
+                              "error": "the quoted user text is negated or preserves the earlier requirement"}
+        return quote, source, None
+
+    def _replacement_quote_source(self, quote: str, goal: str, state: GoalState) -> Tuple[str, str, Any, Optional[Dict[str, Any]]]:
+        """Authorize a replacement only from a recorded, typed user message.
+
+        Both the quoted authority and the new objective must be found in the same recorded message
+        after deterministic whitespace/case/punctuation normalization. A generic replacement verb is
+        not enough to authorize agent-supplied goal text, and negated instructions never authorize it.
+        """
+        quote = str(quote or "").strip()
+        if len(_normalize_authority_text(quote)) < _REVISION_QUOTE_MIN_CHARS:
+            return "", "", None, {"error_code": "user_quote_too_short",
+                                   "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
+        rows = _typed_user_message_records_since(self.session_id, state.created_at)
+        if not rows:
+            return "", "", None, {"error_code": "user_quote_not_found",
+                                   "error": "quote the user's requested replacement in a recorded typed user message of this session"}
+        # Newest-first: a stale earlier instruction must not activate a replacement after a newer turn.
+        row = rows[0]
+        source = _typed_user_message_text(row)
+        if len(source) > _REVISION_SOURCE_MAX_CHARS:
+            return "", "", None, {"error_code": "user_message_too_long",
+                                   "error": f"the latest user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters; "
+                                            "state the replacement in a short message and quote that"}
+        if not _recorded_text_contains(quote, source):
+            return "", "", None, {"error_code": "user_quote_not_found",
+                                   "error": "user_quote must appear in the latest recorded typed user message"}
+        if not _recorded_text_contains(goal, source):
+            return "", "", None, {"error_code": "replacement_authority_required",
+                                   "error": "quote the user's requested goal text; the new objective must appear in that recorded user message"}
+        if _contains_negated_text(source, quote) or any(
+                _replacement_goal_is_negated(unit, goal) for unit in _authority_units(source)):
+            return "", "", None, {"error_code": "replacement_authority_required",
+                                   "error": "the recorded user instruction is negated or preserves the existing goal; replacement rejected"}
+        if not _replacement_action_is_authorized(source, goal):
+            return "", "", None, {"error_code": "replacement_authority_required",
+                                   "error": "the latest user message must plainly instruct replacing, changing, or re-scoping the goal"}
+        return quote, source, row.get("id"), None
+
+    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                contract: Optional[GoalContract] = None, user_quote: str = "",
+                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace a goal only after deterministic authority validation, before state changes.
+
+        ``user_messages`` is retained for API compatibility but is deliberately ignored: replacement
+        authority must come from the latest recorded typed user message for this session. Existing
+        quality gates and the remaining turn budget carry forward. A user message that explicitly
+        removes gates or the turn budget may opt out of those restrictions.
+        """
+        state = self._state
+        if state is None or state.status not in {"active", "paused"}:
+            return {"ok": False, "error_code": "no_active_goal", "error": "no active or paused goal"}
+        reason = (reason or "").strip()
+        goal = (goal or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason"}
+        if not goal:
+            return {"ok": False, "error_code": "invalid_goal", "error": "goal text is empty"}
+
+        # This is the complete authority gate. Do not construct, assign, or persist a replacement
+        # until it passes; failure therefore leaves the prior object and its serialized bytes intact.
+        quote, source, source_id, quote_error = self._replacement_quote_source(user_quote, goal, state)
+        if quote_error:
+            return {"ok": False, **quote_error}
+
+        remove_gates, remove_budget = _explicit_restriction_removals(source)
+        prior_remaining = 0 if state.max_turns == 0 else max(0, state.max_turns - state.turns_used)
+        carried_gates = [] if remove_gates else [GoalGate.from_dict(asdict(gate)) for gate in state.gates]
+        if remove_budget:
+            next_max_turns = normalize_goal_max_turns(max_turns) if max_turns is not None else 0
+        else:
+            # max_turns supplied by the agent cannot silently reset or enlarge the old budget.
+            next_max_turns = 0 if state.max_turns == 0 else prior_remaining
+        previous_goal = state.goal
+        previous = {
+            "goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals),
+            "gates": [asdict(gate) for gate in state.gates], "remaining_turns": prior_remaining,
+        }
+        replacement_status = "active" if next_max_turns != 0 or state.max_turns == 0 or prior_remaining > 0 else "paused"
+        new_state = GoalState(
+            goal=goal, status=replacement_status, turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            max_turns=next_max_turns, contract=contract or GoalContract(), gates=carried_gates,
+            paused_reason=("replacement preserved exhausted turn budget" if replacement_status == "paused" else None),
+        )
+        revision = {
+            "at": time.time(), "actor": "user", "kind": "replace", "reason": reason,
+            "user_quote": quote, "user_message": source, "user_message_id": source_id,
+            "authority": "user_quote", "authority_check": "deterministic_latest_typed_user_message",
+            "before": previous,
+            "after": {"goal": goal, **new_state.contract.to_dict(), "subgoals": [],
+                      "gates": [asdict(gate) for gate in carried_gates], "max_turns": next_max_turns},
+            "carried_gates": not remove_gates, "carried_remaining_turns": prior_remaining,
+            "removed_restrictions": (["gates"] if remove_gates else []) + (["turn_budget"] if remove_budget else []),
+        }
+        new_state.revisions.append(revision)
+        self._state = new_state
+        self._save()
+        return {"ok": True, "state": new_state, "previous_goal": previous_goal, "revision": revision,
+                "version": 1}
+
+    def _recorded_evidence_error(self, evidence: str, state: GoalState) -> Optional[Dict[str, str]]:
+        """Require evidence-backed revisions to cite an eligible recorded tool result.
+
+        Matching first tries the raw substring, then compares identically whitespace-normalized text
+        on both sides. This accepts a multiline excerpt copied from a result without accepting prose
+        fabricated by the agent: every candidate still comes from a recorded tool row in this session.
+        """
+        db = _get_session_db()
+        if db is None:
+            return {"error_code": "evidence_not_recorded",
+                    "error": "evidence must appear in a recorded tool result"}
+        raw_evidence = str(evidence or "")
+        normalized_evidence = " ".join(raw_evidence.split())
+        if not normalized_evidence:
+            return {"error_code": "evidence_not_recorded",
+                    "error": "evidence must appear in a recorded tool result"}
+        try:
+            reader = getattr(db, "messages_by_role", None)
+            if reader is not None:
+                rows = reader(self.session_id, "tool", since=state.created_at, limit=1_000_000)
+                found_negated = False
+                for row in rows:
+                    if _evidence_tool_excluded(str(row.get("tool_name") or "")):
+                        continue
+                    content = str(row.get("content") or "")
+                    if raw_evidence in content or normalized_evidence in " ".join(content.split()):
+                        if _contains_negated_text(content, raw_evidence):
+                            found_negated = True
+                            continue
+                        return None
+                if found_negated:
+                    return {"error_code": "evidence_negated",
+                            "error": "the recorded evidence is negated or preserves the earlier requirement"}
+            else:
+                finder = getattr(db, "find_messages_containing", None)
+                if finder is not None:
+                    matches = finder(
+                        self.session_id, raw_evidence, role="tool", since=state.created_at, limit=1,
+                        **_EVIDENCE_EXCLUSION_KW,
+                    )
+                    if matches:
+                        return None
+        except Exception as exc:
+            logger.debug("goal revise: evidence lookup failed: %s", exc)
+        return {"error_code": "evidence_not_recorded",
+                "error": "evidence must appear in a recorded tool result from this goal's session"}
 
     def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-               user_quote: str = "", user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+               user_quote: str = "", user_messages: Optional[List[str]] = None,
+               evidence: str = "") -> Dict[str, Any]:
         """Record a versioned revision of the goal, contract fields and/or subgoal list.
 
         ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
-        A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
-        excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
-        user messages since the goal was set). Returns ``{"ok", "error_code", "error", "revision"}``."""
+        A change to the objective, outcome, constraints, boundaries, stop condition, or a dropped
+        subgoal needs ``user_quote``: a verbatim excerpt (12+ chars) of a real recorded typed user
+        message sent since the goal was set. ``user_messages`` is retained for API compatibility but
+        is not an authority source. The requested new text must appear in the same message; removals
+        need an explicit un-negated removal instruction. A verification change or dropped subgoal may instead carry evidence of at least 12 characters
+        when it is obsolete or impossible; evidence must be an exact substring of a tool result
+        recorded in this session after the goal started and cannot authorize any other field. Returns
+        ``{"ok", "error_code", "error", "revision"}``."""
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -2298,32 +2709,50 @@ class GoalManager:
         if not changed:
             return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
         dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
+        evidence = str(evidence or "").strip()
+        if evidence and len(" ".join(evidence.split())) < _REVISION_QUOTE_MIN_CHARS:
+            return {"ok": False, "error_code": "evidence_too_short",
+                    "error": f"evidence must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
         needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
+        evidence_changes = [k for k in changed if k == "verification"] + (["subgoals"] if dropped else [])
         quote = " ".join((user_quote or "").split())
-        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
+        # Evidence scope matters only when evidence is the authority; a valid quote can authorize more.
+        if evidence and not quote and set(changed) - set(evidence_changes):
+            return {"ok": False, "error_code": "evidence_not_authorized",
+                    "error": "evidence may authorize only verification changes or dropped subgoals"}
+        if evidence and not quote and not set(needs_authority) - {"subgoals"}:
+            evidence_error = self._recorded_evidence_error(evidence, state)
+            if evidence_error:
+                return {"ok": False, **evidence_error}
+        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS and not (evidence and not set(needs_authority) - {"subgoals"}):
+            return {"ok": False, "error_code": "user_authority_required",
+                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
+                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session, "
+                             "or concrete evidence only when the dropped criterion is obsolete or impossible"}
+        source = ""
+        authority = ""
+        if quote:
+            quote, source, quote_error = self._quote_source(quote, state, user_messages)
+            if quote_error:
+                return {"ok": False, **quote_error}
+            bound_fields = [key for key in changed if key != "subgoals"]
+            for key in bound_fields:
+                if not _change_text_bound(source, key, before.get(key), after.get(key)):
+                    return {"ok": False, "error_code": "user_authority_unbound",
+                            "error": f"the user's quoted instruction does not authorize the requested {key} change; "
+                                     "quote the user's requested text or explicit removal instruction"}
+            if dropped and not all(_dropped_text_bound(source, text) for text in dropped):
+                return {"ok": False, "error_code": "user_authority_unbound",
+                        "error": "the user's quoted instruction does not identify every dropped subgoal; quote the user's requested removal"}
+            authority = "user_quote"
+        elif evidence and evidence_changes and not set(needs_authority) - {"subgoals"}:
+            authority = "evidence"
+        elif needs_authority:
             return {"ok": False, "error_code": "user_authority_required",
                     "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
                              f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
-        source = ""
-        if quote:
-            # Deterministic part: the quote must come from a real user message. Whether that message
-            # authorizes this specific change is judged against the full message, shown with the revision.
-            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-                return {"ok": False, "error_code": "user_quote_too_short",
-                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
-            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
-            if not sources:
-                return {"ok": False, "error_code": "user_quote_not_found",
-                        "error": "user_quote does not match any user message sent since the goal was set"}
-            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
-            if not source:
-                return {"ok": False, "error_code": "user_message_too_long",
-                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
-                                 "long to judge whether it authorizes this change; ask the user to state the "
-                                 "change in a short message and quote that"}
         revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
-                    "user_message": source,
+                    "user_message": source, "authority": authority, "evidence": evidence,
                     "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
         state.goal = after["goal"]
         state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
@@ -2333,7 +2762,8 @@ class GoalManager:
         state.consecutive_disputes = 0
         state.last_dispute_evidence = ""
         self._save()
-        return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
+        return {"ok": True, "revision": revision,
+                "version": sum(1 for rev in state.revisions if rev.get("kind") != "replace") + 1}
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -2926,7 +3356,7 @@ class GoalManager:
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+            evidence=evidence or None, citations=citations, revisions_block=state.render_judge_revisions_block(),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -3069,8 +3499,14 @@ class GoalManager:
         if not s or s.status != "active":
             return None
         prompt = self._current_continuation_prompt(s)
-        if s.revisions:
-            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=s.render_revisions_block())
+        # A replacement is not just judge-only context: keep the prior goal and its restrictions
+        # visible to the working agent until the cited user message is plainly authoritative.
+        revision_lines = s.render_revisions_block() if s.revisions else ""
+        replacement_audit = s.render_replacement_authority_block() if s.revisions else ""
+        if revision_lines.strip():
+            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)
+        if replacement_audit.strip():
+            prompt += "\n\n" + replacement_audit
         return prompt
 
     @staticmethod
