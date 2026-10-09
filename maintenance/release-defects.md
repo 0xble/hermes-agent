@@ -710,3 +710,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   upstream's wedged and restart-safe counts to the fork's message, which had no
   placeholders for them, so every no-budget restart raised inside logging. Guards:
   `scripts/run_tests.sh tests/tools/test_memory_transactions.py tests/tools/test_memory_tool.py tests/gateway/test_restart_drain.py`.
+- A static undefined-name and import-resolution sweep of the merged tree, compared
+  against both parents, found seven more clean-merge losses: the `tui_gateway.checkpoints`
+  import in `tui_gateway/server.py`, `platform_ssl_context` in the Telegram adapter,
+  `blocked_sessions` threading in `gateway/shutdown_flush.py`, the free-tier cooldown
+  block (`attempts_made`) in `agent/turn_api_error.py`, the moved retry-after helper,
+  `_hermes_user_agent` in `hermes_cli/models_pricing.py`, and `resumed` plus
+  `_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS` in `hermes_cli/update_cmd_fleet.py`. Skill Sync
+  housekeeping rows were dropped because upstream removed Skill Sync. Guard: a
+  `ruff check --select F821` and lazy-import resolution diff against both merge parents
+  reports no new entries.
+- Upstream-added `tests/ci` files that only check upstream's hosted workflows or
+  `scripts/ci/classify_changes.py`, which the fork deleted in #62, stay deleted with them.

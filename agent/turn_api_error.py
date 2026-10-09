@@ -228,8 +228,8 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     cap = getattr(agent, "_max_retry_wait_s", None)
     if cap is None:
         return False
-    from agent.turn_recovery_autorecover import _retry_after_seconds
-    retry_after = _retry_after_seconds(api_error)
+    from agent.retry_utils import provider_retry_after_seconds
+    retry_after = provider_retry_after_seconds(api_error)
     return retry_after is not None and retry_after > cap
 
 
@@ -372,6 +372,14 @@ def settle_unrecovered_error(
         # transport rebuild and the auto-recovery ladder below would each restart or park the
         # attempt, so both are skipped too.
         max_retries = retry_count
+
+    # An attended session on the free model does not sit through a long cooldown: end the attempt
+    # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
+    attempts_made = min(retry_count, max_retries)
+    if is_rate_limited and retry_count < max_retries and free_tier_cooldown_ends_turn(agent, api_error, _base):
+        logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
+                    agent.log_prefix, retry_count)
+        retry_count = max_retries
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for

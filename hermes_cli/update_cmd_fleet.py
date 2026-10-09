@@ -30,6 +30,11 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 # this one is the fleet-restart obligation after a git pull that advanced HEAD (#95294).
 _FLEET_RESTART_PENDING_NAME = PROFILE_MARKER_NAME
 
+# A supervisor can report a restarted unit active before the gateway finishes its
+# bootstrap and publishes ``gateway_state.json``. Keep the readiness poll bounded,
+# but allow the default systemd startup budget plus status-publication slack.
+_FLEET_PROBE_SETTLE_TIMEOUT_SECONDS = 120.0
+
 _FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
 
 _SYSTEMD_SCOPES = (("user", ["systemctl", "--user"]), ("system", ["systemctl"]))
@@ -1083,17 +1088,19 @@ def _restart_macos_launchd_gateways(
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
-    if acknowledged_label == get_launchd_label():
+    from hermes_cli.update_cmd_posix_pause import already_restarted
+    current_label = get_launchd_label()
+    resumed = already_restarted()["labels"]  # paused for the update, restarted on the new code
+    if acknowledged_label == current_label:
         # The release transaction already booted this exact label and the new
         # gateway acknowledged its loaded root. Fleet verification still checks
         # its successor; only the second mutating relaunch is omitted.
         restarted_services.append(acknowledged_label)
-    else:
+    elif current_label not in resumed:
         _restarted, _failed = _restart_launchd_gateway_after_update(
             supervision_verify=True, self_restart_pending=self_restart_pending)
         restarted_services.extend(_restarted)
         failed_or_stale_units.extend(_failed)
-    current_label = get_launchd_label()
 
     derived_labels = launchd_gateway_labels_for_install()
     # Units labelled before the profile-name suffix scheme (ai.hermes.gateway-<hash>) are invisible

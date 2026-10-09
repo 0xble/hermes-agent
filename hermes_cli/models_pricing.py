@@ -438,7 +438,7 @@ def _fetch_kilocode_pricing(timeout: float = 8.0, *, force_refresh: bool = False
     The gateway's ``-1`` rate sentinel means "varies" (auto-router models); no price is shown
     rather than a fabricated one, so such rows are skipped.
     """
-    from hermes_cli.models import _HERMES_USER_AGENT
+    from hermes_cli.models import _hermes_user_agent
 
     cache_key = _kilo_pricing_scope()
     if not cache_key:
@@ -448,7 +448,7 @@ def _fetch_kilocode_pricing(timeout: float = 8.0, *, force_refresh: bool = False
         if cached is not None:
             return cached
 
-    headers = {"Accept": "application/json", "User-Agent": _HERMES_USER_AGENT}
+    headers = {"Accept": "application/json", "User-Agent": _hermes_user_agent()}
     api_key = os.getenv("KILOCODE_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

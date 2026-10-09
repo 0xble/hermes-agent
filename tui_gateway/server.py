@@ -39,6 +39,8 @@ from agent.compaction_display import project_compaction_message_for_display  # n
 from agent.skill_commands import describe_skill_invocation  # noqa: F401
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
 from tui_gateway import git_probe, pending_moa
+from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
+                                     resolve_checkpoints_enabled as _resolve_checkpoints_enabled)  # noqa: F401
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start  # noqa: F401
 from tui_gateway.contracts import registry as _contracts

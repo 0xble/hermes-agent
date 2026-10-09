@@ -407,7 +407,8 @@ def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_fo
                     continue
                 result = _recover_one_payload(session_db, path, payload,
                                               session_resolver=session_resolver,
-                                              deferred_followup=deferred_followup)
+                                              deferred_followup=deferred_followup,
+                                              blocked_sessions=blocked_sessions)
                 if result is DROP_PENDING:
                     path.unlink(missing_ok=True)
                     continue
@@ -438,7 +439,8 @@ DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without tran
 
 
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
-                         session_resolver=None, deferred_followup=None) -> bool | object:
+                         session_resolver=None, deferred_followup=None,
+                         blocked_sessions: Dict[str, int]) -> bool | object:
     """Append a flush payload or retain a claimed follow-up until adapter admission."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.

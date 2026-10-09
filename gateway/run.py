@@ -4822,8 +4822,6 @@ def _start_gateway_housekeeping(
         # Per served profile: each profile has its own skills tree, curator state, Nous login
         # and state.db.
         (60, "Curator tick", profile_scoped_chore(runner, _housekeeping_curator), False),
-        (60, "Sync pull tick", profile_scoped_chore(runner, _housekeeping_skill_sync), False),
-        (60, "Org sync pull tick", profile_scoped_chore(runner, _housekeeping_org_skill_sync), False),
         (60, "state.db maintenance tick", profile_scoped_chore(
             runner,
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.

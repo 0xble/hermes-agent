@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
 from agent.deadline import run_bounded_async
+from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
