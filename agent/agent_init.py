@@ -2305,6 +2305,11 @@ def init_agent(
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
+    # Gateway eviction and independent workers construct fresh agents. Adopt a durable primary
+    # outage before the first turn so construction itself never leaves a cooled primary active.
+    with suppress(Exception):
+        from agent.agent_runtime_helpers import _adopt_shared_primary_cooldown
+        _adopt_shared_primary_cooldown(agent)
 
 
 __all__ = ["init_agent"]

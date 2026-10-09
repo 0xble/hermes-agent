@@ -90,7 +90,7 @@ with patch("model_tools.get_tool_definitions", return_value=[]), patch("model_to
 print(json.dumps({"before": before, "after": after, "fallback_calls": resolve.call_count}))
 """,
     )
-    assert result["before"] == "primary-model"
+    assert result["before"] == "fallback-model"
     assert result["after"] == "fallback-model"
     assert result["fallback_calls"] >= 1
 
