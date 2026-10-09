@@ -122,7 +122,7 @@ function global:New-Object {
     return Microsoft.PowerShell.Utility\New-Object -ComObject $ComObject -ArgumentList $ArgumentList
 }
 
-function New-Item {
+function global:New-Item {
     param([string]$ItemType, [switch]$Force, [string]$Path)
     if (-not [IO.Path]::GetFullPath($Path).StartsWith(
         [IO.Path]::GetFullPath($env:FAKE_INSTALL_DIR), [StringComparison]::OrdinalIgnoreCase)) {
