@@ -574,6 +574,7 @@ class SessionEntry:
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
         "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
         "restart_note_turn_id", "restart_note_reconcile_attempts", "restart_notes", "active_turn_human",
+        "yolo",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
