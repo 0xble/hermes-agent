@@ -73,6 +73,18 @@ def _derived_default_threshold_percent(agent: Any, compression: dict) -> float:
     return pct
 
 
+def _default_compression_int(key: str, fallback: int) -> int:
+    """The value a fresh agent build installs when ``compression.<key>`` is absent. agent_init reads the
+    MERGED config, so DEFAULT_CONFIG wins over the ContextCompressor ctor default; falling back to the ctor
+    alone would let a live session drift from a rebuilt one (for example a fork default above the ctor's 0)."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    value = (DEFAULT_CONFIG.get("compression") or {}).get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return int(_compressor_ctor_default(key, fallback))
+
+
 # (config key == compressor attr, ctor-default fallback, min_value)
 _COMPRESSION_INT_KEYS = (
     ("proactive_prune_tokens", 0, 0),
@@ -120,7 +132,7 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     mode = str(compression.get("tail_mode", default_tail) or default_tail).strip().lower()
     cc.tail_mode = mode if mode in ("legacy", "lean") else default_tail
     for key, fallback, min_value in _COMPRESSION_INT_KEYS:
-        default = int(_compressor_ctor_default(key, fallback))
+        default = _default_compression_int(key, fallback)
         raw = compression.get(key, default)
         with contextlib.suppress(TypeError, ValueError):
             setattr(cc, key, max(min_value, default if raw is None else int(raw)))
