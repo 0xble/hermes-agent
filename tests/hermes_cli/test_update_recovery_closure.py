@@ -98,7 +98,10 @@ def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None
     (root / ".git/info/attributes").unlink()
 
     (tmp_path / "bin").mkdir()
-    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", Path(sys.executable),
+    # The base interpreter, not this venv: a venv with an editable install of another checkout (CI's
+    # and the in-tree dev venv) would import that tree's ``hermes_bootstrap`` in place of the missing
+    # one, so the torn checkout would never reach the repair under test.
+    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", Path(getattr(sys, "_base_executable", sys.executable)),
                                                _launchers._launcher_script("hermes", root, None))
     assert launcher is not None
     return root, env, original, launcher

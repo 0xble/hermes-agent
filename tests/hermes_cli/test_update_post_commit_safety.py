@@ -283,8 +283,11 @@ _ZIP_PARENT = textwrap.dedent('''
     sys.path.insert(0, root_checkout)
     cell = Path(cell)
     calls = cell / "parent-resume-calls.jsonl"
-    from hermes_cli import main as hermes_main, update_cmd, update_inventory, update_receipt
+    from hermes_cli import main as hermes_main, update_cmd, update_inventory, update_owning_install, update_receipt
     hermes_main.PROJECT_ROOT = cell / "source"
+    # This interpreter may be the outer checkout's in-tree venv, which would send the cell's
+    # update back to that checkout instead of running it.
+    update_owning_install.retarget_to_owning_install = lambda project_root: None
     receipts = update_receipt._receipt_dir()
     receipts.mkdir(parents=True, exist_ok=True)
     os.environ["PROBE_RECEIPTS"] = str(receipts)
