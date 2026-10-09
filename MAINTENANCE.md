@@ -174,7 +174,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: goal continuation silence
 
 - **Patch identity:** `goal-continuation-silence`.
-- **Behavior:** Gateway-built standing-goal continuations (the post-turn continuation and the lifted-barrier wake) carry `reply_expected=False`, so a no-change tick that answers a bare `NO_REPLY` stays silent instead of posting the "No reply was written" fallback. A typed message absorbed into the same turn restores `reply_expected` through `MessageEvent.absorb_reply_expected`, so the human-turn guard is unchanged. Heartbeat and `/loop` prompts keep their existing contract.
+- **Behavior:** Gateway-built standing-goal continuations (the post-turn continuation and the lifted-barrier wake) carry `reply_expected=False`, so a no-change tick that answers a bare `NO_REPLY` stays silent instead of posting the "No reply was written" fallback. A typed message absorbed into the same turn restores `reply_expected` through `MessageEvent.absorb_reply_expected`, so the human-turn guard is unchanged. Heartbeat and `/loop` wakeups follow the internal-notification-silence contract: their prompts ask for a bare `[SILENT]` on a no-change tick.
 - **Source surfaces:** `gateway/run_goals.py` (`_synthetic_prompt_event`, `_post_turn_goal_continuation`, lifted-barrier wake) and `tests/gateway/test_goal_continuation_silence.py`.
 - **Upstream status:** no upstream equivalent; upstream gateway goal continuations are plain synthetic text events.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_goal_continuation_silence.py tests/gateway/test_goal_continuation_drain.py`.
@@ -190,6 +190,18 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_session_env_session_id.py tests/tools/test_mcp_caller_identity.py`.
 - **Retirement:** Remove when upstream binds the session id in the gateway turn's session context.
 - **Rollback:** Revert the mcp-caller-cached-agent fix commit.
+
+## Active patch record: Responses reasoning summary is never a reply
+
+- **Patch identity:** `responses-reasoning-summary-not-reply`.
+- **Behavior:** A Responses/Codex turn that stops cleanly with empty visible output never promotes its reasoning summary (the bolded title from `codex_reasoning_items` summary parts) to `final_response` or `api_content`. With `reply_expected=False` (relay "No reply needed", goal wakes) the turn resolves to `[SILENT]` and the gateway suppresses delivery; otherwise it walks the normal empty-response ladder (prefill, retry, fallback, generic empty copy). The exhausted-ladder preview and the content-filter refusal text no longer read the summary either. Chat-completions inline reasoning promotion (vLLM Nemotron parser, #109205) is unchanged.
+- **Discriminator:** `agent.api_mode == "codex_responses"` or a non-empty `codex_reasoning_items` carrier on the normalized message; both mean the reasoning came from Responses summary items, not an inline parser field.
+- **Source surfaces:** `agent/reasoning_summaries.py` (`is_responses_reasoning_summary`, the one detection rule), `agent/turn_final_response.py` (clean-stop promotion gate, and silence only for a contentless stop on a non-reply turn), `agent/turn_context.py` (`_turn_reply_expected` from `persist_user_display_metadata`), `gateway/run_busy.py` (`_fold_into_running_turn` refreshes `_turn_reply_expected` when a human message joins the turn), `agent/turn_empty_response.py` (`_terminal_empty` preview), `agent/turn_truncation.py` (`handle_content_policy_refusal`), and `tests/agent/test_responses_reasoning_summary_delivery.py`.
+- **Evidence:** state.db rows 6518674 and 6519049 (session `20261008_135347_0099257a`, gpt-6.1-sol via a Codex proxy): content empty, `finish_reason=stop`, `api_content` equal to the 36-char summary title; gateway logged `response=36 chars` then `[Telegram] Sending response (36 chars)`.
+- **Upstream status:** #133729 (route gate for chat-completions promotion) and #132997 (Anthropic summarized thinking) are merged; neither covers Responses summaries. No open issue or PR found for this path; contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_responses_reasoning_summary_delivery.py tests/agent/test_reasoning_only_stop_persistence.py tests/agent/test_empty_terminal_reasoning_surface.py`.
+- **Retirement:** Remove when upstream releases an equivalent Responses-summary gate.
+- **Rollback:** Revert the responses-reasoning-summary-not-reply commit.
 
 ## Update
 
@@ -246,3 +258,7 @@ branch must allow merges while retaining its required App-bound local CI, strict
 admin enforcement, and prohibition on force pushes. Conflict resolution and review happen
 on a candidate branch before normal protected landing. Unattended sync disables rerere
 so unreviewed remembered resolutions cannot silently resolve a new release conflict.
+
+## Eager plugin tools
+
+Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).

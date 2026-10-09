@@ -16,7 +16,8 @@ pending-update heartbeat probe, or reconnect token ownership.
   replies are still awaited.
 - The pending-update probe escalates only when Telegram reports a backlog **and** no update
   was dispatched since the previous probe. A backlog seen while dispatch progresses starts a
-  new window.
+  new window. Each polling generation starts the stuck window at zero. Its first probe has no
+  dispatch baseline, so it only records one and never counts as stuck.
 - A reconnect waits up to 25s for this process's previous poller on the token to finish and
   release it, instead of refusing while the old poller is still stopping.
 
@@ -54,6 +55,8 @@ not ledgered and can still be lost in that window.
 tests/plugins/test_telegram_ingress_consumer_ptb.py`. It covers:
 - the 13:26 probe shape (backlog with dispatch progress) not escalating, while a backlog
   without progress still escalates;
+- after a polling-generation reset with a carried-over stuck count, the baseline-less first
+  probe not counting, while two later baseline probes without progress still escalate;
 - command replies and busy replies on the consumer returning before the budget slot opens,
   while off the consumer they are still awaited;
 - the consumer role not being inherited by spawned tasks;
@@ -70,3 +73,25 @@ It makes no state, schema or configuration change.
 **Retirement:** Retire the probe change once upstream probes pending updates against dispatch
 progress. Retire the consumer offload once replies on the ingress path no longer share a paced
 outbound queue.
+
+## 2026-10-08 Dispatcher-stall diagnostics
+
+When the once-per-stall healthy-but-deaf stall is detected, the adapter emits one bounded
+`[Telegram] deaf-dispatcher diagnostics:` warning. It includes the PTB update queue depth, the
+concurrency and semaphore state when available, the time since the last dispatched update, and the
+await chain of up to five PTB fetcher or update-processing tasks. `Task.get_stack()` stops at the
+task's own coroutine, so the adapter follows `cr_await` down to the frame that is actually blocked,
+which is usually a handler nested under PTB's fetcher and wrapper coroutines. Frames are rendered as
+`func@file.py:line`. Since v0.21.6 the stall hands the adapter to the supervisor for a rebuild, so
+the diagnostics are logged first, while the wedged tasks still exist. Collection is best-effort and
+cannot alter recovery, user-visible Telegram behavior or pacing.
+
+**Regression:** `tests/gateway/test_telegram_ingress_delivery_gap.py` covers a handler blocked two
+awaits below a PTB-named processing task, which must appear in order in the logged chain. It also
+covers bounded output, once-per-stall emission, and diagnostic failure isolation.
+
+**Rollback:** Revert the `fix(telegram): log the dispatcher await chain when ingress goes deaf`
+commit. It makes no state, schema or configuration change.
+
+**Retirement:** Retire this once a deaf-dispatcher stall has been attributed to a root cause and
+fixed, or upstream ships an equivalent dispatcher diagnostic.

@@ -316,6 +316,9 @@ class CLIStreamMixin:
         if text is None:
             # An intermediate tool boundary means more assistant text will follow, so a held
             # marker candidate is content there: release it through the normal display path.
+            silence_held, self._silence_hold = getattr(self, "_silence_hold", ""), ""
+            if silence_held:
+                self._emit_unheld(silence_held)
             held = getattr(self, "_loop_complete_hold", "")
             self._loop_complete_hold = ""
             if held:
@@ -325,6 +328,14 @@ class CLIStreamMixin:
             return
         if not text:
             return
+        if getattr(self, "_silence_hold_active", False):
+            # A heartbeat or /loop wakeup may answer only [SILENT]: hold text while it could
+            # still be that marker so it is never shown, and stream normally once it diverges.
+            from gateway.response_filters import is_partial_silence_marker
+            self._silence_hold = getattr(self, "_silence_hold", "") + text
+            if is_partial_silence_marker(self._silence_hold):
+                return
+            text, self._silence_hold, self._silence_hold_active = self._silence_hold, "", False
         from gateway.response_filters import (
             ends_with_partial_loop_complete_marker,
             split_trailing_loop_complete_marker,
@@ -549,6 +560,13 @@ class CLIStreamMixin:
         """Emit any remaining partial line from the stream buffer and close the box."""
         from agent.markdown_tables import is_table_divider, looks_like_table_row
         from cli import _ACCENT, _RST, _cprint, _strip_markdown_syntax
+        # End of turn: a held bare silence marker on a wakeup turn is dropped; a held prefix
+        # that never completed one (a reply that is just "NO") is content.
+        silence_held, self._silence_hold = getattr(self, "_silence_hold", ""), ""
+        if silence_held:
+            from gateway.response_filters import is_intentional_silence_response
+            if not is_intentional_silence_response(silence_held):
+                self._emit_unheld(silence_held)
         # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
         # anything else held (a partial prefix, a marker inside an open fence) is content.
         self._resolve_loop_complete_hold()
@@ -582,6 +600,9 @@ class CLIStreamMixin:
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
         self._stream_buf = ""
+        self._silence_hold = ""
+        # Re-armed per segment: the reply after a tool call may still be the bare marker.
+        self._silence_hold_active = getattr(self, "_quiet_wakeup_turn", False)
         self._loop_complete_hold = ""
         self._loop_complete_seen = ""
         self._stream_started = False

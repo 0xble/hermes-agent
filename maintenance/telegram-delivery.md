@@ -163,6 +163,16 @@ migration is involved.
 call, sized by chat class, shedding cosmetic traffic and widening on `retry_after`, and passes
 the regression above.
 
+## Deferred Outbound-Class Isolation
+
+**Patch identity:** `telegram-outbound-class`. Durable outbox rows preserve their outbound class
+before a deferred sweep is created, and replay binds that class explicitly. A sweep created while a
+notice or progress send is in flight therefore cannot shed a replayed final at the daily ceiling;
+legacy rows without a class default to the protected final class, while interim metadata remains
+progress. Source: `gateway/outbox.py`; proof: `tests/gateway/test_outbox_coalesced_sweep.py`.
+Retire when the durable delivery owner records and restores outbound classes through an equivalent
+released upstream mechanism.
+
 ## Provenance and patches
 
 - Fork patch identities: `slice-10-flood-coherence`, `slice-10-telegram-delivery`,

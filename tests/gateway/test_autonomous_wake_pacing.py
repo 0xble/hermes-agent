@@ -332,26 +332,84 @@ async def test_window_zero_keeps_only_same_tick_fan_in(hermes_home):
 
 @pytest.mark.asyncio
 async def test_watcher_holds_routine_delegation_results_and_delivers_one_turn(hermes_home, monkeypatch):
+    import gateway.run_notifications as notifications
     import tools.process_registry as pr_module
 
     q = queue.Queue()
     monkeypatch.setattr(pr_module.process_registry, "completion_queue", q)
     runner, adapter = _fan_in_runner(window=1.0, last_turn_age=None)
 
-    async def _drive():
-        task = asyncio.create_task(runner._async_delegation_watcher(interval=0.05))
-        await asyncio.sleep(3.1)  # watcher's startup delay is 3s
-        # A turn just started; two routine results land a few watcher ticks apart.
+    # The production watcher has a connection-startup delay. Replace only that delay with an
+    # explicit readiness signal; the test must not infer readiness from elapsed wall-clock time.
+    startup_ready = asyncio.Event()
+    real_sleep = notifications.asyncio.sleep
+
+    async def _sleep(delay, *args, **kwargs):
+        if delay == 3:
+            startup_ready.set()
+            return
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(notifications.asyncio, "sleep", _sleep)
+
+    # Hold the first flush behind an explicit release so a second queue item is guaranteed to join
+    # the same production batch, independent of scheduler load.
+    flush_waiting = asyncio.Event()
+    flush_release = asyncio.Event()
+
+    async def _wait_batch_window(delay, release):
+        del delay, release
+        flush_waiting.set()
+        await flush_release.wait()
+
+    runner._wait_batch_window = _wait_batch_window
+    second_enqueued = asyncio.Event()
+    delivery_settled = asyncio.Event()
+    original_enqueue = runner._enqueue_async_delegation_group
+    original_deliver = runner._deliver_async_delegation_group
+
+    async def _enqueue(group):
+        result = await original_enqueue(group)
+        if any(evt["delegation_id"] == "deleg_b" for evt in group):
+            second_enqueued.set()
+        return result
+
+    async def _deliver(group):
+        result = await original_deliver(group)
+        delivery_settled.set()
+        return result
+
+    runner._enqueue_async_delegation_group = _enqueue
+    runner._deliver_async_delegation_group = _deliver
+
+    async def _reach(awaitable, what):
+        # Hang guard only: the success path is ordered by the events above and never waits on it.
+        try:
+            return await asyncio.wait_for(awaitable, timeout=10)
+        except asyncio.TimeoutError:
+            raise AssertionError(f"watcher never reached: {what}") from None
+
+    task = asyncio.create_task(runner._async_delegation_watcher(interval=0.05))
+    try:
+        await _reach(startup_ready.wait(), "startup")
         runner._session_state(ROUTE["session_key"]).conversation.last_turn_started_at = time.time()
         q.put(_persist_pending(_delegation("deleg_a")))
-        await asyncio.sleep(0.3)
+        await _reach(flush_waiting.wait(), "a held flush for deleg_a")
         assert adapter.handle_message.await_count == 0
-        q.put(_persist_pending(_delegation("deleg_b")))
-        await _settle(lambda: adapter.handle_message.await_count >= 1, timeout=3.0)
-        runner._running = False
-        await asyncio.wait_for(task, timeout=2.0)
 
-    await _drive()
+        q.put(_persist_pending(_delegation("deleg_b")))
+        await _reach(second_enqueued.wait(), "deleg_b joining the held batch")
+        assert adapter.handle_message.await_count == 0
+
+        flush_release.set()
+        await _reach(delivery_settled.wait(), "delivery of the held batch")
+        runner._running = False
+        await _reach(task, "watcher shutdown")
+    finally:
+        runner._running = False
+        if not task.done():
+            task.cancel()
+
     adapter.handle_message.assert_awaited_once()
     text = adapter.handle_message.await_args.args[0].text
     assert "2 background subagent delegations" in text and "deleg_a" in text and "deleg_b" in text

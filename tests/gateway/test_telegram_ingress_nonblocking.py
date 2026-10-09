@@ -59,6 +59,55 @@ async def test_pending_backlog_without_dispatch_progress_still_escalates():
     recovery.assert_awaited_once()
 
 
+def _reset_generation(adapter: TelegramAdapter, *, carried_stuck: int) -> None:
+    """Start a new polling generation while a stuck count is carried over from the previous one."""
+    adapter._polling_pending_dispatched_seen = 7
+    adapter._polling_pending_stuck_count = carried_stuck
+    adapter._begin_polling_generation()
+    assert adapter._polling_pending_dispatched_seen is None
+
+
+@pytest.mark.asyncio
+async def test_first_probe_after_generation_reset_only_records_baseline():
+    """No baseline means no stall evidence: a busy batch at the first probe must not restart polling."""
+    adapter = _probe_adapter(pending=1)
+    _reset_generation(adapter, carried_stuck=1)
+    assert adapter._polling_pending_stuck_count == 0
+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as recovery:
+        await adapter._probe_pending_updates(adapter._bot, 5)
+        assert adapter._polling_pending_stuck_count == 0
+        assert adapter._polling_pending_dispatched_seen == 0
+        assert adapter._polling_error_task is None
+    recovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_two_baseline_probes_without_progress_after_reset_still_escalate():
+    adapter = _probe_adapter(pending=1)
+    _reset_generation(adapter, carried_stuck=1)
+    recovery = AsyncMock()
+    with patch.object(adapter, "_handle_polling_network_error", new=recovery):
+        await adapter._probe_pending_updates(adapter._bot, 5)  # baseline only
+        await adapter._probe_pending_updates(adapter._bot, 5)  # first probe with a baseline: 1/2
+        assert adapter._polling_pending_stuck_count == 1
+        assert adapter._polling_error_task is None
+        await adapter._probe_pending_updates(adapter._bot, 5)  # second with no progress: wedged
+        await adapter._polling_error_task
+    recovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_progress_between_probes_after_reset_does_not_escalate():
+    adapter = _probe_adapter(pending=1)
+    _reset_generation(adapter, carried_stuck=1)
+    with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as recovery:
+        for _ in range(4):
+            await adapter._probe_pending_updates(adapter._bot, 5)
+            adapter._updates_dispatched_total += 1
+        assert adapter._polling_error_task is None
+    recovery.assert_not_called()
+
+
 async def _on_consumer(coro):
     token = ingress_consumer_scope()
     try:

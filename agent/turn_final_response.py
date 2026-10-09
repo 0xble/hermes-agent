@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
 from agent.reasoning_promotion import answer_in_reasoning_capability
+from agent.reasoning_summaries import is_responses_reasoning_summary
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
 from agent.turn_failure_copy import stamp_failure
 from agent.turn_empty_response import recover_empty_response
@@ -127,10 +128,19 @@ def finish_text_response(
     # takes the empty-response continuation below instead.
     _content = assistant_message.content
     _promoted = None
-    if (
+    # Responses/Codex reasoning is a provider-generated summary, not the assistant's visible
+    # answer. The encrypted item and its summary are retained for replay, but must never enter
+    # final_response or api_content. Chat-completions parsers (including vLLM's Nemotron route)
+    # have no codex_reasoning_items carrier and keep the legacy promotion behavior.
+    _responses_reasoning_summary = is_responses_reasoning_summary(agent, assistant_message)
+    _contentless_stop = (
         finish_reason == "stop"
         and not assistant_message.tool_calls
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
+    )
+    if (
+        _contentless_stop
+        and not _responses_reasoning_summary
         and not any(
             isinstance(d, dict) and (
                 (d.get("type") in ("thinking", "redacted_thinking") and (d.get("signature") or d.get("data")))
@@ -151,6 +161,16 @@ def finish_text_response(
                 sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")),
             )
     final_response = _promoted or assistant_message.content or ""
+    # A gateway turn that explicitly does not expect a reply treats a contentless Responses
+    # reasoning summary like the ordinary silence token. Keep the assistant row's visible content
+    # empty and never copy the summary into api_content; the gateway suppresses [SILENT].
+    # Only a contentless stop qualifies: visible text on a goal wake or relay turn is a real reply.
+    if (
+        _contentless_stop
+        and _responses_reasoning_summary
+        and getattr(agent, "_turn_reply_expected", None) is False
+    ):
+        final_response = "[SILENT]"
     # Interactive gateway replies may contain a control marker on a final standalone line after
     # substantive prose. Strip it before the assistant row is flushed; autonomous cron/webhook
     # lanes keep their existing first/last-line silence semantics.

@@ -218,8 +218,43 @@ def _snapshot_file(home: Path, path: str) -> str:
     return str(target)
 
 
+def _outbound_class_for_payload(payload: dict[str, Any]) -> str:
+    """Persist the semantic class before a durable send crosses into a child task."""
+    from gateway.platforms.base import OUTBOUND_FINAL, OUTBOUND_PROGRESS, current_outbound_class
+
+    current = current_outbound_class()
+    if current is not None:
+        return current
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("_interim_send"):
+        return OUTBOUND_PROGRESS
+    return OUTBOUND_FINAL
+
+
+def _replay_outbound_class(payload: dict[str, Any]) -> str:
+    """Rebind replayed rows explicitly; legacy rows default to the protected final class."""
+    from gateway.platforms.base import OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS
+
+    kind = payload.get("_outbound_class")
+    if kind in {OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS}:
+        return kind
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("_interim_send"):
+        return OUTBOUND_PROGRESS
+    return OUTBOUND_FINAL
+
+
 def wire_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if key != "_outbox_original"}
+    return {key: value for key, value in payload.items() if key not in {"_outbox_original", "_outbound_class"}}
+
+
+def _same_send(stored: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Match a stored row against a re-sent payload by what reaches the wire.
+
+    The outbound class is delivery metadata, not message identity: rows written before it was
+    persisted, or the same reply sent under another class, must still dedupe.
+    """
+    return wire_payload(stored.get("_outbox_original", stored)) == wire_payload(payload)
 
 
 def _discard_delivered_media(home: Path, payload: dict[str, Any]) -> None:
@@ -375,6 +410,8 @@ async def deliver(adapter, kind: str, payload: dict[str, Any], send):
     turn = active_turn()
     if turn is None:
         return await send(payload)
+    payload = dict(payload)
+    payload.setdefault("_outbound_class", _outbound_class_for_payload(payload))
     home, turn_id = turn
     store = await _store_io_retry(store_for, home)
     lock = _TURN_LOCKS.setdefault(turn, asyncio.Lock())
@@ -447,7 +484,11 @@ async def _schedule_retry(store: "Outbox", adapter) -> None:
         existing[1].set()
         return
     wake = asyncio.Event()
-    task = asyncio.create_task(_deferred_sweep(store, adapter, profile, key, wake))
+    from gateway.platforms.base import OUTBOUND_FINAL, outbound_class
+    # Background sweeps must never inherit a caller's notice/progress label. Each row
+    # is rebound below from its persisted class before its adapter call.
+    with outbound_class(OUTBOUND_FINAL):
+        task = asyncio.create_task(_deferred_sweep(store, adapter, profile, key, wake))
     _SWEEPS[key] = (task, wake)
 
 
@@ -567,21 +608,23 @@ async def _recover_locked(store: "Outbox", adapter, *, startup: bool) -> tuple[i
             flight = (store.path, row.idempotency_key)
             _IN_FLIGHT.add(flight)
             try:
-                with transport_bypass():
-                    if row.type == "control_prompt":
-                        from gateway.platforms.base import SendResult
-                        from telegram import InlineKeyboardMarkup
-                        payload = wire_payload(row.payload)
-                        markup = payload.get("reply_markup")
-                        if markup is not None:
-                            payload["reply_markup"] = InlineKeyboardMarkup.de_json(markup, adapter._bot)
-                        message = await adapter._send_control_message(**payload)
-                        result = SendResult(success=True, message_id=str(message.message_id))
-                    else:
-                        payload = wire_payload(row.payload)
-                        if row.type == "send_multiple_images" and "images" in payload:
-                            payload["images"] = [tuple(image) for image in payload["images"]]
-                        result = await getattr(adapter, row.type)(**payload)
+                from gateway.platforms.base import outbound_class
+                with outbound_class(_replay_outbound_class(row.payload)):
+                    with transport_bypass():
+                        if row.type == "control_prompt":
+                            from gateway.platforms.base import SendResult
+                            from telegram import InlineKeyboardMarkup
+                            payload = wire_payload(row.payload)
+                            markup = payload.get("reply_markup")
+                            if markup is not None:
+                                payload["reply_markup"] = InlineKeyboardMarkup.de_json(markup, adapter._bot)
+                            message = await adapter._send_control_message(**payload)
+                            result = SendResult(success=True, message_id=str(message.message_id))
+                        else:
+                            payload = wire_payload(row.payload)
+                            if row.type == "send_multiple_images" and "images" in payload:
+                                payload["images"] = [tuple(image) for image in payload["images"]]
+                            result = await getattr(adapter, row.type)(**payload)
             except asyncio.CancelledError:
                 await _write_receipt(store, row, message_id=None, success=False)
                 _IN_FLIGHT.discard(flight)
@@ -774,7 +817,7 @@ class Outbox:
                              (turn_id,)).fetchone()
             if row and row["state"] == "pending" and row["retry_at"] is None and row["type"] == kind:
                 stored = json.loads(row["payload"])
-                if stored.get("_outbox_original", stored) == payload:
+                if _same_send(stored, payload):
                     return self._row(row)
             return None
 
@@ -784,7 +827,7 @@ class Outbox:
                                   "AND (state IN ('sending','ambiguous','expired_ambiguous') "
                                   "OR (state='pending' AND retry_at IS NOT NULL))", (turn_id, kind)):
                 stored = json.loads(row[0])
-                if stored.get("_outbox_original", stored) == payload:
+                if _same_send(stored, payload):
                     return True
         return False
 

@@ -382,6 +382,16 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         try:
             from agent.vault_origin_aliases import apply_origin_aliases
             metas = apply_origin_aliases(backend.list_items())
+            # A cached 1Password display listing can hide an item added by the user moments ago.
+            # An origin-filtered miss is the one case where freshness is worth another op call;
+            # matching cached logins, other filters, and unfiltered listings keep the quota-saving path.
+            if (origin is not None and kind in (None, "login")
+                    and (backend.name == "onepassword" or backend.name.startswith("onepassword@"))
+                    and not any(meta.kind == "login" and origin in (meta.allowed_origins or (meta.origin,))
+                                for meta in metas)):
+                from agent.vault_backends.onepassword import OnePasswordLoginBackend
+                if isinstance(backend, OnePasswordLoginBackend):
+                    metas = apply_origin_aliases(backend.list_items(fresh=True))
         except Exception as exc:
             errors.append({"backend": backend.name, "error": str(exc)[:200]})
             continue
@@ -680,7 +690,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                                "error": "Alias-origin login confirmation was declined or unanswered. Do not retry; ask the user to fill the login or explicitly start a new approval session."})
         if decision is None:
             decision = _confirm_alias_fill(meta.label, page_origin, saved_origins)
-            _record_alias_fill_decision(alias_key, "accept" if decision == "accept" else "refused")
+            if decision != "accept":
+                _record_alias_fill_decision(alias_key, "refused")
+            elif refusal := _alias_fill_revalidation_refusal(raw_meta, page_origin):
+                # The prompt can wait for hours (approvals.timeout); `allowed` above predates it.
+                # Nothing is cached, so a re-added alias asks again instead of reusing this acceptance.
+                return refusal
+            else:
+                _record_alias_fill_decision(alias_key, "accept")
         if decision != "accept":
             return json.dumps({"success": False,
                                "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
@@ -892,6 +909,26 @@ def _confirm_payment_fill(label: str, origin: str) -> str:
         "The agent wants to enter your saved card details into this checkout page. The card number and "
         "CVC never enter the conversation. Approve only if you intend to pay here.",
         surface="vault-payment", title="Confirm payment card fill?")
+
+
+def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | None:
+    """Re-authorize an alias-only login fill after its confirmation prompt returns.
+
+    The prompt can wait up to ``approvals.timeout``. Re-read ``vault.origin_aliases`` through the
+    same registry path used before the prompt (it revalidates the config file signature), and
+    refuse when the exact page origin is no longer allowed. A navigation during the wait is
+    already refused at write time by the fill script's ``expected_origin`` check.
+    """
+    from agent.vault_origin_aliases import apply_origin_aliases
+
+    fresh = apply_origin_aliases([raw_meta])[0]
+    allowed = list(fresh.allowed_origins) or ([str(fresh.origin)] if fresh.origin else [])
+    if page_origin not in allowed:
+        return json.dumps({"success": False, "error_type": "origin_alias_revoked",
+                           "error": (f"Refused: the origin alias for {page_origin} was removed from "
+                                     "vault.origin_aliases while the confirmation was pending. Nothing was written. "
+                                     "Do not re-add it without the user's instruction.")})
+    return None
 
 
 def _confirm_alias_fill(label: str, origin: str, saved_origins: tuple[str, ...]) -> str:
