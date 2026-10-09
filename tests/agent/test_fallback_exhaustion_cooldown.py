@@ -39,6 +39,18 @@ def _make_agent(fallback_model=None):
         return agent
 
 
+def _expire_shared_window(agent):
+    """Move the shared record's reset into the past: the cooldown is over for every process,
+    not only for this agent's in-memory deadline (turn start re-reads the shared record)."""
+    import time
+    from agent.shared_primary_cooldown import _locked_state, _write_state, route_from_agent, route_key
+    route = route_from_agent(agent)
+    with _locked_state() as (path, state):
+        entry = state["routes"][route_key(provider=route[0], base_url=route[1], model=route[2])]
+        entry["reset_at"] = time.time() - 1
+        _write_state(path, state)
+
+
 def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock = MagicMock()
     mock.base_url = base_url
@@ -194,6 +206,7 @@ class TestRateLimitBackoffEscalation:
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
         agent._fallback_activated = True
         agent._rate_limited_until = 0
+        _expire_shared_window(agent)
         assert agent._restore_primary_runtime() is True
         with (
             patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
@@ -249,6 +262,7 @@ class TestRateLimitBackoffEscalation:
         # Cooldown expired; the primary restores successfully.
         agent._fallback_activated = True
         agent._rate_limited_until = 0
+        _expire_shared_window(agent)
         assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
         # Restoring only makes the primary eligible for a probe; the shared outage (and its

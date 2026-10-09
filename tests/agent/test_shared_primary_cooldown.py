@@ -63,6 +63,7 @@ print(json.dumps({{'active': bool(record), 'claim': claim_outage_notice(route, r
     )
     assert third == {"active": True, "claim": False}
 
+
 def test_fresh_agent_after_eviction_adopts_cooldown_without_primary_call(tmp_path):
     """The gateway eviction regression: a second AIAgent reads the durable record at turn start."""
     result = _run(
@@ -117,7 +118,6 @@ print(json.dumps(arm_cooldown({route!r}, reason='rate_limit', backoff_count=1)))
     assert first["reset_at"] - first["recorded_at"] >= 59
     assert second["backoff_count"] == 2
     assert second["reset_at"] - second["recorded_at"] >= 119
-
 
 
 # ── Real request path (AIAgent.run_conversation against a loopback stub) ────────────────────
@@ -270,3 +270,221 @@ def test_rearm_onto_the_announced_fallback_stays_silent():
     _activate(second, reset_at=time.time() + 7200)
     assert second.model == "fallback-one"
     assert _pending(second) == []
+
+
+# ── Cached fallback agent vs. a longer cooldown armed by another process (review round 2, P1) ─
+#
+# A long-lived (gateway-cached) agent goes to the fallback with a short in-memory window. Another
+# process then re-arms the SAME outage with a much longer provider reset. When the cached agent's
+# own window passes, its next turn must follow the shared record: stay on the fallback, leave the
+# long reset in place for everyone, and make no primary call.
+
+_CACHED_AGENT_CHILD = r'''
+import json, os, sys, time
+from run_agent import AIAgent
+url, go_file, ready_file = sys.argv[1:4]
+notices = []
+fallback = [{"provider": "custom", "model": "fallback-model", "base_url": url, "api_key": "fixture", "api_mode": "chat_completions"}]
+agent = AIAgent(
+    api_key="fixture", base_url=url, provider="custom", model="primary-model",
+    api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True,
+    enabled_toolsets=[], fallback_model=fallback, max_iterations=3,
+    status_callback=lambda kind, message: notices.append(str(message)),
+)
+first = agent.run_conversation("hello")
+open(ready_file, "w").close()
+deadline = time.time() + 120
+while not os.path.exists(go_file):
+    if time.time() > deadline:
+        raise SystemExit("timed out waiting for the re-arm")
+    time.sleep(0.05)
+# This agent's own short window has passed (the gateway keeps the object across turns).
+agent._rate_limited_until = 0
+second = agent.run_conversation("hello again")
+agent.close()
+print(json.dumps({
+    "first": first.get("final_response"), "second": second.get("final_response"),
+    "model_after": agent.model, "notices": notices,
+}))
+'''
+
+
+def test_cached_fallback_agent_honors_longer_cooldown_armed_by_another_process(tmp_path):
+    home = tmp_path / ".hermes"
+    write_home_config(home)
+    go_file, ready_file = tmp_path / "go", tmp_path / "ready"
+    env = os.environ.copy()
+    env.update({"HERMES_HOME": str(home), "PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"})
+    for key in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        env.pop(key, None)
+    with StubProvider() as stub:
+        stub.retry_after = None  # agent A arms only the short 60 s shared backoff
+        agent_a = subprocess.Popen(
+            [sys.executable, "-c", _CACHED_AGENT_CHILD, stub.url, str(go_file), str(ready_file)],
+            cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 150
+            while not ready_file.exists():
+                assert agent_a.poll() is None, agent_a.communicate()
+                assert time.time() < deadline, "agent A never finished its first turn"
+                time.sleep(0.05)
+            short = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8"))["routes"].values()))
+            assert short["reset_at"] - short["recorded_at"] < 120, short
+            # Process B probes, gets a 429 with a 2 h provider reset and re-arms the same outage.
+            rearmed = _run(home, f"""
+import json, time
+from agent.shared_primary_cooldown import arm_cooldown, route_from_record
+print(json.dumps(arm_cooldown(route_from_record({short!r}), reason="rate_limit", reset_at=time.time() + 7200)))
+""")
+            assert rearmed["outage_id"] == short["outage_id"]
+            primary_before = len(stub.primary_requests())
+            go_file.touch()
+            out, err = agent_a.communicate(timeout=150)
+        finally:
+            if agent_a.poll() is None:
+                agent_a.kill()
+        assert agent_a.returncode == 0, err
+        result = json.loads(out.strip().splitlines()[-1])
+        primary_after = len(stub.primary_requests())
+    after = next(iter(json.loads(_record_path(home).read_text(encoding="utf-8"))["routes"].values()))
+    assert result["first"] == "OK from fallback-model"
+    assert primary_after - primary_before == 0, "the cached agent called the cooled primary"
+    assert result["second"] == "OK from fallback-model", result
+    assert result["model_after"] == "fallback-model", result
+    assert after["outage_id"] == short["outage_id"]
+    assert after["reset_at"] - time.time() > 7000, f"the long shared cooldown was overwritten: {after}"
+    assert not [n for n in result["notices"] if "restored" in n], result["notices"]
+
+
+# ── Stale outages (review round 2, P2-1) ─────────────────────────────────────────────────────
+
+from agent import shared_primary_cooldown as spc  # noqa: E402
+
+_ROUTE = ("custom:fixture", "http://127.0.0.1:8317/v1", "primary")
+
+
+def _age_record(route, *, reset_ago, window):
+    """Rewrite the record as if it expired ``reset_ago`` seconds ago after a ``window`` cooldown."""
+    with spc._locked_state() as (path, state):
+        entry = state["routes"][spc.route_key(provider=route[0], base_url=route[1], model=route[2])]
+        entry["reset_at"] = time.time() - reset_ago
+        entry["recorded_at"] = entry["reset_at"] - window
+        spc._write_state(path, state)
+
+
+def test_stale_record_starts_a_new_outage_with_a_fresh_notice_and_backoff():
+    first = spc.arm_cooldown(_ROUTE, reason="rate_limit", backoff_count=0)
+    for _ in range(3):  # escalate the shared level to 4
+        spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    assert spc.claim_outage_notice(_ROUTE, first["outage_id"], fallback=("fb", "openai"))
+    _age_record(_ROUTE, reset_ago=3 * 86_400, window=480)  # days later
+    later = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    assert later["outage_id"] != first["outage_id"]
+    assert later["notice_claimed"] is False
+    assert "notice_fallback" not in later
+    assert later["backoff_count"] == 1
+    assert 59 <= later["reset_at"] - later["recorded_at"] <= 61
+    assert spc.claim_outage_notice(_ROUTE, later["outage_id"]) is True
+
+
+def test_recently_expired_record_is_still_the_same_outage():
+    first = spc.arm_cooldown(_ROUTE, reason="rate_limit", backoff_count=0)
+    assert spc.claim_outage_notice(_ROUTE, first["outage_id"])
+    _age_record(_ROUTE, reset_ago=spc._STALE_GRACE_FLOOR_SECONDS - 60, window=60)
+    again = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    assert again["outage_id"] == first["outage_id"]
+    assert again["notice_claimed"] is True
+    assert again["backoff_count"] == 2
+
+
+def test_grace_scales_with_a_long_window():
+    spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 7200)
+    # 30 min past a 2 h window: beyond the 10 min floor but inside the window-sized grace.
+    _age_record(_ROUTE, reset_ago=1800, window=7200)
+    assert spc.get_cooldown(_ROUTE) is not None
+    _age_record(_ROUTE, reset_ago=7300, window=7200)
+    assert spc.get_cooldown(_ROUTE) is None
+
+
+def test_readers_prune_stale_records():
+    other = ("custom:fixture", "http://127.0.0.1:8317/v1", "other")
+    spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 7200)
+    spc.arm_cooldown(other, reason="rate_limit")
+    _age_record(other, reset_ago=86_400, window=60)
+    assert [r["model"] for r in spc.list_cooldowns()] == ["primary"]
+    routes = json.loads(spc._state_path().read_text(encoding="utf-8"))["routes"]
+    assert [entry["model"] for entry in routes.values()] == ["primary"]
+
+
+# ── Turn-start adoption details (review round 2, P2-2 and P3) ────────────────────────────────
+
+def _arm_for(agent, seconds=7200):
+    from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+    return arm_cooldown(route_from_agent(agent), reason="rate_limit", reset_at=time.time() + seconds)
+
+
+def test_stranded_fallback_index_does_not_send_the_turn_to_a_cooled_primary():
+    with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
+        agent = _agent_with_chain(_CHAIN)
+    _arm_for(agent)
+    agent._fallback_index = len(_CHAIN)  # stranded by an earlier failed activation
+    clients = {"fallback-one": (_fallback_client("https://one.invalid/v1"), "fallback-one")}
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        side_effect=lambda _provider, model=None, **_kw: clients[model],
+    ):
+        assert agent._restore_primary_runtime() is False
+    assert agent.model == "fallback-one"
+    assert agent._fallback_activated is True
+
+
+def test_adoption_skips_the_state_file_without_a_fallback_chain():
+    with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
+        agent = _agent_with_chain([])
+    with patch("agent.shared_primary_cooldown.get_cooldown", side_effect=AssertionError("locked")):
+        from agent.agent_runtime_helpers import _adopt_shared_primary_cooldown
+        assert _adopt_shared_primary_cooldown(agent) is False
+        assert agent._restore_primary_runtime() is False
+    assert agent.model == "primary-model"
+
+
+def test_cleared_cooldown_reaches_a_cached_fallback_agent_at_its_next_turn():
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent, reset_at=time.time() + 7200)
+    assert agent.model == "fallback-one"
+    assert agent._restore_primary_runtime() is False  # still cooling for everyone
+    assert spc.clear_cooldowns(all_routes=True)
+    assert agent._restore_primary_runtime() is True  # next turn start re-reads the record
+    assert agent.model == "primary-model"
+
+
+def test_cached_fallback_agent_adopts_a_longer_shared_window():
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)  # 60 s shared backoff
+    _arm_for(agent)  # another process re-arms the same outage for 2 h
+    agent._rate_limited_until = 0  # this agent's own window has passed
+    assert agent._restore_primary_runtime() is False
+    assert agent.model == "fallback-one"
+    assert agent._rate_limited_until - time.monotonic() > 7000
+    assert spc.active_cooldown(spc.route_from_agent(agent))["reset_at"] - time.time() > 7000
+
+
+# ── Exact cooldown clearing (review round 2, P2-3) ───────────────────────────────────────────
+
+def test_clear_cooldowns_matches_exactly():
+    a = ("custom:claude-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5-5")
+    b = ("custom:codex-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5-5")
+    c = ("custom:claude-proxy", "http://127.0.0.1:8317/v1", "claude-opus-5")
+    for route in (a, b, c):
+        spc.arm_cooldown(route, reason="rate_limit", reset_at=time.time() + 7200)
+    assert spc.clear_cooldowns("opus") == []  # no substring matches
+    assert spc.clear_cooldowns("claude-proxy") == []
+    removed = spc.clear_cooldowns("CUSTOM:codex-proxy/claude-opus-5-5")
+    assert [(r["provider"], r["model"]) for r in removed] == [("custom:codex-proxy", "claude-opus-5-5")]
+    assert [r["model"] for r in spc.clear_cooldowns("claude-opus-5")] == ["claude-opus-5"]
+    assert len(spc.clear_cooldowns(all_routes=True)) == 1
+    with pytest.raises(ValueError):
+        spc.clear_cooldowns()
+    with pytest.raises(ValueError):
+        spc.clear_cooldowns("x", all_routes=True)

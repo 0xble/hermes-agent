@@ -58,11 +58,22 @@ def route_from_record(record: dict[str, Any]) -> tuple[str, str, str]:
 
 
 def route_from_agent(agent: Any) -> tuple[str, str, str]:
-    runtime = getattr(agent, "_primary_runtime", None) or {}
+    """The agent's configured primary route.
+
+    Once the primary snapshot exists it is the only source: the live attributes may already
+    describe a fallback, and mixing them in would key the record by the fallback's model.
+    """
+    runtime = getattr(agent, "_primary_runtime", None)
+    if isinstance(runtime, dict) and runtime:
+        return (
+            str(runtime.get("provider") or "").strip().lower(),
+            normalize_route_base_url(runtime.get("base_url") or ""),
+            str(runtime.get("model") or "").strip(),
+        )
     return (
-        str(runtime.get("provider") or getattr(agent, "provider", "") or "").strip().lower(),
-        normalize_route_base_url(runtime.get("base_url") or getattr(agent, "base_url", "")),
-        str(runtime.get("model") or getattr(agent, "model", "") or "").strip(),
+        str(getattr(agent, "provider", "") or "").strip().lower(),
+        normalize_route_base_url(getattr(agent, "base_url", "") or ""),
+        str(getattr(agent, "model", "") or "").strip(),
     )
 
 

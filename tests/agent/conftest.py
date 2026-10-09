@@ -33,6 +33,7 @@ def _isolated_shared_primary_cooldown(monkeypatch, tmp_path):
         lambda: tmp_path / "state" / "model_cooldowns.json",
     )
 
+
 @pytest.fixture(autouse=True)
 def _fast_retry_backoff(request, monkeypatch):
     """Short-circuit retry backoff for all tests in this directory.
