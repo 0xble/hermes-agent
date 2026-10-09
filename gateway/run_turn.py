@@ -4204,6 +4204,9 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
+        # The streamed message is the body only; copy blocks go out as separate messages.
+        from gateway.copy_blocks import strip_copy_blocks
+        content = strip_copy_blocks(content or "")
         try:
             _res = await _sc.adapter.edit_message(
                 chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,

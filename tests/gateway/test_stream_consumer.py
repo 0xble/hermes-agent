@@ -1633,3 +1633,27 @@ class TestCopyBlocksNeverStream:
         assert "[[co" not in joined.replace("```\n[[copy]]\nliteral in fence", "")
         assert "middle" in joined and "after" in joined
         assert "literal in fence" in joined
+
+
+class TestStreamedReconcileEditsOmitCopyBlocks:
+
+    @pytest.mark.parametrize("transformed", [False, True])
+    def test_reconcile_edit_never_carries_copy_syntax(self, transformed):
+        from gateway.run_turn import GatewayTurnMixin
+        adapter = MagicMock()
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        consumer = SimpleNamespace(
+            adapter=adapter, message_id="m1", final_content_delivered=True,
+            final_response_sent=True, _turn_split_delivery=False,
+            delivered_final_matches=lambda _t: False,
+        )
+        final = "visible\nmore\n[[copy]]\nSECRET\n[[/copy]]\n"
+        response = {"final_response": final, "response_transformed": transformed}
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[consumer], source=SimpleNamespace(platform="telegram", chat_id="c1"),
+            session_key="s1",
+        )
+        asyncio.run(GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx))
+        edited = adapter.edit_message.call_args.kwargs["content"]
+        assert edited == "visible\nmore\n"
+        assert response.get("already_sent") is True
