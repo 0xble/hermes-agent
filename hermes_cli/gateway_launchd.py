@@ -869,6 +869,12 @@ def launchd_restart():
     # bootout/bootstrap-retry path, which is bounded and reports its own
     # failure instead of stalling the update for 90s.
     refresh_ok = _gw().refresh_launchd_plist_if_needed()
+    if refresh_ok == "deferred":
+        # The helper's bootout restarts the gateway under the planned-restart marker it wrote for the
+        # current pid. A SIGUSR1/kickstart here would retire that pid first, so the helper would boot
+        # out the replacement instead: a second, unplanned (slow SIGTERM) restart.
+        print("↻ Service reload handed to launchd; it restarts the gateway")
+        return
     from gateway.status import get_running_pid
     try:
         pid = get_running_pid()

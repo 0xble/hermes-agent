@@ -147,3 +147,33 @@ def test_helper_supervision_probe_matches_real_launchctl_output(tmp_path, monkey
     result = real_run(["/bin/bash", "-c", f"if {probe}; then echo MATCH; fi"],
                             capture_output=True, text=True, env={"PATH": f"{fake}:/usr/bin:/bin"})
     assert (result.stdout.strip() == "MATCH") is matches
+
+
+def test_restart_with_deferred_reload_does_not_also_signal_the_gateway(tmp_path, monkeypatch):
+    """The deferred helper's bootout IS the restart. Signalling the gateway too retires the pid the
+    marker names, so the helper would then boot out the replacement as an unplanned SIGTERM."""
+    from gateway import status
+
+    gw = gateway_launchd._gw()
+    plist_path = tmp_path / "ai.hermes.gateway.plist"
+    plist_path.write_text("<plist/>", encoding="utf-8")
+    launchctl, signalled = [], []
+    monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gw, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: os.getpid())
+    monkeypatch.setattr(gw, "refresh_launchd_plist_if_needed",
+                        lambda: gateway_launchd._reload_installed_launchd_plist(plist_path))
+    monkeypatch.setattr(gateway_launchd.subprocess, "run",
+                        lambda argv, **_: launchctl.append(argv[:2]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append(("kill", pid, sig)))
+    monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: signalled.append("self") or True)
+    monkeypatch.setattr(gw, "_graceful_restart_via_sigusr1",
+                        lambda pid, timeout, **_: signalled.append("sigusr1") or True)
+    monkeypatch.setattr(gw, "_wait_for_launchd_service_pid", lambda *a, **k: True)
+
+    gateway_launchd.launchd_restart()
+
+    assert signalled == []
+    assert launchctl == [["launchctl", "submit"]], "only the deferred helper may restart the gateway"
+    assert status.consume_planned_restart_marker_for_self(), "the marker must still name the original pid"
