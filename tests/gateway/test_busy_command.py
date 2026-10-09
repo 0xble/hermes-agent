@@ -105,6 +105,47 @@ def test_deferred_policy_registry_covers_session_mutations():
         assert resolve_command(name).busy_policy == "defer_until_idle"
     for name in ("fast", "reasoning", "title"):
         assert resolve_command(name).busy_policy == "dispatch"
+    assert resolve_command("model").busy_policy == "defer_until_idle"
+
+
+@pytest.mark.asyncio
+async def test_model_busy_command_is_deferred_and_replayed_once():
+    """A model pick made during a turn runs after the current turn, never against its live agent."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return {}
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._delivery_adapter_for = lambda _source: adapter
+    turns = []
+    busy = True
+
+    async def handler(event):
+        if busy:
+            return await runner._dispatch_busy_slash_command(
+                event, resolve_command("model"), build_session_key(event.source), event.source)
+        turns.append(event.text)
+
+    adapter.set_message_handler(handler)
+    event = _make_event("/model sonnet")
+    session_key = build_session_key(event.source)
+    await adapter.handle_message(event)
+    await asyncio.sleep(0.2)
+
+    assert turns == []
+    assert adapter._deferred_commands[session_key][0][2].text == "/model sonnet"
+
+    busy = False
+    adapter.resume_deferred_commands(session_key)
+    await asyncio.sleep(0.1)
+    await adapter.cancel_background_tasks()
+    assert turns == ["/model sonnet"]
 
 
 @pytest.mark.asyncio

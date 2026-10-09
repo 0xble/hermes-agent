@@ -4046,7 +4046,6 @@ class GatewayRunner(
     # entry here); all other rejected commands get the generic text in _dispatch_busy_slash_command.
     # Values are catalog keys; ``run_busy._dispatch_busy_slash_command`` resolves them with ``t()``.
     _BUSY_REJECT_TEXT: Dict[str, str] = {
-        "model": "gateway.busy.reject_model",
         "codex-runtime": "gateway.busy.reject_codex_runtime"}
 
     def _active_profile_name(self) -> str:
