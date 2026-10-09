@@ -125,7 +125,8 @@ def test_unattended_migration_install_carries_lazy_install_consent(tmp_path, mon
     assert seen.get("assume_deps_consent", False) is consent
 
 
-@pytest.mark.parametrize(("name", "installs"), [("hindsight", True), ("someplugin", False)])
+# honcho, not hindsight: this fork still bundles hindsight, so it never needs startup recovery.
+@pytest.mark.parametrize(("name", "installs"), [("honcho", True), ("someplugin", False)])
 def test_startup_recovery_never_asks_a_dependency_question(tmp_path, monkeypatch, name, installs):
     """Agent init cannot answer a prompt: in the CLI the question hangs the turn behind the chat input,
     with no terminal it is refused on every process start. A provider that shipped in core installs
