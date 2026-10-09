@@ -34,6 +34,7 @@ from gateway.response_filters import (
     is_partial_silence_marker as _is_partial_silence_marker,
     strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
     strip_trailing_silence_marker as _strip_trailing_silence_marker)
+from gateway.copy_blocks import CopyMarkerStreamFilter, strip_copy_blocks
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -202,6 +203,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # ``_stream_ledger`` mirrors ``_accumulated`` but is NOT truncated when
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
+        # Copy blocks are delivered as separate messages after the turn, so they never
+        # enter the stream buffers; every preview, split, and fallback send inherits that.
+        # Fresh per segment so an unclosed block cannot swallow the next segment.
+        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=True)
         self._last_sent_text = ""    # skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -255,11 +260,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if line:
             self._queue.put((_TOOL_PROGRESS, line))
 
-    def _compose_frame_content(self, text: str | None = None) -> str:
+    def _compose_frame_content(self) -> str:
         """Native frame content: text, with any tool-progress lines below a rule."""
         progress = "\n".join(self._tool_progress_lines)
-        body = self._accumulated if text is None else text
-        return "\n\n---\n".join(p for p in (body, progress) if p)
+        return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
     def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
         """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
@@ -293,6 +297,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _append_accumulated(self, text: str) -> None:
         """Append to the live buffer and the split-stable stream ledger."""
+        text = self._copy_filter.feed(text)
         if not text:
             return
         if self._tool_progress_lines:  # real text overwrites the overlay
@@ -572,8 +577,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._eager_reopen_seed()
                     continue
 
+                if tick.got_segment_break and not tick.got_done:
+                    self._flush_copy_filter()
                 if tick.got_done:
                     self._flush_think_buffer()
+                    self._flush_copy_filter()
                     # Strip a trailing standalone marker only from substantive interactive
                     # replies. A bare marker remains unchanged for the existing silence path.
                     self._strip_final_marker_from_state()
@@ -703,6 +711,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             else:
                 self._filter_and_accumulate(item)
 
+    def _flush_copy_filter(self) -> None:
+        """On stream end, release a held line that did not become a copy marker."""
+        tail = self._copy_filter.flush()
+        if tail:
+            self._accumulated += tail
+            self._stream_ledger += tail
+
     def _strip_final_silence_marker(self, text: str) -> str:
         """Apply the interactive trailing-marker filter at the final delivery boundary."""
         if not self.cfg.strip_trailing_silence_markers:
@@ -729,6 +744,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         strictly prefix-extends the ledger."""
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
+        final_raw = strip_copy_blocks(final_raw)  # the buffers never hold copy blocks
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:
@@ -859,13 +875,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
-        from gateway.copy_blocks import copy_preview_text
-        # Copy blocks go out as separate messages, so previews never show their
-        # bodies or a half-streamed marker line.
-        display_text = copy_preview_text(self._accumulated, final=not tick.is_interim)
+        display_text = self._accumulated
         if tick.is_interim:
             if self._use_native_streaming:
-                display_text = self._compose_frame_content(display_text)
+                display_text = self._compose_frame_content()
                 if display_text and self.cfg.cursor:
                     display_text += self.cfg.cursor
             else:
@@ -1009,5 +1022,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
     def _clean_for_display(text: str) -> str:
-        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        """Hide copy blocks and MEDIA:<path> / [[audio_as_voice]] directives; both are
+        delivered post-stream."""
+        return _BasePlatformAdapter.strip_media_directives_for_display(strip_copy_blocks(text))

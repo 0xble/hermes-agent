@@ -7,9 +7,9 @@ import pytest
 
 from gateway.copy_blocks import (
     CopyMarkerStreamFilter,
-    copy_preview_text,
     extract_copy_blocks,
     render_copy_blocks_inline,
+    strip_copy_blocks,
 )
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.run_notifications import GatewayNotificationsMixin
@@ -99,19 +99,31 @@ def test_tilde_and_backtick_fences_do_not_close_each_other() -> None:
     assert extract_copy_blocks(text) == (text, [])
 
 
-def test_interim_preview_hides_partial_markers_and_block_bodies() -> None:
-    assert copy_preview_text("before\n[[co", final=False) == "before\n"
-    assert copy_preview_text("before\n[[copy]]\npartial bo", final=False) == "before\n"
-    assert copy_preview_text("before\n[[copy]]\nbody\n[[/co", final=False) == "before\n"
-    assert copy_preview_text("before\n[[copy]]\nbody\n[[/copy]]\naft", final=False) == "before\naft"
-    assert copy_preview_text("plain [[ text", final=False) == "plain [[ text"
-    assert copy_preview_text("before\n[[copy]]\nbody\n[[/copy]]", final=True) == "before\n"
+def test_drop_bodies_filter_hides_blocks_across_any_split() -> None:
+    text = "intro\n[[copy]]\nSECRET body\n[[/copy]]\nafter [[ text\n```\n[[copy]]\n```\n"
+    expected = strip_copy_blocks(text)
+    for size in (1, 2, 3, 5, 8, 13, len(text)):
+        stream = CopyMarkerStreamFilter(drop_bodies=True)
+        out = "".join(stream.feed(text[i:i + size]) for i in range(0, len(text), size))
+        out += stream.flush()
+        assert out == expected
+        assert "SECRET" not in out
 
 
-def test_preview_without_markers_is_unchanged() -> None:
+def test_drop_bodies_filter_never_emits_partial_markers() -> None:
+    stream = CopyMarkerStreamFilter(drop_bodies=True)
+    assert stream.feed("before\n[[co") == "before\n"
+    assert stream.feed("py]]\npartial bo") == ""
+    assert stream.feed("dy\n[[/co") == ""
+    assert stream.feed("py]]\naft") == "aft"
+    assert stream.flush() == ""
+
+
+def test_strip_copy_blocks_leaves_marker_free_text_unchanged() -> None:
     text = "ordinary reply\nwith `code` and [[link]] text"
-    assert copy_preview_text(text, final=False) == text
-    assert copy_preview_text(text, final=True) == text
+    assert strip_copy_blocks(text) == text
+    stream = CopyMarkerStreamFilter(drop_bodies=True)
+    assert stream.feed(text) + stream.flush() == text
 
 
 class _FakeAdapter(BasePlatformAdapter):

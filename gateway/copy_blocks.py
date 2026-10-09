@@ -101,9 +101,13 @@ class CopyMarkerStreamFilter:
     outside a fenced code block are control syntax, and CRLF is preserved for ordinary text.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, drop_bodies: bool = False) -> None:
+        # drop_bodies=True removes whole blocks (markers and bodies) for surfaces whose
+        # copy blocks are delivered separately; False keeps bodies inline.
+        self._drop_bodies = drop_bodies
+        self._in_copy = False
         self._pending = ""  # held line prefix that may still become a marker line
-        self._line = ""  # already-emitted text of the current line, for fence tracking
+        self._line = ""  # already-seen text of the current line, for fence tracking
         self._fence: str | None = None
 
     @staticmethod
@@ -123,6 +127,16 @@ class CopyMarkerStreamFilter:
             _line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)
         )
 
+    def _on_marker(self, line: str) -> None:
+        if _line_marker(line, _COPY_OPEN) and not self._in_copy:
+            self._in_copy = True
+        elif _line_marker(line, _COPY_CLOSE) and self._in_copy:
+            self._in_copy = False
+        # A nested open or stray close is control syntax and changes nothing.
+
+    def _emit(self) -> bool:
+        return not (self._drop_bodies and self._in_copy)
+
     def feed(self, delta: str) -> str:
         """Filter one streamed text delta, holding only a possible trailing marker line."""
         if not delta:
@@ -138,7 +152,8 @@ class CopyMarkerStreamFilter:
                 if self._fence is None and not self._line and self._could_be_marker_prefix(tail):
                     self._pending = tail
                 else:
-                    output.append(tail)
+                    if self._emit():
+                        output.append(tail)
                     self._line += tail
                 break
             end = cursor + match.end()
@@ -149,9 +164,10 @@ class CopyMarkerStreamFilter:
             segment = text[cursor:end]
             full_line = self._line + segment
             if not self._line and self._is_marker(segment):
-                pass  # a complete marker line is control syntax
+                self._on_marker(segment)  # a complete marker line is control syntax
             else:
-                output.append(segment)
+                if self._emit():
+                    output.append(segment)
                 self._fence = _next_fence(self._fence, full_line)
             self._line = ""
             cursor = end
@@ -161,22 +177,14 @@ class CopyMarkerStreamFilter:
         """Release a non-marker tail, or drop it when it is a complete marker line."""
         pending, self._pending = self._pending, ""
         self._line = ""
-        if not pending or self._is_marker(pending):
+        if not pending or self._is_marker(pending) or not self._emit():
             return ""
         return pending
 
 
-def copy_preview_text(text: str, *, final: bool) -> str:
-    """Return editable-preview text with copy blocks and marker syntax hidden.
-
-    Block bodies are removed because they are delivered as separate messages. On an
-    interim preview, a trailing partial line that may still become a marker line is
-    held back so an edit never shows half a marker.
-    """
-    remaining, _ = extract_copy_blocks(text)
-    if final:
-        return remaining
-    return CopyMarkerStreamFilter().feed(remaining)
+def strip_copy_blocks(text: str) -> str:
+    """Return *text* without copy blocks, for display surfaces that send them separately."""
+    return extract_copy_blocks(text)[0]
 
 
 def render_copy_blocks_inline(text: str) -> str:
@@ -195,7 +203,7 @@ def render_copy_blocks_inline(text: str) -> str:
 
 __all__ = [
     "CopyMarkerStreamFilter",
-    "copy_preview_text",
     "extract_copy_blocks",
     "render_copy_blocks_inline",
+    "strip_copy_blocks",
 ]

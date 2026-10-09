@@ -1566,3 +1566,36 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+
+class TestCopyBlocksNeverStream:
+
+    @pytest.mark.asyncio
+    async def test_overflow_split_and_previews_never_send_copy_syntax(self):
+        """Copy blocks are delivered separately, so no streamed send carries their markers
+        or bodies, including sealed overflow heads and the finalize edit."""
+        adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
+        msg_ids = iter(f"msg_{i}" for i in range(100))
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(msg_ids)))
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_x"))
+        setattr(adapter, "MAX_MESSAGE_LENGTH", 700)
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_copy", config)
+        body = "SECRET line\n" * 120
+        text = "intro\n" + ("words " * 150) + "\n[[copy]]\n" + body + "[[/copy]]\nafter\n" + ("more " * 150)
+        task = asyncio.create_task(consumer.run())
+        for i in range(0, len(text), 7):
+            consumer.on_delta(text[i:i + 7])
+            if i % 140 == 0:
+                await asyncio.sleep(0.02)
+        consumer.finish(text)
+        await task
+
+        visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
+        visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
+        assert visible
+        assert not any("[[" in t and "copy" in t for t in visible)
+        assert not any("SECRET" in t for t in visible)
+        assert any("after" in t for t in visible)
