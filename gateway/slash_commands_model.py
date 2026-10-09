@@ -420,6 +420,76 @@ class GatewayModelCommandsMixin:
                 persist_global=ctx.persist_global and global_error is None)
         return reply
 
+    def _model_switch_context(
+        self, source, session_key: str, *, profile_home=None, **fields,
+    ) -> _ModelSwitchContext:
+        """Context for a model switch on ``session_key``: current route from the owning profile's
+        config, with any session override applied (one builder for every switch entry point). The
+        persisted override is rehydrated first: after a gateway restart the in-memory map is empty
+        until the session's next turn, and resolving against the global route would let a
+        model-only switch silently change the session's provider."""
+        from gateway.run import _hermes_home
+        ctx = _ModelSwitchContext(
+            session_key=session_key, source=source,
+            config_path=(profile_home or _hermes_home) / "config.yaml", **fields,
+        )
+        ctx.read_config()
+        if session_key:
+            self._rehydrate_session_model_override(session_key)
+        ctx.apply_override(self._session_model_overrides.get(session_key, {}))
+        return ctx
+
+    async def resolve_session_model_selection(
+        self, source, model: str, provider: str = "", *, session_key: str = "",
+    ):
+        """Resolve ``model``/``provider`` the way ``/model`` does against ``session_key``'s current
+        route (the configured route when empty), committing nothing. Lets a caller with no slash
+        event (the ``telegram_topic`` tool) validate a pick before an irreversible step:
+        ``(ctx, result, None)`` or ``(None, None, error_text)``.
+
+        A pick ``/model`` would ask the user to confirm (cost, data-training tier, large-context
+        switch) is refused: an agent caller cannot give that confirmation, so the user makes the
+        switch with ``/model`` where the confirm prompt is shown."""
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+        ctx = self._model_switch_context(source, session_key, profile_home=profile_home, persist_global=False)
+        result, error = await self._perform_model_switch(ctx, model, provider, source)
+        if error is not None:
+            return None, None, error
+        warning = await self._model_selection_warning(ctx, result)
+        if warning is not None:
+            picked = getattr(result, "new_model", None) or model
+            return None, None, (
+                f"{warning.title}: {picked} needs the user's confirmation, so it cannot be "
+                f"set here. Leave the model unset and have the user run /model {picked} "
+                f"in the topic.\n\n{warning.message}")
+        return ctx, result, None
+
+    async def commit_session_model_selection(
+        self, ctx: _ModelSwitchContext, result, source, *, announce: bool = True,
+    ) -> Optional[str]:
+        """Commit a resolved pick as the session override of the session ``source`` routes to: the
+        ``/model --session`` commit (cached agent, state.db, write-through for restarts) without its
+        reply or switch-away metrics. Error text or None.
+
+        Refused when the session started a turn after the caller's idle check: resolving can block
+        for seconds, and swapping a running agent's client mid-turn is what the check exists to
+        stop. ``announce=False`` drops the next-turn switch note for a session that never ran on
+        another model (a just-created topic)."""
+        ctx = dataclasses.replace(ctx, session_key=self._session_key_for_source(source), source=source)
+        async with self._model_switch_lock():
+            if self._is_session_running(ctx.session_key):
+                return ("That session started a turn, so its model cannot change now. "
+                        "Retry when it is idle, or use /model there.")
+            error = self._switch_cached_agent_model(result, ctx, False)
+            if error is not None:
+                return error
+            await self._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
+            if not announce:
+                (getattr(self, "_pending_model_notes", None) or {}).pop(ctx.session_key, None)
+        return None
+
     async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
         """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
         is session-key-normalized so the picker's thread metadata lands where the next turn reads."""
@@ -488,26 +558,30 @@ class GatewayModelCommandsMixin:
         lines.append(t("gateway.model.usage_persist"))
         return "\n".join(lines)
 
-    async def _model_selection_guard_reply(
-        self, event: MessageEvent, ctx: _ModelSwitchContext, result
-    ) -> tuple[bool, Optional[str]]:
-        """Selection-guard confirmation for the typed path (pickers confirm via their own UI).
+    async def _model_selection_warning(self, ctx: _ModelSwitchContext, result):
+        """The selection-guard warning (cost, data-policy, large-context switch) a resolved pick must
+        confirm before it applies, or None. One check for ``/model`` and agent-driven selection.
 
-        The unified registry (cost + data-policy guards) runs off-loop — pricing lookups may hit
-        models.dev on a cache miss. Returns ``(fired, reply)``; the reply is None when the platform
-        rendered confirm buttons itself.
-        """
+        The unified registry runs off-loop — pricing lookups may hit models.dev on a cache miss."""
         try:
             from hermes_cli.model_selection_guards import (
                 combined_selection_warning, selection_context_for_agent)
-            warning = await asyncio.to_thread(
+            return await asyncio.to_thread(
                 combined_selection_warning, result.new_model, provider=result.target_provider,
                 base_url=result.base_url or ctx.current_base_url or "",
                 api_key=result.api_key or ctx.current_api_key or "", model_info=result.model_info,
                 selection_context=selection_context_for_agent(self._cached_agent_for(ctx.session_key)),
             )
         except Exception:
-            warning = None
+            return None
+
+    async def _model_selection_guard_reply(
+        self, event: MessageEvent, ctx: _ModelSwitchContext, result
+    ) -> tuple[bool, Optional[str]]:
+        """Selection-guard confirmation for the typed path (pickers confirm via their own UI).
+        Returns ``(fired, reply)``; the reply is None when the platform rendered confirm buttons itself.
+        """
+        warning = await self._model_selection_warning(ctx, result)
         if warning is None:
             return False, None
 
@@ -548,22 +622,8 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
-        ctx = _ModelSwitchContext(
-            # Gateway routing columns — forward ALL of them at CREATE time, same fix as the
-            # compression-rotation bug in agent/conversation_compression.py. Without these, the branched
-            # child row has NULL routing columns until switch_session() below calls
-            # _record_gateway_session_peer() — a crash/kill anywhere between here and there (most plausibly
-            # mid-history-copy, since each append_message call a few lines down is independently
-            # best-effort) leaves the branch permanently unroutable: unreachable by chat/thread lookup, and
-            # unreachable via /resume's IDOR guard too (which requires the row's chat_id/thread_id to match
-            # the caller's). user_id is critical for the fallback lookup path (hermes_state.py:1994-2009)
-            # that searches by the complete peer tuple when session_key doesn't match. origin_json and
-            # display_name complete the identity (same shape as the reset path's db_create_kwargs in
-            # gateway/session.py, #82633) so consumers that read routing/presentation data from state.db
-            # (mcp_serve, mirror, channel directory) see the branch row fully formed with zero backfill gap.
-            session_key=session_key,
-            source=source,
-            config_path=(profile_home or _hermes_home) / "config.yaml",
+        ctx = self._model_switch_context(
+            source, session_key, profile_home=profile_home,
             persist_global=resolve_persist_behavior(
                 request.is_global, request.is_session, is_once=request.is_once,
                 explicit_provider=request.explicit_provider,
@@ -572,8 +632,6 @@ class GatewayModelCommandsMixin:
             reasoning_effort=request.reasoning_effort,
             restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
         )
-        ctx.read_config()
-        ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         if not request.target and not request.explicit_provider:
             return await self._model_listing_reply(event, ctx, profile_home)
         result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
