@@ -58,6 +58,31 @@ first bootstrap. The respawn window is derived from the generated
 one throttle later passes instead of failing. Regression:
 `tests/hermes_cli/test_launchd_reload_exit_budget.py`.
 
+## Planned restart on reload bootout
+
+Fork patch identity: `launchd-reload-planned-restart`.
+
+The reload's `launchctl bootout` delivers a plain SIGTERM, which the gateway
+read as an unplanned signal: it exited 1 after the unbounded post-interrupt tool
+sweep. In the field that sweep took 36.80s (13 subprocesses) and 53.62s (25), so
+Telegram was back only 60-77s after the signal. Every gateway-label bootout that
+only reloads the definition now first writes `.gateway-planned-restart.json`
+naming the gateway PID (`gateway.status.write_planned_restart_marker`): the
+deferred helper (written in Python before `launchctl submit`), its in-process
+fallback, the `launchd_restart` unloaded branch, and the guardian rollback
+`reload_target` (into the gateway's home). The shutdown handler consumes it
+one-shot and calls `runner.stop(restart=True, service_restart=True)`, the stop a
+SIGUSR1 restart reaches, without the after-turn wait that `ExitTimeOut` cannot
+cover. The sweep is then bounded at 2s and the exit is 75. An unknown PID writes
+no marker and keeps the old behavior. Stops, takeovers and SIGINT take
+precedence. No drain or shutdown timeout changed; the restart path's existing
+5s post-interrupt agent grace replaces the 1s signal grace for this SIGTERM.
+Regressions: `tests/gateway/test_planned_restart_signal.py`,
+`test_launchd_reload_exit_budget.py::test_deferred_reload_marks_planned_restart_before_bootout`,
+`test_gateway_guardian.py::test_rollback_marks_planned_restart_before_bootout`.
+Retire with the bootout path itself, or when upstream distinguishes a planned
+launchd reload from an external kill.
+
 ## Verification and retirement
 
 Run scripts/run_tests.sh for

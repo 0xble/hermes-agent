@@ -522,6 +522,33 @@ def test_rollback_waits_for_old_pid_and_recovers_bootstrap_eio(tmp_path, monkeyp
 
 
 @pytest.mark.platforms("macos")
+def test_rollback_marks_planned_restart_before_bootout(tmp_path, monkeypatch):
+    """The rollback reload is planned: the old gateway takes its bounded restart path."""
+    home, plist, label, a, _ = layout(tmp_path)
+    from gateway import status
+    from hermes_cli import gateway_launchd
+    import psutil
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
+    monkeypatch.setattr(psutil, "Process", lambda pid: type("P", (), {"wait": lambda self, timeout: None})())
+    marker = home / ".gateway-planned-restart.json"
+    at_bootout = []
+
+    def run(argv, **kwargs):
+        if argv[1] == "bootout":
+            at_bootout.append(json.loads(marker.read_text()) if marker.exists() else None)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(guardian.subprocess, "run", run)
+    monkeypatch.setattr(guardian, "rollback", lambda *args, **kwargs:
+                        kwargs["reload_callback"]() and {"reload_pending": False})
+    monkeypatch.setattr(guardian, "healthy", lambda *args: True)
+    assert guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}")
+    assert len(at_bootout) == 1 and at_bootout[0] is not None
+    assert at_bootout[0]["target_pid"] == 123
+    assert status._same_hermes_home(at_bootout[0]["target_hermes_home"], home)
+
+
+@pytest.mark.platforms("macos")
 def test_slow_bootout_does_not_exhaust_rollback_repair_budget(tmp_path, monkeypatch):
     home, plist, label, a, _ = layout(tmp_path)
     clock = [0.0]

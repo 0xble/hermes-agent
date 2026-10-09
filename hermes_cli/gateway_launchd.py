@@ -522,6 +522,15 @@ def launchd_plist_is_current(release_target: Path | None = None) -> bool:
     return norm(installed) == norm(expected)
 
 
+def _mark_planned_gateway_restart(gateway_pid: int | None) -> None:
+    """Before a gateway-label bootout: its SIGTERM then takes the gateway's bounded restart path
+    instead of the unplanned-signal shutdown. An unknown pid keeps the plain bootout."""
+    if gateway_pid is None:
+        return
+    from gateway.status import write_planned_restart_marker
+    write_planned_restart_marker(gateway_pid)
+
+
 def _spawn_deferred_launchd_reload(
     *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
 ) -> bool:
@@ -564,6 +573,7 @@ def _spawn_deferred_launchd_reload(
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
     )
+    _mark_planned_gateway_restart(gateway_pid)
     try:
         # `launchctl submit` rather than setsid: setsid does NOT leave the launchd coalition that bootout kills.
         # Spawn the reload helper via `launchctl submit` (a transient launchd one-shot job) instead of
@@ -637,6 +647,7 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
     # during a drain, and KeepAlive can't revive an unregistered job.
     # Captured: best-effort (the job may already be unloaded), keep expected noise off the terminal.
+    _mark_planned_gateway_restart(gateway_pid)
     subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
     _reload_budget = _launchd_reload_budget()
     # Wait out the old gateway's drain first so the budget isn't burned on guaranteed EIO ("already loaded").
@@ -909,6 +920,7 @@ def launchd_restart():
             # After a drain the job is usually still registered (bootstrap would hit EIO): boot it out first.
             # Captured: best-effort (the job may already be unloaded after the drain),
             # so an expected Boot-out failed: 3 must not leak past the ↻ line below.
+            _mark_planned_gateway_restart(pid)
             subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
             plist_path = str(_gw().get_launchd_plist_path())
             subprocess.run(["launchctl", "bootstrap", _gw()._launchd_domain(), plist_path], check=True, timeout=30)

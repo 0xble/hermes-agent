@@ -11,6 +11,7 @@ the new release was serving.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
 import subprocess
@@ -52,6 +53,24 @@ def test_deferred_helper_waits_the_exit_budget_not_the_bootstrap_budget(tmp_path
     exit_budget = int(gateway_launchd._launchd_old_gateway_exit_budget())
     assert f"_wait_deadline=$(($(date +%s) + {exit_budget}))" in script
     assert f"_deadline=$(($(date +%s) + 30))" in script  # bootstrap retries keep their own budget
+
+
+def test_deferred_reload_marks_planned_restart_before_bootout(tmp_path, monkeypatch):
+    """The helper's bootout SIGTERM must reach the gateway as a planned restart, not a crash."""
+    from gateway import status
+
+    seen_at_submit = []
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30.0)
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
+    monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(_append_launchd_reload_log=lambda *_: None))
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", lambda args, **_: seen_at_submit.append(
+        status.consume_planned_restart_marker_for_self()) or subprocess.CompletedProcess(args, 0))
+
+    assert gateway_launchd._spawn_deferred_launchd_reload(
+        domain="gui/501", label="ai.hermes.gateway", target="gui/501/ai.hermes.gateway",
+        plist_path=tmp_path / "ai.hermes.gateway.plist", gateway_pid=os.getpid(),
+    )
+    assert seen_at_submit == [True]
 
 
 def test_supervision_window_outlasts_the_generated_throttle_interval(monkeypatch, tmp_path):
