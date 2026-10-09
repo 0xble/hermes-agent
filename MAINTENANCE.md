@@ -140,6 +140,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
+| Proactive tool-result prune default | Enable the existing deterministic no-LLM tool-result prune at 48000 tokens while protecting the recent tail | `compression.proactive_prune_tokens`, its config/docs, and proactive-prune regressions | [Proactive tool-result prune default](maintenance/proactive-tool-result-prune.md) |
 
 ## Active patch record: relay silence (S1)
 
@@ -231,6 +232,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_resume_queued_followup.py -k machinery_silence`.
 - **Retirement:** Remove when upstream spools and restores the internal flag and `reply_expected` for every queued event.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-turn-contract`.
+
+## Active patch record: proactive tool-result prune default
+
+- **Patch identity:** `proactive-tool-result-prune-default`.
+- **Behavior:** Enable the existing deterministic no-LLM tool-result prune by default at `compression.proactive_prune_tokens: 48000`; retain the 8000-character eligibility floor, 4096-token minimum reclaim gate, and recent-tail protection. `0` remains the explicit opt-out.
+- **Source surfaces:** `hermes_cli/config_defaults.py`, `agent/agent_init.py` configuration attachment (unchanged), `website/docs/user-guide/configuration.md`, and proactive-prune regression tests.
+- **Upstream status:** The pruning implementation is already present upstream, but upstream retains a zero default; no equivalent nonzero default was found during preflight.
+- **Focused regression:** `python -m pytest -q tests/agent/test_proactive_prune_config.py tests/agent/test_proactive_tool_result_pruning.py tests/agent/test_proactive_prune_rearm_threshold.py tests/agent/test_proactive_prune_loop_wiring.py`.
+- **Retirement:** Remove the fork-only default, documentation, and default-specific regression when released upstream enables an equivalent nonzero default with the same tail protection and reclaim gating.
+- **Rollback:** Revert the commit carrying `Fork-Patch: proactive-tool-result-prune-default`.
 
 ## Active patch record: state.db compaction at next gateway start
 
