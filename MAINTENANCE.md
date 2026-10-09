@@ -243,6 +243,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
 - **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
 
+## Active patch record: shutdown spool fidelity
+
+- **Patch identity:** `shutdown-spool-fidelity`.
+- **Behavior:** a queued caption-less attachment (image, voice, file) is spooled and recovered: flush and recovery both reject only slots with neither text nor `media_urls`/`media`, and the transcript-append fallback writes the gateway's media placeholder when text is empty. Every spooled `MessageEvent` also keeps `message_type`, `media_text_inlined`, `reply_to_text`, `reply_to_author_id`, `reply_to_author_name`, and `reply_to_is_own_message`, and startup replay restores them, so a queued reply keeps its quoted context and voice/audio/document routing and text-inlining replay as they arrived. Old spool files without these keys recover as before (TEXT, no reply context).
+- **Source surfaces:** `gateway/shutdown_flush.py` (`has_user_content`, `_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Upstream status:** upstream v0.21.6 (`818c13be`) writes media-only events but its recovery still rejects empty text, so they stay spooled forever; it also drops reply context, `media_text_inlined`, and `message_type`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Retirement:** Remove when upstream spools and replays media-only events and reply context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-fidelity`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
