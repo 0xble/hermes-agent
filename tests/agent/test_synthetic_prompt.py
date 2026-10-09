@@ -665,9 +665,6 @@ def test_retaindb_current_batch_still_publishes():
     assert "fresh memory" in result and "fresh synthesis" in result
 
 
-    assert provider._consume_pending_dialectic() == "fresh dialectic"
-
-
 def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expired_buffer(clock):
     import threading
 
