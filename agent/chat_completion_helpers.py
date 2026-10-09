@@ -1950,12 +1950,12 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
-    """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
-    short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
-    context across every provider again."""
-    from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS
-    if agent._fallback_chain and reason not in _SHARED_COOLDOWN_REASONS:
+def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
+    """Chain exhausted (always False). A non-empty chain walked without an armed primary cooldown
+    arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
+    whole context across every provider again. A rate limit or overload from an active fallback
+    arms nothing shared, so it still gets this short window."""
+    if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
     return False
@@ -2171,7 +2171,7 @@ def try_activate_fallback(
         cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
-            return _fallback_chain_exhausted(agent, reason)
+            return _fallback_chain_exhausted(agent, reason, cooldown_armed=cooldown_seconds is not None)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)

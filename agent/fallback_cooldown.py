@@ -72,10 +72,12 @@ def _arm_rate_limit_cooldown(
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
         return None
-    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
-    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
-        return None
+    if getattr(agent, "_fallback_activated", False):
+        # Compare the whole route: a same-provider fallback (another model or endpoint) failing
+        # says nothing about the primary and must not arm the primary's shared window.
+        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
+        if live_route_from_agent(agent) != route_from_agent(agent):
+            return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
