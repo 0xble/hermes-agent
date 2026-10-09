@@ -1457,65 +1457,6 @@ def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) ->
     return results
 
 
-def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None) -> bool:
-    """Restore state from a quick snapshot."""
-    home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-    # Reject ids with separators or traversal so ``root / snapshot_id`` stays inside root.
-    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
-        logger.error("Invalid snapshot_id: %s", snapshot_id)
-        return False
-    snap_dir = root / snapshot_id
-    if not _is_within(snap_dir, root.resolve()):  # handles symlinks etc.
-        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
-        return False
-    manifest_path = snap_dir / "manifest.json"
-    if not snap_dir.is_dir() or not manifest_path.exists():
-        return False
-    with open(manifest_path, encoding="utf-8-sig") as f:
-        meta = json.load(f)
-    # Validate every captured member before any destination write. A damaged
-    # versioned snapshot must not partially restore unrelated configuration.
-    if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
-        return False
-    if meta.get("version", 1) != 1 or "sha256" in meta:
-        if not all(isinstance(rel, str) and payload_matches(snap_dir, rel, size, meta)
-                   for rel, size in meta["files"].items()):
-            logger.error("Snapshot content verification failed: %s", snapshot_id)
-            return False
-    snap_res, home_res = snap_dir.resolve(), home.resolve()
-    restored = 0
-    for rel in meta.get("files", {}):
-        src = snap_dir / rel
-        dst = home / rel
-        if not (_is_within(src, snap_res) and _is_within(dst, home_res)):
-            logger.error("Manifest path traversal blocked: %s", rel)
-            continue
-        if not src.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if dst.suffix == ".db":
-                integrity = verify_sqlite_integrity(src, run_pragma=True)
-                if not integrity.get("valid"):
-                    logger.error("Refusing restore of corrupted snapshot member %s: %s",
-                                 rel, integrity.get("message"))
-                    continue
-                # Through the backup API so live connections see the restored data instead of
-                # stale pages from a replaced inode (#65942).
-                if not _safe_restore_db(src, dst):
-                    # Refused (live holder) or failed: destination untouched — a failure, not a restore.
-                    logger.error("Failed to restore %s: live-safe restore refused", rel)
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            restored += 1
-        except (OSError, PermissionError) as exc:
-            logger.error("Failed to restore %s: %s", rel, exc)
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
-    return restored > 0
-
-
 # Kept in sync with ``_QUICK_STATE_FILES`` and ``cron/jobs.py``'s ``JOBS_FILE``.
 _CRON_JOBS_REL = "cron/jobs.json"
 
@@ -1799,6 +1740,15 @@ def restore_quick_snapshot(
 
     with open(manifest_path, encoding="utf-8-sig") as f:
         meta = json.load(f)
+    # Validate every captured member before any destination write. A damaged
+    # versioned snapshot must not partially restore unrelated configuration.
+    if not isinstance(meta, dict) or not isinstance(meta.get("files"), dict):
+        return False
+    if meta.get("version", 1) != 1 or "sha256" in meta:
+        if not all(isinstance(rel, str) and payload_matches(snap_dir, rel, size, meta)
+                   for rel, size in meta["files"].items()):
+            logger.error("Snapshot content verification failed: %s", snapshot_id)
+            return False
 
     restored = 0
     auth_restore_failed = False
@@ -1864,10 +1814,6 @@ def restore_quick_snapshot(
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0 and not auth_restore_failed
-
-
-
-
 
 
 def _load_cron_jobs_doc(path: Path) -> Optional[Any]:
