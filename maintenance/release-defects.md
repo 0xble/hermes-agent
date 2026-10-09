@@ -702,3 +702,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `finish_worker_boot()` without importing it, so every restart-safe cron worker died
   with `NameError` before its acknowledgement. Guard:
   `scripts/run_tests.sh tests/cron/test_restart_safe_worker.py`.
+- Review of the merged candidate found three more `v0.21.6` integration defects.
+  `MemoryStore.compare_and_restore` (fork `memory-transaction-observers`) still called
+  `_error` without upstream's new required `failure_class`, so invalid-target and stale
+  restores raised `TypeError`. Batch memory operations persisted the `new_text` alias
+  without scanning it. The restart-wait warning in `gateway/run_shutdown.py` passed
+  upstream's wedged and restart-safe counts to the fork's message, which had no
+  placeholders for them, so every no-budget restart raised inside logging. Guards:
+  `scripts/run_tests.sh tests/tools/test_memory_transactions.py tests/tools/test_memory_tool.py tests/gateway/test_restart_drain.py`.

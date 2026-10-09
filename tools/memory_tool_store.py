@@ -345,7 +345,7 @@ class MemoryStore:
         snapshots remain frozen, as with ordinary memory mutations.
         """
         if target not in {"memory", "user"}:
-            return _error("Invalid memory target")
+            return _error("Invalid memory target", "invalid_args")
         from tools.memory_transactions import MemoryTransaction, observe_memory_transaction
 
         path = self._path_for(target)
@@ -354,7 +354,7 @@ class MemoryStore:
             if not readable:
                 return _read_failed_error(path)
             if raw != expected:
-                return _error("Memory changed after the snapshot", error_code="stale_undo")
+                return _error("Memory changed after the snapshot", "stale_undo", error_code="stale_undo")
             transaction = MemoryTransaction(target, path, raw, replacement, dict(metadata or {}))
             with observe_memory_transaction(transaction):
                 try:
@@ -508,7 +508,9 @@ class MemoryStore:
         ops = [op or {} for op in operations]
         # Scan every add/replace content BEFORE touching disk -- one poisoned op rejects the batch.
         for i, op in enumerate(ops):
-            scan_error = op.get("action") in {"add", "replace"} and op.get("content") and _scan_memory_content(op["content"])
+            # Scan exactly the text _apply_batch_op will persist: ``new_text`` is accepted as an alias.
+            op_text = op.get("content") or op.get("new_text")
+            scan_error = op.get("action") in {"add", "replace"} and op_text and _scan_memory_content(op_text)
             if scan_error:
                 return _error(f"Operation {i + 1}: {scan_error}", "scan_blocked")
 

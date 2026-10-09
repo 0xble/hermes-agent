@@ -2191,8 +2191,9 @@ class GatewayShutdownMixin:
         )
         if turn_deadline is None and delegation_deadline is None:
             logger.warning(
-                "Restart requested with %d active work unit(s), but no work has a configured wait budget; "
-                "proceeding to stop()/drain", active,
+                "Restart requested with %d active work unit(s), but no work has a configured wait budget "
+                "(%d wedged past the inactivity timeout, %d in restart-safe external cron workers that "
+                "outlive this process); proceeding to stop()/drain", active,
                 self._wedged_agent_count(), self._restart_safe_cron_count(),
             )
             return False
