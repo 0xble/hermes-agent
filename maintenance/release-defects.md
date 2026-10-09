@@ -8,7 +8,7 @@ snapshot pin, memory-provider config cloning, `/update` reporting, deferred slas
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
 session lifecycle, the alias-cache isolation guard, gateway orphan-reaper
-home scoping, and per-run cron terminal isolation.
+home scoping, per-run cron terminal isolation, and the `v0.21.6` merge integration.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -683,3 +683,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `pm-shipped-extras`.
 - When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
 - Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
+
+## v0.21.6 merge integration
+
+- Fork patch identity: `v0216-merge-integration`.
+- Merging upstream `v0.21.6` into fork main lost three fork-side bindings that
+  Git merged cleanly or resolved mechanically. `recover_pending_to_db` dropped the
+  fork's `deferred_followup` passthrough while `gateway/run_pending_recovery.py`
+  still passes it, so every startup pending-spool replay raised `TypeError`.
+  `[tool.hermes.extras-platforms]` kept a `mem0` gate after upstream removed the
+  `mem0` extra (moved to the plugin catalog). The merged `uv.lock` carried two
+  `mem0ai` entries and did not parse. The lock is regenerated with
+  `hermes pm lock` from fork main's lock, so it differs only by the catalog-moved
+  providers' packages.
+- Guard: `scripts/run_tests.sh tests/gateway/test_multiplex_pending_recovery.py tests/pm/test_extras.py tests/gateway/test_cron_active_work_drain.py` and `uv lock --check`.
+- Retire once the next release sync no longer carries these merge points.

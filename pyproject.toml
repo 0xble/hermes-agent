@@ -600,8 +600,6 @@ opt-in-extras = ["kittentts", "documents"]
 matrix = "sys_platform == 'linux'"
 # grpcio (via google-cloud-pubsub) has no win_arm64 wheel.
 google-chat = "platform_machine != 'ARM64' or sys_platform != 'win32'"
-# qdrant-client → grpcio (via mem0ai) has no win_arm64 wheel.
-mem0 = "platform_machine != 'ARM64' or sys_platform != 'win32'"
 # pymupdf has no win_arm64 or android wheel (sdist builds MuPDF from C). Termux
 # reports sys_platform 'linux' on a Bionic libc that no manylinux wheel fits,
 # so the Android kernel release guard used for nemo-relay applies too.

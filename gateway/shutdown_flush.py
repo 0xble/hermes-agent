@@ -341,10 +341,11 @@ def _order_flush_files(paths) -> list[Path]:
     return [path for _key, path in entries]
 
 
-def recover_pending_to_db(session_db=None, *, session_resolver=None) -> int:
+def recover_pending_to_db(session_db=None, *, session_resolver=None, deferred_followup=None) -> int:
     """Replay flush-dir ``*.json`` files into state.db; return the number of messages recovered.
     See :func:`recover_pending_spool`, which also reports the sessions it held back."""
-    return recover_pending_spool(session_db, session_resolver=session_resolver)[0]
+    return recover_pending_spool(
+        session_db, session_resolver=session_resolver, deferred_followup=deferred_followup)[0]
 
 
 def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_followup=None) -> tuple[int, set[str]]:
