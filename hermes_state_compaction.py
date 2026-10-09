@@ -90,7 +90,7 @@ def _write_attempts(db_path, request: Dict[str, Any], attempts: int) -> None:
 
 def _sqlite_temp_dir() -> Path:
     """Where SQLite's unix VFS puts VACUUM's temporary copy (same search order as os_unix.c)."""
-    for candidate in (os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR"), "/var/tmp", "/usr/tmp", "/tmp"):
+    for candidate in (os.environ.get("SQLITE_TMPDIR"), os.environ.get("TMPDIR"), "/var/tmp", "/usr/tmp", "/tmp"):  # no-tmp: ok — mirrors SQLite's temp-dir search to size VACUUM, not scratch use
         if candidate and os.path.isdir(candidate):
             return Path(candidate)
     return Path(".")
