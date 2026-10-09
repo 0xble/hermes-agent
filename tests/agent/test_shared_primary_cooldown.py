@@ -543,4 +543,3 @@ def test_bedrock_stream_success_runs_primary_recovery(monkeypatch):
 
     assert stream._poll() is stream.result["response"]
     assert recovered == [agent]
-
