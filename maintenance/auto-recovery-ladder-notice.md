@@ -6,6 +6,13 @@ The maintenance unit identity is ``auto-recovery-ladder-notice``.
 
 `auto-recovery-ladder-notice`.
 
+Fork-Patch-Backfill: 54ced3c54159aef6ec64691781641d174045b28d; auto-recovery-ladder-notice
+
+PR #410's squash merge `4affbc6f0584` kept only its title as the message, so it
+dropped the branch commit's `Fork-Patch: auto-recovery-ladder-notice` trailer.
+The backfill line above records the merge's stable patch ID, which is identical
+to the reviewed branch commit `82c47843`, so `main` is not rewritten.
+
 ## Required behavior
 
 The post-exhaustion provider-recovery ladder must keep the countdown notice out of
