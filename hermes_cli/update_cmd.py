@@ -2385,6 +2385,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
     _hermes_current_updater_frame = True
+    _commit.begin_update_attempt()  # nothing an earlier update in this process armed is ours (O5)
     # A user's active Git operation owns the checkout, including its index.
     # Refuse before release recovery, snapshots or branch switching can mutate it.
     git_operation = (None if getattr(args, "rollback", False)
@@ -2393,7 +2394,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         root = _m().PROJECT_ROOT
         print(f"✗ Cannot update while a Git {git_operation} is in progress in {root}.")
         print(f"  Finish it or run `git {git_operation} --abort`, then re-run `hermes update`.")
+        _record_stop("git_in_progress", without_receipt="failed")  # before the receipt opens: a metrics row only
         raise SystemExit(1)
+    if not getattr(args, "rollback", False):
+        # Self-heal abandoned .git/*.lock files (a crashed fetch) and aborted-transfer pack temps
+        # before anything else touches the checkout. Run at START, not only in the apply path
+        # below: a run that dies between here and the fetch would otherwise leave the next run to
+        # fail with "File exists" until an operator removed the lock by hand (#132089). Idempotent,
+        # and _sweep_stale skips everything while a git process holds it. A killed update's
+        # index.lock is younger than the sweep's age floor, so it goes here once its git is proven
+        # dead (we hold the update lock: no other update's git can own it).
+        from hermes_cli.gitlock import release_dead_index_lock
+        if release_dead_index_lock(_m().PROJECT_ROOT):
+            print("  (removed .git/index.lock left by a git that was killed)")
+        _check.clear_git_debris(_m().PROJECT_ROOT)
     # Rollback does not fetch, prompt, inspect dependency options or mutate the checkout.
 
     if getattr(args, "rollback", False) and getattr(args, "no_gateway_restart", False):
