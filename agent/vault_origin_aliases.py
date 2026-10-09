@@ -138,7 +138,8 @@ def alias_fill_confirmation_enabled() -> bool:
     value = vault_config.get("confirm_alias_fills") if isinstance(vault_config, dict) else None
     if isinstance(value, bool):
         return value
-    if value is not None:
+    if value is not None and ("confirm_alias_fills", repr(value)) not in _invalid_alias_warnings:
+        _invalid_alias_warnings.add(("confirm_alias_fills", repr(value)))
         logger.warning("Ignoring invalid vault.confirm_alias_fills value %r; keeping confirmation enabled", value)
     return True
 
