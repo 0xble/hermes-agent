@@ -24,8 +24,13 @@ def _mode(path) -> int:
 
 
 def _no_managed(monkeypatch, home):
-    """Force the not-managed branch: no HERMES_MANAGED env, no marker in ``home``."""
+    """Force the not-managed, not-container branch: no HERMES_MANAGED env, no marker in
+    ``home``, and no container signal (containers skip reconciliation by design, and CI
+    runs these tests inside one)."""
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
+    monkeypatch.delenv("HERMES_CONTAINER", raising=False)
+    monkeypatch.delenv("HERMES_SKIP_CHMOD", raising=False)
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
     monkeypatch.delenv("HERMES_HOME_MODE", raising=False)
     monkeypatch.delenv("HERMES_UID", raising=False)
     monkeypatch.delenv("HERMES_GID", raising=False)
