@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+# The facade re-exports gateway_launchd's functions by value at its first import. Load it before any
+# test patches a gateway_launchd function, or the facade keeps that test's stub for the whole process.
+import hermes_cli.gateway  # noqa: F401
 from hermes_cli import gateway_guardian as guardian
 
 
