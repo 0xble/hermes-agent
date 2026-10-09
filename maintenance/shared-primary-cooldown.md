@@ -24,6 +24,14 @@ deadline follows the record, so a longer window that another process re-armed wi
 Restore only proceeds once the shared window has passed or the record is gone, and
 restore never rewrites the record.
 
+A 429 that arrives while the record is still active came from a request already in
+flight before the outage was recorded, not from a fresh probe. It keeps the current
+backoff level, so a burst of concurrent 429s costs one 60 s window rather than
+60 → 960 s. A re-arm without a provider reset never shortens an active window, so a
+header-less 429 cannot pull a known two-hour reset forward. A provider reset time
+still replaces the window, since it is the authoritative answer. Backoff escalates
+only on a 429 after the window lapsed, which is a real re-probe.
+
 An expired record counts as the same outage only within a grace period: the larger of
 10 minutes and the record's own window, capped at the 4 h backoff ceiling. Busy
 profiles probe within seconds of expiry, so a record nobody re-armed within that grace
