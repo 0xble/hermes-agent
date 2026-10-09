@@ -9,6 +9,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -1105,16 +1106,16 @@ def _rebind_primary_credential_pool(agent, primary_provider, matches_primary, lo
 
 def _adopt_shared_primary_cooldown(agent) -> bool:
     """Start a fresh agent on the configured fallback when another process armed the primary route."""
+    if not getattr(agent, "_fallback_chain", None):
+        return False  # nothing to adopt onto; skip the state-file lock on every turn
     try:
-        from agent.shared_primary_cooldown import active_cooldown, get_cooldown, route_from_agent
-        route = route_from_agent(agent)
-        record = active_cooldown(route)
-        if record is None:
-            # Preserve an expired record as a recovery probe. The first successful primary request
-            # clears it atomically and owns the sole recovery notice.
-            expired = get_cooldown(route)
-            if isinstance(expired, dict):
-                agent._shared_primary_cooldown_record = expired
+        from agent.shared_primary_cooldown import get_cooldown, is_active, route_from_agent
+        record = get_cooldown(route_from_agent(agent))
+        if not is_active(record):
+            # Keep an expired record as a recovery probe: the first successful primary request
+            # clears it atomically and owns the sole recovery notice. None drops a record that
+            # was cleared elsewhere (another process recovered, or `hermes fallback cooldowns clear`).
+            agent._shared_primary_cooldown_record = record
             return False
         from agent.error_classifier import FailoverReason
         try:
@@ -1128,14 +1129,41 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         return False
 
 
+def _refresh_from_shared_cooldown(agent) -> str:
+    """Sync an agent already on a provider fallback with the shared primary record.
+
+    Returns ``"active"`` (another process holds the primary in cooldown: the in-memory deadline
+    now follows the record), ``"expired"`` (the record awaits a recovery probe), ``"absent"``
+    (no record: cleared by a recovery elsewhere, by the CLI, or pruned as stale) or
+    ``"unavailable"`` (the state could not be read; callers keep the in-memory deadline).
+    """
+    try:
+        from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent
+        record = read_cooldown(route_from_agent(agent))
+    except Exception:
+        logger.debug("Shared primary cooldown read failed; keeping the in-memory deadline", exc_info=True)
+        return "unavailable"
+    agent._shared_primary_cooldown_record = record
+    if record is None:
+        return "absent"
+    if not is_active(record):
+        return "expired"
+    remaining = max(0, math.ceil(float(record.get("reset_at", 0)) - time.time()))
+    agent._rate_limited_until = time.monotonic() + remaining
+    agent._rate_limit_backoff_count = int(record.get("backoff_count", 0) or 0)
+    return "active"
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
     if not agent._fallback_activated:
+        # Reset the index even without activation, and before adoption walks the chain: a failed
+        # _try_activate_fallback() can strand _fallback_index past the chain end, which would make
+        # adoption see an exhausted chain and send the turn to the cooled primary.
+        agent._fallback_index = 0
         if _adopt_shared_primary_cooldown(agent):
             return False
-        # Reset the index even without activation: a failed _try_activate_fallback() can strand
-        # _fallback_index past the chain end and silently block future fallbacks.
         agent._fallback_index = 0
         return False
     # Reset the chain index even when no fallback was activated this turn. Without this, a turn where
@@ -1143,7 +1171,17 @@ def restore_primary_runtime(agent) -> bool:
     # leaves _fallback_index >= len(_fallback_chain) while _fallback_activated stays False. The next turn
     # skips this block entirely, stranding the index and silently blocking all future fallback attempts for
     # the session. Fixes #20465.
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    # The shared record is the source of truth across processes: another agent may have re-armed
+    # the same outage with a longer window after this agent's in-memory deadline was set, or the
+    # outage may have been cleared (a recovery elsewhere, or the CLI).
+    held_shared_record = isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict)
+    shared_state = "unavailable"
+    if getattr(agent, "_provider_fallback_active", False):  # not `/model --once`
+        shared_state = _refresh_from_shared_cooldown(agent)
+        if shared_state == "active":
+            return False  # another process holds the primary in cooldown, stay on fallback
+    cleared_elsewhere = held_shared_record and shared_state == "absent"
+    if getattr(agent, "_rate_limited_until", 0) > time.monotonic() and not cleared_elsewhere:
         return False  # primary still in rate-limit cooldown, stay on fallback
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
@@ -1214,12 +1252,10 @@ def restore_primary_runtime(agent) -> bool:
         logger.info("Primary runtime restored for new turn: %s (%s)", agent.model, agent.provider)
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
-        shared_record = getattr(agent, "_shared_primary_cooldown_record", None)
-        if isinstance(shared_record, dict):
-            with contextlib.suppress(Exception):
-                from agent.shared_primary_cooldown import release_for_recovery, route_from_record
-                release_for_recovery(route_from_record(shared_record), str(shared_record.get("outage_id", "")))
-        if provider_fallback_active and not isinstance(shared_record, dict):
+        # A shared outage's recovery notice belongs to the request that proves the primary works
+        # (complete_primary_recovery), never to this restore. Restore proceeds only once the
+        # shared window has passed or the record is gone, so it never rewrites the record.
+        if provider_fallback_active and not held_shared_record:
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
                 agent._emit_diagnostic_status(
