@@ -40,7 +40,9 @@ the browser vault fill tool, or the 1Password backends.
   full origin and item label; cross-registrable-domain aliases warn with both domains when the advisory fallback recognizes
   those suffixes. The warning is advisory, has partial suffix coverage and never authorizes a fill; the full origin is
   always shown. Declines and unanswered prompts
-  remain fail-closed for retries in the same session. Never rewrite a 1Password item to add a URL because template
+  remain fail-closed for retries in the same session. An accepted prompt re-reads `vault.origin_aliases` before
+  writing and refuses with `origin_alias_revoked` (nothing written, acceptance not cached) when the alias was removed
+  while the prompt waited. Never rewrite a 1Password item to add a URL because template
   rewrites can delete passkeys.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect
   one-time-password fields, automatic 2FA is announced only when a code can really be minted, an unusable OTP field
