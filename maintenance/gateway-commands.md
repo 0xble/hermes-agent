@@ -10,8 +10,10 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   primary's aliases. Aliases that target `/stop`, `/new`, or `/reset` keep ordinary busy
   semantics. Name-less alias targets are rejected before the busy-path guard.
 - `/fast`, `/reasoning`, `/title`, `/usage`, and `/whoami` run during an active turn.
-  `/compress`, `/undo`, `/retry`, `/save`, and `/branch` are acknowledged, keep their
-  command identity, and execute ahead of queued follow-up text once the turn commits.
+  `/model` is acknowledged, keeps its command identity, and executes after the current turn commits,
+  so switching models never mutates the live agent or gets rejected. `/compress`, `/undo`, `/retry`,
+  `/save`, and `/branch` are acknowledged, keep their command identity, and execute ahead of queued
+  follow-up text once the turn commits.
 
 ## Provenance and patches
 
