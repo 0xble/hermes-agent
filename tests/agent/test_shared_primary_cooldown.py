@@ -633,7 +633,7 @@ def test_generic_500_on_the_real_path_does_not_arm(tmp_path):
     assert not _record_path(home).exists()
 
 
-# ── Non-finite records (review deleg_57eb875c, P2) ──────────────────────────────────────────
+# ── Malformed records: non-finite or implausibly distant resets ──────────────────────────────────────────
 
 def _write_routes(entries):
     routes = {
@@ -658,6 +658,34 @@ def test_non_finite_records_are_pruned_by_readers():
     assert [r["model"] for r in spc.list_cooldowns()] == ["healthy"]
     routes = json.loads(spc._state_path().read_text(encoding="utf-8-sig"))["routes"]
     assert [entry["model"] for entry in routes.values()] == ["healthy"]
+
+
+def test_implausibly_distant_reset_is_pruned_but_a_weekly_cap_is_kept():
+    now = time.time()
+    base = {"provider": "custom:fixture", "base_url": "http://127.0.0.1:8317/v1", "reason": "rate_limit",
+            "outage_id": "x", "backoff_count": 1, "recorded_at": now}
+    _write_routes([
+        {**base, "model": "huge", "reset_at": 1e20},
+        {**base, "model": "past-ceiling", "reset_at": now + spc._MAX_PROVIDER_RESET_SECONDS + 3600},
+        {**base, "model": "weekly-cap", "reset_at": now + 6 * 86_400},
+    ])
+    assert [r["model"] for r in spc.list_cooldowns()] == ["weekly-cap"]
+    assert spc.active_cooldown(("custom:fixture", "http://127.0.0.1:8317/v1", "huge")) is None
+
+
+def test_arm_keeps_a_multi_day_provider_reset():
+    """The original motivating case: a usage cap that resets days away must be honored."""
+    days = time.time() + 5 * 86_400
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=days)
+    assert entry["source"] == "provider_reset"
+    assert abs(entry["reset_at"] - days) < 1
+
+
+def test_arm_ignores_an_implausible_provider_reset():
+    entry = spc.arm_cooldown(_ROUTE, reason="overloaded", reset_at=1e20)
+    assert entry is not None
+    assert entry["source"] == "backoff"
+    assert 59 <= entry["reset_at"] - entry["recorded_at"] <= 61
 
 
 def test_arm_ignores_a_non_finite_provider_reset():

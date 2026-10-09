@@ -31,6 +31,9 @@ _MAX_BACKOFF_SECONDS = 14_400
 # 10 minutes and its own window (capped at the 4 h backoff ceiling) describes an outage that
 # already ended. A 429 after that is a new outage: fresh id, unclaimed notice, backoff from 60 s.
 _STALE_GRACE_FLOOR_SECONDS = 600
+# Furthest-out reset a reader or writer accepts. Weekly usage caps reset within 7 days;
+# 31 days leaves room for monthly billing caps without letting a corrupt value pin a route.
+_MAX_PROVIDER_RESET_SECONDS = 31 * 86_400
 
 
 def _state_path() -> Path:
@@ -151,11 +154,24 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _plausible_reset(value: Any, now: float) -> float | None:
+    """A finite reset no further out than ``_MAX_PROVIDER_RESET_SECONDS``, else None (malformed).
+
+    Provider resets can legitimately be days away (weekly usage caps), so the ceiling is
+    generous; it only rejects values no real provider sends, which would otherwise pin the
+    route and overflow timestamp formatting.
+    """
+    reset_at = _finite_float(value)
+    if reset_at is None or reset_at > now + _MAX_PROVIDER_RESET_SECONDS:
+        return None
+    return reset_at
+
+
 def _stale(entry: Any, now: float) -> bool:
     """True when a record is malformed, or expired past its grace and no longer the current outage."""
     if not isinstance(entry, dict):
         return True
-    reset_at = _finite_float(entry.get("reset_at", 0))
+    reset_at = _plausible_reset(entry.get("reset_at", 0), now)
     recorded_at = _finite_float(entry.get("recorded_at", reset_at)) if reset_at is not None else None
     if reset_at is None or recorded_at is None:
         return True
@@ -176,8 +192,9 @@ def _prune_stale(state: dict[str, Any], now: float) -> bool:
 def _active(entry: Any, now: float | None = None) -> bool:
     if not isinstance(entry, dict):
         return False
-    reset_at = _finite_float(entry.get("reset_at", 0))
-    return reset_at is not None and reset_at > (time.time() if now is None else now)
+    now = time.time() if now is None else now
+    reset_at = _plausible_reset(entry.get("reset_at", 0), now)
+    return reset_at is not None and reset_at > now
 
 
 def read_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
@@ -217,7 +234,7 @@ def arm_cooldown(
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record."""
     now = time.time()
-    requested_reset = (_finite_float(reset_at) or 0.0) if reset_at is not None else 0.0
+    requested_reset = (_plausible_reset(reset_at, now) or 0.0) if reset_at is not None else 0.0
     if requested_reset <= now:
         requested_reset = 0.0
     key = route_key(provider=route[0], base_url=route[1], model=route[2])

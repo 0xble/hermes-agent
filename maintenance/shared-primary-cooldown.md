@@ -38,9 +38,11 @@ short chain-exhaustion cooldown. `switch_deferred_by_reset` still applies only t
 limits.
 
 Readers treat a record whose `reset_at` or `recorded_at` is not a finite number (NaN,
-±Infinity, junk) as malformed and prune it, and `arm_cooldown` ignores a non-finite
-provider reset. A corrupted state file therefore cannot pin a route forever or make
-`hermes fallback status` raise.
+±Infinity, junk), or whose `reset_at` is more than 31 days out, as malformed and prune it.
+`arm_cooldown` ignores such a provider reset and falls back to the shared backoff. The
+31-day ceiling admits weekly and monthly usage caps. `hermes fallback status` prints
+`unknown` for a reset it cannot format instead of raising. A corrupted state file
+therefore cannot pin a route forever or crash the status listing.
 
 A 429 that arrives while the record is still active came from a request already in
 flight before the outage was recorded, not from a fresh probe. It keeps the current

@@ -403,6 +403,19 @@ class TestCooldownsCommand:
         assert "No primary-model cooldowns active" in capsys.readouterr().out
         assert not path.exists()
 
+    def test_status_survives_a_huge_finite_record(self, isolated_home, capsys):
+        import json
+        from agent.shared_primary_cooldown import _state_path, route_key
+        route = {"provider": "custom:claude-proxy", "base_url": "http://127.0.0.1:8317/v1", "model": "claude-opus-5-5"}
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": 1, "routes": {route_key(**route): {
+            **route, "reset_at": 1e20, "recorded_at": 0, "reason": "rate_limit", "outage_id": "x",
+        }}}), encoding="utf-8")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "status"]))
+        assert "No primary-model cooldowns active" in capsys.readouterr().out
+
 # ---------------------------------------------------------------------------
 # cmd_fallback dispatcher
 # ---------------------------------------------------------------------------
