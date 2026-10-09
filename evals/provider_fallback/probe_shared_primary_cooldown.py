@@ -5,9 +5,19 @@ Run from the repository root:
     ./.venv/bin/python evals/provider_fallback/probe_shared_primary_cooldown.py
 
 The script creates a temporary HERMES_HOME under ~/.hermes/cache/scratch, serves a
-loopback OpenAI-compatible stub, and runs independent AIAgent processes. PASS output
-shows one primary request across the outage, one outage notice, zero primary requests
-after the simulated restart, and one recovery notice after reset expiry.
+loopback OpenAI-compatible stub (primary 429 with Retry-After 7200 until released,
+fallback 200), and runs every turn as a separate process through the production request
+path, ``AIAgent.run_conversation``. Roles exercise all three request wrappers: streaming
+(``first``, ``session``, ``restart``, ``recovery``), non-streaming (``subagent``) and
+``direct_api_call`` (``cron``, platform=cron).
+
+A pass prints two lines:
+    PROBE_OK: one primary outage call, one outage notice, restart-safe fallback, one recovery notice
+    PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary
+
+Phase 1 also proves that fallback replies never clear the outage: the shared record must
+still exist with its 2h reset after every outage-phase turn, and no recovery notice may
+appear before the primary actually answers.
 """
 from __future__ import annotations
 
@@ -31,8 +41,11 @@ HERMES_HOME.mkdir()
     "agent:\n  api_max_retries: 0\ncompression:\n  enabled: false\n",
     encoding="utf-8",
 )
+RECORD_PATH = HERMES_HOME / "state" / "model_cooldowns.json"
+PRIMARY_MODEL = "primary-model"
 
 state = {"primary_available": False, "send_reset": True, "requests": []}
+lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,115 +59,177 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'{"data":[]}')
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
         model = body.get("model")
-        primary = model == "primary-model"
-        status = 200 if (not primary or state["primary_available"]) else 429
-        state["requests"].append({"model": model, "status": status})
-        payload = (
-            {"id": "local", "object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
-            if status == 200
-            else {"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}}
-        )
-        self.send_response(status)
-        if status == 429 and state["send_reset"]:
-            self.send_header("Retry-After", "7200")
+        stream = bool(body.get("stream"))
+        ok = model != PRIMARY_MODEL or state["primary_available"]
+        with lock:
+            state["requests"].append({"model": model, "status": 200 if ok else 429, "stream": stream})
+        if not ok:
+            payload = json.dumps({"error": {"message": "rate_limit_error: retry later", "type": "rate_limit_error"}}).encode()
+            self.send_response(429)
+            if state["send_reset"]:
+                self.send_header("Retry-After", "7200")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        text = f"OK from {model}"
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            base = {"id": "local", "object": "chat.completion.chunk", "created": 0, "model": model}
+            for chunk in (
+                {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]},
+                {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            ):
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+        payload = json.dumps({
+            "id": "local", "object": "chat.completion", "created": 0, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }).encode()
+        self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.write(payload)
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 URL = f"http://127.0.0.1:{server.server_port}/v1"
 
+# One real user turn. Roles choose the request wrapper; nothing here calls the client, the
+# fallback switch or the recovery helper directly.
 CHILD = r'''
-import json, os, sys
+import json, sys
 from run_agent import AIAgent
-from agent.error_classifier import classify_api_error
-from agent.shared_primary_cooldown import complete_primary_recovery
-role, url = sys.argv[1:]
+role, url = sys.argv[1:3]
 notices = []
-def status(kind, message):
-    notices.append(str(message))
 fallback = [{"provider": "custom", "model": "fallback-model", "base_url": url, "api_key": "fixture", "api_mode": "chat_completions"}]
-agent = AIAgent(api_key="fixture", base_url=url, provider="custom", model="primary-model", api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True, fallback_model=fallback, status_callback=status)
-agent.client.max_retries = 0
-primary_calls = 0
+agent = AIAgent(
+    api_key="fixture", base_url=url, provider="custom", model="primary-model",
+    api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True,
+    enabled_toolsets=[], fallback_model=fallback, max_iterations=3,
+    platform="cron" if role == "cron" else None,
+    status_callback=lambda kind, message: notices.append(str(message)),
+)
+if role in ("subagent", "cron"):
+    agent._disable_streaming = True
+if role == "cron":
+    from agent.chat_completion_helpers import should_use_direct_api_call
+    assert should_use_direct_api_call(agent), "cron role must exercise direct_api_call"
 try:
-    if role == "first":
-        try:
-            agent.client.chat.completions.create(model=agent.model, messages=[{"role":"user", "content":"hello"}])
-            raise AssertionError("primary unexpectedly succeeded")
-        except Exception as exc:
-            primary_calls += 1
-            classified = classify_api_error(exc)
-            if not agent._try_activate_fallback(classified.reason, reset_at=classified.error_context.get("reset_at")):
-                raise
-        agent.client.chat.completions.create(model=agent.model, messages=[{"role":"user", "content":"hello"}])
-        agent._emit_pending_fallback_notice()
-    else:
-        agent._restore_primary_runtime()
-        agent.client.chat.completions.create(model=agent.model, messages=[{"role":"user", "content":"hello"}])
-        if role == "recovery":
-            complete_primary_recovery(agent)
+    result = agent.run_conversation("hello")
 finally:
     agent.close()
-print(json.dumps({"role": role, "model": agent.model, "primary_calls": primary_calls, "notices": notices}))
+print(json.dumps({"role": role, "model": agent.model, "final_response": result.get("final_response"), "notices": notices}))
 '''
+
+
+def primary_count() -> int:
+    with lock:
+        return len([r for r in state["requests"] if r["model"] == PRIMARY_MODEL])
 
 
 def run_child(role: str) -> dict:
     env = os.environ.copy()
     env.update({"HOME": str(HOME), "HERMES_HOME": str(HERMES_HOME), "PYTHONPATH": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"})
-    completed = subprocess.run([sys.executable, "-c", CHILD, role, URL], cwd=ROOT, env=env, check=True, capture_output=True, text=True)
-    return json.loads(completed.stdout.strip().splitlines()[-1])
+    for key in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        env.pop(key, None)
+    before = primary_count()
+    completed = subprocess.run(
+        [sys.executable, "-c", CHILD, role, URL], cwd=ROOT, env=env,
+        capture_output=True, text=True, timeout=300,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"{role} child failed ({completed.returncode}):\n{completed.stdout}\n{completed.stderr}")
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    result["primary_calls"] = primary_count() - before
+    return result
+
+
+def read_record() -> dict:
+    return next(iter(json.loads(RECORD_PATH.read_text(encoding="utf-8"))["routes"].values()))
+
+
+def expire_record() -> None:
+    record = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
+    for entry in record["routes"].values():
+        entry["reset_at"] = time.time() - 1
+    RECORD_PATH.write_text(json.dumps(record), encoding="utf-8")
+
+
+def notices_matching(results, needle: str) -> list[str]:
+    return [n for r in results for n in r["notices"] if needle in n]
 
 
 try:
-    outage_results = [run_child(role) for role in ("first", "session", "subagent", "cron")]
+    # Phase 1: provider reset (Retry-After 7200).
+    outage_results = []
+    for role in ("first", "session", "subagent", "cron"):
+        result = run_child(role)
+        outage_results.append(result)
+        assert result["final_response"] == "OK from fallback-model", result
+        # A fallback reply must never clear the outage (P1-A regression guard).
+        assert RECORD_PATH.exists(), f"{role}: fallback reply cleared the shared outage"
+        entry = read_record()
+        assert entry["reset_at"] - time.time() > 7000, (role, entry)
     restart_result = run_child("restart")
-    record_path = HERMES_HOME / "state" / "model_cooldowns.json"
-    record = json.loads(record_path.read_text(encoding="utf-8"))
-    for entry in record["routes"].values():
-        entry["reset_at"] = time.time() - 1
-    record_path.write_text(json.dumps(record), encoding="utf-8")
+    assert restart_result["final_response"] == "OK from fallback-model", restart_result
+    assert RECORD_PATH.exists(), "restart: fallback reply cleared the shared outage"
+    expire_record()
     state["primary_available"] = True
     recovery_result = run_child("recovery")
-    primary_requests = [request for request in state["requests"] if request["model"] == "primary-model"]
-    outage_notices = [notice for result in outage_results for notice in result["notices"] if "rate-limited" in notice]
-    recovery_notices = [notice for notice in recovery_result["notices"] if "restored" in notice]
-    summary = {"home": str(HOME), "requests": state["requests"], "outage_results": outage_results, "restart": restart_result, "recovery": recovery_result, "outage_notice_count": len(outage_notices), "recovery_notice_count": len(recovery_notices)}
+    primary_requests = [r for r in state["requests"] if r["model"] == PRIMARY_MODEL]
+    outage_notices = notices_matching(outage_results + [restart_result], "rate-limited until")
+    early_recovery = notices_matching(outage_results + [restart_result], "restored")
+    recovery_notices = notices_matching([recovery_result], "restored")
+    summary = {
+        "home": str(HOME), "requests": state["requests"], "outage_results": outage_results,
+        "restart": restart_result, "recovery": recovery_result,
+        "outage_notice_count": len(outage_notices), "recovery_notice_count": len(recovery_notices),
+    }
     print(json.dumps(summary, indent=2))
-    assert len(primary_requests) == 2, primary_requests  # one 429 + one successful recovery probe
+    assert [r["status"] for r in primary_requests] == [429, 200], primary_requests
+    assert outage_results[0]["primary_calls"] == 1, outage_results[0]
+    assert all(r["primary_calls"] == 0 for r in outage_results[1:] + [restart_result])
     assert len(outage_notices) == 1, outage_notices
+    assert early_recovery == [], early_recovery
+    assert recovery_result["final_response"] == "OK from primary-model", recovery_result
+    assert recovery_result["model"] == PRIMARY_MODEL, recovery_result
     assert len(recovery_notices) == 1, recovery_notices
-    assert all(result["primary_calls"] == 0 for result in outage_results[1:] + [restart_result])
+    assert not RECORD_PATH.exists(), "primary success must clear the shared outage"
     print("PROBE_OK: one primary outage call, one outage notice, restart-safe fallback, one recovery notice")
 
-    # Phase 2 (Done 5): no provider reset. Each new outage-arming process escalates the SHARED
-    # level (60s -> 120s -> 240s ...), and a process started while cooling never calls the primary.
+    # Phase 2 (no provider reset): each outage-arming turn escalates the SHARED level
+    # (60s -> 120s -> 240s), and a turn started while cooling never calls the primary.
     state["primary_available"] = False
     state["send_reset"] = False
     windows = []
+    phase2 = []
     for _ in range(3):
-        before = len([r for r in state["requests"] if r["model"] == "primary-model"])
-        result = run_child("first")
-        after = len([r for r in state["requests"] if r["model"] == "primary-model"])
-        assert after - before == 1, (before, after)
-        entry = next(iter(json.loads(record_path.read_text(encoding="utf-8"))["routes"].values()))
+        armed = run_child("first")
+        assert armed["primary_calls"] == 1, armed
+        assert armed["final_response"] == "OK from fallback-model", armed
+        entry = read_record()
         windows.append(round(entry["reset_at"] - entry["recorded_at"]))
-        blocked_before = len([r for r in state["requests"] if r["model"] == "primary-model"])
         blocked = run_child("session")
-        assert blocked["model"] == "fallback-model" and blocked["primary_calls"] == 0
-        assert len([r for r in state["requests"] if r["model"] == "primary-model"]) == blocked_before
-        # Expire the window so the next process probes the primary (still 429) and escalates.
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        for e in record["routes"].values():
-            e["reset_at"] = time.time() - 1
-        record_path.write_text(json.dumps(record), encoding="utf-8")
-    print(json.dumps({"no_reset_backoff_windows_s": windows}))
+        assert blocked["primary_calls"] == 0 and blocked["final_response"] == "OK from fallback-model", blocked
+        phase2 += [armed, blocked]
+        expire_record()  # the next turn probes the primary (still 429) and escalates
+    phase2_outage = notices_matching(phase2, "rate-limited until")
+    print(json.dumps({"no_reset_backoff_windows_s": windows, "phase2_outage_notice_count": len(phase2_outage)}))
     assert windows == [60, 120, 240], windows
+    assert len(phase2_outage) == 1, phase2_outage
+    assert notices_matching(phase2, "restored") == []
     print("PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary")
 finally:
     server.shutdown()
