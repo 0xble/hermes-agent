@@ -333,3 +333,22 @@ def is_partial_silence_marker(text: Any) -> bool:
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
         for c in _canonical_silence_candidates(text)
     )
+
+
+def hold_silence_delta(hold: dict, delta: str) -> str:
+    """Streamed text safe to release now while a bare silence marker stays withheld.
+
+    ``hold`` is per-turn state ``{"buf": "", "held": ""}``. The agent opens the first text after
+    a tool round with ``"\\n\\n"``, so such a delta re-arms the hold for the new segment: the reply
+    after tool commentary may still be the bare marker. A prefix still held from the previous
+    segment is content once more text follows, so it is released.
+    """
+    released = ""
+    if delta.startswith("\n\n"):
+        released, hold["held"], hold["buf"] = hold["held"], "", ""
+    hold["buf"] += delta
+    if is_partial_silence_marker(hold["buf"]):
+        hold["held"] += delta
+        return released
+    released, hold["held"] = released + hold["held"] + delta, ""
+    return released

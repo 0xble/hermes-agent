@@ -30,6 +30,13 @@ def _bot_mode_delivery_text(response: Any, *, successful: bool) -> Any:
     return "" if successful and is_intentional_silence_response(response) else response
 
 
+def _silence_hidden_turn(session: dict, prompt: Any) -> bool:
+    """Whether a successful bare silence marker stays invisible for this turn: every Bot Chat turn,
+    and heartbeat or /loop wakeups, whose prompt asks for ``[SILENT]`` when nothing changed."""
+    from hermes_cli.loops import is_quiet_wakeup_prompt
+    return is_quiet_wakeup_prompt(prompt) or _is_bot_mode_session(session)
+
+
 def _is_bot_mode_session(session: dict) -> bool:
     """Whether this completion belongs to the canonical Bot Chat surface.
 
@@ -431,10 +438,14 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
         except Exception:
             pass  # transient DB failure — keep pending_title for retry
     # Voice fallback when the streaming pipeline couldn't start (tts_queue already spoke
-    # everything otherwise); barge-aware.
+    # everything otherwise); barge-aware. Speaks the delivered text: a quiet wakeup's bare
+    # [SILENT] stays in ``raw`` for the /loop hook above but is never spoken.
     if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
+        spoken = (_bot_mode_delivery_text(raw, successful=True)
+                  if _silence_hidden_turn(session, getattr(st, "prompt_text", "")) else raw)
         try:
-            threading.Thread(target=_speak_text_with_barge, args=(raw,), daemon=True).start()
+            if spoken.strip():
+                threading.Thread(target=_speak_text_with_barge, args=(spoken,), daemon=True).start()
         except ImportError:
             logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
         except Exception as e:
@@ -830,7 +841,8 @@ def _invoke_agent(
     # Bot Chat mirrors gateway.stream_consumer: deltas are withheld while the streamed buffer
     # could still resolve to a silence marker ("NO"->"NO_REPLY"), so a bare marker is never
     # shown and then retracted (the client keeps streamed text when message.complete is "").
-    hold = {"buf": "", "held": ""} if _is_bot_mode_session(session) else None
+    # Heartbeat and /loop wakeups ask for a bare [SILENT] on a no-change tick: hold it the same way.
+    hold = {"buf": "", "held": ""} if _silence_hidden_turn(session, prompt) else None
     loop_hold = {"text": "", "seen": ""}
 
     def _deliver_delta(delta):
@@ -865,12 +877,9 @@ def _invoke_agent(
                 loop_hold["text"] = ""
             loop_hold["seen"] += delta
         if hold is not None and isinstance(delta, str):
-            from gateway.response_filters import is_partial_silence_marker
-            hold["buf"] += delta
-            if is_partial_silence_marker(hold["buf"]):
-                hold["held"] += delta
+            from gateway.response_filters import hold_silence_delta
+            if not (delta := hold_silence_delta(hold, delta)):
                 return
-            delta, hold["held"] = hold["held"] + delta, ""
         _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
@@ -1018,10 +1027,15 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         except Exception:
             _error_surface = None
     raw, status, last_reasoning = _turn_outcome(result, _error_surface)
+    delivered = raw
+    if _silence_hidden_turn(session, st.prompt_text):
+        delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
     if _is_bot_mode_session(session):
-        raw = _bot_mode_delivery_text(raw, successful=status == "complete")
+        raw = delivered
+    # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
+    # only the rendered text is emptied.
     from gateway.response_filters import strip_trailing_loop_complete_marker
-    visible_raw = strip_trailing_loop_complete_marker(raw)
+    visible_raw = strip_trailing_loop_complete_marker(delivered)
     payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt

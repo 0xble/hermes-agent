@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,46 @@ _INTERVAL_TOKEN_RE = re.compile(
 
 
 WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
+# Shared wakeup contract. A wakeup is machinery, not a conversation: the user hears from the loop
+# only when something new needs them, so a no-change tick ends with the bare silence marker.
+_WAKEUP_REPLY_RULES = (
+    "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
+    "If nothing new and material happened since your last visible update and nothing needs the "
+    f"user's action, reply with exactly {SILENCE_MARKER} and nothing else. That includes plain "
+    "acknowledgements and anything that changes nothing for the user. Never send status like "
+    "\"still waiting\", \"nothing new\", or what you did not do.\n"
+    "If something did change, reply in one or two short lines with only the new fact or the "
+    "action the user needs to take.\n"
+)
+_WAKEUP_REVISE_RULE = (
+    "If the cadence, run count, or stop condition no longer fits, revise the loop with the "
+    "loop_set tool (action=revise) instead of stopping it."
+)
 WAKEUP_PROMPT_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "This is an automatic wakeup from the /loop. "
+    + _WAKEUP_REPLY_RULES
+    + "If the task is complete, no longer applicable, or the thing you were watching has "
+    f"finished, say so briefly with the evidence and end with {LOOP_COMPLETE_MARKER} on its own "
+    "line; that stops the loop. "
+    + _WAKEUP_REVISE_RULE
+)
+
+WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "Stop condition: {until}\n\n"
+    "This is an automatic wakeup from the /loop. "
+    + _WAKEUP_REPLY_RULES
+    + "If the stop condition is met, or the task is no longer applicable, say so briefly with "
+    f"the evidence and end with {LOOP_COMPLETE_MARKER} on its own line; that stops the loop. "
+    + _WAKEUP_REVISE_RULE
+)
+
+# Wording before the silence contract. Stored rows still carry it, so the generated-turn
+# classifier (agent/synthetic_prompt.py) keeps recognizing it; never render these.
+_PREVIOUS_WAKEUP_PROMPT_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
     "This is an automatic wakeup from the /loop the user set. Perform the "
@@ -55,8 +96,7 @@ WAKEUP_PROMPT_TEMPLATE = (
     "If the cadence, run count, or stop condition no longer fits, revise "
     "the loop with the loop_set tool (action=revise) instead of stopping it."
 )
-
-WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
+_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
     "Stop condition: {until}\n\n"
@@ -71,6 +111,18 @@ WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     "longer fits, revise the loop with the loop_set tool (action=revise) "
     "instead of stopping it."
 )
+
+
+def is_quiet_wakeup_prompt(text: Any) -> bool:
+    """Whether ``text`` is a heartbeat or prompt-form /loop wakeup, the turns whose prompt asks
+    for a bare silence marker when nothing changed. Surfaces without the gateway's machinery
+    display kind (CLI, TUI, Desktop) use this to hide that marker."""
+    return isinstance(text, str) and text.startswith((WAKEUP_PROMPT_PREFIX, HEARTBEAT_PROMPT_PREFIX))
+
+
+def _is_silence_reply(response: Any) -> bool:
+    from gateway.response_filters import is_intentional_silence_response
+    return is_intentional_silence_response(response)
 
 
 def parse_interval_token(token: str) -> Optional[int]:
@@ -394,6 +446,10 @@ def _digest_response(response: str) -> str:
     """Digest for self-paced change detection; whitespace-normalized with clock/timestamp/duration
     tokens stripped so 'checked at 14:02:33' doesn't defeat the backoff."""
     text = (response or "").strip().lower()
+    if _is_silence_reply(response):
+        # Every silence marker form (NO_REPLY, "[SILENT].") is the same "nothing changed" reply,
+        # matching the --until judge skip, so repeated quiet ticks back off.
+        return SILENCE_MARKER.lower()
     text = re.sub(r"\d{1,2}:\d{2}(:\d{2})?", "", text)
     text = re.sub(r"\d{4}-\d{2}-\d{2}", "", text)
     text = re.sub(r"\b\d+(\.\d+)?\s*(s|sec|secs|seconds|m|min|mins|minutes|h|hr|hrs|hours)\b", "", text)
@@ -872,8 +928,9 @@ class LoopManager:
             return self._stop("done", "agent signaled the task is complete",
                               f"✓ Loop finished after {ticks} — task complete.")
 
-        # 2. Evidence-based --until judge (reuses the /goal judge; fail-open).
-        if s.until and (last_response or "").strip():
+        # 2. Evidence-based --until judge (reuses the /goal judge; fail-open). A bare silence
+        # marker is the prompt's "nothing changed" reply: no evidence to judge, so no model call.
+        if s.until and (last_response or "").strip() and not _is_silence_reply(last_response):
             try:
                 from hermes_cli.goals import judge_goal
 
@@ -1029,5 +1086,5 @@ __all__ = [
     "response_signals_complete", "goal_blocks_loop_tick", "load_loop", "save_loop", "clear_loop",
     "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "LOOP_COMPLETE_MARKER",
     "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",
-    "DEFAULT_MAX_TICKS",
+    "DEFAULT_MAX_TICKS", "is_quiet_wakeup_prompt",
 ]

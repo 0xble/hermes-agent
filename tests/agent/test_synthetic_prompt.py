@@ -292,6 +292,30 @@ def test_crafted_near_miss_is_classified_in_linear_time(module_name, template_na
     assert time.perf_counter() - started < 1.0
 
 
+@pytest.mark.parametrize("module_name,template_name,fields", [
+    ("hermes_cli.heartbeat", "HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
+    ("hermes_cli.heartbeat", "_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
+    ("hermes_cli.loops", "WAKEUP_PROMPT_TEMPLATE", {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
+    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
+     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
+    ("hermes_cli.loops", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
+    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
+])
+def test_current_and_pre_silence_wakeup_wording_stay_generated(module_name, template_name, fields):
+    """Stored heartbeat and /loop rows rendered before the [SILENT] contract have no display_kind,
+    so their old wording must still classify as generated or memory would ingest it as user text."""
+    import importlib
+
+    from agent.synthetic_prompt import text_after_generated_prefix
+
+    rendered = getattr(importlib.import_module(module_name), template_name).format(**fields)
+    assert text_after_generated_prefix(rendered) is None
+    assert human_prompt_text(rendered) is None
+    assert human_prompt_text(rendered + "\n" + HUMAN) == HUMAN
+
+
 def test_trivial_suffix_still_skips_recall():
     assert auto_recall_query(_goal_prompt() + "\n\nok", display_kind=None, platform="telegram") == ""
 
