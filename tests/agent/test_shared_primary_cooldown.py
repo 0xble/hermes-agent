@@ -107,6 +107,13 @@ from agent.shared_primary_cooldown import arm_cooldown
 print(json.dumps(arm_cooldown({route!r}, reason='rate_limit', backoff_count=0)))
 """,
     )
+    # A real escalation follows a re-probe after the window lapsed. A 429 that was already in
+    # flight inside the window must not escalate (test_in_flight_burst_does_not_escalate_backoff).
+    state_path = tmp_path / "state" / "model_cooldowns.json"
+    state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    for entry in state["routes"].values():
+        entry["reset_at"] = time.time() - 1
+    state_path.write_text(json.dumps(state), encoding="utf-8")
     second = _run(
         tmp_path,
         f"""
@@ -398,6 +405,31 @@ def test_recently_expired_record_is_still_the_same_outage():
     assert again["backoff_count"] == 2
 
 
+def test_in_flight_burst_does_not_escalate_backoff():
+    """Concurrent in-flight 429s at outage start share one level, not 60 -> 960 s."""
+    windows = []
+    for _ in range(5):
+        entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", backoff_count=0)
+        windows.append(round(entry["reset_at"] - entry["recorded_at"]))
+    assert windows == [60, 60, 60, 60, 60]
+    assert entry["backoff_count"] == 1
+
+
+def test_no_reset_rearm_never_shortens_an_active_provider_reset():
+    long = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 7200)
+    again = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    assert again["reset_at"] >= long["reset_at"] - 1
+    assert again["source"] == "provider_reset"
+    assert again["outage_id"] == long["outage_id"]
+
+
+def test_provider_reset_still_wins_over_an_active_window():
+    spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 7200)
+    sooner = time.time() + 600
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=sooner)
+    assert abs(entry["reset_at"] - sooner) < 1
+
+
 def test_grace_scales_with_a_long_window():
     spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 7200)
     # 30 min past a 2 h window: beyond the 10 min floor but inside the window-sized grace.
@@ -488,3 +520,27 @@ def test_clear_cooldowns_matches_exactly():
         spc.clear_cooldowns()
     with pytest.raises(ValueError):
         spc.clear_cooldowns("x", all_routes=True)
+
+
+def test_bedrock_stream_success_runs_primary_recovery(monkeypatch):
+    """All four primary success paths (stream, non-stream, direct, Bedrock) clear the outage."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agent import chat_completion_helpers as h
+
+    recovered = []
+    monkeypatch.setattr(spc, "complete_primary_recovery", lambda agent: recovered.append(agent) or True)
+    agent = SimpleNamespace(_interrupt_requested=False, _consecutive_stale_streams=0)
+    stream = h._BedrockStream.__new__(h._BedrockStream)
+    stream.agent = agent
+    stream.result = {"response": object(), "error": None}
+    stream.last_event = time.time()
+    stream.stale_timeout = 60
+    stream._worker = lambda: None
+    stream._raise_if_interrupted = MagicMock()
+    stream._on_stale = MagicMock()
+
+    assert stream._poll() is stream.result["response"]
+    assert recovered == [agent]
+

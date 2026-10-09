@@ -157,10 +157,16 @@ class TestRateLimitBackoffEscalation:
         """Simulate the primary provider rate-limiting again on a later turn
         (without a successful restore, which would reset the counter): put
         the agent's identity back on the primary and reset the turn-scoped
-        fallback chain state."""
+        fallback chain state. A later turn only re-probes the primary once the
+        shared window has lapsed (turn start adopts an active record and stays
+        on fallback), so expire it; a 429 inside the window is an in-flight
+        request and must not escalate."""
+        from agent.shared_primary_cooldown import get_cooldown, route_from_agent
         agent.provider, agent.model, agent.base_url = snapshot
         agent._fallback_activated = False
         agent._fallback_index = 0
+        if get_cooldown(route_from_agent(agent)) is not None:
+            _expire_shared_window(agent)
 
     def test_backoff_doubles_per_consecutive_rate_limit(self):
         """Each consecutive primary rate-limit doubles the cooldown:

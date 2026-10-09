@@ -2474,6 +2474,9 @@ class _BedrockStream:
         # Success clears the cross-turn breaker (#58962).
         if self.result["response"] is not None:
             _reset_stale_streak(self.agent)
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import complete_primary_recovery
+                complete_primary_recovery(self.agent)
         return self.result["response"]
 
     def run(self):

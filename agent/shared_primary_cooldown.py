@@ -231,14 +231,26 @@ def arm_cooldown(
             else:
                 outage_id = f"{now:.6f}-{os.getpid()}-{threading.get_ident()}"
                 prior_count = max(0, int(backoff_count or 0))
+            # A 429 that lands while the record is still active comes from a request that was
+            # already in flight before the outage was recorded, not from a fresh probe, so it
+            # must neither escalate the backoff nor shorten the window everyone else honours.
+            still_active = _active(old, now)
+            old_reset = float(old.get("reset_at", 0) or 0) if still_active else 0.0
             if requested_reset:
                 effective_reset = requested_reset
                 source = "provider_reset"
-                backoff_count = max(1, prior_count + (0 if _active(old, now) else 1))
+                backoff_count = max(1, prior_count + (0 if still_active else 1))
+            elif still_active:
+                backoff_count = max(1, prior_count)
+                effective_reset = now + min(60 * (2 ** (backoff_count - 1)), _MAX_BACKOFF_SECONDS)
+                source = str(old.get("source") or "backoff")
             else:
                 backoff_count = prior_count + 1
                 effective_reset = now + min(60 * (2 ** max(0, backoff_count - 1)), _MAX_BACKOFF_SECONDS)
                 source = "backoff"
+            if old_reset > effective_reset and not requested_reset:
+                effective_reset = old_reset
+                source = str(old.get("source") or source)
             entry = {
                 **_route_fields(route),
                 "reset_at": effective_reset,
