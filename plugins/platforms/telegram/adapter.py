@@ -5160,6 +5160,21 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_update_prompt", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
 
+    async def send_control_request(
+        self, chat_id: str, text: str, request_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a durable session-control approval request with Approve/Deny buttons."""
+        def build():
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Approve", callback_data=f"ctl:a:{request_id}"),
+                InlineKeyboardButton("Deny", callback_data=f"ctl:d:{request_id}"),
+            ]])
+            return self.format_message(text), keyboard, None
+        return await self._send_prompt(
+            "send_control_request", chat_id, metadata, build,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+
     # Template attrs for the shared _format_exec_approval core (HTML mode). Properties, not class
     # constants: the wording comes from the catalog for the language active at send time, and the
     # translated text is HTML-escaped BEFORE the <b> wrapper (a stray ``&``/``<`` would break the card).
@@ -5674,6 +5689,34 @@ class TelegramAdapter(BasePlatformAdapter):
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+        if data.startswith("ctl:"):
+            await self._handle_session_control_callback(query, data, cb)
+            return
+
+    async def _handle_session_control_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """Resolve durable session-control requests after the normal callback allowlist gate."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"a", "d"}:
+            return
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        request_id = parts[2]
+        try:
+            from hermes_cli.session_controls import resolve_request
+            user_id = str(getattr(query.from_user, "id", ""))
+            record = await asyncio.to_thread(resolve_request, request_id, "approve" if parts[1] == "a" else "deny", user_id)
+        except Exception:
+            logger.exception("[%s] session-control callback failed", self.name)
+            record = None
+        if record is None:
+            text = "already resolved or expired"
+            await query.answer(text=text[:_TOAST_LIMIT])
+            return
+        who = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        status = str(record.get("status") or "failed")
+        label = "Approved" if status == "applied" else "Denied" if status == "denied" else status.title()
+        await query.answer(text=label[:_TOAST_LIMIT])
+        await self._edit_md_quiet(query, f"{label} by {who}")
 
     async def _claim_callback_state(self, query, cb: Dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""

@@ -2070,6 +2070,15 @@ def _is_user_typed(row: Dict[str, Any]) -> bool:
         return False
     if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
         return False
+    # Relay and other gateway-authored text is persisted as an ordinary user row.  The
+    # response-origin marker is the authoritative second provenance check; fail closed if
+    # the filter cannot be imported so synthetic text can never authorize a revision.
+    try:
+        from gateway.response_filters import is_agent_origin_text
+        if is_agent_origin_text(content):
+            return False
+    except Exception:
+        return False
     try:
         from agent.context_compressor import ContextCompressor
         if ContextCompressor._is_context_summary_content(content):
@@ -2351,6 +2360,60 @@ class GoalManager:
         state.last_dispute_evidence = ""
         self._save()
         return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
+
+    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                contract: Optional[Any] = None, user_quote: str = "",
+                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace the goal with explicit quote authority and preserve revision history."""
+        old = self._state
+        if old is None or old.status == "cleared":
+            return {"ok": False, "error_code": "no_goal", "error": "there is no active or paused goal to replace", "state": old, "revision": None}
+        reason = (reason or "").strip()
+        goal = (goal or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason", "state": old, "revision": None}
+        if not goal:
+            return {"ok": False, "error_code": "no_change", "error": "replacement goal is empty", "state": old, "revision": None}
+        authority = None
+        try:
+            from hermes_cli.session_controls import _CURRENT_AUTHORITY
+            authority = _CURRENT_AUTHORITY.get()
+        except Exception:
+            authority = None
+        quote = " ".join((user_quote or "").split())
+        source = ""
+        if not (authority and authority.get("via") in {"quote", "button"}):
+            if not quote:
+                return {"ok": False, "error_code": "user_authority_required", "error": "goal replacement needs user_quote", "state": old, "revision": None}
+            try:
+                from hermes_cli.session_controls import check_user_quote
+                checked = check_user_quote(self.session_id, quote)
+                if isinstance(checked, str):
+                    return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
+                quote, source = checked
+            except ValueError as exc:
+                code = str(exc)
+                return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}
+        else:
+            source = str(authority.get("message") or "")
+        if user_messages is not None and source == "" and user_messages:
+            source = " ".join(str(user_messages[-1]).split())
+        old_contract = old.contract.to_dict()
+        new_contract = contract.to_dict() if hasattr(contract, "to_dict") else dict(contract or {})
+        new_contract = {k: str(new_contract.get(k) or "").strip() for k in _CONTRACT_FIELDS}
+        before = {"goal": old.goal, "max_turns": old.max_turns, "contract": old_contract,
+                  "status": old.status, "subgoals": list(old.subgoals)}
+        after = {"goal": goal, "max_turns": old.max_turns if max_turns is None else normalize_goal_max_turns(max_turns, self.default_max_turns),
+                 "contract": new_contract, "status": "active", "subgoals": []}
+        revision = {"kind": "replace", "before": before, "after": after, "user_quote": quote,
+                    "user_message": source, "reason": reason, "at": time.time(), "actor": "agent"}
+        revisions = list(old.revisions) + [revision]
+        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=time.time(),
+                                max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),
+                                revisions=revisions)
+        self._save()
+        return {"ok": True, "error_code": "", "error": "", "state": self._state,
+                "revision": revision}
 
     # --- /subgoal user controls ---------------------------------------
 
