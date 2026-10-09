@@ -490,6 +490,25 @@ def test_top_level_session_close_keeps_its_tab(camofox, monkeypatch):
     assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])  # left for adoption
 
 
+def test_subagent_release_refuses_adoption_before_tab_delete(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    tab = cf._sessions["child"]["tab_id"]
+
+    real_delete = cf._delete
+    def delete_with_racing_adoption(path, *args, **kwargs):
+        if path == f"/tabs/{tab}":
+            raced = _dispatch("browser_navigate", {"url": "https://a.example.test/race"}, "sibling")
+            assert raced["success"]
+            assert cf._sessions["sibling"]["tab_id"] != tab
+        return real_delete(path, *args, **kwargs)
+
+    with patch.object(cf, "_delete", side_effect=delete_with_racing_adoption):
+        _close_agent({"child"}, _delegate_depth=1)
+    assert cf._sessions["sibling"]["tab_id"] != tab
+    assert _tab_deletes(camofox.server) == [(f"/tabs/{tab}", {"userId": _user_id(cf, "sibling")})]
+
+
 def test_subagent_close_never_deletes_an_adopted_tab(camofox):
     cf = camofox.cf
     user_id = cf._get_session("seed")["user_id"]

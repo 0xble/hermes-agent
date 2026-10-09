@@ -631,6 +631,10 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
                         and tab_id not in (_protected_tab_ids | quarantined)
                         and tab_id not in still_bound):
                     closable[tab_id] = session["user_id"]
+        # Refuse adoption before dropping the lock: the DELETE below is an external call, and a
+        # sibling task must not claim a tab in that gap.
+        for tab_id, user_id in closable.items():
+            _stale_tab_ids.setdefault(user_id, set()).add(tab_id)
     for session in dropped:
         if session and not session.get("managed"):
             try:
