@@ -531,6 +531,9 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Opti
             body["url"] = url
         data = _post("/tabs", body)
         session["tab_id"] = data.get("tabId")
+        # The tab this task opened itself (never an adopted or handed-off one): a finished
+        # subagent or one-shot run may close it (:func:`release_task_bindings`).
+        session["created_by_task"] = session["tab_id"]
     return session
 
 
@@ -598,10 +601,15 @@ def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False
             _drop_session_locked(old_task_id)
 
 
-def release_task_bindings(task_ids: Iterable[str]) -> None:
+def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool = False) -> None:
     """Agent close: forget these tasks' local tab bindings. A managed profile and its tabs stay on
     the server for another task to adopt; an ephemeral session still open (a turn cut before its
-    cleanup, or headed mode) is deleted as :func:`camofox_close` would."""
+    cleanup, or headed mode) is deleted as :func:`camofox_close` would.
+
+    ``close_created_tabs`` (a finished subagent or one-shot/cron run, whose tasks are never
+    resumed) also closes each released managed binding's tab on the server, but only a tab the
+    task opened itself via ``POST /tabs``: never an adopted, handed-off or shared-identity tab,
+    a protected or quarantined tab, or a tab another live task is still bound to."""
     with _sessions_lock:
         keys = {key or "default" for key in task_ids}
         # Include continuation ids carried from these tasks that no turn has used yet (a used one
@@ -610,13 +618,30 @@ def release_task_bindings(task_ids: Iterable[str]) -> None:
                           if key not in keys and session.get("carried")
                           and session.get("carried_from") in keys}:
             keys |= carried
-        dropped = [_drop_session_locked(key) for key in keys]
+        dropped = [_drop_session_locked(key) for key in keys]  # quarantines protected tabs first
+        closable: Dict[str, str] = {}
+        if close_created_tabs:
+            still_bound = {other.get("tab_id") for other in _sessions.values()}
+            quarantined = _protected_tabs_on_disk()
+            for session in dropped:
+                tab_id = session.get("tab_id") if session else None
+                if (tab_id and session.get("managed") and session.get("created_by_task") == tab_id
+                        and session.get("session_key") != SHARED_IDENTITY_GROUP
+                        and quarantined is not None  # unreadable quarantine fails closed
+                        and tab_id not in (_protected_tab_ids | quarantined)
+                        and tab_id not in still_bound):
+                    closable[tab_id] = session["user_id"]
     for session in dropped:
         if session and not session.get("managed"):
             try:
                 _delete(f"/sessions/{session['user_id']}")
             except Exception as exc:
                 logger.debug("Camofox ephemeral session close failed for %s: %s", session.get("user_id"), exc)
+    for tab_id, user_id in closable.items():
+        try:
+            _delete(f"/tabs/{tab_id}", params={"userId": user_id}, timeout=10)
+        except Exception as exc:
+            logger.debug("Camofox tab close failed for %s (%s): %s", tab_id, user_id, exc)
 
 
 # ---- HTTP helpers ----
@@ -644,8 +669,8 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> r
     return _request("get", path, timeout, params=params)
 
 
-def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
-    return _request("delete", path, timeout, json=body).json()
+def _delete(path: str, body: dict = None, timeout: Optional[int] = None, *, params: dict = None) -> dict:
+    return _request("delete", path, timeout, json=body, params=params).json()
 
 
 # ---- Tool implementations ----
