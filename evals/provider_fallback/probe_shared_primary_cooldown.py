@@ -4,7 +4,8 @@
 Run from the repository root:
     ./.venv/bin/python evals/provider_fallback/probe_shared_primary_cooldown.py
 
-The script creates a temporary HERMES_HOME under ~/.hermes/cache/scratch, serves a
+The script creates a temporary HERMES_HOME under ~/.hermes/cache/scratch (removed on exit;
+set PROBE_KEEP_HOME=1 to keep it for debugging), serves a
 loopback OpenAI-compatible stub (primary 429 with Retry-After 7200 until released,
 fallback 200), and runs every turn as a separate process through the production request
 path, ``AIAgent.run_conversation``. Roles exercise all three request wrappers: streaming
@@ -24,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -233,3 +235,8 @@ try:
     print("PROBE_OK: no-reset shared backoff 60s -> 120s -> 240s; cooling sessions never wait on the primary")
 finally:
     server.shutdown()
+    server.server_close()
+    if os.environ.get("PROBE_KEEP_HOME") == "1":
+        print(f"probe HERMES_HOME kept at {HOME}")
+    else:
+        shutil.rmtree(HOME, ignore_errors=True)
