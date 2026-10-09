@@ -12,11 +12,13 @@ import { $gatewayState, $sessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import { isAuxiliaryWindow } from '@/store/windows'
 
+import type { SubmitTextResult } from '../../session/hooks/use-prompt-actions/utils'
+
 interface QuickEntryBridgeParams {
   submitText: (
     text: string,
     options?: { onAccepted?: (identity: QuickEntryAcceptedIdentity) => void }
-  ) => Promise<boolean> | boolean
+  ) => Promise<SubmitTextResult> | SubmitTextResult
   submitTextToNewSession: (text: string, owner?: string) => Promise<{ runtimeSessionId: string; sessionId: string }>
 }
 
@@ -32,14 +34,15 @@ const QUICK_ENTRY_SESSION_OPTIONS = 5
 
 /**
  * `submitText` resolves false when a pre-submit guard declines the prompt
- * without throwing (for example, while the target is busy). That is a failed
- * delivery, not an acknowledgement of success.
+ * without throwing (for example, while the target is busy), or `'dropped'`
+ * when the gateway discarded a deferred MoA prompt. Both are failed
+ * deliveries, not an acknowledgement of success.
  */
 export function quickEntrySubmitAck(
-  submitted: boolean,
+  submitted: SubmitTextResult,
   identity?: null | QuickEntryAcceptedIdentity
 ): QuickEntrySubmitResult {
-  if (!submitted) {
+  if (submitted !== true) {
     return {
       code: 'submit-rejected',
       message: 'The prompt was not accepted.',
