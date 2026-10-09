@@ -152,7 +152,12 @@ tidy.tidy_partial_clone_packs(Path(sys.argv[1]))
 def test_a_refused_or_killed_erase_leaves_git_reading_and_is_finished_later(
         clone: Path, monkeypatch: pytest.MonkeyPatch, midx_layout: list) -> None:
     pack_dir = clone / ".git" / "objects" / "pack"
-    _git("multi-pack-index", "write", *midx_layout, cwd=clone)
+    try:
+        _git("multi-pack-index", "write", *midx_layout, cwd=clone)
+    except subprocess.CalledProcessError:
+        if not midx_layout:
+            raise
+        pytest.skip("git too old for an incremental multi-pack-index")
     held, before = _objects(clone), _packs(clone)
     real_unlink = Path.unlink
 
