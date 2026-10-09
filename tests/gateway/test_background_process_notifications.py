@@ -214,6 +214,52 @@ async def test_arm_process_watcher_schedules_on_live_loop_only(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_watcher_armed_from_a_delegated_child_does_not_carry_child_context(monkeypatch, tmp_path):
+    """A child's background process can be handed off to its parent, whose next turn is the
+    completion this watcher injects. Arming from the child's tool thread must not leak the
+    child's marker or session id into the watcher and the tasks it spawns, or the parent's turns
+    read as a subagent's (review_candidate refused as parent_only, processes tagged subagent-owned)."""
+    import threading
+
+    from agent.delegation_context import delegated_child_context, is_delegated_child_context
+    from gateway.session_context import get_session_env
+
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    seen = {}
+    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def _injected_parent_turn():
+        seen["turn_child"] = is_delegated_child_context()
+        seen["turn_session"] = get_session_env("HERMES_SESSION_ID")
+
+    async def _fake_watcher(watcher):
+        seen["watcher_child"] = is_delegated_child_context()
+        await asyncio.create_task(_injected_parent_turn())
+        done.set()
+    runner._run_process_watcher = _fake_watcher
+    runner._gateway_loop = loop
+    runner._running = True
+
+    armed = []
+
+    def _child_tool_thread():
+        with delegated_child_context("child-session-id"):
+            assert is_delegated_child_context()
+            armed.append(runner.arm_process_watcher({"session_id": "proc_from_child"}))
+
+    worker = threading.Thread(target=_child_tool_thread)
+    worker.start()
+    await asyncio.to_thread(worker.join, 5)
+    await asyncio.wait_for(done.wait(), 5)
+
+    assert armed == [True]
+    assert seen["watcher_child"] is False
+    assert seen["turn_child"] is False
+    assert seen["turn_session"] != "child-session-id"
+
+
+@pytest.mark.asyncio
 async def test_consumed_completion_skips_raw_notification_without_agent_notify(
     monkeypatch, tmp_path
 ):
