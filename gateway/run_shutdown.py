@@ -2117,6 +2117,8 @@ class GatewayShutdownMixin:
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
             + self._restart_wait_cron_counts()["awaitable"]
+            # Delegations are waited on under their own budget; the restart wait splits them out.
+            + self._active_async_delegation_count()
         )
 
     def _describe_active_work(self) -> list:
@@ -2236,7 +2238,7 @@ class GatewayShutdownMixin:
                     budgets.append("delegations %.0fs left" % (delegation_deadline - now))
                 logger.info(
                     "Restart deferred: waiting on %d active work unit(s) "
-                    "(%d wedged and excluded; %s); active work: %s",
+                    "(%d wedged and excluded, %d restart-safe and excluded; %s); active work: %s",
                     awaitable, self._wedged_agent_count(),
                     self._restart_safe_cron_count(), ", ".join(budgets),
                     self._describe_active_work(),
@@ -2246,7 +2248,8 @@ class GatewayShutdownMixin:
             await asyncio.sleep(0.1)
         if self._active_work_count() > 0:
             logger.warning(
-                "Restart deferred wait: %d work unit(s) remain outside configured wait budgets; "
+                "Restart deferred wait: %d work unit(s) remain outside configured wait budgets "
+                "(%d wedged, %d restart-safe external cron); "
                 "proceeding to stop()/drain which will interrupt them",
                 self._active_work_count(), self._wedged_agent_count(),
                 self._restart_safe_cron_count(),
