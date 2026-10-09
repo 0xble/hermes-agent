@@ -892,6 +892,28 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
     import agent.memory_manager as memory_manager
     stale_now = memory_manager._now
     fresh = threading.Thread(target=manager.queue_prefetch_all, args=(HUMAN,), kwargs={"session_id": "s-1"})
+    fresh_blocked = threading.Event()
+    allow_fresh = threading.Event()
+    generation_lock = manager._prefetch_generation.lock
+
+    class _ObservedGenerationLock:
+        def __enter__(self):
+            if threading.current_thread() is fresh:
+                # Prove that the fresh queue is actually waiting behind the stale check's lock. Keep
+                # it there until the current prefetch has consumed the stale buffer; the timeout is
+                # only a hang guard, not the ordering mechanism.
+                if generation_lock.acquire(blocking=False):
+                    generation_lock.release()
+                    raise AssertionError("fresh queue was not blocked by the stale check")
+                fresh_blocked.set()
+                assert allow_fresh.wait(5), "fresh queue did not receive its release"
+            generation_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            generation_lock.release()
+
+    manager._prefetch_generation.lock = _ObservedGenerationLock()  # type: ignore[assignment]
     raced = []
 
     def now_with_a_fresh_queue_in_flight():
@@ -900,7 +922,7 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
         if not raced:
             raced.append(True)
             fresh.start()
-            fresh.join(0.3)
+            assert fresh_blocked.wait(5), "fresh queue did not reach the generation lock"
         return stale_now()
 
     memory_manager._now = now_with_a_fresh_queue_in_flight
@@ -908,7 +930,9 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
         assert manager.prefetch_all("follow-up", session_id="s-1") == ""  # the stale recall is dropped
     finally:
         memory_manager._now = stale_now
+        allow_fresh.set()
     fresh.join(5)
+    assert not fresh.is_alive(), "fresh queue did not finish"
     assert manager.flush_pending(timeout=5) is True
     assert provider.queued[-1] == HUMAN
     assert manager.prefetch_all("next", session_id="s-1") != ""  # the fresh recall survived
