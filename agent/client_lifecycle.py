@@ -100,6 +100,16 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         agent._replace_primary_openai_client(reason="fallback_timeout_apply")
 
 
+def _camofox_tabs_end_with_agent(agent: Any) -> bool:
+    """A delegated subagent, cron job or one-shot run is never resumed, so the Camofox tabs its
+    tasks opened close with it. A top-level interactive session keeps them for adoption across
+    turns and gateway restarts."""
+    if (getattr(agent, "_delegate_depth", 0) or 0) > 0 or getattr(agent, "platform", None) == "cron":
+        return True
+    from agent.oneshot_footprint import is_single_query_session
+    return is_single_query_session()
+
+
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -141,7 +151,8 @@ class ClientLifecycleMixin:
             import sys
             camofox = sys.modules.get("tools.browser_camofox")
             if camofox is not None:
-                camofox.release_task_bindings(getattr(self, "_process_owner_task_ids", ()))
+                camofox.release_task_bindings(getattr(self, "_process_owner_task_ids", ()),
+                                              close_created_tabs=_camofox_tabs_end_with_agent(self))
 
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
                      release_camofox_tabs, release_computer_use, forget_file_state):
