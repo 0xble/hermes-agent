@@ -74,7 +74,7 @@ def test_saved_origin_refuses_extra_signin_origin_without_alias(monkeypatch):
         "(https://gusto.com). Vault fills only run on the exact origin(s) the credential was saved for. Add the exact "
         "origin with `hermes config set vault.origin_aliases.op:gusto-id '[\"https://login.gusto.com\"]'`, including any "
         "existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may "
-        "write this config entry; the fill-time confirmation names the exact origin and item label. Never edit or rewrite "
+        "write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite "
         "the existing 1Password item to add a URL: template rewrites can delete passkeys."
     )
 
@@ -165,6 +165,55 @@ def test_alias_only_login_fill_confirms_once_and_saved_origin_does_not(monkeypat
     assert saved["success"]
     assert prompts == []
 
+
+
+def test_alias_only_login_fill_skips_confirmation_when_disabled(monkeypatch, caplog):
+    backend = _Backend(_meta(handle="op:quiet-id"))
+    _fill_patches(monkeypatch, backend)
+    prompts = []
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "decline")
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "confirm_alias_fills": False,
+        "origin_aliases": {"op:quiet-id": ["https://login.gusto.com"]},
+    }}):
+        with caplog.at_level("INFO", logger="tools.browser_vault_tool"):
+            result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="quiet"))
+    assert result["success"] is True
+    assert prompts == []
+    assert not vault._alias_fill_refused
+    assert "registrable domain differs" not in caplog.text
+
+
+def test_disabled_alias_confirmation_logs_cross_domain_warning_without_prompt(monkeypatch, caplog):
+    backend = _Backend(_meta(handle="op:quiet-cross-domain"))
+    _fill_patches(monkeypatch, backend, page_origin="https://login.example.com")
+    prompts = []
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "decline")
+    with patch("hermes_cli.config.load_config_readonly", return_value={"vault": {
+        "confirm_alias_fills": False,
+        "origin_aliases": {"op:quiet-cross-domain": ["https://login.example.com"]},
+    }}):
+        with caplog.at_level("INFO", logger="tools.browser_vault_tool"):
+            result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="quiet-cross-domain"))
+    assert result["success"] is True
+    assert prompts == []
+    assert "registrable domain differs" in caplog.text
+
+
+def test_disabled_alias_confirmation_still_refuses_unlisted_and_other_item_alias(monkeypatch):
+    backend = _Backend(_meta(handle="op:quiet-scoped"))
+    _fill_patches(monkeypatch, backend, page_origin="https://login.evil.example")
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: (_ for _ in ()).throw(AssertionError("prompted")))
+    config = {"vault": {
+        "confirm_alias_fills": False,
+        "origin_aliases": {"op:other-id": ["https://login.evil.example"]},
+    }}
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="quiet-scoped"))
+    assert result["success"] is False
+    assert result["error_type"] == "origin_mismatch"
 
 
 def test_declined_alias_only_login_fill_refuses_retries(monkeypatch):
@@ -405,7 +454,7 @@ def test_alias_still_present_after_confirmation_fills(monkeypatch):
     assert result["success"] is True
     assert result["origin"] == "https://login.gusto.com"
     assert len(writes) == 1
-    assert len(loads) == 2  # once before the prompt, once after it
+    assert len(loads) == 3  # aliases, confirmation setting, and post-confirmation revalidation
 
 
 def test_saved_origin_fill_skips_prompt_and_alias_recheck(monkeypatch):

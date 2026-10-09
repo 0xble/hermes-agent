@@ -2518,6 +2518,8 @@ DEFAULT_CONFIG = {
         # Aliases extend fill authorization without editing the password-manager item; malformed,
         # HTTP, and wildcard origins are ignored. Example: {"item-id": ["https://signin.example.com"]}.
         "origin_aliases": {},
+        # Alias-only login fills ask for confirmation unless this is false.
+        "confirm_alias_fills": True,
         "onepassword": {
             # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
             "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
