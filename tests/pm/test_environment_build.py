@@ -265,6 +265,57 @@ def test_first_bundle_extension_preserves_shipped_extras(locked_project, build_w
     assert (source / "uv.lock").read_bytes() == locked
 
 
+def test_first_on_demand_extra_preserves_payload_extras(locked_project, build_worker, tmp_path, monkeypatch):
+    """A payload's shipped anchors remain enabled when the first lazy extra creates PM facts."""
+    import pm
+    from pm import paths
+    from pm.environments import runtime_facts_path, selected_venv
+    from pm.lock import Facts
+
+    source, uv, env = locked_project
+    wheels = tmp_path / "wheels"
+    _wheel(wheels, "telegram")
+    _wheel(wheels, "anthropic")
+    metadata = (source / "pyproject.toml").read_text(encoding="utf-8")
+    metadata = metadata.replace(
+        "[project.optional-dependencies]\n",
+        "[project.optional-dependencies]\n"
+        "messaging=[\"telegram==1.0\"]\n"
+        "telegram=[\"telegram==1.0\"]\n"
+        "anthropic=[\"anthropic==1.0\"]\n",
+    )
+    metadata = metadata.replace(
+        f"find-links=[{json.dumps((tmp_path / 'wheels').as_posix())}]",
+        f"find-links=[{json.dumps(wheels.as_posix())}]",
+    )
+    (source / "pyproject.toml").write_text(metadata, encoding="utf-8")
+    _run([str(uv), "lock", "--python", sys.executable], cwd=source, env=env)
+    monkeypatch.setattr(paths, "repo_root", lambda: source)
+
+    payload = pm.build_environment(
+        source=source, out=tmp_path / "payload", extras=["telegram"],
+        env=env, cache=tmp_path / "cache", offline=True, explicit=True,
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"repo": source.name, "venv": payload.parent.parent.name}), encoding="utf-8",
+    )
+    facts_path = runtime_facts_path(source)
+    facts_path.unlink(missing_ok=True)
+    (tmp_path / "enabled-features.json").unlink(missing_ok=True)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.setattr("pm.environments.running_from_selected_environment", lambda _root: True)
+
+    # This is the first on-demand sync: there is no PM selection or frozen feature list yet.
+    pm.sync_venv(["anthropic"])
+
+    fact = Facts(facts_path, strict=True).get("venv")
+    assert fact is not None
+    assert fact["extras"] == ["anthropic", "telegram"]
+    selected = selected_venv(source)
+    executable = selected / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    assert _run([str(executable), "-I", "-c", "import anthropic, telegram"], cwd=tmp_path, env=env) == ""
+
+
 def test_worker_sync_reuses_unions_and_reports_real_lock_drift(locked_project, build_worker, tmp_path, monkeypatch):
     import pm
     from pm.environments import selected_venv, runtime_facts_path

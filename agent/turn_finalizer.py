@@ -21,6 +21,7 @@ from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 from agent.served_model import result_model_fields
+from agent.skill_review_gate import consume_skill_review_if_due, note_human_turn_for_skill_review
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
@@ -736,14 +737,10 @@ def finalize_turn(
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 
-    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used.
-    _should_review_skills = (
-        agent._skill_nudge_interval > 0
-        and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
-    )
-    if _should_review_skills:
-        agent._iters_since_skill = 0
+    # Skill trigger is checked NOW — based on how many tool iterations THIS turn used and whether
+    # a human-authored turn occurred since the previous skill review.
+    note_human_turn_for_skill_review(agent, original_user_message)
+    _should_review_skills = consume_skill_review_if_due(agent)
 
     # External memory provider: sync the completed turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
