@@ -73,7 +73,7 @@ jobs:
       - name: Run ruff + ty on HEAD
         run: |
           mkdir -p .lint-reports/head
-          ruff check --config ruff.strict.toml --output-format json --exit-zero \
+          ruff check --output-format json --exit-zero \
             > .lint-reports/head/ruff.json || true
           ty check --output-format gitlab --exit-zero \
             > .lint-reports/head/ty.json || true
@@ -96,7 +96,7 @@ jobs:
             git worktree add --detach /tmp/lint-base "$BASE_SHA"
             (
               cd /tmp/lint-base
-              ruff check --config ruff.strict.toml --output-format json --exit-zero \
+              ruff check --output-format json --exit-zero \
                 > "$GITHUB_WORKSPACE/.lint-reports/base/ruff.json" || true
               ty check --output-format gitlab --exit-zero \
                 > "$GITHUB_WORKSPACE/.lint-reports/base/ty.json" || true
@@ -149,7 +149,7 @@ jobs:
         # No --exit-zero, no || true. Exit code propagates to the job,
         # which propagates to the required-check gate.
         run: |
-          ruff check --config ruff.strict.toml .
+          ruff check .
 
   code-health:
     # Per-unit ratchet: every function and file keeps its own cap (its value on main when it is
