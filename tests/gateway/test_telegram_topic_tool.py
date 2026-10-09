@@ -318,6 +318,42 @@ async def test_edit_follows_a_restored_binding_instead_of_repointing_the_topic(h
 
 
 @pytest.mark.asyncio
+async def test_a_model_edit_on_a_restored_topic_resolves_and_lands_on_the_topics_route(home):
+    """Model and reasoning overrides and the running-turn slot belong to the topic's route
+    (session_key), and the binding heal's switch_session carries both overrides onto the restored
+    session, so resolving before the heal reads the same route state the heal leaves behind.
+    Resolving first keeps an invalid pick from binding or switching anything."""
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    created = await create_topic_session(runner, _source(), TopicSpec(
+        name="Room", model="gpt-test", provider="openai-codex", reasoning="high"))
+    key = runner._session_key_for_source(_source(thread_id="4242"))
+    home.db.create_session(session_id="older-session", source="telegram")
+    home.db.bind_telegram_topic(chat_id=CHAT, thread_id="4242", user_id=CHAT, session_key=key,
+                                session_id="older-session")
+    seen_running = []
+    runner._is_session_running = lambda k: seen_running.append(k) or False
+
+    # An invalid pick is refused before the heal, so it neither switches the route nor touches overrides.
+    runner._perform_model_switch.return_value = (None, "unknown model")
+    with pytest.raises(TopicRequestError, match="unknown model"):
+        await edit_topic_session(runner, _source(), "4242", TopicSpec(model="nope"))
+    assert runner.session_store.peek_session_id(key) == created["session_id"]
+    assert runner.session_store.get_model_override(key)["model"] == "gpt-test"
+
+    runner._perform_model_switch.return_value = (_model_result("gpt-test-2"), None)
+    result = await edit_topic_session(runner, _source(), "4242", TopicSpec(model="gpt-test-2"))
+
+    ctx = runner._perform_model_switch.await_args.args[0]
+    assert (ctx.session_key, ctx.current_model, ctx.current_provider) == (key, "gpt-test", "openai-codex")
+    assert set(seen_running) == {key}
+    assert result["session_id"] == "older-session" != created["session_id"]
+    assert runner.session_store.peek_session_id(key) == "older-session"
+    assert runner.session_store.get_model_override(key)["model"] == "gpt-test-2"
+    assert runner.session_store.get_reasoning_override(key)["effort"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_a_settings_only_edit_of_an_unknown_topic_is_refused(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)

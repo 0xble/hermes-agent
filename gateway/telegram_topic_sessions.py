@@ -264,6 +264,10 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     effort = _parse_reasoning(spec.reasoning)
     model = None
     if spec.model or spec.provider:
+        # Resolved before the binding heal below, on purpose: the running-turn slot and the model
+        # and reasoning overrides belong to the topic's route (session_key), and the heal's
+        # switch_session carries both overrides onto the bound session, so this reads the state the
+        # heal leaves. Resolving first keeps an invalid pick from switching or binding anything.
         if runner._is_session_running(session_key):
             raise TopicRequestError(
                 "That topic's session is mid-turn, so its model cannot change now. "
