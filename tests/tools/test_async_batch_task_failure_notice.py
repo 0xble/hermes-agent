@@ -90,16 +90,28 @@ def test_notice_is_not_sent_for_a_finished_batch():
     assert q.empty()
 
 
-def test_interim_notice_never_claims_or_acknowledges_the_batch_final_row(tmp_path, monkeypatch):
-    """Independent-review witness: a busy parent that drained the notice first acknowledged the FINAL
-    result's durable row, and the consolidated result was never delivered (nor replayed after restart)."""
+def test_interim_notice_claims_its_outbox_row_without_acknowledging_the_batch_final_row(tmp_path, monkeypatch):
+    """A durable notice owns an outbox row distinct from the batch's terminal lifecycle row."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
-    notice = {"type": "async_delegation", "delegation_id": "deleg_x", "task_failure_notice": True, "results": [{"task_index": 0}]}
+    record = _record()
+    ad._persist_dispatch(record)
+    notice = {"type": "async_delegation", "delegation_id": "deleg_x", "task_failure_notice": True,
+              "results": [{"task_index": 0}]}
+    ad._persist_outbox_event(notice, None, event_kind="task_failure")
     final = {"type": "async_delegation", "delegation_id": "deleg_x", "is_batch": True, "results": []}
-    # The notice is a non-durable event: empty token, no row touched.
-    assert ad.claim_event_delivery(notice, "tui-poller") == ""
-    ad.complete_event_delivery(notice, "")
+    claim = ad.claim_event_delivery(notice, "tui-poller")
+    assert claim and claim.startswith("outbox:")
+    ad.complete_event_delivery(notice, claim)
     assert ad.is_interim_delegation_event(notice) and not ad.is_interim_delegation_event(final)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegation_events WHERE event_id=?",
+            (notice["_delivery_event_id"],),
+        ).fetchone() == ("delivered",)
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            ("deleg_x",),
+        ).fetchone() == ("pending",)
 
 
 def test_gateway_dedup_identity_separates_notices_from_the_final_and_from_each_other():
