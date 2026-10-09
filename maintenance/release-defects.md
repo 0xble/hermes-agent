@@ -698,3 +698,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   providers' packages.
 - Guard: `scripts/run_tests.sh tests/gateway/test_multiplex_pending_recovery.py tests/pm/test_extras.py tests/gateway/test_cron_active_work_drain.py` and `uv lock --check`.
 - Retire once the next release sync no longer carries these merge points.
+- The same merge left `cron/scheduler.py`'s `__main__` external-worker entry calling
+  `finish_worker_boot()` without importing it, so every restart-safe cron worker died
+  with `NameError` before its acknowledgement. Guard:
+  `scripts/run_tests.sh tests/cron/test_restart_safe_worker.py`.

@@ -41,7 +41,7 @@ _LOADED_CODE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_LOADED_CODE_ROOT))
 
 from hermes_cli import immutable_releases
-from cron.worker_bootstrap import WORKER_MARKER
+from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting

@@ -222,12 +222,35 @@ def _background_review_read_before_write_guard(
         _read_before_write_required=True)
 
 
+def _background_review_external_write_guard(name: str, skill_dir: Path) -> Optional[Dict[str, Any]]:
+    """Refuse autonomous content writes to skills.external_dirs skills: they are read-only
+    installs whose source lives in another repository, so a local edit would be overwritten
+    or diverge from its owner. Ownership no longer gates writes to any other skill."""
+    if not _is_background_review():
+        return None
+    try:
+        from agent.skill_utils import is_external_skill_path
+        if not is_external_skill_path(skill_dir):
+            return None
+    except Exception:
+        logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
+        return None
+    return _refusal(
+        f"Refusing background curator write for skill '{name}': the skill lives in "
+        f"skills.external_dirs, which are externally owned and read-only to autonomous "
+        f"curation. Change it at its source in the owning repository.")
+
+
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
-    if action != "delete":
+    if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     from tools import skill_manager_tool as _smt
     existing = _smt._find_skill(name)
-    return _background_review_delete_guard(name, existing["path"]) if existing else None
+    if not existing:
+        return None
+    if action == "delete":
+        return _background_review_delete_guard(name, existing["path"])
+    return _background_review_external_write_guard(name, existing["path"])
 
 
 def _curator_consolidation_delete_guard(
