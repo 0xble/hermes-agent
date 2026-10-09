@@ -731,13 +731,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   closure, host-cancelled compression accounting, restart-wait budgets and logs,
   bounded shutdown-spool recovery, the session `/yolo` routing-index flag, launchd
   account-home resolution for an unknown uid, quick-snapshot digest checks before
-  restore, the update body's start-of-run steps, `worktree_gc` git isolation, and the
-  desktop frozen-transport, slash-attachment and Quick Entry bindings. Fork-only cases
-  that exercised only the `honcho` or `openviking` providers upstream removed are
-  dropped; their retaindb, Hindsight and other consumer cases stay. Four new
-  upstream tests assumed a host the fork's CI is not: the media-permission tests
-  now pin the not-container branch, the launch-repair and zip-update probes avoid
-  an interpreter with another checkout installed, and the incremental
-  multi-pack-index case skips on a git too old to write one. Guard:
-  `scripts/run_tests.sh` on the hosted-failing files, with
-  `tests/hermes_cli/test_update_head_moved_gate.py` failing on both parents.
+  restore, the update body's start-of-run steps, `worktree_gc` git isolation, the
+  desktop frozen-transport, slash-attachment and Quick Entry bindings, the
+  rejected-thinking carry to a compression child, the finalized-row reopen before an
+  isolated compute-host dispatch, and the fork's release-aware fleet verification
+  (target release probe, post-verify release retention, no migration on rollback)
+  ported into v0.21.6's `update_cmd_fleet_verify`. Fork-only cases that exercised only
+  the `honcho` or `openviking` providers upstream removed are dropped; their retaindb,
+  Hindsight and other consumer cases stay. Fork tests whose doubles or synchronization
+  predated v0.21.6 (the Relay monitor-first race, now held before the first provider
+  chunk, and the deferred-ack launchd probe) follow the new seams. Four new upstream
+  tests assumed a host the fork's CI is not: the media-permission tests now pin the
+  not-container branch, the launch-repair and zip-update probes avoid an interpreter
+  with another checkout installed, and the incremental multi-pack-index case skips on
+  a git too old to write one. Guard: `scripts/run_tests.sh` on the hosted-failing
+  files, with `tests/hermes_cli/test_update_head_moved_gate.py` failing on both
+  parents.
