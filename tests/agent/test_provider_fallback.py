@@ -94,6 +94,12 @@ def test_fallback_reason_text_defaults_when_reason_is_missing():
     assert chat_completion_helpers._fallback_reason_text(None) == "provider failure"
 
 
+def _shared_outage_notice(primary, record, fb_model, fb_provider):
+    from datetime import datetime
+    reset = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
+    return f"⚠️ {primary} is rate-limited until {reset}; using {fb_model} via {fb_provider} until then."
+
+
 class TestFallbackChainAdvancement:
     def test_exhausted_returns_false(self):
         agent = _make_agent(fallback_model=None)
@@ -125,11 +131,11 @@ class TestFallbackChainAdvancement:
         ):
             assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
 
-        expected = (
-            "⚠️ Model fallback: gpt-5.6-sol via openai-codex unavailable "
-            "(rate limit); using glm-5.2 via zai. "
-            "Primary retry eligible in ~60 s; recovery is not guaranteed."
-        )
+        # A rate-limit switch arms the shared primary cooldown and claims its single outage
+        # notice, which names the primary and the wall-clock expiry instead of the generic text.
+        record = agent._shared_primary_cooldown_record
+        assert record["reason"] == FailoverReason.rate_limit.value
+        expected = _shared_outage_notice("gpt-5.6-sol", record, "glm-5.2", "zai")
         assert agent._pending_fallback_notice == [expected]
         assert agent._retry_status_buffer[-1] == ("status", expected)
 
@@ -155,9 +161,8 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback(FailoverReason.overloaded) is True
 
         assert agent._pending_fallback_notice == [
-            "⚠️ Model fallback: gpt-5.6-sol via openai-codex unavailable "
-            "(rate limit); using glm-5.2 via zai. "
-            "Primary retry eligible in ~60 s; recovery is not guaranteed.",
+            _shared_outage_notice(
+                "gpt-5.6-sol", agent._shared_primary_cooldown_record, "glm-5.2", "zai"),
             "⚠️ Model fallback: glm-5.2 via zai unavailable "
             "(provider overloaded); using deepseek-v4-flash via deepseek.",
         ]
