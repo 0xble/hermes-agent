@@ -2363,7 +2363,7 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
                 _resume_windows_gateways_and_merge_outcome(restart, _windows_gateway_resume, gateway_mode)
                 _verify_fleet_after_update(
                     restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
-                    node_failures=[], update_complete=update_complete, expected_sha=release.name,
+                    update_complete=update_complete, expected_sha=release.name,
                     expected_root=release)
             else:
                 _record_update_step("immutable_release", True, "activation deferred; fleet restart not requested")
@@ -2508,7 +2508,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _write_gateway_update_exit_code(not restart.incomplete)
         _verify_fleet_after_update(
             restart, _pre_update_plan=None, _windows_gateway_resume=None,
-            node_failures=[], update_complete=not restart.incomplete,
+            update_complete=not restart.incomplete,
             expected_sha=result.get("source_sha") if source_layout else Path(current_target).name,
             expected_root=Path(current_target), rollback=True,
         )

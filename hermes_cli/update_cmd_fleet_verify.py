@@ -44,7 +44,8 @@ def _print_legacy_units_warning() -> None:
     print("  (add `sudo` if any are in system scope)")
 
 
-def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
+def _collect_fleet_snapshot(restart, rows_expected: bool, *, expected_sha: str | None = None,
+                            expected_root=None) -> list:
     """Fleet version rows, polled over a bounded settle window when runtimes are expected.
 
     Gateways need time to rewrite gateway_state.json; Windows resumes DETACHED (~10s boot),
@@ -58,14 +59,16 @@ def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
     """
     from hermes_cli.update_receipt import collect_fleet_versions
     pending = getattr(restart, "self_restart_pending_pids", None) or None
+    expected = ({"expected_sha_override": expected_sha, "expected_root_override": expected_root}
+                if expected_sha is not None and expected_root is not None else {})
     if not rows_expected:
         return collect_fleet_versions(
-            pre_restart_pids=restart.pre_restart_gateway_pids, self_restart_pending=pending)
+            pre_restart_pids=restart.pre_restart_gateway_pids, self_restart_pending=pending, **expected)
     pre_pids = restart.pre_restart_gateway_pids
     _fleet_deadline = _time.monotonic() + _FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
     while True:
         _time.sleep(2.0)
-        snapshot = collect_fleet_versions(pre_restart_pids=pre_pids, self_restart_pending=pending)
+        snapshot = collect_fleet_versions(pre_restart_pids=pre_pids, self_restart_pending=pending, **expected)
         unstamped = [row for row in snapshot if _fleet_row_identity_pending(row, pre_pids)]
         if snapshot and not unstamped and not any(row.get("state") == "down" for row in snapshot):
             return snapshot
@@ -182,7 +185,8 @@ def _named_gateways_still_owed() -> bool:
     return not fleet._marker_only_restart_obsolete()
 
 
-def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, update_complete):
+def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, update_complete,
+                               expected_sha: str | None = None, expected_root=None, rollback: bool = False):
     """Post-restart verification: legacy-unit warning, dashboard cleanup, stale serve
     probe, fleet version matrix, plan-vs-execution reconciliation, receipt finalize.
 
@@ -243,7 +247,9 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         _fleet_rows_expected = _m()._fleet_probe_expected_runtimes(
             _pre_update_plan, _pre_restart, _windows_gateway_resume, restart.restarted_services, _killed,
         )
-        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected)
+        overrides = ({"expected_sha": expected_sha, "expected_root": expected_root}
+                     if expected_sha is not None or expected_root is not None else {})
+        _fleet_snapshot = _collect_fleet_snapshot(restart, _fleet_rows_expected, **overrides)
         if print_fleet_version_matrix(_fleet_snapshot):
             restart.incomplete = True
             # A proven-stale survivor must not keep running (its ticker yields every tick and
@@ -338,6 +344,22 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
         )
         with _best_effort('Fleet restart inventory not recorded: %s'):
             _record_owed_gateway_inventory(_pre_update_plan, stopped)
+    # Destructive retention is the last update step: never prune on partial
+    # health, a deferred restart, or an unverified candidate. A failed prune
+    # records a warning without turning a healthy promotion into failure.
+    if not restart.incomplete and update_complete:
+        try:
+            from hermes_cli.immutable_releases import retain, resolved_release
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            if resolved_release(home) is not None:
+                removed = retain(home)
+                from hermes_cli.update_receipt import record_step
+                record_step("release_retention", True, f"removed={len(removed)}: {', '.join(map(str, removed))}")
+        except Exception as exc:
+            logger.warning("Immutable release retention failed after verification: %s", exc, exc_info=True)
+            from hermes_cli.update_receipt import record_step
+            record_step("release_retention", False, str(exc))
     with _best_effort('Update receipt finalize failed: %s'):
         from hermes_cli.update_receipt import finalize_update_receipt
         # A False ``update_complete`` (unsafe SQLite runtime, owed tail work) never fails the
@@ -352,6 +374,8 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
     if not update_complete:
         # Fleet caught up, but the selected runtime's SQLite is unsafe or the tail is still owed
         # (both reported by the completion): leave the topology alone until they are repaired.
+        return
+    if rollback:
         return
     # Fleet is healthy on the new code: fold per-profile gateways into one multiplexer when nothing
     # blocks it (deterministic; never prompts), else print the blockers and the one-liner to run later.

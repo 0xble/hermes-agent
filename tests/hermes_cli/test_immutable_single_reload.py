@@ -13,7 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli import gateway, gateway_launchd, immutable_releases as releases, update_cmd, update_cmd_fleet, update_receipt
+from hermes_cli import (gateway, gateway_launchd, immutable_releases as releases, update_cmd, update_cmd_fleet,
+                        update_cmd_fleet_verify, update_receipt)
 from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
 
 
@@ -79,7 +80,7 @@ def release_job(tmp_path, monkeypatch, request):
     monkeypatch.setattr(update_cmd_fleet, "_restart_systemd_gateway_units", lambda *args: None)
     monkeypatch.setattr(update_cmd_fleet, "_restart_manual_gateways", lambda *args: None)
     monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *args: None)
-    monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
     monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kw: None)
     monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *args: [])
     monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *args: True)
@@ -157,7 +158,7 @@ def test_release_to_release_activation_reload_once(release_job, monkeypatch):
     outcome = update_cmd._restart_gateway_fleet_after_update(
         None, False, acknowledged_release_root=job.b)
     update_cmd._verify_fleet_after_update(outcome, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True,
+        _windows_gateway_resume=None, update_complete=True,
         expected_sha=job.b.name, expected_root=job.b)
     _assert_one_reload(job, job.initial["pid"], job.b)
 
@@ -252,6 +253,6 @@ def test_pending_then_acknowledged_recovery_does_not_relaunch(release_job, monke
     outcome = update_cmd._restart_gateway_fleet_after_update(
         None, False, acknowledged_release_root=job.b)
     update_cmd._verify_fleet_after_update(outcome, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True,
+        _windows_gateway_resume=None, update_complete=True,
         expected_sha=job.b.name, expected_root=job.b)
     _assert_one_reload(job, job.initial["pid"], job.b)

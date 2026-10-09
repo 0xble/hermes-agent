@@ -165,7 +165,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         # Discover ONLY this throwaway label; the account's ai.hermes.gateway job
         # is neither enumerated nor eligible for any restart/kill helper.
         from types import SimpleNamespace
-        from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+        from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
         monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: path)
         monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [label])
         monkeypatch.setattr(gateway, "legacy_launchd_labels_for_install", lambda **kw: [])
@@ -176,7 +176,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         monkeypatch.setattr(update_cmd_fleet, "_restart_systemd_gateway_units", lambda *args: None)
         monkeypatch.setattr(update_cmd_fleet, "_restart_manual_gateways", lambda *args: None)
         monkeypatch.setattr(update_cmd_fleet, "_force_kill_stuck_gateways", lambda *args: None)
-        monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *args, **kw: None)
         monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *args: [])
         monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *args: True)
