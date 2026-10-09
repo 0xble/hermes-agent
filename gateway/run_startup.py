@@ -621,15 +621,22 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             note_event = await self._redelivery_restart_note_event(row)
-            content = row["content"]
+            from gateway.copy_blocks import extract_copy_blocks
+            content, copy_blocks = extract_copy_blocks(row["content"])
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
-            except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                result = None
+            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
+            payloads = [(content, metadata)] if content.strip() else []
+            payloads.extend((block, {**metadata, "copy_block": True, "plain": True}) for block in copy_blocks)
+            result = None
+            for payload, payload_metadata in payloads:
+                try:
+                    result = await adapter.send(chat_id=row["chat_id"], content=payload, metadata=payload_metadata)
+                except Exception as send_err:
+                    logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                    result = None
+                if result is None or not getattr(result, "success", False):
+                    break
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])

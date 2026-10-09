@@ -1944,14 +1944,16 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
+        from gateway.copy_blocks import extract_copy_blocks
+        response_without_copy, copy_blocks = extract_copy_blocks(response) if response else (response, [])
+        # Copy blocks are separate finals even when the ordinary body was streamed.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
         if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+            event, response_without_copy, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            await self._send_voice_reply(event, response_without_copy)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
@@ -1959,8 +1961,25 @@ class GatewayTurnMixin:
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             media_delivered = False
-            if response and adapter and not agent_result.get("media_already_delivered"):
-                media_delivered = bool(await self._deliver_media_from_response(response, event, adapter))
+            copy_failed = False
+            copy_delivered = False
+            if adapter:
+                for copy_block in copy_blocks:
+                    copy_metadata = dict(self._event_thread_metadata(event, source) or {})
+                    copy_metadata["copy_block"] = True
+                    copy_metadata["plain"] = True
+                    copy_result = await adapter.send(source.chat_id, copy_block, metadata=copy_metadata)
+                    if getattr(copy_result, "success", False):
+                        copy_delivered = True
+                    else:
+                        copy_failed = True
+                        logger.error("Streamed copy block delivery failed for %s: %s", source.chat_id,
+                                     getattr(copy_result, "error", None) or "no result")
+            if copy_failed:
+                agent_result["failed"] = True
+                agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
+            if response_without_copy and adapter and not agent_result.get("media_already_delivered"):
+                media_delivered = bool(await self._deliver_media_from_response(response_without_copy, event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
@@ -1972,13 +1991,13 @@ class GatewayTurnMixin:
             # later delivery can still reconcile it (the queued lane reconciles its own uploads).
             if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
                 streamed_text = False
-                if response:
+                if response_without_copy:
                     try:
                         from gateway.run import _strip_response_attachments_for_direct_send
-                        streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
+                        streamed_text = bool(_strip_response_attachments_for_direct_send(response_without_copy, adapter))
                     except Exception:
                         streamed_text = True  # fail open to the historical unconditional reconcile
-                if streamed_text or media_delivered:
+                if streamed_text or media_delivered or (copy_delivered and not copy_failed):
                     await adapter._reconcile_restart_note_after_delivery(event, session_key)
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
@@ -2604,13 +2623,23 @@ class GatewayTurnMixin:
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
             images, media_files, text_content = [], [], ""
+            from gateway.copy_blocks import extract_copy_blocks
+            response, copy_blocks = extract_copy_blocks(response)
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
+            for copy_block in copy_blocks:
+                copy_metadata = dict(_thread_metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["plain"] = True
+                copy_result = await adapter.send(chat_id=source.chat_id, content=copy_block, metadata=copy_metadata)
+                if not getattr(copy_result, "success", False):
+                    logger.error("Background copy block delivery failed for %s: %s", source.chat_id,
+                                 getattr(copy_result, "error", None) or "no result")
+            if not text_content and not copy_blocks and not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
                 )

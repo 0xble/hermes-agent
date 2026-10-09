@@ -644,6 +644,7 @@ DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
 _MEDIA_NATIVE = (
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
+    "For text the user should copy exactly, wrap it in [[copy]] and [[/copy]] on separate lines; each copy block is sent as its own plain-text message. "
 )
 
 _LOCAL_CRON_DELIVERY_NOTE = (

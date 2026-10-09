@@ -859,6 +859,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
         display_text = self._accumulated
+        from gateway.copy_blocks import extract_copy_blocks
+        display_text, _ = extract_copy_blocks(display_text)
         if tick.is_interim:
             if self._use_native_streaming:
                 display_text = self._compose_frame_content()
@@ -866,6 +868,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     display_text += self.cfg.cursor
             else:
                 display_text += self.cfg.cursor
+        display_text, _ = extract_copy_blocks(display_text)
 
         # A got_done FRESH send via the draft transport already carries finalize=True,
         # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.

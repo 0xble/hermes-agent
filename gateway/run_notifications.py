@@ -638,8 +638,10 @@ class GatewayNotificationsMixin:
         from gateway.run import _strip_response_attachments_for_direct_send
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
+        from gateway.copy_blocks import extract_copy_blocks
+        response_without_copy, copy_blocks = extract_copy_blocks(response)
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response, adapter)
+            text_content = _strip_response_attachments_for_direct_send(response_without_copy, adapter)
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
@@ -686,6 +688,17 @@ class GatewayNotificationsMixin:
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
                     delivered_confirmed = True
+        for copy_block in copy_blocks:
+            copy_metadata = dict(metadata or {})
+            copy_metadata["copy_block"] = True
+            copy_metadata["plain"] = True
+            _sent = await self._send_queued_final_text(
+                adapter, source, copy_block, copy_metadata, event_message_id, session_key, inbound_message_id)
+            if not getattr(_sent, "success", False):
+                logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
+                               getattr(_sent, "error", None) or "no result")
+                return False
+            delivered_confirmed = True
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
             if not hasattr(note_event, "_restart_note_marker_api_available"):
@@ -695,7 +708,7 @@ class GatewayNotificationsMixin:
         if not deliver_media:
             return True
         media_delivered = await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            response_without_copy, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
         # Attachment-only answer: no text was sent, so the note is reconciled only once an upload

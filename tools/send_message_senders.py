@@ -290,10 +290,14 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
+                   copy_block=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
-        formatted, send_parse_mode, _has_html = _telegram_format(message)
+        if copy_block:
+            formatted, send_parse_mode, _has_html = message, None, False
+        else:
+            formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
         from gateway.platforms.base import BasePlatformAdapter, utf16_len

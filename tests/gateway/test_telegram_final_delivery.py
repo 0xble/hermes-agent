@@ -166,7 +166,46 @@ async def test_telegram_long_flood_result_keeps_retry_after():
     assert result.retry_after == 30.0
 
 
+@pytest.mark.asyncio
+async def test_copy_block_chunk_is_plain_text_without_markdown(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+    monkeypatch.setattr(adapter, "_text_send_refusal", lambda: None)
 
+    await adapter._send_chunk_markdown_or_plain(
+        "*literal* _text_ `code`", {"chat_id": "123"}, plain=True)
+
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["text"] == "*literal* _text_ `code`"
+    assert kwargs["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_copy_block_over_telegram_limit_is_one_document(monkeypatch):
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = MagicMock()
+    adapter._send_path_degraded = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter._text_send_refusal = lambda: None
+    adapter._send_flood_cooldown_remaining = lambda _chat_id: None
+    adapter._chat_outbound_slot_remaining = lambda _chat_id: 0
+    adapter._hold_chat_outbound_slot = lambda _chat_id: None
+    adapter._telegram_error_types = lambda: (OSError, None, None)
+    adapter._should_attempt_rich = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rich path used"))
+    captured = {}
+
+    async def send_document(**kwargs):
+        captured["content"] = open(kwargs["file_path"], "rb").read()
+        captured["name"] = kwargs["file_name"]
+        return SendResult(success=True, message_id="doc-1")
+
+    adapter.send_document = send_document
+    body = "🙂" * 4096
+    result = await adapter._send_text_locked("123", body, None, {"copy_block": True})
+
+    assert result.success is True
+    assert captured == {"content": body.encode("utf-8"), "name": "copy.txt"}
 
 @pytest.mark.asyncio
 async def test_empty_fallback_resend_preserves_reply_anchor():

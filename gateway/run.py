@@ -2834,6 +2834,8 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     Queued follow-up resends only replay explicit ``MEDIA:`` attachments in this path. Keep bare local paths
     and ordinary image URLs visible because the post-stream uploader intentionally ignores them (#20834).
     """
+    from gateway.copy_blocks import extract_copy_blocks
+    response, _ = extract_copy_blocks(response)
     _, cleaned = adapter.extract_media(response)
     return cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
 
