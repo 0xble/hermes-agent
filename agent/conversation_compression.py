@@ -4036,7 +4036,8 @@ def _run_summary_phase(
             (
                 "route_deadline"
                 if commit_fence is not None and commit_fence.route_deadline_aborted
-                else (STALL_INTERRUPTED_FAILURE_CLASS if _stall_backoff else "explicit_interrupt")
+                else STALL_INTERRUPTED_FAILURE_CLASS if _stall_backoff
+                else "commit_fence_cancelled" if _host_cancel else "explicit_interrupt"
             ),
         )
         return _SummaryPhase(messages=messages, abort_prompt=_existing_system_prompt(agent, system_message))
