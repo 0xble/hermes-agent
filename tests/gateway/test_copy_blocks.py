@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.copy_blocks import CopyMarkerStreamFilter, extract_copy_blocks, render_copy_blocks_inline
+from gateway.copy_blocks import (
+    CopyMarkerStreamFilter,
+    copy_preview_text,
+    extract_copy_blocks,
+    render_copy_blocks_inline,
+)
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_turn import GatewayTurnMixin
@@ -70,6 +75,43 @@ def test_copy_marker_stream_filter_passes_ordinary_partial_lines_immediately() -
     assert stream.feed("ordinary ") == "ordinary "
     assert stream.feed("text") == "text"
     assert stream.flush() == ""
+
+
+def test_longer_fence_quotes_shorter_fences_and_markers() -> None:
+    text = "````\n[[copy]]\nliteral\n[[/copy]]\n```\n[[copy]]\nbody\n[[/copy]]\n````\n"
+    assert extract_copy_blocks(text) == (text, [])
+    stream = CopyMarkerStreamFilter()
+    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == text
+
+
+def test_fenced_marker_inside_copy_body_is_body_text() -> None:
+    text = "[[copy]]\n```\n[[/copy]]\n```\n[[/copy]]\nafter\n"
+    remaining, blocks = extract_copy_blocks(text)
+    assert blocks == ["```\n[[/copy]]\n```"]
+    assert remaining == "after\n"
+    stream = CopyMarkerStreamFilter()
+    rendered = "".join(stream.feed(ch) for ch in text) + stream.flush()
+    assert rendered == "```\n[[/copy]]\n```\nafter\n"
+
+
+def test_tilde_and_backtick_fences_do_not_close_each_other() -> None:
+    text = "~~~\n```\n[[copy]]\nx\n[[/copy]]\n~~~\n"
+    assert extract_copy_blocks(text) == (text, [])
+
+
+def test_interim_preview_hides_partial_markers_and_block_bodies() -> None:
+    assert copy_preview_text("before\n[[co", final=False) == "before\n"
+    assert copy_preview_text("before\n[[copy]]\npartial bo", final=False) == "before\n"
+    assert copy_preview_text("before\n[[copy]]\nbody\n[[/co", final=False) == "before\n"
+    assert copy_preview_text("before\n[[copy]]\nbody\n[[/copy]]\naft", final=False) == "before\naft"
+    assert copy_preview_text("plain [[ text", final=False) == "plain [[ text"
+    assert copy_preview_text("before\n[[copy]]\nbody\n[[/copy]]", final=True) == "before\n"
+
+
+def test_preview_without_markers_is_unchanged() -> None:
+    text = "ordinary reply\nwith `code` and [[link]] text"
+    assert copy_preview_text(text, final=False) == text
+    assert copy_preview_text(text, final=True) == text
 
 
 class _FakeAdapter(BasePlatformAdapter):

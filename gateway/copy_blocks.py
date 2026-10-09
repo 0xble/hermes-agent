@@ -6,7 +6,7 @@ import re
 
 _COPY_OPEN = "[[copy]]"
 _COPY_CLOSE = "[[/copy]]"
-_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 def _line_marker(line: str, marker: str) -> bool:
@@ -14,9 +14,23 @@ def _line_marker(line: str, marker: str) -> bool:
     return line.strip() == marker
 
 
-def _fence_kind(line: str) -> str | None:
-    match = _FENCE_RE.match(line)
-    return match.group(1)[:3] if match else None
+def _next_fence(fence: str | None, line: str) -> str | None:
+    """Return the open fence after *line*, following CommonMark fence rules.
+
+    A fence closes only on a run of the same character at least as long as the
+    opener with nothing else on the line, so a longer fence can quote shorter ones.
+    """
+    match = _FENCE_RE.match(line.rstrip("\r\n"))
+    if match is None:
+        return fence
+    run, rest = match.group(1), match.group(2)
+    if fence is None:
+        if run[0] == "`" and "`" in rest:
+            return None  # an info string may not contain backticks
+        return run
+    if run[0] == fence[0] and len(run) >= len(fence) and not rest.strip():
+        return None
+    return fence
 
 
 def _strip_one_adjacent_newline(text: str, *, leading: bool) -> str:
@@ -53,36 +67,23 @@ def extract_copy_blocks(text: str) -> tuple[str, list[str]]:
     fence: str | None = None
 
     for line in lines:
-        if in_copy:
-            if _line_marker(line, _COPY_CLOSE):
+        if fence is None and _line_marker(line, _COPY_OPEN if not in_copy else _COPY_CLOSE):
+            if in_copy:
                 body = "".join(copy_parts)
                 body = _strip_one_adjacent_newline(body, leading=True)
                 body = _strip_one_adjacent_newline(body, leading=False)
                 if body.strip():
                     blocks.append(body)
-                in_copy = False
                 copy_parts = []
-            else:
-                copy_parts.append(line)
+            in_copy = not in_copy
             continue
-
-        if fence is None and _line_marker(line, _COPY_OPEN):
-            in_copy = True
-            copy_parts = []
-            continue
-        if fence is None and _line_marker(line, _COPY_CLOSE):
+        if fence is None and not in_copy and _line_marker(line, _COPY_CLOSE):
             # A stray close marker is control syntax, never visible text.
             continue
-
-        remaining.append(line)
-        if fence is None:
-            candidate = _fence_kind(line)
-            if candidate is not None:
-                fence = candidate
-        else:
-            candidate = _fence_kind(line)
-            if candidate == fence:
-                fence = None
+        # Fences are tracked inside copy bodies too, so a fenced marker line is
+        # body text there, matching CopyMarkerStreamFilter.
+        (copy_parts if in_copy else remaining).append(line)
+        fence = _next_fence(fence, line)
 
     if in_copy:
         body = _strip_one_adjacent_newline("".join(copy_parts), leading=True)
@@ -101,8 +102,8 @@ class CopyMarkerStreamFilter:
     """
 
     def __init__(self) -> None:
-        self._pending = ""
-        self._line_start = True
+        self._pending = ""  # held line prefix that may still become a marker line
+        self._line = ""  # already-emitted text of the current line, for fence tracking
         self._fence: str | None = None
 
     @staticmethod
@@ -117,21 +118,10 @@ class CopyMarkerStreamFilter:
                 return True
         return False
 
-    def _process_line(self, line: str) -> str:
-        body = line.rstrip("\r\n")
-        if self._fence is None and _line_marker(body, _COPY_OPEN):
-            return ""
-        if self._fence is None and _line_marker(body, _COPY_CLOSE):
-            return ""
-        if self._fence is None:
-            candidate = _fence_kind(body)
-            if candidate is not None:
-                self._fence = candidate
-        else:
-            candidate = _fence_kind(body)
-            if candidate == self._fence:
-                self._fence = None
-        return line
+    def _is_marker(self, line: str) -> bool:
+        return self._fence is None and (
+            _line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)
+        )
 
     def feed(self, delta: str) -> str:
         """Filter one streamed text delta, holding only a possible trailing marker line."""
@@ -140,40 +130,53 @@ class CopyMarkerStreamFilter:
         text = self._pending + delta
         self._pending = ""
         output: list[str] = []
-        line_start = self._line_start
         cursor = 0
         while cursor < len(text):
             match = re.search(r"\r\n|\n|\r", text[cursor:])
             if match is None:
                 tail = text[cursor:]
-                if self._fence is None and line_start and self._could_be_marker_prefix(tail):
+                if self._fence is None and not self._line and self._could_be_marker_prefix(tail):
                     self._pending = tail
                 else:
                     output.append(tail)
-                    line_start = False
+                    self._line += tail
                 break
             end = cursor + match.end()
-            if text[cursor:end].endswith(chr(13)) and end == len(text):
+            if text[end - 1] == "\r" and end == len(text):
+                # A lone CR may be the first half of CRLF; wait for the next delta.
                 self._pending = text[cursor:]
-                line_start = True
                 break
-            line = text[cursor:end]
-            output.append(self._process_line(line))
+            segment = text[cursor:end]
+            full_line = self._line + segment
+            if not self._line and self._is_marker(segment):
+                pass  # a complete marker line is control syntax
+            else:
+                output.append(segment)
+                self._fence = _next_fence(self._fence, full_line)
+            self._line = ""
             cursor = end
-            line_start = True
-        self._line_start = line_start
         return "".join(output)
 
     def flush(self) -> str:
         """Release a non-marker tail, or drop it when it is a complete marker line."""
-        if not self._pending:
-            return ""
         pending, self._pending = self._pending, ""
-        if self._fence is None and _line_marker(pending, _COPY_OPEN):
-            return ""
-        if self._fence is None and _line_marker(pending, _COPY_CLOSE):
+        self._line = ""
+        if not pending or self._is_marker(pending):
             return ""
         return pending
+
+
+def copy_preview_text(text: str, *, final: bool) -> str:
+    """Return editable-preview text with copy blocks and marker syntax hidden.
+
+    Block bodies are removed because they are delivered as separate messages. On an
+    interim preview, a trailing partial line that may still become a marker line is
+    held back so an edit never shows half a marker.
+    """
+    remaining, _ = extract_copy_blocks(text)
+    if final:
+        return remaining
+    return CopyMarkerStreamFilter().feed(remaining)
 
 
 def render_copy_blocks_inline(text: str) -> str:
@@ -190,4 +193,9 @@ def render_copy_blocks_inline(text: str) -> str:
     return "\n\n".join(part for part in inline_parts if part)
 
 
-__all__ = ["CopyMarkerStreamFilter", "extract_copy_blocks", "render_copy_blocks_inline"]
+__all__ = [
+    "CopyMarkerStreamFilter",
+    "copy_preview_text",
+    "extract_copy_blocks",
+    "render_copy_blocks_inline",
+]

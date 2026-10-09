@@ -255,10 +255,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if line:
             self._queue.put((_TOOL_PROGRESS, line))
 
-    def _compose_frame_content(self) -> str:
+    def _compose_frame_content(self, text: str | None = None) -> str:
         """Native frame content: text, with any tool-progress lines below a rule."""
         progress = "\n".join(self._tool_progress_lines)
-        return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
+        body = self._accumulated if text is None else text
+        return "\n\n---\n".join(p for p in (body, progress) if p)
 
     def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
         """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
@@ -858,17 +859,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
-        display_text = self._accumulated
-        from gateway.copy_blocks import extract_copy_blocks
-        display_text, _ = extract_copy_blocks(display_text)
+        from gateway.copy_blocks import copy_preview_text
+        # Copy blocks go out as separate messages, so previews never show their
+        # bodies or a half-streamed marker line.
+        display_text = copy_preview_text(self._accumulated, final=not tick.is_interim)
         if tick.is_interim:
             if self._use_native_streaming:
-                display_text = self._compose_frame_content()
+                display_text = self._compose_frame_content(display_text)
                 if display_text and self.cfg.cursor:
                     display_text += self.cfg.cursor
             else:
                 display_text += self.cfg.cursor
-        display_text, _ = extract_copy_blocks(display_text)
 
         # A got_done FRESH send via the draft transport already carries finalize=True,
         # unlike an EDIT, which REQUIRES_EDIT_FINALIZE adapters still need a pass for.
