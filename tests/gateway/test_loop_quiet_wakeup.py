@@ -121,8 +121,7 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
     event = adapter.events[0]
     assert event.internal is True
     assert event.reply_expected is False
-    assert "If nothing meaningful changed since the last wakeup" in event.text
-    assert "only [SILENT] and nothing else" in event.text
+    assert "reply with exactly [SILENT] and nothing else" in event.text
     assert LoopManager(session_id="loop-sid").state.awaiting_response is True
 
     assert await _deliver(event, "[SILENT]", monkeypatch) == ""

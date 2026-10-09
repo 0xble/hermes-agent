@@ -44,38 +44,41 @@ _INTERVAL_TOKEN_RE = re.compile(
 
 
 WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
+# Shared wakeup contract. A wakeup is machinery, not a conversation: the user hears from the loop
+# only when something new needs them, so a no-change tick ends with the bare silence marker.
+_WAKEUP_REPLY_RULES = (
+    "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
+    "If nothing new and material happened since your last visible update and nothing needs the "
+    f"user's action, reply with exactly {SILENCE_MARKER} and nothing else. That includes plain "
+    "acknowledgements and anything that changes nothing for the user. Never send status like "
+    "\"still waiting\", \"nothing new\", or what you did not do.\n"
+    "If something did change, reply in one or two short lines with only the new fact or the "
+    "action the user needs to take.\n"
+)
+_WAKEUP_REVISE_RULE = (
+    "If the cadence, run count, or stop condition no longer fits, revise the loop with the "
+    "loop_set tool (action=revise) instead of stopping it."
+)
 WAKEUP_PROMPT_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
-    "This is an automatic wakeup from the /loop. Perform the "
-    "task now against the CURRENT state (re-check files, processes, or "
-    "services fresh — do not assume anything from earlier iterations still "
-    "holds). If nothing meaningful changed since the last wakeup, reply with "
-    f"only {SILENCE_MARKER} and nothing else so this tick stays quiet; otherwise "
-    "report concisely what you found or did this iteration.\n"
-    "If the task is now complete, no longer applicable, or the thing you "
-    "were watching has finished, say so and end your reply with "
-    f"{LOOP_COMPLETE_MARKER} on its own line — that stops the loop. "
-    "If the cadence, run count, or stop condition no longer fits, revise "
-    "the loop with the loop_set tool (action=revise) instead of stopping it."
+    "This is an automatic wakeup from the /loop. "
+    + _WAKEUP_REPLY_RULES
+    + "If the task is complete, no longer applicable, or the thing you were watching has "
+    f"finished, say so briefly with the evidence and end with {LOOP_COMPLETE_MARKER} on its own "
+    "line; that stops the loop. "
+    + _WAKEUP_REVISE_RULE
 )
 
 WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"
     "Stop condition: {until}\n\n"
-    "This is an automatic wakeup from the /loop. Perform the "
-    "task now against the CURRENT state (re-check files, processes, or "
-    "services fresh — do not assume anything from earlier iterations still "
-    "holds). If nothing meaningful changed since the last wakeup, reply with "
-    f"only {SILENCE_MARKER} and nothing else so this tick stays quiet; otherwise "
-    "report concisely what you found or did this iteration, and "
-    "show concrete evidence of the stop condition's status.\n"
-    "If the stop condition is met, or the task is no longer applicable, say "
-    f"so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — "
-    "that stops the loop. If the cadence, run count, or stop condition no "
-    "longer fits, revise the loop with the loop_set tool (action=revise) "
-    "instead of stopping it."
+    "This is an automatic wakeup from the /loop. "
+    + _WAKEUP_REPLY_RULES
+    + "If the stop condition is met, or the task is no longer applicable, say so briefly with "
+    f"the evidence and end with {LOOP_COMPLETE_MARKER} on its own line; that stops the loop. "
+    + _WAKEUP_REVISE_RULE
 )
 
 # Wording before the silence contract. Stored rows still carry it, so the generated-turn

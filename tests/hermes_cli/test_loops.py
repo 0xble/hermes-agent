@@ -357,8 +357,23 @@ class TestTickLifecycle:
         wakeup = mgr.fire_tick()
         assert wakeup is not None
         assert "the /loop the user set" not in wakeup
-        assert "nothing meaningful changed since the last wakeup" in wakeup
-        assert "only [SILENT] and nothing else" in wakeup
+        assert "reply with exactly [SILENT] and nothing else" in wakeup
+        # No-change, acknowledgement and "still waiting" ticks must stay silent, and the old
+        # report-every-tick instruction must be gone (it overrode the silence contract).
+        assert "plain acknowledgements" in wakeup
+        assert '"still waiting"' in wakeup
+        assert "one or two short lines" in wakeup
+        assert "Report concisely what you found" not in wakeup
+
+    def test_until_wakeup_prompt_no_longer_demands_evidence_every_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t3-until-prompt")
+        mgr.set("watch the queue", interval_seconds=300, until="queue is empty")
+        wakeup = mgr.fire_tick()
+        assert "Stop condition: queue is empty" in wakeup
+        assert "reply with exactly [SILENT] and nothing else" in wakeup
+        assert "show concrete evidence of the stop condition's status" not in wakeup
 
     def test_slash_prompt_returned_raw(self, hermes_home):
         from hermes_cli.loops import LoopManager
