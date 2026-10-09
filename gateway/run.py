@@ -4136,7 +4136,11 @@ class GatewayRunner(
             cached_sources = OrderedDict()
             self._session_sources = cached_sources
         try:
-            cached_sources[session_key] = dataclasses.replace(source)
+            # replace_source keeps the wire-invisible routing provenance (receiving bot, identity)
+            # that a plain dataclasses.replace drops, so every reader of the cache — tool calls,
+            # goal and process notices, shutdown notices — reaches the bot that received the turn.
+            from gateway.session_identity import replace_source
+            cached_sources[session_key] = replace_source(source)
         except Exception:
             logger.debug("Failed to cache live session source for %s", session_key, exc_info=True)
             return
