@@ -224,15 +224,26 @@ def _make_text_cb(
     # ``None`` is the flush sentinel Hermes core sends between assistant messages
     # (before tool execution / at end of stream): it closes the active messageId so
     # the next delta opens a new bubble instead of merging into the previous one.
+    from gateway.copy_blocks import CopyMarkerStreamFilter
+    marker_filter = CopyMarkerStreamFilter()
+
     def _cb(text: str | None) -> None:
         if text:
-            from gateway.copy_blocks import render_copy_blocks_inline
-            update = wrap(render_copy_blocks_inline(text))
+            filtered = marker_filter.feed(text)
+            if not filtered:
+                return
+            update = wrap(filtered)
             if message_ids is not None:
                 update.message_id = message_ids.current()
             _send_update(conn, session_id, loop, update)
-        elif text is None and message_ids is not None:
-            message_ids.close()
+        elif text is None:
+            if pending := marker_filter.flush():
+                update = wrap(pending)
+                if message_ids is not None:
+                    update.message_id = message_ids.current()
+                _send_update(conn, session_id, loop, update)
+            if message_ids is not None:
+                message_ids.close()
 
     return _cb
 

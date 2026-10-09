@@ -3667,6 +3667,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
+        from gateway.copy_blocks import CopyMarkerStreamFilter
+        copy_filter = CopyMarkerStreamFilter()
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
@@ -3675,8 +3677,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 
         def _delta(delta: str) -> None:
-            if delta:
-                events.enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+            filtered = copy_filter.feed(delta) if delta else ""
+            if filtered:
+                events.enqueue("assistant.delta", {"message_id": message_id, "delta": filtered})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -3715,6 +3718,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 from gateway.copy_blocks import render_copy_blocks_inline
                 final_response = render_copy_blocks_inline(_resolve_media_to_data_urls(
                     result.get("final_response", "") if is_dict else ""))
+                trailing = copy_filter.flush()
+                if trailing:
+                    events.enqueue("assistant.delta", {"message_id": message_id, "delta": trailing})
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
                 effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)

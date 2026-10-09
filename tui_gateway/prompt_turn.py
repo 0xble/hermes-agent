@@ -844,6 +844,8 @@ def _invoke_agent(
     # Heartbeat and /loop wakeups ask for a bare [SILENT] on a no-change tick: hold it the same way.
     hold = {"buf": "", "held": ""} if _silence_hidden_turn(session, prompt) else None
     loop_hold = {"text": "", "seen": ""}
+    from gateway.copy_blocks import CopyMarkerStreamFilter
+    copy_filter = CopyMarkerStreamFilter()
 
     def _deliver_delta(delta):
         with session["history_lock"]:
@@ -859,6 +861,9 @@ def _invoke_agent(
         if getattr(agent, "_mute_notification_reply", False):
             return
         if isinstance(delta, str):
+            delta = copy_filter.feed(delta)
+            if not delta:
+                return
             from gateway.response_filters import (
                 ends_with_partial_loop_complete_marker,
                 split_trailing_loop_complete_marker,
@@ -919,6 +924,8 @@ def _invoke_agent(
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            if copy_tail := copy_filter.flush():
+                _deliver_delta(copy_tail)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).

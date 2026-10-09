@@ -92,6 +92,90 @@ def extract_copy_blocks(text: str) -> tuple[str, list[str]]:
     return "".join(remaining), blocks
 
 
+class CopyMarkerStreamFilter:
+    """Hide copy marker lines from a streamed single-response surface.
+
+    Text is emitted immediately except for a trailing line prefix that can still become an
+    exact marker line. Marker recognition follows :func:`extract_copy_blocks`: only lines
+    outside a fenced code block are control syntax, and CRLF is preserved for ordinary text.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._line_start = True
+        self._fence: str | None = None
+
+    @staticmethod
+    def _could_be_marker_prefix(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped:
+            return True
+        for marker in (_COPY_OPEN, _COPY_CLOSE):
+            if marker.startswith(stripped):
+                return True
+            if stripped.startswith(marker) and stripped[len(marker):].strip() == "":
+                return True
+        return False
+
+    def _process_line(self, line: str) -> str:
+        body = line.rstrip("\r\n")
+        if self._fence is None and _line_marker(body, _COPY_OPEN):
+            return ""
+        if self._fence is None and _line_marker(body, _COPY_CLOSE):
+            return ""
+        if self._fence is None:
+            candidate = _fence_kind(body)
+            if candidate is not None:
+                self._fence = candidate
+        else:
+            candidate = _fence_kind(body)
+            if candidate == self._fence:
+                self._fence = None
+        return line
+
+    def feed(self, delta: str) -> str:
+        """Filter one streamed text delta, holding only a possible trailing marker line."""
+        if not delta:
+            return ""
+        text = self._pending + delta
+        self._pending = ""
+        output: list[str] = []
+        line_start = self._line_start
+        cursor = 0
+        while cursor < len(text):
+            match = re.search(r"\r\n|\n|\r", text[cursor:])
+            if match is None:
+                tail = text[cursor:]
+                if self._fence is None and line_start and self._could_be_marker_prefix(tail):
+                    self._pending = tail
+                else:
+                    output.append(tail)
+                    line_start = False
+                break
+            end = cursor + match.end()
+            if text[cursor:end].endswith(chr(13)) and end == len(text):
+                self._pending = text[cursor:]
+                line_start = True
+                break
+            line = text[cursor:end]
+            output.append(self._process_line(line))
+            cursor = end
+            line_start = True
+        self._line_start = line_start
+        return "".join(output)
+
+    def flush(self) -> str:
+        """Release a non-marker tail, or drop it when it is a complete marker line."""
+        if not self._pending:
+            return ""
+        pending, self._pending = self._pending, ""
+        if self._fence is None and _line_marker(pending, _COPY_OPEN):
+            return ""
+        if self._fence is None and _line_marker(pending, _COPY_CLOSE):
+            return ""
+        return pending
+
+
 def render_copy_blocks_inline(text: str) -> str:
     """Render copy blocks inline for response surfaces that cannot send separate messages.
 
@@ -106,4 +190,4 @@ def render_copy_blocks_inline(text: str) -> str:
     return "\n\n".join(part for part in inline_parts if part)
 
 
-__all__ = ["extract_copy_blocks", "render_copy_blocks_inline"]
+__all__ = ["CopyMarkerStreamFilter", "extract_copy_blocks", "render_copy_blocks_inline"]

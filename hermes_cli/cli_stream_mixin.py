@@ -19,6 +19,7 @@ from rich.markup import escape as _escape
 
 from agent.i18n import t
 from agent.think_scrubber import THINK_CLOSE_TAGS, THINK_OPEN_TAGS
+from gateway.copy_blocks import CopyMarkerStreamFilter
 
 # Model-generated reasoning tags: suppressed during streaming (they'd display as raw XML;
 # the agent strips them from final_response too) unless show_reasoning routes them to the box.
@@ -328,6 +329,9 @@ class CLIStreamMixin:
             return
         if not text:
             return
+        text = self._copy_filter.feed(text)
+        if not text:
+            return
         if getattr(self, "_silence_hold_active", False):
             # A heartbeat or /loop wakeup may answer only [SILENT]: hold text while it could
             # still be that marker so it is never shown, and stream normally once it diverges.
@@ -570,6 +574,9 @@ class CLIStreamMixin:
         # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
         # anything else held (a partial prefix, a marker inside an open fence) is content.
         self._resolve_loop_complete_hold()
+        copy_tail = self._copy_filter.flush()
+        if copy_tail:
+            self._emit_unheld(copy_tail)
         # Still inside a "reasoning block" at end-of-stream = false positive (the model
         # mentioned a tag in prose and never closed it): recover the buffer as regular text.
         if getattr(self, "_in_reasoning_block", False) and getattr(self, "_stream_prefilt", ""):
@@ -609,6 +616,7 @@ class CLIStreamMixin:
         self._stream_box_opened = False
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
+        self._copy_filter = CopyMarkerStreamFilter()
         self._in_reasoning_block = False
         self._stream_last_was_newline = True
         self._reasoning_box_opened = False

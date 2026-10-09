@@ -1944,6 +1944,17 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
+        from gateway.platforms.base import EphemeralReply
+        is_ephemeral_response = isinstance(response, EphemeralReply) or bool(
+            agent_result.get("is_ephemeral_response", getattr(event, "_is_ephemeral_response", False)))
+        ephemeral_ttl = getattr(response, "ttl_seconds", None)
+        if isinstance(response, EphemeralReply):
+            response = response.text
+        if ephemeral_ttl is None:
+            try:
+                ephemeral_ttl = int(agent_result.get("ephemeral_ttl", getattr(event, "_ephemeral_ttl", 0)) or 0)
+            except (TypeError, ValueError):
+                ephemeral_ttl = 0
         from gateway.copy_blocks import extract_copy_blocks, render_copy_blocks_inline
         response_without_copy, copy_blocks = extract_copy_blocks(response) if response else (response, [])
         if agent_result.get("interrupted") and response:
@@ -1971,7 +1982,8 @@ class GatewayTurnMixin:
                 copy_results = []
                 await adapter._send_copy_blocks(
                     event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},
-                    copy_results.append,
+                    copy_results.append, is_ephemeral_response=is_ephemeral_response,
+                    ephemeral_ttl=ephemeral_ttl,
                 )
                 copy_delivered = any(getattr(result, "success", False) for result in copy_results)
                 copy_failed = any(not getattr(result, "success", False) for result in copy_results)

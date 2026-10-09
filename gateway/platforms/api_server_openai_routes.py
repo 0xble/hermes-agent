@@ -22,6 +22,8 @@ try:
 except ImportError:  # pragma: no cover - mirrors api_server's optional import
     web = None  # type: ignore[assignment]
 
+from gateway.copy_blocks import CopyMarkerStreamFilter, render_copy_blocks_inline
+
 # Logger parity with the origin module (moved log records keep their name).
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -238,6 +240,7 @@ class _ResponsesStream:
         self.message_opened = False
         self.reasoning_item: Optional[Dict[str, Any]] = None  # open ``reasoning`` output item
         self.final_response_text = ""
+        self.raw_final_response = ""
         self.transformed_final = ""  # non-append transform_llm_output rewrite; replaces the deltas
         self.agent_error: Optional[str] = None
         self.usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -246,6 +249,7 @@ class _ResponsesStream:
         self._batch_buf: List[str] = []
         self._batch_timer: Optional[asyncio.Task] = None
         self._batch_lock = asyncio.Lock()
+        self._copy_filter = CopyMarkerStreamFilter()
 
     async def write_event(self, event_type: str, data: Dict[str, Any]) -> None:
         if "sequence_number" not in data:
@@ -290,7 +294,7 @@ class _ResponsesStream:
         history = self._history_with_user()
         if text:
             items.append(_message_item(text))
-            history.append({"role": "assistant", "content": text})
+            history.append({"role": "assistant", "content": self.raw_final_response or text})
         self.persist_snapshot(self.terminal_envelope("incomplete", items), history=history)
 
     async def emit_created(self) -> None:
@@ -311,7 +315,9 @@ class _ResponsesStream:
             "item": {"id": self.message_item_id, "type": "message", "status": "in_progress",
                      "role": "assistant", "content": []}})
 
-    async def emit_text_delta(self, delta_text: str) -> None:
+    async def _emit_filtered_text_delta(self, delta_text: str) -> None:
+        if not delta_text:
+            return
         await self.close_reasoning_item()
         await self._open_message_item()
         self.final_text_parts.append(delta_text)
@@ -319,6 +325,9 @@ class _ResponsesStream:
             "type": "response.output_text.delta", "item_id": self.message_item_id,
             "output_index": self.message_output_index, "content_index": 0, "delta": delta_text,
             "logprobs": []})
+
+    async def emit_text_delta(self, delta_text: str) -> None:
+        await self._emit_filtered_text_delta(self._copy_filter.feed(delta_text))
 
     async def emit_reasoning_delta(self, delta_text: str) -> None:
         """Responses reasoning-summary family (#99552): one ``reasoning`` output item per
@@ -476,16 +485,17 @@ class _ResponsesStream:
             self.result = result
             self.usage = agent_usage or self.usage
             agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+            self.raw_final_response = agent_final
             tail, appended = _post_stream_transform(result)
             if tail and self.final_text_parts:
                 if appended:
                     await self.emit_text_delta(tail)
                 else:
-                    self.transformed_final = agent_final
+                    self.transformed_final = render_copy_blocks_inline(agent_final)
             if agent_final and not self.final_text_parts:
                 await self.emit_text_delta(agent_final)
             if agent_final and not self.final_response_text:
-                self.final_response_text = agent_final
+                self.final_response_text = render_copy_blocks_inline(agent_final)
             if isinstance(result, dict) and result.get("error") and not self.final_response_text:
                 self.agent_error = self._api._redact_api_error_text(result["error"])
         except Exception as e:  # noqa: BLE001
@@ -493,6 +503,9 @@ class _ResponsesStream:
             self.agent_error = self._api._redact_api_error_text(e)
 
     async def close_message_item(self) -> None:
+        trailing = self._copy_filter.flush()
+        if trailing:
+            await self._emit_filtered_text_delta(trailing)
         await self.close_reasoning_item()
         self.final_response_text = (
             self.transformed_final or "".join(self.final_text_parts) or self.final_response_text)
@@ -531,7 +544,7 @@ class _ResponsesStream:
         env = self.terminal_envelope("completed", self._final_items())
         result = self.result
         full_history = self.adapter._build_response_conversation_history(
-            self.conversation_history, self.user_message, result, self.final_response_text,
+            self.conversation_history, self.user_message, result, self.raw_final_response or self.final_response_text,
             tool_output_max_chars=self.adapter._history_tool_output_max_chars)
         # Transcript substitution for result["_compressed"] happens in the history builder; only
         # a compression-rotated session_id is propagated so chaining resumes the child session.
@@ -798,7 +811,7 @@ class OpenAICompatRoutesMixin:
             return err
         result, usage = outcome
         presentation_muted = result.get("_notification_presentation_suppressed") is True
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = render_copy_blocks_inline(_resolve_media_to_data_urls(result.get("final_response") or ""))
         completed, is_partial, is_failed, err_msg = _result_flags(result)
         if err_msg:
             err_msg = _redact_api_error_text(err_msg)
@@ -898,6 +911,15 @@ class OpenAICompatRoutesMixin:
                     "model": model,
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}], **extra}
         content_sent = False
+        copy_filter = CopyMarkerStreamFilter()
+
+        async def _write_content_delta(text: str) -> None:
+            nonlocal content_sent
+            filtered = copy_filter.feed(text)
+            if filtered:
+                content_sent = True
+                await response.write(_sse_frame(_chunk({"content": filtered})))
+
         try:
             await response.write(_sse_frame(_chunk({"role": "assistant"})))
             async for delta in _iter_stream_items(stream_q, agent_task, response):
@@ -918,8 +940,7 @@ class OpenAICompatRoutesMixin:
                     await response.write(_sse_frame(delta[1], event="approval.request"))
                 else:
                     if delta:
-                        content_sent = True
-                    await response.write(_sse_frame(_chunk({"content": delta})))
+                        await _write_content_delta(str(delta))
             # The agent can fail after the queue drains (task raises / result flagged failed or
             # partial): surface a non-"stop" finish_reason like the non-streaming path.
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -947,12 +968,16 @@ class OpenAICompatRoutesMixin:
             if not content_sent and not presentation_muted and isinstance(result, dict):
                 fallback_text = _resolve_media_to_data_urls(result.get("final_response") or "")
                 if fallback_text:
-                    await response.write(_sse_frame(_chunk({"content": fallback_text})))
+                    await _write_content_delta(fallback_text)
             elif not presentation_muted:
                 # Chat chunks can only append: a non-append rewrite follows the streamed text (as in the CLI).
                 tail, appended = _post_stream_transform(result)
                 if tail:
-                    await response.write(_sse_frame(_chunk({"content": tail if appended else _transformed_notice() + tail})))
+                    await _write_content_delta(tail if appended else _transformed_notice() + tail)
+            trailing = copy_filter.flush()
+            if trailing:
+                content_sent = True
+                await response.write(_sse_frame(_chunk({"content": trailing})))
             if finish_reason != "stop":
                 if err_msg and not presentation_muted:
                     finish_chunk["error"] = {
@@ -1179,13 +1204,14 @@ class OpenAICompatRoutesMixin:
         if err is not None:
             return err
         result, usage = outcome
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
-        if not final_response:
+        raw_final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
+        final_response = render_copy_blocks_inline(raw_final_response)
+        if not raw_final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
         full_history = self._build_response_conversation_history(
-            conversation_history, user_message, result, final_response,
+            conversation_history, user_message, result, raw_final_response,
             tool_output_max_chars=self._history_tool_output_max_chars)
         # _run_agent's effective session id carries compression rotations; storing it keeps
         # previous_response_id chaining off the pre-rotation session (else compression re-fires).
@@ -1199,7 +1225,8 @@ class OpenAICompatRoutesMixin:
         response_data = {
             "id": response_id, "object": "response", "status": "completed",
             "created_at": created_at, "model": body.get("model", self._model_name),
-            "output": self._extract_output_items(result, start_index=output_start_index),
+            "output": self._extract_output_items(
+                result, start_index=output_start_index, final_response=final_response),
             "usage": _responses_usage_payload(usage)}
         if store:
             response_store = self._current_response_store()
@@ -1300,7 +1327,8 @@ class OpenAICompatRoutesMixin:
         return out
 
     @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
+    def _extract_output_items(
+        result: Dict[str, Any], start_index: int = 0, final_response: Any = None) -> List[Dict[str, Any]]:
         """Output items from ``result["messages"][start_index:]``: ``function_call`` per assistant
         tool_call, ``function_call_output`` per tool message, then the final ``message``."""
         from gateway.platforms.api_server import _redact_api_error_text
@@ -1330,7 +1358,11 @@ class OpenAICompatRoutesMixin:
                     "id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
                     "status": "completed", "call_id": msg.get("tool_call_id", ""),
                     "output": msg.get("content", "")})
-        final = result.get("final_response", "") or _redact_api_error_text(
-            result.get("error", "(No response generated)"))
+        final = (
+            final_response
+            if final_response is not None
+            else result.get("final_response", "") or _redact_api_error_text(
+                result.get("error", "(No response generated)"))
+        )
         items.append(_message_item(final))
         return items

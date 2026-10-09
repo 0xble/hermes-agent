@@ -688,17 +688,30 @@ class GatewayNotificationsMixin:
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
                     delivered_confirmed = True
-        for copy_block in copy_blocks:
-            copy_metadata = dict(metadata or {})
-            copy_metadata["copy_block"] = True
-            copy_metadata["plain"] = True
-            _sent = await self._send_queued_final_text(
-                adapter, source, copy_block, copy_metadata, event_message_id, session_key, inbound_message_id)
-            if not getattr(_sent, "success", False):
-                logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
-                               getattr(_sent, "error", None) or "no result")
+        if copy_blocks and session_key and isinstance(adapter, BasePlatformAdapter):
+            queued_copy_event = MessageEvent(
+                text="", source=source, message_id=event_message_id, ledger_message_id=inbound_message_id)
+            copy_results = []
+            await adapter._send_copy_blocks(
+                queued_copy_event, session_key, copy_blocks, _mark_notify_metadata(metadata),
+                copy_results.append)
+            if any(getattr(result, "success", False) for result in copy_results):
+                delivered_confirmed = True
+            if any(not getattr(result, "success", False) for result in copy_results):
                 return False
-            delivered_confirmed = True
+        else:
+            for copy_block_index, copy_block in enumerate(copy_blocks):
+                copy_metadata = dict(metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["copy_block_index"] = copy_block_index
+                copy_metadata["plain"] = True
+                _sent = await self._send_queued_final_text(
+                    adapter, source, copy_block, copy_metadata, event_message_id, session_key, inbound_message_id)
+                if not getattr(_sent, "success", False):
+                    logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
+                                   getattr(_sent, "error", None) or "no result")
+                    return False
+                delivered_confirmed = True
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
             if not hasattr(note_event, "_restart_note_marker_api_available"):
