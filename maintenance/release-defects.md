@@ -734,6 +734,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   restore, the update body's start-of-run steps, `worktree_gc` git isolation, and the
   desktop frozen-transport, slash-attachment and Quick Entry bindings. Fork-only cases
   that exercised only the `honcho` or `openviking` providers upstream removed are
-  dropped; their retaindb, Hindsight and other consumer cases stay. Guard:
+  dropped; their retaindb, Hindsight and other consumer cases stay. Four new
+  upstream tests assumed a host the fork's CI is not: the media-permission tests
+  now pin the not-container branch, the launch-repair and zip-update probes avoid
+  an interpreter with another checkout installed, and the incremental
+  multi-pack-index case skips on a git too old to write one. Guard:
   `scripts/run_tests.sh` on the hosted-failing files, with
   `tests/hermes_cli/test_update_head_moved_gate.py` failing on both parents.
