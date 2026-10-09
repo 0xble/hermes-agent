@@ -2321,9 +2321,7 @@ def _native_service_homes() -> set[Path]:
     if is_macos():
         # launchd plists live under the account home, even when a profile or
         # sandbox pins HOME elsewhere. Use the same authority for bare labels.
-        import pwd
-        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — macOS launchd account identity
-        native = account_home / (".hermes" + os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
+        native = _launchd_account_home() / (".hermes" + os.environ.get("HERMES_DATA_DIR_SUFFIX", ""))
     homes = {native.resolve()}
     sudo_home = sudo_invoker_default_home()
     if sudo_home is not None:
@@ -3028,22 +3026,25 @@ def get_systemd_linger_status(username: str | None = None) -> tuple[bool | None,
     return None, f"unexpected loginctl output: {value or '<empty>'}"
 
 
-def get_launchd_plist_path() -> Path:
-    """``~/Library/LaunchAgents/ai.hermes.gateway[-<profile>].plist`` under the real account home."""
-    import pwd
-    suffix = _profile_suffix()
-    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    # Real account home: profile mode may point HOME at a profile dir. Sandboxed/app-hosted
-    # shells can expose a UID that pwd cannot resolve (#57292); fall back to the shared
-    # real-home resolver (HERMES_REAL_HOME → HOME → pwd → ~, profile home skipped) instead
-    # of crashing launchd commands.
+def _launchd_account_home() -> Path:
+    """The real account home launchd reads: profile mode may point HOME at a profile dir.
+    Sandboxed/app-hosted shells can expose a UID that pwd cannot resolve (#57292); fall back to
+    the shared real-home resolver (HERMES_REAL_HOME → HOME → pwd → ~, profile home skipped)
+    instead of crashing launchd commands."""
     try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     except (KeyError, ImportError, OSError):
         from hermes_constants import get_real_home
 
-        home = Path(get_real_home())
-    return home / "Library" / "LaunchAgents" / f"{name}.plist"
+        return Path(get_real_home())
+
+
+def get_launchd_plist_path() -> Path:
+    """``~/Library/LaunchAgents/ai.hermes.gateway[-<profile>].plist`` under the real account home."""
+    suffix = _profile_suffix()
+    name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
+    return _launchd_account_home() / "Library" / "LaunchAgents" / f"{name}.plist"
 
 
 def launchd_gateway_labels_for_install() -> list[str]:
