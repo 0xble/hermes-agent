@@ -62,6 +62,38 @@ print(json.dumps({{'active': bool(record), 'claim': claim_outage_notice(route, r
     )
     assert third == {"active": True, "claim": False}
 
+def test_fresh_agent_after_eviction_adopts_cooldown_without_primary_call(tmp_path):
+    """The gateway eviction regression: a second AIAgent reads the durable record at turn start."""
+    result = _run(
+        tmp_path,
+        """
+import json
+from unittest.mock import MagicMock, patch
+from run_agent import AIAgent
+from agent.error_classifier import FailoverReason
+
+fallback = [{"provider": "openai", "model": "fallback-model", "base_url": "https://fallback.invalid/v1"}]
+with patch("model_tools.get_tool_definitions", return_value=[]), patch("model_tools.check_toolset_requirements", return_value={}), patch("agent.process_bootstrap.OpenAI"):
+    with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+        client = MagicMock()
+        client.base_url = "https://fallback.invalid/v1"
+        client.api_key = "fallback-key"
+        resolve.return_value = (client, "fallback-model")
+        first = AIAgent(api_key="primary-key", base_url="https://primary.invalid/v1", provider="custom", model="primary-model", api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True, fallback_model=fallback)
+        first._try_activate_fallback(reason=FailoverReason.rate_limit)
+        first.close()
+        second = AIAgent(api_key="primary-key", base_url="https://primary.invalid/v1", provider="custom", model="primary-model", api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True, fallback_model=fallback)
+        before = second.model
+        second._restore_primary_runtime()
+        after = second.model
+        second.close()
+print(json.dumps({"before": before, "after": after, "fallback_calls": resolve.call_count}))
+""",
+    )
+    assert result["before"] == "primary-model"
+    assert result["after"] == "fallback-model"
+    assert result["fallback_calls"] >= 1
+
 
 def test_no_reset_backoff_survives_processes(tmp_path):
     route = ("custom:fixture", "http://127.0.0.1:8317/v1", "primary")
@@ -84,3 +116,4 @@ print(json.dumps(arm_cooldown({route!r}, reason='rate_limit', backoff_count=1)))
     assert first["reset_at"] - first["recorded_at"] >= 59
     assert second["backoff_count"] == 2
     assert second["reset_at"] - second["recorded_at"] >= 119
+

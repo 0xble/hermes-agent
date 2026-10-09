@@ -1399,6 +1399,10 @@ def restore_primary_runtime(agent) -> bool:
         agent._provider_fallback_active = False
         agent._provider_fallback_route = None
         shared_record = getattr(agent, "_shared_primary_cooldown_record", None)
+        if isinstance(shared_record, dict):
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import release_for_recovery, route_from_record
+                release_for_recovery(route_from_record(shared_record), str(shared_record.get("outage_id", "")))
         if provider_fallback_active and not isinstance(shared_record, dict):
             # Notification surfaces are best-effort and must never undo a successful restore.
             with contextlib.suppress(Exception):
