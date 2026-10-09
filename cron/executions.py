@@ -92,6 +92,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
     # Additive only: an older release can still SELECT/INSERT/UPDATE this table during rollback.
     add_column_if_missing(conn, "executions", "code_sha", "code_sha TEXT")
     add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
@@ -428,7 +429,7 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at, owner_kind
+                      handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
