@@ -169,6 +169,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
+        # Copy blocks are delivered as separate messages after the turn, so they never
+        # enter the stream buffers; every preview, split, and fallback send inherits that.
+        # One filter per turn: a block or fence may span a segment break, and a held
+        # partial marker line carries into the next segment instead of being flushed.
+        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=True)
         self._before_finalize_notified = False
         self._reset_message_state()
 
@@ -203,10 +208,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # ``_stream_ledger`` mirrors ``_accumulated`` but is NOT truncated when
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
-        # Copy blocks are delivered as separate messages after the turn, so they never
-        # enter the stream buffers; every preview, split, and fallback send inherits that.
-        # Fresh per segment so an unclosed block cannot swallow the next segment.
-        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=True)
         self._last_sent_text = ""    # skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -348,6 +349,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must not confirm delivery).  True: recorded payload (or an earlier segment /
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
+        final_text = strip_copy_blocks(final_text or "")  # buffers never hold copy blocks
         target = self._display_payload(final_text)
         if not target:
             return None
@@ -374,7 +376,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
-        target = self._clean_for_display(text or "").strip()
+        target = self._clean_for_display(strip_copy_blocks(text or "")).strip()
         seen = (self._visible_prefix(), *self._delivered_commentary_texts,
                 *self._delivered_segment_texts)
         return bool(target) and any(sent.strip() == target for sent in seen)
@@ -384,7 +386,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         finalized segments always count; the visible prefix only once ``_already_sent`` (a draft frame
         sets ``_last_sent_text`` but is ephemeral — a failed finalize send after it must still fall
         back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
-        target = self._clean_for_display(text or "").strip()
+        target = self._clean_for_display(strip_copy_blocks(text or "")).strip()
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
         if self._already_sent:
             seen.append(self._visible_prefix())
@@ -577,8 +579,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._eager_reopen_seed()
                     continue
 
-                if tick.got_segment_break and not tick.got_done:
-                    self._flush_copy_filter()
                 if tick.got_done:
                     self._flush_think_buffer()
                     self._flush_copy_filter()
@@ -1022,6 +1022,5 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
     def _clean_for_display(text: str) -> str:
-        """Hide copy blocks and MEDIA:<path> / [[audio_as_voice]] directives; both are
-        delivered post-stream."""
-        return _BasePlatformAdapter.strip_media_directives_for_display(strip_copy_blocks(text))
+        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
+        return _BasePlatformAdapter.strip_media_directives_for_display(text)

@@ -1599,3 +1599,37 @@ class TestCopyBlocksNeverStream:
         assert not any("[[" in t and "copy" in t for t in visible)
         assert not any("SECRET" in t for t in visible)
         assert any("after" in t for t in visible)
+
+    @pytest.mark.asyncio
+    async def test_copy_block_and_partial_marker_spanning_segment_break_stay_hidden(self):
+        """The copy filter lives for the turn: a block, fence, or partial marker line that
+        spans a tool-call segment break never leaks into either segment."""
+        adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
+        msg_ids = iter(f"msg_{i}" for i in range(100))
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(msg_ids)))
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_x"))
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "chat_seg", config)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("intro\n[[copy]]\nPART1\n")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("PART2\n[[/copy]]\nmiddle\n[[co")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("py]]\nPART3\n[[/copy]]\n```\n")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("[[copy]]\nliteral in fence\n```\nafter")
+        consumer.finish()
+        await task
+
+        visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
+        visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
+        joined = "\n".join(visible)
+        assert "PART1" not in joined and "PART2" not in joined and "PART3" not in joined
+        assert "[[co" not in joined.replace("```\n[[copy]]\nliteral in fence", "")
+        assert "middle" in joined and "after" in joined
+        assert "literal in fence" in joined
