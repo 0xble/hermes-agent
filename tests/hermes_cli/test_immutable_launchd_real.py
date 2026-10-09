@@ -13,7 +13,12 @@ import pytest
 
 from hermes_cli import gateway, gateway_launchd
 from hermes_cli.immutable_releases import promote
-from tests.hermes_cli.immutable_launchd_cleanup import register_disposable_label, sweep_prior_sessions, install_probe_process_dependency
+from tests.hermes_cli.immutable_launchd_cleanup import (
+    install_probe_process_dependency,
+    register_disposable_label,
+    sweep_prior_sessions,
+)
+from tests.hermes_cli.immutable_test_helpers import _build_test_venv
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -77,6 +82,12 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     monkeypatch.setattr(gateway_launchd, "get_launchd_label", lambda: label)
 
     from hermes_cli import immutable_releases as releases
+    # This test exercises launchd and immutable Python release identity; the optional web
+    # bundle is unrelated and rebuilding it for both revisions can exhaust the native-file budget.
+    monkeypatch.setattr(releases, "_build_candidate_web", lambda _staging: None)
+    # Dependency isolation is out of scope here: the .pth reuses the runner's
+    # site-packages. Real _build_venv coverage lives in test_immutable_releases.py:354 and :913.
+    monkeypatch.setattr(releases, "_build_venv", _build_test_venv)
     # Both commits contain the real S2 tree. A pre-S2 fixture would be refused by
     # the candidate smoke check and would not prove an installable release.
     source = tmp_path / "source-revisions"

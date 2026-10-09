@@ -68,6 +68,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Internal notification silence | Internal process/delegation turns use an exact silence contract; parked-goal notices are durable and state-change deduplicated | Internal notification footer, process/delegation wake delivery, parked-goal status notices, or their regressions | [Internal notification silence](maintenance/internal-notification-silence.md) |
 | Goal status flood retry | Important parked, continuing, wait-ended, achieved, paused, and blocked notices survive short Telegram flood windows without blocking the turn pipeline | Goal status notice delivery, flood-control classification, or shared cron/notice retry budgets | [Goal status flood retry](maintenance/goal-notice-flood-retry.md) |
 | External-wait goal backoff | Park goals gated on external work, back off after no-progress turns, and re-arm still-running pid/session barriers | Goal judge WAIT semantics, persistent no-progress state, barrier liveness, or idle wake behavior | [External-wait goal backoff](maintenance/goal-external-wait-backoff.md) |
+| Auto-recovery ladder notice buffering | Keep post-exhaustion provider countdown notices non-durable during recovery, flush them only on terminal failure, and preserve live wait/interrupt behavior | Auto-recovery ladder notices, retry-status buffering, or recovery-surface regressions | [Auto-recovery ladder notice buffering](maintenance/auto-recovery-ladder-notice.md) |
 | Parked goal idle wake | A parked goal resumes when its wait ends, even when no completion turn arrives (restart-killed process, no notify, elapsed timer), and stale restart-resume markers cannot wedge it forever | Goal wait barriers, the gateway loop wakeup watcher, TUI notification poller, or restart process cleanup changes | [Parked goal idle wake](maintenance/goal-parked-idle-wake.md) |
 | Restart-parked goal wake | A stale `resume_pending` marker yields ownership to the idle goal ticker after restart auto-resume's freshness window, with CAS fencing against a refreshed marker | Restart-interrupted parked goals and gateway idle wake ownership | [Restart-parked goal wake](maintenance/goal-restart-parked-wake.md) |
 | Gateway stop stays stopped | `/stop` pauses the standing goal and holds the completions it produced until the user's next turn | Gateway `/stop`, completion injection, or goal pause/revival changes | [Gateway stop stays stopped](maintenance/gateway-stop-stays-stopped.md) |
@@ -211,6 +212,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py`.
 - **Retirement:** Remove when upstream provides equivalent shared cooldown, fresh-agent adoption, notice ownership, recovery clearing, and CLI status/clear controls.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shared-primary-cooldown`.
+
+## Active patch record: process watcher context isolation
+
+- **Patch identity:** `process-watcher-context-isolation`.
+- **Behavior:** `arm_process_watcher` schedules `_run_process_watcher` on the gateway loop in a fresh `contextvars.Context()`. It runs on the tool thread that started the process, which can be a `delegate_task` child's. Scheduling copied that thread's context, so a process the child handed to its parent ran its watcher, and the completion turn it injects into the parent, with the child's delegated-child marker and session id. The parent's turns then read as a subagent's: `review_candidate` refused with `parent_only`, and its background processes were labelled subagent-owned. Startup-recovered watchers already run in the root context and resolve their profile scope through `_completion_event_scope`.
+- **Source surfaces:** `gateway/run_notifications.py` (`arm_process_watcher`) and `tests/gateway/test_background_process_notifications.py`.
+- **Upstream status:** upstream `main` has the same `arm_process_watcher` (from #112287) without the isolation, and no upstream fix exists. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_background_process_notifications.py tests/tools/test_terminal_watcher_arming.py`.
+- **Retirement:** Remove when upstream arms live watchers outside the caller's context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: process-watcher-context-isolation`.
 
 ## Update
 
