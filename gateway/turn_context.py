@@ -61,6 +61,10 @@ class TurnContext:
     title_user_message: Optional[str] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    # Structured event metadata, retained when a follow-up must be rebuilt without its event object.
+    event_metadata: dict = field(default_factory=dict)
+    # Whether the source event was synthetic/internal; preserved for event-less requeues.
+    internal: bool = False
     # display_kind of the persisted user row for a self-injected turn; DB-only, never sent.
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None

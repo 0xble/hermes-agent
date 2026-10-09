@@ -228,6 +228,41 @@ class TestGoalManager:
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
 
+    def test_continuation_prompts_share_silence_rule_but_gate_failure_does_not(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(session_id="prompt-variants")
+        manager.set("finish the task")
+        assert goals.SILENCE_MARKER in manager.next_continuation_prompt()
+
+        manager._state.contract = goals.GoalContract(outcome="ship it")
+        assert goals.SILENCE_MARKER in manager.next_continuation_prompt()
+
+        manager._state.contract = None
+        manager._state.subgoals = ["also verify it"]
+        assert goals.SILENCE_MARKER in manager.next_continuation_prompt()
+
+        gate = goals.CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+            goal="finish the task", command="pytest", exit_code=1, attempt=1, max_retries=2,
+            output="failed",
+        )
+        assert goals.SILENCE_MARKER not in gate
+
+    def test_silent_automatic_continuation_skips_judge_and_counts_no_progress(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(session_id="silent-continuation", default_max_turns=20)
+        manager.set("wait for an external result")
+        with patch.object(goals, "judge_goal", side_effect=AssertionError("judge must be skipped")):
+            decision = manager.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+        assert decision["should_continue"] is True
+        assert manager.state.consecutive_parse_failures == 0
+        assert manager.state.consecutive_disputes == 0
+        assert manager.state.consecutive_no_progress == 1
+        assert decision["continuation_prompt"]
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired

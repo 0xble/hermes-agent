@@ -23,6 +23,29 @@ _REASON_NEW_MESSAGE = "user sent a new message"
 _REASON_USER_INTERRUPT = "user interrupt"
 USER_INTERRUPT_REASONS = frozenset({_REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT})
 
+# Exact messages emitted by system-owned interrupt producers. This registry is the safe fallback for
+# older result payloads that carry only ``interrupt_message``; structured ``interrupt_source`` remains
+# authoritative when present.
+SYSTEM_INTERRUPT_MESSAGES = frozenset({
+    "stop requested",
+    "session reset requested",
+    "execution timed out (inactivity)",
+    "sse client disconnected",
+    "sse task cancelled",
+    "session ended while the turn was running",
+    "gateway shutting down",
+    "gateway restarting",
+    "session turn lease lost; stopping to protect the transcript.",
+    "session turn lease could not be refreshed; stopping to protect the transcript.",
+})
+
+
+def is_system_interrupt_message(message: Optional[str]) -> bool:
+    """True when an interrupt payload is system control flow, not a user follow-up."""
+    if not message:
+        return False
+    return " ".join(str(message).strip().split()).lower() in SYSTEM_INTERRUPT_MESSAGES
+
 
 def interrupt_issuer(agent) -> Optional[str]:
     """Slug of the system producer behind the pending interrupt, or ``None`` for a human stop."""
