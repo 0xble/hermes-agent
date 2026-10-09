@@ -1029,6 +1029,14 @@ def build_turn_context(
     # This turn's user-row provenance for the memory gates (auto-recall and retention). Reset with
     # the author so a cached agent never carries an internal turn's kind into a human turn.
     agent._turn_display_kind = persist_user_display_kind
+    # Gateway routing metadata is needed by final-response recovery: a turn that was not expected
+    # to receive a reply must resolve an empty Responses reasoning summary to silence, not a retry
+    # diagnostic or leaked summary title. Reset on every cached-agent turn.
+    agent._turn_reply_expected = (
+        persist_user_display_metadata.get("reply_expected")
+        if isinstance(persist_user_display_metadata, dict)
+        else None
+    )
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.
