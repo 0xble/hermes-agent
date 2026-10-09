@@ -276,6 +276,29 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_external_dirs_use_source_maintenance_guidance(self, monkeypatch, tmp_path):
+        """External installs must not receive the local skill patching nudge."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local = tmp_path / "skills" / "tools" / "local-skill"
+        local.mkdir(parents=True)
+        (local / "SKILL.md").write_text("---\nname: local-skill\ndescription: Local\n---\n")
+        external = tmp_path / "external-skills" / "remote-skill"
+        external.mkdir(parents=True)
+        (external / "SKILL.md").write_text(
+            "---\nname: remote-skill\ndescription: External\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external.parent}\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "remote-skill" in result
+        assert "If a skill has issues, fix it with skill_manage(action='patch')." not in result
+        assert "Skills from skills.external_dirs are read-only installs" in result
+        assert "change them at their source in the owning repository" in result
+        assert "fix it with skill_manage(action='patch')" in result
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path
