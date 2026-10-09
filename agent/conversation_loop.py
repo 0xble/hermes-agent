@@ -977,6 +977,13 @@ _DEGENERATE_FINAL_NUDGE = (
     "WAS your complete answer, send it again exactly as before.]"
 )
 
+# Re-prompt once when a user-addressed gateway turn ends on an intentional silence marker.
+_GATEWAY_SILENCE_REPROMPT_NUDGE = (
+    "[System: The user typed this message and expects a visible reply. Silence markers are only "
+    "for gateway-generated turns. Reply now with a short status of what you did or started, "
+    "without a silence marker.]"
+)
+
 # Re-prompt for finish_reason="tool_calls" with empty tool_calls (an interrupt mid-retry can persist it).
 _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "Your previous turn indicated a tool call but none was included. Do not narrate a plan or "

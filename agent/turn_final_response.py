@@ -57,7 +57,7 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
-    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_nudge", "_gateway_silence_reprompt",
 )
 
 
@@ -96,7 +96,7 @@ def finish_text_response(
     stop gates accept it."""
     from agent.conversation_loop import (
         _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _join_truncated_parts
+        _GATEWAY_SILENCE_REPROMPT_NUDGE, _join_truncated_parts,
     )
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> FinalResponseVerdict:
@@ -365,6 +365,43 @@ def finish_text_response(
 
     # Genuine turn end (no dropped-tool-call mismatch): clear stall budget.
     agent._dropped_toolcall_retries = 0
+
+    # A model can incorrectly apply the gateway's silence convention to a human message. The
+    # gateway will replace that marker with a warning after this loop, so give the model one
+    # bounded chance to provide the useful status it omitted. The marker and nudge are both
+    # ephemeral scaffolding: they participate in the retry request but never become durable
+    # transcript rows. Gateway identity is deliberate here; CLI, cron, webhook and machinery
+    # turns must retain their existing silence behavior.
+    from gateway.response_filters import is_intentional_silence_response, silence_allowed
+    _gateway_silence_retry_spent = any(
+        isinstance(_message, dict) and _message.get("_gateway_silence_reprompt")
+        for _message in messages
+    )
+    if (
+        getattr(agent, "_gateway_session_key", None)
+        and is_intentional_silence_response(final_response)
+        and not silence_allowed(
+            getattr(agent, "_turn_display_kind", None),
+            getattr(agent, "_turn_reply_expected", None),
+        )
+        and not _gateway_silence_retry_spent
+    ):
+        logger.warning(
+            "User-addressed gateway turn ended on a silence marker — re-prompting once "
+            "for a visible status (session=%s)", getattr(agent, "session_id", "none"),
+        )
+        _silence_msg = agent._build_assistant_message(assistant_message, finish_reason)
+        _silence_msg["_gateway_silence_reprompt"] = True
+        _silence_msg["content"] = final_response
+        append_message(messages, _silence_msg)
+        append_message(messages, {
+            "role": "user",
+            "content": _GATEWAY_SILENCE_REPROMPT_NUDGE,
+            "_gateway_silence_reprompt": True,
+        })
+        agent._session_messages = messages
+        final_response = None
+        return _verdict("continue")
 
     # Pop prefill / empty-retry scaffolding before the final response or
     # verification follow-up; it must not become durable transcript.
