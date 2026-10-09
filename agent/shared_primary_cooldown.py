@@ -194,6 +194,8 @@ def arm_cooldown(
                 "outage_id": outage_id,
                 "recorded_at": now,
             }
+            if same_outage and old.get("notice_fallback"):
+                entry["notice_fallback"] = old["notice_fallback"]
             state["routes"][key] = entry
             _write_state(path, state)
             return dict(entry)
