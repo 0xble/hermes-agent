@@ -50,7 +50,7 @@ async def _call(limiter, endpoint, chat="2027045491", result="ok"):
     ("[IMPORTANT: 5 background processes completed for this session", True, "process"),
     ("[ASYNC DELEGATION BATCH COMPLETE — deleg_1]", True, "delegation"),
     ("[IMPORTANT: 2 background subagent delegations completed", True, "delegation"),
-    ("[System note: The previous turn was interrupted by a gateway restart", True, "restart"),
+    ("[System note: Resume the pending turn. Any restart, update, or shutdown command has already run", True, "restart"),
     ("something else", True, "internal"),
 ])
 def test_classify_trigger(text, internal, expected):

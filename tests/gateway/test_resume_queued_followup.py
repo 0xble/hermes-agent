@@ -54,7 +54,7 @@ async def test_spooled_followup_waits_for_resumed_answer_with_own_reply_anchor(t
         if event.internal:
             note, _ = _prepare_resume_pending_message(
                 "restart_interrupted", event.text, restart_resume_policy="continue")
-            assert "CONTINUE the interrupted task" in note
+            assert "continue the pending task to completion" in note.lower()
             assert "B: answer separately" not in note
             rows.extend([{"role": "user", "content": note}, {"role": "assistant", "content": "A answer"}])
             replies.append(("A answer", runner._reply_anchor_for_event(event)))

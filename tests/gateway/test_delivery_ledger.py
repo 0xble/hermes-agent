@@ -30,7 +30,6 @@ def _fresh_db(tmp_path, monkeypatch):
     monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
     yield
 
-
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
     dl.record_obligation(
         obligation_id=oid,
@@ -41,6 +40,15 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
     )
+
+
+def test_recovery_markers_keep_only_the_duplicate_hint():
+    for marker in (dl.RECOVERED_MARKER, dl.RECONNECTED_MARKER):
+        assert marker == "♻️ Recovered reply — this may be a duplicate:\n\n"
+        assert "restart" not in marker.lower()
+        assert "reconnect" not in marker.lower()
+
+    assert "may already have arrived" in dl.FLOOD_MARKER
 
 
 def _row(oid):
