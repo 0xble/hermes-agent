@@ -209,6 +209,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream provides equivalent shared cooldown, fresh-agent adoption, notice ownership, recovery clearing, and CLI status/clear controls.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shared-primary-cooldown`.
 
+## Active patch record: process watcher context isolation
+
+- **Patch identity:** `process-watcher-context-isolation`.
+- **Behavior:** `arm_process_watcher` schedules `_run_process_watcher` on the gateway loop in a fresh `contextvars.Context()`. It runs on the tool thread that started the process, which can be a `delegate_task` child's. Scheduling copied that thread's context, so a process the child handed to its parent ran its watcher, and the completion turn it injects into the parent, with the child's delegated-child marker and session id. The parent's turns then read as a subagent's: `review_candidate` refused with `parent_only`, and its background processes were labelled subagent-owned. Startup-recovered watchers already run in the root context and resolve their profile scope through `_completion_event_scope`.
+- **Source surfaces:** `gateway/run_notifications.py` (`arm_process_watcher`) and `tests/gateway/test_background_process_notifications.py`.
+- **Upstream status:** upstream `main` has the same `arm_process_watcher` (from #112287) without the isolation, and no upstream fix exists. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_background_process_notifications.py tests/tools/test_terminal_watcher_arming.py`.
+- **Retirement:** Remove when upstream arms live watchers outside the caller's context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: process-watcher-context-isolation`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

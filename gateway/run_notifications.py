@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import json
 import logging
@@ -2825,8 +2826,14 @@ class GatewayNotificationsMixin:
         if not getattr(self, "_running", False) or loop is None or not loop.is_running():
             return False
         from agent.async_utils import safe_schedule_threadsafe
-        future = safe_schedule_threadsafe(
-            self._run_process_watcher(watcher), loop, logger=logger,
+        # Arm in a FRESH context, like a startup-recovered watcher. Scheduling captures the
+        # caller's contextvars, and the caller can be a delegate_task child's tool thread: the
+        # watcher, and the completion turn it injects into the parent, would then inherit the
+        # child's delegated-child marker and session id. The parent's turns then read as a
+        # subagent's (parent-only tools refused, background processes tagged subagent-owned).
+        # The watcher already resolves the owning profile's scope itself (_completion_event_scope).
+        future = contextvars.Context().run(
+            safe_schedule_threadsafe, self._run_process_watcher(watcher), loop, logger=logger,
             log_message="Live process watcher arming failed",
         )
         return future is not None
