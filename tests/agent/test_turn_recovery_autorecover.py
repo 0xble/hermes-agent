@@ -34,6 +34,7 @@ class _Agent:
 
     def __init__(self, *, fallback_left=False, cycles=5, platform="cli"):
         self.statuses, self.waits, self.activated = [], [], []
+        self._retry_status_buffer = []
         self._fallback_left = fallback_left
         self._auto_recovery_cycles = cycles
         self.platform = platform
@@ -53,6 +54,13 @@ class _Agent:
 
     def _emit_diagnostic_status(self, text):
         self.statuses.append(str(text))
+
+    def _buffer_diagnostic_status(self, text):
+        self._retry_status_buffer.append(("status", str(text)))
+
+    def _flush_status_buffer(self):
+        self.statuses.extend(text for kind, text in self._retry_status_buffer if kind == "status")
+        self._retry_status_buffer.clear()
 
     def _emit_diagnostic_wait(self, text):
         self.waits.append(str(text))
@@ -94,8 +102,10 @@ def test_transient_exhaustion_without_fallback_enters_ladder_and_retries(status,
     agent = _Agent()
     verdict, retry = _settle(agent, _Err(status, message))
     assert (verdict.action, verdict.retry_count, retry.auto_recovery_cycles_used) == ("continue", 0, 1)
-    assert agent.statuses == agent.waits and len(agent.statuses) == 1
-    line = agent.statuses[0]
+    assert agent.statuses == []
+    assert agent.waits and len(agent.waits) == 1
+    assert agent._retry_status_buffer and agent._retry_status_buffer[0][0] == "status"
+    line = agent._retry_status_buffer[0][1]
     assert "(cycle 1/5)" in line
 
 
@@ -104,7 +114,9 @@ def test_ladder_is_bounded_and_yields_to_fallback_and_shuns_nonretryable():
     spent = TurnRetryState(primary_recovery_attempted=True, auto_recovery_cycles_used=5)
     verdict, _ = _settle(agent, _Err(503, "down"), retry=spent)
     assert verdict.action == "return" and verdict.result == {"failed": True}
-    assert any("gave up after 5 cycles" in s for s in agent.statuses)
+    assert any("gave up after 5 cycles" in text for _kind, text in agent._retry_status_buffer)
+    agent._flush_status_buffer()
+    assert any("gave up after 5 cycles" in text for text in agent.statuses)
 
     # Fallback first: a remaining fallback engages and the ladder never runs.
     fb = _Agent(fallback_left=True)
@@ -145,10 +157,10 @@ def test_ladder_schedule_honours_retry_after_and_platform_stop_hint(monkeypatch)
 
     tg = _Agent(platform="telegram")
     _settle(tg, plain)
-    assert "send /stop to cancel" in tg.statuses[0]
+    assert "send /stop to cancel" in tg.waits[0]
     cron = _Agent(platform="cron")
     _settle(cron, plain)
-    assert cron.statuses[0].endswith("(cycle 1/5)")
+    assert cron._retry_status_buffer[0][1].endswith("(cycle 1/5)")
 
 
 def test_interrupt_during_ladder_wait_returns_interrupted_result():

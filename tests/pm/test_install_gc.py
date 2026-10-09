@@ -90,7 +90,7 @@ def test_non_object_metadata_is_treated_as_legacy_not_a_crash(monkeypatch, tmp_p
         assert state.is_dir()
 
 
-def test_pre_lease_generation_keeps_orphan_install_on_the_legacy_grace(monkeypatch, tmp_path):
+def test_pre_lease_generation_keeps_orphan_install_on_the_long_grace(monkeypatch, tmp_path):
     import time
 
     home = _setup(monkeypatch, tmp_path)
@@ -182,6 +182,44 @@ def test_legacy_install_stays_until_long_threshold(monkeypatch, tmp_path):
     assert state.is_dir()
     assert collect_install_orphans(now=old + 101, legacy_grace_seconds=100) == [state]
     assert not state.exists()
+
+
+def _legacy_install(home: Path, key: str, idle_days: float, now: float) -> Path:
+    state = home / "installs" / key
+    state.mkdir(parents=True)
+    payload = state / "facts.json"
+    payload.write_text(json.dumps({"schema": 1, "packages": {}}), encoding="utf-8")
+    old = now - idle_days * 24 * 60 * 60
+    _age(payload, old)
+    _age(state, old)
+    return state
+
+
+def test_default_legacy_grace_reclaims_after_three_idle_days(monkeypatch, tmp_path):
+    """Legacy installs are regenerable caches: the default window is days, not a month."""
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    now = time.time()
+    stale = _legacy_install(home, "b" * 16, idle_days=4, now=now)
+    recent = _legacy_install(home, "c" * 16, idle_days=2, now=now)
+
+    assert collect_install_orphans(now=now) == [stale]
+    assert not stale.exists()
+    assert recent.is_dir()
+
+
+def test_default_legacy_grace_keeps_an_install_whose_key_is_visible(monkeypatch, tmp_path):
+    import time
+
+    home = _setup(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    now = time.time()
+    state = _legacy_install(home, install_key(checkout), idle_days=90, now=now)
+
+    assert collect_install_orphans((checkout,), now=now) == []
+    assert state.is_dir()
 
 
 def test_corrupt_or_mismatched_metadata_fails_closed(monkeypatch, tmp_path):
