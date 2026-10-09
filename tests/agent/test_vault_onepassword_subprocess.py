@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from agent import secret_scope
+from agent.vault_backends import onepassword
 from agent.vault_backends.base import UnlockRequired
 from agent.vault_backends.onepassword import OnePasswordLoginBackend
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -130,8 +131,13 @@ def assert_no_secret_diagnostics(capfd, caplog, *diagnostics):
     pytest.param(None, marks=pytest.mark.platforms("linux"), id="linux"),
     pytest.param(None, marks=pytest.mark.platforms("macos"), id="macos"),
 ], indirect=True)
-def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, capfd, caplog):
+def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, capfd, caplog, monkeypatch):
     profile, calls, state = fake_op
+    now = [1000.0]
+    monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
+
+    def later():  # a separate fill, past the per-fill listing reuse window
+        now[0] += onepassword._FRESH_LISTING_REUSE_SECONDS + 1
     with profile("a") as backend:
         metadata = backend.list_items()
         assert [item.id for item in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
@@ -146,6 +152,7 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
         assert backend.resolve_password("op:item-b") == "dummy-password"
         # An already-issued handle must use newly listed metadata, not a cached vault.
         state.write_text(json.dumps({"mode": "ok", "vault": "vault-moved"}))
+        later()
         assert backend.resolve_otp("op:item-b") == "123456"
         state.write_text(json.dumps({"mode": "error", "vault": "vault-moved"}))
         with pytest.raises(RuntimeError, match="synthetic read failure") as error:
@@ -153,6 +160,7 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
         assert backend.resolve_otp("op:item-b") is None
         before = len(calls())
         state.write_text(json.dumps({"mode": "ambiguous", "vault": "vault-moved"}))
+        later()
         with pytest.raises(RuntimeError, match="missing or ambiguous") as ambiguous:
             backend.resolve_password("op:item-b")
         assert backend.resolve_otp("op:item-b") is None
@@ -177,9 +185,11 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
 def test_real_subprocess_auth_is_scoped_and_empty_profile_fails_closed(fake_op, capfd, caplog):
     profile, calls, _ = fake_op
     for name in ("a", "b", "a"):
+        before = len(calls())
         with profile(name) as backend:
             assert backend.resolve_password("op:item-b") == "dummy-password"
-        assert [row["identity"] for row in calls()[-2:]] == [name, name]
+        # A listing reused within the per-fill window is the same identity's own listing.
+        assert {row["identity"] for row in calls()[before:]} == {name}
     before = calls()
     with profile("empty") as backend:
         assert not backend.is_unlocked()

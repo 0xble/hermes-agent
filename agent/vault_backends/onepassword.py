@@ -4,8 +4,9 @@ Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
 List: ``op item list --categories Login,"Credit Card" --format json`` → title,
-urls, username / masked card number. Resolve: ``op item get <id> --vault
-<vault-id> ...``, selecting the item's vault from fresh listing metadata
+urls, username / masked card number. Listings are reused (15 minutes for display, 5 seconds
+for a fill) and fetched single-flight: every ``op`` call spends a daily account quota.
+Resolve: ``op item get <id> --vault <vault-id> ...``, selecting the item's vault from fresh listing metadata
 (required for service accounts). Cards carry no origin: the browser fill
 binds them to the page it is on and the user confirms that origin per fill.
 
@@ -26,6 +27,7 @@ import re
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -42,12 +44,31 @@ _TIMEOUT = 30.0
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 _ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vault selector
-# `op item list` output, reused briefly for display listings only (browser_vault_list is
-# called repeatedly against a per-account request quota). Metadata only, never secrets.
-# Anything that authorizes a fill (get_meta's origins, _locate's vault) always lists fresh.
-_LISTING_TTL_SECONDS = 120.0
+# `op item list` output (metadata only, never secrets), keyed per backend, account and
+# credential fingerprint. Every `op` call spends the account's daily request quota.
+# Display listings (browser_vault_list) reuse an answer for 15 minutes; fresh=True bypasses it.
+_LISTING_TTL_SECONDS = 900.0
 _LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+# Fill authorization (get_meta's origins, then _locate's vault) never reads the display cache.
+# It reuses only a listing that was itself fetched fresh, and only for 5 seconds: long enough
+# for get_meta and the secret read of the same fill (milliseconds apart, plus one `op` round
+# trip) to share one listing, and short enough that a website or vault change made by hand is
+# seen by the next fill in practice. The age is measured from when the fetch started.
+_FRESH_LISTING_REUSE_SECONDS = 5.0
+_FRESH_LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+# Single flight: concurrent callers wanting the same (kind, key) listing wait on one `op` call.
+_LISTING_INFLIGHT: Dict[Tuple[str, Tuple[str, str, str]], Future] = {}
 _LISTING_LOCK = threading.Lock()
+_LISTING_GENERATION = [0]  # bumped on invalidation so a fetch already in flight is not stored
+
+
+def invalidate_listing_cache() -> None:
+    """Forget every reused listing. Call after anything changes 1Password items."""
+    with _LISTING_LOCK:
+        _LISTING_CACHE.clear()
+        _FRESH_LISTING_CACHE.clear()
+        _LISTING_INFLIGHT.clear()
+        _LISTING_GENERATION[0] += 1
 # A bare "host[.tld][:port][/path]" website. Anything else without "://" (mailto:, user@host,
 # javascript:) stays unparseable rather than being coerced into an https origin.
 _BARE_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+(?::\d{1,5})?(?:[/?#][^\s]*)?")
@@ -291,23 +312,54 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError(f"op failed: {err[:200]}")
         return proc.stdout or ""
 
-    def _item_list_json(self) -> str:
-        """`op item list` for this account, reused for ``_LISTING_TTL_SECONDS``. Keyed by the
-        credential's fingerprint, so another account, token or session never sees this listing;
-        failures are never cached."""
+    def _listing_key(self) -> Tuple[str, str, str]:
+        # The credential's fingerprint, so another account, token or session never sees a listing.
         credential = self._service_token or _unlock.get_session_token(self.name) or ""
-        key = (self.name, str(self.cfg.get("account") or ""), _fingerprint(credential))
-        with _LISTING_LOCK:
-            hit = _LISTING_CACHE.get(key)
-            if hit and time.monotonic() - hit[0] < _LISTING_TTL_SECONDS:
-                return hit[1]
-        out = self._list_json_fresh()
-        with _LISTING_LOCK:
-            _LISTING_CACHE[key] = (time.monotonic(), out)
-        return out
+        return (self.name, str(self.cfg.get("account") or ""), _fingerprint(credential))
+
+    def _item_list_json(self) -> str:
+        """Display listing: reuses any listing younger than ``_LISTING_TTL_SECONDS``."""
+        return self._shared_listing("display", _LISTING_TTL_SECONDS)
 
     def _list_json_fresh(self) -> str:
-        return self._run("item", "list", "--categories", _CATEGORIES, "--format", "json")
+        """Fill-authorizing listing: reuses only a fresh fetch younger than
+        ``_FRESH_LISTING_REUSE_SECONDS``, so one fill (get_meta, then _locate) lists once."""
+        return self._shared_listing("fresh", _FRESH_LISTING_REUSE_SECONDS)
+
+    def _shared_listing(self, kind: str, max_age: float) -> str:
+        """One ``op item list`` per key and kind at a time; concurrent callers share its answer.
+        Failures are never cached: every waiter sees the error and the next caller retries."""
+        key = self._listing_key()
+        cache = _FRESH_LISTING_CACHE if kind == "fresh" else _LISTING_CACHE
+        with _LISTING_LOCK:
+            hit = cache.get(key)
+            if hit and time.monotonic() - hit[0] < max_age:
+                return hit[1]
+            pending = _LISTING_INFLIGHT.get((kind, key))
+            owner = pending is None
+            if owner:
+                pending = _LISTING_INFLIGHT[(kind, key)] = Future()
+            generation = _LISTING_GENERATION[0]
+        if not owner:
+            return pending.result()
+        started = time.monotonic()
+        try:
+            out = self._run("item", "list", "--categories", _CATEGORIES, "--format", "json")
+        except BaseException as exc:
+            with _LISTING_LOCK:
+                if _LISTING_INFLIGHT.get((kind, key)) is pending:
+                    del _LISTING_INFLIGHT[(kind, key)]
+            pending.set_exception(exc)
+            raise
+        with _LISTING_LOCK:
+            if _LISTING_INFLIGHT.get((kind, key)) is pending:
+                del _LISTING_INFLIGHT[(kind, key)]
+            if generation == _LISTING_GENERATION[0]:
+                _LISTING_CACHE[key] = (started, out)  # a fresh answer also serves display listings
+                if kind == "fresh":
+                    _FRESH_LISTING_CACHE[key] = (started, out)
+        pending.set_result(out)
+        return out
 
     # ── backend contract ───────────────────────────────────────────────────
     def list_items(self, *, fresh: bool = False) -> List[VaultItemMeta]:
@@ -374,8 +426,8 @@ class OnePasswordLoginBackend(LoginBackend):
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
-        # Fresh: this is the fill's origin authorization, and _locate resolves the secret
-        # from a fresh listing too, so both must see the item's current websites.
+        # Fresh: this is the fill's origin authorization. _locate then resolves the secret from
+        # the same fresh listing (see _FRESH_LISTING_REUSE_SECONDS), so one fill lists once.
         return next((m for m in self.list_items(fresh=True) if m.id == handle), None)
 
     def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
@@ -384,7 +436,8 @@ class OnePasswordLoginBackend(LoginBackend):
     def _locate(self, handle: str, categories) -> tuple:
         """``([item_id, "--vault", vault_id], category)`` for a CLI handle, from fresh listing metadata."""
         # Keep existing op:<item-id> handles valid, including across backend instances.
-        # Resolve from fresh metadata rather than caching a vault or guessing the first one.
+        # Resolve from fresh metadata (at most _FRESH_LISTING_REUSE_SECONDS old, never the display
+        # cache) rather than caching a vault or guessing the first one.
         if not handle.startswith(self.prefix):
             raise ValueError("Invalid 1Password item handle")
         item_id = handle[len(self.prefix):]

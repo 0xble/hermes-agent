@@ -2221,7 +2221,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._updates_received_total = self._updates_dispatched_total = 0
         self._last_ingress_dispatch_monotonic = None
         self._ingress_dispatched_seen = self._ingress_stalled_heartbeats = 0
+        # The pending-update stuck window is generation-scoped too: the next probe only records a baseline.
         self._polling_pending_dispatched_seen = None
+        self._polling_pending_stuck_count = 0
         return self._polling_generation, self._polling_progress_event
 
     def _record_polling_progress(self, generation: int) -> bool:
@@ -2802,6 +2804,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_pending_dispatched_seen = dispatched
         if pending <= 0:
             self._polling_pending_stuck_count = 0
+            return
+        if seen is None:
+            # First probe of a polling generation: no baseline, so it cannot show a stall. Record the
+            # baseline only; the stuck window starts with the next probe.
+            self._polling_pending_stuck_count = 0
+            logger.debug("[%s] Telegram polling heartbeat: %d update(s) pending; recorded dispatch baseline",
+                         self.name, pending)
             return
         if progressed:
             # Telegram counts the batch being handled as pending until the next getUpdates confirms its

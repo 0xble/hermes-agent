@@ -40,7 +40,9 @@ the browser vault fill tool, or the 1Password backends.
   full origin and item label; cross-registrable-domain aliases warn with both domains when the advisory fallback recognizes
   those suffixes. The warning is advisory, has partial suffix coverage and never authorizes a fill; the full origin is
   always shown. Declines and unanswered prompts
-  remain fail-closed for retries in the same session. Never rewrite a 1Password item to add a URL because template
+  remain fail-closed for retries in the same session. An accepted prompt re-reads `vault.origin_aliases` before
+  writing and refuses with `origin_alias_revoked` (nothing written, acceptance not cached) when the alias was removed
+  while the prompt waited. Never rewrite a 1Password item to add a URL because template
   rewrites can delete passkeys.
 - Vault fills support 1Password Connect and secret-safe Camofox login fills: TOTP codes are minted from Connect
   one-time-password fields, automatic 2FA is announced only when a code can really be minted, an unusable OTP field
@@ -129,7 +131,13 @@ the browser vault fill tool, or the 1Password backends.
   multi-account vault logins as of 2026-09-26), and
   `op-quota-resilience` (own fork fix: last-good 1Password secrets on rate limit or
   outage, a display-only listing cache, https for bare-host websites, and a stop at the
-  first 429 with a 15-minute per-identity cooldown shared across processes).
+  first 429 with a 15-minute per-identity cooldown shared across processes). Since
+  2026-10-08 the vault listing is reused for 15 minutes for display, fetched single-flight
+  per backend/account/credential fingerprint, and a fill reuses only a listing fetched
+  fresh within the last 5 seconds, so one fill spends one `op item list` plus its
+  `op item get`. `invalidate_listing_cache()` clears both; Hermes has no path that writes
+  1Password items, and `browser_vault_save_login` writes only the uncached local vault.
+  Upstream (`908e4a4b444`) has no vault listing cache to adopt.
   `vault-card-retry-guard` (separate fork-only safety fix: session/origin-scoped
   ten-minute in-memory refusal after a declined/unanswered prompt; retire when released
   upstream enforces equivalent no-reprompt behavior), and
@@ -171,6 +179,7 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_subprocess.py` (real subprocess, fake `op`),
 `tests/agent/test_vault_protected_fields.py`,
 `tests/agent/test_vault_onepassword_accounts.py` (multi-account, real config + fake `op`),
+`tests/agent/test_vault_onepassword_listing_quota.py` (counts `op` calls per list and fill),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
 `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and

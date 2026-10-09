@@ -33,10 +33,12 @@ def _fresh_structured_output_memo(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fresh_onepassword_listing_cache(monkeypatch):
-    """1Password item listings are reused process-wide for a short window; a listing one test's
-    fake ``op`` produced must not answer the next test's backend."""
+    """1Password item listings are reused process-wide; a listing one test's fake ``op``
+    produced must not answer the next test's backend."""
     from agent.vault_backends import onepassword
-    monkeypatch.setattr(onepassword, "_LISTING_CACHE", {})
+    onepassword.invalidate_listing_cache()
+    yield
+    onepassword.invalidate_listing_cache()
 
 
 @pytest.fixture(autouse=True)

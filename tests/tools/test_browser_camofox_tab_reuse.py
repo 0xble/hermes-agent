@@ -83,6 +83,16 @@ class _Camofox:
                     return self._send({"ok": True})
                 return self._send({"error": "not found"}, 404)
 
+            def do_DELETE(self):  # noqa: N802
+                parsed = urlsplit(self.path)
+                query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+                stub.calls.append(("DELETE", parsed.path, query))
+                if parsed.path.startswith("/tabs/"):
+                    tab_id = parsed.path.split("/")[2]
+                    stub.tabs[query.get("userId")] = [
+                        t for t in stub.tabs.get(query.get("userId"), []) if t["tabId"] != tab_id]
+                return self._send({"ok": True})
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -435,3 +445,121 @@ def test_a_protected_binding_does_not_move_to_a_continuation(camofox):
     assert not _dispatch("browser_snapshot", {}, second)["success"]
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, second)["success"]
     assert cf._sessions[second]["tab_id"] not in {tab, None}
+
+
+def _close_agent(task_ids, **attrs):
+    """The real agent-close resource release for an agent that ran ``task_ids``."""
+    from agent.client_lifecycle import ClientLifecycleMixin
+
+    agent = SimpleNamespace(_process_owner_task_ids=set(task_ids), **attrs)
+    with patch("run_agent.cleanup_vm"), patch("run_agent.cleanup_browser"):
+        ClientLifecycleMixin._close_task_resources(agent, "session-id")
+
+
+def _tab_deletes(server):
+    return [(path, query) for method, path, query in server.calls if method == "DELETE"]
+
+
+@pytest.mark.parametrize("attrs", [{"_delegate_depth": 1}, {"platform": "cron"}])
+def test_finished_subagent_or_cron_run_closes_the_tab_it_created(camofox, attrs):
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child-task")["success"]
+    tab, user_id = camofox.cf._sessions["child-task"]["tab_id"], _user_id(camofox.cf, "child-task")
+    _end_turn("child-task")
+    _close_agent({"child-task"}, **attrs)
+    assert "child-task" not in camofox.cf._sessions
+    assert _tab_deletes(camofox.server) == [(f"/tabs/{tab}", {"userId": user_id})]
+    assert all(t["tabId"] != tab for t in camofox.server.tabs[user_id])
+
+
+def test_one_shot_run_closes_the_tab_it_created(camofox, monkeypatch):
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "oneshot-task")["success"]
+    tab = camofox.cf._sessions["oneshot-task"]["tab_id"]
+    _close_agent({"oneshot-task"}, platform="cli")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_top_level_session_close_keeps_its_tab(camofox, monkeypatch):
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    tab, user_id = camofox.cf._sessions["chat"]["tab_id"], _user_id(camofox.cf, "chat")
+    _end_turn("chat")
+    _close_agent({"chat"}, platform="telegram", _delegate_depth=0)
+    assert "chat" not in camofox.cf._sessions
+    assert _tab_deletes(camofox.server) == []
+    assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])  # left for adoption
+
+
+def test_subagent_release_refuses_adoption_before_tab_delete(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    tab = cf._sessions["child"]["tab_id"]
+
+    real_delete = cf._delete
+    def delete_with_racing_adoption(path, *args, **kwargs):
+        if path == f"/tabs/{tab}":
+            raced = _dispatch("browser_navigate", {"url": "https://a.example.test/race"}, "sibling")
+            assert raced["success"]
+            assert cf._sessions["sibling"]["tab_id"] != tab
+        return real_delete(path, *args, **kwargs)
+
+    with patch.object(cf, "_delete", side_effect=delete_with_racing_adoption):
+        _close_agent({"child"}, _delegate_depth=1)
+    assert cf._sessions["sibling"]["tab_id"] != tab
+    assert _tab_deletes(camofox.server) == [(f"/tabs/{tab}", {"userId": _user_id(cf, "sibling")})]
+
+
+def test_subagent_close_never_deletes_an_adopted_tab(camofox):
+    cf = camofox.cf
+    user_id = cf._get_session("seed")["user_id"]
+    cf._drop_session("seed")
+    camofox.server.seed(user_id, {"tabId": "left-open", "url": "https://a.example.test/", "listItemId": "task_x"})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    assert cf._sessions["child"]["tab_id"] == "left-open"
+    _close_agent({"child"}, _delegate_depth=1)
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_subagent_close_never_deletes_a_handed_off_shared_tab(camofox):
+    # The task first opens its own tab, then a handoff rebinds it to the shared visible tab.
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "child")["success"]
+    assert _dispatch("browser_handoff", {"account": "brianle"}, "child")["success"]
+    assert camofox.cf._sessions["child"]["tab_id"] == "visible-tab"
+    _close_agent({"child"}, _delegate_depth=1)
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_subagent_close_never_deletes_a_tab_another_task_is_bound_to(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    tab = cf._sessions["child"]["tab_id"]
+    with cf._sessions_lock:
+        cf._sessions["sibling"] = {**cf._sessions["child"], "task_id": "sibling", "created_by_task": None}
+    _close_agent({"child"}, _delegate_depth=1)
+    assert cf._sessions["sibling"]["tab_id"] == tab
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_subagent_close_never_deletes_a_protected_tab(camofox):
+    from agent.redact import clear_vault_date_components, register_vault_date_component
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    tab = cf._sessions["child"]["tab_id"]
+    cf.quarantine_current_protected_tab("child")
+    register_vault_date_component("bday-year", "1990", tab="child", origin="https://a.example.test")
+    try:
+        _close_agent({"child"}, _delegate_depth=1)
+    finally:
+        clear_vault_date_components("child")
+    assert _tab_deletes(camofox.server) == []
+    assert tab in cf._protected_tab_ids  # quarantined, not closed
+
+
+def test_subagent_tab_close_failure_is_swallowed(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
+    tab = cf._sessions["child"]["tab_id"]
+    with patch.object(cf, "_delete", side_effect=requests.ConnectionError("camofox down")) as delete:
+        cf.release_task_bindings({"child"}, close_created_tabs=True)  # must not raise
+    assert delete.call_args.args == (f"/tabs/{tab}",)
+    assert "child" not in cf._sessions
