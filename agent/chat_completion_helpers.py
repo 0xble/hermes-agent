@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -1060,6 +1061,9 @@ def direct_api_call(agent, api_kwargs: dict):
         # reset undoes the bump; the finally discards the poisoned client).
         request.mark_done()
         _reset_stale_streak(agent)
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import complete_primary_recovery
+            complete_primary_recovery(agent)
         succeeded = True
         return response
     finally:
@@ -2105,14 +2109,65 @@ def _buffer_fallback_notice(agent, notice: str) -> None:
         agent._pending_fallback_notice = [str(pending), notice] if pending else [notice]
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_at=None) -> bool:
+def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_model, fb_provider):
+    """Choose the user notice for a fallback switch.
+
+    Returns ``(use_generic, notice)``: ``use_generic`` selects the pre-existing generic notice;
+    otherwise ``notice`` is the shared outage notice, or None to stay silent. Silence is
+    reserved for switches the user was already told about: a session adopting a shared outage,
+    or a re-arm of the same outage that lands on the model the claimed notice already
+    announced. Missing shared state (a failed write) or a move to a different model than the
+    one announced keeps a notice.
+    """
+    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
+    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        return True, None
+    if shared_adoption:
+        return False, None  # one notice per outage: another session already announced it
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if not isinstance(record, dict) or not record.get("outage_id"):
+        return True, None  # shared state unavailable; never drop the notice
+    target = (str(fb_model), str(fb_provider or "").strip().lower())
+    try:
+        from agent.shared_primary_cooldown import announced_fallback, claim_outage_notice, route_from_record
+        route = route_from_record(record)
+        outage_id = str(record["outage_id"])
+        if claim_outage_notice(route, outage_id, fallback=target):
+            try:
+                reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
+            except (KeyError, TypeError, ValueError, OSError):
+                reset_label = "the cooldown expiry"
+            return False, f"⚠️ {old_model} is rate-limited until {reset_label}; using {fb_model} via {fb_provider} until then."
+        if announced_fallback(route, outage_id) == target:
+            return False, None
+    except Exception:
+        logger.debug("Shared outage notice claim failed; using the generic notice", exc_info=True)
+    return True, None
+
+
+def try_activate_fallback(
+    agent, reason: "FailoverReason | None" = None, reset_at=None, *,
+    _shared_cooldown_record=None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
-    construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    construction goes through resolve_provider_client (no duplicated provider→key mappings).
+
+    ``_shared_cooldown_record`` is used only by a newly-created agent adopting an outage that
+    another process already armed; it must not re-arm the record or emit a duplicate notice.
+    """
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    shared_adoption = isinstance(_shared_cooldown_record, dict)
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
-    cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    if shared_adoption:
+        agent._shared_primary_cooldown_record = _shared_cooldown_record
+        remaining = max(0, math.ceil(float(_shared_cooldown_record.get("reset_at", 0)) - time.time()))
+        agent._rate_limited_until = time.monotonic() + remaining
+        agent._rate_limit_backoff_count = int(_shared_cooldown_record.get("backoff_count", 0) or 0)
+        cooldown_seconds = remaining
+    else:
+        cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
@@ -2203,13 +2258,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-            notice = (
-                f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-                f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}.")
-            if cooldown_seconds is not None:
-                remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
-                notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
-            _buffer_fallback_notice(agent, notice)
+            use_generic_notice, notice = _rate_limit_fallback_notice(
+                agent, reason, shared_adoption, old_model, fb_model, fb_provider)
+            if use_generic_notice:
+                notice = (
+                    f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
+                    f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
+                )
+                if cooldown_seconds is not None:
+                    remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
+                    notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
+            if notice:
+                _buffer_fallback_notice(agent, notice)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
@@ -2809,6 +2869,9 @@ class _BedrockStream:
         # Success clears the cross-turn breaker (#58962).
         if self.result["response"] is not None:
             _reset_stale_streak(self.agent)
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import complete_primary_recovery
+                complete_primary_recovery(self.agent)
         return self.result["response"]
 
     def run(self):
@@ -4094,6 +4157,9 @@ class _StreamingCall(StreamingWaitMonitor):
             raise self.result["error"]
         if self.result["response"] is not None:
             _reset_stale_streak(self.agent)  # provider proved responsive: clear the breaker
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import complete_primary_recovery
+                complete_primary_recovery(self.agent)
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])

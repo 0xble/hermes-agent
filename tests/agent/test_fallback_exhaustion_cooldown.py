@@ -39,6 +39,18 @@ def _make_agent(fallback_model=None):
         return agent
 
 
+def _expire_shared_window(agent):
+    """Move the shared record's reset into the past: the cooldown is over for every process,
+    not only for this agent's in-memory deadline (turn start re-reads the shared record)."""
+    import time
+    from agent.shared_primary_cooldown import _locked_state, _write_state, route_from_agent, route_key
+    route = route_from_agent(agent)
+    with _locked_state() as (path, state):
+        entry = state["routes"][route_key(provider=route[0], base_url=route[1], model=route[2])]
+        entry["reset_at"] = time.time() - 1
+        _write_state(path, state)
+
+
 def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock = MagicMock()
     mock.base_url = base_url
@@ -145,10 +157,16 @@ class TestRateLimitBackoffEscalation:
         """Simulate the primary provider rate-limiting again on a later turn
         (without a successful restore, which would reset the counter): put
         the agent's identity back on the primary and reset the turn-scoped
-        fallback chain state."""
+        fallback chain state. A later turn only re-probes the primary once the
+        shared window has lapsed (turn start adopts an active record and stays
+        on fallback), so expire it; a 429 inside the window is an in-flight
+        request and must not escalate."""
+        from agent.shared_primary_cooldown import get_cooldown, route_from_agent
         agent.provider, agent.model, agent.base_url = snapshot
         agent._fallback_activated = False
         agent._fallback_index = 0
+        if get_cooldown(route_from_agent(agent)) is not None:
+            _expire_shared_window(agent)
 
     def test_backoff_doubles_per_consecutive_rate_limit(self):
         """Each consecutive primary rate-limit doubles the cooldown:
@@ -173,6 +191,39 @@ class TestRateLimitBackoffEscalation:
                     f"backoff #{n + 1}: expected {want}s cooldown"
                 )
                 assert agent._rate_limit_backoff_count == n + 1
+
+    def test_restore_without_primary_success_keeps_shared_backoff_level(self):
+        """A turn-start restore is only a recovery probe: if the primary rate-limits again
+        before any primary request succeeds, the shared level keeps escalating."""
+        fbs = [{"provider": "openai", "model": "gpt-4o"}]
+        agent = _make_agent(fallback_model=fbs)
+        snapshot = (agent.provider, agent.model, agent.base_url)
+        frozen = 1_000.0
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            agent._rate_limited_until = 0
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+            self._back_on_primary(agent, snapshot)
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        agent._fallback_activated = True
+        agent._rate_limited_until = 0
+        _expire_shared_window(agent)
+        assert agent._restore_primary_runtime() is True
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "resolved"),
+            ),
+        ):
+            agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        assert agent._rate_limit_backoff_count == 3
+        assert agent._rate_limited_until == frozen + 240
 
     def test_backoff_caps_at_four_hours(self):
         """Escalation is capped at 14400s (4h) no matter how many
@@ -217,8 +268,14 @@ class TestRateLimitBackoffEscalation:
         # Cooldown expired; the primary restores successfully.
         agent._fallback_activated = True
         agent._rate_limited_until = 0
+        _expire_shared_window(agent)
         assert agent._restore_primary_runtime() is True
         assert agent._rate_limit_backoff_count == 0
+        # Restoring only makes the primary eligible for a probe; the shared outage (and its
+        # backoff level) ends when a primary request actually succeeds. The request wrappers
+        # call complete_primary_recovery after every successful response.
+        from agent.shared_primary_cooldown import complete_primary_recovery
+        assert complete_primary_recovery(agent) is True
 
         # The next rate-limit is treated as a fresh first failure: 60s.
         with (

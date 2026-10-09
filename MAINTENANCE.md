@@ -200,6 +200,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream releases an equivalent Responses-summary gate.
 - **Rollback:** Revert the responses-reasoning-summary-not-reply commit.
 
+## Active patch record: shared primary cooldown
+
+- **Patch identity:** `shared-primary-cooldown`.
+- **Behavior:** A primary route that is rate-limited, billing-limited, or upstream-rate-limited writes an atomic, file-locked cooldown under `$HERMES_HOME/state/model_cooldowns.json`. Fresh agents adopt the configured fallback without calling the primary while the shared record is active. One process claims the outage notice; one successful primary response clears the record and emits the recovery notice.
+- **Source surfaces:** `agent/shared_primary_cooldown.py`, `agent/fallback_cooldown.py`, `agent/agent_runtime_helpers.py`, `agent/chat_completion_helpers.py`, `agent/chat_completion_nonstream.py`, and `hermes_cli/fallback_cmd.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py`.
+- **Retirement:** Remove when upstream provides equivalent shared cooldown, fresh-agent adoption, notice ownership, recovery clearing, and CLI status/clear controls.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shared-primary-cooldown`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
