@@ -20,6 +20,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -215,11 +216,16 @@ def _serialise_value(value: Any) -> Optional[dict]:
                 result[attr] = val
         if getattr(value, "_drain_deferred", False):
             result["drain_deferred"] = True
-            result["internal"] = bool(getattr(value, "internal", False))
-            result["allow_gateway_control"] = bool(getattr(value, "allow_gateway_control", False))
-            metadata = getattr(value, "metadata", None)
-            if isinstance(metadata, dict) and _json_safe(metadata):
-                result["metadata"] = metadata
+        # Every queued event keeps its turn contract: a machinery notice recovered without
+        # ``internal``/``reply_expected`` would be judged a human turn on replay.
+        result["internal"] = getattr(value, "internal", False) is True
+        result["allow_gateway_control"] = getattr(value, "allow_gateway_control", False) is True
+        reply_expected = getattr(value, "reply_expected", None)
+        if isinstance(reply_expected, bool):
+            result["reply_expected"] = reply_expected
+        metadata = getattr(value, "metadata", None)
+        if isinstance(metadata, dict) and metadata and _json_safe(metadata):
+            result["metadata"] = metadata
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
@@ -382,8 +388,21 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             return False
         if claim:
             return CLAIMED_FOLLOWUP
+    # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
+    # reply judgement, display filters) does not treat it as a human prompt.
+    row_display: Dict[str, Any] = {}
+    if data.get("internal") is True:
+        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+        from gateway.warning_notifications import diagnostic_metadata
+        row_display["display_kind"] = INTERNAL_NOTIFICATION_DISPLAY_KIND
+        row_display["display_metadata"] = diagnostic_metadata(
+            SimpleNamespace(internal=True, metadata=data.get("metadata")))
+    if isinstance(data.get("reply_expected"), bool):
+        row_display.setdefault("display_metadata", {})["reply_expected"] = data["reply_expected"]
+    if not row_display.get("display_metadata"):
+        row_display.pop("display_metadata", None)
     target_db.append_message(session_id=session_id, role="user", content=text,
-                             timestamp=payload.get("ts", int(time.time())))
+                             timestamp=payload.get("ts", int(time.time())), **row_display)
     return True
 
 
