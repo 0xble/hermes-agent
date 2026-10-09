@@ -361,14 +361,13 @@ def test_alias_removed_during_confirmation_refuses_fill(monkeypatch):
 
 def test_alias_removed_from_config_file_during_confirmation_is_not_served_stale(tmp_path, monkeypatch):
     """The re-check goes through the real config loader, whose cache must observe the rewrite."""
-    import yaml
-
     vault._alias_fill_decisions.clear()
     vault._alias_fill_refused.clear()
     home = tmp_path / "hermes-home"
     home.mkdir()
     config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump({"vault": {"origin_aliases": {
+    # JSON is valid YAML; the test runner's environment does not ship PyYAML.
+    config_path.write_text(json.dumps({"vault": {"origin_aliases": {
         "op:file-revoke-id": ["https://login.gusto.com"],
     }}}), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -381,7 +380,7 @@ def test_alias_removed_from_config_file_during_confirmation_is_not_served_stale(
     })
 
     def _confirm(*_):
-        config_path.write_text(yaml.safe_dump({"vault": {"origin_aliases": {}}}), encoding="utf-8")
+        config_path.write_text(json.dumps({"vault": {"origin_aliases": {}}}) + "\n", encoding="utf-8")
         return "accept"
 
     monkeypatch.setattr(vault, "_confirm_alias_fill", _confirm)
