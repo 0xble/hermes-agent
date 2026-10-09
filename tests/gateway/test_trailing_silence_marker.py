@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from agent.agent_runtime_helpers import strip_think_blocks as _real_strip_think_blocks
+from agent.conversation_loop import _DEGENERATE_FINAL_NUDGE, _GATEWAY_SILENCE_REPROMPT_NUDGE
 from agent.turn_final_response import finish_text_response
 from gateway.run_turn import GatewayTurnMixin
 
@@ -34,6 +35,7 @@ def _stub_conversation_loop(monkeypatch):
     module._CODEX_ACK_CONTINUATION_NUDGE = "continue"
     module._DEGENERATE_FINAL_NUDGE = "continue"
     module._DROPPED_TOOLCALL_NUDGE_CONTENT = "continue"
+    setattr(module, "_GATEWAY_SILENCE_REPROMPT_NUDGE", _GATEWAY_SILENCE_REPROMPT_NUDGE)
     module._join_truncated_parts = lambda parts: "".join(text for text, _ in parts)
     monkeypatch.setitem(sys.modules, "agent.conversation_loop", module)
 
