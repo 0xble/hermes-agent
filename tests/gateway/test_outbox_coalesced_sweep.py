@@ -307,3 +307,19 @@ def test_retry_identity_uses_platform_and_profile():
     adapter = _Adapter()
     adapter.gateway_runner = SimpleNamespace(_profile_adapters={"work": {"telegram": adapter}})
     assert outbox._retry_profile(adapter) == "work"
+
+
+def test_rows_without_a_persisted_class_still_match_their_resend(tmp_path):
+    """Rows written before ``_outbound_class`` existed must still dedupe a re-run send, or an
+    uncertain dispatch from before the upgrade would be sent again instead of held."""
+    store = Outbox(tmp_path)
+    legacy = {"chat_id": "c", "content": "reply"}
+    resend = {**legacy, "_outbound_class": OUTBOUND_FINAL}
+
+    pending = store.enqueue("t", "send", legacy)
+    assert store.pending_retry("t", "send", resend) == pending
+
+    assert store.begin_send(pending)
+    assert store.held_payload("t", "send", resend)
+    assert store.held_payload("t", "send", {**legacy, "_outbound_class": OUTBOUND_NOTICE})
+    assert not store.held_payload("t", "send", {**resend, "content": "other"})

@@ -248,6 +248,15 @@ def wire_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in {"_outbox_original", "_outbound_class"}}
 
 
+def _same_send(stored: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Match a stored row against a re-sent payload by what reaches the wire.
+
+    The outbound class is delivery metadata, not message identity: rows written before it was
+    persisted, or the same reply sent under another class, must still dedupe.
+    """
+    return wire_payload(stored.get("_outbox_original", stored)) == wire_payload(payload)
+
+
 def _discard_delivered_media(home: Path, payload: dict[str, Any]) -> None:
     """Only delete copies owned by this outbox after the receipt commits."""
     if "_outbox_original" not in payload:
@@ -808,7 +817,7 @@ class Outbox:
                              (turn_id,)).fetchone()
             if row and row["state"] == "pending" and row["retry_at"] is None and row["type"] == kind:
                 stored = json.loads(row["payload"])
-                if stored.get("_outbox_original", stored) == payload:
+                if _same_send(stored, payload):
                     return self._row(row)
             return None
 
@@ -818,7 +827,7 @@ class Outbox:
                                   "AND (state IN ('sending','ambiguous','expired_ambiguous') "
                                   "OR (state='pending' AND retry_at IS NOT NULL))", (turn_id, kind)):
                 stored = json.loads(row[0])
-                if stored.get("_outbox_original", stored) == payload:
+                if _same_send(stored, payload):
                     return True
         return False
 
