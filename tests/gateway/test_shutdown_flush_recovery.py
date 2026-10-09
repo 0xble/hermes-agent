@@ -445,27 +445,37 @@ def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
     """Resume turns and queued inbound write live rows. The store knows nothing about the previous
     run's spool until recovery has run, so a live row written first lands ahead of it for good."""
     import asyncio
+    from functools import partial
 
     import gateway.run as gateway_run
+    import gateway.run_pending_recovery as pending_recovery
 
     order = []
-    monkeypatch.setattr("gateway.shutdown_flush.recover_gateway_pending",
-                        lambda runner: order.append("recover") or 0)
+    monkeypatch.setattr(pending_recovery, "recover_pending_shutdown_flush",
+                        lambda runner, **_kwargs: order.append("recover") or 0)
     monkeypatch.setattr(gateway_run, "_restart_notification_pending", lambda: False)
     monkeypatch.setattr(gateway_run, "_planned_restart_notification_pending", lambda: False)
 
     async def noop(*_args, **_kwargs):
         return None
 
+    async def no_candidates(*_args, **_kwargs):
+        return []
+
     async def finish_startup_restore():
         order.append("drain inbound")
 
     runner = SimpleNamespace(
-        _start_post_connect_services=noop, _await_startup_boot_sends=noop,
-        _schedule_resume_pending_sessions=lambda: order.append("resume"),
-        _finish_startup_restore=finish_startup_restore,
+        _start_post_connect_services=noop, _await_startup_boot_sends=noop, _await_mcp_discovery=noop,
+        _claim_pending_obligations=no_candidates, _resume_pending_candidates=lambda: [],
+        _resume_pending_candidates_async=no_candidates, _startup_interrupted_note_candidates=lambda _c: [],
+        _queue_startup_restore_event=lambda *_a, **_k: None,
+        _schedule_resume_pending_sessions=lambda **_kwargs: order.append("resume"),
+        _finish_startup_restore=finish_startup_restore, _schedule_auto_resume_delegations=lambda: None,
         _send_session_db_warning_notifications=noop, _spawn_supervised=lambda *a, **k: None,
     )
+    runner._recover_pending_shutdown_flush_off_loop = partial(
+        gateway_run.GatewayRunner._recover_pending_shutdown_flush_off_loop, runner)
     asyncio.run(gateway_run.GatewayRunner._start_finish_wiring(runner, 0))
 
     assert order == ["recover", "resume", "drain inbound"]

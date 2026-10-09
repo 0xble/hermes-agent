@@ -6,7 +6,7 @@ from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.shutdown_flush import DROP_PENDING, OTHER_PLATFORM_PENDING, recover_pending_to_db
+from gateway.shutdown_flush import DROP_PENDING, OTHER_PLATFORM_PENDING, recover_pending_spool
 
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
@@ -154,12 +154,16 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
                     with _profile_runtime_scope(owner_home, prepared_secret_scope={}):
                         return runner.session_store.resolve_session_id_for_key(key, not_after=not_after)
 
-                recovered += recover_pending_to_db(
+                count, held_back = recover_pending_spool(
                     session_resolver=resolve_here,
                     deferred_followup=partial(_defer_followup, runner, eligible, platform,
                                               breaker_tripped=candidates is None,
                                               reconnect_recovery=platform is not None,
                                               recovered_events=recovered_events))
+                recovered += count
+                # A held-back session's next live row must drain its spool first, or it lands ahead.
+                if held_back:
+                    runner.session_store.mark_spooled_drop_sessions(held_back)
         except Exception:
             logger.warning("Pending-message recovery failed for profile home %s; spool retained", home,
                            exc_info=True)
