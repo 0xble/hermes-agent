@@ -243,6 +243,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
 - **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
 
+## Active patch record: release-owned config writes
+
+- **Patch identity:** `release-owned-config-writes`.
+- **Behavior:** Refuse config.yaml writes from a non-live Hermes code root when HERMES_HOME resolves to an immutable release, while allowing the live release and the process-local updater context. The refusal names the config path, running root, live release, and release-owned executable.
+- **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` round-trip YAML writers, `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
