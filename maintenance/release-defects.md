@@ -722,3 +722,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   reports no new entries.
 - Upstream-added `tests/ci` files that only check upstream's hosted workflows or
   `scripts/ci/classify_changes.py`, which the fork deleted in #62, stay deleted with them.
+- Fork patch identity for the hosted-CI repair of the merged candidate (PR #396): `release-sync`.
+- In that repair, each test that failed only on the candidate passed on the parent
+  that owns it, so each fix restores that parent's lost lines and keeps the other's
+  additions: memory prefetch fan-out redaction, the cron `progress_at` column
+  (additive, column-guarded `ALTER TABLE`) and live-owner stale read, the primary's
+  reasoning override through `reinstall_primary_runtime`, interrupted tool-tail
+  closure, host-cancelled compression accounting, restart-wait budgets and logs,
+  bounded shutdown-spool recovery, the session `/yolo` routing-index flag, launchd
+  account-home resolution for an unknown uid, quick-snapshot digest checks before
+  restore, the update body's start-of-run steps, `worktree_gc` git isolation, and the
+  desktop frozen-transport, slash-attachment and Quick Entry bindings. Fork-only cases
+  that exercised only the `honcho` or `openviking` providers upstream removed are
+  dropped; their retaindb, Hindsight and other consumer cases stay. Guard:
+  `scripts/run_tests.sh` on the hosted-failing files, with
+  `tests/hermes_cli/test_update_head_moved_gate.py` failing on both parents.
