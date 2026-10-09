@@ -18,7 +18,10 @@ _SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overlo
 def _provider_reset_epoch(reset_at) -> float | None:
     """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""
     from agent.credential_pool import _parse_absolute_timestamp
-    parsed = _parse_absolute_timestamp(reset_at)
+    try:
+        parsed = _parse_absolute_timestamp(reset_at)
+    except (OverflowError, ValueError, TypeError):
+        return None  # malformed provider metadata falls back to exponential backoff
     if parsed is not None and math.isfinite(parsed) and parsed > time.time():
         return float(parsed)
     return None
