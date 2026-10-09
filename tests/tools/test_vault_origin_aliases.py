@@ -327,3 +327,95 @@ def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monk
     result = json.loads(vault.browser_vault_fill("example-item", task_id="config-set"))
     assert result["success"] is True
 
+
+def test_alias_removed_during_confirmation_refuses_fill(monkeypatch):
+    """An alias deleted while the (possibly hours-long) prompt waits must not authorize the write."""
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    backend = _Backend(_meta(handle="op:revoke-id"))
+    _fill_patches(monkeypatch, backend)
+    config = {"vault": {"origin_aliases": {"op:revoke-id": ["https://login.gusto.com"]}}}
+    writes, prompts = [], []
+    monkeypatch.setattr(vault, "_eval_js_secret", lambda *args: writes.append(args) or {
+        "success": True, "result": json.dumps({"filled": 1}),
+    })
+
+    def _confirm(*args):
+        prompts.append(args)
+        config["vault"]["origin_aliases"].pop("op:revoke-id")
+        return "accept"
+
+    monkeypatch.setattr(vault, "_confirm_alias_fill", _confirm)
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: config):
+        result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="revoke"))
+        assert result["success"] is False
+        assert result["error_type"] == "origin_alias_revoked"
+        assert writes == []
+        # The acceptance was not cached: re-adding the alias asks again rather than reusing it.
+        config["vault"]["origin_aliases"]["op:revoke-id"] = ["https://login.gusto.com"]
+        monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "accept")
+        again = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="revoke"))
+    assert again["success"] is True
+    assert len(prompts) == 2 and len(writes) == 1
+
+
+def test_alias_removed_from_config_file_during_confirmation_is_not_served_stale(tmp_path, monkeypatch):
+    """The re-check goes through the real config loader, whose cache must observe the rewrite."""
+    import yaml
+
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"vault": {"origin_aliases": {
+        "op:file-revoke-id": ["https://login.gusto.com"],
+    }}}), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert _configured_aliases()["op:file-revoke-id"] == ("https://login.gusto.com",)  # warm the cache
+    backend = _Backend(_meta(handle="op:file-revoke-id"))
+    _fill_patches(monkeypatch, backend)
+    writes = []
+    monkeypatch.setattr(vault, "_eval_js_secret", lambda *args: writes.append(args) or {
+        "success": True, "result": json.dumps({"filled": 1}),
+    })
+
+    def _confirm(*_):
+        config_path.write_text(yaml.safe_dump({"vault": {"origin_aliases": {}}}), encoding="utf-8")
+        return "accept"
+
+    monkeypatch.setattr(vault, "_confirm_alias_fill", _confirm)
+    result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="file-revoke"))
+    assert result["success"] is False
+    assert result["error_type"] == "origin_alias_revoked"
+    assert writes == []
+
+
+def test_alias_still_present_after_confirmation_fills(monkeypatch):
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    backend = _Backend(_meta(handle="op:kept-id"))
+    _fill_patches(monkeypatch, backend)
+    writes, loads = [], []
+    monkeypatch.setattr(vault, "_eval_js_secret", lambda *args: writes.append(args) or {
+        "success": True, "result": json.dumps({"filled": 1}),
+    })
+    config = {"vault": {"origin_aliases": {"op:kept-id": ["https://login.gusto.com"]}}}
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or config):
+        result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="kept"))
+    assert result["success"] is True
+    assert result["origin"] == "https://login.gusto.com"
+    assert len(writes) == 1
+    assert len(loads) == 2  # once before the prompt, once after it
+
+
+def test_saved_origin_fill_skips_prompt_and_alias_recheck(monkeypatch):
+    backend = _Backend(_meta(handle="op:saved-id"))
+    _fill_patches(monkeypatch, backend, page_origin="https://gusto.com")
+    prompts, loads = [], []
+    monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "accept")
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or {"vault": {}}):
+        result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="saved-only"))
+    assert result["success"] is True
+    assert prompts == []
+    assert len(loads) == 1
