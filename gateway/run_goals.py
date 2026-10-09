@@ -14,7 +14,7 @@ import time
 from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Optional
 
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -151,6 +151,7 @@ class GatewayGoalsMixin:
     @staticmethod
     def _synthetic_prompt_event(
         source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
+        goal_continuation: bool = False,
     ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
@@ -166,6 +167,7 @@ class GatewayGoalsMixin:
         return MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
+            metadata={GOAL_CONTINUATION_METADATA_KEY: True} if goal_continuation else {},
         )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -549,7 +551,7 @@ class GatewayGoalsMixin:
             if adapter and _quick_key:
                 # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False), adapter,
+                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True), adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -703,7 +705,9 @@ class GatewayGoalsMixin:
                 platform_name, source.chat_id, source.thread_id,
             )
             await adapter.handle_message(
-                self._synthetic_prompt_event(source, wakeup, internal=True, reply_expected=False)
+                self._synthetic_prompt_event(
+                    source, wakeup, internal=True, reply_expected=False, goal_continuation=False,
+                )
             )
             # Slash-command loops dispatch through the command path and never hit the post-turn
             # completion hook — complete the tick immediately (caps + scheduling).
@@ -787,7 +791,7 @@ class GatewayGoalsMixin:
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(source, prompt, reply_expected=False)
+        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
         event.metadata["gateway_session_key"] = key
         if resume_marker is not None:
             cleared = await self.async_session_store.clear_resume_pending(

@@ -883,6 +883,30 @@ def _cmd_optimize(db, args):
     _print_size_change(db, before_mb)
 
 
+def _cmd_optimize_next_start(args):
+    """Record or withdraw the one-shot request; never opens the store, so it works beside a live gateway."""
+    from hermes_state import _default_db_path
+    from hermes_state_compaction import cancel_request, read_request, request_compaction
+
+    db_path = _default_db_path()
+    if getattr(args, "cancel_next_start", False):
+        print("Withdrew the pending next-start optimization." if cancel_request(db_path)
+              else "No next-start optimization was pending.")
+        return 0
+    if not db_path.exists():
+        print(f"No session database at {db_path} — nothing to optimize.")
+        return 1
+    already = read_request(db_path) is not None
+    path = request_compaction(db_path)
+    print(f"{'Renewed' if already else 'Recorded'} a one-shot optimization (FTS merge + VACUUM) of {db_path}.\n"
+          f"  Request: {path}\n"
+          "  The next gateway start runs it before connecting any platform, then clears the request.\n"
+          "  It waits for a later start while another process (Desktop, dashboard, cron worker, another\n"
+          "  gateway) holds the store, or while free disk is short. On a large store that start takes\n"
+          "  minutes longer than usual. Withdraw with: hermes sessions optimize --cancel-next-start")
+    return 0
+
+
 def _cmd_clean_markers(db, args):
     print(f"{'Dry run — scanning' if args.dry_run else 'Scanning'} for stale tool-call marker rows (#78148)…")
     report = db.purge_stale_tool_call_markers(dry_run=args.dry_run, backup=not args.no_backup)
@@ -1210,6 +1234,9 @@ def cmd_sessions(args, sessions_parser=None):
     pre = _PRE_DB_HANDLERS.get(action)
     if pre is not None:
         return pre(args)
+    if action == "optimize" and (getattr(args, "at_next_start", False)
+                                 or getattr(args, "cancel_next_start", False)):
+        return _cmd_optimize_next_start(args)
     observational = action in _OBSERVATIONAL_DB_ACTIONS
     from hermes_state import SessionDB, _default_db_path
     try:

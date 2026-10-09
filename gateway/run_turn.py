@@ -2199,6 +2199,15 @@ class GatewayTurnMixin:
         if resolved is None:
             return
         source, session_entry, session_key = resolved
+        from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
+        if (
+            isinstance(getattr(event, "metadata", None), dict)
+            and event.metadata.get(GOAL_CONTINUATION_METADATA_KEY)
+            and event.reply_expected is not True
+        ):
+            # The structured marker survives adapter copies/recovery; derive the quiet contract at
+            # the turn boundary instead of trusting a rebuilt event's nullable field.
+            event.reply_expected = False
         # Snapshot the interruption marker before preparation/delivery can yield to a successor turn.
         _resume_pending_marker = None
         _resume_marker_reader = None
@@ -2268,7 +2277,8 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
+                channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
+                moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
@@ -3744,10 +3754,10 @@ class GatewayTurnMixin:
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
-                if _is_control_interrupt_message(interrupt_message):
+                if result.get("interrupt_source") or _is_control_interrupt_message(interrupt_message):
                     logger.info(
-                        "Ignoring control interrupt message for session %s: %s",
-                        session_key or "?", interrupt_message,
+                        "Ignoring control interrupt message for session %s: %s (source=%s)",
+                        session_key or "?", interrupt_message, result.get("interrupt_source"),
                     )
                 else:
                     pending = interrupt_message
@@ -3921,7 +3931,15 @@ class GatewayTurnMixin:
                 adapter._pending_messages[session_key] = pending_event
                 pending_event._gateway_accepted = True
             elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
+                # Legacy adapters expose only a text queue API. Pass the event contract when the
+                # adapter supports keyword metadata, then fall back without changing old adapters.
+                try:
+                    adapter.queue_message(
+                        session_key, pending, reply_expected=turn_ctx.reply_expected,
+                        internal=turn_ctx.internal, metadata=dict(turn_ctx.event_metadata or {}),
+                    )
+                except TypeError:
+                    adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
@@ -3933,6 +3951,8 @@ class GatewayTurnMixin:
                 from gateway.platforms.base import MessageEvent, MessageType
                 deferred = pending_event or MessageEvent(
                     text=str(pending), message_type=MessageType.TEXT, source=source,
+                    internal=turn_ctx.internal, reply_expected=turn_ctx.reply_expected,
+                    metadata=dict(turn_ctx.event_metadata or {}),
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
                     existing = adapter._pending_messages.get(session_key)
@@ -3962,6 +3982,13 @@ class GatewayTurnMixin:
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
         next_reply_expected = pending_event.reply_expected if pending_event is not None else None
+        if (
+            pending_event is not None
+            and isinstance(getattr(pending_event, "metadata", None), dict)
+            and pending_event.metadata.get("goal_continuation")
+            and next_reply_expected is not True
+        ):
+            next_reply_expected = False
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
@@ -4396,7 +4423,8 @@ class GatewayTurnMixin:
         source: SessionSource, session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
+        channel_prompt: Optional[str] = None, internal: bool = False, event_metadata: Optional[dict] = None,
+        moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,

@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_time import safe_strftime
+from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
 
 logger = logging.getLogger(__name__)
 
@@ -176,9 +177,23 @@ _NO_PROGRESS_BACKOFF_S = (5 * 60, 15 * 60, _MAX_BARRIER_WAIT_S)
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+# Shared autonomous-wakeup reply contract. Goal continuations and /loop wakeups are machinery,
+# not conversations: the user hears from them only when something new needs attention.
+_AUTONOMOUS_REPLY_RULES = (
+    "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
+    "If since your last visible update nothing new and material happened and nothing needs the "
+    "user's action (for example, you are still waiting on an external party, a scheduled check, "
+    "or a background process), reply with exactly "
+    f"{SILENCE_MARKER} and nothing else. Never post status like \"no change\", \"still waiting\", "
+    "plain acknowledgements, \"next check at\", or what you did not do.\n"
+    "When something changed, report only the new fact or needed action briefly, in one or two short lines. "
+    "Claiming done (with an Evidence section) and being blocked or needing input still require a visible reply.\n"
+)
+
 CONTINUATION_PROMPT_TEMPLATE = (
     f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
-    "Continue working toward this goal. Take the next concrete step. "
+    + _AUTONOMOUS_REPLY_RULES
+    + "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly, cite the proof "
     "(exact identifiers or output lines from tool results, in backticks), and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
@@ -201,7 +216,8 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
     "Completion contract:\n"
     "{contract_block}\n\n"
-    "Continue working toward the outcome above. Take the next concrete step. "
+    + _AUTONOMOUS_REPLY_RULES
+    + "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Your method may change as you learn; the end state may not. If a criterion "
     "has become obsolete or wrong, say so and revise the goal (goal_set "
@@ -219,7 +235,8 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     f"{GOAL_CONTINUATION_PREFIX} {{goal}}\n\n"
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
-    "Continue working toward the goal AND all additional criteria. Take "
+    + _AUTONOMOUS_REPLY_RULES
+    + "Continue working toward the goal AND all additional criteria. Take "
     "the next concrete step. If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly "
@@ -2923,11 +2940,20 @@ class GoalManager:
                                            since=state.created_at)
         progress_fingerprint = _goal_progress_fingerprint(turn_evidence)
         new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
-        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
-            state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
-            contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
-        )
+        # A bare silence marker is an explicit no-op from a gateway-authored continuation. Do not
+        # send it to the judge: silence is not a parse failure or a dispute, and the existing
+        # no-progress/backoff logic should decide when to park the goal.
+        silent_automatic = not user_initiated and is_intentional_silence_response(last_response)
+        if silent_automatic:
+            verdict, reason, parse_failed, wait_directive, transport_failed = (
+                "continue", state.last_reason or "no material change since the last update", False, None, False
+            )
+        else:
+            verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
+                state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
+                contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+                evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+            )
         state.last_verdict = verdict
         state.last_reason = reason
         # A non-WAIT verdict is a real lifecycle transition out of the previous

@@ -735,6 +735,9 @@ def finalize_turn(
     agent._response_was_previewed = False
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
+        from agent.interrupt_control import interrupt_issuer
+        if (issuer := interrupt_issuer(agent)):
+            result["interrupt_source"] = issuer
     agent.clear_interrupt()
     agent._stream_callback = None  # don't leak into future calls
 

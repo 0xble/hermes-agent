@@ -72,19 +72,27 @@ class GatewayGoalCommandsMixin:
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
-        A kickoff keeps the triggering message id / channel prompt; a resume continuation carries
-        none. Best-effort: failures only logged.
+        A kickoff answers the user's own ``/goal`` message, so it keeps that message's id, channel
+        prompt and reply contract. A resume continuation is gateway-authored like every other goal
+        continuation: it is built by the shared synthetic-prompt constructor so a no-change tick
+        may end on the silence marker. Best-effort: failures only logged.
         """
         try:
             adapter, quick_key = self._adapter_and_key_for(event)
             if text and adapter and quick_key:
-                turn = MessageEvent(
-                    text=text,
-                    message_type=MessageType.TEXT,
-                    source=event.source,
-                    message_id=event.message_id if kickoff else None,
-                    channel_prompt=event.channel_prompt if kickoff else None,
-                )
+                if kickoff:
+                    turn = MessageEvent(
+                        text=text,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                        reply_expected=event.reply_expected,
+                    )
+                else:
+                    turn = self._synthetic_prompt_event(
+                        event.source, text, reply_expected=False, goal_continuation=True,
+                    )
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)

@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import tui_gateway.server as srv
 from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE
+from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, GOAL_GATE_FAILED_PREFIX
 from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, is_quiet_wakeup_prompt
 
 LOOP_WAKEUP = WAKEUP_PROMPT_TEMPLATE.format(tick=2, cadence=" · every 5m", prompt="check the queue")
@@ -22,6 +23,8 @@ HEARTBEAT = HEARTBEAT_PROMPT_TEMPLATE.format(interval="30m", prompt="check the q
 def test_wakeup_prompts_are_recognized_and_user_text_is_not():
     assert is_quiet_wakeup_prompt(LOOP_WAKEUP)
     assert is_quiet_wakeup_prompt(HEARTBEAT)
+    assert is_quiet_wakeup_prompt(CONTINUATION_PROMPT_TEMPLATE.format(goal="check the queue"))
+    assert not is_quiet_wakeup_prompt(GOAL_GATE_FAILED_PREFIX + " check the queue")
     assert not is_quiet_wakeup_prompt("check the queue")
     assert not is_quiet_wakeup_prompt(None)
 

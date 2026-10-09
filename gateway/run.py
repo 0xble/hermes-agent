@@ -2822,18 +2822,10 @@ def _watch_gateway_turn_inactivity(
         return
 
 
-_CONTROL_INTERRUPT_MESSAGES = frozenset({
-    _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
-    _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
-    _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
-
-
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
     """Return True when an interrupt message is internal control flow."""
-    if not message:
-        return False
-    return " ".join(str(message).strip().split()).lower() in _CONTROL_INTERRUPT_MESSAGES
+    from agent.interrupt_control import is_system_interrupt_message
+    return is_system_interrupt_message(message)
 
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
@@ -5483,6 +5475,23 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     return True
 
 
+def _run_requested_state_db_compaction() -> None:
+    """Honor a pending ``hermes sessions optimize --at-next-start`` request (no-op otherwise).
+
+    Runs synchronously on purpose: nothing else in this process may touch state.db while VACUUM
+    rewrites it. The startup watchdog lease is renewed inside. Never raises.
+    """
+    try:
+        from hermes_state import _default_db_path
+        from hermes_state_compaction import request_path, run_pending_compaction
+
+        db_path = Path(_default_db_path())
+        if request_path(db_path).exists():
+            run_pending_compaction(db_path)
+    except Exception as exc:
+        logger.warning("state.db compaction request could not be processed: %s", exc)
+
+
 def _claim_host_gateway_role(force: bool = False) -> None:
     """Take the HOST-wide gateway lock, publish the record — or REFUSE to be the second gateway.
 
@@ -6042,6 +6051,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
     if not _start_gateway_claim_pid_file(force=force):
         return False
+
+    # Only the authoritative gateway may rewrite the store, and only before adapters, cron, the
+    # housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
+    _run_requested_state_db_compaction()
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)

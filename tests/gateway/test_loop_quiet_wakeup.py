@@ -15,6 +15,8 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.response_filters import display_kind_for_event
 from gateway.run import GatewayRunner
 from gateway.run_turn import GatewayTurnMixin
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 
 
 @pytest.fixture()
@@ -115,7 +117,22 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
 
     adapter = _Adapter()
     state = LoopManager(session_id="loop-sid").state
-    await _runner(adapter)._loop_wakeup_fire_one("loop-sid", state, 1e12, set())
+    if state is None:
+        # The loop DB writer is intentionally asynchronous under the test/bootstrap path; the
+        # gateway's scanner would already hold the state it loaded, so use this manager's state.
+        state = mgr.state
+    import hermes_cli.loops as loops
+    monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
+    runner = _runner(adapter)
+    runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.TELEGRAM, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"], user_name=evt.get("user_name"),
+    )
+    runner._session_key_for_source = lambda source: "agent:main:telegram:dm:42"
+    runner._running_agents = {}
+    runner._run_in_executor_with_context = _runner(adapter)._run_in_executor_with_context
+    await runner._loop_wakeup_fire_one("loop-sid", state, 1e12, set())
 
     assert len(adapter.events) == 1
     event = adapter.events[0]
@@ -124,5 +141,18 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
     assert "reply with exactly [SILENT] and nothing else" in event.text
     assert LoopManager(session_id="loop-sid").state.awaiting_response is True
 
+    assert await _deliver(event, "[SILENT]", monkeypatch) == ""
+    assert await _deliver(event, "Queue depth changed to 2.", monkeypatch) == "Queue depth changed to 2."
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_silence_is_gateway_quiet_but_updates_deliver(
+    hermes_home, monkeypatch,
+):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
+    event = GatewayRunner._synthetic_prompt_event(
+        source, "[Continuing toward your standing goal]\\nGoal: check the queue", reply_expected=False,
+    )
+    assert event.reply_expected is False
     assert await _deliver(event, "[SILENT]", monkeypatch) == ""
     assert await _deliver(event, "Queue depth changed to 2.", monkeypatch) == "Queue depth changed to 2."

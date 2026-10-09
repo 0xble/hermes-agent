@@ -221,6 +221,27 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream arms live watchers outside the caller's context.
 - **Rollback:** Revert the commits carrying `Fork-Patch: process-watcher-context-isolation`.
 
+## Active patch record: shutdown spool turn contract
+
+- **Patch identity:** `shutdown-spool-turn-contract`.
+- **Behavior:** `gateway/shutdown_flush.py` serialises `internal`, `allow_gateway_control`, `reply_expected` (when known), and JSON-safe `metadata` for every spooled `MessageEvent`, not only drain-deferred arrivals. Startup replay (`gateway/run_pending_recovery.py`) restores `reply_expected`, and the transcript-append fallback stamps `display_kind=internal_notification` and `display_metadata.reply_expected`. Previously a process-completion notice queued at shutdown came back as a human turn, so the agent's correct `NO_REPLY` drew "No reply was written for this message" after each restart. Old spool files without these keys recover as before.
+- **Source surfaces:** `gateway/shutdown_flush.py` (`_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_resume_queued_followup.py`.
+- **Upstream status:** upstream `_serialise_value` keeps only text and routing fields; open upstream PR NousResearch/hermes-agent#95217 serialises internal routing for a different replay design and does not cover `reply_expected`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_resume_queued_followup.py -k machinery_silence`.
+- **Retirement:** Remove when upstream spools and restores the internal flag and `reply_expected` for every queued event.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-turn-contract`.
+
+## Active patch record: state.db compaction at next gateway start
+
+- **Patch identity:** `state-db-compact-at-start`.
+- **Behavior:** `hermes sessions optimize --at-next-start` records a one-shot request in `state.db.compact-at-start.json` beside the store without opening it, so it works while the gateway runs (`--cancel-next-start` withdraws it). `start_gateway` honors it right after the PID-file claim, before the control socket, adapters, cron, the housekeeping worker or any SessionDB handle exist, running the same `SessionDB.vacuum()` as `hermes sessions optimize` (FTS merge, VACUUM, TRUNCATE checkpoint) and logging before/after size at INFO. It keeps the request and logs a WARNING instead when a foreign process holds the store, a release promotion awaits this gateway's acknowledgement (`release-txn.json`), or free disk is below about twice the live data plus 1 GiB. The rewrite renews the startup-watchdog lease (and systemd `EXTEND_TIMEOUT_USEC`) every 60s only while SQLite's VM or the store/WAL files show progress. Attempts are counted before the rewrite and the request is dropped after three, so a start killed mid-VACUUM cannot loop. It never raises into startup.
+- **Why core:** the held-store refusal (#110054) correctly blocks a live rewrite, and automatic VACUUM needs a fresh prune plus a quiet store, so a gateway-owned install had no supported way to reclaim space after a bulk delete. Only the gateway's own startup can run before its own handles exist.
+- **Source surfaces:** `hermes_state_compaction.py`, `gateway/run.py` (`_run_requested_state_db_compaction` and its call in `start_gateway`), `hermes_cli/sessions_cmd.py`, `hermes_cli/subcommands/sessions.py`, `website/docs/user-guide/sessions.md`, and `tests/hermes_state/test_compact_at_next_start.py`.
+- **Upstream status:** no upstream issue or PR proposes deferred compaction. Related: #84525 (optimize under live holders, fixed by the refusal), #121324/#121783 (prune exempted from the held-store guard), #57752 and #112105 (auto-VACUUM gating). Candidate for an upstream contribution.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_compact_at_next_start.py tests/hermes_cli/test_sessions_held_store_gate.py tests/hermes_state/test_auto_vacuum_holder_gate.py tests/hermes_state/test_startup_maintenance_lease.py`.
+- **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
+- **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

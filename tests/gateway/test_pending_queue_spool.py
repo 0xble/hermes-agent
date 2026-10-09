@@ -14,7 +14,9 @@ import time
 import pytest
 
 from gateway import shutdown_flush
-from gateway.session import SessionStore
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session import SessionSource, SessionStore
 
 
 def _make_store(db):
@@ -202,6 +204,47 @@ class TestSpoolOnDrop:
 
 
 class TestSpoolPrimitives:
+    def test_recovery_rehydrates_goal_continuation_reply_expectation(self, tmp_path):
+        from gateway import run_pending_recovery
+
+        key = "agent:main:telegram:chat"
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", user_id="u")
+        entry = type("Entry", (), {
+            "origin": type("Origin", (), {"platform": Platform.TELEGRAM})(),
+            "resume_pending": True,
+            "session_id": "sid",
+        })()
+
+        class Store:
+            def __init__(self):
+                import threading
+                self._lock = threading.Lock()
+                self._entries = {key: entry}
+            def _ensure_loaded_locked(self):
+                return None
+
+        class Runner:
+            session_store = Store()
+            _startup_restore_queue = []
+            _draining = False
+            def _is_session_running(self, _key): return False
+            def _restored_source(self, _entry): return source
+            def _resume_owner_authorized(self, _key, _source): return True
+            def _auto_resume_ready(self, _entry, require_adapter=False): return (object(), source)
+
+        recovered = []
+        event = MessageEvent(
+            text="[Continuing toward your standing goal]\\nGoal: wait",
+            message_type=MessageType.TEXT,
+            user_id="u", reply_expected=False,
+        )
+        data = shutdown_flush._serialise_value(event)
+        assert data["reply_expected"] is False
+        result = run_pending_recovery._defer_followup(
+            Runner(), {key: entry}, None, key, "sid", data, tmp_path / "pending.json", recovered_events=recovered,
+        )
+        assert result is True
+        assert recovered[0].reply_expected is False
     def test_drain_skips_other_reasons(self, spool_home):
         # A shutdown-format flush file must not be consumed by the drain.
         shutdown_flush.flush_pending_to_file({"key1": "hello"}, reason="shutdown")

@@ -284,6 +284,29 @@ async def test_eventless_followup_keeps_effective_prompt_through_next_human(
 
 
 @pytest.mark.asyncio
+async def test_system_lease_interrupt_is_not_requeued_as_a_follow_up(monkeypatch):
+    runner = _make_runner(monkeypatch)
+    adapter = MagicMock()
+    adapter.get_pending_message.return_value = None
+    adapter._active_sessions = {}
+    source = _human_source()
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {
+            "interrupted": True,
+            "interrupt_message": "Session turn lease could not be refreshed; stopping to protect the transcript.",
+        },
+        adapter,
+        source,
+        KEY,
+    )
+
+    assert pending_event is None
+    assert pending is None
+    adapter.queue_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_event_backed_followup_overrides_inherited_channel_prompt(monkeypatch):
     runner = _make_runner(monkeypatch)
     calls: list[dict] = []
