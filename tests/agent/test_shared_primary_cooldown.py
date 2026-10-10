@@ -502,6 +502,28 @@ def test_cached_fallback_agent_adopts_a_longer_shared_window():
     assert spc.active_cooldown(spc.route_from_agent(agent))["reset_at"] - time.time() > 7000
 
 
+def test_shortened_shared_window_releases_a_cached_fallback_agent_once_it_expires():
+    """A provider reset that shortens the outage must not leave the old local deadline blocking."""
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent, reset_at=time.time() + 7200)  # 2 h outage, local deadline set from it
+    assert agent._rate_limited_until - time.monotonic() > 7000
+    _arm_for(agent, seconds=60)  # a later provider reset shortens the shared window to 60 s
+    _age_record(spc.route_from_agent(agent), reset_ago=1, window=60)  # 61 s later: expired
+    assert agent._restore_primary_runtime() is True
+    assert agent.model == "primary-model"
+    # The expired record stays for the recovery probe: a primary success clears it with one notice.
+    assert spc.read_cooldown(spc.route_from_agent(agent)) is not None
+
+
+def test_expired_shared_record_does_not_release_a_longer_local_window_without_a_record():
+    """No shared record held (shared state unavailable or never read) keeps the local deadline."""
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent, reset_at=time.time() + 7200)
+    with patch("agent.shared_primary_cooldown.read_cooldown", side_effect=OSError("unreadable")):
+        assert agent._restore_primary_runtime() is False
+    assert agent.model == "fallback-one"
+
+
 # ── Exact cooldown clearing (review round 2, P2-3) ───────────────────────────────────────────
 
 def test_clear_cooldowns_matches_exactly():
