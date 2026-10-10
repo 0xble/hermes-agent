@@ -190,6 +190,14 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     assert repeated["status"] == "failed"
     assert repeated["error"] == "nothing_to_clear"
 
+    # A cleared goal is still stored; pause and resume must not revive it.
+    for action in ("pause", "resume"):
+        pending_goal = request_control("goal", action, "target", requester_sid="requester")
+        revived = resolve_request(pending_goal["id"], "approve", "admin")
+        assert revived["status"] == "failed"
+        assert revived["error"] == f"nothing_to_{action}"
+        assert GoalManager("target").state.status == "cleared"
+
     pending = request_control("loop", "stop", "target", requester_sid="requester")
     resolved = resolve_request(pending["id"], "approve", "admin")
     assert resolved["status"] == "failed"

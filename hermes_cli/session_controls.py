@@ -143,6 +143,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid)
+        if manager.state is None or manager.state.status == "cleared":
+            code = f"nothing_to_{action}"
+            return {"result": {"ok": False, "error_code": code, "error": code},
+                    "state": manager.state}
         result = manager.resume()
         if result is None:
             code = f"nothing_to_{action}"
@@ -156,6 +160,10 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if kind == "goal":
         from hermes_cli.goals import load_goal
         before_state = load_goal(target_sid)
+        # A cleared goal stays stored; pausing or clearing it again must not revive or re-announce it.
+        if before_state is None or getattr(before_state, "status", None) not in {"active", "paused"}:
+            code = f"nothing_to_{action}"
+            return {"result": {"ok": False, "error_code": code, "error": code}, "state": before_state}
     result = handler(target_sid, reason, payload, authority)
     if kind == "goal":
         from hermes_cli.goals import load_goal
