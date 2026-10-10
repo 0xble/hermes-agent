@@ -4500,9 +4500,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as copy_file:
                             copy_file.write(content.encode("utf-8"))
                             temp_path = copy_file.name
-                        return await self.send_document(
-                            chat_id=chat_id, file_path=temp_path, file_name="copy.txt",
-                            reply_to=reply_to, metadata=metadata)
+                        # Native upload only: the generic fallback sends a warning text whose success
+                        # would wrongly acknowledge the copy body itself as delivered.
+                        return await self._send_local_file(
+                            "File", temp_path, chat_id, reply_to, metadata, "document",
+                            lambda f: {"document": f, "filename": "copy.txt"},
+                            self._copy_document_failed)
                     finally:
                         if temp_path:
                             with contextlib.suppress(OSError):
@@ -6400,6 +6403,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return _flood_cap_result(flood.wait)
         except Exception as e:
             return await on_error(e)
+
+    async def _copy_document_failed(self, e: Exception) -> SendResult:
+        logger.warning("[%s] Failed to send copy block document: %s", self.name, _redact_telegram_error_text(e))
+        return SendResult(success=False, error=f"copy block document upload failed: {_redact_telegram_error_text(e)}")
 
     async def _warn_then(self, media_key: str, e: Exception, fallback) -> SendResult:
         logger.warning("[%s] Failed to send %s: %s", self.name, media_key, _redact_telegram_error_text(e))

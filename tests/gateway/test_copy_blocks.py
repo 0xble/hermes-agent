@@ -607,3 +607,15 @@ async def test_interrupted_streamed_turn_shows_hidden_partial_copy_text() -> Non
     )
     assert returned is None
     assert sends == ["partial paste text"]
+
+
+@pytest.mark.asyncio
+async def test_auto_tts_never_speaks_inline_copy_bodies() -> None:
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "discord"
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="c", platform="discord"), text="")
+    text = "Run this:\n[[copy]]\nrm -rf build\n[[/copy]]\nThen retry.\n"
+    extracted = await adapter._extract_response_content(text, event, "", is_ephemeral_response=True)
+    assert "rm -rf build" in extracted.text_content  # shown inline on Discord
+    spoken_text = adapter._spoken_reply_text(extracted)
+    assert "rm -rf build" not in spoken_text and "Run this:" in spoken_text and "Then retry." in spoken_text

@@ -25,7 +25,7 @@ from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 from gateway.copy_blocks import (
-    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected)
+    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
 logger = logging.getLogger(__name__)
 
@@ -4467,6 +4467,15 @@ class BasePlatformAdapter(ABC):
         lo, hi = bounds
         return random.uniform(lo / 1000.0, hi / 1000.0)
 
+    def _spoken_reply_text(self, extracted: "_ExtractedResponse") -> str:
+        """The reply as auto-TTS speaks it: paste-ready copy bodies are read, never spoken."""
+        raw = extracted.pre_extract or ""
+        without_copy = strip_copy_blocks(raw)
+        if without_copy == raw:
+            return extracted.text_content
+        _, spoken = self.extract_images(self.extract_media(without_copy)[1])
+        return _strip_media_directives(spoken).strip()
+
     async def _synthesize_auto_tts(self, text_content: str) -> Tuple[List[str], Optional[str]]:
         """Synthesize auto-TTS audio -> ``(existing_paths, requested_path)``; empty/None on failure
         (logged, never raised). Path built platform-aware HERE: HERMES_SESSION_PLATFORM is cleared
@@ -5083,9 +5092,10 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
+                _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
+                        event, session_key, interrupt_event, _spoken_text, media_files):
+                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):

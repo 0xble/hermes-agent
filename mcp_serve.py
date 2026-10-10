@@ -226,7 +226,12 @@ def _extract_attachments(msg: dict) -> List[dict]:
             continue
         if url:
             attachments.append({"type": "image", "url": url})
-    for match in re.finditer(r'MEDIA:\s*(\S+)', _extract_message_content(msg)):
+    # Scan text outside copy blocks only: a MEDIA line inside a body is literal paste-ready text.
+    scan = _extract_message_content({"content": content})
+    if msg.get("role") == "assistant":
+        from gateway.copy_blocks import strip_copy_blocks
+        scan = strip_copy_blocks(scan)
+    for match in re.finditer(r'MEDIA:\s*(\S+)', scan):
         attachments.append({"type": "media", "path": match.group(1)})
     return attachments
 
