@@ -1,6 +1,7 @@
 """Cross-session goal and loop controls with durable approval records."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -102,7 +103,7 @@ def _is_negated(quote: str, source: str) -> bool:
         start = idx + 1
 
 
-def check_user_quote(requester_session_id: str, quote: str) -> Tuple[str, str] | str:
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
     """Validate a quote against only the requester's latest typed user message."""
     normalized = _normalize(quote)
     if len(normalized) < _REVISION_QUOTE_MIN_CHARS:
@@ -111,7 +112,7 @@ def check_user_quote(requester_session_id: str, quote: str) -> Tuple[str, str] |
     if db is None:
         return "user_quote_not_found"
     try:
-        rows = db.messages_by_role(requester_session_id, "user", since=0.0, limit=500)
+        rows = db.messages_by_role(requester_session_id, "user", since=0.0, limit=500, cursor=cursor)
     except Exception:
         return "user_quote_not_found"
     latest = next((row for row in rows if _is_user_typed(row)), None)
@@ -159,12 +160,12 @@ def _save_record(record: Dict[str, Any], *, cursor=None) -> None:
 
 def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                    payload: Optional[Dict[str, Any]] = None,
-                   authority: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   authority: Optional[Dict[str, Any]] = None, cursor=None) -> Dict[str, Any]:
     payload = dict(payload or {})
     handler = CONTROLS.get((kind, action))
     if action == "replace" and kind == "goal":
         from hermes_cli.goals import GoalManager
-        manager = GoalManager(target_sid)
+        manager = GoalManager(target_sid, cursor=cursor)
         with _approved_authority(authority):
             result = manager.replace(
                 reason=reason or "session-control",
@@ -179,7 +180,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 "continuation_prompt": continuation_prompt}
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
-        manager = GoalManager(target_sid)
+        manager = GoalManager(target_sid, cursor=cursor)
         # Only a paused goal resumes: never revive a done/cleared goal or re-arm an active one.
         if manager.state is None or manager.state.status != "paused":
             code = f"nothing_to_{action}"
@@ -197,18 +198,18 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     before_state = None
     if kind == "goal":
         from hermes_cli.goals import load_goal
-        before_state = load_goal(target_sid)
+        before_state = load_goal(target_sid, cursor=cursor)
         # A cleared goal stays stored; pausing or clearing it again must not revive or re-announce it.
         if before_state is None or getattr(before_state, "status", None) not in {"active", "paused"}:
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code}, "state": before_state}
-    result = handler(target_sid, reason, payload, authority)
+    result = handler(target_sid, reason, payload, authority, cursor)
     if kind == "goal":
         from hermes_cli.goals import load_goal
-        state = load_goal(target_sid)
+        state = load_goal(target_sid, cursor=cursor)
     elif kind == "loop":
         from hermes_cli.loops import load_loop
-        state = load_loop(target_sid)
+        state = load_loop(target_sid, cursor=cursor)
     else:
         raise ValueError("unsupported_control")
     cleared_goal = (
@@ -222,77 +223,93 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     return {"result": result, "state": state}
 
 
-def _session_title(session_id: str) -> str:
+def _session_title(session_id: str, *, cursor=None) -> str:
     db = _db()
     if db is None:
         return ""
     try:
+        if cursor is not None:
+            row = cursor.execute("SELECT title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            return str(row[0] or "") if row else ""
         return str(db.get_session_title(session_id) or "")
     except Exception:
         return ""
 
 
-def _affected_text(kind: str, action: str, target_sid: str, payload: Optional[Dict[str, Any]] = None) -> str:
+def _affected_text(kind: str, action: str, raw: Optional[str], payload: Optional[Dict[str, Any]] = None) -> str:
     payload = payload or {}
     try:
         if kind == "goal":
-            from hermes_cli.goals import GoalManager
-            state = GoalManager(target_sid).state
+            from hermes_cli.goals import GoalState
+            state = GoalState.from_json(raw) if raw else None
             old = str(getattr(state, "goal", "") or "")
             if action == "replace":
                 return f"goal: {old or '(none)'} -> {str(payload.get('goal') or '')}"
             return f"goal: {old or '(none)'}"
         if kind == "loop":
-            from hermes_cli.loops import LoopManager
-            state = LoopManager(target_sid).state
+            from hermes_cli.loops import LoopState
+            state = LoopState.from_json(raw) if raw else None
             prompt = str(getattr(state, "prompt", "") or "")
             cadence = state.cadence_label() if state is not None else ""
             return f"loop: {prompt or '(none)'}{f' ({cadence})' if cadence else ''}"
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         logger.debug("could not describe session-control target", exc_info=True)
     return ""
 
 
 def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
-    """Identity of the goal or loop a request was shown against: its text plus creation time.
+    """Bind the authored definition, not progress counters or scheduler bookkeeping.
 
-    A replace, a new /goal or /loop, or a clear-then-set changes it, so an approval for the
-    definition on the card can never land on a different one."""
-    if not raw:
+    v2 also covers contracts/revisions and cadence/conditions. Old text-only cards
+    cannot authorize a v2 definition and must be requested again.
+    """
+    if not raw or kind not in {"goal", "loop"}:
         return ""
     try:
         data = json.loads(raw)
-    except (TypeError, ValueError):
+        text_key = "goal" if kind == "goal" else "prompt"
+        if not isinstance(data, dict) or not isinstance(data.get(text_key), str) or not data[text_key]:
+            return ""
+        fields = (
+            ("goal", "created_at", "max_turns", "contract", "subgoals", "revisions") if kind == "goal"
+            else ("prompt", "created_at", "mode", "interval_seconds", "times", "until", "max_ticks", "route", "revisions")
+        )
+        definition = {field: data.get(field) for field in fields}
+        if kind == "goal":
+            definition["gates"] = [
+                {field: gate.get(field) for field in ("command", "timeout_seconds", "max_retries")}
+                for gate in (data.get("gates") or [])
+            ]
+        encoded = json.dumps(definition, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        return "v2:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, AttributeError):
         return ""
-    text = data.get("goal") if kind == "goal" else data.get("prompt")
-    if data.get("status") in {"cleared", "done"}:
-        return ""
-    return json.dumps([str(text or ""), float(data.get("created_at") or 0.0)])
 
+
+def _meta_value(cursor, key: str) -> Optional[str]:
+    row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
 
 def _definition_key(kind: str, session_id: str) -> str:
     return f"{'goal' if kind == 'goal' else 'loop'}:{session_id}"
 
 
-def _current_fingerprint(kind: str, session_id: str) -> str:
-    db = _db()
-    if db is None:
-        return ""
-    try:
-        return _definition_fingerprint(kind, db.get_meta(_definition_key(kind, session_id)))
-    except Exception:
-        return ""
-
+def _bind_continuation(record: Dict[str, Any], result: Dict[str, Any], cursor) -> None:
+    if result.get("continuation_prompt"):
+        record["continuation_prompt"] = result["continuation_prompt"]
+        record["continuation_fingerprint"] = _definition_fingerprint(
+            record["kind"], _meta_value(cursor, _definition_key(record["kind"], record["target_session_id"]))
+        )
 
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
                 reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
-                status: str, now: float, expires_at: Optional[float]) -> Dict[str, Any]:
+                status: str, now: float, expires_at: Optional[float], affected_text: str, cursor=None) -> Dict[str, Any]:
     return {
         "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
         "target_session_id": target_sid, "requester_session_id": requester_sid,
-        "requester_title": _session_title(requester_sid), "target_title": _session_title(target_sid),
+        "requester_title": _session_title(requester_sid, cursor=cursor), "target_title": _session_title(target_sid, cursor=cursor),
         "reason": reason or "session-control", "payload": dict(payload or {}),
-        "affected_text": _affected_text(kind, action, target_sid, payload),
+        "affected_text": affected_text,
         "authority": dict(authority), "status": status, "created_at": now,
         "expires_at": expires_at, "resolved_at": None, "error": None,
         "request_posted": status != "pending", "request_skipped": False,
@@ -356,12 +373,20 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     if not _has_approval_surface(target_sid):
         return {"ok": False, "error_code": "target_unapprovable", "error": "target_unapprovable"}
     now = _now()
-    record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
-                         authority={"via": "button", "user_id": None}, status="pending", now=now,
-                         expires_at=now + _REQUEST_TTL_SECONDS)
-    record["target_fingerprint"] = _current_fingerprint(kind, target_sid)
-    _save_record(record)
-    return record
+    db = _db()
+
+    def create(conn):
+        # Card description and binding come from one SQLite snapshot, never two manager loads.
+        raw = _meta_value(conn, _definition_key(kind, target_sid))
+        record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
+                             authority={"via": "button", "user_id": None}, status="pending", now=now,
+                             expires_at=now + _REQUEST_TTL_SECONDS,
+                             affected_text=_affected_text(kind, action, raw, payload), cursor=conn)
+        record["target_fingerprint"] = _definition_fingerprint(kind, raw)
+        _save_record(record, cursor=conn)
+        return record
+
+    return db._execute_write(create)
 
 
 def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
@@ -389,109 +414,130 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         if not record.get("id"):
             return record
         return {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
-    quote, message = quote_check
-    authority = {"via": "quote", "quote": quote, "message": message}
-    try:
-        affected_before = _affected_text(kind, action, target_sid, payload)
-        result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload, authority=authority)
+    def apply(conn):
+        # Recheck after acquiring the write lock: a newer message must not inherit an older quote.
+        checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+        if isinstance(checked, str):
+            return {"ok": False, "error_code": checked, "error": checked}
+        quote, message = checked
+        authority = {"via": "quote", "quote": quote, "message": message}
+        raw = _meta_value(conn, _definition_key(kind, target_sid))
+        affected_before = _affected_text(kind, action, raw, payload)
+        conn.execute("SAVEPOINT session_control_quote")
+        result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload,
+                                authority=authority, cursor=conn)
         manager_result = result.get("result")
+        code = ""
         if isinstance(manager_result, dict) and not manager_result.get("ok", True):
             code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
-            if code.startswith("nothing_to_"):
-                now = _now()
-                record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
-                                     authority=authority, status="failed", now=now, expires_at=None)
-                record["affected_text"] = affected_before
-                record["resolved_at"], record["error"] = now, code
-                _save_record(record)
-                return {"ok": False, "status": "failed", "error_code": code, "error": code,
-                        "record": record, **result}
-            raise ValueError(code)
+            conn.execute("ROLLBACK TO session_control_quote")
+        conn.execute("RELEASE session_control_quote")
         now = _now()
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
-                             authority=authority, status="applied", now=now, expires_at=None)
-        record["affected_text"] = affected_before
-        record["resolved_at"] = now
-        if result.get("continuation_prompt"):
-            record["continuation_prompt"] = result["continuation_prompt"]
-        _save_record(record)
-        return {"ok": True, "status": "applied", "record": record, **result}
+                             authority=authority, status="failed" if code else "applied", now=now,
+                             expires_at=None, affected_text=affected_before, cursor=conn)
+        record["resolved_at"], record["error"] = now, code or None
+        _bind_continuation(record, result, conn)
+        _save_record(record, cursor=conn)
+        return {"ok": not bool(code), "status": record["status"], "record": record,
+                **({"error_code": code, "error": code} if code else {}), **result}
+
+    try:
+        return _db()._execute_write(apply)
     except Exception as exc:
         return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
 
-
 def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """Atomically claim a pending request, then apply it when approved."""
+    """Validate, mutate through the shared manager, and settle in one write transaction."""
     if decision not in {"approve", "deny"}:
         return None
     db = _db()
     if db is None:
         return None
-    key = _record_key(request_id)
-    now = _now()
-    def _claim(conn):
-        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return None
+    key, now = _record_key(request_id), _now()
+
+    def resolve(conn):
+        raw = _meta_value(conn, key)
         try:
-            record = json.loads(row[0])
+            record = json.loads(raw) if raw else None
         except (TypeError, ValueError):
             return None
-        if record.get("status") != "pending":
+        if not isinstance(record, dict) or record.get("status") != "pending":
             return None
         if float(record.get("expires_at") or 0) <= now:
-            record["status"] = "expired"
-            record["resolved_at"] = now
-            db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+            record["status"], record["resolved_at"] = "expired", now
+            _save_record(record, cursor=conn)
             return None
-        if decision == "deny":
-            record["status"] = "denied"
-            record["authority"] = {"via": "button", "user_id": str(user_id)}
-            record["resolved_at"] = now
-            db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
-            return record
-        # The approval covers the goal/loop shown on the card. Read the live definition inside the
-        # same write transaction so a replaced or re-set target cannot inherit this approval.
-        if "target_fingerprint" in record:
-            live = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?",
-                (_definition_key(record.get("kind", ""), record.get("target_session_id", "")),),
-            ).fetchone()
-            if _definition_fingerprint(record.get("kind", ""), live[0] if live else None) != record["target_fingerprint"]:
-                record["status"] = "failed"
-                record["error"] = "target_changed"
-                record["authority"] = {"via": "button", "user_id": str(user_id)}
-                record["resolved_at"] = now
-                db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
-                return record
-        record["status"] = "applying"
         record["authority"] = {"via": "button", "user_id": str(user_id)}
         record["resolved_at"] = now
-        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
-        return record
-    claimed = db._execute_write(_claim)
-    if claimed is None or claimed.get("status") == "expired":
-        return None
-    if claimed.get("status") in {"denied", "failed"}:
-        return claimed
-    try:
-        authority = claimed["authority"]
-        result = _manager_apply(claimed["kind"], claimed["action"], claimed["target_session_id"],
-                                reason=claimed.get("reason") or "session-control",
-                                payload=claimed.get("payload"), authority=authority)
-        manager_result = result.get("result")
-        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
-            raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
-        if result.get("continuation_prompt"):
-            claimed["continuation_prompt"] = result["continuation_prompt"]
-        claimed["status"] = "applied"
-        claimed["error"] = None
-    except Exception as exc:
-        claimed["status"] = "failed"
-        claimed["error"] = str(exc)
-    _save_record(claimed)
-    return claimed
+        if decision == "deny":
+            record["status"] = "denied"
+            _save_record(record, cursor=conn)
+            return record
 
+        expected = record.get("target_fingerprint")
+        kind, action = record.get("kind"), record.get("action")
+        live = _meta_value(conn, _definition_key(kind, record.get("target_session_id", "")))
+        if ((kind, action) not in CONTROLS or not isinstance(expected, str)
+                or not expected.startswith("v2:") or expected != _definition_fingerprint(kind, live)):
+            record["status"], record["error"] = "failed", "target_changed"
+            _save_record(record, cursor=conn)
+            return record
+
+        # Roll back even a partially saved manager action before persisting a failure receipt.
+        conn.execute("SAVEPOINT session_control_apply")
+        try:
+            result = _manager_apply(kind, action, record["target_session_id"],
+                                    reason=record.get("reason") or "session-control",
+                                    payload=record.get("payload"), authority=record["authority"], cursor=conn)
+            manager_result = result.get("result")
+            if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+                raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
+            _bind_continuation(record, result, conn)
+            record["status"], record["error"] = "applied", None
+        except Exception as exc:
+            conn.execute("ROLLBACK TO session_control_apply")
+            record["status"], record["error"] = "failed", str(exc)
+        finally:
+            conn.execute("RELEASE session_control_apply")
+        _save_record(record, cursor=conn)
+        return record
+
+    return db._execute_write(resolve)
+
+
+def continuation_is_current(request_id: str) -> bool:
+    """Discard superseded outbox prompts, including legacy prompts without a definition binding."""
+    db = _db()
+    if db is None:
+        return False
+
+    def validate(conn):
+        raw = _meta_value(conn, _record_key(request_id))
+        try:
+            record = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(record, dict) or record.get("status") != "applied"
+                or record.get("kind") != "goal" or record.get("action") not in {"resume", "replace"}):
+            return False
+        if record.get("continuation_discarded"):
+            return False
+        live = _meta_value(conn, _definition_key("goal", record["target_session_id"]))
+        expected = record.get("continuation_fingerprint")
+        try:
+            active = bool(live) and json.loads(live).get("status") == "active"
+        except (TypeError, ValueError, AttributeError):
+            active = False
+        valid = (active and isinstance(expected, str) and expected.startswith("v2:")
+                 and expected == _definition_fingerprint("goal", live))
+        if not valid:
+            record["continuation_enqueued"] = True
+            record["continuation_discarded"] = "target_changed"
+            _save_record(record, cursor=conn)
+        return bool(valid)
+
+    return db._execute_write(validate)
 
 def fail_request(request_id: str, error: str) -> Optional[Dict[str, Any]]:
     """CAS a pending request to failed so an unroutable target can notify its requester."""
@@ -611,16 +657,16 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[
 
 
 CONTROLS = {
-    ("goal", "pause"): lambda sid, reason, payload, authority: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid).pause(reason=reason or "session-control"),
-    ("goal", "resume"): lambda sid, reason, payload, authority: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid).resume(),
-    ("goal", "clear"): lambda sid, reason, payload, authority: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid).clear(),
-    ("loop", "pause"): lambda sid, reason, payload, authority: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid).pause(reason=reason or "session-control"),
-    ("loop", "resume"): lambda sid, reason, payload, authority: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid).resume(),
-    ("loop", "stop"): lambda sid, reason, payload, authority: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid).clear(),
+    ("goal", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
+    ("goal", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).resume(),
+    ("goal", "clear"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.goals", fromlist=["GoalManager"]).GoalManager(sid, cursor=cursor).clear(),
+    ("loop", "pause"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).pause(reason=reason or "session-control"),
+    ("loop", "resume"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).resume(),
+    ("loop", "stop"): lambda sid, reason, payload, authority, cursor=None: __import__("hermes_cli.loops", fromlist=["LoopManager"]).LoopManager(sid, cursor=cursor).clear(),
     ("goal", "replace"): None,
 }
 
 __all__ = [
     "CONTROLS", "resolve_target", "check_user_quote", "apply_control", "request_control",
-    "resolve_request", "fail_request", "expire_request", "pending_outbox", "mark_outbox",
+    "resolve_request", "fail_request", "expire_request", "pending_outbox", "mark_outbox", "continuation_is_current",
 ]

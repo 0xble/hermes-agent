@@ -307,6 +307,157 @@ async def test_watcher_enqueues_replaced_goal_continuation(state):
     assert pending_outbox() == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ["quote", "button"])
+@pytest.mark.parametrize("action", ["resume", "replace"])
+@pytest.mark.parametrize("subsequent", ["pause", "clear", "replace"])
+async def test_watcher_discards_superseded_control_continuation(state, authority, action, subsequent):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause("waiting")
+    payload = {"goal": "approved objective"} if action == "replace" else None
+    if authority == "quote":
+        quote = f"Please {action} the target goal right now"
+        state.append_message("requester", "user", quote)
+        record = session_controls.apply_control("goal", action, "target", requester_sid="requester",
+                                                user_quote=quote, payload=payload)["record"]
+    else:
+        request = session_controls.request_control("goal", action, "target", requester_sid="requester",
+                                                   payload=payload)
+        record = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert record["status"] == "applied"
+    assert record["continuation_prompt"]
+    if subsequent == "replace":
+        GoalManager("target").set("superseding objective")
+    else:
+        getattr(GoalManager("target"), subsequent)()
+    # Recreate the runner from durable state, as after a gateway restart.
+    runner = _runner(state)
+    async def admit_event(_adapter, event):
+        event._gateway_accepted = True
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=admit_event)) as admit:
+        await runner._drain_session_controls()
+        await runner._drain_session_controls()
+    admit.assert_not_awaited()
+    persisted = session_controls._load_record(record["id"])
+    assert persisted["continuation_enqueued"] is True
+    assert persisted["continuation_discarded"] == "target_changed"
+    assert session_controls.pending_outbox() == []
+    assert len(runner.adapter.sends) == 1
+    assert len(runner.injections) == 1
+    assert load_goal("target").status == ("active" if subsequent == "replace" else "paused" if subsequent == "pause" else "cleared")
+
+
+@pytest.mark.asyncio
+async def test_watcher_discards_superseded_continuation_after_idle_probe(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause()
+    request = session_controls.request_control("goal", "resume", "target", requester_sid="requester")
+    record = session_controls.resolve_request(request["id"], "approve", "admin")
+    runner = _runner(state)
+
+    def pause_while_probing(_key):
+        GoalManager("target").pause("new instruction at idle boundary")
+        return False
+
+    runner._is_session_running = pause_while_probing
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock()) as admit:
+        await runner._drain_session_controls()
+    admit.assert_not_awaited()
+    assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
+    assert session_controls.pending_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_discards_superseded_continuation_at_admission_boundary(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause()
+    request = session_controls.request_control("goal", "resume", "target", requester_sid="requester")
+    record = session_controls.resolve_request(request["id"], "approve", "admin")
+    runner = _runner(state)
+    build_event = runner._synthetic_prompt_event
+
+    def pause_after_build(*args, **kwargs):
+        event = build_event(*args, **kwargs)
+        GoalManager("target").pause("new instruction before adapter admission")
+        return event
+
+    runner._synthetic_prompt_event = pause_after_build
+    runner.adapter.handle_message = AsyncMock()
+    await runner._drain_session_controls()
+    runner.adapter.handle_message.assert_not_awaited()
+    assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
+    assert session_controls.pending_outbox() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subsequent", ["pause", "clear", "replace"])
+async def test_control_continuation_revalidated_at_idle_runner_ingress(state, subsequent):
+    from gateway.run_inbound import GatewayInboundMixin
+    from gateway.platforms.event import MessageEvent
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause()
+    request = session_controls.request_control("goal", "resume", "target", requester_sid="requester")
+    record = session_controls.resolve_request(request["id"], "approve", "admin")
+    runner = _runner(state)
+    source = runner.session_store.lookup_by_session_id("target").origin
+    event = MessageEvent(source=source, text=record["continuation_prompt"], internal=True, reply_expected=False,
+                         metadata={"goal_continuation": True, "session_control_continuation_id": record["id"]})
+    # Adapter accepted the wake, then a new control arrived before its idle handler task ran.
+    event._gateway_accepted = True
+    if subsequent == "replace":
+        GoalManager("target").set("superseding objective")
+    else:
+        getattr(GoalManager("target"), subsequent)()
+    with patch("gateway.run_inbound._admit_outbox_event", new=AsyncMock()) as admit:
+        assert await GatewayInboundMixin._hm_admit_event(runner, event) is None
+    admit.assert_not_awaited()
+    assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
+
+
+@pytest.mark.asyncio
+async def test_control_continuation_revalidated_for_active_replacement_in_followup(state):
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.platforms.event import MessageEvent
+    from gateway.turn_context import TurnContext
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause()
+    request = session_controls.request_control("goal", "resume", "target", requester_sid="requester")
+    record = session_controls.resolve_request(request["id"], "approve", "admin")
+    runner = _runner(state)
+    source = runner.session_store.lookup_by_session_id("target").origin
+    prompt = record["continuation_prompt"]
+    event = MessageEvent(source=source, text=prompt, internal=True, reply_expected=False,
+                         metadata={"goal_continuation": True, "session_control_continuation_id": record["id"]})
+    GoalManager("target").set("superseding objective")
+    runner._MAX_INTERRUPT_DEPTH = 5
+    runner._is_goal_continuation_event = lambda value: value.metadata.get("goal_continuation", False)
+    runner._goal_still_active_for_session = lambda sid: GoalManager(sid).state.status == "active"
+    runner._run_agent = AsyncMock()
+    ctx = TurnContext(source=source, session_key="target-key", session_id="target", run_generation=1, history=[])
+    result = {"interrupted": True, "messages": []}
+    returned = await GatewayTurnMixin._run_agent_queued_followup(
+        runner, ctx, runner.adapter, prompt, event, "", result, None
+    )
+    assert returned is result
+    runner._run_agent.assert_not_awaited()
+    assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
+
+
 def test_replace_notices_show_old_and_new_goal(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, request_control, resolve_request

@@ -4066,6 +4066,13 @@ class GatewayTurnMixin:
                     session_key or "?",
                 )
                 return result
+            # A replacement stays active, so status alone cannot authorize a queued old prompt.
+            metadata = getattr(pending_event, "metadata", None)
+            control_id = metadata.get("session_control_continuation_id") if isinstance(metadata, dict) else None
+            if control_id:
+                from hermes_cli.session_controls import continuation_is_current
+                if not await self._run_in_executor_with_context(continuation_is_current, control_id):
+                    return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
             try:

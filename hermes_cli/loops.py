@@ -424,26 +424,36 @@ def _parse_state(raw: str, session_id: str = "") -> Optional[LoopState]:
         return None
 
 
-def load_loop(session_id: str) -> Optional[LoopState]:
+def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
     """Load the loop for a session, or None if none exists."""
     db = _get_session_db() if session_id else None
     if db is None:
         return None
-    raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
+    if cursor is not None:
+        row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+        raw = row[0] if row else None
+    else:
+        raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
     return _parse_state(raw, session_id) if raw else None
 
 
-def save_loop(session_id: str, state: LoopState) -> None:
+def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
     """Persist a loop to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
     db = _get_session_db()
     if db is None:
+        if cursor is not None:
+            raise RuntimeError("session-control store unavailable")
         from hermes_cli.goals import _warn_dropped_write
 
         _warn_dropped_write("LoopManager", "loop", session_id)
         return
-    _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
+    if cursor is not None:
+        # Transaction owners must see failures, not report an unapplied control as successful.
+        db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
+    else:
+        _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
 
 
 def clear_loop(session_id: str) -> None:
@@ -545,9 +555,12 @@ class LoopManager:
     evaluate the finished turn, and ``status_line()``.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, cursor=None):
         self.session_id = session_id
-        self._state: Optional[LoopState] = load_loop(session_id)
+        self._cursor = cursor
+        self._state: Optional[LoopState] = (
+            load_loop(session_id) if cursor is None else load_loop(session_id, cursor=cursor)
+        )
 
     @property
     def state(self) -> Optional[LoopState]:
@@ -570,7 +583,10 @@ class LoopManager:
         return self._state is not None and self._state.status in {"active", "paused"}
 
     def _save(self) -> LoopState:
-        save_loop(self.session_id, self._state)
+        if self._cursor is None:
+            save_loop(self.session_id, self._state)
+        else:
+            save_loop(self.session_id, self._state, cursor=self._cursor)
         return self._state
 
     def status_line(self) -> str:

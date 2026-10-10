@@ -192,35 +192,20 @@ class GatewaySessionControlsMixin:
                         session_controls, record, "continuation_enqueued"
                     )
                 else:
-                    event = self._synthetic_prompt_event(
-                        source, prompt, reply_expected=False, goal_continuation=True
+                    # This runs after routing and the idle probe, both of which may yield.
+                    current = await self._run_in_executor_with_context(
+                        session_controls.continuation_is_current, request_id
                     )
-                    event.metadata["gateway_session_key"] = key
-                    try:
-                        from gateway.wake import WakeNotAccepted, admit_internal_event
-                        await admit_internal_event(adapter, event)
-                    except WakeNotAccepted:
-                        logger.info(
-                            "session-control continuation for %s not accepted; retrying",
-                            request_id,
+                    if not current:
+                        record = await self._mark_and_finish(
+                            session_controls, record, "continuation_enqueued"
                         )
-                        return
-                    except Exception:
-                        logger.warning(
-                            "session-control continuation admission failed for %s",
-                            request_id,
-                            exc_info=True,
+                    else:
+                        record = await self._admit_control_continuation(
+                            record, session_controls, source, adapter, key, prompt
                         )
-                        return
-                    if not getattr(event, "_gateway_accepted", False):
-                        logger.info(
-                            "session-control continuation for %s was not accepted; retrying",
-                            request_id,
-                        )
-                        return
-                    record = await self._mark_and_finish(
-                        session_controls, record, "continuation_enqueued"
-                    )
+                        if not record.get("continuation_enqueued"):
+                            return
 
         notice = self._control_notice(record)
         if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
@@ -267,6 +252,27 @@ class GatewaySessionControlsMixin:
 
         if self._outbox_complete(record) and not record.get("outbox_done"):
             await self._mark_control(session_controls, request_id, "outbox_done")
+
+    async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
+        from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
+
+        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
+        event.metadata["gateway_session_key"] = key
+        event.metadata["session_control_continuation_id"] = record["id"]
+        try:
+            await admit_internal_event(adapter, event)
+        except WakeSuperseded:
+            return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
+        except WakeNotAccepted:
+            logger.info("session-control continuation for %s not accepted; retrying", record["id"])
+            return record
+        except Exception:
+            logger.warning("session-control continuation admission failed for %s", record["id"], exc_info=True)
+            return record
+        if not getattr(event, "_gateway_accepted", False):
+            logger.info("session-control continuation for %s was not accepted; retrying", record["id"])
+            return record
+        return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
 
     @staticmethod
     def _control_notice(record: dict) -> str:

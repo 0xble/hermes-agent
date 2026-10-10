@@ -957,7 +957,7 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
@@ -965,8 +965,14 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     if db is None:
         return None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        if cursor is not None:
+            row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+            raw = row[0] if row else None
+        else:
+            raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
+        if cursor is not None:
+            raise
         logger.debug("GoalManager: get_meta failed: %s", exc)
         return None
     if not raw:
@@ -978,18 +984,25 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
+def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
     db = _get_session_db()
     if db is None:
+        if cursor is not None:
+            raise RuntimeError("session-control store unavailable")
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
         state.mutation_id = uuid.uuid4().hex
-        db.set_meta(_meta_key(session_id), state.to_json())
+        if cursor is None:
+            db.set_meta(_meta_key(session_id), state.to_json())
+        else:
+            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
     except Exception as exc:
+        if cursor is not None:
+            raise
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
@@ -2140,7 +2153,7 @@ class GoalManager:
     """
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
-                 min_continuation_gap_seconds: Optional[float] = None):
+                 min_continuation_gap_seconds: Optional[float] = None, cursor=None):
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         if min_continuation_gap_seconds is None:
@@ -2150,7 +2163,11 @@ class GoalManager:
             # turns synchronously without a wall-clock scheduler.
             min_continuation_gap_seconds = 0
         self.min_continuation_gap_seconds = normalize_goal_continuation_gap(min_continuation_gap_seconds)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        # Session controls lend their write transaction; ordinary drivers keep independent writes.
+        self._cursor = cursor
+        self._state: Optional[GoalState] = (
+            load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
+        )
 
     # --- introspection ------------------------------------------------
 
@@ -2202,7 +2219,10 @@ class GoalManager:
             db, expected = snapshot
             assert_goal_snapshot(self.session_id, expected, db)
             return self._state
-        save_goal(self.session_id, self._state)
+        if self._cursor is None:
+            save_goal(self.session_id, self._state)
+        else:
+            save_goal(self.session_id, self._state, cursor=self._cursor)
         return self._state
 
     def _require_goal(self) -> GoalState:

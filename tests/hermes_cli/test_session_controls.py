@@ -201,7 +201,8 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     pending = request_control("loop", "stop", "target", requester_sid="requester")
     resolved = resolve_request(pending["id"], "approve", "admin")
     assert resolved["status"] == "failed"
-    assert resolved["error"] == "nothing_to_stop"
+    # A card without a target snapshot is never approval authority, even for a no-op.
+    assert resolved["error"] == "target_changed"
     assert GoalManager("target").state.status == "cleared"
     assert LoopManager("target").state is None
 
@@ -412,6 +413,199 @@ def test_approval_is_bound_to_the_definition_on_the_card(state):
     unchanged = request_control("goal", "pause", "target", requester_sid="requester")
     assert resolve_request(unchanged["id"], "approve", "admin")["status"] == "applied"
     assert load_goal("target").status == "paused"
+
+
+@pytest.mark.parametrize("kind,action", [("goal", "clear"), ("loop", "stop")])
+def test_approval_blocks_cross_process_definition_swap_at_apply_boundary(state, monkeypatch, kind, action):
+    import json
+    import subprocess
+    import sys
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.loops import LoopManager, load_loop
+
+    manager_type, load = (GoalManager, load_goal) if kind == "goal" else (LoopManager, load_loop)
+    manager_type("target").set("old definition")
+    request = session_controls.request_control(kind, action, "target", requester_sid="requester")
+    key = f"{kind}:target"
+    replacement = json.loads(state.get_meta(key))
+    replacement["goal" if kind == "goal" else "prompt"] = "new definition"
+    replacement["created_at"] += 1
+    script = (
+        "import sqlite3,sys; c=sqlite3.connect(sys.argv[1], timeout=0); "
+        "c.execute('UPDATE state_meta SET value=? WHERE key=?', (sys.argv[3],sys.argv[2])); c.commit()"
+    )
+    attempts = []
+    original = session_controls._manager_apply
+
+    def at_boundary(*args, **kwargs):
+        attempt = subprocess.run(
+            [sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
+            capture_output=True, text=True, timeout=10,
+        )
+        attempts.append(attempt)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(session_controls, "_manager_apply", at_boundary)
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert len(attempts) == 1
+    assert attempts[0].returncode != 0, "replacement won the gap after approval validation"
+    assert "database is locked" in attempts[0].stderr
+    assert resolved["status"] == "applied"
+    assert load("target").status == "cleared"
+    assert getattr(load("target"), "goal" if kind == "goal" else "prompt") == "old definition"
+    # The other process can replace after commit; approval cannot subsequently clear its row.
+    subprocess.run([sys.executable, "-c", script, str(state.db_path), key, json.dumps(replacement)],
+                   check=True, capture_output=True, timeout=10)
+    assert load("target").status == "active"
+
+
+@pytest.mark.parametrize("kind,field,value", [
+    ("goal", "contract", {"constraints": "never deploy"}),
+    ("goal", "subgoals", ["additional criterion"]),
+    ("goal", "revisions", [{"reason": "changed contract"}]),
+    ("goal", "max_turns", 77),
+    ("goal", "gates", [{"command": "pytest", "timeout_seconds": 120, "max_retries": 3}]),
+    ("loop", "mode", "self_paced"),
+    ("loop", "interval_seconds", 600),
+    ("loop", "until", "build complete"),
+    ("loop", "times", 7),
+    ("loop", "max_ticks", 77),
+    ("loop", "route", {"chat_id": "other"}),
+    ("loop", "revisions", [{"reason": "changed conditions"}]),
+])
+def test_approval_binds_whole_definition(state, kind, field, value):
+    import json
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    if kind == "goal":
+        GoalManager("target").set("same text")
+    else:
+        LoopManager("target").set("same text", interval_seconds=30)
+    request = session_controls.request_control(kind, "pause", "target", requester_sid="requester")
+    key = f"{kind}:target"
+    revised = json.loads(state.get_meta(key))
+    assert revised.get(field) != value, "regression setup must change the bound definition"
+    revised[field] = value
+    state.set_meta(key, json.dumps(revised))
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert (resolved["status"], resolved["error"]) == ("failed", "target_changed")
+    assert json.loads(state.get_meta(key))["status"] == "active"
+
+
+def test_approval_binds_description_and_definition_from_single_snapshot(state, monkeypatch):
+    import json
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("target").set("old definition")
+    key = "goal:target"
+    old = state.get_meta(key)
+    changed = json.loads(old)
+    changed["goal"] = "different definition"
+    changed["created_at"] += 1
+    original = state.get_meta
+    reads = []
+
+    def inconsistent_read(name):
+        if name != key:
+            return original(name)
+        reads.append(name)
+        return old if len(reads) == 1 else json.dumps(changed)
+
+    monkeypatch.setattr(state, "get_meta", inconsistent_read)
+    request = session_controls.request_control("goal", "pause", "target", requester_sid="requester")
+    assert request["affected_text"] == "goal: old definition"
+    assert request["target_fingerprint"] == session_controls._definition_fingerprint("goal", old)
+
+
+@pytest.mark.parametrize("snapshot", [None, "", '["old definition", 123]', "v999:unknown"])
+def test_approval_binds_supported_nonempty_snapshot_only(state, snapshot):
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("target").set("old definition")
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    if snapshot is None:
+        request.pop("target_fingerprint")
+    else:
+        request["target_fingerprint"] = snapshot
+    session_controls._save_record(request)
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert resolved["status"] == "failed"
+    assert GoalManager("target").state.status == "active"
+
+
+def test_approval_blocks_partial_manager_write_on_failure(state, monkeypatch):
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("target").set("old definition")
+    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
+    original = session_controls._manager_apply
+
+    def fail_after_save(*args, **kwargs):
+        original(*args, **kwargs)
+        raise ValueError("injected failure after mutation")
+
+    monkeypatch.setattr(session_controls, "_manager_apply", fail_after_save)
+    resolved = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert resolved["status"] == "failed"
+    assert GoalManager("target").state.status == "active"
+
+
+@pytest.mark.parametrize("kind,action", [("goal", "clear"), ("loop", "stop")])
+@pytest.mark.parametrize("authority", ["quote", "button"])
+def test_control_transaction_does_not_reenter_read_pool(state, monkeypatch, kind, action, authority):
+    from contextlib import contextmanager
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    (GoalManager if kind == "goal" else LoopManager)("target").set("old definition")
+    state.set_session_title("target", "The target")
+    state.set_session_title("requester", "The requester")
+    _user(state, "requester", f"Please {action} the target {kind} right now")
+    original = state._read_ctx
+
+    @contextmanager
+    def no_nested_reads():
+        # WAL read-pool fallback owns the same non-reentrant writer lock.
+        assert not state._conn.in_transaction, "read-pool fallback would deadlock the transaction"
+        with original() as conn:
+            yield conn
+
+    monkeypatch.setattr(state, "_read_ctx", no_nested_reads)
+    if authority == "quote":
+        result = session_controls.apply_control(kind, action, "target", requester_sid="requester",
+                                                user_quote=f"{action} the target {kind} right now")
+        record = result["record"]
+    else:
+        request = session_controls.request_control(kind, action, "target", requester_sid="requester")
+        record = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert record["status"] == "applied"
+    assert record["target_title"] == "The target"
+    assert record["requester_title"] == "The requester"
+
+
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+def test_approval_allows_progress_without_overwriting_it(state, kind):
+    import json
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    (GoalManager if kind == "goal" else LoopManager)("target").set("old definition")
+    request = session_controls.request_control(kind, "pause", "target", requester_sid="requester")
+    key, counter = f"{kind}:target", "turns_used" if kind == "goal" else "ticks_fired"
+    progressed = json.loads(state.get_meta(key))
+    progressed[counter] = 9
+    state.set_meta(key, json.dumps(progressed))
+    record = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert record["status"] == "applied"
+    assert json.loads(state.get_meta(key))[counter] == 9
 
 
 def test_replace_refuses_done_goal_on_quote_and_approval_paths(state):
