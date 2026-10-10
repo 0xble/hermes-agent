@@ -23,7 +23,9 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
 - When a real user message arrives while resume is pending, the note addresses
   that message first regardless of policy and skips stale unfinished work unless
   the message asks for it, as upstream's note always has. Only `continue` with no
-  new message resumes the pending task, from its first unrecorded step.
+  new message automatically resumes the pending task, from its first unrecorded
+  step. An explicit continuation request in a new message can resume it under
+  either policy.
 - Explicit `/stop` retires the recovery marker captured before adapter cancellation.
   A newer marker or replaced session created during the cancellation survives. The
   persisted marker token is additive and older routing entries remain readable.
