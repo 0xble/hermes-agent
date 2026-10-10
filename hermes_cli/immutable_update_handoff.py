@@ -19,11 +19,12 @@ def detach_update_receipt() -> dict | None:
 
 
 def reclaim_handoff() -> bool:
-    """Whether the post-swap child left this process's hand-off unclaimed.
+    """Return True when the hand-off is still on disk, i.e. the child never claimed it.
 
-    The child unlinks the hand-off as it takes the receipt and the Windows resume, so a file
-    still on disk after it exits means both stayed with the parent. The file is removed so
-    nothing resumes that receipt a second time.
+    True means the receipt and the Windows resume stay with the parent. The child unlinks
+    the hand-off as it takes both; the parent removes a leftover so nothing resumes that
+    receipt a second time. Removing it is best effort: a failed unlink does not change that
+    answer.
     """
     path = handoff_path()
     if not path.exists():

@@ -60,14 +60,14 @@ def _child(code, *, claims):
     return child
 
 
-def _assert_parent_recorded(result, detail):
+def _assert_parent_recorded(result, detail, *, leftover=()):
     assert result.code == 1
     assert [step["name"] for step in result.steps] == ["pre_update_backup", "post_swap_handoff"]
     assert result.steps[-1]["ok"] is False and detail in result.steps[-1]["detail"]
     assert result.markers == ["incomplete"]
     assert result.gateway_exit == "1"
     assert result.token["resume_needed"] is True
-    assert result.leftover == []
+    assert result.leftover == list(leftover)
 
 
 @pytest.mark.parametrize("code", [0, 1])
@@ -85,6 +85,25 @@ def test_claiming_child_owns_receipt_resume_and_exit_code(hand_off, code):
     assert result.markers == []
     assert result.gateway_exit is None
     assert result.token["resume_needed"] is False
+
+
+def test_unremovable_leftover_hand_off_still_leaves_the_receipt_with_the_parent(hand_off, monkeypatch):
+    run, _release = hand_off
+    real_unlink = Path.unlink
+    leftover = []
+
+    def child(payload, *, argv_tail):
+        leftover.append(write_handoff(payload))
+
+        def unlink(self, *args, **kwargs):
+            if self == leftover[0]:
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+        return 0
+
+    _assert_parent_recorded(run(child), "exited 0 before claiming", leftover=leftover)
 
 
 def test_child_that_could_not_start_leaves_the_receipt_with_the_parent(hand_off):
