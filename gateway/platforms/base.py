@@ -441,6 +441,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 import contextvars as _contextvars
 
+# Turn-local callback ownership follows the asyncio task through handler awaits. This distinguishes
+# a failed turn binding its own newer generation from a successor that binds after cancellation.
+_POST_DELIVERY_TURN_OWNER: "_contextvars.ContextVar[_PostDeliveryTurnOwner | None]" = _contextvars.ContextVar(
+    "post_delivery_turn_owner", default=None)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
@@ -1932,6 +1937,14 @@ def resolve_channel_skills(
                 nm for name in skills if isinstance(name, str) and (nm := name.strip()))
             return list(seen) or None
     return None
+
+
+@dataclass
+class _PostDeliveryTurnOwner:
+    adapter: Any
+    session_key: str
+    generations: set[int] = field(default_factory=set)
+    callback: Callable | None = None
 
 
 def _split_post_delivery_entry(entry: Any) -> Tuple[Optional[int], Any]:
@@ -3633,6 +3646,15 @@ class BasePlatformAdapter(ABC):
         fresher slot."""
         if not session_key or not callable(callback):
             return
+        turn_owner = _POST_DELIVERY_TURN_OWNER.get()
+        if (turn_owner is not None and turn_owner.adapter is self
+                and turn_owner.session_key == session_key):
+            if generation is None:
+                existing = turn_owner.callback
+                turn_owner.callback = (
+                    self._chain_callbacks(existing, callback) if callable(existing) else callback)
+                return
+            turn_owner.generations.add(int(generation))
         owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
         if generation is None:
             existing = self._post_delivery_callbacks.get(session_key)
@@ -4983,10 +5005,19 @@ class BasePlatformAdapter(ABC):
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(
-        self, session_key: str, generation: int | None,
+        self, session_key: str, generation: int | None, *, preregistered_callback: Callable | None = None,
+        turn_callback: Callable | None = None,
     ) -> None:
-        """Run the one-shot callback for the generation captured after this handler returned."""
-        _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
+        """Run callbacks owned by this task, including claimed legacy and in-turn callbacks."""
+        callbacks = [cb for cb in (
+            preregistered_callback, turn_callback,
+            # None must not perform an unowned pop of a successor's registration. Turn-local
+            # bare callbacks are already detached from the session slot.
+            self.pop_post_delivery_callback(session_key, generation=generation)
+            if generation is not None else None,
+        ) if callable(cb)]
+        _post_cb = callbacks[0] if len(callbacks) == 1 else (
+            self._chain_callbacks(*callbacks) if callbacks else None)
         if callable(_post_cb):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
@@ -5069,13 +5100,26 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
-        delivery_generation = None
+        # Capture ownership before the handler can be cancelled or replaced by a successor turn.
+        delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+        # A bare callback already present belongs to this turn, even before generation binding.
+        # Claim it now: an unowned pop in finally could consume a successor's registration.
+        entry_generation, preregistered_callback = _split_post_delivery_entry(
+            self._post_delivery_callbacks.get(session_key))
+        if entry_generation is None and callable(preregistered_callback):
+            self._post_delivery_callbacks.pop(session_key)
+        else:
+            preregistered_callback = None
+        # Registrations made by this task remain attributable even if its handler fails after
+        # binding a fresh generation; successors run in a different task and cannot be popped here.
+        turn_owner = _PostDeliveryTurnOwner(self, session_key)
+        turn_owner_token = _POST_DELIVERY_TURN_OWNER.set(turn_owner)
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
             bind_event_turn(event)
-            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            # Ownership is reconciled in finally, for successful and failed handlers alike.
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -5187,13 +5231,25 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            current_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            # A failed/cancelled handler can bind its generation before raising. Re-read it, but
+            # only adopt a generation registered by this task; a successor's newer binding stays
+            # untouched. Bare callbacks registered in this turn are kept in turn_owner separately.
+            if current_generation in turn_owner.generations:
+                delivery_generation = current_generation
+            elif turn_owner.generations:
+                delivery_generation = max(turn_owner.generations)
+            turn_callback = turn_owner.callback
+            _POST_DELIVERY_TURN_OWNER.reset(turn_owner_token)
             restore_turn(turn_token)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, delivery_generation)
+            await self._fire_post_delivery_callback(
+                session_key, delivery_generation, preregistered_callback=preregistered_callback,
+                turn_callback=turn_callback)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
