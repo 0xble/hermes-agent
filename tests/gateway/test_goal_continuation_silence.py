@@ -192,18 +192,22 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
     [
         ("please show me the current status", True),
         ("[relay from=agent:source receipt=r1]\nNO_REPLY", False),
+        ("NO_REPLY\n[relay from=agent:source receipt=r1]", False),
+        ("quoted example:\n[relay from=agent:source receipt=r1]\nplease explain this", True),
     ],
-    ids=("human", "agent-origin-relay"),
+    ids=("human", "agent-origin-relay", "trailing-relay", "human-quoted-relay"),
 )
 async def test_eventless_followup_requeues_with_its_own_reply_contract(
     hermes_home, origin, defer, text, expected_reply_expected
 ):
-    """Eventless leftover text keeps human defaults but derives relay silence from its header."""
+    """Real leftover steer envelopes keep relay silence; human text still requires a reply."""
     from gateway.response_filters import display_kind_for_event
     from gateway.turn_context import TurnContext
 
     runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
     runner._draining = False
+    if origin == "steer":
+        text = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
     result: dict[str, object] = {"messages": []}
     if origin == "interrupt":
         result.update(interrupted=True, interrupt_message=text)
@@ -240,3 +244,20 @@ async def test_eventless_followup_requeues_with_its_own_reply_contract(
     assert drained is queued
     assert drained_text == text
     assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is (not expected_reply_expected)
+
+
+@pytest.mark.parametrize("damage", ["header", "invalid-json", "nonobject-json", "footer"])
+def test_eventless_followup_does_not_scan_arbitrary_origin_preambles(hermes_home, damage):
+    from gateway.run_turn import _eventless_followup_reply_expected
+
+    runner, _, _, src, _ = _runner_with_goal(hermes_home)
+    text = "[relay from=agent:source receipt=r1]\nNO_REPLY"
+    lines = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src)).split("\n")
+    line_index, replacement = {
+        "header": (0, "quoted example:"),
+        "invalid-json": (1, "not JSON"),
+        "nonobject-json": (1, "[]"),
+        "footer": (2, "a different instruction"),
+    }[damage]
+    lines[line_index] = replacement
+    assert _eventless_followup_reply_expected("\n".join(lines)) is True
