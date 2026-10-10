@@ -57,6 +57,29 @@ def test_update_path_preserves_explicit_empty_allowlist(hermes_env):
     assert updated is not None and updated["enabled_toolsets"] == []
 
 
+@pytest.mark.parametrize("bad", ["web", {"web": True}, 3])
+def test_update_rejects_non_list_allowlist_before_storing(hermes_env, bad):
+    """update_job validates enabled_toolsets like create_job: a non-list raises and the
+    stored allowlist is unchanged (a string or dict must never become the job's allowlist)."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt="daily digest", schedule="every 1h", enabled_toolsets=["web"])
+    with pytest.raises(ValueError, match="enabled_toolsets must be a list"):
+        update_job(job["id"], {"enabled_toolsets": bad})
+    stored = get_job(job["id"])
+    assert stored is not None and stored["enabled_toolsets"] == ["web"]
+
+
+def test_update_normalizes_list_allowlist(hermes_env):
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt="daily digest", schedule="every 1h")
+    updated = update_job(job["id"], {"enabled_toolsets": [" web ", "", "terminal"]})
+    assert updated is not None and updated["enabled_toolsets"] == ["web", "terminal"]
+    updated = update_job(job["id"], {"enabled_toolsets": []})
+    assert updated is not None and updated["enabled_toolsets"] == []
+
+
 def test_scheduler_resolves_explicit_empty_as_zero_toolsets(hermes_env):
     from cron.scheduler import _resolve_cron_enabled_toolsets
 

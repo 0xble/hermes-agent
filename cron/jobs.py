@@ -1826,6 +1826,8 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
+    # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
+    "enabled_toolsets": _normalize_enabled_toolsets,
     "timezone": normalize_job_timezone,
     "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,

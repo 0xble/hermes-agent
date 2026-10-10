@@ -774,6 +774,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `scripts/run_tests.sh tests/hermes_cli/test_update_external_supervisor_sweep.py tests/hermes_cli/test_update_outgoing_gateway_identity.py`.
   The outgoing-identity test's service-PID double returns a set, matching the
   production helper and upstream's set-union contract.
+- The sync kept upstream's `enabled_toolsets` normalizer in the cron create map
+  but dropped it from `_UPDATE_FIELD_NORMALIZERS`, so `update_job` stored a
+  string, dict or int as a job's tool allowlist. Restore the update entry: a
+  non-list raises `ValueError` before storing, a list is trimmed, and `[]` stays
+  an explicit zero-tool allowlist. Guard:
+  `scripts/run_tests.sh tests/cron/test_cron_explicit_empty_toolsets.py`.
 
 ## Gateway Subcommand Exit Codes
 
