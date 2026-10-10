@@ -253,6 +253,37 @@ def _affected_text(kind: str, action: str, target_sid: str, payload: Optional[Di
     return ""
 
 
+def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
+    """Identity of the goal or loop a request was shown against: its text plus creation time.
+
+    A replace, a new /goal or /loop, or a clear-then-set changes it, so an approval for the
+    definition on the card can never land on a different one."""
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    text = data.get("goal") if kind == "goal" else data.get("prompt")
+    if data.get("status") in {"cleared", "done"}:
+        return ""
+    return json.dumps([str(text or ""), float(data.get("created_at") or 0.0)])
+
+
+def _definition_key(kind: str, session_id: str) -> str:
+    return f"{'goal' if kind == 'goal' else 'loop'}:{session_id}"
+
+
+def _current_fingerprint(kind: str, session_id: str) -> str:
+    db = _db()
+    if db is None:
+        return ""
+    try:
+        return _definition_fingerprint(kind, db.get_meta(_definition_key(kind, session_id)))
+    except Exception:
+        return ""
+
+
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
                 reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
                 status: str, now: float, expires_at: Optional[float]) -> Dict[str, Any]:
@@ -328,6 +359,7 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                          authority={"via": "button", "user_id": None}, status="pending", now=now,
                          expires_at=now + _REQUEST_TTL_SECONDS)
+    record["target_fingerprint"] = _current_fingerprint(kind, target_sid)
     _save_record(record)
     return record
 
@@ -418,6 +450,20 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
             record["resolved_at"] = now
             db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
             return record
+        # The approval covers the goal/loop shown on the card. Read the live definition inside the
+        # same write transaction so a replaced or re-set target cannot inherit this approval.
+        if "target_fingerprint" in record:
+            live = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_definition_key(record.get("kind", ""), record.get("target_session_id", "")),),
+            ).fetchone()
+            if _definition_fingerprint(record.get("kind", ""), live[0] if live else None) != record["target_fingerprint"]:
+                record["status"] = "failed"
+                record["error"] = "target_changed"
+                record["authority"] = {"via": "button", "user_id": str(user_id)}
+                record["resolved_at"] = now
+                db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+                return record
         record["status"] = "applying"
         record["authority"] = {"via": "button", "user_id": str(user_id)}
         record["resolved_at"] = now
@@ -426,7 +472,7 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
     claimed = db._execute_write(_claim)
     if claimed is None or claimed.get("status") == "expired":
         return None
-    if claimed.get("status") == "denied":
+    if claimed.get("status") in {"denied", "failed"}:
         return claimed
     try:
         authority = claimed["authority"]

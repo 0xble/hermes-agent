@@ -163,6 +163,29 @@ async def test_watcher_denied_control_leaves_goal_and_notifies_requester(state):
     assert len(runner.injections) == 1
     assert "denied" in runner.injections[0]["content"]
     assert pending_outbox() == []
+    # A declined pause/clear must not drop the target's queued continuation.
+    assert not hasattr(runner, "cleared")
+
+
+@pytest.mark.asyncio
+async def test_watcher_failed_or_expired_pause_keeps_queued_continuation(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import expire_request, request_control
+    import json
+    from hermes_cli import session_controls
+
+    GoalManager("target").set("watch the build")
+    runner = _runner(state)
+    expired = request_control("goal", "pause", "target", requester_sid="requester")
+    raw = json.loads(state.get_meta(session_controls._record_key(expired["id"])))
+    raw["expires_at"] = 0
+    state.set_meta(session_controls._record_key(expired["id"]), json.dumps(raw))
+    assert expire_request(expired["id"])["status"] == "expired"
+    failed = request_control("goal", "clear", "target", requester_sid="requester")
+    assert session_controls.fail_request(failed["id"], "target_unroutable")["status"] == "failed"
+    await runner._drain_session_controls()
+    assert not hasattr(runner, "cleared")
+    assert GoalManager("target").state.status == "active"
 
 
 @pytest.mark.asyncio

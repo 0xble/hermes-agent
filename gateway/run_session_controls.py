@@ -147,7 +147,9 @@ class GatewaySessionControlsMixin:
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
         if not record.get("continuations_cleared"):
-            needs_cleanup = (record.get("kind"), record.get("action")) in {
+            # Only an applied pause/clear stops the goal; a denied, expired or failed request
+            # must leave the target's queued continuation alone.
+            needs_cleanup = status == "applied" and (record.get("kind"), record.get("action")) in {
                 ("goal", "pause"), ("goal", "clear")
             }
             if not needs_cleanup or source is None or adapter is None:

@@ -2376,7 +2376,7 @@ class GoalManager:
                 user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
         """Replace the goal with explicit quote authority and preserve revision history."""
         old = self._state
-        if old is None or old.status == "cleared":
+        if old is None or old.status not in {"active", "paused"}:
             return {"ok": False, "error_code": "no_goal", "error": "there is no active or paused goal to replace", "state": old, "revision": None}
         reason = (reason or "").strip()
         goal = (goal or "").strip()

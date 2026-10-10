@@ -383,3 +383,51 @@ def test_unnegated_quote_is_allowed(state, message, quote):
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
     assert result["status"] == "applied"
     assert load_goal("target").status == "cleared"
+
+
+def test_approval_is_bound_to_the_definition_on_the_card(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.loops import LoopManager, load_loop
+    from hermes_cli.session_controls import request_control, resolve_request
+
+    GoalManager("target").set("old objective")
+    request = request_control("goal", "clear", "target", requester_sid="requester")
+    GoalManager("target").clear()
+    GoalManager("target").set("a different objective")
+    resolved = resolve_request(request["id"], "approve", "admin")
+    assert resolved["status"] == "failed"
+    assert resolved["error"] == "target_changed"
+    assert load_goal("target").goal == "a different objective"
+    assert load_goal("target").status == "active"
+    assert resolve_request(request["id"], "approve", "admin") is None
+
+    LoopManager("target").set("check the build")
+    loop_request = request_control("loop", "stop", "target", requester_sid="requester")
+    LoopManager("target").clear()
+    LoopManager("target").set("check a different thing")
+    stopped = resolve_request(loop_request["id"], "approve", "admin")
+    assert stopped["error"] == "target_changed"
+    assert load_loop("target").prompt == "check a different thing"
+
+    unchanged = request_control("goal", "pause", "target", requester_sid="requester")
+    assert resolve_request(unchanged["id"], "approve", "admin")["status"] == "applied"
+    assert load_goal("target").status == "paused"
+
+
+def test_replace_refuses_done_goal_on_quote_and_approval_paths(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, request_control, resolve_request
+
+    GoalManager("target").set("finished work")
+    GoalManager("target").mark_done("verified")
+    pending = request_control("goal", "replace", "target", requester_sid="requester",
+                              payload={"goal": "brand new objective"})
+    approved = resolve_request(pending["id"], "approve", "admin")
+    assert approved["status"] == "failed"
+    _user(state, "requester", "Please replace the goal with brand new objective")
+    quoted = apply_control("goal", "replace", "target", requester_sid="requester",
+                           user_quote="replace the goal with brand new objective",
+                           payload={"goal": "brand new objective"})
+    assert quoted["ok"] is False
+    assert load_goal("target").status == "done"
+    assert load_goal("target").goal == "finished work"
