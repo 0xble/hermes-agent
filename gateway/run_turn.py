@@ -4072,6 +4072,9 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                internal=pending_event.internal if pending_event is not None else turn_ctx.internal,
+                event_metadata=dict(
+                    (pending_event.metadata if pending_event is not None else turn_ctx.event_metadata) or {}),
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
                 persist_user_display_kind=next_display_kind,
@@ -4464,6 +4467,7 @@ class GatewayTurnMixin:
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
+            internal=internal, event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
