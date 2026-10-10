@@ -2193,6 +2193,8 @@ def _deliver_result(
     # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
     # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
     cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
+    # Copy blocks leave on every lane below too, so they pass the same redaction boundary.
+    copy_blocks = [_redact_cron_payload(block, "copy block") for block in copy_blocks]
     requested_media = len(media_files)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Policy-dropped attachments will never be sent on ANY lane — record them in run status.

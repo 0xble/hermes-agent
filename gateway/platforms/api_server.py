@@ -3634,9 +3634,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 conversation_history=history, resume_unanswered_turn=True, **ctx["run_kwargs"])
         is_dict = isinstance(result, dict)
         effective_session_id = result.get("session_id") if is_dict else session_id
-        from gateway.copy_blocks import render_copy_blocks_inline
-        final_response = render_copy_blocks_inline(_resolve_media_to_data_urls(
-            result.get("final_response", "") if is_dict else ""))
+        from gateway.copy_blocks import map_outside_copy_blocks
+        final_response = map_outside_copy_blocks(
+            result.get("final_response", "") if is_dict else "", _resolve_media_to_data_urls)
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
         return web.json_response(
             {"object": "hermes.session.chat.completion",
@@ -3715,9 +3715,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     active_run_id=run_id, approval_notify_callback=approval_notify,
                     approval_session_key=run_id, **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
-                from gateway.copy_blocks import render_copy_blocks_inline
-                final_response = render_copy_blocks_inline(_resolve_media_to_data_urls(
-                    result.get("final_response", "") if is_dict else ""))
+                from gateway.copy_blocks import map_outside_copy_blocks
+                final_response = map_outside_copy_blocks(
+                    result.get("final_response", "") if is_dict else "", _resolve_media_to_data_urls)
                 trailing = copy_filter.flush()
                 if trailing:
                     events.enqueue("assistant.delta", {"message_id": message_id, "delta": trailing})

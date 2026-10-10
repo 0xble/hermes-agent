@@ -8,6 +8,7 @@ import pytest
 from gateway.copy_blocks import (
     CopyMarkerStreamFilter,
     extract_copy_blocks,
+    map_outside_copy_blocks,
     render_copy_blocks_inline,
     strip_copy_blocks,
 )
@@ -139,6 +140,26 @@ def test_inline_render_matches_streamed_render_for_any_split() -> None:
             out.append(stream.feed(text[i:i + n]))
             i += n
         assert "".join(out) + stream.flush() == render_copy_blocks_inline(text), repr(text)
+
+
+def test_map_outside_copy_blocks_never_rewrites_bodies() -> None:
+    def resolve(text: str) -> str:
+        return text.replace("MEDIA:/a.png", "data:image/png")
+
+    text = "hi MEDIA:/a.png\n[[copy]]\nMEDIA:/a.png\n[[/copy]]\nbye MEDIA:/a.png\n"
+    assert map_outside_copy_blocks(text, resolve) == "hi data:image/png\nMEDIA:/a.png\nbye data:image/png\n"
+    kept = map_outside_copy_blocks(text, resolve, keep_markers=True)
+    stream = CopyMarkerStreamFilter()
+    assert stream.feed(kept) + stream.flush() == map_outside_copy_blocks(text, resolve)
+    assert map_outside_copy_blocks("plain MEDIA:/a.png", resolve) == "plain data:image/png"
+
+
+def test_extracted_response_keeps_legacy_constructor() -> None:
+    from gateway.platforms.base import _ExtractedResponse
+    extracted = _ExtractedResponse(
+        text_content="", images=[], media_files=[], local_files=[],
+        force_document_attachments=False, pre_extract="")
+    assert extracted.copy_blocks == []
 
 
 class _FakeAdapter(BasePlatformAdapter):

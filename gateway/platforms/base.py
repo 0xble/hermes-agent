@@ -1618,12 +1618,12 @@ def _append_text(existing: Optional[str], new: Optional[str]) -> str:
 class _ExtractedResponse:
     """Deliverable parts of a handler response (see ``_extract_response_content``)."""
     text_content: str
-    copy_blocks: list[str]
     images: list
     media_files: list
     local_files: list
     force_document_attachments: bool
     pre_extract: str
+    copy_blocks: list[str] = field(default_factory=list)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (

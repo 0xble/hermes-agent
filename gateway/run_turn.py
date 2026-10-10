@@ -1978,7 +1978,7 @@ class GatewayTurnMixin:
             media_delivered = False
             copy_failed = False
             copy_delivered = False
-            if adapter and not agent_result.get("interrupted"):
+            if adapter and copy_blocks and not agent_result.get("interrupted"):
                 copy_results = []
                 await adapter._send_copy_blocks(
                     event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},

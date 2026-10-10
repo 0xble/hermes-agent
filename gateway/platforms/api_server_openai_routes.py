@@ -22,7 +22,7 @@ try:
 except ImportError:  # pragma: no cover - mirrors api_server's optional import
     web = None  # type: ignore[assignment]
 
-from gateway.copy_blocks import CopyMarkerStreamFilter, render_copy_blocks_inline
+from gateway.copy_blocks import CopyMarkerStreamFilter, map_outside_copy_blocks, render_copy_blocks_inline
 
 # Logger parity with the origin module (moved log records keep their name).
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -811,7 +811,7 @@ class OpenAICompatRoutesMixin:
             return err
         result, usage = outcome
         presentation_muted = result.get("_notification_presentation_suppressed") is True
-        final_response = render_copy_blocks_inline(_resolve_media_to_data_urls(result.get("final_response") or ""))
+        final_response = map_outside_copy_blocks(result.get("final_response") or "", _resolve_media_to_data_urls)
         completed, is_partial, is_failed, err_msg = _result_flags(result)
         if err_msg:
             err_msg = _redact_api_error_text(err_msg)
@@ -966,7 +966,9 @@ class OpenAICompatRoutesMixin:
             # once so the client does not see an empty stream (#31449). Mirrors
             # _ResponsesStream.collect_result for /v1/responses.
             if not content_sent and not presentation_muted and isinstance(result, dict):
-                fallback_text = _resolve_media_to_data_urls(result.get("final_response") or "")
+                # Markers stay so the stream filter renders them; copy bodies skip MEDIA resolution.
+                fallback_text = map_outside_copy_blocks(
+                    result.get("final_response") or "", _resolve_media_to_data_urls, keep_markers=True)
                 if fallback_text:
                     await _write_content_delta(fallback_text)
             elif not presentation_muted:
@@ -1204,8 +1206,8 @@ class OpenAICompatRoutesMixin:
         if err is not None:
             return err
         result, usage = outcome
-        raw_final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
-        final_response = render_copy_blocks_inline(raw_final_response)
+        raw_final_response = result.get("final_response", "")
+        final_response = map_outside_copy_blocks(raw_final_response, _resolve_media_to_data_urls)
         if not raw_final_response:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
         response_id = f"resp_{uuid.uuid4().hex[:28]}"

@@ -290,11 +290,29 @@ def _telegram_format(message):
         return message, ParseMode.MARKDOWN_V2, False  # formatting unavailable: send as-is
 
 
+async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
+    """Send an oversized copy block as one UTF-8 ``copy.txt`` document."""
+    import io
+    from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+    bot = _telegram_bot(token)
+    doc = io.BytesIO(message.encode("utf-8"))
+    doc.name = "copy.txt"
+    msg = await bot.send_document(
+        chat_id=normalize_telegram_chat_id(chat_id), document=doc, filename="copy.txt",
+        **_telegram_thread_kwargs(thread_id))
+    return _success("telegram", chat_id, [], message_id=str(getattr(msg, "message_id", "")))
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False,
                    copy_block=False):
     """One-shot Telegram Bot API send; parse failures fall back to plain text."""
     try:
         if copy_block:
+            from gateway.platforms.base import utf16_len
+            if utf16_len(message) > 4096 and not media_files:
+                # One paste-ready body never splits: send it intact as a .txt document,
+                # matching the live adapter.
+                return await _send_telegram_copy_document(token, chat_id, message, thread_id)
             formatted, send_parse_mode, _has_html = message, None, False
         else:
             formatted, send_parse_mode, _has_html = _telegram_format(message)

@@ -187,6 +187,42 @@ def strip_copy_blocks(text: str) -> str:
     return extract_copy_blocks(text)[0]
 
 
+def map_outside_copy_blocks(text: str, transform, *, keep_markers: bool = False) -> str:
+    """Apply *transform* only to text outside copy blocks, then render blocks inline.
+
+    Directive processing such as MEDIA resolution must not rewrite paste-ready bodies,
+    so each run of ordinary text is transformed on its own and bodies stay byte-exact.
+    With ``keep_markers`` the marker lines stay, for callers that stream the result
+    through :class:`CopyMarkerStreamFilter`.
+    """
+    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+        return transform(text) if text else text
+    out: list[str] = []
+    ordinary: list[str] = []
+    fence: str | None = None
+    in_copy = False
+
+    def _flush_ordinary() -> None:
+        if ordinary:
+            out.append(transform("".join(ordinary)))
+            ordinary.clear()
+
+    for line in text.splitlines(keepends=True):
+        if fence is None and (_line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)):
+            _flush_ordinary()
+            if _line_marker(line, _COPY_OPEN):
+                in_copy = True
+            elif in_copy:
+                in_copy = False
+            if keep_markers:
+                out.append(line)
+            continue
+        (out if in_copy else ordinary).append(line)
+        fence = _next_fence(fence, line)
+    _flush_ordinary()
+    return "".join(out)
+
+
 def render_copy_blocks_inline(text: str) -> str:
     """Render copy blocks inline for response surfaces that cannot send separate messages.
 
@@ -204,6 +240,7 @@ def render_copy_blocks_inline(text: str) -> str:
 __all__ = [
     "CopyMarkerStreamFilter",
     "extract_copy_blocks",
+    "map_outside_copy_blocks",
     "render_copy_blocks_inline",
     "strip_copy_blocks",
 ]
