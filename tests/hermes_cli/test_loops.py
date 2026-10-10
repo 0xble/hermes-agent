@@ -468,6 +468,67 @@ class TestTickLifecycle:
         assert decision["stopped"] is True
         assert decision["status"] == "paused"
 
+    @pytest.mark.parametrize("change, expected", [
+        ("pause", "paused"),
+        ("clear", "cleared"),
+        ("stop_then_set", "active"),
+    ])
+    @pytest.mark.parametrize("response", ["still building", "The deploy is live.\nLOOP_COMPLETE"])
+    def test_change_during_tick_survives_completion(self, hermes_home, change, expected, response):
+        """A pause, stop or re-set that lands mid-tick is never overwritten by the tick's outcome."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-mid")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        other = LoopManager(session_id="t-mid")
+        if change == "pause":
+            other.pause("paused from another session")
+        elif change == "clear":
+            other.clear()
+        else:
+            other.clear()
+            time.sleep(0.01)
+            LoopManager(session_id="t-mid").set("a different task", interval_seconds=600)
+        decision = mgr.complete_tick(response)
+        stored = load_loop("t-mid")
+        assert stored.status == expected
+        assert decision["stopped"] is False
+        if change == "stop_then_set":
+            assert stored.prompt == "a different task"
+            assert stored.awaiting_response is False
+
+    def test_revise_during_tick_survives_completion(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-rev")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        stored = load_loop("t-rev")
+        stored.revisions.append({"reason": "slow down"})
+        stored.interval_seconds = 900.0
+        from hermes_cli.loops import save_loop
+        save_loop("t-rev", stored)
+        mgr.complete_tick("still building")
+        after = load_loop("t-rev")
+        assert after.interval_seconds == 900.0
+        assert after.revisions == [{"reason": "slow down"}]
+
+    def test_abandon_after_external_pause_keeps_pause(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-ab")
+        state = mgr.set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        LoopManager(session_id="t-ab").pause("paused elsewhere")
+        mgr.abandon_tick()
+        stored = load_loop("t-ab")
+        assert stored.status == "paused"
+        assert stored.ticks_fired == 1
+
     def test_until_judge_done_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

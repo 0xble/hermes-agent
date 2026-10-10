@@ -986,14 +986,57 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
+    def _save_tick_outcome(self, fired_ticks: int) -> bool:
+        """Commit a tick's outcome only if the stored loop is still the tick this manager fired.
+
+        A user or cross-session pause, stop, resume or replace can land while the tick's turn runs;
+        the in-memory copy predates it, and saving it would resurrect a stopped loop or undo a
+        pause. Compare-and-set inside one write transaction keeps that newer change."""
+        s = self._state
+        db = _get_session_db() if self._cursor is None else None
+        if s is None:
+            return False
+        if db is None:
+            self._save()
+            return True
+
+        def write(conn) -> bool:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
+            ).fetchone()
+            stored = _parse_state(row[0]) if row and row[0] else None
+            if (
+                stored is None or stored.status != "active" or not stored.awaiting_response
+                or stored.created_at != s.created_at or stored.ticks_fired != fired_ticks
+                or stored.version != s.version
+            ):
+                return False
+            save_loop(self.session_id, s, cursor=conn)
+            return True
+
+        try:
+            applied = bool(db._execute_write(write))
+        except Exception as exc:
+            logger.debug("LoopManager: tick outcome write failed: %s", exc)
+            return False
+        if not applied:
+            self.refresh()
+        return applied
+
+    def _superseded_result(self) -> Dict[str, Any]:
+        s = self._state
+        return {"status": s.status if s else None, "stopped": False,
+                "reason": "loop changed during the tick", "message": ""}
+
     def abandon_tick(self) -> None:
         """Roll back a fired tick whose injection failed (nothing ran)."""
         s = self._state
         if s is None or not s.awaiting_response:
             return
+        fired = s.ticks_fired
         s.awaiting_response = False
-        s.ticks_fired = max(0, s.ticks_fired - 1)
-        self._save()
+        s.ticks_fired = max(0, fired - 1)
+        self._save_tick_outcome(fired)
 
     def _stop(self, status: str, reason: str, message: str) -> Dict[str, Any]:
         """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result."""
@@ -1003,7 +1046,8 @@ class LoopManager:
             s.last_stop_reason = reason
         else:
             s.paused_reason = reason
-        self._save()
+        if not self._save_tick_outcome(s.ticks_fired):
+            return self._superseded_result()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
@@ -1067,7 +1111,8 @@ class LoopManager:
         else:
             s.current_delay = s.interval_seconds
         s.next_due_at = now + s.current_delay
-        self._save()
+        if not self._save_tick_outcome(s.ticks_fired):
+            return self._superseded_result()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 
