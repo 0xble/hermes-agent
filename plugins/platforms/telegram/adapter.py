@@ -425,10 +425,10 @@ def check_telegram_requirements() -> bool:
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
-# A one-line CommonMark code span delimited by two or more backticks, and the real (line-start) fenced
-# blocks such a span must never be matched inside.
+# A one-line CommonMark code span delimited by two or more backticks. The MarkdownV2 fenced-block
+# pass shares its boundaries with the inline pass so code inside a block is never rewritten.
 _MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
-_LINE_START_FENCE_RE = re.compile(r'^ {0,3}(?P<f>`{3,})[^`\n]*\n[\s\S]*?(?:^ {0,3}(?P=f)`*[ \t]*$|\Z)', re.MULTILINE)
+_MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 _BACKTICK_RUN_RE = re.compile(r'`+')
 
 
@@ -6715,9 +6715,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         text = _wrap_markdown_tables(content)
         # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
         # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
-        # fenced pass, which would otherwise read a one-line ```a `` b``` span as a fence; spans inside a real
-        # line-start fence stay that fence's content.
-        fences = [m.span() for m in _LINE_START_FENCE_RE.finditer(text)]
+        # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside
+        # the protected span so multi-backtick inline code there still renders as code.
+        fences = [(m.start(2), m.end()) for m in _MDV2_FENCE_RE.finditer(text)]
 
         def _protect_multi_tick(m):
             if any(start <= m.start() < end for start, end in fences):
@@ -6728,14 +6728,31 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return _ph('`' + body.replace('\\', '\\\\').replace('`', '\\`') + '`')
 
         text = _MULTI_TICK_CODE_SPAN_RE.sub(_protect_multi_tick, text)
-        # 1) Protect fenced code blocks; per MarkdownV2 spec \\ and ` inside pre/code must be escaped.
+        # 1) Protect fenced code blocks (``` ... ```)
+        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
+        #    A fence still opens on its own line — the opening ``` must be the
+        #    first triple-backtick run on that line and must end it — but the
+        #    line may carry arbitrary leading whitespace (list/blockquote-
+        #    nested code indents fences by 4+ spaces) or lead-in prose
+        #    ("Here is the code: ```"), both of which the line-start-only
+        #    anchor silently downgraded from <pre> to escaped literal text.
+        #    Requiring the rest of the opening line to be backtick-free is
+        #    what keeps *inline* triple backticks (e.g. "the syntax is
+        #    ```x``` inline") out of the match: a closing run can never sit
+        #    on the same line as the opener, and the tempered prefix cannot
+        #    skip past an earlier run to a later one.  The closing fence must
+        #    sit on its own line (any indent), with optional trailing
+        #    whitespace and an optional ``\r`` so CRLF-terminated fences
+        #    (Windows-authored content) match too.
         def _protect_fenced(m):
-            raw = m.group(0)
-            open_end = raw.index('\n') + 1 if '\n' in raw[3:] else 3  # opening ``` (+ optional language)
-            body = raw[open_end:][:-3].replace('\\', '\\\\').replace('`', '\\`')
-            return _ph(raw[:open_end] + body + '```')
+            prefix = m.group(1)   # lead-in text / indent before the opening fence
+            opening = m.group(2)  # opening ``` (with optional language) and newline
+            body = m.group(3)     # code body (may be empty)
+            closing = m.group(4)   # closing fence (with its indent)
+            body = body.replace('\\', '\\\\').replace('`', '\\`')
+            return prefix + _ph(opening + body + closing)
 
-        text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _protect_fenced, text)
+        text = _MDV2_FENCE_RE.sub(_protect_fenced, text)
         # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
         text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.

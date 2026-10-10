@@ -107,6 +107,23 @@ class TestFormatMessageCodeBlocks:
         result = adapter.format_message(text)
         assert r"echo \`hostname\`" in result
 
+    def test_fence_closes_only_on_its_own_line(self, adapter):
+        text = '```python\ns = "```"\nprint(s)\n```'
+        assert adapter.format_message(text) == '```python\ns = "\\`\\`\\`"\nprint(s)\n```'
+
+    @pytest.mark.parametrize("text, expected", [
+        (
+            "- item:\n    ```\n    x = ``y``\n    ```",
+            "\\- item:\n    ```\n    x = \\`\\`y\\`\\`\n    ```",
+        ),
+        (
+            "Here is the code: ```python\nx = ``y``\n```",
+            "Here is the code: ```python\nx = \\`\\`y\\`\\`\n```",
+        ),
+    ])
+    def test_multi_backticks_inside_nested_and_midline_fences_stay_literal(self, adapter, text, expected):
+        assert adapter.format_message(text) == expected
+
     def test_inline_code_no_double_escape(self, adapter):
         r"""Already-escaped backslashes should not be quadruple-escaped."""
         text = r"Use `\\server\share`"
@@ -124,11 +141,8 @@ class TestFormatMessageCodeBlocks:
         """
         text = "the syntax is ```like this``` inline"
         result = adapter.format_message(text)
-        # Content is preserved, and the inline span is NOT emitted as a raw
-        # fenced block: no unescaped triple-backtick run survives to open an
-        # unbalanced <pre> entity (the literal backticks are escaped instead).
-        assert "like this" in result
-        assert "```" not in result
+        # The fork's multi-backtick pass emits one inline entity, never a <pre> block.
+        assert result == "the syntax is `like this` inline"
 
     def test_fence_and_inline_backticks_mixed(self, adapter):
         r"""A real fenced block still gets protected even when the same message
@@ -158,20 +172,15 @@ class TestFormatMessageCodeBlocks:
         ``\``` runs, dropping the code formatting."""
         text = "```\r\ncode\r\n```\r\n"
         result = adapter.format_message(text)
-        # Protected as a real fence: the body survives and the fence backticks
-        # are emitted literally, not escaped (which is what an unmatched close
-        # would produce).
-        assert "code" in result
-        assert "\\`" not in result
+        # Upstream consumes the closing line's optional carriage return.
+        assert result == "```\r\ncode\r\n```\n"
 
     def test_midline_opened_fence_stays_protected(self, adapter):
         r"""A fence opened after lead-in prose on the same line ("Here is the
         code: ```") is a real <pre> block on main and must stay one: the
         line-start-only anchor downgraded it to escaped literal prose."""
         text = "Here is the code: ```python\nprint('hi')\n```"
-        result = adapter.format_message(text)
-        assert "```python\nprint('hi')\n```" in result
-        assert "\\`" not in result
+        assert adapter.format_message(text) == text
 
     def test_list_nested_indented_fence_stays_protected(self, adapter):
         r"""Fences indented by 4+ spaces (code nested in lists/blockquotes) are
