@@ -52,11 +52,35 @@ def orphan_install_states(installs: Path) -> list[Path]:
     return orphans
 
 
-def _held(state: Path) -> bool:
-    """True while a process may still be using this state dir: the install lock is taken or a
-    generation lease is held. Any lock we cannot even open counts as held."""
+@contextlib.contextmanager
+def _install_fence(state: Path):
+    """Yield whether both fork install locks were acquired without waiting."""
+    from pm.environments import install_recovery_lock_path, install_state_lock
+    from pm.filesystem import lock_fd
+
+    with install_state_lock(state, timeout=0) as stable_held:
+        if not stable_held:
+            yield False
+            return
+        recovery = install_recovery_lock_path(state)
+        fd = os.open(recovery, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            yield lock_fd(fd, wait=False)
+        finally:
+            os.close(fd)
+
+
+def _held(state: Path, *, fence_held: bool = False) -> bool:
+    """True while a process may still use this state: either fork install lock, the legacy
+    install lock, or a generation lease is taken. Any lock we cannot open counts as held."""
     from hermes_cli.runtime_state import leases_held
     from pm.filesystem import lock_fd
+
+    if not fence_held:
+        with _install_fence(state) as held:
+            if not held:
+                return True
+            return _held(state, fence_held=True)
 
     lock = state / ".install.lock"
     if lock.exists():
@@ -80,25 +104,31 @@ def _held(state: Path) -> bool:
 def collect_orphan_install_states(installs: Path) -> list[Path]:
     """Remove every unheld orphan state dir under *installs*; returns what was removed."""
     removed: list[Path] = []
+
     for state in orphan_install_states(installs):
-        if _held(state):
-            logger.debug("orphan install state %s is still held; skipped", state.name)
+        try:
+            with _install_fence(state) as fence_held:
+                if not fence_held or _held(state, fence_held=True):
+                    logger.debug("orphan install state %s is still held; skipped", state.name)
+                    continue
+                # The record goes last, and only once everything else is gone: the startup prune runs on
+                # a daemon thread and a removal can fail part-way (an open file on Windows, a read-only
+                # dir), and a dir that lost its record first would never be recognised again.
+                for child in state.iterdir():
+                    if child.name == "inputs":
+                        continue
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        with contextlib.suppress(OSError):
+                            child.unlink()
+                if any(child.name != "inputs" for child in state.iterdir()):
+                    logger.debug("orphan install state %s only partly removed; retried next pass", state.name)
+                    continue
+                shutil.rmtree(state, ignore_errors=True)
+                if not state.exists():
+                    removed.append(state)
+        except OSError:
+            logger.debug("orphan install state %s could not be fenced; skipped", state.name, exc_info=True)
             continue
-        # The record goes last, and only once everything else is gone: the startup prune runs on
-        # a daemon thread and a removal can fail part-way (an open file on Windows, a read-only
-        # dir), and a dir that lost its record first would never be recognised again.
-        for child in state.iterdir():
-            if child.name == "inputs":
-                continue
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                with contextlib.suppress(OSError):
-                    child.unlink()
-        if any(child.name != "inputs" for child in state.iterdir()):
-            logger.debug("orphan install state %s only partly removed; retried next pass", state.name)
-            continue
-        shutil.rmtree(state, ignore_errors=True)
-        if not state.exists():
-            removed.append(state)
     return removed

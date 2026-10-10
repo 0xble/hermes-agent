@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 import pm.environments
 import pytest
 from hermes_cli.worktree_ops import _prune_stale_worktrees
+from pm.environments import install_state_lock
 from pm.filesystem import lock_fd
 from pm.install_states import collect_orphan_install_states, orphan_install_states
 
@@ -45,6 +47,38 @@ def test_startup_prune_reclaims_only_provably_deleted_checkouts(tmp_path, monkey
     _prune_stale_worktrees(str(repo))
     assert not gone_scratch.exists() and not gone_worktree.exists()
     assert all(p.is_dir() for p in (live, unknown, host_install, container_install))
+
+
+def test_stable_install_lock_keeps_orphan_install(tmp_path):
+    installs = tmp_path / "installs"
+    state = _state(installs, "dddd", tmp_path / "gone")
+    ready = threading.Event()
+    release = threading.Event()
+    failures = []
+
+    def hold_lock():
+        try:
+            with install_state_lock(state) as held:
+                assert held
+                ready.set()
+                assert release.wait(5)
+        except BaseException as exc:
+            failures.append(exc)
+            ready.set()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert ready.wait(5)
+    try:
+        assert not failures
+        assert collect_orphan_install_states(installs) == []
+        assert state.is_dir()
+    finally:
+        release.set()
+        holder.join(timeout=5)
+    assert not holder.is_alive()
+    assert not failures
+    assert collect_orphan_install_states(installs) == [state]
 
 
 def test_held_orphan_is_kept(tmp_path):

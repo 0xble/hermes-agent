@@ -781,6 +781,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   an explicit zero-tool allowlist. Guard:
   `scripts/run_tests.sh tests/cron/test_cron_explicit_empty_toolsets.py`.
 
+- The sync retained upstream's `pm/install_states.py` orphan collector after the fork relocated
+  install locks into `.locks/<name>.lock` plus `.recovery.lock`. Its `_held` checked only the
+  deleted state's legacy `.install.lock`, so startup provisioning could delete an in-use state.
+  The collector now fences both fork locks non-blocking through `install_state_lock` and
+  `install_recovery_lock_path` while preserving the legacy lock check and holding that fence
+  through deletion. Guard: `scripts/run_tests.sh tests/pm/test_install_states_gc.py`.
+
 ## Gateway Subcommand Exit Codes
 
 - Fork patch identity: `gateway-cli-exit-code`.
