@@ -29,14 +29,22 @@ class GatewaySessionControlsMixin:
             await asyncio.sleep(interval)
 
     @staticmethod
-    def _control_text(record: dict) -> str:
+    def _clip(text: Any, limit: int) -> str:
+        """Bound one free-text field so a card or notice always fits one Telegram message."""
+        text = str(text or "")
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+    @classmethod
+    def _control_text(cls, record: dict) -> str:
+        # Every free-text field is bounded: the card is one message with buttons (Telegram caps a
+        # message at 4096 chars), and an oversized card would fail and strand the request.
         kind, action = record.get("kind", ""), record.get("action", "")
         target = record.get("target_session_id", "")
         requester = record.get("requester_session_id", "")
-        requester_title = record.get("requester_title") or "Untitled session"
-        target_title = record.get("target_title") or "Untitled session"
-        reason = record.get("reason") or "session-control"
-        detail = record.get("affected_text") or "(state unavailable)"
+        requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
+        target_title = cls._clip(record.get("target_title") or "Untitled session", 120)
+        reason = cls._clip(record.get("reason") or "session-control", 600)
+        detail = cls._clip(record.get("affected_text") or "(state unavailable)", 2400)
         return (
             "Session control request\n"
             f"Requester: {requester_title} ({requester})\n"
@@ -299,11 +307,11 @@ class GatewaySessionControlsMixin:
             return record
         return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
 
-    @staticmethod
-    def _control_notice(record: dict) -> str:
+    @classmethod
+    def _control_notice(cls, record: dict) -> str:
         kind, action = record.get("kind", ""), record.get("action", "")
         requester_id = record.get("requester_session_id", "")
-        requester_title = record.get("requester_title") or "Untitled session"
+        requester_title = cls._clip(record.get("requester_title") or "Untitled session", 120)
         requester = f"{requester_title} ({requester_id})"
         quote = (record.get("authority") or {}).get("quote")
         status = record.get("status")
@@ -317,10 +325,13 @@ class GatewaySessionControlsMixin:
             "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
             "replace": "replaced",
         }.get(action, action)
-        change = f"\n{record['affected_text']}" if action == "replace" and record.get("affected_text") else ""
+        change = (f"\n{cls._clip(record['affected_text'], 2400)}"
+                  if action == "replace" and record.get("affected_text") else "")
         if quote:
             message = str((record.get("authority") or {}).get("message") or "")
-            full = f"\nFull message: \"{message}\"" if message and message != quote else ""
+            full = (f"\nFull message: \"{cls._clip(message, 1200)}\""
+                    if message and message != quote else "")
+            quote = cls._clip(quote, 300)
             return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}"
         return f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram){change}"
 
@@ -335,7 +346,7 @@ class GatewaySessionControlsMixin:
                 how = "using your quoted words"
             else:
                 how = "after Telegram approval"
-            change = (f" ({record['affected_text']})"
+            change = (f" ({cls._clip(record['affected_text'], 2400)})"
                       if record.get("action") == "replace" and record.get("affected_text") else "")
             return f"✓ Your request to {action} in {target} was applied {how}.{change}"
         if record.get("status") == "denied":

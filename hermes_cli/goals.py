@@ -2103,8 +2103,10 @@ def _is_user_typed(row: Dict[str, Any]) -> bool:
         from agent.context_compressor import ContextCompressor
         if ContextCompressor._is_context_summary_content(content):
             return False
-    except Exception:  # pragma: no cover - compressor is part of the runtime
-        pass
+    except Exception:
+        # Same fail-closed rule: if a context summary cannot be ruled out, the row cannot
+        # authorize a revision or session control.
+        return False
     return True
 # Gateway reply pointer (gateway/run_inbound.py ``_prepend_inbound_reply_context``), with or without
 # " your previous message". Greedy to the last ``"]`` line end: the quoted text is the assistant's

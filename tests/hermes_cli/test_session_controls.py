@@ -764,3 +764,21 @@ def test_stale_manager_set_cannot_reuse_a_newer_goal_instance(state, monkeypatch
     b = GoalManager("target").state.created_at
     stale.set("goal C")
     assert GoalManager("target").state.created_at > b
+
+
+def test_quote_source_fails_closed_when_summary_classifier_is_unavailable(state, monkeypatch):
+    """If a context summary cannot be ruled out, the row cannot authorize a control."""
+    from agent.context_compressor import ContextCompressor
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    def broken(_content):
+        raise RuntimeError("classifier unavailable")
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please clear the target goal immediately")
+    monkeypatch.setattr(ContextCompressor, "_is_context_summary_content", staticmethod(broken))
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal immediately")
+    assert result["status"] == "pending"
+    assert load_goal("target").status == "active"

@@ -668,3 +668,22 @@ async def test_unapplied_outcome_notice_waits_for_offline_adapter(state, monkeyp
     await online._drain_session_controls()
     assert len(online.adapter.sends) == 1
     assert session_controls._load_record(record["id"])["outbox_done"] is True
+
+
+@pytest.mark.parametrize("status", ["pending", "applied"])
+def test_long_goals_keep_cards_and_notices_within_one_telegram_message(state, status):
+    """A long goal or message must not push a card or notice past Telegram's 4096-char cap."""
+    long_goal = "migrate every service " * 400
+    record = {
+        "kind": "goal", "action": "replace", "status": status,
+        "target_session_id": "target", "requester_session_id": "requester",
+        "requester_title": "R" * 500, "target_title": "T" * 500, "reason": "why " * 500,
+        "affected_text": f"goal: {long_goal} -> {long_goal}",
+        "authority": {"via": "quote", "quote": "replace the target goal " * 40,
+                      "message": "Please replace the target goal " * 200},
+    }
+    runner = _runner(state)
+    for text in (runner._control_text(record), runner._control_notice(record),
+                 runner._requester_notice(record)):
+        assert len(text) <= 4096
+    assert runner._control_text(record).endswith("…")
