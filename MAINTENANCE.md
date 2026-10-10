@@ -85,6 +85,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Cron restart survival | Keep launchd-managed macOS cron workers alive through gateway process-group termination | Cron external worker dispatch, liveness recovery, or launchd restart changes | [Cron restart survival](maintenance/cron-restart-survival.md) |
 | Immutable releases S2 | Pin code and venv to immutable releases behind an atomic pointer; preserve migration and rollback receipts | Update, release staging, launchd path resolution, cron worker pins or retention changes | [Immutable releases and activation runbook](maintenance/seamless-restart-s2.md) |
 | Telegram ingress non-blocking | The update consumer never waits on outbound pacing, the pending-update probe requires no dispatch progress, and reconnect waits for the old poller to release | Telegram update handlers, busy or inline command replies, the heartbeat pending probe, or poller token ownership | [Telegram ingress non-blocking](maintenance/telegram-ingress-nonblocking.md) |
+| Telegram first-poll health | Each new polling generation proves health from a non-blocking first getUpdates; steady-state polls keep the long poll | The instrumented getUpdates request, polling-generation fencing, `start_polling` arguments, or a PTB upgrade | [Telegram first-poll health](maintenance/telegram-first-poll-health.md) |
 | Stdio wrapper chain | Agent builds and thread-scoped silencing never stack or loop `sys.stdout`/`sys.stderr` wrappers, and wrapper attribute lookup cannot recurse | `_SafeWriter`, `_install_safe_stdio`, `thread_scoped_output`, or other process-lifetime stdio rebinding | [Stdio wrapper chain](maintenance/stdio-wrapper-chain.md) |
 | Telegram delivery | Preserve flood coherence, split-send recovery, and legacy emphasis | Telegram send/edit/typing, delivery ledger, or emphasis changes | [Telegram delivery](maintenance/telegram-delivery.md) |
 | Telegram stale final delivery | Recover completed replies from deleted private DM topics without duplicating partially sent content or moving interim output | Telegram private-topic final sends and recovery | [Telegram stale final delivery](maintenance/telegram-stale-final-delivery.md) |
@@ -273,6 +274,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
 - **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
 - **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
+
+## Active patch record: Telegram first-poll health
+
+- **Patch identity:** `telegram-first-poll-health`.
+- **Behavior:** While the current polling generation has not proven progress, its getUpdates requests use Telegram `timeout=0`, and the read timeout drops by the matching allowance. A new gateway or reconnect then logs `Telegram polling confirmed healthy` within about 1s instead of after a 10s idle long poll. Health still requires a real successful current-generation getUpdates response. Stale or untagged generations and every post-progress poll keep PTB's long poll.
+- **Source surfaces:** `plugins/platforms/telegram/adapter.py` (`_non_blocking_get_updates_kwargs`, `_polling_health_unproven`, `_instrument_polling_request`), `tests/plugins/test_telegram_first_poll_fast_ptb.py`, and [Telegram first-poll health](maintenance/telegram-first-poll-health.md).
+- **Upstream status:** Upstream has no polling-generation health gate. PTB 22.8 `Updater.start_polling` uses one timeout for every poll. No equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/plugins/test_telegram_first_poll_fast_ptb.py tests/plugins/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_polling_progress.py`.
+- **Retirement:** Remove when upstream or PTB proves first-poll health without an idle long poll. Review on any PTB 23+ upgrade (private `RequestParameter`).
+- **Rollback:** Revert the commit carrying `Fork-Patch: telegram-first-poll-health`.
 
 ## Update
 
