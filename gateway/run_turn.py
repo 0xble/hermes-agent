@@ -52,7 +52,9 @@ logger = logging.getLogger("gateway.run")
 
 def _eventless_followup_reply_expected(text: Any) -> bool:
     """Derive the reply contract from leftover text when no event object survived the drain."""
-    event = MessageEvent(text=str(text), reply_expected=None)
+    from gateway.run_busy import _steer_text_without_origin
+
+    event = MessageEvent(text=_steer_text_without_origin(str(text)), reply_expected=None)
     apply_agent_origin_reply_expectation(event)
     return event.reply_expected if event.reply_expected is not None else True
 
