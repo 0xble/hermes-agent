@@ -26,8 +26,8 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
-    strip_trailing_silence_marker,
+    apply_agent_origin_reply_expectation, display_kind_for_event, is_machinery_display_kind,
+    reply_expected_metadata, silence_allowed, strip_trailing_silence_marker,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -48,6 +48,16 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _eventless_followup_reply_expected(text: Any) -> bool:
+    """Derive the reply contract from leftover text when no event object survived the drain."""
+    from gateway.run_busy import _steer_text_without_origin
+
+    event = MessageEvent(text=_steer_text_without_origin(str(text)), reply_expected=None)
+    apply_agent_origin_reply_expectation(event)
+    return event.reply_expected if event.reply_expected is not None else True
+
 
 _tool_call_logger_lock = threading.Lock()
 
@@ -2331,7 +2341,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
+                channel_prompt=_turn_channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
                 persist_user_message=prepared.persist_user_message,
@@ -4002,10 +4012,17 @@ class GatewayTurnMixin:
                 # Legacy adapters expose only a text queue API. Pass the event contract when the
                 # adapter supports keyword metadata, then fall back without changing old adapters.
                 try:
-                    adapter.queue_message(
-                        session_key, pending, reply_expected=turn_ctx.reply_expected,
-                        internal=turn_ctx.internal, metadata=dict(turn_ctx.event_metadata or {}),
-                    )
+                    if pending_event is not None:
+                        adapter.queue_message(
+                            session_key, pending, reply_expected=pending_event.reply_expected,
+                            internal=pending_event.internal, metadata=dict(pending_event.metadata or {}),
+                        )
+                    else:
+                        adapter.queue_message(
+                            session_key, pending,
+                            reply_expected=_eventless_followup_reply_expected(pending),
+                            internal=False, metadata={},
+                        )
                 except TypeError:
                     adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
@@ -4019,8 +4036,8 @@ class GatewayTurnMixin:
                 from gateway.platforms.base import MessageEvent, MessageType
                 deferred = pending_event or MessageEvent(
                     text=str(pending), message_type=MessageType.TEXT, source=source,
-                    internal=turn_ctx.internal, reply_expected=turn_ctx.reply_expected,
-                    metadata=dict(turn_ctx.event_metadata or {}),
+                    internal=False, reply_expected=_eventless_followup_reply_expected(pending),
+                    metadata={},
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
                     existing = adapter._pending_messages.get(session_key)
@@ -4049,7 +4066,13 @@ class GatewayTurnMixin:
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
-        next_reply_expected = pending_event.reply_expected if pending_event is not None else None
+        # A pending event is authoritative. Without one, derive the contract from the leftover
+        # text: an agent-origin relay remains silent, while plain steer/interrupt text replies.
+        next_reply_expected = (
+            pending_event.reply_expected
+            if pending_event is not None
+            else _eventless_followup_reply_expected(pending)
+        )
         if (
             pending_event is not None
             and isinstance(getattr(pending_event, "metadata", None), dict)
@@ -4494,8 +4517,7 @@ class GatewayTurnMixin:
         source: SessionSource, session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        channel_prompt: Optional[str] = None, internal: bool = False, event_metadata: Optional[dict] = None,
-        moa_config: Optional[dict] = None,
+        channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
