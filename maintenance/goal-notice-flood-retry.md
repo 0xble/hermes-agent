@@ -2,7 +2,7 @@
 
 ## Required behavior
 
-Goal status notices (`⏳` parked, `↻` continuing, `▶` wait ended/resumed, `✓`
+Goal status notices (`⏳` parked, `↻` continuing, `▶` resumed, `✓`
 achieved, `⏸` paused, and blocked) must not be silently lost when the delivery
 adapter refuses a send with a short `flood_control:<seconds>` window. The first
 send remains on the normal path; only the bounded recovery wait runs off the

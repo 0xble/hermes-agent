@@ -116,7 +116,8 @@ Failed or interrupted model turns do not run completion judging.
   (default 900, `0` disables) after `GoalState.last_continuation_at`, stamped on
   every judge CONTINUE and on the idle ticker's CAS clear. The hold is the ordinary
   durable timed wait with reason `minimum gap between autonomous goal continuations`;
-  it is silent (no parked or wait-ended notice). A user turn or an event with
+  it is silent (no parked notice). Every idle-ticker resume is silent: the
+  continuation turn is the visible signal, so no wait-ended notice is sent. A user turn or an event with
   `notification_origin=process_registry_synthetic` (also carried through queued
   follow-up chains as `queued_terminal_notification_origin`) pierces only this hold;
   judge waits and pid/session/delegation barriers stay authoritative. CLI/TUI

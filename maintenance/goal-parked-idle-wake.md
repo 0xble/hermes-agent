@@ -23,6 +23,8 @@ case stayed parked for 14.5 hours.
 - Surfaces clear the barrier only after the continuation was admitted, through
   `clear_lifted_wait(waiting_since)`. A failed or refused injection is retried on the next scan,
   and a resumed turn that has already re-parked keeps its newer barrier.
+- Resuming is silent on every surface: no "wait ended" chat notice or TUI status line. The
+  continuation turn is the visible signal.
 - A tracked `notify_on_complete` process that exited in this process defers for
   `_COMPLETION_NOTICE_GRACE_S` so its own completion turn re-judges first.
 - Gateway: `_loop_wakeup_watcher` (15 s, all served profiles) also scans parked goals through
