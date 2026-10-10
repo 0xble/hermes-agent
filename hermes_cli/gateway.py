@@ -5945,31 +5945,8 @@ def _cmd_list(args):
 
 
 def _cmd_update(args) -> int:
-    """Forward an agent's update handoff to its owning gateway only."""
-    from gateway.update_launcher import validate_agent_update_reason
-
-    try:
-        reason = validate_agent_update_reason(getattr(args, "reason", None))
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return 2
-    from gateway.session_context import get_session_env
-    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
-    if not session_id:
-        print("Error: update requests require a durable messaging session route")
-        return 2
-    from gateway.control_socket import query_gateway_control
-    result = query_gateway_control(get_hermes_home(), "agent-update", payload={
-        "reason": reason, "session_id": session_id,
-    })
-    if not result:
-        print("Error: gateway update handoff unavailable")
-        return 1
-    if not result.get("accepted"):
-        print(f"Error: {result.get('error') or 'gateway refused update handoff'}")
-        return 1
-    print(result["handoff"])
-    return 0
+    from hermes_cli.gateway_agent_update import cmd_agent_update
+    return cmd_agent_update(args)
 
 
 def _cmd_migrate_legacy(args):
