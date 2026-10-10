@@ -508,6 +508,39 @@ try {
             self.assertEqual(which.call_args_list[1].args, ('rg.exe',))
             self.assertEqual(check.call_args.args[0][0], 'D:\\checkout\\.ci\\toolchain\\bin\\rg.exe')
 
+    def test_checkout_venv_symlinks_are_rejected_before_commands_run(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory) / 'checkout'
+            root.mkdir()
+            target = Path(directory) / 'other-checkout' / '.venv'
+            target.mkdir(parents=True)
+            alias = Path(directory) / 'venv-alias'
+            try:
+                alias.symlink_to(target, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f'Directory symlinks unavailable: {error}')
+            local = root / 'local-venv'
+            local.mkdir()
+            venv = root / '.venv'
+            stack.enter_context(patch.object(ci, 'ROOT', root))
+            stack.enter_context(patch.object(ci, 'require_tools'))
+            stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
+            stack.enter_context(patch.object(ci, 'provision_rg'))
+            run = stack.enter_context(patch.object(ci, 'run'))
+            check = stack.enter_context(patch.object(ci.subprocess, 'check_output'))
+            for destination in (target, alias, target.parent / 'missing-venv', local):
+                venv.symlink_to(destination, target_is_directory=True)
+                for action in (ci.setup, ci.python, lambda env: ci.environment(root / 'home')):
+                    with self.subTest(destination=destination, action=action):
+                        with self.assertRaisesRegex(RuntimeError, r'\.venv.*symlink.*Remove the symlink.*bin/ci setup') as caught:
+                            action({})
+                        self.assertIn(str(destination.resolve()), str(caught.exception))
+                        run.assert_not_called()
+                        check.assert_not_called()
+                        self.assertTrue(venv.is_symlink())
+                venv.unlink()
+
     def test_setup_re_resolves_pinned_npm_after_provisioning(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             root = Path(directory)
