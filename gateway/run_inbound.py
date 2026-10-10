@@ -379,7 +379,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         ``.update_response``); None when nothing was consumed. Recognized slash commands must bypass
         this or /new, /help etc. get silently consumed as update answers."""
         _up_state = self._peek_session_state(_quick_key)
-        if _up_state is None or not _up_state.persistent.update_prompt_pending:
+        _up_persistent = getattr(_up_state, "persistent", None) if _up_state is not None else None
+        if _up_persistent is None or not _up_persistent.update_prompt_pending:
             return None
         # Accept /approve and /deny as shorthand for yes/no
         cmd = event.get_command()
@@ -400,7 +401,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             if err is not None:
                 logger.warning("Failed to write update response: %s", err)
                 return t("gateway.update.reply_failed", error=err)
-            _up_state.persistent.update_prompt_pending = False
+            _up_persistent.update_prompt_pending = False
             label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
             return t("gateway.update.reply_sent", label=label)
         # Recognized slash command during a pending update prompt: write a blank response so the
@@ -416,7 +417,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 )
             else:
                 logger.warning("Failed to write cancel response for pending update prompt: %s", err)
-            _up_state.persistent.update_prompt_pending = False
+            _up_persistent.update_prompt_pending = False
         return None
 
     async def _hm_clarify_reply(
@@ -1437,9 +1438,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # The original response was already acknowledged. Returning it
             # here would send it a second time.
             return None
-        if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
-            return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
         alias_text = self._quick_command_alias_text(event)
@@ -1465,6 +1463,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _reply = await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply
+        if self._draining and not self._hm_is_registered_command(event):
+            self._preserve_drain_event(_quick_key, event)
+            return None
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
