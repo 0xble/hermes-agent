@@ -1540,6 +1540,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     """Parse the ``compression`` section. Defaults here MUST match DEFAULT_CONFIG."""
     cfg = _cfg_dict(_agent_cfg, "compression")
     threshold, autoraise_notice_enabled = _compression_threshold(agent, cfg)
+    _default_prune_tokens = int(
+        cfg_get(DEFAULT_CONFIG, "compression", "proactive_prune_tokens", default=0) or 0
+    )
     # Plain int()/float() coercions raise on garbage; evaluated up front, in config order.
     target_ratio = float(cfg.get("target_ratio", 0.20))
     protect_last = int(cfg.get("protect_last_n", 20))
@@ -1576,8 +1579,10 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         # Actionable user messages guaranteed to survive in the tail (default 1, floor 1).
         min_tail_users=max(1, _parse_config_int(cfg.get("min_tail_user_messages", 1), 1)),
         max_attempts=min(max_attempts, 10),
-        # Opt-in proactive tool-result prune trigger (0 = disabled; negatives = disabled).
-        proactive_prune_tokens=max(0, _parse_config_int(cfg.get("proactive_prune_tokens", 0), 0)),
+        # Proactive tool-result prune trigger: absent, null or invalid -> DEFAULT_CONFIG; 0 or negative disables.
+        proactive_prune_tokens=max(0, _parse_config_int(
+            cfg.get("proactive_prune_tokens", _default_prune_tokens), _default_prune_tokens
+        )),
         proactive_prune_min_chars=_parse_config_int(
             cfg.get("proactive_prune_min_result_chars", 8000), 8000
         ),
