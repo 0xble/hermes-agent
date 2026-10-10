@@ -1200,6 +1200,52 @@ def test_cancelled_preflight_settle_is_not_released_again(
     assert [operation[0] for operation in operations] == [expected_operation]
 
 
+@pytest.mark.parametrize("event_kind", ["task_failure", "terminal_fallback"])
+def test_gateway_main_path_acknowledges_exact_outbox_event_and_restart_does_not_replay(
+    monkeypatch, isolated_registry, event_kind,
+):
+    """Gateway admission settles the outbox event, not the delegation lifecycle row."""
+    from tools import async_delegation
+
+    event = _async_event(f"deleg_outbox_{event_kind}")
+    if event_kind == "task_failure":
+        event.update(
+            task_failure_notice=True,
+            is_batch=True,
+            status="running",
+            results=[{"task_index": 0, "status": "error", "error": "worker failed"}],
+        )
+        result = None
+    else:
+        event.update(summary="fallback result")
+        result = {"status": "completed", "summary": event["summary"]}
+    _persist_pending_completion(event)
+    async_delegation._persist_outbox_event(event, result, event_kind=event_kind)
+
+    isolated_registry.completion_queue.put(dict(event))
+    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    runner = _runner(adapter)
+    runner._completion_notification_batch_window = 0
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    with async_delegation._DB_LOCK, async_delegation._transaction() as conn:
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegation_events WHERE event_id=?",
+            (event["_delivery_event_id"],),
+        ).fetchone() == ("delivered",)
+        assert conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone() == ("pending",)
+
+    restart_queue = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restart_queue) == 0
+    assert restart_queue.empty()
+
+
 def test_cancelled_settle_waits_for_queued_worker():
     """Cancellation cannot cancel a durable settle that is queued behind a busy worker."""
     import concurrent.futures

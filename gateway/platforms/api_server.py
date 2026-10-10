@@ -3634,8 +3634,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 conversation_history=history, resume_unanswered_turn=True, **ctx["run_kwargs"])
         is_dict = isinstance(result, dict)
         effective_session_id = result.get("session_id") if is_dict else session_id
-        final_response = _resolve_media_to_data_urls(
-            result.get("final_response", "") if is_dict else "")
+        from gateway.copy_blocks import map_outside_copy_blocks
+        final_response = map_outside_copy_blocks(
+            result.get("final_response", "") if is_dict else "", _resolve_media_to_data_urls)
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
         return web.json_response(
             {"object": "hermes.session.chat.completion",
@@ -3666,6 +3667,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
+        from gateway.copy_blocks import CopyMarkerStreamFilter
+        copy_filter = CopyMarkerStreamFilter()
         # Claim ownership inside the request's profile scope before any run-keyed state
         # exists, so /v1/runs/{id}* control is confined to the starting profile.
         # See #93689.
@@ -3674,8 +3677,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 
         def _delta(delta: str) -> None:
-            if delta:
-                events.enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+            if delta is None:
+                copy_filter.message_boundary()  # a new assistant message starts at a line start
+                return
+            filtered = copy_filter.feed(delta) if delta else ""
+            if filtered:
+                events.enqueue("assistant.delta", {"message_id": message_id, "delta": filtered})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -3711,7 +3718,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     active_run_id=run_id, approval_notify_callback=approval_notify,
                     approval_session_key=run_id, **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
+                from gateway.copy_blocks import map_outside_copy_blocks
+                final_response = map_outside_copy_blocks(
+                    result.get("final_response", "") if is_dict else "", _resolve_media_to_data_urls)
+                trailing = copy_filter.flush()
+                if trailing:
+                    events.enqueue("assistant.delta", {"message_id": message_id, "delta": trailing})
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
                 effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
