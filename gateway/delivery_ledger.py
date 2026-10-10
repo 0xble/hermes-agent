@@ -568,20 +568,25 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed') AND platform=?
                ORDER BY created_at, rowid""", (platform,)).fetchall()
-        # Messages to one chat leave in the order they were recorded: a row waits while any
-        # earlier row for its chat is still outstanding (in flight, or failed and not yet due).
+        # Messages to one chat leave in the order they were recorded: a row waits while an
+        # earlier row of this process for its chat is in flight or will retry soon. A row parked
+        # for boot recovery, abandoned, or owned elsewhere never holds a chat, so the wait is
+        # always bounded by one backoff.
         held_chats: set = set()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
              marker_session_id, marker_token, marker_marked_at, resume_turn_id, state) in rows:
-            if (adapter_profile or "default") != expected_profile:
+            if adapter_profile != expected_profile:
                 continue  # another bot identity: its own order, its own sweep
             chat_key = (chat_id, thread_id)
             if chat_key in held_chats:
                 continue
             # Exact process-start matching prevents PID reuse from stealing work.
-            if state != "failed" or owner_pid != pid or owner_started_at != started:
-                held_chats.add(chat_key)
+            if owner_pid != pid or owner_started_at != started:
+                continue
+            if state != "failed":
+                if state == "attempting":
+                    held_chats.add(chat_key)  # this process is sending it right now
                 continue
             due = retry_not_before(updated_at, last_error, attempts)
             owner_guard = (now, oid, owner_pid, owner_started_at)
@@ -598,8 +603,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
             if due is None:
-                held_chats.add(chat_key)
-                continue
+                continue  # parked for boot recovery or dead: never a runtime predecessor
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations

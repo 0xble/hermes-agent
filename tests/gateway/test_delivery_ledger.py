@@ -333,6 +333,20 @@ class TestRuntimeFailedSweep:
         claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 10_000)
         assert [row["obligation_id"] for row in claimed][:1] == ["ob-1"]
 
+    def test_parked_earlier_row_never_holds_a_later_due_row(self, monkeypatch):
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 202))
+        _record(oid="ob-1", platform="telegram", content="old")
+        time.sleep(0.002)
+        _record(oid="ob-2", platform="telegram", content="new")
+        dl.mark_failed("ob-1", "timed out")
+        dl.mark_failed("ob-2", "flood_control:1")
+        with dl._connect() as conn:
+            # ob-1 kept its last attempt for boot recovery: no runtime deadline at all.
+            conn.execute("UPDATE delivery_obligations SET attempts=2 WHERE obligation_id='ob-1'")
+        claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 5)
+        assert [row["obligation_id"] for row in claimed] == ["ob-2"]
+        assert _row("ob-1")["state"] == "failed"
+
     def test_profile_scope_never_claims_another_bot_identity(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
@@ -449,6 +463,26 @@ class TestGatewayRedeliverySweep:
             return_value=MagicMock(success=success, error="" if success else "nope")
         )
         return adapter
+
+    @pytest.mark.asyncio
+    async def test_one_bots_refusal_never_holds_another_bots_rows(self):
+        from gateway.config import Platform
+        runner = self._runner()
+        bad, good = self._adapter(success=False), self._adapter()
+        runner._obligation_adapter = AsyncMock(side_effect=lambda row: bad if row["profile"] == "a" else good)
+        runner._redelivery_restart_note_event = AsyncMock(return_value=None)
+        runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+        _record(oid="ob-a", platform="telegram", content="from a", adapter_profile="a")
+        _record(oid="ob-b", platform="telegram", content="from b", adapter_profile="b")
+        rows = [{"obligation_id": oid, "platform": "telegram", "chat_id": "C1", "thread_id": "171.001",
+                 "profile": prof, "content": content, "attempts": 1, "session_key": "s"}
+                for oid, prof, content in (("ob-a", "a", "from a"), ("ob-b", "b", "from b"))]
+
+        n = await runner._redeliver_claimed_obligations(rows)
+
+        assert n == 1
+        assert [c.kwargs["content"] for c in good.send.call_args_list] == ["from b"]
+        assert _row("ob-b")["state"] == "delivered"
 
     @pytest.mark.asyncio
     async def test_refused_row_holds_later_rows_for_the_same_chat(self):

@@ -614,7 +614,8 @@ class GatewayStartupMixin:
         redelivered = 0
         blocked_chats: dict = {}
         for row in claimed:
-            chat_key = (row.get("platform"), row.get("chat_id"), row.get("thread_id"))
+            # Ordering is per bot identity: one bot's refusal never holds another bot's messages.
+            chat_key = (row.get("platform"), row.get("profile") or "default", row.get("chat_id"), row.get("thread_id"))
             if chat_key in blocked_chats and not row.get("adopted"):
                 # An earlier message to this chat was refused: sending this one now would put it
                 # ahead of that one. It goes back to failed and is retried after it, in order.
