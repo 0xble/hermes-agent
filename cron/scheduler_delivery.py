@@ -2185,7 +2185,10 @@ def _deliver_result(
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
     from gateway.media_policy import apply_media_policy_env
     apply_media_policy_env(user_cfg)
-    from gateway.copy_blocks import extract_copy_blocks
+    from gateway.copy_blocks import extract_copy_blocks, map_outside_copy_blocks, platform_sends_copy_blocks
+    # Targets that cannot send a block as byte-exact plain text get it inline in the reply.
+    inline_delivery_content = map_outside_copy_blocks(
+        delivery_content or "", lambda part: BasePlatformAdapter.extract_media(part)[1])
     delivery_content, copy_blocks = extract_copy_blocks(delivery_content)
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
@@ -2195,6 +2198,8 @@ def _deliver_result(
     cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
     # Copy blocks leave on every lane below too, so they pass the same redaction boundary.
     copy_blocks = [_redact_cron_payload(block, "copy block") for block in copy_blocks]
+    if copy_blocks:
+        inline_delivery_content = _redact_cron_payload(inline_delivery_content, "delivery content")
     requested_media = len(media_files)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
@@ -2259,14 +2264,17 @@ def _deliver_result(
         if t is None:
             continue
         target_errors: list = []
+        target_content, target_blocks = cleaned_delivery_content, copy_blocks
+        if copy_blocks and not platform_sends_copy_blocks(t.platform_name):
+            target_content, target_blocks = inline_delivery_content, []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
-            t, cleaned_delivery_content, media_files,
+            t, target_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
-            unverified_targets=unverified_targets, copy_blocks=copy_blocks,
+            unverified_targets=unverified_targets, copy_blocks=target_blocks,
         )
         if not delivered:
-            remaining_content = "" if t.live_delivered_text else cleaned_delivery_content
-            remaining_blocks = copy_blocks[t.live_delivered_copy_count:]
+            remaining_content = "" if t.live_delivered_text else target_content
+            remaining_blocks = target_blocks[t.live_delivered_copy_count:]
             _deliver_standalone(
                 t, remaining_content, media_files, target_errors, delivery_errors,
                 copy_blocks=remaining_blocks)

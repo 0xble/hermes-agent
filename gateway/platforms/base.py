@@ -24,7 +24,7 @@ from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
-from gateway.copy_blocks import extract_copy_blocks
+from gateway.copy_blocks import split_copy_blocks_for
 
 logger = logging.getLogger(__name__)
 
@@ -4792,6 +4792,32 @@ class BasePlatformAdapter(ABC):
                     self.name, index + 1, len(copy_blocks), event.source.chat_id,
                     result.error or "unknown delivery error",
                 )
+                # A later block must never overtake an undelivered earlier one. The rest wait in
+                # the ledger behind the failed block, and redelivery keeps their order.
+                await self._defer_copy_blocks(
+                    event, session_key, copy_blocks, index + 1, copy_metadata, delivery_adapter,
+                    str(result.error or "send failed"), record_delivery,
+                    is_ephemeral_response=is_ephemeral_response)
+                return
+
+    async def _defer_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
+        metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        record_delivery: Callable, *, is_ephemeral_response: bool,
+    ) -> None:
+        """Ledger blocks ``start..`` as failed, in order, without sending them."""
+        from gateway.delivery_ledger import mark_failed
+        for index in range(start, len(copy_blocks)):
+            block_metadata = {**metadata, "copy_block_index": index}
+            # Never sent, so the durable outbox will not replay it: the ledger must own it.
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, copy_blocks[index], delivery_adapter, is_ephemeral_response,
+                metadata=block_metadata, outbox_refused=True)
+            if obligation_id is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mark_failed, obligation_id, error)
+            record_delivery(SendResult(
+                success=False, error=f"copy block {index + 1} held behind an undelivered earlier block"))
 
     async def _notify_turn_error(
         self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
@@ -4871,7 +4897,7 @@ class BasePlatformAdapter(ABC):
         pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
         recovered."""
         pre_extract = response
-        response, copy_blocks = extract_copy_blocks(response)
+        response, copy_blocks = split_copy_blocks_for(self, response)
         # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
         force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.

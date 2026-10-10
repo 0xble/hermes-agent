@@ -307,6 +307,13 @@ class CLIStreamMixin:
         if not getattr(self, "_stream_box_live", False):
             self._release_held_status_lines()
 
+    def _turn_copy_filter(self):
+        """The turn's copy-marker filter, created on first use."""
+        copy_filter = getattr(self, "_copy_filter", None)
+        if copy_filter is None:
+            copy_filter = self._copy_filter = CopyMarkerStreamFilter()
+        return copy_filter
+
     def _stream_delta(self, text) -> None:
         """Line-buffered streaming callback for real-time token rendering.
 
@@ -324,12 +331,16 @@ class CLIStreamMixin:
             self._loop_complete_hold = ""
             if held:
                 self._emit_unheld(held)
-            self._flush_stream()
+            self._flush_stream(turn_end=False)
+            # The copy filter spans the whole turn: a block, fence, or held partial marker
+            # line may continue after the tool call.
+            copy_filter = self._turn_copy_filter()
             self._reset_stream_state()
+            self._copy_filter = copy_filter
             return
         if not text:
             return
-        text = self._copy_filter.feed(text)
+        text = self._turn_copy_filter().feed(text)
         if not text:
             return
         if getattr(self, "_silence_hold_active", False):
@@ -560,7 +571,7 @@ class CLIStreamMixin:
             except Exception:
                 pass
 
-    def _flush_stream(self) -> None:
+    def _flush_stream(self, *, turn_end: bool = True) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
         from agent.markdown_tables import is_table_divider, looks_like_table_row
         from cli import _ACCENT, _RST, _cprint, _strip_markdown_syntax
@@ -574,7 +585,9 @@ class CLIStreamMixin:
         # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
         # anything else held (a partial prefix, a marker inside an open fence) is content.
         self._resolve_loop_complete_hold()
-        copy_tail = self._copy_filter.flush()
+        # Only the turn's end resolves a held copy-marker line; at a tool boundary it may
+        # still complete in the next segment.
+        copy_tail = self._turn_copy_filter().flush() if turn_end else ""
         if copy_tail:
             self._emit_unheld(copy_tail)
         # Still inside a "reasoning block" at end-of-stream = false positive (the model
@@ -737,7 +750,7 @@ class CLIStreamMixin:
         cleared when a tool actually starts (``tool.started``), i.e. on the next batch."""
         from cli import _cprint
         if getattr(self, '_stream_box_opened', False):
-            self._flush_stream()
+            self._flush_stream(turn_end=False)
             self._stream_box_opened = False
         self._close_reasoning_box()
         announced = self.__dict__.setdefault("_tool_gen_announced", set())

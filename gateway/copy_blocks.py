@@ -183,6 +183,31 @@ class CopyMarkerStreamFilter:
         return pending
 
 
+# Platforms whose adapter sends a ``copy_block`` payload byte-exact as plain text. Every other
+# platform formats outbound text, so its copy blocks stay inline in the ordinary reply instead.
+PLAIN_COPY_PLATFORMS = frozenset({"telegram"})
+
+
+def platform_sends_copy_blocks(platform) -> bool:
+    return str(getattr(platform, "value", platform) or "").lower() in PLAIN_COPY_PLATFORMS
+
+
+def adapter_sends_copy_blocks(adapter) -> bool:
+    return platform_sends_copy_blocks(getattr(adapter, "platform", None))
+
+
+def split_copy_blocks_for(adapter, text: str) -> tuple[str, list[str]]:
+    """Separate copy blocks where *adapter* can send them plain, else render them inline."""
+    if adapter_sends_copy_blocks(adapter):
+        return extract_copy_blocks(text)
+    return render_copy_blocks_inline(text), []
+
+
+def copy_free_text_for(adapter, text: str) -> str:
+    """The streamed body *adapter* shows: bodies removed where they go out separately."""
+    return strip_copy_blocks(text) if adapter_sends_copy_blocks(adapter) else render_copy_blocks_inline(text)
+
+
 def strip_copy_blocks(text: str) -> str:
     """Return *text* without copy blocks, for display surfaces that send them separately."""
     return extract_copy_blocks(text)[0]

@@ -612,7 +612,15 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
+        blocked_chats: dict = {}
         for row in claimed:
+            chat_key = (row.get("platform"), row.get("chat_id"), row.get("thread_id"))
+            if chat_key in blocked_chats and not row.get("adopted"):
+                # An earlier message to this chat was refused: sending this one now would put it
+                # ahead of that one. It goes back to failed and is retried after it, in order.
+                await self._release_runtime_claim_quiet(
+                    row["obligation_id"], "failed to release held obligation %s", error=blocked_chats[chat_key])
+                continue
             if row.get("adopted"):
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
@@ -656,8 +664,9 @@ class GatewayStartupMixin:
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
+                    blocked_chats[chat_key] = str(getattr(result, "error", "") or "send failed")
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["obligation_id"], blocked_chats[chat_key]
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.

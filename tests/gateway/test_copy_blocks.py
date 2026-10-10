@@ -242,6 +242,7 @@ async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
         record(SimpleNamespace(success=True))
 
     adapter = SimpleNamespace(
+        platform="telegram",
         _streaming_tts_turn_completed=lambda *_args, **_kwargs: False,
         _send_copy_blocks=send_copy_blocks,
     )
@@ -320,6 +321,7 @@ async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_never_resend_del
 
     runner = object.__new__(GatewayNotificationsMixin)
     adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
     adapter._final_delivery_adapter = lambda _source: adapter
     adapter.gateway_runner = None
     rows = []
@@ -352,7 +354,8 @@ async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_never_resend_del
     # The reply text landed, so the caller must not replay the whole response: the refused
     # blocks each hold their own failed ledger row and are redelivered from there.
     assert delivered is True
-    assert [content for content, _metadata in sends] == ["same", "same", "same"]
+    # Block 1 was refused, so block 2 is held unsent behind it instead of overtaking it.
+    assert [content for content, _metadata in sends] == ["same", "same"]
     copy_rows = [row for row in rows if row["content"] == "[[copy]]\nsame\n[[/copy]]"]
     assert len(copy_rows) == 2
     reply_rows = [row for row in rows if row["content"] == "same"]
@@ -374,3 +377,44 @@ async def test_copy_blocks_propagate_ephemeral_ttl_and_delete() -> None:
         is_ephemeral_response=True, ephemeral_ttl=7,
     )
     assert deletes == [("chat", "id-one", 7)]
+
+
+def test_platforms_without_plain_copy_send_keep_blocks_inline() -> None:
+    from gateway.copy_blocks import copy_free_text_for, split_copy_blocks_for
+    text = "Intro\n[[copy]]\n**exact** text\n[[/copy]]\nAfter\n"
+    telegram = SimpleNamespace(platform="telegram")
+    discord = SimpleNamespace(platform="discord")
+    assert split_copy_blocks_for(telegram, text) == ("Intro\nAfter\n", ["**exact** text"])
+    assert split_copy_blocks_for(discord, text) == ("Intro\n**exact** text\nAfter\n", [])
+    assert copy_free_text_for(telegram, text) == "Intro\nAfter\n"
+    assert copy_free_text_for(discord, text) == "Intro\n**exact** text\nAfter\n"
+
+
+@pytest.mark.asyncio
+async def test_failed_copy_block_holds_later_blocks_in_order(monkeypatch) -> None:
+    import gateway.delivery_ledger as ledger
+
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    adapter._final_delivery_adapter = lambda _source: adapter
+    adapter.gateway_runner = None
+    rows, failed, sends, results = [], [], [], []
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "record_obligation", lambda **kwargs: rows.append(kwargs))
+    monkeypatch.setattr(ledger, "mark_attempting", lambda _oid: None)
+    monkeypatch.setattr(ledger, "mark_delivered", lambda _oid: None)
+    monkeypatch.setattr(ledger, "mark_failed", lambda oid, _error: failed.append(oid))
+
+    async def send_with_retry(*, chat_id, content, reply_to, metadata):
+        sends.append(content)
+        return SimpleNamespace(success=content != "two", message_id=None, pre_send=True, error="blocked")
+
+    adapter._send_with_retry = send_with_retry
+    source = SimpleNamespace(chat_id="chat", platform="telegram", thread_id=None)
+    event = SimpleNamespace(source=source, message_id="m", ledger_message_id="m", text="")
+    await adapter._send_copy_blocks(event, "session", ["one", "two", "three", "four"], {}, results.append)
+
+    assert sends == ["one", "two"]
+    assert [row["content"] for row in rows] == [f"[[copy]]\n{b}\n[[/copy]]" for b in ("one", "two", "three", "four")]
+    assert len(failed) == 3 and len(set(failed)) == 3
+    assert [getattr(r, "success", None) for r in results] == [True, False, False, False]

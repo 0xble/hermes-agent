@@ -638,8 +638,8 @@ class GatewayNotificationsMixin:
         from gateway.run import _strip_response_attachments_for_direct_send
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
-        from gateway.copy_blocks import extract_copy_blocks
-        response_without_copy, copy_blocks = extract_copy_blocks(response)
+        from gateway.copy_blocks import split_copy_blocks_for
+        response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response_without_copy, adapter)
             if text_content:

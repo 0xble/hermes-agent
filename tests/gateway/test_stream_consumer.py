@@ -1184,6 +1184,8 @@ class TestUtf16OverflowDetection:
         # abstract methods set after class creation.
         TelegramLikeAdapter.__abstractmethods__ = frozenset()
         adapter = TelegramLikeAdapter.__new__(TelegramLikeAdapter)
+        from gateway.config import Platform
+        adapter.platform = Platform.TELEGRAM
         adapter._typing_paused = set()
         adapter._fatal_error_message = None
         return adapter
@@ -1641,6 +1643,7 @@ class TestStreamedReconcileEditsOmitCopyBlocks:
     def test_reconcile_edit_never_carries_copy_syntax(self, transformed):
         from gateway.run_turn import GatewayTurnMixin
         adapter = MagicMock()
+        adapter.platform = "telegram"
         adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
         consumer = SimpleNamespace(
             adapter=adapter, message_id="m1", final_content_delivered=True,

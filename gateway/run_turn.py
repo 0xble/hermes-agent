@@ -1955,8 +1955,8 @@ class GatewayTurnMixin:
                 ephemeral_ttl = int(agent_result.get("ephemeral_ttl", getattr(event, "_ephemeral_ttl", 0)) or 0)
             except (TypeError, ValueError):
                 ephemeral_ttl = 0
-        from gateway.copy_blocks import extract_copy_blocks, render_copy_blocks_inline
-        response_without_copy, copy_blocks = extract_copy_blocks(response) if response else (response, [])
+        from gateway.copy_blocks import render_copy_blocks_inline, split_copy_blocks_for
+        response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response) if response else (response, [])
         if agent_result.get("interrupted") and response:
             # An interrupted model may end inside a copy block. Never promote that partial
             # fragment to a separate copy message; inline degradation also keeps markers hidden.
@@ -2635,8 +2635,8 @@ class GatewayTurnMixin:
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
             images, media_files, text_content = [], [], ""
-            from gateway.copy_blocks import extract_copy_blocks
-            response, copy_blocks = extract_copy_blocks(response)
+            from gateway.copy_blocks import split_copy_blocks_for
+            response, copy_blocks = split_copy_blocks_for(adapter, response)
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -4205,8 +4205,8 @@ class GatewayTurnMixin:
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
         # The streamed message is the body only; copy blocks go out as separate messages.
-        from gateway.copy_blocks import strip_copy_blocks
-        content = strip_copy_blocks(content or "")
+        from gateway.copy_blocks import copy_free_text_for
+        content = copy_free_text_for(_sc.adapter, content or "")
         try:
             _res = await _sc.adapter.edit_message(
                 chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,

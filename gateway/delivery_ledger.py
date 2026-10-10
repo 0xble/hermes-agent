@@ -479,7 +479,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
                       resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+               ORDER BY created_at, rowid"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
@@ -563,7 +564,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                       owner_started_at, last_error, adapter_profile, updated_at,
                       resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+               WHERE state='failed' AND platform=?
+               ORDER BY created_at, rowid""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
              marker_session_id, marker_token, marker_marked_at, resume_turn_id) in rows:

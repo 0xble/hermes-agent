@@ -435,6 +435,23 @@ class TestGatewayRedeliverySweep:
         return adapter
 
     @pytest.mark.asyncio
+    async def test_refused_row_holds_later_rows_for_the_same_chat(self):
+        for oid, content in (("ob-1", "first"), ("ob-2", "second"), ("ob-3", "third")):
+            _record(oid, content=content)
+            _orphan(oid)
+            time.sleep(0.002)  # distinct created_at, so replay order is the recorded order
+        adapter = self._adapter(success=False)
+        runner = self._runner(adapter)
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        assert [c.kwargs["content"] for c in adapter.send.call_args_list] == ["first"]
+        # Later messages were never sent ahead of the refused one; all three wait to retry in order.
+        assert [_row(oid)["state"] for oid in ("ob-1", "ob-2", "ob-3")] == ["failed"] * 3
+        assert _row("ob-2")["attempts"] == 0 and _row("ob-3")["attempts"] == 0
+
+    @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
         _record()  # pending
         _orphan("ob-1")
