@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 from gateway import response_filters
 from gateway.response_filters import (
+    apply_agent_origin_reply_expectation,
     is_agent_origin_text,
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
@@ -7,18 +10,23 @@ from gateway.response_filters import (
 )
 
 
-def test_registered_agent_origin_headers_match_only_as_the_first_full_line():
+def test_registered_agent_origin_headers_match_only_at_message_edges():
     header = "[relay from=agent@example.com receipt=receipt-1]"
     assert is_agent_origin_text(header)
     assert is_agent_origin_text(f"  \n{header}\nbody")
     assert is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1 task=task-1]\nbody")
-    assert not is_agent_origin_text(f"body\n{header}")
+    assert is_agent_origin_text(f"body\n{header}")
+    assert is_agent_origin_text(f"**Title**\n\n> quoted body\n> more quote\n\n{header}\n\n")
+    assert not is_agent_origin_text(f"body\n{header}\nmore")
     assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1")
     assert not is_agent_origin_text("[relay from=agent@example.com receipt=receipt-1 extra=value]" )
-    assert not is_agent_origin_text("body\n[relay from=x receipt=y]\n\n[relay from=z receipt=q]")
     # Same value class as relay's own parser: a value may not contain "]".
     assert not is_agent_origin_text("[relay from=a] receipt=b]\nbody")
     assert is_agent_origin_text("[relay from=hermes:default/20261005_123248_1ad0e297 receipt=59666700-260a-4356-8533-8d889ca51de4]\nbody")
+
+    addressed = SimpleNamespace(text=f"body\n{header}\n\n", reply_expected=True)
+    assert apply_agent_origin_reply_expectation(addressed) is addressed
+    assert addressed.reply_expected is True
 
 
 def test_exact_silence_tokens_are_intentional_silence():
