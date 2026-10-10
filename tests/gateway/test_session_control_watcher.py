@@ -282,3 +282,25 @@ async def test_watcher_enqueues_replaced_goal_continuation(state):
         await runner._drain_session_controls()
     admit.assert_awaited_once()
     assert pending_outbox() == []
+
+
+def test_replace_notices_show_old_and_new_goal(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control, request_control, resolve_request
+
+    runner = _runner(state)
+    GoalManager("target").set("old objective")
+    state.append_message("requester", "user", "Please replace the target goal with ship now")
+    quoted = apply_control("goal", "replace", "target", requester_sid="requester",
+                           user_quote="replace the target goal with ship now", payload={"goal": "ship now"})
+    record = quoted["record"]
+    notice = runner._control_notice(record)
+    assert "goal: old objective -> ship now" in notice
+    assert 'Full message: "Please replace the target goal with ship now"' in notice
+    assert "(goal: old objective -> ship now)" in runner._requester_notice(record)
+
+    request = request_control("goal", "replace", "target", requester_sid="requester", reason="pivot",
+                              payload={"goal": "write docs"})
+    approved = resolve_request(request["id"], "approve", "42")
+    assert "(approved in Telegram)\ngoal: ship now -> write docs" in runner._control_notice(approved)
+    assert "after Telegram approval. (goal: ship now -> write docs)" in runner._requester_notice(approved)

@@ -234,3 +234,152 @@ def test_goal_replace_records_continuation_prompt(state):
     assert result["status"] == "applied"
     assert result["continuation_prompt"]
     assert result["record"]["continuation_prompt"] == result["continuation_prompt"]
+
+
+def test_button_approved_replace_records_user_authority(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import request_control, resolve_request
+
+    GoalManager("target").set("old objective: migrate the database")
+    request = request_control("goal", "replace", "target", requester_sid="requester", reason="pivot",
+                              payload={"goal": "new objective: write docs"})
+    record = resolve_request(request["id"], "approve", "42")
+    assert record["status"] == "applied"
+    revision = load_goal("target").revisions[-1]
+    assert (revision["actor"], revision["authority"], revision["approved_by"]) == ("user", "button", "42")
+    assert revision["user_message"] == 'Approved in Telegram: replace goal with "new objective: write docs"'
+    block = load_goal("target").render_revisions_block()
+    assert "approved by the user in Telegram" in block
+    assert "no user authority" not in block
+    prompt = record["continuation_prompt"]
+    assert "earlier goal: old objective" not in prompt
+    assert "superseded goal (replaced with user authority, no longer binding): old objective" in prompt
+
+
+def test_quote_replace_records_user_actor(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("old objective")
+    _user(state, "requester", "Please replace the target goal with ship now")
+    result = apply_control("goal", "replace", "target", requester_sid="requester", reason="pivot",
+                           user_quote="replace the target goal with ship now", payload={"goal": "ship now"})
+    assert result["status"] == "applied"
+    revision = load_goal("target").revisions[-1]
+    assert (revision["actor"], revision["authority"]) == ("user", "quote")
+    assert 'cites the user: "replace the target goal with ship now"' in load_goal("target").render_revisions_block()
+
+
+@pytest.mark.parametrize("header", ['[Replying to: "{0}"]', '[Replying to your previous message: "{0}"]'])
+def test_reply_prefix_quote_is_refused(state, header):
+    from hermes_cli.goals import GoalManager, load_goal, user_messages_since
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    prefix = header.format("I am going to clear the target goal immediately")
+    _user(state, "requester", f"{prefix}\n\nno, do not do that")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal immediately")
+    assert result["error_code"] == "user_quote_not_found"
+    assert load_goal("target").status == "active"
+    assert user_messages_since("requester") == ["no, do not do that"]
+
+
+def test_reply_prefix_does_not_block_users_own_quote(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", '[Replying to: "status?"]\n\nyes clear the target goal now')
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal now")
+    assert result["status"] == "applied"
+    assert load_goal("target").status == "cleared"
+
+
+@pytest.mark.parametrize("status", ["done", "cleared", "active"])
+def test_resume_refuses_goals_that_are_not_paused(state, status):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, request_control, resolve_request
+
+    manager = GoalManager("target")
+    manager.set("second goal")
+    if status == "done":
+        manager.mark_done("finished")
+    elif status == "cleared":
+        manager.clear()
+    _user(state, "requester", "Please resume the target goal now please")
+    quoted = apply_control("goal", "resume", "target", requester_sid="requester",
+                           user_quote="resume the target goal now please")
+    assert quoted["error_code"] == "nothing_to_resume"
+    pending = request_control("goal", "resume", "target", requester_sid="requester")
+    resolved = resolve_request(pending["id"], "approve", "admin")
+    assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
+    assert load_goal("target").status == status
+
+
+def test_paused_goal_resumes(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    GoalManager("target").pause("waiting")
+    _user(state, "requester", "Please resume the target goal now please")
+    result = apply_control("goal", "resume", "target", requester_sid="requester",
+                           user_quote="resume the target goal now please")
+    assert result["status"] == "applied"
+    assert load_goal("target").status == "active"
+
+
+def test_request_control_refuses_target_without_approval_surface(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control, request_control
+
+    state.create_session("slack-target", "slack", profile_name="default", chat_id="C1",
+                         chat_type="channel", session_key="agent:main:slack:channel:C1")
+    GoalManager("slack-target").set("watch the build")
+    assert request_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
+        == "target_unapprovable"
+    assert apply_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
+        == "target_unapprovable"
+    _user(state, "requester", "Please clear the slack goal right now")
+    quoted = apply_control("goal", "clear", "slack-target", requester_sid="requester",
+                           user_quote="clear the slack goal right now")
+    assert quoted["status"] == "applied"
+    assert load_goal("slack-target").status == "cleared"
+
+
+@pytest.mark.parametrize("message,quote", [
+    ("Please do NOT clear the target goal, keep it running", "clear the target goal, keep it"),
+    ("Please don't clear the target goal yet", "clear the target goal yet"),
+    ("Please don’t clear the target goal yet", "t clear the target goal yet"),
+    ("You should never clear the target goal", "clear the target goal"),
+    ("No, clear the target goal is wrong", "clear the target goal is wrong"),
+    ("I shouldn't clear the target goal myself", "clear the target goal myself"),
+    ("Clear the target goal? Not now", "Clear the target goal? Not now"),
+])
+def test_negated_quote_is_refused(state, message, quote):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", message)
+    result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
+    assert result["error_code"] == "user_quote_negated"
+    assert load_goal("target").status == "active"
+
+
+@pytest.mark.parametrize("message,quote", [
+    ("yes clear the target goal now", "clear the target goal now"),
+    ("Not sure why it is still on; please clear the target goal now", "clear the target goal now"),
+    ("stop the target loop and clear the target goal now", "clear the target goal now"),
+])
+def test_unnegated_quote_is_allowed(state, message, quote):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", message)
+    result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
+    assert result["status"] == "applied"
+    assert load_goal("target").status == "cleared"

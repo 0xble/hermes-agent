@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, Optional, Tuple
 
 from hermes_cli.goals import (
+    _REPLY_QUOTE_RE,
     _REVISION_QUOTE_MIN_CHARS,
     _REVISION_SOURCE_MAX_CHARS,
     _get_session_db,
@@ -68,6 +69,39 @@ def resolve_target(target: str) -> str:
     return raw
 
 
+# Deterministic negation guard: a quoted span preceded (within three words) by, or containing, one
+# of these tokens is refused so "do NOT clear the goal" cannot authorize a clear. "stop" is not a
+# negation: it is itself a control verb.
+_NEGATION_TOKENS = frozenset({"not", "don't", "dont", "never", "no", "shouldn't", "shouldnt",
+                              "can't", "cant", "cannot", "won't", "wont", "didn't", "didnt", "doesn't"})
+_NEGATION_WINDOW_WORDS = 3
+
+
+def _negation_words(text: str) -> list[str]:
+    return [w.replace("\u2019", "'").strip(".,;:!?\"'()[]").lower() for w in text.split()]
+
+
+def _is_negated(quote: str, source: str) -> bool:
+    """True when the quote contains a negation or one appears within 3 words before it."""
+    def negates(words: list[str]) -> bool:
+        return any(w in _NEGATION_TOKENS for w in words)
+
+    if negates(_negation_words(quote)):
+        return True
+    start = 0
+    while True:
+        idx = source.find(quote, start)
+        if idx < 0:
+            return False
+        prefix = source[:idx]
+        if idx and not source[idx - 1].isspace():
+            # The quote starts mid-word ("t clear ..." inside "don't clear ..."): judge the whole word.
+            prefix += quote.split(" ", 1)[0]
+        if negates(_negation_words(prefix)[-_NEGATION_WINDOW_WORDS:]):
+            return True
+        start = idx + 1
+
+
 def check_user_quote(requester_session_id: str, quote: str) -> Tuple[str, str] | str:
     """Validate a quote against only the requester's latest typed user message."""
     normalized = _normalize(quote)
@@ -92,11 +126,14 @@ def check_user_quote(requester_session_id: str, quote: str) -> Tuple[str, str] |
         raise
     except Exception:
         return "user_quote_not_found"
-    source = _normalize(source_raw)
+    # The gateway reply pointer repeats the assistant's words; only the user's own text authorizes.
+    source = _normalize(_REPLY_QUOTE_RE.sub("", source_raw, count=1))
     if len(source) > _REVISION_SOURCE_MAX_CHARS:
         return "user_message_too_long"
     if normalized not in source:
         return "user_quote_not_found"
+    if _is_negated(normalized, source):
+        return "user_quote_negated"
     return normalized, source
 
 
@@ -143,7 +180,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid)
-        if manager.state is None or manager.state.status == "cleared":
+        # Only a paused goal resumes: never revive a done/cleared goal or re-arm an active one.
+        if manager.state is None or manager.state.status != "paused":
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
@@ -243,6 +281,20 @@ def _approved_authority(authority: Optional[Dict[str, Any]]):
         _CURRENT_AUTHORITY.reset(token)
 
 
+# Platforms whose adapter renders Approve/Deny buttons for ``send_control_request``.
+_APPROVABLE_SOURCES = frozenset({"telegram"})
+
+
+def _session_source(session_id: str) -> str:
+    db = _db()
+    row = db.get_session(session_id) if db is not None else None
+    return str((row or {}).get("source") or "").strip().lower()
+
+
+def _has_approval_surface(session_id: str) -> bool:
+    return _session_source(session_id) in _APPROVABLE_SOURCES
+
+
 def _has_gateway_route(session_id: str) -> bool:
     db = _db()
     if db is None:
@@ -270,6 +322,8 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
     target_sid = resolve_target(target_sid)
     if not _has_gateway_route(target_sid):
         return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
+    if not _has_approval_surface(target_sid):
+        return {"ok": False, "error_code": "target_unapprovable", "error": "target_unapprovable"}
     now = _now()
     record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                          authority={"via": "button", "user_id": None}, status="pending", now=now,

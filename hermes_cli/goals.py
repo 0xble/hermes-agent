@@ -780,7 +780,9 @@ class GoalState:
         for i, rev in enumerate(self.revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
-            if quote:
+            if rev.get("authority") == "button":
+                authority = "approved by the user in Telegram" + (f" ({source})" if source else "")
+            elif quote:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
             else:
                 authority = "agent, no user authority"
@@ -788,8 +790,13 @@ class GoalState:
             changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
             lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
                          f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}")
+            # A user-authorized replacement supersedes the old objective; label it so it is not read as binding.
+            superseded = rev.get("kind") == "replace" and rev.get("actor") == "user"
             for key in changed:
-                if key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
+                if superseded and key == "goal":
+                    lines.append(f"    superseded goal (replaced with user authority, no longer binding): "
+                                 f"{str(before.get(key) or '(empty)')}")
+                elif key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
                     lines.append(f"    earlier {key}: {str(before.get(key) or '(empty)')}")
                 elif key == "subgoals":
                     dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
@@ -2086,7 +2093,10 @@ def _is_user_typed(row: Dict[str, Any]) -> bool:
     except Exception:  # pragma: no cover - compressor is part of the runtime
         pass
     return True
-_REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
+# Gateway reply pointer (gateway/run_inbound.py ``_prepend_inbound_reply_context``), with or without
+# " your previous message". Greedy to the last ``"]`` line end: the quoted text is the assistant's
+# words and may itself contain ``"]``, so stripping too much fails closed for quote authority.
+_REPLY_QUOTE_RE = re.compile(r'^\[Replying to(?: your previous message)?: ".*"\]\n\s*', re.DOTALL)
 
 
 _REVISION_QUOTE_MIN_CHARS = 12
@@ -2394,6 +2404,11 @@ class GoalManager:
             except ValueError as exc:
                 code = str(exc)
                 return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}
+        elif authority.get("via") == "button":
+            # Button approval is the user's authority: record who approved what so the judge and
+            # continuation treat the old goal as superseded rather than as an agent-only change.
+            quote = ""
+            source = f'Approved in Telegram: replace goal with "{goal}"'
         else:
             source = str(authority.get("message") or "")
         if user_messages is not None and source == "" and user_messages:
@@ -2407,6 +2422,11 @@ class GoalManager:
                  "contract": new_contract, "status": "active", "subgoals": []}
         revision = {"kind": "replace", "before": before, "after": after, "user_quote": quote,
                     "user_message": source, "reason": reason, "at": time.time(), "actor": "agent"}
+        if authority and authority.get("via") in {"quote", "button"}:
+            revision["actor"] = "user"
+            revision["authority"] = authority["via"]
+            if authority["via"] == "button":
+                revision["approved_by"] = str(authority.get("user_id") or "")
         revisions = list(old.revisions) + [revision]
         self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=time.time(),
                                 max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),

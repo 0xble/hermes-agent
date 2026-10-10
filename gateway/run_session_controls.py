@@ -284,9 +284,12 @@ class GatewaySessionControlsMixin:
             "pause": "paused", "resume": "resumed", "clear": "cleared", "stop": "stopped",
             "replace": "replaced",
         }.get(action, action)
+        change = f"\n{record['affected_text']}" if action == "replace" and record.get("affected_text") else ""
         if quote:
-            return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\")"
-        return f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram)"
+            message = str((record.get("authority") or {}).get("message") or "")
+            full = f"\nFull message: \"{message}\"" if message and message != quote else ""
+            return f"⊘ {kind.title()} {verb} by {requester} (your words: \"{quote}\"){change}{full}"
+        return f"⊘ {kind.title()} {verb} by {requester} (approved in Telegram){change}"
 
     @classmethod
     def _requester_notice(cls, record: dict) -> str:
@@ -299,7 +302,9 @@ class GatewaySessionControlsMixin:
                 how = "using your quoted words"
             else:
                 how = "after Telegram approval"
-            return f"✓ Your request to {action} in {target} was applied {how}."
+            change = (f" ({record['affected_text']})"
+                      if record.get("action") == "replace" and record.get("affected_text") else "")
+            return f"✓ Your request to {action} in {target} was applied {how}.{change}"
         if record.get("status") == "denied":
             return f"✗ Your request to {action} in {target} was denied."
         if record.get("status") == "expired":
