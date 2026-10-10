@@ -1221,18 +1221,18 @@ def _barrier_lift_note(state: Optional["GoalState"]) -> str:
         sid = state.waiting_on_session
         outcome = _process_outcome(sid)
         if outcome is None:
-            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} is no longer tracked, most likely because "
-                    "the gateway restarted. Its outcome is unknown; verify the real state before relying on it "
-                    "and do not assume it succeeded.]")
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} is no longer tracked and its outcome "
+                    "is unknown. Check its output or artifacts and verify the real state before rerunning; "
+                    "do not assume it succeeded.]")
         if outcome.get("running"):
             return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} is still running after "
                     f"{_MAX_BARRIER_WAIT_S // 60} minutes. Check its progress before waiting again.]")
         if outcome.get("completion_reason") == "killed":
-            cause = ("a gateway restart or shutdown" if outcome.get("termination_source") == "kill_all"
-                     else "an explicit kill")
-            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} was killed by {cause} before it finished "
+            status = ("stopped" if outcome.get("termination_source") in {"kill_all", "gateway_shutdown"}
+                      else "was killed by an explicit kill")
+            return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} {status} before it finished "
                     f"(exit {outcome.get('exit_code')}). Its result is incomplete; check it with the process "
-                    "tool and verify the real state before deciding whether to restart that work.]")
+                    "tool and verify the real state before deciding whether to rerun that work.]")
         return (f"{GOAL_WAIT_LIFTED_NOTE_OPEN}background process {sid} finished "
                 f"({outcome.get('completion_reason') or 'exited'}, exit {outcome.get('exit_code')}). "
                 "Read its output with the process tool before continuing.]")

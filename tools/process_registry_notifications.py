@@ -184,7 +184,7 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     (r,) = (evt.get("results") or [{}])[:1] or [{}]
     goals, idx, n = evt.get("goals") or [], r.get("task_index", 0), evt.get("n_tasks") or len(evt.get("goals") or [])
     goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-    err = str(r.get("error") or "").strip().replace("\n", " ")[:400]
+    err = str(_outcome_only_stop_detail(r.get("error")) or "").strip().replace("\n", " ")[:400]
     lines = [
         f"{DELEGATION_NOTICE_OPEN}TASK FAILED — {deleg_id}, task {idx + 1}/{n}]",
         "One subagent in a background fan-out you dispatched has failed while its siblings are still running. "
@@ -198,12 +198,24 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def _outcome_only_stop_detail(detail):
+    """Keep lifecycle causes in diagnostic metadata, not in model-facing prose."""
+    if not isinstance(detail, str):
+        return detail
+    reason = detail.strip().casefold()
+    if reason in {"shutdown", "gateway_shutdown", "gateway shutdown", "gateway restart",
+                  "gateway shutting down", "gateway restarting"} or (
+            reason.startswith("gateway shutdown (") and reason.endswith(")")):
+        return "stopped before finishing"
+    return detail
+
+
 def _recovery_lines(evt: dict) -> "list[str]":
     """Owner-died recovery diagnostics (``recover_abandoned_delegations``): last persisted
     status, per-task transcript paths, their verbatim tails and the owner's git state."""
     if not evt.get("last_known_status"):
         return []
-    lines = [f"Last persisted unit status: {evt['last_known_status']} (before owner exit; not current liveness). "
+    lines = [f"Last persisted unit status: {evt['last_known_status']} (historical; not current liveness). "
              "Unrecorded outcomes remain unknown; inspect evidence before retrying side effects."]
     tails = evt.get("transcript_tails") or {}
     for index, path in (evt.get("task_transcripts") or {}).items():
@@ -233,18 +245,18 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
     if evt.get("error") and not results:
-        lines += ["--- ERROR ---", f"The batch did not complete successfully: {evt['error']}"]
+        lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
     # Config-level rejection notice BEFORE the per-task wall — a rejected
     # delegation model fails every task identically and must not stay buried.
     lines += _notice_lines(results)
     for r in sorted(results, key=lambda x: x.get("task_index", 0)):
         idx, r_truncated = r.get("task_index", 0), _is_truncated(r)
-        r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), r.get("error")
+        r_status, r_summary, r_error = r.get("status", "?"), r.get("summary"), _outcome_only_stop_detail(r.get("error"))
         r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
         icon = "⚠" if r_truncated else ("✓" if r_status in _DONE else "✗")
         header = (f"--- {icon} TASK {idx + 1}/{n}" + (f": {r_goal}" if r_goal else "") + f"  (status={r_status}"
-                  + (f", reason={r['interrupt_reason']}" if r.get("interrupt_reason") else "")
+                  + (f", reason={_outcome_only_stop_detail(r['interrupt_reason'])}" if r.get("interrupt_reason") else "")
                   + (f", api_calls={r['api_calls']}" if r.get("api_calls") else "")
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
@@ -294,7 +306,7 @@ def _format_async_delegation(evt: dict) -> str:
         return _format_task_failure_notice(evt, deleg_id)
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
-    status, summary, error = evt.get("status") or "completed", evt.get("summary"), evt.get("error")
+    status, summary, error = evt.get("status") or "completed", evt.get("summary"), _outcome_only_stop_detail(evt.get("error"))
     truncated = _is_truncated(evt)
     lines = _preamble(
         evt,
@@ -425,9 +437,15 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
             + (f' Task: "{goal}"' if goal else ""))
 
 
+def _routine_process_stop(evt: dict) -> bool:
+    return evt.get("completion_reason") == "killed" and evt.get("termination_source") == "gateway_shutdown"
+
+
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
     if reason == "killed":
+        if _routine_process_stop(evt):
+            return "stopped before it finished"
         return f"terminated by {evt.get('termination_source') or 'Hermes'}"
     return _REASON_STATUS.get(reason) or ("completed normally" if evt.get("exit_code", "?") == 0 else "exited")
 
@@ -466,7 +484,10 @@ def _format_process_notification_payload(evt: dict) -> "str | None":
             + (f"\n({_sup} earlier matches were suppressed by rate limit)" if _sup else "") + "]")
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
-    _signal = ", SIGTERM" if _exit in {-15, 143, "-15", "143"} else ""
+    _routine_stop = _routine_process_stop(evt)
+    _signal = "" if _routine_stop else (", SIGTERM" if _exit in {-15, 143, "-15", "143"} else "")
+    _retry = ("It did not complete. If its result is still needed, rerun it; "
+              "reconcile any non-idempotent effect first.\n" if _routine_stop else "")
     # A subagent-owned process's full output belongs in the child's transcript, not as
     # a raw wall in the parent — trim hard but keep enough tail to recognise failures.
     if _attribution and isinstance(_out, str) and len(_out) > 600:
@@ -480,7 +501,7 @@ def _format_process_notification_payload(evt: dict) -> "str | None":
                 f"session_id=\"{_sid}\") has the full output)\n{_out}")
     return (
         f"{PROCESS_NOTICE_OPEN}Background process {_sid} {_completion_status(evt)} (exit code {_exit}{_signal}).\n"
-        f"{attribution}Command: {_cmd}\nOutput:\n{_out}]")
+        f"{_retry}{attribution}Command: {_cmd}\nOutput:\n{_out}]")
 
 
 def format_process_notification(evt: dict) -> "str | None":

@@ -188,7 +188,9 @@ async def test_watcher_resumes_goal_parked_on_restart_killed_process(hermes_home
     assert len(adapter.handled) == 1
     event = adapter.handled[0]
     assert event.text.startswith("[Continuing toward your standing goal]")
-    assert f"{PROC} was killed by a gateway restart" in event.text
+    assert f"{PROC} stopped before it finished" in event.text
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in event.text.lower()
     assert event.metadata["gateway_session_key"] == KEY
     assert event.source.message_id is None
     assert adapter.sent == ["▶ Goal wait ended — resuming."]
@@ -238,7 +240,9 @@ async def test_stale_resume_pending_does_not_block_lifted_barrier(hermes_home, m
     await _one_scan(runner, monkeypatch)
 
     assert len(adapter.handled) == 1
-    assert "was killed by a gateway restart" in adapter.handled[0].text
+    assert "stopped before it finished" in adapter.handled[0].text
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in adapter.handled[0].text.lower()
     assert entry.resume_pending is False
     assert adapter.sent == ["▶ Goal wait ended — resuming."]
     assert goals.load_goal(SID).waiting_on_session is None
@@ -353,7 +357,9 @@ async def test_real_store_legacy_marker_falls_back_to_old_updated_at(hermes_home
     await _one_scan(runner, monkeypatch)
 
     assert len(adapter.handled) == 1
-    assert "was killed by a gateway restart" in adapter.handled[0].text
+    assert "stopped before it finished" in adapter.handled[0].text
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in adapter.handled[0].text.lower()
     assert store.lookup_by_session_id(entry.session_id).resume_pending is False
     assert goals.load_goal(entry.session_id).waiting_on_session is None
 
