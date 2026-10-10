@@ -21,6 +21,58 @@ def _agent(home: Path, main_url: str):
     )
 
 
+@pytest.mark.parametrize("voice_window_ok, restore_failed", [
+    pytest.param(True, False, id="accepted"),
+    pytest.param(False, False, id="rejected"),
+    pytest.param(True, True, id="restore-failed"),
+])
+def test_voice_route_preserves_explicit_delegation_reasoning(
+    tmp_path, monkeypatch, voice_window_ok, restore_failed,
+):
+    from agent import route_binding
+    from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+    from tools.delegate_tool_config import explicit_parent_reasoning
+
+    with FakeLLMServer([]) as main, FakeLLMServer([]) as voice:
+        context = "128000" if voice_window_ok else "1000"
+        home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+            "auxiliary:\n  voice_chat:\n    provider: custom\n"
+            f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: sk-fake-e2e\n"
+            "custom_providers:\n  - name: voice\n"
+            f"    base_url: {voice.base_url}\n    models:\n      voice-model:\n        context_length: {context}\n"
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        agent = _agent(home, main.base_url)
+        pick = {"enabled": True, "effort": "high"}
+        saved_pick = {"enabled": True, "effort": "low"}
+        agent.reasoning_config = dict(pick)
+        agent.reasoning_override = dict(pick)
+        agent._pre_fallback_reasoning_override = dict(saved_pick)
+        assert explicit_parent_reasoning(agent) == pick
+        agent._voice_turn_pending = True
+        begin_voice_turn_route(agent, [{"role": "user", "content": "spoken question"}], "system " * 1000)
+        assert agent.model == ("voice-model" if voice_window_ok else "fake-model")
+        if restore_failed:
+            def reject_restore(*args, **kwargs):
+                raise RuntimeError("restore rejected")
+            monkeypatch.setattr(route_binding, "reinstall_runtime_snapshot", reject_restore)
+        try:
+            if not voice_window_ok:
+                # A rejected voice route must restore the markers immediately, not just at turn end.
+                assert explicit_parent_reasoning(agent) == pick
+                assert agent._pre_fallback_reasoning_override == saved_pick
+        finally:
+            end_voice_turn_route(agent)
+        assert agent.reasoning_config == pick
+        assert agent.reasoning_override == pick
+        assert agent._pre_fallback_reasoning_override == saved_pick
+        assert explicit_parent_reasoning(agent) == pick
+        assert agent._fallback_activated is restore_failed
+        end_voice_turn_route(agent)  # repeated cleanup cannot consume either marker
+        assert explicit_parent_reasoning(agent) == pick
+        assert agent._pre_fallback_reasoning_override == saved_pick
+
+
 @pytest.mark.parametrize("voice_window_ok", [True, False])
 def test_voice_turn_routes_then_restores(tmp_path, monkeypatch, voice_window_ok):
     with FakeLLMServer([Text("main one"), Text("main two")]) as main, \

@@ -27,6 +27,8 @@ TASK = "voice_chat"
 # reasoning-rejection flags are facts about one route: the voice model starts without the main
 # model's and leaves its own behind (a learned floor is remembered per route instead).
 _REJECTION_FIELDS = ("_reasoning_disable_rejected", "_reasoning_floor_required", "_reasoning_effort_rejected")
+# Explicit delegation picks travel with the session's level, not the temporary voice route.
+_REASONING_FIELDS = ("reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override")
 _EXTRA_FIELDS = (
     "_fallback_activated", "_fallback_index", "_provider_fallback_active", "_provider_fallback_route",
     "_rate_limit_backoff_count", "_credential_pool", "_credential_pool_entry_id", "_config_context_length",
@@ -112,11 +114,20 @@ def _capture(agent: Any) -> Dict[str, Any]:
     }
 
 
+def _restore_reasoning(agent: Any, state: Dict[str, Any]) -> None:
+    for name in _REASONING_FIELDS:
+        setattr(agent, name, state[name])
+
+
 def _reinstall(agent: Any, state: Dict[str, Any]) -> None:
     from agent.route_binding import reinstall_runtime_snapshot
-    reinstall_runtime_snapshot(agent, state["snapshot"])
-    for name in _EXTRA_FIELDS:
-        setattr(agent, name, state[name])
+    try:
+        reinstall_runtime_snapshot(agent, state["snapshot"])
+        for name in _EXTRA_FIELDS:
+            setattr(agent, name, state[name])
+    finally:
+        # Also restore picks when a rejected route's runtime reinstatement raises.
+        _restore_reasoning(agent, state)
 
 
 def _warn_once(agent: Any, target: Dict[str, Any], reason: str) -> None:
@@ -143,7 +154,7 @@ def begin_voice_turn_route(agent: Any, messages: List[Dict[str, Any]], system_pr
     target = _route_target(agent, cfg)
     if target is None and effort is None:
         return system_prompt
-    state: Dict[str, Any] = {"reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None))}
+    state: Dict[str, Any] = {name: copy.deepcopy(getattr(agent, name, None)) for name in _REASONING_FIELDS}
     agent._voice_route_state = state
     if target is not None:
         state.update(_capture(agent))
@@ -159,7 +170,7 @@ def begin_voice_turn_route(agent: Any, messages: List[Dict[str, Any]], system_pr
         if reason:
             _reinstall(agent, state)
             _warn_once(agent, target, reason)
-            agent._voice_route_state = {"reasoning_config": state["reasoning_config"]}
+            agent._voice_route_state = {name: state[name] for name in _REASONING_FIELDS}
             return agent._cached_system_prompt or system_prompt
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, agent.model, agent.provider)
@@ -214,4 +225,4 @@ def end_voice_turn_route(agent: Any) -> None:
         logger.warning("Voice turn route restore failed; the next turn re-resolves the main runtime",
                        exc_info=True)
         agent._fallback_activated = True  # restore_primary_runtime takes it from here
-    agent.reasoning_config = state["reasoning_config"]
+    _restore_reasoning(agent, state)
