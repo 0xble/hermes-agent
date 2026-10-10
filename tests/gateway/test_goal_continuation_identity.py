@@ -273,10 +273,10 @@ async def test_current_noninternal_goal_continuation_still_requires_user_authori
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route_change", ["new", "resume"])
+@pytest.mark.parametrize("route_change", ["new", "resume", "same"])
 @pytest.mark.parametrize("producer", ["post_turn", "control"])
 async def test_idle_continuation_cannot_enter_replacement_conversation(
-    state, monkeypatch, tmp_path, route_change, producer,
+    state, tmp_path, route_change, producer,
 ):
     from types import MethodType
     from gateway.config import GatewayConfig
@@ -286,15 +286,8 @@ async def test_idle_continuation_cannot_enter_replacement_conversation(
     from hermes_cli.session_controls import goal_continuation_is_current
 
     runner = _runner(state)
-    GoalManager("target").set("old objective still active")
-    if producer == "control":
-        GoalManager("target").pause()
-        event = await _control_event(runner, _apply(state, "resume"))
-    else:
-        event = await _post_turn_event(runner)
     store = SessionStore(tmp_path / "gateway-sessions", GatewayConfig())
     runner.session_store = store
-    runner._session_key_for_source = store._generate_session_key
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = MethodType(GatewayTurnMixin._hmwa_resolve_session, runner)
     runner._recover_telegram_topic_thread_id = lambda source: None
@@ -303,23 +296,36 @@ async def test_idle_continuation_cannot_enter_replacement_conversation(
     runner._PreparedTurn = GatewayTurnMixin._PreparedTurn
     runner._hmwa_prepare_turn = AsyncMock(return_value=(None, None))
     try:
-        entry = store.get_or_create_session(event.source)
+        entry = store.get_or_create_session(runner.target.origin)
         entry = store.switch_session(entry.session_key, "target")
-        # Preserve the producer's route key while using the real routing store.
-        event.metadata["gateway_session_key"] = entry.session_key
+        assert entry is not None
+        runner.target = entry
+        runner._session_key_for_source = store._generate_session_key
+        GoalManager("target").set("old objective still active")
+        if producer == "control":
+            GoalManager("target").pause()
+            event = await _control_event(runner, _apply(state, "resume"))
+        else:
+            event = await _post_turn_event(runner)
         if route_change == "new":
             replacement = store.reset_session(entry.session_key)
-        else:
+        elif route_change == "resume":
             state.create_session("resumed", source="telegram")
             replacement = store.switch_session(entry.session_key, "resumed")
-        assert replacement.session_id != "target"
+        else:
+            replacement = entry
+        assert replacement is not None
+        assert (replacement.session_id == "target") == (route_change == "same")
         assert goal_continuation_is_current(event.metadata), "Only routing changed, not the goal"
 
         await GatewayTurnMixin._handle_message_with_agent(
             runner, event, event.source, entry.session_key, 1,
         )
 
-        runner._hmwa_prepare_turn.assert_not_awaited()
+        if route_change == "same":
+            runner._hmwa_prepare_turn.assert_awaited_once()
+        else:
+            runner._hmwa_prepare_turn.assert_not_awaited()
     finally:
         store.close_all_db_handles()
 

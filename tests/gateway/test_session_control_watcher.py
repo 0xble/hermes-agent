@@ -480,7 +480,8 @@ def test_replace_notices_show_old_and_new_goal(state):
 
 
 @pytest.mark.asyncio
-async def test_pause_cleanup_cannot_delete_human_arriving_in_drained_adapter_slot(state):
+@pytest.mark.parametrize("handoff", ["event_loop", "reentrant"])
+async def test_pause_cleanup_cannot_delete_human_arriving_in_drained_adapter_slot(state, handoff):
     import threading
     from types import MethodType
     from gateway.platforms.event import MessageEvent
@@ -515,13 +516,19 @@ async def test_pause_cleanup_cannot_delete_human_arriving_in_drained_adapter_slo
         replaced.set()
 
     class HandoffSlot(dict):
+        handed_off = False
+
         def get(self, lookup_key, default=None):
             item = super().get(lookup_key, default)
-            if item is old and not replaced.is_set():
+            if item is old and not self.handed_off:
+                self.handed_off = True
                 cleanup_threads.append(threading.get_ident())
-                loop.call_soon_threadsafe(adapter_drain_and_human_arrival)
-                if threading.get_ident() != loop_thread:
-                    assert replaced.wait(5), "event-loop handoff did not run"
+                if handoff == "reentrant":
+                    adapter_drain_and_human_arrival()
+                else:
+                    loop.call_soon_threadsafe(adapter_drain_and_human_arrival)
+                    if threading.get_ident() != loop_thread:
+                        assert replaced.wait(5), "event-loop handoff did not run"
             return item
 
     runner.adapter._pending_messages = HandoffSlot()
