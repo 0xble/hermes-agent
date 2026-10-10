@@ -1920,9 +1920,9 @@ class GatewayStartupMixin:
             interrupted_note_keys=interrupted_note_keys,
             claimed=claimed,
         )
-        # Recover shutdown follow-ups before scheduling resumed turns. A queued follow-up to an
-        # interrupted session must wait as a distinct event, not enter that turn's history.
-        candidates = await self._resume_pending_candidates_async()
+        # Refresh before follow-up recovery without spending boot budget or overriding a tripped verdict.
+        if candidates is not None:
+            candidates = await self._resume_pending_candidates_async(record_boot=False)
         await self._recover_pending_shutdown_flush_off_loop(
             candidates=candidates,
             failure_message="Pending-message recovery failed; spools retained",
