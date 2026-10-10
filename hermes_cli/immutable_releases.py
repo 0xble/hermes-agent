@@ -1239,6 +1239,21 @@ def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | 
         if operation in {"rollback", "first-migration-rollback"}:
             assert result is not None
             return result
+    completed = completed_rollback(paths.home)
+    if completed is not None:
+        return completed
+    previous = read_pointer(paths.previous)
+    if previous is None:
+        raise RuntimeError("no previous release is available")
+    if previous.parent != paths.releases.resolve():
+        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback)
+    return activate_release(paths.home, previous, plist_path=plist_path, plist_body=plist_body,
+                            reload_callback=reload_callback, operation="rollback")
+
+
+def completed_rollback(home: Path) -> dict[str, str | None] | None:
+    """Read a completed rollback only when its pointers, journal and plist still match."""
+    paths = ReleasePaths.for_home(home)
     # An os._exit immediately after the pending record's deletion is also an
     # interrupted CLI invocation. Repeating it cannot reverse the completed
     # rollback merely because previous now identifies the old current.
@@ -1255,13 +1270,7 @@ def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | 
                     return {"current": last["source"], "previous": last["current_original"],
                             "source_sha": last["source_sha"]}
                 return {"current": last["candidate"], "previous": last["previous_intended"]}
-    previous = read_pointer(paths.previous)
-    if previous is None:
-        raise RuntimeError("no previous release is available")
-    if previous.parent != paths.releases.resolve():
-        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback)
-    return activate_release(paths.home, previous, plist_path=plist_path, plist_body=plist_body,
-                            reload_callback=reload_callback, operation="rollback")
+    return None
 
 
 def resolved_release(home: Path) -> Path | None:

@@ -112,6 +112,65 @@ def test_equal_pointer_with_stale_service_repairs_on_noop(tmp_path, monkeypatch)
     assert (home / "release-txn.json").exists()
 
 
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("entrypoint", ["repair", "replay", "rollback-replay"])
+@pytest.mark.parametrize("leftover", ["journal", "label"])
+def test_leftovers_block_service_repair_and_transaction_replay(tmp_path, monkeypatch,
+                                                              entrypoint, leftover):
+    import json
+    from types import SimpleNamespace
+    from hermes_cli import immutable_releases as releases, forward_only_guard, gateway, gateway_launchd
+
+    home = tmp_path / "profile"
+    candidate = home / "releases" / "B"
+    candidate.mkdir(parents=True)
+    (candidate / ".release-ready").write_text("B\n")
+    (candidate / ".hermes_build_sha").write_text("B\n")
+    releases.promote(home, candidate)
+    plist = tmp_path / "service.plist"
+    plist.write_text("source")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"release_acknowledgement_timeout_seconds": 0})
+    monkeypatch.setattr(releases, "release_sha", lambda _: "B")
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "launchd_plist_is_current", lambda **kwargs: plist.read_text() == "release")
+    monkeypatch.setattr(gateway, "generate_launchd_plist", lambda release_target=None: "release")
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *a, **kw: False)
+    if entrypoint != "repair":
+        releases.activate_release(home, candidate, plist_path=plist, plist_body=b"release",
+                                  reload_callback=lambda: "deferred", force_reload=True)
+        # Model a crash before the write-ahead reload submission marker.
+        pending = home / "release-txn.json"
+        record = json.loads(pending.read_text())
+        record.pop("reload_issued")
+        if entrypoint == "rollback-replay":
+            record["operation"] = "rollback"
+        pending.write_text(json.dumps(record))
+        plist.write_text("source")
+    label = "ai.hermes.gateway.g-" + "a" * 32
+    monkeypatch.setattr(forward_only_guard, "_loaded_forward_labels",
+                        lambda **kw: [label] if leftover == "label" else [])
+    monkeypatch.setattr(forward_only_guard, "_label_hermes_homes", lambda *a, **kw: [home])
+    if leftover == "journal":
+        (home / "forward-update.json").write_text('{"state": "draining"}')
+    before = {path: path.read_bytes() for path in home.glob("*.json")}
+    reloads = []
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
+                        lambda path: reloads.append(path) or "deferred")
+    with pytest.raises(RuntimeError, match="withdrawn forward-only state remains"):
+        if entrypoint == "rollback-replay":
+            update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        elif entrypoint == "replay":
+            update_cmd._finish_pending_release_transaction(home)
+        else:
+            update_cmd._catch_up_immutable_release(defer=False)
+    assert reloads == []
+    assert plist.read_text() == "source"
+    assert {path: path.read_bytes() for path in home.glob("*.json")} == before
+    assert (home / "current").resolve() == candidate
+
+
 def test_equal_pointer_with_stale_runtime_arms_fleet_catchup(tmp_path, monkeypatch):
     from hermes_cli import immutable_releases as releases, update_receipt
     home = tmp_path / "profile"
