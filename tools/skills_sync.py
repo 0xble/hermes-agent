@@ -273,6 +273,7 @@ class _SyncState:
     suppressed: List[str] = field(default_factory=list)
     relocated: List[str] = field(default_factory=list)
     shadowed_by_external: List[str] = field(default_factory=list)
+    failed: List[str] = field(default_factory=list)
     active_index: Optional[Dict[str, List[Path]]] = None  # rename-recovery indexes are expensive on
     hub_paths: Set[str] = field(default_factory=set)  # bind mounts: built lazily, only when needed
 
@@ -326,6 +327,7 @@ def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: P
             st.manifest[skill_name] = bundled_hash
             st.say(f"  + {skill_name}")
     except OSError as e:
+        st.failed.append(f"copy {skill_name} to {dest}: {e}")
         st.say(f"  ! Failed to copy {skill_name}: {e}")  # not in manifest — next sync retries
 
 
@@ -373,6 +375,7 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
     try:
         _replace_skill_dir(skill_src, dest)
     except OSError as e:
+        st.failed.append(f"update {skill_name} at {dest}: {e}")
         st.say(f"  ! Failed to update {skill_name}: {e}")
         return
     st.manifest[skill_name] = bundled_hash
@@ -396,7 +399,9 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]
 
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
-    result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
+    result dict, including ``failed`` copy/update diagnostics for strict callers.
+    Failures remain best-effort: other skills still sync and the result is returned.
+    Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
     points at ``hermes-agent``); a home that additionally sets ``skills.seed_essentials:
     false`` is a locked-down home and seeds nothing at all."""
     essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
@@ -473,7 +478,7 @@ def sync_skills(quiet: bool = False) -> dict:
     return {
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
-        "total_bundled": len(bundled_skills),
+        "total_bundled": len(bundled_skills), "failed": st.failed,
         "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet),
         "shadowed_by_external": st.shadowed_by_external,
         "skipped_opt_out": essential_only}  # lets callers report "opted out", not a normal sync
