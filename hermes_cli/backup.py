@@ -532,11 +532,16 @@ def _is_critical_state(rel_path: Path) -> bool:
 
     Matched on the RELATIVE path against the module's own criticality list, not on
     basename: ``plugins/x/.env`` is an ordinary file that may legitimately rotate,
-    while ``.env`` at the root is not. _QUICK_STATE_FILES entries may name a file or
+    while ``.env`` at a home root (default or ``profiles/<name>/``) is not.
+    _QUICK_STATE_FILES entries may name a file or
     a directory, so a prefix match covers ``kanban/boards`` and ``platforms/pairing``.
     _SECRET_FILE_NAMES is deliberately NOT used here: its own comment says it exists so
     restore can chmod 0600, which is a permissions question, not a criticality one.
     """
+    # Full-machine archives include named homes; match exactly one profile-root
+    # prefix, never arbitrary nested files with a critical basename.
+    if len(rel_path.parts) >= 3 and rel_path.parts[0] == "profiles":
+        rel_path = Path(*rel_path.parts[2:])
     posix = rel_path.as_posix()
     return any(posix == entry or posix.startswith(f"{entry}/") for entry in _QUICK_STATE_FILES)
 
@@ -1261,16 +1266,16 @@ def _quick_snapshot_candidates(home: Path):
 
 def _copy_quick_snapshot_files(
     home: Path, staging_dir: Path, max_file_size: Optional[int]
-) -> tuple[Dict[str, int], list[str], list[str]]:
+) -> tuple[Dict[str, int], list[str], list[str], list[str]]:
     """Copy every quick-snapshot candidate into *staging_dir*.
 
-    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped)``. The last two are snapshot
-    incompleteness (#68805): the caller must suppress pruning so the older snapshot that may hold
-    the only recoverable DB survives.
+    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped, failed_files)``.
+    Every omission must reach retention so older verified recovery copies survive.
     """
     manifest: Dict[str, int] = {}
     failed_dbs: list[str] = []
     oversized_skipped: list[str] = []
+    failed_files: list[str] = []
     for src, rel, in_dir in _quick_snapshot_candidates(home):
         if max_file_size is not None:
             try:
@@ -1310,8 +1315,10 @@ def _copy_quick_snapshot_files(
                 shutil.copy2(src, dst)
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
+            failed_files.append(rel)
+            print(f"  ⚠ Snapshot: could not snapshot {rel} — file omitted: {exc}")
             logger.warning("Could not snapshot %s: %s", rel, exc)
-    return manifest, failed_dbs, oversized_skipped
+    return manifest, failed_dbs, oversized_skipped, failed_files
 
 
 def _secure_quick_snapshot_tree(root: Path, snapshot_dir: Path) -> None:
@@ -1367,7 +1374,8 @@ def _create_quick_snapshot_locked(
             logger.warning("Removed abandoned snapshot staging %s", stale.name)
     staging_dir.mkdir(mode=0o700, exist_ok=False)
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-    manifest, failed_dbs, oversized_skipped = _copy_quick_snapshot_files(home, staging_dir, max_file_size)
+    manifest, failed_dbs, oversized_skipped, failed_files = _copy_quick_snapshot_files(
+        home, staging_dir, max_file_size)
     if failed_dbs:
         # Surface on stdout: a log-and-continue made a missing state.db backup look like a
         # successful pre-update snapshot (#68474).
@@ -1386,6 +1394,7 @@ def _create_quick_snapshot_locked(
         "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
         "total_size": sum(manifest.values()), "files": manifest,
         "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
+        "failed_files": failed_files,
     }
     with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -2184,14 +2193,15 @@ def _prune_quick_snapshots(
         files = meta["files"]
         failed = meta.get("failed_dbs") or []
         oversized = meta.get("oversized_skipped") or []
-        if not isinstance(failed, list) or not isinstance(oversized, list):
+        failed_files = meta.get("failed_files") or []
+        if not all(isinstance(paths, list) for paths in (failed, oversized, failed_files)):
             continue
-        omissions.update(rel for rel in failed + oversized if isinstance(rel, str))
+        omissions.update(rel for rel in failed + oversized + failed_files if isinstance(rel, str))
         # Prove one complete anchor, newest first. Once it exists, discarded
         # generations need no payload reads. A retained database is checked
         # only until its path has a verified anchor. Same-size corruption is
         # an omission too, but restore validates every payload independently.
-        if not found_complete and not failed and not oversized and all(
+        if not found_complete and not failed and not oversized and not failed_files and all(
                 isinstance(rel, str) and usable(directory, rel, size, meta)
                 for rel, size in files.items()):
             retained.add(directory)

@@ -1355,8 +1355,9 @@ class TestBackupEdgeCases:
         assert "Backup incomplete" in capsys.readouterr().out
         assert good_old.exists(), "an incomplete run must not rotate the last complete backup out"
 
+    @pytest.mark.parametrize("profile_root", ["", "profiles/coder"])
     def test_a_nested_file_sharing_a_critical_basename_is_still_tolerated(
-            self, tmp_path, monkeypatch, capsys):
+            self, tmp_path, monkeypatch, capsys, profile_root):
         """Basename matching would reinstate the very bug this fixes.
 
         plugins/x/.env is an ordinary file that may rotate; only .env at the root is
@@ -1365,7 +1366,7 @@ class TestBackupEdgeCases:
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         _make_hermes_tree(hermes_home)
-        nested = hermes_home / "plugins" / "someplugin" / ".env"
+        nested = hermes_home / profile_root / "plugins" / "someplugin" / ".env"
         nested.parent.mkdir(parents=True, exist_ok=True)
         nested.write_text("PLUGIN=1\n")
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
