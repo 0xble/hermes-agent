@@ -74,10 +74,18 @@ def test_terminal_write_failure_keeps_completion_replayable(tmp_path, monkeypatc
     assert event["_delivery_event_id"] == f"{result['delegation_id']}:terminal_fallback"
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
+    monkeypatch.setattr(ad, "_owner_liveness", lambda: (lambda pid, started: False))
     assert ad.restore_undelivered_completions(process_registry.completion_queue) == 1
     replayed = process_registry.completion_queue.get_nowait()
     assert replayed["delegation_id"] == result["delegation_id"]
     assert replayed["summary"] == "kept"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state, event_json FROM async_delegations WHERE delegation_id=?",
+            (result["delegation_id"],),
+        ).fetchone() == ("completed", None)
+    from tools.delegation_resume import list_boot_candidates
+    assert list_boot_candidates() == []
     monkeypatch.setattr(ad, "_persist_completion", original)
 
 
@@ -120,4 +128,9 @@ def test_gateway_dedup_identity_separates_notices_from_the_final_and_from_each_o
     n0 = {"type": "async_delegation", "delegation_id": "d", "task_failure_notice": True, "results": [{"task_index": 0}]}
     n1 = {"type": "async_delegation", "delegation_id": "d", "task_failure_notice": True, "results": [{"task_index": 1}]}
     final = {"type": "async_delegation", "delegation_id": "d", "is_batch": True, "results": []}
+    no_index_a = {"type": "async_delegation", "delegation_id": "d", "task_failure_notice": True,
+                  "results": [{"status": "error", "error": "a"}]}
+    no_index_b = {"type": "async_delegation", "delegation_id": "d", "task_failure_notice": True,
+                  "results": [{"status": "error", "error": "b"}]}
     assert len({ident(n0), ident(n1), ident(final)}) == 3
+    assert ad._outbox_event_id(no_index_a, "task_failure") != ad._outbox_event_id(no_index_b, "task_failure")

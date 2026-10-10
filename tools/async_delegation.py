@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -372,13 +373,21 @@ def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
         raise ValueError("durable async delegation events require a delegation_id")
     if event_kind == "task_failure":
         results = event.get("results") or [{}]
-        task_index = results[0].get("task_index", "") if isinstance(results[0], dict) else ""
-        return f"{delegation_id}:task-failure:{task_index}"
+        task_index = results[0].get("task_index") if isinstance(results[0], dict) else None
+        if task_index is not None:
+            return f"{delegation_id}:task-failure:{task_index}"
+        # Older callers can omit task_index. Hash the complete event instead of
+        # collapsing every such notice onto one INSERT OR IGNORE identity.
+        payload = dict(event)
+        payload.pop("_delivery_event_id", None)
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return f"{delegation_id}:task-failure:{digest}"
     return f"{delegation_id}:{event_kind}"
 
 
 def _persist_outbox_event(
     event: Dict[str, Any], result: Optional[Dict[str, Any]], *, event_kind: str,
+    terminal_status: Optional[str] = None, expected_state: Optional[str] = None,
 ) -> str:
     """Persist a non-terminal or fallback event before it enters a process-local queue.
 
@@ -399,6 +408,17 @@ def _persist_outbox_event(
             (event_id, event["delegation_id"], event_kind, json.dumps(persisted),
              json.dumps(result) if result is not None else None, now, now),
         )
+        if terminal_status is not None:
+            # The outbox owns delivery, but the lifecycle row must still become
+            # terminal. Otherwise a dead-owner restart classifies it as unknown
+            # and replays a second, synthetic completion beside this outbox event.
+            conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?, result_json=?
+                   WHERE delegation_id=? AND state=?""",
+                (terminal_status, event.get("completed_at", now), now,
+                 json.dumps(result) if result is not None else None,
+                 event["delegation_id"], expected_state or "running"),
+            )
     event["_delivery_event_id"] = event_id
     return event_id
 
@@ -1812,7 +1832,11 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.error("Async delegation%s %s: durable terminal row write failed; persisting a delivery outbox event: %s",
                      label, record.get("delegation_id"), exc)
         try:
-            _persist_outbox_event(evt, result, event_kind="terminal_fallback")
+            _persist_outbox_event(
+                evt, result, event_kind="terminal_fallback",
+                terminal_status=record.get("_terminal_state") or status,
+                expected_state=record.get("_durable_state") or "running",
+            )
         except Exception:
             logger.error("Async delegation%s %s: durable terminal outbox write failed; delivering in-memory only: %s",
                          label, record.get("delegation_id"), exc, exc_info=True)
