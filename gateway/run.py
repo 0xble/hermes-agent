@@ -1070,51 +1070,49 @@ def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
     return str(configured) if configured is not None else "ask"
 
 
+# Opening of every resume note. Classifiers (Telegram trigger budget, e2e fakes) import this rather
+# than copying the wording.
+RESUME_NOTE_PREFIX = "[System note: Resume the pending turn."
+
+
 def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: Optional[bool] = None,
     restart_resume_policy: Optional[str] = None) -> str:
-    """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
+    """Build the neutral continuation instruction for a pending turn.
 
-    Under ``ask`` the note reports the restore and asks what next; under ``continue`` it finishes the work.
-
-    ``restart_resume_policy`` is the resolved policy from ``resolve_restart_resume_policy``. When omitted
-    the adapter-derived default applies: non-interactive platforms (webhook, API server — adapters with
-    ``interactive_resume = False``) continue, everything else asks (#57056). The continue guidance is
-    platform-neutral because an interactive platform can opt into ``continue``.
+    The note is model-visible scaffolding, not a status announcement. ``reason`` remains part of
+    the recovery API for callers and persistence, but it intentionally does not change the wording.
     """
-    reason_phrase = (
-        "a gateway restart" if reason == "restart_timeout"
-        else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
     policy = restart_resume_policy or ("continue" if interactive is False else "ask")
     if policy not in ("ask", "continue"):
         raise ValueError("restart_resume_policy must be 'ask' or 'continue'")
+    safety_guidance = (
+        "Any restart, update, or shutdown command in the history has already run — do NOT re-run "
+        "or verify it. Do NOT re-run tool calls whose results are recorded. Before retrying a "
+        "non-idempotent effect without a recorded result (send, payment, push, or external write), "
+        "reconcile its current state first. Do not mention this recovery to the user unless it "
+        "changed an outcome they are waiting on; if so, report the outcome rather than the "
+        "recovery. Do not announce a resumed session."
+    )
     if message:
-        resume_guidance = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+        # The user has moved on: answer them, and leave stale pending work alone unless they ask.
+        continuation = (
+            "Address the user's NEW message below FIRST and focus on what the user is asking now. "
+            "Skip unfinished work from the conversation history unless the new message asks for it; "
+            "if it does, resume from the first step without a recorded result."
         )
-    elif policy == "ask":
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+    elif policy == "continue":
+        continuation = (
+            "Do not emit an acknowledgement. Continue the pending task to completion, resuming from "
+            "the first step without a recorded result."
         )
     else:
-        resume_guidance = (
-            "No new user message is attached to this recovery turn, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask what to do next. Review the conversation history and "
-            "CONTINUE the interrupted task to completion.")
-        tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
+        continuation = (
+            "Do not run tools or continue the pending task until the user replies. In one short "
+            "line, ask whether to carry on with the pending step, naming that step."
+        )
     return (
-        f"[System note: The previous turn was interrupted by "
-        f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
+        f"{RESUME_NOTE_PREFIX} {safety_guidance} {continuation}]"
         + (f"\n\n{message}" if message else ""))
 
 
