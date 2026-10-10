@@ -110,7 +110,7 @@ select = [
   #  "C417",
   "C418",
   #  "C419",
-  #  "C901",
+  "C901",
   #  "DTZ001",
   "DTZ002",
   #  "DTZ003",
@@ -454,7 +454,7 @@ select = [
   #  "TRY201",
   #  "TRY203",
   #  "TRY401",
-  "TID251",
+  "TID251"
 ]
 
 [lint.flake8-tidy-imports.banned-api]
