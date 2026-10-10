@@ -918,7 +918,8 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 # In-memory marker on a terminal event whose producer could not prove which durable identity, if
 # any, owns it (reconciliation failed). Its delegation_id alone proves nothing: a competing writer
-# may own the lifecycle row. Never persisted; stripped once ownership is resolved.
+# may own the lifecycle row. Never persisted; only proven deliverable ownership is stripped.
+# A rejected marker stays on every retained/copyable event, even after its ledger disappears.
 _TERMINAL_OWNERSHIP_KEY = "_terminal_ownership"
 _OWNERSHIP_RETRY_BASE_S = 5.0
 _OWNERSHIP_RETRY_MAX_S = 300.0
@@ -972,12 +973,14 @@ def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> st
 
 def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
     """True when ``evt`` may be delivered: it carries no unproven terminal ownership, or that
-    ownership now resolves to this event. A proven loser is discarded; an event whose ledger is
-    still unreadable is held and re-offered later (``reoffer_unresolved_completions``). Either way
-    the caller must drop its copy without showing it."""
-    meta = evt.pop(_TERMINAL_OWNERSHIP_KEY, None)
+    ownership now resolves to this event. A proven loser remains permanently rejected, including
+    on copies/requeues. An event whose ledger is still unreadable is held and re-offered later
+    (``reoffer_unresolved_completions``); neither may be shown by this caller."""
+    meta = evt.get(_TERMINAL_OWNERSHIP_KEY)
     if not meta:
         return True
+    if meta.get("rejected"):
+        return False
     evt.pop("_delivery_event_id", None)
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     token = set_hermes_home_override(meta["home"])
@@ -991,9 +994,13 @@ def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
     if disposition == "outbox":
         evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
     elif disposition not in {"lifecycle", "missing"}:
+        # A failed batch can requeue this very dict after skipping it. Keep rejection
+        # in the existing marker (shared by shallow copies), not in the mutable ledger.
+        meta["rejected"] = True
         logger.error("Async delegation %s: unproven terminal result lost ownership to a competing "
-                     "result; discarding it", evt.get("delegation_id"))
+                     "result; permanently rejecting it", evt.get("delegation_id"))
         return False
+    evt.pop(_TERMINAL_OWNERSHIP_KEY, None)
     return True
 
 
