@@ -793,9 +793,23 @@ class GatewayInboundMixin:
         running_agent = _ra_state.turn.agent if _ra_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:  # agent still being set up
             if event.get_command() == "stop":  # force-clean the sentinel so the session is unlocked
-                self._latch_user_stop(_quick_key)
+                stop_session_entry = self._stop_owner_session_entry(_quick_key)
+                stop_generation = self._current_session_run_generation(_quick_key)
+                if stop_session_entry is None:
+                    # The sentinel can precede cold route loading. Warm it off-loop while keeping
+                    # the slot claimed; a reset/newer generation wins over this delayed stop.
+                    stop_session_entry = await self.async_session_store.lookup_by_session_key(_quick_key)
+                    if not self._is_session_run_current(_quick_key, stop_generation):
+                        return EphemeralReply(t("gateway.stop.force_stopped_pending"))
+                stop_session_id = getattr(stop_session_entry, "session_id", None)
+                stop_latch_revision = self._latch_user_stop(
+                    _quick_key, session_id=stop_session_id, session_entry=stop_session_entry)
                 self._release_running_agent_state(_quick_key)
-                await self._pause_goal_for_stop(_quick_key, source)
+                await self._persist_user_stop_latch(
+                    _quick_key, session_id=stop_session_id, revision=stop_latch_revision)
+                await self._pause_goal_for_stop(
+                    _quick_key, source, expected_session_id=stop_session_id,
+                    expected_generation=stop_generation, expected_session_entry=stop_session_entry)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start

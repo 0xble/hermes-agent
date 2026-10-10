@@ -524,12 +524,21 @@ class GatewaySlashCommandsMixin(
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
         # Between turns, /stop still means stop: hold the completions it produces and pause the goal
-        # so a queued continuation or a judge-resumed goal cannot start the next turn.
-        self._latch_user_stop(session_key)
+        # so a queued continuation or a judge-resumed goal cannot start the next turn. Capture ownership
+        # before the first await so a concurrent /new cannot receive this stop's pause.
+        stop_session_entry = self._stop_owner_session_entry(session_key)
+        stop_session_id = getattr(stop_session_entry, "session_id", None)
+        stop_generation = self._current_session_run_generation(session_key)
+        stop_latch_revision = self._latch_user_stop(
+            session_key, session_id=stop_session_id, session_entry=stop_session_entry)
         from tools.async_delegation import interrupt_for_session
         interrupted = interrupt_for_session(session_key=session_key, reason="stop_command",
                                             parent_session_id=str(getattr(session_entry, "session_id", "") or ""))
-        goal_paused = await self._pause_goal_for_stop(session_key, source)
+        await self._persist_user_stop_latch(
+            session_key, session_id=stop_session_id, revision=stop_latch_revision)
+        goal_paused = await self._pause_goal_for_stop(
+            session_key, source, expected_session_id=stop_session_id,
+            expected_generation=stop_generation, expected_session_entry=stop_session_entry)
         if interrupted or goal_paused:
             return EphemeralReply(t("gateway.stop.stopped"))
         # A platform status indicator can still be stuck —

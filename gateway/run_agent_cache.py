@@ -407,9 +407,11 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return 0
         persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
-        return persistent.run_generation
+        # Stop commits share only a short in-memory ownership check, never a blocking I/O span.
+        with persistent.run_generation_lock:
+            # Monotonic by design (#28686): incremented here, NEVER reset.
+            persistent.run_generation = int(persistent.run_generation) + 1
+            return persistent.run_generation
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``.
@@ -489,16 +491,28 @@ class GatewayAgentCacheMixin:
             return
         from gateway.run import _INTERRUPT_REASON_STOP
         stop_marker = None
+        stop_session_id = None
+        stop_session_entry = None
+        stop_latch_revision = 0
         if interrupt_reason == _INTERRUPT_REASON_STOP:
-            # Latch before interrupting: the interrupted background delegations below report back
-            # within a second and must not start the turn the user just stopped.
-            self._latch_user_stop(session_key)
-            try:
-                # Capture before the first await. The immutable marker includes the
-                # session identity, so a delayed stop cannot clear a newer recovery.
-                stop_marker = self.session_store.get_resume_pending_marker(session_key)
-            except Exception:
-                logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
+            # Snapshot warmed ownership before interrupt awaits; cold setup loads routing off-loop
+            # while its original slot is still claimed. Identity/generation fence the delayed tail.
+            stop_session_entry = self._stop_owner_session_entry(session_key)
+            if stop_session_entry is None and getattr(self, "session_store", None) is not None:
+                # Busy-command dispatch can reach /stop before a cold pending turn loads routing.
+                # Keep its slot claimed until lookup finishes, and never adopt a newer generation.
+                before_lookup = self._current_session_run_generation(session_key)
+                with suppress(Exception):
+                    stop_session_entry = await self.async_session_store.lookup_by_session_key(session_key)
+                if not self._is_session_run_current(session_key, before_lookup):
+                    return
+            stop_session_id = getattr(stop_session_entry, "session_id", None)
+            stop_latch_revision = self._latch_user_stop(
+                session_key, session_id=stop_session_id, session_entry=stop_session_entry)
+            # Capture the immutable marker from warmed routing too: no store lock/I/O on-loop.
+            entry = stop_session_entry
+            if (entry is not None and entry.session_id == stop_session_id and entry.resume_pending):
+                stop_marker = (entry.session_id, entry.resume_marker_token, entry.last_resume_marked_at)
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -529,6 +543,9 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
+        if interrupt_reason == _INTERRUPT_REASON_STOP:
+            await self._persist_user_stop_latch(
+                session_key, session_id=stop_session_id, revision=stop_latch_revision)
         adapter = self._delivery_adapter_for(source)
         # /stop, /new, and /reset invalidate the adapter-side deferred-command queue too. The
         # runner's turn generation protects agent state, but queued slash events live on adapters
@@ -574,23 +591,88 @@ class GatewayAgentCacheMixin:
             except Exception:
                 logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
         if interrupt_reason == _INTERRUPT_REASON_STOP:
-            await self._pause_goal_for_stop(session_key, source)
+            await self._pause_goal_for_stop(
+                session_key, source, expected_session_id=stop_session_id,
+                expected_generation=_generation_at_interrupt, expected_session_entry=stop_session_entry)
 
-    def _latch_user_stop(self, session_key: str) -> None:
-        """Hold background wakes for ``session_key`` until the next non-internal turn."""
-        if session_key:
-            self._session_state(session_key).conversation.stop_latched = True
+    def _stop_owner_session_entry(self, session_key: str) -> Any:
+        """Capture an already-admitted route without taking an I/O-bearing store lock on-loop.
 
-    def _clear_user_stop_latch(self, session_key: str) -> None:
-        state = self._peek_session_state(session_key) if session_key else None
-        if state is not None:
+        Stop callers have warmed routing at admission. Compression retains this entry object;
+        reset/resume replaces it. Durable writes revalidate ownership off-loop. Missing fails closed.
+        """
+        store = getattr(self, "session_store", None)
+        return getattr(store, "_entries", {}).get(session_key)
+
+    def _latch_user_stop(
+        self, session_key: str, *, session_id: Optional[str] = None, session_entry: Any = None,
+    ) -> int:
+        """Latch on-loop before interrupts can produce completions; persistence is off-loop."""
+        if not session_key:
+            return 0
+        owner = session_entry if session_entry is not None else self._stop_owner_session_entry(session_key)
+        if session_entry is None and session_id and getattr(owner, "session_id", None) != session_id:
+            return 0  # no captured entry can prove this is compression rather than a reset
+        state = self._session_state(session_key)
+        state.conversation.stop_latched = True
+        state.conversation.stop_latched_session_entry = owner
+        state.persistent.stop_latch_revision += 1
+        return state.persistent.stop_latch_revision
+
+    async def _persist_user_stop_latch(
+        self, session_key: str, *, session_id: Optional[str], revision: int, latched: bool = True,
+        session_entry: Any = None, clear_fences: tuple = (),
+    ) -> None:
+        if not session_key or not session_id:
+            return
+        state = self._peek_session_state(session_key)
+        owner = session_entry if session_entry is not None else (
+            state.conversation.stop_latched_session_entry if state is not None else None)
+
+        def _is_current() -> bool:
+            current = self._peek_session_state(session_key)
+            return (current is state and current is not None
+                    and current.persistent.stop_latch_revision == revision
+                    and current.conversation.stop_latched == latched
+                    and all(self._peek_session_state(key) is owner
+                            and owner.persistent.stop_latch_revision == rev
+                            for key, owner, rev in clear_fences))
+
+        with suppress(Exception):
+            await self.async_session_store.set_stop_latched(
+                session_key, latched, session_id=session_id, expected_entry=owner, is_current=_is_current)
+
+    async def _clear_user_stop_latch(self, *session_keys: str) -> None:
+        # Capture/clear every alias before any await: an intervening /stop must win, not be
+        # undone by a late second alias clear from the older admission. Persist as one revision set.
+        captured = []
+        for key in dict.fromkeys(session_keys):
+            if not key:
+                continue
+            state = self._session_state(key)
+            entry = self._stop_owner_session_entry(key)
             state.conversation.stop_latched = False
+            state.conversation.stop_latched_session_entry = None
+            state.persistent.stop_latch_revision += 1
+            captured.append((key, state, state.persistent.stop_latch_revision, entry))
+        fences = tuple((key, state, rev) for key, state, rev, _ in captured)
+        for key, _, revision, entry in captured:
+            await self._persist_user_stop_latch(
+                key, session_id=getattr(entry, "session_id", None), revision=revision, latched=False,
+                session_entry=entry, clear_fences=fences)
 
-    def _user_stop_latched(self, *session_keys: str) -> bool:
+    def _user_stop_latched(self, *session_keys: str, session_ids: tuple[str, ...] = ()) -> bool:
         for key in session_keys:
             state = self._peek_session_state(key) if key else None
             if state is not None and state.conversation.stop_latched:
-                return True
+                owner = state.conversation.stop_latched_session_entry
+                current = self._stop_owner_session_entry(key)
+                if owner is current and (not session_ids or getattr(current, "session_id", None) in session_ids):
+                    return True
+            for session_id in session_ids or (None,):
+                with suppress(Exception):
+                    if self.session_store.is_stop_latched(key, session_id=session_id):
+                        return True
         return False
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:

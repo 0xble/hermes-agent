@@ -31,6 +31,7 @@ def hermes_home(tmp_path, monkeypatch):
     from hermes_state_registry import close_all_under
 
     goals._DB_CACHE.clear()
+    goals._get_session_db()  # warm synchronously, before /loop's async bootstrap boundary
     yield home
     goals._DB_CACHE.clear()
     close_all_under(home)
