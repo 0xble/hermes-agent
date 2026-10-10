@@ -32,13 +32,20 @@ session ID, authored-definition fingerprint, and creation time. The fingerprint 
 card definition identity (creation time plus objective, contract, criteria, gates and revisions),
 not progress counters or the active/paused status. Wake admission, idle ingress (including ordinary
 non-internal continuations), busy ingress and FIFO follow-up all require the goal to be active and
-the stamped definition to match. Unstamped legacy continuations fail closed.
+the stamped definition to match. Resolved-session ingress also compares the stamp with the actual
+session ID after routing and Telegram binding recovery, so a /new or /resume cannot move an old
+continuation into the replacement conversation. Control wakes use the existing strict gateway
+session pin. Unstamped legacy continuations fail closed.
 
 Restart-persisted control outbox records use that same check, retaining their durable discard
 receipt. An applied historical pause/clear only removes queued continuations created no later than
 the control, leaving a later resume's continuation and human queue items intact. A busy session or
 arbitrary queue depth is not an enqueue receipt: the outbox retries until its own continuation is
-accepted or superseded.
+accepted or superseded. Queue cleanup runs synchronously on the event loop and removes the adapter
+slot only while it still holds the inspected continuation. A persisted gateway origin with an
+unavailable adapter retains its unsettled outcome flags for retry, including cleanup and notices;
+only a missing origin is permanently skipped. Offline continuations still record supersession,
+and the existing 24-hour outcome expiry bounds retries.
 
 ## Proof surface
 

@@ -338,6 +338,6 @@ async def test_control_continuation_pins_its_destination_session(state):
     GoalManager("target").set("old objective")
     GoalManager("target").pause()
     event = await _control_event(runner, _apply(state, "resume"))
-    assert event.metadata["gateway_session_id"] == "target"
-    assert event.metadata["gateway_session_strict"] is True
+    assert event.metadata.get("gateway_session_id") == "target"
+    assert event.metadata.get("gateway_session_strict") is True
 

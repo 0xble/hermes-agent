@@ -146,6 +146,14 @@ class GatewaySessionControlsMixin:
 
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
+        if source is not None and adapter is None:
+            # A persisted gateway origin can reconnect. Do not invent delivery/cleanup receipts.
+            # Still fence a saved wake against goal supersession while its adapter is offline.
+            if record.get("continuation_prompt") and not record.get("continuation_enqueued"):
+                await self._run_in_executor_with_context(
+                    session_controls.continuation_is_current, request_id,
+                )
+            return
         if not record.get("continuations_cleared"):
             # Only an applied pause/clear stops the goal; a denied, expired or failed request
             # must leave the target's queued continuation alone.
@@ -158,9 +166,9 @@ class GatewaySessionControlsMixin:
                 )
             else:
                 try:
-                    await self._run_in_executor_with_context(
-                        self._clear_goal_pending_continuations, target_entry.session_key, adapter,
-                        record.get("resolved_at", record["created_at"]),
+                    # Adapter slots/FIFOs belong to the event loop, not the DB executor.
+                    self._clear_goal_pending_continuations(
+                        target_entry.session_key, adapter, record.get("resolved_at", record["created_at"]),
                     )
                 except Exception:
                     logger.debug("goal continuation cleanup failed", exc_info=True)
@@ -261,6 +269,8 @@ class GatewaySessionControlsMixin:
             goal_fingerprint=record.get("continuation_fingerprint", ""),
         )
         event.metadata["gateway_session_key"] = key
+        event.metadata["gateway_session_id"] = record["target_session_id"]
+        event.metadata["gateway_session_strict"] = True
         event.metadata["session_control_continuation_id"] = record["id"]
         try:
             await admit_internal_event(adapter, event)

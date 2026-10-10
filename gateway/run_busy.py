@@ -197,7 +197,7 @@ class GatewayBusySessionMixin:
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
-            if remove(pending_event):
+            if remove(pending_event) and pending_slot.get(session_key) is pending_event:
                 pending_slot.pop(session_key, None)
                 removed += 1
 
