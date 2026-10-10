@@ -184,6 +184,11 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   11-file home as a mass disappearance, which after (b) costs that install four of its five
   rollback points. A floor can only relax the verdict on churn, never on critical state, which
   `_is_critical_state` routes to `on_error` before the vanished branch is reached.
+  Criticality is relative to both the default home and each `profiles/<name>/` home.
+  A named-profile config/auth/cron or pairing file disappearing must not be
+  routine churn: it makes the archive incomplete and preserves prior complete ZIPs.
+  Nested plugin `.env` files remain churn. Proof: real scan-then-unlink cases in
+  `test_backup_all_profiles.py` cover manual, pre-update, and pre-migration retention.
   (e) `status=` and `coverage=` are separate fields on both log lines. One word carrying both
   facts made the log contradict the console twice, in opposite directions: first always
   `complete`, then `incomplete` while the console said complete on a vanished-only run.
