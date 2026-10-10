@@ -93,11 +93,10 @@ async def test_busy_relay_after_an_existing_relay_does_not_reset_false():
 
 
 @pytest.mark.asyncio
-async def test_busy_merge_with_typed_human_keeps_the_silence_guard():
+async def test_busy_merge_with_typed_human_restores_visible_fallback():
     adapter, source, key = _busy_adapter("interrupt")
 
     await adapter.handle_message(_relay_event(source))
     await adapter.handle_message(MessageEvent(text="typed follow-up", source=source, message_id="human-1"))
 
     assert adapter._pending_messages[key].reply_expected is None
-
