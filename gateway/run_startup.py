@@ -1059,35 +1059,38 @@ class GatewayStartupMixin:
                         obligation_id=compute_obligation_id(key, ref, content), session_key=key,
                         platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
                         thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
-                        resume_turn_id=token, part="#copy" in ref)
+                        # Parts were matched against the ledger above; only a single whole-reply
+                        # row still needs the content-based duplicate check.
+                        resume_turn_id=token, part=ref != f"crash:{token}" or text != content)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
 
     @staticmethod
     def _crash_left_parts(key: str, token: str, text: str, started: float, origin) -> list:
-        """The ``(message_ref, content)`` rows a crash-left reply still owes. A reply whose copy
-        blocks go out as separate messages is ledgered per part as it is sent: once any part of
-        this turn is in the ledger, only the copy blocks not yet recorded are owed, never the
-        whole reply again."""
+        """The ``(message_ref, content)`` rows a crash-left reply still owes.
+
+        Where copy blocks go out as separate messages, the reply is owed as one ledger row per
+        message (its ordinary text, then each block), so a retry of one refused part never
+        resends parts that landed. Live delivery records the same rows as it sends; a part this
+        turn already recorded (matched by exact content, one row per occurrence) is not owed
+        again. Elsewhere the reply is one message and one row."""
         from gateway.copy_blocks import extract_copy_blocks, platform_sends_copy_blocks, wrap_copy_block
         from gateway.delivery_ledger import recorded_contents_since
-        whole = [(f"crash:{token}", text)]
         if not platform_sends_copy_blocks(getattr(origin, "platform", None)):
-            return whole
-        _, blocks = extract_copy_blocks(text)
-        recorded = recorded_contents_since(key, started) if blocks else {}
-        if not recorded:
-            return whole
-        # Blocks go out in order, so the recorded ones are the first occurrences of each body:
-        # consume one recorded row per block, and every block left over is still owed.
+            return [(f"crash:{token}", text)]
+        ordinary, blocks = extract_copy_blocks(text)
+        if not blocks:
+            return [(f"crash:{token}", text)]
+        parts = [(f"crash:{token}", ordinary.strip())] if ordinary.strip() else []
+        parts += [(f"crash:{token}#copy{index}", wrap_copy_block(block)) for index, block in enumerate(blocks)]
+        recorded = recorded_contents_since(key, started)
         owed = []
-        for index, block in enumerate(blocks):
-            wrapped = wrap_copy_block(block)
-            if recorded.get(wrapped, 0) > 0:
-                recorded[wrapped] -= 1
+        for ref, content in parts:
+            if recorded.get(content, 0) > 0:
+                recorded[content] -= 1  # this exact message was already ledgered by live delivery
             else:
-                owed.append((f"crash:{token}#copy{index}", wrapped))
+                owed.append((ref, content))
         return owed
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:

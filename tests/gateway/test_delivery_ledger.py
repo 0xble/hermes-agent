@@ -547,12 +547,61 @@ class TestGatewayRedeliverySweep:
             obligation_id="adopted", session_key=key2, platform="telegram", chat_id="C1", thread_id=None,
             content=wrap_copy_block("same"), since=started, part=True)
         assert _row("adopted") is not None
-        # Nothing of this turn was ledgered yet: the whole reply is owed, as before.
+        # Nothing of this turn was ledgered yet: every message is owed, one row each, so a retry
+        # of a refused part never resends the parts that landed.
         assert GatewayRunner._crash_left_parts("agent:other", "tok", text, started, origin) == [
-            ("crash:tok", text)]
+            ("crash:tok", "Intro"), ("crash:tok#copy0", wrap_copy_block("one")),
+            ("crash:tok#copy1", wrap_copy_block("two"))]
+        # A queued follow-up after a delivered first answer still owes its own ordinary text.
+        key3 = "agent:main:telegram:dm:C3"
+        _record(oid="first", session_key=key3, platform="telegram", content="The first answer.")
+        follow = "The follow-up answer.\n[[copy]]\nnew payload\n[[/copy]]\n"
+        assert GatewayRunner._crash_left_parts(key3, "tok", follow, started, origin) == [
+            ("crash:tok", "The follow-up answer."), ("crash:tok#copy0", wrap_copy_block("new payload"))]
         # Inline platforms never split.
         slack = SimpleNamespace(platform="slack")
         assert GatewayRunner._crash_left_parts(key, "tok", text, started, slack) == [("crash:tok", text)]
+
+    @pytest.mark.asyncio
+    async def test_crash_left_split_reply_retry_resends_only_the_refused_part(self):
+        from types import SimpleNamespace
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+        key = "agent:main:telegram:dm:C9"
+        started = time.time() - 1
+        text = "Intro\n[[copy]]\none\n[[/copy]]\n[[copy]]\ntwo\n[[/copy]]\n"
+        origin = SimpleNamespace(platform="telegram")
+        for ref, content in GatewayRunner._crash_left_parts(key, "tok", text, started, origin):
+            dl.record_crash_left_reply(
+                obligation_id=dl.compute_obligation_id(key, ref, content), session_key=key,
+                platform="telegram", chat_id="C9", thread_id=None, content=content, since=started,
+                part=True)
+            time.sleep(0.002)
+        sends = []
+        refuse = {"two": 1}
+
+        async def send(*, chat_id, content, metadata=None, **_kw):
+            body = content.split("\n")[-1] if "\n" in content else content
+            sends.append(body)
+            if refuse.get(body):
+                refuse[body] -= 1
+                return MagicMock(success=False, error="nope")
+            return MagicMock(success=True, error="")
+
+        adapter = MagicMock()
+        adapter.platform = "telegram"
+        adapter.send = AsyncMock(side_effect=send)
+        runner = self._runner()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        await runner._redeliver_pending_obligations()
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1, "
+                         "updated_at=0 WHERE state='failed'")
+        await runner._redeliver_pending_obligations()
+        assert [s for s in sends if s in ("Intro", "one", "two") or s.endswith("Intro")][-1] == "two"
+        assert sum(1 for s in sends if s == "one") == 1
+        assert sum(1 for s in sends if s.endswith("Intro")) == 1
+        assert sends.count("two") == 2
 
     @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
