@@ -137,8 +137,11 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
 def _evict_modules(module_name: str) -> None:
     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
     prefix = f"{module_name}."
-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
-        del sys.modules[name]
+    # Startup imports run on other threads. Iterating the live module table can
+    # disable a healthy plugin with "dictionary changed size during iteration".
+    for name in sys.modules.copy():
+        if name == module_name or name.startswith(prefix):
+            sys.modules.pop(name, None)  # another loader may already have evicted it
 
 
 def _serialized_replacement(method):
