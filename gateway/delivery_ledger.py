@@ -37,11 +37,9 @@ _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
-# post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
-# occurred, but a network rejection's acknowledgement can still have been lost independently.
-RECOVERED_MARKER = "♻️ Recovered reply — the gateway restarted during delivery, so this may be a duplicate:\n\n"
-RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconnected after the original "
-                      "delivery failed, so this may be a duplicate:\n\n")
+# post-rejection retry) — honest at-least-once. The marker is intentionally neutral: it preserves the
+# only user-relevant fact (the reply may already have arrived) without exposing transport lifecycle.
+RECOVERED_MARKER = "♻️ Recovered reply — this may be a duplicate:\n\n"
 # A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
 # and MarkdownV2 escaping alone can push a reply that fits one message into two), and the platform may have
 # accepted the first chunk(s) before refusing the rest; the send result does not say which landed. The raw
@@ -64,8 +62,7 @@ assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 # refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
 # closed as ``flood_control:<seconds>`` on purpose (#91969) so that this ledger owns the wait instead of
 # the send coroutine sleeping through it. Before this the row simply sat in ``failed`` until the next
-# restart's sweep, which then redelivered it hours late under the "gateway restarted during delivery"
-# marker.
+# restart's sweep, which then redelivered it hours late with the normal duplicate hint.
 FLOOD_ERROR_PREFIX = "flood_control:"
 FLOOD_RETRY_DEFAULT_SECONDS = 60.0
 FLOOD_RETRY_CAP_SECONDS = 15 * 60.0
@@ -438,11 +435,11 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
                  last_error: Optional[str] = None, resume_marker: Optional[tuple] = None,
                  resume_turn_id: Optional[str] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
-    the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
-    ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
-    restart marker default. ``last_error`` is the row's pre-claim error, carried so a runtime claim that is
-    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility."""
-    marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
+    the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime;
+    other ambiguous redeliveries get the neutral duplicate hint. ``last_error`` is the row's pre-claim
+    error, carried so a runtime claim that is released unsent goes back to ``failed`` with the same error
+    and keeps its retry eligibility."""
+    marker = FLOOD_MARKER if flood else (RECOVERED_MARKER if runtime else None)
     row = {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
            **({"marker": marker} if needs_marker and marker else {}), "profile": profile,

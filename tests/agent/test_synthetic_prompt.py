@@ -127,7 +127,7 @@ def test_structured_provenance_is_never_overridden_by_text(build, display_kind, 
 
 
 def test_recovery_note_wrapping_a_generated_notice_is_fully_synthetic():
-    note = "[System note: The previous turn was interrupted by a gateway restart.]\n\n"
+    note = "[System note: Resume the pending turn. Any restart, update, or shutdown command has already run.]\n\n"
 
     assert human_prompt_text(note + _delegation_notice()) is None
     assert human_prompt_text(note + _delegation_notice() + "\n\n" + HUMAN) == HUMAN
