@@ -233,7 +233,7 @@ async def test_installed_request_limiter_shares_the_adapter_quota(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup(tmp_path):
+async def test_cosmetic_pressure_sheds_typing_interim_edits_and_progress(tmp_path):
     adapter = _adapter(tmp_path)
     _spend(adapter, 7)
     await adapter.send_typing(CHAT)
@@ -241,9 +241,6 @@ async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup
     skipped = await adapter.edit_message(CHAT, "5", "interim", finalize=False)
     assert skipped.raw_response == {"skipped": True}
     adapter._bot.edit_message_text.assert_not_awaited()
-    assert await adapter.delete_messages(CHAT, ["1", "2"]) == {"1": False, "2": False}
-    assert await adapter.delete_message(CHAT, "3") is False
-    adapter._bot.delete_messages.assert_not_awaited()
     with outbound_class(OUTBOUND_PROGRESS):
         shed = await adapter.send(CHAT, "⚙️ progress")
     assert shed.error == "daily_budget_shed"
@@ -304,3 +301,49 @@ async def test_a_shed_notice_is_final_no_retry_fallback_or_failure_notice(tmp_pa
     assert result.error == "daily_budget_shed"
     assert calls == ["status line"]  # no retry, plain-text copy, or "delivery failed" notice
     adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_pressure_never_sheds_cleanup_deletes(tmp_path):
+    """Deletes create no messages, so shedding them saves none of the daily cap and strands bubbles.
+
+    Regression: a typed turn's end-of-turn cleanup ran labelled with a drained background follow-up's
+    trigger, was shed, and left every progress bubble behind (``returned_false``).
+    """
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 7)  # past the cosmetic threshold
+    token = bind_trigger(SimpleNamespace(text="[IMPORTANT: Background process 42 finished]", internal=True))
+    try:
+        assert adapter._daily_sheds(CHAT, OUTBOUND_PROGRESS)  # background progress is still shed
+        assert await adapter.delete_messages(CHAT, ["1", "2"]) == {"1": True, "2": True}
+        assert await adapter.delete_message(CHAT, "3") is True
+    finally:
+        reset_trigger(token)
+    adapter._bot.delete_messages.assert_awaited_once()
+    adapter._bot.delete_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_path):
+    """Draining a queued background event relabels the task; the prior turn's cleanup must not inherit it."""
+    from plugins.platforms.telegram.chat_budget import bind_trigger, current_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    seen = []
+    token = bind_trigger(SimpleNamespace(text="please check the build"))
+    try:
+        adapter.register_post_delivery_callback("sk", lambda: seen.append(current_trigger()), generation=1)
+        adapter._pending_messages["sk"] = SimpleNamespace(
+            text="[IMPORTANT: Background process 42 finished]", internal=True)
+        adapter.get_pending_message("sk")  # the runner's in-band drain
+        assert current_trigger() == "process"
+        callback = adapter.pop_post_delivery_callback("sk", generation=1)
+        result = callback()
+        if asyncio.iscoroutine(result):
+            await result
+        assert seen == ["typed"]
+        assert current_trigger() == "process"  # the follow-up turn keeps its own label afterwards
+    finally:
+        reset_trigger(token)
