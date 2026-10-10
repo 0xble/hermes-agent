@@ -66,7 +66,11 @@ exactly. A bare model name matches that model on every provider, and substrings 
 match. Neither form changes the configured fallback chain. `hermes fallback clear`
 keeps its original meaning and empties the chain. A clear does not interrupt a turn
 that is already running. Live cached agents pick it up at their next turn-start check,
-which finds no record and lets the agent retry the primary.
+which finds no record and lets the agent retry the primary. The same check also treats an
+expired record as authoritative over the agent's cached deadline. A provider reset can
+shorten an outage below a deadline cached earlier, so a cached fallback agent probes the
+primary once the shared window passes. The expired record stays until that probe succeeds
+and clears it with one recovery notice.
 
 ## Source surfaces and proof
 
