@@ -575,3 +575,33 @@ async def test_control_outbox_retries_persisted_origin_when_adapter_is_unavailab
     assert session_controls._load_record(record["id"])["outbox_done"] is True
     assert session_controls.pending_outbox() == []
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["superseded", "expired"])
+async def test_control_outbox_retries_persisted_origin_when_adapter_is_unavailable_until_settled(
+    state, monkeypatch, settlement,
+):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+    from tests.gateway.test_goal_continuation_identity import _apply
+
+    GoalManager("target").set("old objective")
+    GoalManager("target").pause()
+    record = _apply(state, "resume")
+    runner = _runner(state, target_route=False)
+    await runner._drain_session_controls()
+    assert not session_controls._load_record(record["id"]).get("outbox_done")
+    if settlement == "superseded":
+        GoalManager("target").clear()
+        await runner._drain_session_controls()
+        persisted = session_controls._load_record(record["id"])
+        assert persisted["continuation_discarded"] == "target_changed"
+        assert persisted["continuation_enqueued"] is True
+        assert not persisted.get("target_notice_skipped")
+    else:
+        monkeypatch.setattr(session_controls, "_now", lambda: record["resolved_at"] + 86401)
+        await runner._drain_session_controls()
+        assert session_controls._load_record(record["id"])["outbox_done"] is True
+        assert session_controls.pending_outbox() == []
+
+
