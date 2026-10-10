@@ -184,9 +184,14 @@ class CopyMarkerStreamFilter:
     def message_boundary(self) -> None:
         """A new assistant message starts here, so it starts on a new line.
 
-        Block, fence, and held-marker state carry over (a block may span a tool call), but an
-        unterminated ordinary line ends, so a following ``[[copy]]`` is at line start.
+        Block and fence state carry over (a block may span a tool call), but an unterminated
+        ordinary line ends, so a following ``[[copy]]`` is at line start. A held tail that is
+        already a complete marker line (a message may end on ``[[/copy]]`` with no newline) is
+        consumed here; a genuinely partial marker stays held for the next message.
         """
+        if self._pending and self._is_marker(self._pending):
+            self._on_marker(self._pending)
+            self._pending = ""
         self._line = ""
 
     def flush(self) -> str:

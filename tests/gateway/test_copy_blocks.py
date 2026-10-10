@@ -666,3 +666,20 @@ async def test_queued_copy_refusal_without_a_ledger_keeps_the_completion_fallbac
         "[[copy]]\nonly copy\n[[/copy]]", source, adapter, event_message_id="e",
         session_key="session", inbound_message_id="in")
     assert delivered is False
+
+
+@pytest.mark.parametrize("drop_bodies", [False, True])
+def test_message_ending_on_a_close_marker_without_newline_closes_the_block(drop_bodies) -> None:
+    f = CopyMarkerStreamFilter(drop_bodies=drop_bodies)
+    out = f.feed("[[copy]]\nfirst body\n[[/copy]]")
+    f.message_boundary()
+    out += f.feed("Next assistant message.\n") + f.flush()
+    assert out == ("" if drop_bodies else "first body\n") + "Next assistant message.\n"
+
+
+def test_partial_marker_still_carries_across_a_message_boundary() -> None:
+    f = CopyMarkerStreamFilter()
+    out = f.feed("intro\n[[co")
+    f.message_boundary()
+    out += f.feed("py]]\nbody\n[[/copy]]\nafter\n") + f.flush()
+    assert out == "intro\nbody\nafter\n"
