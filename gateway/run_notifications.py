@@ -638,6 +638,8 @@ class GatewayNotificationsMixin:
         from gateway.run import _strip_response_attachments_for_direct_send
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
+        from gateway.copy_blocks import split_copy_blocks_for
+        _, copy_blocks = split_copy_blocks_for(adapter, response)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -686,6 +688,49 @@ class GatewayNotificationsMixin:
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
                     delivered_confirmed = True
+        if copy_blocks and session_key and isinstance(adapter, BasePlatformAdapter):
+            queued_copy_event = MessageEvent(
+                text="", source=source, message_id=event_message_id, ledger_message_id=inbound_message_id)
+            copy_results = []
+            await adapter._send_copy_blocks(
+                queued_copy_event, session_key, copy_blocks, _mark_notify_metadata(metadata),
+                copy_results.append)
+            if any(getattr(result, "success", False) for result in copy_results):
+                delivered_confirmed = True
+            if any(not getattr(result, "success", False) for result in copy_results):
+                from gateway.delivery_ledger import ledger_enabled
+                if not await asyncio.to_thread(ledger_enabled):
+                    # No ledger owns the refused blocks. With nothing landed, the caller's
+                    # whole-response fallback is the only retry; after a partial delivery it would
+                    # duplicate, so the gap is reported and the turn stops here.
+                    if not delivered_confirmed:
+                        return False
+                    logger.error(
+                        "Queued-lane copy block delivery incomplete for %s and no delivery ledger "
+                        "is enabled; the undelivered blocks are lost.", source.chat_id)
+                else:
+                    # Each block has its own ledger row, so a refused block is redelivered from
+                    # the ledger. A whole-response fallback here would resend delivered parts.
+                    logger.warning(
+                        "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
+                        source.chat_id)
+        else:
+            for copy_block_index, copy_block in enumerate(copy_blocks):
+                copy_metadata = dict(metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["copy_block_index"] = copy_block_index
+                copy_metadata["plain"] = True
+                _sent = await self._send_queued_final_text(
+                    adapter, source, copy_block, copy_metadata, event_message_id, session_key, inbound_message_id)
+                if not getattr(_sent, "success", False):
+                    logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
+                                   getattr(_sent, "error", None) or "no result")
+                    # Only a turn where nothing landed may fall back to the whole-response send;
+                    # after a partial delivery that resend would duplicate what already arrived.
+                    if not delivered_confirmed:
+                        return False
+                    break
+                delivered_confirmed = True
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
             if not hasattr(note_event, "_restart_note_marker_api_available"):
@@ -694,8 +739,10 @@ class GatewayNotificationsMixin:
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
+        # Attachments come only from text outside copy blocks: a body is literal text.
+        from gateway.copy_blocks import strip_copy_blocks
         media_delivered = await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            strip_copy_blocks(response), MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
         # Attachment-only answer: no text was sent, so the note is reconciled only once an upload
@@ -2022,25 +2069,29 @@ class GatewayNotificationsMixin:
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
             claim.proceed, claim.early_result = False, False
             return claim
-        # An interim per-task notice shares the batch's delegation_id but is not the durable
-        # completion; claiming that row here would acknowledge the FINAL result before it exists.
-        if evt_type == "async_delegation" and not evt.get("task_failure_notice"):
+        # Every tagged async event owns its delivery identity. Outbox events (interim notices and
+        # terminal fallbacks) must claim that exact event row; legacy untagged finals retain their
+        # delegation lifecycle-row claim for compatibility. An untagged legacy interim notice returns
+        # an empty claim and remains process-local, as it predates durable outbox delivery.
+        if evt_type == "async_delegation":
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery, defer_completion_delivery
-                    delegation_id = claim.delegation_id
+                    from tools.async_delegation import claim_event_delivery, defer_completion_delivery
                     claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    def _defer_claim(token):
+                        if token:
+                            defer_completion_delivery(claim.delegation_id, token)
                     claimed = await claim_off_loop(
-                        lambda: claim_completion_delivery(delegation_id, claim_id),
-                        lambda ok: ok and defer_completion_delivery(delegation_id, claim_id),
+                        lambda: claim_event_delivery(evt, claim_id),
+                        _defer_claim,
                     )
-                    if not claimed:
+                    if claimed is None:
                         claim.proceed = False
                         return claim
-                    # Recorded only once held: a claim abandoned mid-flight has ONE cleanup (the
-                    # deferred refund above), never also the caller's attempt-spending release.
-                    claim.claim_id = claim_id
+                    # Empty tokens are the compatibility result for legacy in-memory notices; only
+                    # a real claim needs durable settlement in the caller's finally block.
+                    claim.claim_id = claimed or ""
                 except Exception as exc:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
                     claim.proceed, claim.early_result = False, False
