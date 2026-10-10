@@ -27,7 +27,7 @@ def state(tmp_path, monkeypatch):
     release_or_close(db)
 
 
-def _runner(state, *, target_route=True):
+def _runner(state, *, target_route=True, request_success=True, send_success=True, injection_result=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
     from gateway.session import Platform, SessionEntry, SessionSource
     from hermes_cli import session_controls
@@ -35,6 +35,8 @@ def _runner(state, *, target_route=True):
 
     class Adapter:
         def __init__(self):
+            self.request_success = request_success
+            self.send_success = send_success
             self.requests = []
             self.sends = []
             self._pending_messages = {}
@@ -43,11 +45,11 @@ def _runner(state, *, target_route=True):
 
         async def send_control_request(self, chat_id, text, request_id, metadata=None):
             self.requests.append((chat_id, text, request_id, metadata))
-            return SimpleNamespace(success=True)
+            return SimpleNamespace(success=self.request_success)
 
         async def send(self, chat_id, text, metadata=None):
             self.sends.append((chat_id, text, metadata))
-            return SimpleNamespace(success=True)
+            return SimpleNamespace(success=self.send_success)
 
     adapter = Adapter()
     now = datetime.now(timezone.utc)
@@ -93,6 +95,7 @@ def _runner(state, *, target_route=True):
 
         async def _dispatch_plugin_message_injection(self, **kwargs):
             self.injections.append(kwargs)
+            return injection_result
 
     runner = Runner()
     runner.injections = []
@@ -119,7 +122,12 @@ async def test_watcher_posts_pending_once_with_topic_metadata_and_skips_unrouted
     unrouted = _runner(state, target_route=False)
     record2 = request_control("goal", "clear", "target", requester_sid="requester")
     await unrouted._drain_session_controls()
-    assert all(r["id"] != record2["id"] for r in pending_outbox())
+    import json
+    from hermes_cli import session_controls
+    failed = json.loads(state.get_meta(session_controls._record_key(record2["id"])))
+    assert failed["status"] == "failed"
+    assert failed["error"] == "target_unroutable"
+    assert len(unrouted.injections) == 1
 
 
 @pytest.mark.asyncio
@@ -192,3 +200,85 @@ async def test_watcher_expiry_does_not_deadlock(state):
     state.set_meta(key, __import__("json").dumps(value))
     await asyncio.wait_for(runner._drain_session_controls(), timeout=1)
     assert __import__("json").loads(state.get_meta(key))["status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_watcher_retries_failed_request_delivery(state):
+    from hermes_cli.session_controls import pending_outbox, request_control
+
+    runner = _runner(state, request_success=False)
+    request = request_control("goal", "clear", "target", requester_sid="requester")
+    await runner._drain_session_controls()
+    await runner._drain_session_controls()
+    record = next(item for item in pending_outbox() if item["id"] == request["id"])
+    assert len(runner.adapter.requests) == 2
+    assert record["request_posted"] is False
+
+
+@pytest.mark.asyncio
+async def test_watcher_retries_failed_target_notice_and_requester_injection(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control, pending_outbox
+
+    runner = _runner(state, send_success=False, injection_result=False)
+    GoalManager("target").set("watch the build")
+    state.append_message("requester", "user", "Please clear the target goal immediately")
+    result = apply_control(
+        "goal", "clear", "target", requester_sid="requester",
+        user_quote="clear the target goal immediately",
+    )
+    await runner._drain_session_controls()
+    record = next(item for item in pending_outbox() if item["id"] == result["record"]["id"])
+    assert record["target_notice_sent"] is False
+    runner.adapter.send_success = True
+    await runner._drain_session_controls()
+    record = next(item for item in pending_outbox() if item["id"] == result["record"]["id"])
+    assert record["target_notice_sent"] is True
+    assert record["requester_notified"] is False
+    runner._dispatch_plugin_message_injection = AsyncMock(return_value=True)
+    await runner._drain_session_controls()
+    assert pending_outbox() == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_retries_wake_not_accepted_and_processes_next_record(state):
+    from gateway.wake import WakeNotAccepted
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import pending_outbox, request_control, resolve_request
+
+    runner = _runner(state)
+    GoalManager("target").set("watch the build")
+    GoalManager("target").pause("waiting")
+    resume = request_control("goal", "resume", "target", requester_sid="requester")
+    denied = request_control("goal", "clear", "target", requester_sid="requester")
+    assert resolve_request(resume["id"], "approve", "admin")["status"] == "applied"
+    assert resolve_request(denied["id"], "deny", "admin")["status"] == "denied"
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=WakeNotAccepted("busy"))):
+        await runner._drain_session_controls()
+    first = next(item for item in pending_outbox() if item["id"] == resume["id"])
+    assert first["continuation_enqueued"] is False
+    assert len(runner.injections) == 1
+
+
+@pytest.mark.asyncio
+async def test_watcher_enqueues_replaced_goal_continuation(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control, pending_outbox
+
+    runner = _runner(state)
+    GoalManager("target").set("old")
+    GoalManager("target").pause("waiting")
+    state.append_message("requester", "user", "Please replace the target goal with ship now")
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester",
+        user_quote="replace the target goal with ship now",
+        payload={"goal": "ship now"},
+    )
+    assert result["record"]["continuation_prompt"]
+    async def admit_event(_adapter, event):
+        event._gateway_accepted = True
+
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=admit_event)) as admit:
+        await runner._drain_session_controls()
+    admit.assert_awaited_once()
+    assert pending_outbox() == []

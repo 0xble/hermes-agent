@@ -160,3 +160,69 @@ def test_target_resolution_errors(state):
         resolve_target("missing")
     with pytest.raises(ValueError, match="cross_profile"):
         resolve_target("hermes:other/target")
+
+
+def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+    from hermes_cli.session_controls import apply_control, request_control, resolve_request
+
+    state.append_message("requester", "user", "Please pause the empty goal right now")
+    quoted = apply_control(
+        "goal", "pause", "target", requester_sid="requester",
+        user_quote="pause the empty goal right now",
+    )
+    assert quoted["status"] == "failed"
+    assert quoted["error"] == "nothing_to_pause"
+
+    GoalManager("target").set("temporary")
+    state.append_message("requester", "user", "Please clear the temporary goal now")
+    cleared = apply_control(
+        "goal", "clear", "target", requester_sid="requester",
+        user_quote="clear the temporary goal now",
+    )
+    assert cleared["status"] == "applied"
+    state.append_message("requester", "user", "Please clear the temporary goal again")
+    repeated = apply_control(
+        "goal", "clear", "target", requester_sid="requester",
+        user_quote="clear the temporary goal again",
+    )
+    assert repeated["status"] == "failed"
+    assert repeated["error"] == "nothing_to_clear"
+
+    pending = request_control("loop", "stop", "target", requester_sid="requester")
+    resolved = resolve_request(pending["id"], "approve", "admin")
+    assert resolved["status"] == "failed"
+    assert resolved["error"] == "nothing_to_stop"
+    assert GoalManager("target").state.status == "cleared"
+    assert LoopManager("target").state is None
+
+
+def test_unroutable_target_is_rejected_before_creating_request(state):
+    from hermes_cli.session_controls import apply_control, request_control
+
+    state.create_session(
+        "cli-target", "cli", profile_name="default", chat_id=None,
+        session_key="agent:main:cli:cli-target",
+    )
+    direct = request_control("goal", "clear", "cli-target", requester_sid="requester")
+    assert direct["error_code"] == "target_unroutable"
+    result = apply_control("goal", "clear", "cli-target", requester_sid="requester")
+    assert result["error_code"] == "target_unroutable"
+
+
+def test_goal_replace_records_continuation_prompt(state):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("old")
+    GoalManager("target").pause("waiting")
+    state.append_message("requester", "user", "Please replace the target goal with ship now")
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="requester",
+        user_quote="replace the target goal with ship now",
+        payload={"goal": "ship now"},
+    )
+    assert result["status"] == "applied"
+    assert result["continuation_prompt"]
+    assert result["record"]["continuation_prompt"] == result["continuation_prompt"]

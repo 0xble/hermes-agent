@@ -9,6 +9,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _send_succeeded(result: Any) -> bool:
+    """Only a successful SendResult counts as delivery acceptance."""
+    return bool(getattr(result, "success", False))
+
+
 class GatewaySessionControlsMixin:
     """Drain session-control approval/outcome records without coupling tools to a live runner."""
 
@@ -57,9 +62,7 @@ class GatewaySessionControlsMixin:
             return bool(record.get("request_skipped"))
         target_done = record.get("target_notice_sent") or record.get("target_notice_skipped")
         requester_done = record.get("requester_notified") or record.get("requester_notification_skipped")
-        continuation_done = (
-            record.get("kind"), record.get("action")
-        ) != ("goal", "resume") or record.get("continuation_enqueued")
+        continuation_done = not record.get("continuation_prompt") or record.get("continuation_enqueued")
         cleanup_done = (
             record.get("kind"), record.get("action")
         ) not in {("goal", "pause"), ("goal", "clear")} or record.get("continuations_cleared")
@@ -86,146 +89,182 @@ class GatewaySessionControlsMixin:
         await self._warm_goals_session_db("session controls")
         records = await self._run_in_executor_with_context(session_controls.pending_outbox)
         for record in records:
-            request_id = record.get("id")
-            if not request_id:
-                continue
-            status = record.get("status")
-            target_entry = await self._control_entry_off_loop(record.get("target_session_id", ""))
-            requester_entry = await self._control_entry_off_loop(record.get("requester_session_id", ""))
+            try:
+                await self._drain_session_control_record(record, session_controls)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "session-control record drain failed for %s",
+                    record.get("id"),
+                    exc_info=True,
+                )
 
-            if status == "pending":
-                if float(record.get("expires_at") or 0) <= time.time():
-                    expired = await self._run_in_executor_with_context(
-                        session_controls.expire_request, request_id
-                    )
-                    if expired is None:
-                        continue
-                    record = expired
-                    status = record.get("status")
-                elif not record.get("request_posted") and not record.get("request_skipped"):
-                    source, adapter = await self._session_control_route(target_entry)
-                    if source is None or adapter is None:
-                        await self._mark_and_finish(session_controls, record, "request_skipped")
-                    else:
-                        metadata = dict(self._thread_metadata_for_source(source) or {})
-                        metadata["session_control_request_id"] = request_id
-                        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
-                        with outbound_class(OUTBOUND_NOTICE):
-                            await adapter.send_control_request(
-                                source.chat_id, self._control_text(record), request_id, metadata=metadata
-                            )
-                        await self._mark_and_finish(session_controls, record, "request_posted")
-                    continue
+    async def _drain_session_control_record(self, record: dict, session_controls) -> None:
+        request_id = record.get("id")
+        if not request_id:
+            return
+        status = record.get("status")
+        target_entry = await self._control_entry_off_loop(record.get("target_session_id", ""))
+        requester_entry = await self._control_entry_off_loop(record.get("requester_session_id", ""))
 
-            if status not in {"applied", "denied", "failed", "expired"}:
-                continue
-
-            # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
-            source, adapter = await self._session_control_route(target_entry)
-            if not record.get("continuations_cleared"):
-                needs_cleanup = (record.get("kind"), record.get("action")) in {
-                    ("goal", "pause"), ("goal", "clear")
-                }
-                if not needs_cleanup or source is None or adapter is None:
-                    record = await self._mark_and_finish(
-                        session_controls, record, "continuations_cleared"
-                    )
-                else:
-                    try:
-                        await self._run_in_executor_with_context(
-                            self._clear_goal_pending_continuations, target_entry.session_key, adapter
-                        )
-                    except Exception:
-                        logger.debug("goal continuation cleanup failed", exc_info=True)
-                    record = await self._mark_and_finish(
-                        session_controls, record, "continuations_cleared"
-                    )
-
-            if not record.get("continuation_enqueued"):
-                if (record.get("kind"), record.get("action")) != ("goal", "resume"):
-                    record = await self._mark_and_finish(
-                        session_controls, record, "continuation_enqueued"
-                    )
-                elif source is None or adapter is None:
-                    record = await self._mark_and_finish(
-                        session_controls, record, "continuation_enqueued"
-                    )
-                else:
-                    prompt = record.get("continuation_prompt")
-                    if not prompt:
-                        record = await self._mark_and_finish(
-                            session_controls, record, "continuation_enqueued"
-                        )
-                    else:
-                        key = target_entry.session_key
-
-                        def busy():
-                            return (
-                                self._is_session_running(key)
-                                or key in getattr(adapter, "_active_sessions", {})
-                                or self._queue_depth(key, adapter=adapter) > 0
-                            )
-
-                        if await self._run_in_executor_with_context(busy):
-                            record = await self._mark_and_finish(
-                                session_controls, record, "continuation_enqueued"
-                            )
-                        else:
-                            event = self._synthetic_prompt_event(
-                                source, prompt, reply_expected=False, goal_continuation=True
-                            )
-                            event.metadata["gateway_session_key"] = key
-                            try:
-                                from gateway.wake import admit_internal_event
-                                await admit_internal_event(adapter, event)
-                                if not getattr(event, "_gateway_accepted", False):
-                                    continue
-                            except Exception:
-                                logger.debug("goal resume continuation admission failed", exc_info=True)
-                            else:
-                                record = await self._mark_and_finish(
-                                    session_controls, record, "continuation_enqueued"
-                                )
-
-            notice = self._control_notice(record)
-            if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
+        if status == "pending":
+            if float(record.get("expires_at") or 0) <= time.time():
+                expired = await self._run_in_executor_with_context(
+                    session_controls.expire_request, request_id
+                )
+                if expired is None:
+                    return
+                record = expired
+                status = record.get("status")
+            elif not record.get("request_posted") and not record.get("request_skipped"):
+                source, adapter = await self._session_control_route(target_entry)
                 if source is None or adapter is None:
-                    record = await self._mark_and_finish(
-                        session_controls, record, "target_notice_skipped"
+                    failed = await self._run_in_executor_with_context(
+                        session_controls.fail_request, request_id, "target_unroutable"
                     )
+                    if failed is None:
+                        return
+                    record = failed
+                    status = record.get("status")
                 else:
                     metadata = dict(self._thread_metadata_for_source(source) or {})
                     metadata["session_control_request_id"] = request_id
                     from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
                     with outbound_class(OUTBOUND_NOTICE):
-                        await adapter.send(source.chat_id, notice, metadata=metadata)
-                    record = await self._mark_and_finish(
-                        session_controls, record, "target_notice_sent"
+                        result = await adapter.send_control_request(
+                            source.chat_id, self._control_text(record), request_id, metadata=metadata
+                        )
+                    if not _send_succeeded(result):
+                        logger.info("session-control request delivery failed for %s; retrying", request_id)
+                        return
+                    await self._mark_and_finish(session_controls, record, "request_posted")
+                    return
+
+        if status not in {"applied", "denied", "failed", "expired"}:
+            return
+
+        # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
+        source, adapter = await self._session_control_route(target_entry)
+        if not record.get("continuations_cleared"):
+            needs_cleanup = (record.get("kind"), record.get("action")) in {
+                ("goal", "pause"), ("goal", "clear")
+            }
+            if not needs_cleanup or source is None or adapter is None:
+                record = await self._mark_and_finish(
+                    session_controls, record, "continuations_cleared"
+                )
+            else:
+                try:
+                    await self._run_in_executor_with_context(
+                        self._clear_goal_pending_continuations, target_entry.session_key, adapter
+                    )
+                except Exception:
+                    logger.debug("goal continuation cleanup failed", exc_info=True)
+                record = await self._mark_and_finish(
+                    session_controls, record, "continuations_cleared"
+                )
+
+        if not record.get("continuation_enqueued"):
+            prompt = record.get("continuation_prompt")
+            if not prompt:
+                record = await self._mark_and_finish(
+                    session_controls, record, "continuation_enqueued"
+                )
+            elif source is None or adapter is None:
+                record = await self._mark_and_finish(
+                    session_controls, record, "continuation_enqueued"
+                )
+            else:
+                key = target_entry.session_key
+
+                def busy():
+                    return (
+                        self._is_session_running(key)
+                        or key in getattr(adapter, "_active_sessions", {})
+                        or self._queue_depth(key, adapter=adapter) > 0
                     )
 
-            if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
-                requester_source, _requester_adapter = await self._session_control_route(requester_entry)
-                if requester_source is None:
+                if await self._run_in_executor_with_context(busy):
                     record = await self._mark_and_finish(
-                        session_controls, record, "requester_notification_skipped"
+                        session_controls, record, "continuation_enqueued"
                     )
                 else:
-                    content = self._requester_notice(record)
+                    event = self._synthetic_prompt_event(
+                        source, prompt, reply_expected=False, goal_continuation=True
+                    )
+                    event.metadata["gateway_session_key"] = key
                     try:
-                        await self._dispatch_plugin_message_injection(
-                            session_key=requester_entry.session_key,
-                            content=content,
-                            plugin_id="session-controls",
+                        from gateway.wake import WakeNotAccepted, admit_internal_event
+                        await admit_internal_event(adapter, event)
+                    except WakeNotAccepted:
+                        logger.info(
+                            "session-control continuation for %s not accepted; retrying",
+                            request_id,
                         )
+                        return
                     except Exception:
-                        logger.debug("requester outcome injection failed", exc_info=True)
-                    else:
-                        record = await self._mark_and_finish(
-                            session_controls, record, "requester_notified"
+                        logger.warning(
+                            "session-control continuation admission failed for %s",
+                            request_id,
+                            exc_info=True,
                         )
+                        return
+                    if not getattr(event, "_gateway_accepted", False):
+                        logger.info(
+                            "session-control continuation for %s was not accepted; retrying",
+                            request_id,
+                        )
+                        return
+                    record = await self._mark_and_finish(
+                        session_controls, record, "continuation_enqueued"
+                    )
 
-            if self._outbox_complete(record) and not record.get("outbox_done"):
-                await self._mark_control(session_controls, request_id, "outbox_done")
+        notice = self._control_notice(record)
+        if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
+            if source is None or adapter is None:
+                record = await self._mark_and_finish(
+                    session_controls, record, "target_notice_skipped"
+                )
+            else:
+                metadata = dict(self._thread_metadata_for_source(source) or {})
+                metadata["session_control_request_id"] = request_id
+                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+                with outbound_class(OUTBOUND_NOTICE):
+                    result = await adapter.send(source.chat_id, notice, metadata=metadata)
+                if not _send_succeeded(result):
+                    logger.info("session-control target notice delivery failed for %s; retrying", request_id)
+                    return
+                record = await self._mark_and_finish(
+                    session_controls, record, "target_notice_sent"
+                )
+
+        if not record.get("requester_notified") and not record.get("requester_notification_skipped"):
+            requester_source, _requester_adapter = await self._session_control_route(requester_entry)
+            if requester_source is None:
+                record = await self._mark_and_finish(
+                    session_controls, record, "requester_notification_skipped"
+                )
+            else:
+                content = self._requester_notice(record)
+                try:
+                    accepted = await self._dispatch_plugin_message_injection(
+                        session_key=requester_entry.session_key,
+                        content=content,
+                        plugin_id="session-controls",
+                    )
+                except Exception:
+                    logger.warning("requester outcome injection failed for %s", request_id, exc_info=True)
+                else:
+                    if not accepted:
+                        logger.info("requester outcome injection not accepted for %s; retrying", request_id)
+                        return
+                    record = await self._mark_and_finish(
+                        session_controls, record, "requester_notified"
+                    )
+
+        if self._outbox_complete(record) and not record.get("outbox_done"):
+            await self._mark_control(session_controls, request_id, "outbox_done")
 
     @staticmethod
     def _control_notice(record: dict) -> str:

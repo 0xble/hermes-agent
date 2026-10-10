@@ -15,8 +15,9 @@ Session controls let one Hermes session pause, resume, clear, or replace another
 - Telegram callbacks must pass the existing callback allowlist and resolve through a durable compare-and-set; a second, expired, or unauthorized press must not mutate state.
 - Gateway delivery is profile-scoped and drains durable request/outcome rows after restart. The watcher
   runs SessionDB and manager work in the gateway executor, expires requests with an in-transaction CAS,
-  retries interrupted approvals only within their bounded recovery window, and marks undeliverable
-  CLI/TUI rows skipped/done rather than growing the outbox forever. The watcher drains only the launch
+  retries interrupted approvals only within their bounded recovery window, and marks applying rows
+  older than 10 minutes as failed/interrupted because the mutation may already have happened. It
+  marks undeliverable CLI/TUI rows skipped/done rather than growing the outbox forever. The watcher drains only the launch
   profile's SessionDB and `session_store`; it does not discover or drain another profile's store.
 
 ## Proof surface

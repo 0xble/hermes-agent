@@ -137,15 +137,25 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 user_quote=str((authority or {}).get("quote") or ""),
                 user_messages=[str((authority or {}).get("message") or "")],
             )
-        return {"result": result, "state": getattr(manager, "state", None)}
+        continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
+        return {"result": result, "state": getattr(manager, "state", None),
+                "continuation_prompt": continuation_prompt}
     if kind == "goal" and action == "resume":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid)
         result = manager.resume()
+        if result is None:
+            code = f"nothing_to_{action}"
+            return {"result": {"ok": False, "error_code": code, "error": code},
+                    "state": getattr(manager, "state", None)}
         return {"result": result, "state": getattr(manager, "state", None),
                 "continuation_prompt": manager.next_continuation_prompt()}
     if not callable(handler):
         raise ValueError("unsupported_control")
+    before_state = None
+    if kind == "goal":
+        from hermes_cli.goals import load_goal
+        before_state = load_goal(target_sid)
     result = handler(target_sid, reason, payload, authority)
     if kind == "goal":
         from hermes_cli.goals import load_goal
@@ -155,6 +165,14 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         state = load_loop(target_sid)
     else:
         raise ValueError("unsupported_control")
+    cleared_goal = (
+        kind == "goal" and action == "clear" and before_state is not None
+        and getattr(before_state, "status", None) != "cleared"
+        and state is not None and getattr(state, "status", None) == "cleared"
+    )
+    if result is False or (result is None and not cleared_goal):
+        code = f"nothing_to_{action}"
+        return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     return {"result": result, "state": state}
 
 
@@ -217,12 +235,33 @@ def _approved_authority(authority: Optional[Dict[str, Any]]):
         _CURRENT_AUTHORITY.reset(token)
 
 
+def _has_gateway_route(session_id: str) -> bool:
+    db = _db()
+    if db is None:
+        return False
+    row = db.get_session(session_id)
+    if not row:
+        return False
+    source = str(row.get("source") or "").strip().lower()
+    chat_id = row.get("chat_id")
+    if not source or chat_id in (None, ""):
+        return False
+    try:
+        from gateway.config import Platform
+        platform = Platform(source)
+    except (TypeError, ValueError):
+        return False
+    return platform.value != "local"
+
+
 def request_control(kind: str, action: str, target_sid: str, *, requester_sid: str,
                     reason: str = "", payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create a durable, 24-hour pending approval request."""
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
     target_sid = resolve_target(target_sid)
+    if not _has_gateway_route(target_sid):
+        return {"ok": False, "error_code": "target_unroutable", "error": "target_unroutable"}
     now = _now()
     record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                          authority={"via": "button", "user_id": None}, status="pending", now=now,
@@ -239,6 +278,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         return {"ok": False, "error_code": "unsupported_control"}
     try:
         target_sid = resolve_target(target_sid)
+        if not _has_gateway_route(target_sid):
+            raise ValueError("target_unroutable")
     except ValueError as exc:
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
     quote_check = check_user_quote(requester_sid, user_quote)
@@ -246,16 +287,32 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         code = quote_check
         if user_quote:
             return {"ok": False, "error_code": code, "error": code}
-        record = request_control(kind, action, target_sid, requester_sid=requester_sid,
-                                 reason=reason, payload=payload)
+        try:
+            record = request_control(kind, action, target_sid, requester_sid=requester_sid,
+                                     reason=reason, payload=payload)
+        except ValueError as exc:
+            return {"ok": False, "error_code": str(exc), "error": str(exc)}
+        if not record.get("id"):
+            return record
         return {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
     quote, message = quote_check
     authority = {"via": "quote", "quote": quote, "message": message}
     try:
         affected_before = _affected_text(kind, action, target_sid, payload)
         result = _manager_apply(kind, action, target_sid, reason=reason, payload=payload, authority=authority)
-        if isinstance(result.get("result"), dict) and not result["result"].get("ok", True):
-            raise ValueError(result["result"].get("error_code") or result["result"].get("error") or "apply_failed")
+        manager_result = result.get("result")
+        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+            code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
+            if code.startswith("nothing_to_"):
+                now = _now()
+                record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
+                                     authority=authority, status="failed", now=now, expires_at=None)
+                record["affected_text"] = affected_before
+                record["resolved_at"], record["error"] = now, code
+                _save_record(record)
+                return {"ok": False, "status": "failed", "error_code": code, "error": code,
+                        "record": record, **result}
+            raise ValueError(code)
         now = _now()
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                              authority=authority, status="applied", now=now, expires_at=None)
@@ -314,8 +371,9 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         result = _manager_apply(claimed["kind"], claimed["action"], claimed["target_session_id"],
                                 reason=claimed.get("reason") or "session-control",
                                 payload=claimed.get("payload"), authority=authority)
-        if isinstance(result.get("result"), dict) and not result["result"].get("ok", True):
-            raise ValueError(result["result"].get("error_code") or result["result"].get("error") or "apply_failed")
+        manager_result = result.get("result")
+        if isinstance(manager_result, dict) and not manager_result.get("ok", True):
+            raise ValueError(manager_result.get("error_code") or manager_result.get("error") or "apply_failed")
         if result.get("continuation_prompt"):
             claimed["continuation_prompt"] = result["continuation_prompt"]
         claimed["status"] = "applied"
@@ -325,6 +383,30 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
         claimed["error"] = str(exc)
     _save_record(claimed)
     return claimed
+
+
+def fail_request(request_id: str, error: str) -> Optional[Dict[str, Any]]:
+    """CAS a pending request to failed so an unroutable target can notify its requester."""
+    db = _db()
+    if db is None:
+        return None
+    key, now = _record_key(request_id), _now()
+
+    def _fail(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            record = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        if record.get("status") != "pending":
+            return None
+        record["status"], record["error"], record["resolved_at"] = "failed", error, now
+        db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
+        return record
+
+    return db._execute_write(_fail)
 
 
 def expire_request(request_id: str) -> Optional[Dict[str, Any]]:
@@ -432,5 +514,5 @@ CONTROLS = {
 
 __all__ = [
     "CONTROLS", "resolve_target", "check_user_quote", "apply_control", "request_control",
-    "resolve_request", "expire_request", "pending_outbox", "mark_outbox",
+    "resolve_request", "fail_request", "expire_request", "pending_outbox", "mark_outbox",
 ]

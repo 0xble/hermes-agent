@@ -5716,9 +5716,13 @@ class TelegramAdapter(BasePlatformAdapter):
         status = str(record.get("status") or "failed")
         label = "✓ Approved" if status == "applied" else "✗ Denied" if status == "denied" else status.title()
         await query.answer(text=label[:_TOAST_LIMIT])
+        message = getattr(query, "message", None)
+        message_text = getattr(message, "text", None) or ""
+        if not message_text:
+            return
         await self._edit_html_quiet(
             query,
-            f"{_html.escape(query.message.text or '')}\n\n"
+            f"{_html.escape(message_text)}\n\n"
             f"<b>{_html.escape(label)} by {_html.escape(who)}</b>",
         )
 
