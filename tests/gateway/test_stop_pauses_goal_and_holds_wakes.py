@@ -10,6 +10,7 @@ Real ``GatewayRunner`` + real ``BasePlatformAdapter`` subclass, real goal SQLite
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import patch
 
@@ -154,3 +155,42 @@ async def test_completions_from_a_stop_are_held_until_the_user_sends_a_turn(monk
     for task in list(adapter._background_tasks):
         await task
     assert len(received) == 1 and received[0].internal
+
+
+@pytest.mark.asyncio
+async def test_stop_latch_survives_gateway_restart(monkeypatch):
+    runner, _adapter, source, key, _session_id = await _runner(monkeypatch)
+    await runner._interrupt_and_clear_session(key, source, interrupt_reason="Stop requested",
+                                              invalidation_reason="stop_command")
+    assert runner._user_stop_latched(key)
+
+    restarted = GatewayRunner(config=GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="x")}))
+    await restarted.async_session_store.get_or_create_session(source)
+    assert restarted._user_stop_latched(key)
+
+
+@pytest.mark.asyncio
+async def test_delayed_stop_tail_does_not_pause_successor_goal(monkeypatch):
+    runner, adapter, source, key, old_session_id = await _runner(monkeypatch)
+    _active_goal(old_session_id)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def suspended_interrupt(self, _session_key, _chat_id, **_kwargs):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(type(adapter), "interrupt_session_activity", suspended_interrupt)
+    stop_task = asyncio.create_task(runner._interrupt_and_clear_session(
+        key, source, interrupt_reason="Stop requested", invalidation_reason="stop_command"))
+    await entered.wait()
+
+    successor = await runner.async_session_store.reset_session(key)
+    _active_goal(successor.session_id)
+    release.set()
+    await stop_task
+
+    from hermes_cli.goals import GoalManager
+    assert GoalManager(old_session_id).state.status == "active"
+    assert GoalManager(successor.session_id).state.status == "active"

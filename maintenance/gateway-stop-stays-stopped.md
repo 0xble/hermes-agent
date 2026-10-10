@@ -14,10 +14,19 @@ async-delegation or process-completion injection, or goal pause/revival.
   While the latch is set, async-delegation completions, process completions and
   watch-pattern wakes for that session stay queued. They are not injected as a
   turn, and holding them takes no durable claim and spends no delivery attempt.
+- The latch is durable. Besides the in-memory conversation flag it is persisted
+  as `stop_latched` on the session's routing entry (`SessionEntry`, stored in
+  the existing `gateway_routing` rows / `sessions.json`; an additive JSON field
+  older releases ignore), fenced by the owning session id. After a gateway
+  restart, held completions stay held until the user sends a turn.
 - The latch clears when the next turn the user sent is admitted (not internal,
-  not a goal continuation, heartbeat or relayed message). Held completions are
-  then delivered as usual. `/new` and other conversation boundaries clear it
-  too, because it lives in conversation-scoped state.
+  not a goal continuation, heartbeat or relayed message), both in memory and
+  on disk. Held completions are then delivered as usual. `/new` and other
+  conversation boundaries clear it too: the successor routing entry starts
+  unlatched and a hold owned by a replaced session id never applies.
+- The goal pause runs after the stop's awaits, so the stopped session id and
+  run generation are captured before the first await and the pause is skipped
+  when a concurrent `/new` or newer turn owns the route by then.
 - Between-turn `/stop` replies "Stopped" when it paused a goal, not only when
   it interrupted background delegations.
 
@@ -56,6 +65,7 @@ fails on the base without this patch and passes with it. Also run
 
 Retire when a selected upstream release pauses the goal on gateway `/stop` and
 holds stop-produced completions until the next user turn, and this regression
-passes without the local code. To roll back, revert the patch commit. The latch
-is process-local and the pause reason is an ordinary goal row value, so nothing
-needs to be migrated.
+passes without the local code. To roll back, revert the patch commit. The durable
+latch is one extra boolean in the routing entry JSON that older code ignores,
+and the pause reason is an ordinary goal row value, so nothing needs to be
+migrated.

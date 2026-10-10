@@ -1876,9 +1876,15 @@ class GatewayNotificationsMixin:
     def _completion_held_by_stop(self, evt: dict) -> bool:
         """True while the event's session is stopped (``/stop``) and the user has not sent a turn."""
         metadata_key = ""
+        metadata_session_id = ""
         with suppress(Exception):
-            metadata_key = str((evt.get("metadata") or {}).get("gateway_session_key") or "")
-        return self._user_stop_latched(str(evt.get("session_key") or "").strip(), metadata_key.strip())
+            metadata = evt.get("metadata") or {}
+            metadata_key = str(metadata.get("gateway_session_key") or "")
+            metadata_session_id = str(metadata.get("gateway_session_id") or "")
+        event_session_id = str(evt.get("parent_session_id") or evt.get("origin_session_id") or metadata_session_id).strip()
+        return self._user_stop_latched(
+            str(evt.get("session_key") or "").strip(), metadata_key.strip(),
+            session_ids=(event_session_id,) if event_session_id else ())
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:

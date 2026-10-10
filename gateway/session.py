@@ -522,6 +522,9 @@ class SessionEntry:
     # When True the next call to get_or_create_session() will auto-reset this session (create a new
     # session_id) so the user starts fresh. See #7536.
     suspended: bool = False
+    # Durable per-session hold set by gateway /stop; unlike ConversationState this survives a gateway
+    # restart and is fenced by session_id so a successor route cannot inherit it.
+    stop_latched: bool = False
     # Interrupted by a restart/drain timeout, recovery expected: unlike ``suspended`` the
     # session_id is kept so the agent auto-continues. Cleared after the next successful turn;
     # escalation to ``suspended`` is the runner's ``.restart_failure_counts`` job.
@@ -568,7 +571,7 @@ class SessionEntry:
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
-        "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
+        "expiry_finalized", "suspended", "stop_latched", "resume_pending", "resume_reason", "resume_marker_token",
         "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
         "restart_note_turn_id", "restart_note_reconcile_attempts", "restart_notes", "active_turn_human",
     )
@@ -928,6 +931,31 @@ class SessionStore(
             return True
 
 
+
+    def set_stop_latched(self, session_key: str, latched: bool, *, session_id: Optional[str] = None) -> bool:
+        """Persist the gateway /stop hold, fenced to the owning session id."""
+        if not session_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or (session_id and entry.session_id != session_id):
+                return False
+            if entry.stop_latched == bool(latched):
+                return True  # no write on every user turn when nothing is held
+            entry.stop_latched = bool(latched)
+            self._save()
+            return True
+
+    def is_stop_latched(self, session_key: str, *, session_id: Optional[str] = None) -> bool:
+        """Read the durable /stop hold, rejecting a hold owned by a replaced session."""
+        if not session_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return bool(entry is not None and entry.stop_latched
+                        and (not session_id or entry.session_id == session_id))
 
     def has_any_sessions(self) -> bool:
         """Whether any session has ever been created. SQLite is the source of truth (ended sessions

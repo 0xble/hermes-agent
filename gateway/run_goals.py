@@ -417,7 +417,10 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
-    async def _pause_goal_for_stop(self, session_key: str, source: Any) -> bool:
+    async def _pause_goal_for_stop(
+        self, session_key: str, source: Any, *, expected_session_id: Optional[str] = None,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """``/stop`` pauses the standing goal and drops its queued continuations (CLI Ctrl+C parity).
 
         A judge BLOCKED pause is overwritten too: an explicit stop must not be revived by the next
@@ -430,6 +433,15 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal stop: session lookup failed for %s: %s", session_key, exc)
             session_id = None
+        # Ownership fence (synchronous from here to the pause target): a /new or newer turn that won
+        # the route while this stop awaited owns the goal now, so the delayed tail must not touch it.
+        if expected_session_id and session_id != expected_session_id:
+            logger.info("goal stop: route %s moved to another session; skipping pause", session_key)
+            return False
+        if (expected_generation is not None
+                and self._current_session_run_generation(session_key) != expected_generation):
+            logger.info("goal stop: run generation for %s advanced; skipping pause", session_key)
+            return False
         adapter = self._delivery_adapter_for(source)
         with suppress(Exception):
             self._clear_goal_pending_continuations(session_key, adapter)

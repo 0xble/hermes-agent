@@ -489,10 +489,12 @@ class GatewayAgentCacheMixin:
             return
         from gateway.run import _INTERRUPT_REASON_STOP
         stop_marker = None
+        stop_session_id = None
         if interrupt_reason == _INTERRUPT_REASON_STOP:
-            # Latch before interrupting: the interrupted background delegations below report back
-            # within a second and must not start the turn the user just stopped.
-            self._latch_user_stop(session_key)
+            # Capture the stopped session before the first await. Both identity and generation fence
+            # the delayed goal-pause tail from mutating a replacement route.
+            stop_session_id = self._stop_owner_session_id(session_key)
+            self._latch_user_stop(session_key, session_id=stop_session_id)
             try:
                 # Capture before the first await. The immutable marker includes the
                 # session identity, so a delayed stop cannot clear a newer recovery.
@@ -574,23 +576,43 @@ class GatewayAgentCacheMixin:
             except Exception:
                 logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
         if interrupt_reason == _INTERRUPT_REASON_STOP:
-            await self._pause_goal_for_stop(session_key, source)
+            await self._pause_goal_for_stop(
+                session_key, source, expected_session_id=stop_session_id,
+                expected_generation=_generation_at_interrupt)
 
-    def _latch_user_stop(self, session_key: str) -> None:
-        """Hold background wakes for ``session_key`` until the next non-internal turn."""
+    def _stop_owner_session_id(self, session_key: str) -> Optional[str]:
+        """Session id that owns ``session_key`` right now; None when the store cannot say."""
+        if not session_key:
+            return None
+        try:
+            return self._lookup_session_id_under_store_lock(self.session_store, session_key)
+        except Exception:
+            return None
+
+    def _latch_user_stop(self, session_key: str, *, session_id: Optional[str] = None) -> None:
+        """Hold background wakes until the next user turn and persist the hold by session id."""
         if session_key:
-            self._session_state(session_key).conversation.stop_latched = True
+            state = self._session_state(session_key)
+            state.conversation.stop_latched = True
+            with suppress(Exception):
+                self.session_store.set_stop_latched(session_key, True, session_id=session_id)
 
     def _clear_user_stop_latch(self, session_key: str) -> None:
         state = self._peek_session_state(session_key) if session_key else None
         if state is not None:
             state.conversation.stop_latched = False
+        with suppress(Exception):
+            self.session_store.set_stop_latched(session_key, False)
 
-    def _user_stop_latched(self, *session_keys: str) -> bool:
+    def _user_stop_latched(self, *session_keys: str, session_ids: tuple[str, ...] = ()) -> bool:
         for key in session_keys:
             state = self._peek_session_state(key) if key else None
             if state is not None and state.conversation.stop_latched:
                 return True
+            for session_id in session_ids or (None,):
+                with suppress(Exception):
+                    if self.session_store.is_stop_latched(key, session_id=session_id):
+                        return True
         return False
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
