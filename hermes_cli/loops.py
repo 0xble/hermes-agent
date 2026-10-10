@@ -328,6 +328,9 @@ class LoopState:
     # True between "wakeup injected" and "that turn's response evaluated": stops a tick from
     # double-firing mid-turn and tells the post-turn hook the turn that just ended was ours.
     awaiting_response: bool = False
+    # Definition version the in-flight tick fired with; completion judges against it, so a revise
+    # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
+    fired_version: int = 0
     last_response_digest: str = ""    # self-paced change detection
     paused_reason: Optional[str] = None
     last_stop_reason: Optional[str] = None
@@ -561,6 +564,15 @@ class LoopManager:
         self._state: Optional[LoopState] = (
             load_loop(session_id) if cursor is None else load_loop(session_id, cursor=cursor)
         )
+        self._mark_synced()
+
+    def _mark_synced(self) -> None:
+        """Remember the stored schedule this manager last read or wrote.
+
+        A tick claim compares it with the stored row: a different value means another writer
+        (pause/resume, revise, cadence change) rescheduled the loop since, and that schedule wins
+        over this manager's cached copy."""
+        self._synced_due_at = self._state.next_due_at if self._state is not None else None
 
     @property
     def state(self) -> Optional[LoopState]:
@@ -575,6 +587,7 @@ class LoopManager:
         fresh = load_loop(self.session_id)
         if fresh is not None or self._state is None:
             self._state = fresh
+            self._mark_synced()
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -587,6 +600,7 @@ class LoopManager:
             save_loop(self.session_id, self._state)
         else:
             save_loop(self.session_id, self._state, cursor=self._cursor)
+        self._mark_synced()
         return self._state
 
     def status_line(self) -> str:
@@ -977,6 +991,7 @@ class LoopManager:
             state.ticks_fired += 1
             state.last_fired_at = time.time()
             state.awaiting_response = True
+            state.fired_version = state.version
             # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
             # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
             state.next_due_at = state.last_fired_at + (
@@ -1016,9 +1031,11 @@ class LoopManager:
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
             ):
                 return None
-            # A revise since load fires the stored definition, and only when its own schedule
-            # (a cadence change can postpone the tick) is due; otherwise the caller's copy fires.
-            if stored.version != s.version and time.time() < stored.next_due_at:
+            # Another writer's schedule since this manager's last sync governs: a revise,
+            # pause/resume or cadence change can postpone the tick. A revise since load fires the
+            # stored definition.
+            rescheduled = stored.next_due_at != self._synced_due_at or stored.version != s.version
+            if rescheduled and time.time() < stored.next_due_at:
                 return None
             base = s if stored.version == s.version else stored
             claimed = _parse_state(base.to_json())
@@ -1035,6 +1052,7 @@ class LoopManager:
             self.refresh()
             return False
         self._state = claimed
+        self._mark_synced()
         return True
 
     def _save_tick_outcome(self, fired_ticks: int, settle) -> bool:
@@ -1078,6 +1096,7 @@ class LoopManager:
             self.refresh()
             return False
         self._state = settled
+        self._mark_synced()
         return True
 
     def _superseded_result(self) -> Dict[str, Any]:
@@ -1167,7 +1186,9 @@ class LoopManager:
         now = time.time()
         ticks = _ticks_label(s.ticks_fired)
         # Verdicts judge the fired definition; a revise since the fire supersedes stop verdicts.
-        judged = {"judged_version": fired.version, "digest": _digest_response(last_response)}
+        # Ticks claimed before fired_version existed fall back to the loaded copy's version.
+        judged = {"judged_version": s.fired_version or fired.version,
+                  "digest": _digest_response(last_response)}
 
         # 1. Agent self-stop marker.
         if response_signals_complete(last_response):

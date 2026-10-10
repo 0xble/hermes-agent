@@ -604,6 +604,22 @@ class TestTickLifecycle:
         stored = load_loop("t-cad")
         assert stored.ticks_fired == 0 and stored.awaiting_response is False
 
+    def test_resume_since_load_postpones_a_stale_scheduler(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-pr").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-pr", state)
+        scheduler = LoopManager(session_id="t-pr")
+        assert scheduler.is_due()
+        LoopManager(session_id="t-pr").pause("hold on")
+        resumed = LoopManager(session_id="t-pr")
+        resumed.resume()
+        assert not LoopManager(session_id="t-pr").is_due()
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-pr")
+        assert stored.ticks_fired == 0 and stored.awaiting_response is False
+
     def test_revise_during_tick_survives_completion(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 

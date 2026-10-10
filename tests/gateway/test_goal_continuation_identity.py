@@ -467,4 +467,3 @@ async def test_control_continuation_pins_its_destination_session(state):
     event = await _control_event(runner, _apply(state, "resume"))
     assert event.metadata.get("gateway_session_id") == "target"
     assert event.metadata.get("gateway_session_strict") is True
-
