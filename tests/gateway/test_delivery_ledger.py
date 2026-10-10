@@ -43,6 +43,14 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
     )
 
 
+def test_recovery_markers_keep_only_the_duplicate_hint():
+    assert dl.RECOVERED_MARKER == "♻️ Recovered reply — this may be a duplicate:\n\n"
+    assert "restart" not in dl.RECOVERED_MARKER.lower()
+    assert "reconnect" not in dl.RECOVERED_MARKER.lower()
+
+    assert "may already have arrived" in dl.FLOOD_MARKER
+
+
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
@@ -569,7 +577,7 @@ class TestGatewayRedeliverySweep:
         )
         assert adapter.send.await_count == 1
         assert adapter.send.call_args.kwargs["content"].startswith(
-            dl.RECONNECTED_MARKER
+            dl.RECOVERED_MARKER
         )
         assert _row("ob-1")["state"] == "delivered"
 

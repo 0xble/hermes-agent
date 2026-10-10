@@ -113,7 +113,7 @@ DEFAULT_CONFIG = {
         # the next message, but an interrupted cron run is recorded as a permanent failure, so it
         # must not inherit restart_drain_timeout's 0. Clamped to the shutdown-watchdog leash minus
         # teardown headroom (~50s unless TimeoutStopSec is raised). 0 = opt out.
-        # A chat turn interrupted by a restart is announced to the user and resumed on their next message;
+        # A chat turn interrupted by a restart resumes on the next message without announcing the restart;
         # an interrupted cron run is written to jobs.json as a permanent failure that nobody is waiting on,
         # so it must not inherit restart_drain_timeout's 0 (#82161).
         "cron_drain_timeout": 30,
@@ -255,7 +255,7 @@ DEFAULT_CONFIG = {
         # circuit breaker. 0 = disable.
         "reconnect_attention_after": 7200,
         # Freshness window (seconds) for the auto-continue note. After a crash/restart mid-run the
-        # next user message gets "[System note: your previous turn was interrupted...]" prepended;
+        # next user message gets the resume note ("[System note: Resume the pending turn...]") prepended;
         # only when the last persisted transcript row is younger than this, so stale markers don't
         # revive an unrelated old task. Covers gateway_timeout (1800) plus slack. 0 = always inject.
         "gateway_auto_continue_freshness": 3600,

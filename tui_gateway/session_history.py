@@ -258,7 +258,7 @@ def _expand_skill_invocation_for_replay(text: str, task_id: str) -> str:
 
 # Opening of the crash-recovery note synthesized by _auto_continue_note; matched (not just built) for
 # rows persisted before display typing existed and for the messaging gateway's twin note.
-_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
+_AUTO_CONTINUE_NOTE_PREFIX = "[System note: Your previous turn"
 
 
 def _legacy_display_kind(role: str, text: str) -> str | None:

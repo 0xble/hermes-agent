@@ -638,8 +638,8 @@ class GatewayConfig:
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
     always_log_local: bool = True  # Always save cron outputs to local files
-    # Empty-message restart recovery policy for interactive adapters: ``ask`` reports the restore
-    # and waits, ``continue`` finishes the interrupted work. None keeps each adapter's native
+    # Empty-message resume policy for interactive adapters: ``ask`` waits for the user before
+    # running tools (asking in one line whether to carry on), ``continue`` finishes the pending work. None keeps each adapter's native
     # default (interactive asks, event platforms continue). Per-platform
     # ``extra.restart_resume_policy`` wins over this global value.
     restart_resume_policy: Optional[str] = None

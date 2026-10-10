@@ -98,7 +98,7 @@ async def test_polling_health_replays_only_owner_failed_rows_once():
     assert primary.send.await_count == 1
     assert primary.send.call_args.kwargs["content"].endswith("answer primary")
     assert primary.send.call_args.kwargs["content"].startswith(
-        ledger.RECONNECTED_MARKER
+        ledger.RECOVERED_MARKER
     )
     secondary.send.assert_not_awaited()
 

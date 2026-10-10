@@ -94,7 +94,8 @@ class Director:
         # A resumed turn's recovery note can arrive merged with the original tagged user message
         # (the unanswered user row and the note are consecutive user turns). It is still a resume,
         # not a second run of that token.
-        resumed = "previous turn was interrupted" in last.lower()
+        from gateway.run import RESUME_NOTE_PREFIX
+        resumed = RESUME_NOTE_PREFIX in last
         tokens = [] if resumed else _TOKEN_RE.findall(last)
         # A tool-result continuation re-sends the same last user message: it is the same turn.
         continuation = request["messages"][-1].get("role") == "tool"

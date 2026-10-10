@@ -341,6 +341,16 @@ admin enforcement, and prohibition on force pushes. Conflict resolution and revi
 on a candidate branch before normal protected landing. Unattended sync disables rerere
 so unreviewed remembered resolutions cannot silently resolve a new release conflict.
 
+## Active patch record: routine restart resume note
+
+- **Patch identity:** `routine-restart-resume-note`.
+- **Behavior:** Present pending-turn recovery as a neutral continuation instruction, not as news about a restart, shutdown, interruption, or the gateway's availability. Preserve command/tool replay safety and reconcile-before-retry guidance for ambiguous non-idempotent effects. A new user message remains first priority and stale unfinished work is skipped unless that message asks for it; `continue` completes the pending task from its first unrecorded step without acknowledgement, while `ask` runs no tools and asks in one plain line whether to carry on with the named pending step. Redelivered replies retain only a neutral duplicate hint; flood-control markers keep their partial-delivery warning.
+- **Source surfaces:** `gateway/run.py`, `gateway/delivery_ledger.py`, `gateway/run_startup.py` marker consumption, `plugins/platforms/telegram/chat_budget.py`, `tui_gateway/session_auto_continue.py` (TUI crash auto-continue note), `gateway/config.py` and `maintenance/restart-continuation.md` policy wording, and resume, delivery-ledger, synthetic-prompt, queued-follow-up, and Telegram trigger tests.
+- **Upstream status:** Upstream issue search found related restart-resume work including #57056, #111644, #117711, #120963, and #127919; no exact upstream equivalent for neutral model-visible wording and transport-neutral duplicate markers was identified. Related open PRs #117711 and #118031 explicitly retain restart-cause wording, so this fork patch intentionally diverges pending a broader upstream design decision.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_resume_queued_followup.py tests/gateway/test_delivery_ledger.py tests/gateway/test_delivery_ledger_process_home.py tests/gateway/test_telegram_internal_delivery_recovery.py tests/gateway/test_telegram_daily_call_counter.py tests/agent/test_synthetic_prompt.py tests/tui_gateway/test_auto_continue.py tests/e2e/core/delivery/test_messaging_exactly_once.py`.
+- **Retirement:** Remove when released upstream provides equivalent neutral resume instructions, preserves all replay/reconciliation safety clauses, and uses a transport-neutral duplicate marker for ambiguous redelivery.
+- **Rollback:** Revert the commit carrying `Fork-Patch: routine-restart-resume-note`.
+
 ## Eager plugin tools
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
