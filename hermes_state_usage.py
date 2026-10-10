@@ -216,7 +216,15 @@ class SessionUsageMixin:
         for session_id, kwargs in batch:
             key = None
             if not kwargs.get("absolute"):
-                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
+                # Cost presence is part of the write shape. A billed delta infers its actual
+                # amount from estimated_cost_usd only when actual_cost_usd is absent; merging
+                # it with an explicit actual write would erase that provenance and make batching
+                # differ from sequential application. ``is not None`` keeps explicit zero distinct
+                # from an omitted field.
+                cost_shape = tuple(
+                    field for field in self._TOKEN_DELTA_COST_FIELDS if kwargs.get(field) is not None
+                )
+                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS), cost_shape)
             if groups and key is not None and groups[-1][0] == key:
                 merged = groups[-1][2]
                 for f in self._TOKEN_DELTA_SUM_FIELDS:

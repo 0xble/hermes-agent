@@ -153,6 +153,114 @@ def test_queued_billed_deltas_coalesce_to_the_same_totals(db):
     assert _model_row(db, "q")["actual_cost_usd"] == pytest.approx(0.06)
 
 
+def _cost_state(db, session_id):
+    db.flush_token_counts()
+    session = dict(db._conn.execute(
+        "SELECT estimated_cost_usd, actual_cost_usd, cost_status FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone())
+    model = _model_row(db, session_id)
+    return session, model
+
+
+def _apply_sequential(db, session_id, deltas):
+    for delta in deltas:
+        db.update_token_counts(session_id, **delta)
+    return _cost_state(db, session_id)
+
+
+def _apply_coalesced(db, session_id, deltas):
+    # Exercise the same batch seam used by the queue writer, while keeping the
+    # comparison deterministic instead of depending on writer-thread timing.
+    db._apply_token_batch([(session_id, dict(delta)) for delta in deltas])
+    return _cost_state(db, session_id)
+
+
+@pytest.mark.parametrize(
+    "deltas, expected_session_actual, expected_model_actual",
+    [
+        pytest.param(
+            [
+                {"estimated_cost_usd": 3.0, "actual_cost_usd": 3.0},
+                {"estimated_cost_usd": 0.25},
+            ],
+            3.25,
+            3.25,
+            id="explicit-then-billed",
+        ),
+        pytest.param(
+            [
+                {"estimated_cost_usd": 0.25},
+                {"estimated_cost_usd": 3.0, "actual_cost_usd": 3.0},
+            ],
+            3.0,
+            3.25,
+            id="billed-then-explicit",
+        ),
+        pytest.param(
+            [
+                {"estimated_cost_usd": 3.0, "actual_cost_usd": 0.0},
+                {"estimated_cost_usd": 0.25},
+            ],
+            0.25,
+            0.25,
+            id="explicit-zero-then-billed-none",
+        ),
+        pytest.param(
+            [
+                {"estimated_cost_usd": 0.01},
+                {"estimated_cost_usd": 0.02},
+                {"estimated_cost_usd": 0.03},
+            ],
+            None,
+            0.06,
+            id="multiple-billed-only",
+        ),
+        pytest.param(
+            [
+                {"estimated_cost_usd": 0.01, "actual_cost_usd": 0.01},
+                {"estimated_cost_usd": 0.02, "actual_cost_usd": 0.02},
+                {"estimated_cost_usd": 0.03, "actual_cost_usd": 0.03},
+            ],
+            0.06,
+            0.06,
+            id="multiple-explicit-only",
+        ),
+        pytest.param(
+            [
+                {"estimated_cost_usd": 0.01, "cost_status": "estimated"},
+                {"estimated_cost_usd": 0.02, "cost_status": "estimated"},
+            ],
+            None,
+            0.0,
+            id="estimated-only",
+        ),
+    ],
+)
+def test_coalesced_cost_write_shapes_match_sequential_sessiondb(db, deltas, expected_session_actual,
+                                                                  expected_model_actual):
+    """Batch coalescing must preserve SessionDB cost semantics for every write shape."""
+    db.create_session(session_id="sequential", source="cli", model="m")
+    db.create_session(session_id="coalesced", source="cli", model="m")
+    route = {"model": "m", "billing_provider": "openrouter", "cost_source": "provider_cost_api",
+             "cost_status": "actual", "api_call_count": 1}
+    sequential_deltas = [{**route, **delta} for delta in deltas]
+    coalesced_deltas = [{**route, **delta} for delta in deltas]
+
+    sequential = _apply_sequential(db, "sequential", sequential_deltas)
+    coalesced = _apply_coalesced(db, "coalesced", coalesced_deltas)
+
+    assert coalesced == sequential
+    for actual, expected in (
+        (sequential[0]["actual_cost_usd"], expected_session_actual),
+        (sequential[1]["actual_cost_usd"], expected_model_actual),
+    ):
+        if expected is None:
+            assert actual is None
+        else:
+            assert actual == pytest.approx(expected)
+
+
 def test_main_turn_persists_provider_reported_cost(tmp_path, monkeypatch):
     """End to end through record_response_usage: an OpenRouter-style plain-object usage with a flat
     ``cost`` lands in SessionDB as the billed amount, displayed once."""
