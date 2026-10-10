@@ -41,7 +41,9 @@ class InterruptScope:
             self._tool_reason = tool_reason
             agents = list(self._agents)
         for agent in agents:
-            request_hard_interrupt(agent, reason, tool_reason=tool_reason)
+            request_hard_interrupt(
+                agent, reason, tool_reason=tool_reason,
+                delegation_reason=("cancel" if tool_reason is None else reason))
 
     @contextmanager
     def track(self, agent: Any) -> Iterator[None]:
@@ -49,7 +51,9 @@ class InterruptScope:
             self._agents.append(agent)
             reason, tool_reason = self.reason, self._tool_reason
         if reason is not None:
-            request_hard_interrupt(agent, reason, tool_reason=tool_reason)
+            request_hard_interrupt(
+                agent, reason, tool_reason=tool_reason,
+                delegation_reason=("cancel" if tool_reason is None else reason))
         try:
             yield
         finally:

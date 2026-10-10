@@ -376,17 +376,17 @@ class GatewayNotificationsMixin:
         early_result: Optional[bool] = None
         settled: bool = False
 
-    async def _deliver_platform_notice(self, source, content: str) -> None:
-        """Deliver a setup/operational notice using platform-specific privacy rules."""
+    async def _deliver_platform_notice(self, source, content: str) -> bool:
+        """Deliver with platform privacy rules; return only an affirmative send receipt."""
         from gateway.run import _is_slack_ignored_channel
         adapter = self._delivery_adapter_for(source)
         if not adapter:
-            return
+            return False
         config = getattr(self, "config", None)
         chat_id = getattr(source, "chat_id", None)
         if config and getattr(source, "platform", None) == Platform.SLACK and _is_slack_ignored_channel(config, chat_id, adapter):
             logger.info("Skipping Slack platform notice for configured ignored channel %s", chat_id)
-            return
+            return False
         # The routed adapter carries ITS profile's ``platforms.<p>`` block; ``self.config`` is the
         # launch profile's, so a served secondary's ``notice_delivery: private`` would be ignored.
         adapter_config = getattr(adapter, "config", None)
@@ -406,9 +406,10 @@ class GatewayNotificationsMixin:
                 getattr(source, "platform", "?"), exc_info=True,
             ):
                 result = await adapter.send_private_notice(source.chat_id, source.user_id, content, metadata=metadata)
-                if getattr(result, "success", False):
-                    return
-        await adapter.send(source.chat_id, content, metadata=metadata)
+                if _media_send_succeeded(result):
+                    return True
+        result = await adapter.send(source.chat_id, content, metadata=metadata)
+        return _media_send_succeeded(result)
 
     async def _resolve_compression_lineage_target(
         self, session_db: Any, session_entry: SessionEntry, pinned_session_id: str,
@@ -2623,6 +2624,105 @@ class GatewayNotificationsMixin:
             if count:
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
+    def _collect_delegation_retry_actions(self) -> list:
+        """Claim due retry notices / terminal lines from every served profile's ledger (atomic claims)."""
+        from tools.delegation_resume import sweep_retries
+        from hermes_cli.profiles import get_active_profile_name
+        actions = []
+        with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
+            primary = get_active_profile_name() or "default"
+            actions += [{**a, "profile": primary} for a in sweep_retries()]
+        profile_homes = (getattr(self, "_served_profile_homes", None) or {}).items()
+
+        def _one(name):
+            found = sweep_retries()
+            actions.extend({**a, "profile": name} for a in found)
+            return len(found)
+
+        from gateway.run import _profile_runtime_scope
+        for profile_name, profile_home in profile_homes:
+            if profile_name in {primary, getattr(self, "_primary_profile_name", None)}:
+                continue
+            with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
+                with _profile_runtime_scope(Path(profile_home), {}):
+                    _one(profile_name)
+        return actions
+
+    async def _deliver_delegation_retry_action(self, action: dict) -> None:
+        """Settle one claimed retry action. A notice wakes the parent to dispatch the retry; a terminal
+        action is sent straight to the user's chat, so no parent reply (NO_REPLY included) can hide it."""
+        from tools import delegation_resume as dr
+        delegation_id, claim = action["delegation_id"], action["claim"]
+        async with self._completion_event_scope(action):
+            if not await asyncio.to_thread(dr.retry_action_is_current, action):
+                return  # /stop invalidated this collected action before delivery
+            if action["kind"] == "terminal":
+                from gateway.run import _redact_gateway_user_facing_secrets
+
+                sent = suppressed = False
+                try:
+                    source, authorized = await self._authorized_completion_notice_target(action)
+                    suppressed = authorized is None
+                    if source is not None and authorized is True:
+                        # Scrub before any display cut; failure must leave the report owed, never send raw text.
+                        line = _redact_gateway_user_facing_secrets(action["text"])
+                        line = " ".join(line.split())[:360]
+                        sent = await self._deliver_platform_notice(source, line)
+                except Exception:
+                    logger.warning("Delegation %s: terminal line send failed", delegation_id, exc_info=True)
+                settle = (dr.suppress_terminal_report if suppressed else
+                          dr.mark_terminal_reported if sent else dr.release_terminal_report)
+                await asyncio.to_thread(settle, delegation_id, claim)
+                if sent:
+                    logger.info("Delegation %s: reported terminal failure to the user", delegation_id)
+                return
+            parent_session_id = str(action.get("parent_session_id") or "").strip()
+            if parent_session_id and await self._classify_completion_target(parent_session_id) == "terminal":
+                # The owning conversation is gone (/new, closed): nobody can dispatch; tell the user instead.
+                await asyncio.to_thread(dr.mark_retry_terminal, delegation_id, claim,
+                                        "its conversation ended before the retry could run")
+                return
+            accepted = suppressed = False
+            try:
+                # Internal wakes bypass the inbound authorization gate, so re-check it live here.
+                _, authorized = await self._authorized_completion_notice_target(action, check_delivery_ready=True)
+                suppressed = authorized is None
+                if authorized is True:
+                    accepted = await self._inject_watch_notification(action["text"], action) is True
+            except Exception:
+                logger.debug("Delegation %s: retry notice injection failed", delegation_id, exc_info=True)
+            settle = (dr.suppress_retry_notice if suppressed else
+                      dr.mark_notice_accepted if accepted else dr.release_notice)
+            await asyncio.to_thread(settle, delegation_id, claim)
+
+    async def _drive_delegation_retries(self) -> None:
+        for action in await asyncio.to_thread(self._collect_delegation_retry_actions):
+            try:
+                await self._deliver_delegation_retry_action(action)
+            except Exception:
+                logger.warning("Delegation retry action failed for %s", action.get("delegation_id"), exc_info=True)
+
+    async def _authorized_completion_notice_target(self, evt: dict, *, check_delivery_ready: bool = False):
+        """Shared boot/terminal route and live authorization gate: None means terminal suppression;
+        False means a disconnected transport (still owed). Terminal reports can outlive the parent session."""
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if source is not None:
+            platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+            if self._resolve_injection_adapter(platform, source) is None:
+                return source, False
+        if check_delivery_ready and not await self._completion_delivery_ready(evt):
+            return source, False
+        if source is not None:
+            try:
+                authorized = self._is_user_authorized_for_source(source)
+            except Exception:
+                logger.warning("Could not authorize completion notice target; suppressing notice", exc_info=True)
+                authorized = False
+            if not authorized:
+                logger.warning("Suppressing completion notice to an unauthorized target")
+                return source, None
+        return source, True
+
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         async with self._completion_event_scope(evt):
@@ -2651,23 +2751,11 @@ class GatewayNotificationsMixin:
                     return await _suppress_claimed_notice()
                 if verdict != "deliver":
                     return False
-            # Authorization depends on the live adapter's allowlist and policy. A disconnected
-            # transport is not an authorization refusal and must not consume the one-shot trigger.
-            source = await asyncio.to_thread(self._build_process_event_source, evt)
-            if source is not None:
-                platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-                if self._resolve_injection_adapter(platform, source) is None:
-                    return False
-            if not await self._completion_delivery_ready(evt):
+            _, authorized = await self._authorized_completion_notice_target(evt, check_delivery_ready=True)
+            if authorized is False:
                 return False
-            if source is not None:
-                try:
-                    authorized = self._is_user_authorized_for_source(source)
-                except Exception:
-                    logger.warning("Could not authorize boot auto-resume target; suppressing notice", exc_info=True)
-                    authorized = False
-                if not authorized:
-                    return await _suppress_claimed_notice()
+            if authorized is None:
+                return await _suppress_claimed_notice()
             def _release_abandoned(claimed) -> None:
                 record, reason = claimed
                 if reason is None and record is not None:
@@ -2717,6 +2805,9 @@ class GatewayNotificationsMixin:
                 if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
                     last_orphan_sweep = time.monotonic()
                     await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
+                    # Durable delegation retries share the cadence: due notices, re-prompts and
+                    # terminal lines are claimed atomically from state.db, so restarts lose nothing.
+                    await self._drive_delegation_retries()
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

@@ -304,6 +304,9 @@ def _format_async_delegation(evt: dict) -> str:
     completed_at = evt.get("completed_at") or time.time()
     if evt.get("task_failure_notice"):
         return _format_task_failure_notice(evt, deleg_id)
+    if evt.get("retry_note"):
+        # Durable retry status (tools/delegation_resume.retry_note): tells the parent not to duplicate.
+        return _format_async_delegation({**evt, "retry_note": None}) + f"\nRETRY: {evt['retry_note']}"
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), _outcome_only_stop_detail(evt.get("error"))
