@@ -27,7 +27,8 @@ def state(tmp_path, monkeypatch):
     release_or_close(db)
 
 
-def _runner(state, *, target_route=True, request_success=True, send_success=True, injection_result=True):
+def _runner(state, *, target_route=True, request_success=True, send_success=True, injection_result=True,
+            target_origin=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
     from gateway.run_goals import GatewayGoalsMixin
     from gateway.session import Platform, SessionEntry, SessionSource
@@ -55,7 +56,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
     now = datetime.now(timezone.utc)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="target", chat_type="dm", thread_id="42")
     requester_source = SessionSource(platform=Platform.TELEGRAM, chat_id="requester", chat_type="dm", thread_id="43")
-    target = SessionEntry("target-key", "target", now, now, origin=source)
+    target = SessionEntry("target-key", "target", now, now, origin=source if target_origin else None)
     requester = SessionEntry("requester-key", "requester", now, now, origin=requester_source)
 
     class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin):
@@ -115,7 +116,8 @@ async def test_watcher_posts_pending_once_with_topic_metadata_and_skips_unrouted
     assert record["id"] not in {r[2] for r in runner.adapter.requests[1:]}
     assert pending_outbox()[0]["request_posted"] is True
 
-    unrouted = _runner(state, target_route=False)
+    # No persisted gateway origin (CLI/TUI target): nothing can ever post the card.
+    unrouted = _runner(state, target_origin=False)
     record2 = request_control("goal", "clear", "target", requester_sid="requester")
     await unrouted._drain_session_controls()
     import json
@@ -610,3 +612,55 @@ async def test_control_outbox_retries_persisted_origin_when_adapter_is_unavailab
         assert session_controls.pending_outbox() == []
 
 
+@pytest.mark.asyncio
+async def test_pending_request_waits_for_offline_adapter_then_posts(state):
+    """A persisted origin with a disconnected adapter keeps the card pending, not failed."""
+    from hermes_cli import session_controls
+    from hermes_cli.session_controls import request_control
+
+    record = request_control("goal", "clear", "target", requester_sid="requester")
+    offline = _runner(state, target_route=False)
+    await offline._drain_session_controls()
+    await offline._drain_session_controls()
+    persisted = session_controls._load_record(record["id"])
+    assert persisted["status"] == "pending"
+    assert not persisted.get("request_posted")
+    assert offline.injections == []
+
+    online = _runner(state)
+    await online._drain_session_controls()
+    assert [r[2] for r in online.adapter.requests] == [record["id"]]
+    assert session_controls._load_record(record["id"])["request_posted"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["denied", "failed", "expired"])
+async def test_unapplied_outcome_notice_waits_for_offline_adapter(state, monkeypatch, outcome):
+    """Denied, failed and expired outcomes keep their target notice retryable while offline."""
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+    from hermes_cli.session_controls import request_control, resolve_request
+
+    GoalManager("target").set("watch the build")
+    record = request_control("goal", "clear", "target", requester_sid="requester")
+    if outcome == "denied":
+        resolve_request(record["id"], "deny", "99")
+    elif outcome == "failed":
+        session_controls.fail_request(record["id"], "apply_failed")
+    else:
+        with monkeypatch.context() as patched:
+            patched.setattr(session_controls, "_now", lambda: record["created_at"] + 86401)
+            session_controls.expire_request(record["id"])
+    offline = _runner(state, target_route=False)
+    await offline._drain_session_controls()
+    persisted = session_controls._load_record(record["id"])
+    assert persisted["status"] == outcome
+    assert not persisted.get("target_notice_skipped")
+    assert not persisted.get("target_notice_sent")
+    assert not persisted.get("outbox_done")
+    assert persisted.get("requester_notified") is True
+
+    online = _runner(state)
+    await online._drain_session_controls()
+    assert len(online.adapter.sends) == 1
+    assert session_controls._load_record(record["id"])["outbox_done"] is True

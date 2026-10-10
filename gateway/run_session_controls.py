@@ -119,7 +119,12 @@ class GatewaySessionControlsMixin:
                 status = record.get("status")
             elif not record.get("request_posted") and not record.get("request_skipped"):
                 source, adapter = await self._session_control_route(target_entry)
-                if source is None or adapter is None:
+                if source is not None and adapter is None:
+                    # Persisted gateway origin, adapter offline: keep the request pending and retry
+                    # after reconnect; its own expiry bounds the wait.
+                    logger.info("session-control request %s waiting for target adapter", request_id)
+                    return
+                if source is None:
                     failed = await self._run_in_executor_with_context(
                         session_controls.fail_request, request_id, "target_unroutable"
                     )
@@ -146,9 +151,9 @@ class GatewaySessionControlsMixin:
 
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
-        # An applied outcome whose gateway origin persists but whose adapter is offline is
-        # retryable: target-side flags stay unset until reconnect, supersession or TTL expiry.
-        target_offline = status == "applied" and source is not None and adapter is None
+        # Any outcome whose gateway origin persists but whose adapter is offline is retryable:
+        # target-side flags stay unset until reconnect, supersession or the record's TTL.
+        target_offline = source is not None and adapter is None
         if not target_offline and not record.get("continuations_cleared"):
             # Only an applied pause/clear stops the goal; a denied, expired or failed request
             # must leave the target's queued continuation alone.
@@ -178,11 +183,14 @@ class GatewaySessionControlsMixin:
                     session_controls, record, "continuation_enqueued"
                 )
             elif target_offline:
-                # Persist supersession while offline so a stale wake is never delivered later.
+                # continuation_is_current persists the discard receipt when the goal moved on, so a
+                # stale wake is never delivered after reconnect; reload that durable record.
                 if not await self._run_in_executor_with_context(
                     session_controls.continuation_is_current, request_id,
                 ):
-                    record = dict(record, continuation_enqueued=True, continuation_discarded="target_changed")
+                    record = (await self._run_in_executor_with_context(
+                        session_controls._load_record, request_id,
+                    )) or record
             elif source is None or adapter is None:
                 record = await self._mark_and_finish(
                     session_controls, record, "continuation_enqueued"
