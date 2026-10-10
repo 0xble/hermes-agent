@@ -277,15 +277,15 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     removed on any failure — ``BaseException`` on purpose, so KeyboardInterrupt / SystemExit still
     clean up.
     """
-    # A profile delete leaves a tombstone beside its removed home.  Background
-    # writers may retain that home in a context variable, so a plain mkdir here
-    # would resurrect the profile before the write can fail.
     if path.name == "config.yaml":
         # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
         # all funnel here, so one check stops a newer-schema build stamping a release-managed
         # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
         from hermes_cli.release_config_owner import ensure_release_owns_config_write
         ensure_release_owns_config_write(path)
+    # A profile delete leaves a tombstone beside its removed home.  Background
+    # writers may retain that home in a context variable, so a plain mkdir here
+    # would resurrect the profile before the write can fail.
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)

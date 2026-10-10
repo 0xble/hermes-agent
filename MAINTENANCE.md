@@ -268,12 +268,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: release-owned config writes
 
 - **Patch identity:** `release-owned-config-writes`.
-- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. Agent-authored edits through the file tool are out of scope: they never stamp a schema. The refusal names the config path, running root and schema, live release and schema, and the live release directory whose hermes to run.
-- **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` `_atomic_write` (the primitive under every atomic config.yaml writer), `hermes_cli/config.py` `_write_config_state` (refuses before read-back checks), `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, including first-run seeding before any parent directory or template copy, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. Agent-authored edits through the file tool are out of scope: they never stamp a schema. The refusal names the config path, running root and schema, live release and schema, and the live release directory whose hermes to run.
+- **Source surfaces:** `hermes_cli/release_config_owner.py`, `hermes_cli/config.py` `seed_config_file` (before parent creation/template copy) and `_write_config_state`, `utils.py` `_atomic_write` (the primitive under every atomic config.yaml writer), `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
 - **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
 - **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
 - **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
-- **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
+- **Rollback:** Revert the commits carrying `Fork-Patch: release-owned-config-writes`.
 
 ## Active patch record: Telegram first-poll health
 

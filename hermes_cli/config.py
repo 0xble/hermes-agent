@@ -518,6 +518,9 @@ def seed_config_file(config_path: Path, template: Optional[Path] = None) -> bool
     merges no defaults, so every written display key becomes a global that beats each platform's own default
     (#121230). Shared by ``hermes config edit`` and ``hermes doctor --fix`` so the seeders cannot drift.
     Returns True when the template was copied (the fallback, like save_config, writes get_config_path())."""
+    from hermes_cli.release_config_owner import ensure_release_owns_config_write
+
+    ensure_release_owns_config_write(config_path)
     template = template or get_project_root() / "cli-config.yaml.example"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     if template.exists():
