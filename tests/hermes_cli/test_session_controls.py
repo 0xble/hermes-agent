@@ -661,3 +661,31 @@ def test_replace_refuses_done_goal_on_quote_and_approval_paths(state):
     assert quoted["ok"] is False
     assert load_goal("target").status == "done"
     assert load_goal("target").goal == "finished work"
+
+
+@pytest.mark.parametrize("change", ["replace", "clear_then_set"])
+def test_new_goal_instance_is_strictly_later_under_a_frozen_clock(state, monkeypatch, change):
+    """A frozen clock cannot let a replacement or re-set reuse the old continuation instance."""
+    import time as _time
+    from hermes_cli.goals import GoalManager
+    frozen = 1_800_000_000.0
+    monkeypatch.setattr(_time, "time", lambda: frozen)
+    manager = GoalManager("target")
+    manager.set("watch the build")
+    before = manager.state.created_at
+    if change == "replace":
+        _user(state, "target", "Please switch this goal to watching the deploy")
+        result = manager.replace(goal="watch the deploy", reason="x",
+                                 user_quote="switch this goal to watching the deploy")
+        assert result["ok"], result
+    else:
+        manager.clear()
+        manager.set("watch the deploy")
+    assert GoalManager("target").state.created_at > before
+    if change == "clear_then_set":
+        fresh = GoalManager("target")
+        fresh.clear()
+        again = fresh.state
+        GoalManager("target").set("watch the release")
+        assert again is None
+        assert GoalManager("target").state.created_at > before

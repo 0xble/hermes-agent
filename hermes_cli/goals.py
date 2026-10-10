@@ -2245,12 +2245,21 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
+    def _next_instance_time(self) -> float:
+        """A new goal instance's created_at, strictly after the one it supersedes.
+
+        created_at is the continuation instance fence, so a coarse or frozen clock must not let a
+        replacement or re-set reuse the previous instance's value.
+        """
+        prior = self._state.created_at if self._state is not None else getattr(self, "_cleared_instance", 0.0)
+        return max(time.time(), float(prior or 0.0) + 1e-6)
+
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
         self._state = GoalState(
-            goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
         )
@@ -2309,6 +2318,7 @@ class GoalManager:
             return
         self._state.status = "cleared"
         self._save()
+        self._cleared_instance = self._state.created_at
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -2450,7 +2460,7 @@ class GoalManager:
             if authority["via"] == "button":
                 revision["approved_by"] = str(authority.get("user_id") or "")
         revisions = list(old.revisions) + [revision]
-        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=time.time(),
+        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(),
                                 max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),
                                 revisions=revisions)
         self._save()
