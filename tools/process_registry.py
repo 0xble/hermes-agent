@@ -2702,16 +2702,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
             and session.pid
             and self._detached_host_fate(session.pid, session.host_start_time) != "running"
         ]
-        for session in detached_nonrunning:
-            if ((stop_event is not None and stop_event.is_set())
-                    or (deadline is not None and time.monotonic() >= deadline)):
-                break
-            if session.systemd_unit:
-                _stop_systemd_unit_bounded(session.systemd_unit, deadline)
-            if ((stop_event is not None and stop_event.is_set())
-                    or (deadline is not None and time.monotonic() >= deadline)):
-                break
-            self._close_reused_detached(session)
+        def _close_detached_nonrunning() -> None:
+            # Scope teardown may spend the whole remaining budget. In bounded
+            # sweeps, run it only after active workers have had their signals.
+            for session in detached_nonrunning:
+                if ((stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    break
+                if session.systemd_unit:
+                    _stop_systemd_unit_bounded(session.systemd_unit, deadline)
+                if ((stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    break
+                self._close_reused_detached(session)
         targets = [session for session in targets if session not in detached_nonrunning]
         def _fallback_kill_one(session: ProcessSession) -> bool:
             if stop_event is not None and stop_event.is_set():
@@ -2789,7 +2792,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return True
             if session.pid_scope == "host" and session.pid:
                 if session.detached:
-                    return self._host_pid_is_ours(session.pid, session.host_start_time)
+                    # An unreadable fingerprint forbids signalling, not liveness.
+                    return self._detached_host_fate(session.pid, session.host_start_time) == "running"
                 return self._is_host_pid_alive(session.pid)
             return False
 
@@ -2830,7 +2834,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 return True
             _pgid, descendants = snapshot
             return any(
-                self._host_pid_is_ours(pid, start_time)
+                self._detached_host_fate(pid, start_time) == "running"
                 for pid, _child_pgid, start_time in descendants
             )
 
@@ -2848,6 +2852,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # more important than Chromium/Electron's orderly parent teardown (#111598).
         bounded_sweep = deadline is not None or stop_event is not None
         if not bounded_sweep:
+            _close_detached_nonrunning()
             killed = sum(_fallback_kill_one(session) for session in targets)
             self._write_checkpoint()
             return killed
@@ -2948,7 +2953,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         break
                     time.sleep(min(0.05, max(0.0, grace_deadline - time.monotonic())))
                 for session in signalable:
+                    if ((stop_event is not None and stop_event.is_set())
+                            or (deadline is not None and time.monotonic() >= deadline)):
+                        break
                     snapshot = snapshots[session.id]
+                    if _alive(session):
+                        # A TERM handler can spawn a setsid child during grace. Keep
+                        # the old tree for reparented children, and merge the new tree
+                        # while the root's identity can still authorize discovery.
+                        old_pgid, old_children = snapshot
+                        _new_pgid, new_children = _sweep_snapshot(session)
+                        snapshot = (old_pgid, tuple(dict.fromkeys((*old_children, *new_children))))
+                        snapshots[session.id] = snapshot
                     if not _snapshot_alive(session, snapshot):
                         continue
                     root_pgid, descendants = snapshot
@@ -3042,6 +3058,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 for session in targets:
                     if _fallback_kill_one(session):
                         killed += 1
+            _close_detached_nonrunning()
             if (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):

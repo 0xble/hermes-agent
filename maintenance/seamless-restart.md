@@ -73,6 +73,32 @@ A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a sta
 
 Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not retry interrupted work.
 
+## Bounded terminal shutdown
+
+Patch identity: `seamless-restart; bounded restart shutdown` (the same lineage as
+`441dcf7470e` and `384dfd2e51d`). This is a core fix: terminal-tree ownership and
+shutdown ordering cannot be enforced by an entry-point plugin.
+
+- An unreadable start-time fingerprint is not exit evidence. Bounded sweeps keep
+  detached roots and previously fingerprinted descendants tracked as survivors,
+  without signalling an unverifiable identity or publishing `killed`.
+- Active targets receive their bounded TERM/KILL sweep before synchronous cleanup
+  of gone/reused detached scopes can consume the remaining shutdown budget.
+  A sync that introduces finished-session `_scope_stop_pending` retries must put
+  those retries after active TERM, or in the asynchronous scope-stop phase.
+- Before escalation, refresh descendants while the root is alive and identifiable,
+  and merge them with the pre-TERM snapshot. The old snapshot preserves already
+  reparented children; the refresh captures new `setsid` children from TERM handlers.
+- No drain, shutdown, grace, or settle default is increased. Unbounded callers keep
+  their existing parent-first termination route. Launchd handling, upstream's
+  completion-race contract, and empty-tick heartbeat skipping are not changed.
+
+Regression: `scripts/run_tests.sh tests/tools/test_process_registry_shutdown_survivors.py`.
+The tests acknowledge real worker startup through pipes, simulate scope teardown
+spending the shared deadline with an Event, and deterministically clean up only
+spawned processes. Retire this divergence when upstream preserves all three
+ownership/ordering rules under the same finite shutdown deadline.
+
 ## Withdrawn: Overlap and Forward-Only Handover (2026-10-06)
 
 The overlap and forward-only gateway handover feature was removed from this fork. In live use on 2026-10-05 it parked the gateway three times: consumed-scope `SystemExit(0)` followed forced or crashed exits, and the startup gate failed under load. No live handover ever completed. The feature also created unnecessary divergence from upstream.
