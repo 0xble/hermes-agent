@@ -410,6 +410,7 @@ async def test_control_continuation_revalidated_at_idle_runner_ingress(state, su
     event = runner._synthetic_prompt_event(
         source, record["continuation_prompt"], reply_expected=False, goal_continuation=True,
         goal_session_id="target", goal_fingerprint=record["continuation_fingerprint"],
+        goal_instance=record["continuation_instance"],
     )
     # Adapter accepted the wake, then a new control arrived before its idle handler task ran.
     event._gateway_accepted = True
@@ -441,6 +442,7 @@ async def test_control_continuation_revalidated_for_active_replacement_in_follow
     event = runner._synthetic_prompt_event(
         source, prompt, reply_expected=False, goal_continuation=True,
         goal_session_id="target", goal_fingerprint=record["continuation_fingerprint"],
+        goal_instance=record["continuation_instance"],
     )
     GoalManager("target").set("superseding objective")
     runner._MAX_INTERRUPT_DEPTH = 5

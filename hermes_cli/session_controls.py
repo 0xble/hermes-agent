@@ -286,26 +286,60 @@ def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
         return ""
 
 
+def _goal_continuation_matches(metadata: Any, session_id: str, definition: Any) -> bool:
+    """Match an active goal instance; authored edits are refreshed at turn consumption."""
+    if not isinstance(metadata, dict) or not isinstance(definition, dict):
+        return False
+    sid = metadata.get("goal_continuation_session_id")
+    fingerprint = metadata.get("goal_continuation_fingerprint")
+    instance = metadata.get("goal_continuation_instance")
+    return bool(
+        isinstance(sid, str) and sid and (not session_id or sid == session_id)
+        and isinstance(fingerprint, str) and fingerprint.startswith("v2:")
+        and type(instance) in (int, float) and instance > 0
+        and definition.get("status") == "active" and instance == definition.get("created_at")
+    )
+
+
 def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=None) -> bool:
-    """One fail-closed fence for every goal continuation, regardless of its producer."""
+    """One fail-closed instance fence for every goal continuation, regardless of its producer."""
     if not isinstance(metadata, dict):
         return False
     sid = metadata.get("goal_continuation_session_id")
-    expected = metadata.get("goal_continuation_fingerprint")
     if not isinstance(sid, str) or not sid or (session_id and sid != session_id):
-        return False
-    if not isinstance(expected, str) or not expected.startswith("v2:"):
         return False
     try:
         db = _db() if cursor is None else None
         raw = _meta_value(cursor, _definition_key("goal", sid)) if cursor is not None else (
             db.get_meta(_definition_key("goal", sid)) if db is not None else None
         )
-        return bool(raw and json.loads(raw).get("status") == "active"
-                    and expected == _definition_fingerprint("goal", raw))
+        return _goal_continuation_matches(metadata, session_id, json.loads(raw) if raw else None)
     except Exception:
-        logger.debug("goal continuation definition check failed", exc_info=True)
+        logger.debug("goal continuation instance check failed", exc_info=True)
         return False
+
+
+def refresh_goal_continuation(event: Any, session_id: str) -> Optional[str]:
+    """Validate and refresh the queued turn input from one current GoalManager snapshot."""
+    from hermes_cli.goals import GoalManager
+
+    try:
+        metadata = getattr(event, "metadata", None)
+        manager = GoalManager(session_id)
+        raw = manager.state.to_json() if manager.state is not None else None
+        if not _goal_continuation_matches(metadata, session_id, json.loads(raw) if raw else None):
+            return None
+        fingerprint = _definition_fingerprint("goal", raw)
+        if fingerprint != metadata["goal_continuation_fingerprint"]:
+            prompt = manager.next_continuation_prompt()
+            if prompt is None:
+                return None
+            event.text = prompt
+            metadata["goal_continuation_fingerprint"] = fingerprint
+        return event.text
+    except Exception:
+        logger.debug("goal continuation refresh failed", exc_info=True)
+        return None
 
 
 def _meta_value(cursor, key: str) -> Optional[str]:
@@ -319,9 +353,10 @@ def _definition_key(kind: str, session_id: str) -> str:
 def _bind_continuation(record: Dict[str, Any], result: Dict[str, Any], cursor) -> None:
     if result.get("continuation_prompt"):
         record["continuation_prompt"] = result["continuation_prompt"]
-        record["continuation_fingerprint"] = _definition_fingerprint(
-            record["kind"], _meta_value(cursor, _definition_key(record["kind"], record["target_session_id"]))
-        )
+        raw = _meta_value(cursor, _definition_key(record["kind"], record["target_session_id"]))
+        record["continuation_fingerprint"] = _definition_fingerprint(record["kind"], raw)
+        if record["kind"] == "goal":
+            record["continuation_instance"] = json.loads(raw)["created_at"]
 
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
                 reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
@@ -550,6 +585,7 @@ def continuation_is_current(request_id: str) -> bool:
         valid = goal_continuation_is_current({
             "goal_continuation_session_id": record["target_session_id"],
             "goal_continuation_fingerprint": record.get("continuation_fingerprint"),
+            "goal_continuation_instance": record.get("continuation_instance"),
         }, cursor=conn)
         if not valid:
             record["continuation_enqueued"] = True

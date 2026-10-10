@@ -269,6 +269,7 @@ class GatewaySessionControlsMixin:
             source, prompt, reply_expected=False, goal_continuation=True,
             goal_session_id=record["target_session_id"],
             goal_fingerprint=record.get("continuation_fingerprint", ""),
+            goal_instance=record.get("continuation_instance"),
         )
         event.metadata["gateway_session_key"] = key
         event.metadata["gateway_session_id"] = record["target_session_id"]

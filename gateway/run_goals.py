@@ -152,7 +152,7 @@ class GatewayGoalsMixin:
     def _synthetic_prompt_event(
         source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
         goal_continuation: bool = False, goal_session_id: str = "",
-        goal_state: Any = None, goal_fingerprint: Optional[str] = None,
+        goal_state: Any = None, goal_fingerprint: Optional[str] = None, goal_instance: Optional[float] = None,
     ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
@@ -167,7 +167,7 @@ class GatewayGoalsMixin:
         metadata = {}
         if goal_continuation:
             from hermes_cli.session_controls import _definition_fingerprint
-            # created_at + authored revisions fence replace, clear/set and prompt-changing revise.
+            # Instance fences replacement; definition edits refresh when the queue is consumed.
             fingerprint = goal_fingerprint if goal_fingerprint is not None else _definition_fingerprint(
                 "goal", goal_state.to_json() if goal_state is not None else None,
             )
@@ -175,6 +175,9 @@ class GatewayGoalsMixin:
                 GOAL_CONTINUATION_METADATA_KEY: True,
                 "goal_continuation_session_id": goal_session_id,
                 "goal_continuation_fingerprint": fingerprint,
+                "goal_continuation_instance": (
+                    goal_instance if goal_instance is not None else getattr(goal_state, "created_at", None)
+                ),
                 "goal_continuation_created_at": time.time(),
             }
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source

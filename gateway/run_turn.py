@@ -459,10 +459,10 @@ class GatewayTurnMixin:
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
         from gateway.platforms.event import is_goal_continuation_event
         if is_goal_continuation_event(event):
-            from hermes_cli.session_controls import goal_continuation_is_current
-            if not await self._run_in_executor_with_context(
-                goal_continuation_is_current, event_metadata, session_entry.session_id,
-            ):
+            from hermes_cli.session_controls import refresh_goal_continuation
+            if await self._run_in_executor_with_context(
+                refresh_goal_continuation, event, session_entry.session_id,
+            ) is None:
                 return
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
@@ -4069,10 +4069,10 @@ class GatewayTurnMixin:
             next_source = getattr(pending_event, "source", None) or source
             from gateway.platforms.event import is_goal_continuation_event
             if is_goal_continuation_event(pending_event):
-                from hermes_cli.session_controls import goal_continuation_is_current
-                if not await self._run_in_executor_with_context(
-                    goal_continuation_is_current, getattr(pending_event, "metadata", None), session_id,
-                ):
+                from hermes_cli.session_controls import refresh_goal_continuation
+                if await self._run_in_executor_with_context(
+                    refresh_goal_continuation, pending_event, session_id,
+                ) is None:
                     logger.info("Discarding stale goal continuation for session %s", session_key or "?")
                     return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image

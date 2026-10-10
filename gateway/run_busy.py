@@ -368,7 +368,7 @@ class GatewayBusySessionMixin:
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict",
         "notification_category", "goal_continuation", "goal_continuation_session_id",
-        "goal_continuation_fingerprint", "goal_continuation_created_at",
+        "goal_continuation_fingerprint", "goal_continuation_instance", "goal_continuation_created_at",
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:

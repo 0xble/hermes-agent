@@ -153,8 +153,8 @@ async def test_ordinary_post_turn_continuation_dropped_after_active_replacement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("admission", ["wake", "busy"])
-@pytest.mark.parametrize("change", ["replace", "clear_then_set", "revise"])
-async def test_ordinary_continuation_identity_fences_all_definition_changes(state, admission, change):
+@pytest.mark.parametrize("change", ["replace", "clear_then_set"])
+async def test_ordinary_continuation_identity_fences_new_goal_instances(state, admission, change):
     from gateway.run_busy import GatewayBusySessionMixin
     from gateway.wake import WakeSuperseded, admit_internal_event
     from hermes_cli.goals import GoalManager
@@ -164,14 +164,10 @@ async def test_ordinary_continuation_identity_fences_all_definition_changes(stat
     old = await _post_turn_event(runner)
     if change == "replace":
         _apply(state, "replace", goal="same objective")
-    elif change == "clear_then_set":
+    else:
         GoalManager("target").clear()
         GoalManager("target").set("same objective")
-    else:
-        revised = GoalManager("target").revise(
-            reason="tighten verification", contract={"verification": "prove the new acceptance criterion"},
-        )
-        assert revised["ok"], revised
+    assert GoalManager("target").state.created_at != old.metadata["goal_continuation_instance"]
     runner.adapter.handle_message = AsyncMock()
     runner._queue_or_replace_pending_event = AsyncMock()
     if admission == "wake":
@@ -184,6 +180,132 @@ async def test_ordinary_continuation_identity_fences_all_definition_changes(stat
         ) is True
     runner.adapter.handle_message.assert_not_awaited()
     runner._queue_or_replace_pending_event.assert_not_awaited()
+
+
+async def _execute_continuation(runner, state, tmp_path, event, path):
+    """Run real ingress/FIFO preparation, stopping only at the next model-turn boundary."""
+    from types import MethodType
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+    from gateway.wake import admit_internal_event
+
+    async def accept(current):
+        current._gateway_accepted = True
+
+    runner.adapter.handle_message = AsyncMock(side_effect=accept)
+    await admit_internal_event(runner.adapter, event)
+    runner.adapter.handle_message.assert_awaited_once_with(event)
+
+    if path == "idle":
+        from gateway.config import GatewayConfig
+        from gateway.session import AsyncSessionStore, SessionStore
+
+        store = SessionStore(tmp_path / "gateway-sessions", GatewayConfig())
+        store._db = state
+        runner.session_store = store
+        runner.async_session_store = AsyncSessionStore(store)
+        runner._hmwa_resolve_session = MethodType(GatewayTurnMixin._hmwa_resolve_session, runner)
+        runner._recover_telegram_topic_thread_id = lambda source: None
+        runner._cache_session_source = lambda key, source: None
+        runner._is_telegram_topic_lane = lambda source: False
+        runner._PreparedTurn = GatewayTurnMixin._PreparedTurn
+        runner._hmwa_prepare_turn = AsyncMock(return_value=(None, None))
+        try:
+            entry = store.get_or_create_session(event.source)
+            runner.target = store.switch_session(entry.session_key, "target")
+            runner._session_key_for_source = store._generate_session_key
+            if event.metadata.get("gateway_session_strict"):
+                event.metadata["gateway_session_key"] = entry.session_key
+            await GatewayTurnMixin._handle_message_with_agent(
+                runner, event, event.source, entry.session_key, 1,
+            )
+            runner._hmwa_prepare_turn.assert_awaited_once()
+            return runner._hmwa_prepare_turn.await_args.args[0].text
+        finally:
+            store.close_all_db_handles()
+
+    runner._MAX_INTERRUPT_DEPTH = 5
+    runner._session_key_for_source = lambda source: runner.target.session_key
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
+        side_effect=lambda **kw: kw["event"].text,
+    )
+    runner._reply_anchor_for_event = lambda event: None
+    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+    runner._persist_prompt_pins = AsyncMock()
+    runner._intake_adapter_for = lambda source: None
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._run_agent = AsyncMock(return_value={"final_response": "resumed", "messages": []})
+    ctx = TurnContext(source=runner.target.origin, session_key=runner.target.session_key,
+                      session_id="target", run_generation=1, history=[])
+    await GatewayTurnMixin._run_agent_queued_followup(
+        runner, ctx, runner.adapter, event.text, event, "", {"interrupted": True, "messages": []}, None,
+    )
+    runner._run_agent.assert_awaited_once()
+    return runner._run_agent.await_args.kwargs["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["idle", "fifo"])
+@pytest.mark.parametrize("change", ["revise", "add_subgoal", "contract_revise", "set_contract"])
+async def test_same_goal_definition_edit_refreshes_queued_continuation(state, tmp_path, path, change):
+    from hermes_cli.goals import GoalContract, GoalManager
+    from hermes_cli.session_controls import _definition_fingerprint, goal_continuation_is_current
+
+    runner = _runner(state)
+    instance = GoalManager("target").set("same objective").created_at
+    event = await _post_turn_event(runner)
+    fingerprint = event.metadata["goal_continuation_fingerprint"]
+    criterion = "prove the new acceptance criterion"
+    manager = GoalManager("target")
+    if change == "add_subgoal":
+        manager.add_subgoal(criterion)
+    elif change == "set_contract":
+        manager.set_contract(GoalContract(verification=criterion))
+    else:
+        result = manager.revise(
+            reason="tighten verification",
+            **({"subgoals": [criterion]} if change == "revise" else {"contract": {"verification": criterion}}),
+        )
+        assert result["ok"], result
+    assert manager.state.created_at == instance
+    assert criterion not in event.text
+    executed = await _execute_continuation(runner, state, tmp_path, event, path)
+    assert criterion in executed
+    assert executed == GoalManager("target").next_continuation_prompt()
+    assert event.text == executed
+    assert event.metadata["goal_continuation_instance"] == instance
+    assert event.metadata["goal_continuation_fingerprint"] != fingerprint
+    assert event.metadata["goal_continuation_fingerprint"] == _definition_fingerprint("goal", manager.state.to_json())
+    assert goal_continuation_is_current(event.metadata, "target")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["resume", "replace"])
+@pytest.mark.parametrize("path", ["idle", "fifo"])
+@pytest.mark.parametrize("edit_before_constructor", [False, True])
+async def test_approved_control_continuation_refreshes_after_subgoal_add(
+    state, tmp_path, action, path, edit_before_constructor,
+):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import continuation_is_current, request_control, resolve_request
+
+    runner = _runner(state)
+    GoalManager("target").set("same objective")
+    GoalManager("target").pause()
+    request = request_control("goal", action, "target", requester_sid="requester",
+                              payload={"goal": "approved objective"} if action == "replace" else {})
+    record = resolve_request(request["id"], "approve", "99")
+    assert record["status"] == "applied"
+    criterion = "also verify the resumed acceptance criterion"
+    if edit_before_constructor:
+        GoalManager("target").add_subgoal(criterion)
+    event = await _control_event(runner, record)
+    if not edit_before_constructor:
+        GoalManager("target").add_subgoal(criterion)
+    executed = await _execute_continuation(runner, state, tmp_path, event, path)
+    assert criterion in executed
+    assert continuation_is_current(record["id"])
+    assert not runner.session_controls._load_record(record["id"]).get("continuation_discarded")
 
 
 @pytest.mark.asyncio
@@ -212,6 +334,10 @@ async def test_current_continuation_survives_progress_and_resume_but_not_unstamp
     runner.adapter.handle_message = AsyncMock(side_effect=accept)
     await admit_internal_event(runner.adapter, event)
     runner.adapter.handle_message.assert_awaited_once_with(event)
+    event.metadata.pop("goal_continuation_instance")  # Legacy fingerprint-only events fail closed too.
+    assert not goal_continuation_is_current(event.metadata, "target")
+    with pytest.raises(WakeSuperseded):
+        await admit_internal_event(runner.adapter, event)
     event.metadata = {"goal_continuation": True}
     with pytest.raises(WakeSuperseded):
         await admit_internal_event(runner.adapter, event)

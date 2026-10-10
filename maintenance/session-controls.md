@@ -30,14 +30,16 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
 ## Continuation lifecycle fence
 
 Every gateway goal continuation is stamped by the shared synthetic-event constructor with its
-session ID, authored-definition fingerprint, and creation time. The fingerprint reuses the control
-card definition identity (creation time plus objective, contract, criteria, gates and revisions),
-not progress counters or the active/paused status. Wake admission, idle ingress (including ordinary
-non-internal continuations), busy ingress and FIFO follow-up all require the goal to be active and
-the stamped definition to match. Resolved-session ingress also compares the stamp with the actual
-session ID after routing and Telegram binding recovery, so a /new or /resume cannot move an old
-continuation into the replacement conversation. Control wakes use the existing strict gateway
-session pin. Unstamped legacy continuations fail closed.
+session ID, goal instance (`created_at`), authored-definition fingerprint, and event creation time:
+replace or clear/set changes the instance and drops old work, while same-goal edits keep the instance
+and refresh the prompt and fingerprint from the current GoalManager when idle ingress or FIFO
+follow-up consumes the event. Control approval cards remain strictly bound to the full authored
+definition (objective, contract, criteria, gates and revisions), not progress counters or status.
+Wake admission, idle ingress (including ordinary non-internal continuations), busy ingress and FIFO
+follow-up all require an active matching instance. Resolved-session ingress also compares the stamp
+with the actual session ID after routing and Telegram binding recovery, so a /new or /resume cannot
+move an old continuation into the replacement conversation. Control wakes use the existing strict
+gateway session pin. Unstamped legacy continuations fail closed.
 
 Restart-persisted control outbox records use that same check, retaining their durable discard
 receipt. An applied historical pause/clear only removes queued continuations created no later than
