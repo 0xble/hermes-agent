@@ -271,6 +271,20 @@ def test_quote_replace_records_user_actor(state):
     assert 'cites the user: "replace the target goal with ship now"' in load_goal("target").render_revisions_block()
 
 
+def test_direct_manager_quote_replace_records_user_authority(state):
+    """GoalManager.replace with a locally validated quote audits the same as apply_control."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    GoalManager("target").set("migrate database")
+    _user(state, "target", "Please replace the goal with ship the release")
+    result = GoalManager("target").replace(reason="pivot", goal="ship the release",
+                                           user_quote="replace the goal with ship the release")
+    assert result["ok"] is True
+    revision = load_goal("target").revisions[-1]
+    assert (revision["actor"], revision["authority"]) == ("user", "quote")
+    assert "earlier goal: migrate database" not in load_goal("target").render_revisions_block()
+
+
 @pytest.mark.parametrize("header", ['[Replying to: "{0}"]', '[Replying to your previous message: "{0}"]'])
 def test_reply_prefix_quote_is_refused(state, header):
     from hermes_cli.goals import GoalManager, load_goal, user_messages_since

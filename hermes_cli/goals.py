@@ -2421,6 +2421,8 @@ class GoalManager:
                 if isinstance(checked, str):
                     return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
                 quote, source = checked
+                # A quote validated here is the same user authority apply_control records.
+                authority = {"via": "quote", "quote": quote, "message": source}
             except ValueError as exc:
                 code = str(exc)
                 return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}

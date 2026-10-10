@@ -986,21 +986,25 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
-    def _save_tick_outcome(self, fired_ticks: int) -> bool:
-        """Commit a tick's outcome only if the stored loop is still the tick this manager fired.
+    def _save_tick_outcome(self, fired_ticks: int, settle) -> bool:
+        """Settle the fired tick on the stored loop inside one write transaction.
 
-        A user or cross-session pause, stop, resume or replace can land while the tick's turn runs;
-        the in-memory copy predates it, and saving it would resurrect a stopped loop or undo a
-        pause. Compare-and-set inside one write transaction keeps that newer change."""
+        A user or cross-session pause, stop, resume, replace or re-set can land while the tick's
+        turn runs; the in-memory copy predates it, and saving that copy would resurrect a stopped
+        loop or undo a pause. So the outcome applies only while the stored row is still this
+        in-flight tick (active, awaiting_response, same created_at and ticks_fired). A revise keeps
+        the tick in flight by design, so ``settle`` runs against the stored row and the revised
+        definition survives while the tick still clears awaiting_response."""
         s = self._state
         db = _get_session_db() if self._cursor is None else None
         if s is None:
             return False
         if db is None:
+            settle(s)
             self._save()
             return True
 
-        def write(conn) -> bool:
+        def write(conn) -> Optional[LoopState]:
             row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
             ).fetchone()
@@ -1008,20 +1012,22 @@ class LoopManager:
             if (
                 stored is None or stored.status != "active" or not stored.awaiting_response
                 or stored.created_at != s.created_at or stored.ticks_fired != fired_ticks
-                or stored.version != s.version
             ):
-                return False
-            save_loop(self.session_id, s, cursor=conn)
-            return True
+                return None
+            settle(stored)
+            save_loop(self.session_id, stored, cursor=conn)
+            return stored
 
         try:
-            applied = bool(db._execute_write(write))
+            settled = db._execute_write(write)
         except Exception as exc:
             logger.debug("LoopManager: tick outcome write failed: %s", exc)
             return False
-        if not applied:
+        if settled is None:
             self.refresh()
-        return applied
+            return False
+        self._state = settled
+        return True
 
     def _superseded_result(self) -> Dict[str, Any]:
         s = self._state
@@ -1034,19 +1040,26 @@ class LoopManager:
         if s is None or not s.awaiting_response:
             return
         fired = s.ticks_fired
-        s.awaiting_response = False
-        s.ticks_fired = max(0, fired - 1)
-        self._save_tick_outcome(fired)
+
+        def settle(state: LoopState) -> None:
+            state.awaiting_response = False
+            state.ticks_fired = max(0, fired - 1)
+
+        self._save_tick_outcome(fired, settle)
 
     def _stop(self, status: str, reason: str, message: str) -> Dict[str, Any]:
         """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result."""
         s = self._state
-        s.status = status
-        if status == "done":
-            s.last_stop_reason = reason
-        else:
-            s.paused_reason = reason
-        if not self._save_tick_outcome(s.ticks_fired):
+
+        def settle(state: LoopState) -> None:
+            state.awaiting_response = False
+            state.status = status
+            if status == "done":
+                state.last_stop_reason = reason
+            else:
+                state.paused_reason = reason
+
+        if s is None or not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
@@ -1056,10 +1069,11 @@ class LoopManager:
         Returns ``{"status": "active|done|paused", "stopped": bool, "reason": str, "message": str}``;
         ``message`` is a user-visible one-liner, "" in the common still-looping case.
         """
+        # Decide on the stored loop: a pause, stop or revise during the turn must govern this tick.
+        self.refresh()
         s = self._state
         if s is None or not s.awaiting_response:
             return {"status": s.status if s else None, "stopped": False, "reason": "no tick in flight", "message": ""}
-        s.awaiting_response = False
         now = time.time()
         ticks = _ticks_label(s.ticks_fired)
 
@@ -1099,19 +1113,24 @@ class LoopManager:
                 "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.",
             )
 
-        # 5. Still looping — schedule the next tick from turn end.
-        if s.mode == "self_paced":
-            digest = _digest_response(last_response)
-            floor = self_paced_floor_seconds()
-            if digest and digest == s.last_response_digest:
-                s.current_delay = min(max(s.current_delay, floor) * 2, self_paced_ceiling_seconds())
+        # 5. Still looping — schedule the next tick from turn end, using the stored cadence so a
+        # revise that landed during this tick takes effect now.
+        digest = _digest_response(last_response)
+
+        def settle(state: LoopState) -> None:
+            state.awaiting_response = False
+            if state.mode == "self_paced":
+                floor = self_paced_floor_seconds()
+                if digest and digest == state.last_response_digest:
+                    state.current_delay = min(max(state.current_delay, floor) * 2, self_paced_ceiling_seconds())
+                else:
+                    state.current_delay = float(floor)
+                state.last_response_digest = digest
             else:
-                s.current_delay = float(floor)
-            s.last_response_digest = digest
-        else:
-            s.current_delay = s.interval_seconds
-        s.next_due_at = now + s.current_delay
-        if not self._save_tick_outcome(s.ticks_fired):
+                state.current_delay = state.interval_seconds
+            state.next_due_at = now + state.current_delay
+
+        if not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 

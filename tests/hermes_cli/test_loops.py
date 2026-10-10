@@ -515,6 +515,34 @@ class TestTickLifecycle:
         after = load_loop("t-rev")
         assert after.interval_seconds == 900.0
         assert after.revisions == [{"reason": "slow down"}]
+        assert after.awaiting_response is False
+        assert after.current_delay == 900.0
+        later = LoopManager(session_id="t-rev")
+        assert later.is_due(time.time() + 901)
+        later.state.next_due_at = time.time() - 1
+        assert later.fire_tick() is not None
+
+    def test_revise_during_until_judge_keeps_loop_schedulable(self, hermes_home):
+        """A revise landing while the --until judge runs is kept and the tick still settles."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-judge")
+        state = mgr.set("poll", interval_seconds=300, until="the suite is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+
+        def judge(*_args, **_kwargs):
+            LoopManager(session_id="t-judge").revise(reason="slow down", interval_seconds=900)
+            return ("continue", "not yet", False, None, False)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge):
+            decision = mgr.complete_tick("still red")
+        after = load_loop("t-judge")
+        assert decision["status"] == "active"
+        assert after.interval_seconds == 900.0
+        assert after.version == 2
+        assert after.awaiting_response is False
+        assert LoopManager(session_id="t-judge").is_due(time.time() + 86400)
 
     def test_abandon_after_external_pause_keeps_pause(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
