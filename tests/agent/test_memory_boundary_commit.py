@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Any, Dict, List
 
+import pytest
+
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 
@@ -96,6 +98,66 @@ def test_boundary_commit_delivers_end_strictly_before_switch():
     assert provider._caller_thread_ids[0] != threading.get_ident()
 
 
+
+
+@pytest.mark.parametrize("queued_session_id", ["new-sid", "old-sid", "other-sid", ""])
+def test_boundary_commit_preserves_only_destination_prefetch(queued_session_id):
+    """A new turn can queue recall while /new is still extracting the old session."""
+    extracting, release = threading.Event(), threading.Event()
+
+    class _BufferingProvider(_RecordingProvider):
+        def __init__(self):
+            super().__init__()
+            self.buffer = ""
+
+        def on_session_end(self, messages):
+            extracting.set()
+            assert release.wait(5), "old-session extraction was not released"
+            super().on_session_end(messages)
+
+        def queue_prefetch(self, query, *, session_id=""):
+            self.calls.append(("queue", query, session_id))
+            self.buffer = f"recall for: {query}"
+
+        def prefetch(self, query, *, session_id=""):
+            result, self.buffer = self.buffer, ""
+            return result
+
+        def discard_prefetch(self):
+            self.calls.append(("discard",))
+            self.buffer = ""
+
+    provider = _BufferingProvider()
+    mm = _make_manager(provider)
+    mm.initialize_all("old-sid")
+    try:
+        mm.queue_prefetch_all("previous topic", session_id="old-sid")
+        assert mm.flush_pending(timeout=5)
+        assert provider.buffer  # the switch must still drop the old session's buffer
+        provider.calls.clear()
+        mm.commit_session_boundary_async(
+            [{"role": "user", "content": "old turn"}], new_session_id="new-sid"
+        )
+        assert extracting.wait(5), "boundary did not reach old-session extraction"
+        mm.queue_prefetch_all("queued topic", session_id=queued_session_id)
+        assert provider.calls == []  # dispatch is waiting behind end -> switch
+        release.set()
+        assert mm.flush_pending(timeout=5)
+
+        expected_calls = [
+            ("end", [{"role": "user", "content": "old turn"}]),
+            ("discard",),
+            ("switch", "new-sid", True),
+        ]
+        expected_recall = ""
+        if queued_session_id == "new-sid":
+            expected_calls.append(("queue", "queued topic", "new-sid"))
+            expected_recall = "recall for: queued topic"
+        assert provider.calls == expected_calls
+        assert mm.prefetch_all("follow-up topic", session_id="new-sid") == expected_recall
+    finally:
+        release.set()
+        mm.shutdown_all()
 
 
 def test_boundary_commit_switch_still_fires_when_end_raises():
