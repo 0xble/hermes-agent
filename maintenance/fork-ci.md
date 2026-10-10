@@ -240,6 +240,23 @@ checkout, and fails on the previous probe order. Upstream main (after
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
 
+## Metrics worker phase drain
+
+The `fork-ci-reliability` identity also covers the suite's phase-boundary wait for
+the gateway shared-metrics worker. Cron and gateway code hand each metric to one
+background thread (`hermes_cli/observability/shared_metrics_gateway.py::_submit`).
+That thread's first job lazily imports the metrics runtime, which registers named
+loggers. Pytest starts every setup, call and teardown phase with
+`catching_logs.__enter__`, and that method iterates the live
+`logging.Logger.manager.loggerDict`. A job still running from the previous phase
+raised `RuntimeError: dictionary changed size during iteration` at teardown of
+`tests/cron/test_warning_execution_outcome.py` (hosted job 114104725116). The
+next setup then cascaded into "previous item was not torn down properly". The
+loop belongs to pytest, so `tests/conftest.py` drains the worker at the end of
+each phase hook. `drain()` no longer starts a worker when none exists. Upstream
+main has the same worker and loop. Retire this when upstream drains or joins the
+worker in its suite, or when pytest copies `loggerDict` before iterating it.
+
 ## Verification and retirement
 
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`

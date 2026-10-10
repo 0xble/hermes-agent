@@ -1247,8 +1247,29 @@ def pytest_runtest_call(item):
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
             wait()
+        _drain_shared_metrics_worker()
 
 
+def _drain_shared_metrics_worker() -> None:
+    """Finish the gateway shared-metrics worker's queued jobs before the next pytest phase.
+
+    Cron and gateway code hand each metric to one background worker
+    (``shared_metrics_gateway._submit``). Its first job lazily imports the metrics
+    runtime, and those imports register named loggers. Pytest starts every phase
+    with ``catching_logs.__enter__``, which iterates the live
+    ``logging.Logger.manager.loggerDict``. A job still running from the previous
+    phase can add a logger during that loop, which raises ``RuntimeError: dictionary
+    changed size during iteration`` (hosted job 114104725116, at teardown of
+    ``tests/cron/test_warning_execution_outcome.py``). The loop is in pytest, so the
+    suite waits for the worker at each phase boundary. A sys.modules lookup, not an
+    import: a test that never loaded the module has no worker.
+    """
+    drain = getattr(sys.modules.get("hermes_cli.observability.shared_metrics_gateway"), "drain", None)
+    if drain is not None:
+        drain()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
 def pytest_runtest_setup(item):
     if item.get_closest_marker("require_symlinks"):
         if not _check_symlink_support():
@@ -1256,6 +1277,18 @@ def pytest_runtest_setup(item):
                 "Environment does not support symbolic links "
                 "(requires admin/developer mode on Windows)"
             )
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    try:
+        return (yield)
+    finally:
+        _drain_shared_metrics_worker()
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
