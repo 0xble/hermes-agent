@@ -457,5 +457,18 @@ select = [
   "TID251"
 ]
 
+[lint.flake8-tidy-imports.banned-api]
+"pm.uv".msg = "Use PM's semantic Python operations, not an installer executable."
+"pm.client.uv".msg = "Use PM's semantic Python operations."
+"pm.install.uv".msg = "The raw uv bridge was removed; use PM operations."
+"pm._uv".msg = "Tool acquisition is private to PM."
+"pm.environment".msg = "The environment engine is private; use PM operations."
+"pm.runtime_stage".msg = "PM stages its own worker runtime; consumers call pm operations."
+
+[lint.per-file-ignores]
+"apps/desktop/electron/fixtures/**" = ["TID251"]
+"pm/**" = ["TID251"]
+"tests/pm/**" = ["TID251"]
+
 [lint.mccabe]
 max-complexity = 20
