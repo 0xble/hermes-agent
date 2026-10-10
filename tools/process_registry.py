@@ -2011,6 +2011,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
         equality; non-owned events are re-queued for their owner. No filter consumes
         everything (legacy single-session) except restored delegation payloads (fail-closed)."""
         self.restore_completions()
+        try:  # terminal events held while their durable ownership was unprovable
+            from tools.async_delegation import reoffer_unresolved_completions
+            reoffer_unresolved_completions(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not re-offer unresolved async delegation completions: %s", exc)
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         # delegation.surface_child_process_notifications, read at most once per drain

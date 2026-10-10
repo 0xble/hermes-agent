@@ -572,6 +572,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
         return True
+    if is_delegation:
+        # Before the status row below: a terminal result whose durable ownership is unproven
+        # is held (or a proven loser discarded), never shown.
+        from tools.async_delegation import resolve_event_ownership
+        if not resolve_event_ownership(evt):
+            return True
     text = fmt(evt)
     if not text:
         return True
