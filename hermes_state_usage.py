@@ -216,7 +216,15 @@ class SessionUsageMixin:
         for session_id, kwargs in batch:
             key = None
             if not kwargs.get("absolute"):
-                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
+                # Cost presence is part of the write shape. A billed delta infers its actual
+                # amount from estimated_cost_usd only when actual_cost_usd is absent; merging
+                # it with an explicit actual write would erase that provenance and make batching
+                # differ from sequential application. ``is not None`` keeps explicit zero distinct
+                # from an omitted field.
+                cost_shape = tuple(
+                    field for field in self._TOKEN_DELTA_COST_FIELDS if kwargs.get(field) is not None
+                )
+                key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS), cost_shape)
             if groups and key is not None and groups[-1][0] == key:
                 merged = groups[-1][2]
                 for f in self._TOKEN_DELTA_SUM_FIELDS:
@@ -283,6 +291,14 @@ class SessionUsageMixin:
         where the cached agent holds cumulative totals). ``source`` is the session's real surface
         for the row-existence guard; callers that don't know it leave the placeholder."""
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
+        # A provider-billed per-call delta arrives as ``cost_status="actual"`` with the amount in
+        # ``estimated_cost_usd``. The sessions row keeps its existing display bucket (readers use
+        # COALESCE(actual_cost_usd, estimated_cost_usd)); the per-call model row also records the
+        # amount as billed. Neither reader adds the two buckets, so the amount displays once.
+        billed_delta = (estimated_cost_usd if (cost_status == "actual" and actual_cost_usd is None
+                                               and not absolute) else None)
+        if billed_delta is not None:
+            usage["actual_cost_usd"] = billed_delta
         # Ensure the row exists: under concurrent load create_session() may have failed on
         # locking, and the UPDATE would silently affect 0 rows. When this guard is the first
         # writer it must carry the agent's real source: the turn lease treats an existing row as
@@ -313,9 +329,16 @@ class SessionUsageMixin:
 
         def _do(conn):
             row = conn.execute(
-                "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?", (session_id,),
+                "SELECT model, billing_provider, api_call_count, actual_cost_usd FROM sessions WHERE id = ?",
+                (session_id,),
             ).fetchone()
             existing = dict(row) if row is not None else {}
+            run_params = params
+            if billed_delta is not None and existing.get("actual_cost_usd") is not None:
+                # A row that already shows its actual bucket (an explicit legacy actual write)
+                # would hide an estimated_cost_usd-only delta from COALESCE readers; add the
+                # billed amount to the shown bucket too.
+                run_params = params[:6] + (billed_delta, billed_delta) + params[8:]
             # create_session records the requested route before any API call. If that fails
             # and fallback succeeds, the first accounted usage is the authoritative route;
             # after that keep the row as is (one row cannot represent mixed usage).
@@ -329,7 +352,7 @@ class SessionUsageMixin:
                        SET model = ?, billing_provider = ?,
                        billing_base_url = ?, billing_mode = ?
                        WHERE id = ?""", (model, billing_provider, billing_base_url, billing_mode, session_id))
-            conn.execute(sql, params)
+            conn.execute(sql, run_params)
             if record_model_usage:
                 self._record_model_usage(conn, session_id, **usage)
         self._execute_write(_do)

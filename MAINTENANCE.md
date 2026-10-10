@@ -144,6 +144,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
 | Proactive tool-result prune default | Enable the existing deterministic no-LLM tool-result prune at 48000 tokens while protecting the recent tail | `compression.proactive_prune_tokens`, its config/docs, and proactive-prune regressions | [Proactive tool-result prune default](maintenance/proactive-tool-result-prune.md) |
+| Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
 
 ## Active patch record: relay silence (S1)
 
