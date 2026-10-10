@@ -1073,16 +1073,28 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
     monkeypatch.setattr(orm, "_can_open_graphical_browser", lambda: True)
     monkeypatch.setattr(orm.webbrowser, "open", _browser)
 
+    loopback_error = None
     try:
         code = orm._openrouter_loopback_code(
             {"code_challenge": "c", "code_challenge_method": "S256"}, open_browser=True, timeout_seconds=10)
+    except BaseException as exc:
+        loopback_error = exc
+        raise
     finally:
         # The server publishing a code does not mean the browser thread has
         # observed its HTTP response. Join that owner before reading its results
         # (and before monkeypatch restores the client on any failure).
         for worker in workers:
             worker.join(timeout=12)
-            assert not worker.is_alive(), "OpenRouter browser redirects did not finish"
+        if loopback_error is not None:
+            # Keep the original exception and traceback, with worker diagnostics
+            # attached rather than an assertion in cleanup hiding the cause.
+            if any(worker.is_alive() for worker in workers):
+                loopback_error.add_note("OpenRouter browser redirects did not finish")
+            if errors:
+                loopback_error.add_note(f"OpenRouter browser redirect failed: {errors!r}")
+    for worker in workers:
+        assert not worker.is_alive(), "OpenRouter browser redirects did not finish"
     assert not errors, f"OpenRouter browser redirect failed: {errors!r}"
 
     parsed = urllib.parse.urlparse(seen["callback"])
