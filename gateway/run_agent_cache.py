@@ -407,9 +407,11 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return 0
         persistent = self._session_state(session_key).persistent
-        # Monotonic by design (#28686): incremented here, NEVER reset.
-        persistent.run_generation = int(persistent.run_generation) + 1
-        return persistent.run_generation
+        # A stop's executor tail holds this lock through its ownership check and goal write.
+        with persistent.run_generation_lock:
+            # Monotonic by design (#28686): incremented here, NEVER reset.
+            persistent.run_generation = int(persistent.run_generation) + 1
+            return persistent.run_generation
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``.

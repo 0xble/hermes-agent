@@ -433,8 +433,8 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal stop: session lookup failed for %s: %s", session_key, exc)
             session_id = None
-        # Ownership fence (synchronous from here to the pause target): a /new or newer turn that won
-        # the route while this stop awaited owns the goal now, so the delayed tail must not touch it.
+        # Fast rejection only. Warm-up and executor admission still await below, so ownership
+        # is revalidated under locks at the goal mutation, not assumed stable from here.
         if expected_session_id and session_id != expected_session_id:
             logger.info("goal stop: route %s moved to another session; skipping pause", session_key)
             return False
@@ -449,18 +449,31 @@ class GatewayGoalsMixin:
             return False
         from hermes_cli.goals import GoalManager
 
+        persistent = self._session_state(session_key).persistent
+
         def _pause() -> Optional[str]:
-            mgr = GoalManager(
-                session_id=str(session_id),
-                default_max_turns=self._goal_max_turns_from_config(),
-                min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
-            )
-            if not mgr.has_goal():
-                return None
-            if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
-                return None
-            mgr.pause(reason=_GOAL_STOP_PAUSE_REASON)
-            return mgr.state.goal
+            # Lock order: generation -> route -> goal DB (inside GoalManager). Generation claims
+            # use the same per-session lock; route replacements use the store lock. Neither can
+            # win between this final identity check and the goal write. All I/O stays off-loop.
+            with persistent.run_generation_lock, self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
+                entry = self.session_store._entries.get(session_key)
+                if entry is None or entry.session_id != session_id:
+                    return None
+                if (expected_generation is not None
+                        and persistent.run_generation != expected_generation):
+                    return None
+                mgr = GoalManager(
+                    session_id=str(session_id),
+                    default_max_turns=self._goal_max_turns_from_config(),
+                    min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
+                )
+                if not mgr.has_goal():
+                    return None
+                if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
+                    return None
+                mgr.pause(reason=_GOAL_STOP_PAUSE_REASON)
+                return mgr.state.goal
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal stop")

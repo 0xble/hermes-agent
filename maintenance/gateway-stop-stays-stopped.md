@@ -18,7 +18,11 @@ async-delegation or process-completion injection, or goal pause/revival.
   as `stop_latched` on the session's routing entry (`SessionEntry`, stored in
   the existing `gateway_routing` rows / `sessions.json`; an additive JSON field
   older releases ignore), fenced by the owning session id. After a gateway
-  restart, held completions stay held until the user sends a turn.
+  restart, held completions stay held until the user sends a turn. Completions
+  pinned to compression ancestors resolve their current conversation owner via
+  `GatewayNotificationsMixin._resolve_compression_lineage_target`, the same
+  live-tip/route-lineage resolver used by notification retargeting. A lineage
+  ending at `/new` or reset does not inherit the successor's hold.
 - The latch clears when the next turn the user sent is admitted (not internal,
   not a goal continuation, heartbeat or relayed message), both in memory and
   on disk. Held completions are then delivered as usual. `/new` and other
@@ -26,7 +30,12 @@ async-delegation or process-completion injection, or goal pause/revival.
   unlatched and a hold owned by a replaced session id never applies.
 - The goal pause runs after the stop's awaits, so the stopped session id and
   run generation are captured before the first await and the pause is skipped
-  when a concurrent `/new` or newer turn owns the route by then.
+  when a concurrent `/new` or newer turn owns the route by then. Warm-up and
+  executor admission can both yield after the early fence: recheck at the goal
+  mutation inside the executor and hold the generation and routing locks through
+  the write (lock order: per-session generation, route store, goal DB). Generation
+  claims share `PersistentState.run_generation_lock`; route replacement shares
+  `SessionStore._lock`. Neither may interleave the final check and write.
 - Between-turn `/stop` replies "Stopped" when it paused a goal, not only when
   it interrupted background delegations.
 
@@ -57,7 +66,12 @@ Upstream comparison on 2026-10-02:
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_stop_pauses_goal_and_holds_wakes.py`
-fails on the base without this patch and passes with it. Also run
+fails on the base without this patch and passes with it. The review regressions
+exercise a durable parent-id delegation after compression, stop, and a fresh
+runner; user-reset successor rejection; newer generation/route ownership at
+both warm-up and executor admission; and concurrent generation/route claims
+while the goal write is suspended. Their waits are event-based and bounded.
+Also run
 `tests/gateway/`, `tests/hermes_cli/test_goals.py`, and
 `tests/tools/test_async_delegation.py`.
 

@@ -1823,7 +1823,7 @@ class GatewayNotificationsMixin:
         gateway route. Not transactional: a crash after acceptance can replay (at-least-once).
         """
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
-        if self._completion_held_by_stop(evt):
+        if await self._completion_held_by_stop(evt):
             # Retryable, not refused: the event stays queued until the user's next turn.
             if raise_not_accepted:
                 raise WakeNotAccepted("session stopped by the user; holding the wake")
@@ -1920,8 +1920,8 @@ class GatewayNotificationsMixin:
             logger.error("Watch notification injection error: %s", e)
             return False
 
-    def _completion_held_by_stop(self, evt: dict) -> bool:
-        """True while the event's session is stopped (``/stop``) and the user has not sent a turn."""
+    async def _completion_held_by_stop(self, evt: dict) -> bool:
+        """Hold completions for their current conversation owner, including compression ancestors."""
         metadata_key = ""
         metadata_session_id = ""
         with suppress(Exception):
@@ -1929,9 +1929,40 @@ class GatewayNotificationsMixin:
             metadata_key = str(metadata.get("gateway_session_key") or "")
             metadata_session_id = str(metadata.get("gateway_session_id") or "")
         event_session_id = str(evt.get("parent_session_id") or evt.get("origin_session_id") or metadata_session_id).strip()
-        return self._user_stop_latched(
-            str(evt.get("session_key") or "").strip(), metadata_key.strip(),
-            session_ids=(event_session_id,) if event_session_id else ())
+        keys = (str(evt.get("session_key") or "").strip(), metadata_key.strip())
+        if await asyncio.to_thread(
+            self._user_stop_latched, *keys,
+            session_ids=(event_session_id,) if event_session_id else (),
+        ):
+            return True
+        session_db = getattr(self, "_session_db", None)
+        if (not event_session_id or session_db is None
+                or not await asyncio.to_thread(self._user_stop_latched, *keys)):
+            return False
+
+        def _stopped_route(key):
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
+                entry = self.session_store._entries.get(key)
+                return dataclasses.replace(entry) if entry is not None and entry.stop_latched else None
+
+        for key in keys:
+            if not key:
+                continue
+            entry = await asyncio.to_thread(_stopped_route, key)
+            if entry is None:
+                continue
+            parent = await session_db.get_session(event_session_id)
+            if not parent or not parent.get("ended_at") or parent.get("end_reason") != "compression":
+                continue
+            # Reuse the notification retargeting resolver: it verifies a LIVE compression tip
+            # and the route's lineage, rejecting /new/reset successors rather than inheriting holds.
+            target = await self._resolve_compression_lineage_target(session_db, entry, event_session_id)
+            if target and await asyncio.to_thread(
+                self._user_stop_latched, key, session_ids=(entry.session_id,),
+            ):
+                return True
+        return False
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -2182,7 +2213,7 @@ class GatewayNotificationsMixin:
         self, synth_text: str, evt: dict, *, sibling_claims=(),
     ) -> Optional[bool]:
         from gateway.wake import WakeNotAccepted
-        if self._completion_held_by_stop(evt):
+        if await self._completion_held_by_stop(evt):
             # Before any durable claim, so holding spends no delivery attempt.
             return False
         identity = self._completion_delivery_identity(evt)
@@ -2532,8 +2563,9 @@ class GatewayNotificationsMixin:
     async def _deliver_async_delegation_group_scoped(self, group: list[dict]) -> Optional[bool]:
         from gateway.run import _format_gateway_process_notification
         from tools.process_registry import process_registry as _pr
-        if any(self._completion_held_by_stop(evt) for evt in group):
-            return False  # requeued whole; no sibling claim is taken while the session is stopped
+        for evt in group:
+            if await self._completion_held_by_stop(evt):
+                return False  # requeued whole; no sibling claim is taken while the session is stopped
         # API delivery does not start a model turn, so there is nothing to coalesce.
         # Keep each unit's stable identity with its row across partial delivery/retry.
         if group and group[0].get("origin_session_id"):

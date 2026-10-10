@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 # /fast stores "priority" or None (explicit normal), so key PRESENCE decides, not truthiness.
@@ -79,6 +80,8 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
+    # Serializes generation claims with ownership-fenced executor mutations, not whole turns.
+    run_generation_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.
