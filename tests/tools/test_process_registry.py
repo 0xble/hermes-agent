@@ -319,7 +319,8 @@ def test_bounded_kill_all_closes_detached_session_when_pid_recycles_during_sweep
     session.detached = True
     session.host_start_time = 123
     registry._running[session.id] = session
-    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "running")
+    fates = iter(["running", "reused"])
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: next(fates, "reused"))
     identity_checks = iter([True, False, False, False])
     monkeypatch.setattr(
         registry,
@@ -489,18 +490,12 @@ def test_bounded_kill_all_revalidates_recycled_descendant_before_group_signal(
     monkeypatch.setattr("psutil.Process", lambda _pid: MagicMock(children=lambda recursive: [child]))
     monkeypatch.setattr(registry, "_proc_alive", lambda _proc: True)
     monkeypatch.setattr(registry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.0))
-    child_checks = 0
-
-    def host_pid_is_ours(pid, _expected):
-        nonlocal child_checks
-        if pid == 100:
-            return True
-        child_checks += 1
-        # Snapshot filter succeeds, the post-term survivor probe keeps the child
-        # eligible for escalation, and the pre-signal recheck rejects the recycle.
-        return child_checks in {1, 3}
-
-    monkeypatch.setattr(registry, "_host_pid_is_ours", host_pid_is_ours)
+    # Capture a verified child, then positively observe its PID reuse. An
+    # unreadable probe is a different fate and must remain a tracked survivor.
+    child_starts = iter([10, 20])
+    monkeypatch.setattr(registry, "_safe_host_start_time", lambda pid: 10 if pid == 100 else next(child_starts, 20))
+    monkeypatch.setattr(registry, "_is_host_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, _expected: pid == 100)
     monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: 999 if pid == 100 else pid)
     monkeypatch.setattr("tools.process_registry.os.getpgrp", lambda: 999)
     with patch("tools.process_registry.os.kill"), patch("tools.process_registry.os.killpg") as killpg:
