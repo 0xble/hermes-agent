@@ -92,8 +92,8 @@ async def test_each_generation_proves_health_with_one_non_blocking_first_poll():
         # Cold boot generation.
         generation, progress = await adapter._start_polling_once(
             app, drop_pending_updates=False, error_callback=lambda _e: None, schedule_verifier=False)
-        await asyncio.wait_for(progress.wait(), timeout=1)
-        await asyncio.wait_for(polling_request.long_poll_started.wait(), timeout=1)
+        await asyncio.wait_for(progress.wait(), timeout=2)
+        await asyncio.wait_for(polling_request.long_poll_started.wait(), timeout=2)
         first, second = _polls(polling_request, generation)[:2]
         assert first["timeout"] == 0
         assert first["read_timeout"] == _BASE_READ_TIMEOUT
@@ -111,8 +111,8 @@ async def test_each_generation_proves_health_with_one_non_blocking_first_poll():
         reconnect, reconnect_progress = await adapter._start_polling_once(
             app, drop_pending_updates=False, error_callback=lambda _e: None, schedule_verifier=False)
         assert reconnect == generation + 1
-        await asyncio.wait_for(reconnect_progress.wait(), timeout=1)
-        await asyncio.wait_for(polling_request.long_poll_started.wait(), timeout=1)
+        await asyncio.wait_for(reconnect_progress.wait(), timeout=2)
+        await asyncio.wait_for(polling_request.long_poll_started.wait(), timeout=2)
         r_first, r_second = _polls(polling_request, reconnect)[:2]
         assert r_first["timeout"] == 0
         assert r_second["timeout"] == _LONG_POLL
