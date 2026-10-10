@@ -764,9 +764,9 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
     await asyncio.gather(*tasks)
 
     with sqlite3.connect(tmp_path / "gateway-outbox.db") as db:
-        admitted = [row[0] for row in db.execute(
-            "SELECT transport_event_id FROM admissions ORDER BY created_at"
-        )]
+        admitted = sorted(row[0] for row in db.execute(
+            "SELECT transport_event_id FROM admissions"
+        ))
     assert admitted == ["resume:resume-0", "resume:resume-1"]
 
 
