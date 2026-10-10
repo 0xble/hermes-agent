@@ -26,8 +26,8 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
-    strip_trailing_silence_marker,
+    apply_agent_origin_reply_expectation, display_kind_for_event, is_machinery_display_kind,
+    reply_expected_metadata, silence_allowed, strip_trailing_silence_marker,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -48,6 +48,14 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _eventless_followup_reply_expected(text: Any) -> bool:
+    """Derive the reply contract from leftover text when no event object survived the drain."""
+    event = MessageEvent(text=str(text), reply_expected=None)
+    apply_agent_origin_reply_expectation(event)
+    return event.reply_expected if event.reply_expected is not None else True
+
 
 _tool_call_logger_lock = threading.Lock()
 
@@ -2331,7 +2339,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
-                channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
+                channel_prompt=_turn_channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
                 persist_user_message=prepared.persist_user_message,
@@ -4009,7 +4017,8 @@ class GatewayTurnMixin:
                         )
                     else:
                         adapter.queue_message(
-                            session_key, pending, reply_expected=True,
+                            session_key, pending,
+                            reply_expected=_eventless_followup_reply_expected(pending),
                             internal=False, metadata={},
                         )
                 except TypeError:
@@ -4025,7 +4034,7 @@ class GatewayTurnMixin:
                 from gateway.platforms.base import MessageEvent, MessageType
                 deferred = pending_event or MessageEvent(
                     text=str(pending), message_type=MessageType.TEXT, source=source,
-                    internal=False, reply_expected=True,
+                    internal=False, reply_expected=_eventless_followup_reply_expected(pending),
                     metadata={},
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
@@ -4055,10 +4064,13 @@ class GatewayTurnMixin:
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
-        # A pending event is authoritative. Without one, the only remaining
-        # follow-up text is an interrupt/steer payload; default it to human
-        # provenance rather than inheriting a prior internal goal tick.
-        next_reply_expected = pending_event.reply_expected if pending_event is not None else True
+        # A pending event is authoritative. Without one, derive the contract from the leftover
+        # text: an agent-origin relay remains silent, while plain steer/interrupt text replies.
+        next_reply_expected = (
+            pending_event.reply_expected
+            if pending_event is not None
+            else _eventless_followup_reply_expected(pending)
+        )
         if (
             pending_event is not None
             and isinstance(getattr(pending_event, "metadata", None), dict)
@@ -4149,9 +4161,6 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
-                internal=pending_event.internal if pending_event is not None else False,
-                event_metadata=dict(
-                    (pending_event.metadata if pending_event is not None else {}) or {}),
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
                 persist_user_display_kind=next_display_kind,
@@ -4506,8 +4515,7 @@ class GatewayTurnMixin:
         source: SessionSource, session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        channel_prompt: Optional[str] = None, internal: bool = False, event_metadata: Optional[dict] = None,
-        moa_config: Optional[dict] = None,
+        channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
@@ -4547,7 +4555,6 @@ class GatewayTurnMixin:
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
-            internal=internal, event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,

@@ -133,8 +133,7 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
     with pytest.raises(_TurnContextBuilt):
         await runner._run_agent_inner(
             message="initial turn", context_prompt="", history=[], source=src,
-            session_id=entry.session_id, session_key=key, internal=True,
-            event_metadata=metadata, reply_expected=False,
+            session_id=entry.session_id, session_key=key, reply_expected=False,
         )
 
     expected_internal = True
@@ -178,8 +177,6 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
         ctx, adapter, "requeued turn", requeued_event, response=result, result=result, stream_task=None,
     )
     event = queued[0] if defer == "depth-cap" else adapter._pending_messages[key]
-    assert ctx.internal is expected_internal
-    assert ctx.event_metadata == expected_metadata
     expected_reply_expected = False if expected_internal else True
     assert ctx.reply_expected is expected_reply_expected
     assert event.internal is expected_internal
@@ -190,14 +187,23 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("origin", ["steer", "interrupt"])
 @pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
-async def test_eventless_human_followup_after_goal_tick_requeues_as_human(hermes_home, origin, defer):
-    """A person's leftover text must never acquire the completed goal tick's silence contract."""
+@pytest.mark.parametrize(
+    ("text", "expected_reply_expected"),
+    [
+        ("please show me the current status", True),
+        ("[relay from=agent:source receipt=r1]\nNO_REPLY", False),
+    ],
+    ids=("human", "agent-origin-relay"),
+)
+async def test_eventless_followup_requeues_with_its_own_reply_contract(
+    hermes_home, origin, defer, text, expected_reply_expected
+):
+    """Eventless leftover text keeps human defaults but derives relay silence from its header."""
     from gateway.response_filters import display_kind_for_event
     from gateway.turn_context import TurnContext
 
     runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
     runner._draining = False
-    text = "please show me the current status"
     result: dict[str, object] = {"messages": []}
     if origin == "interrupt":
         result.update(interrupted=True, interrupt_message=text)
@@ -208,8 +214,7 @@ async def test_eventless_human_followup_after_goal_tick_requeues_as_human(hermes
     assert pending == text
 
     ctx = TurnContext(
-        source=src, session_id=entry.session_id, session_key=key, internal=True,
-        event_metadata={"goal_continuation": True, "origin": "goal-tick"}, reply_expected=False,
+        source=src, session_id=entry.session_id, session_key=key, reply_expected=False,
     )
     if defer == "depth-cap":
         ctx._interrupt_depth = runner._MAX_INTERRUPT_DEPTH
@@ -229,9 +234,9 @@ async def test_eventless_human_followup_after_goal_tick_requeues_as_human(hermes
     assert queued.text == text
     assert queued.internal is False
     assert queued.metadata == {}
-    assert queued.reply_expected is True
+    assert queued.reply_expected is expected_reply_expected
     # Exercise the real second drain and the predicate used by final delivery.
     drained, drained_text = await runner._run_agent_drain_pending(completed, adapter, src, key)
     assert drained is queued
     assert drained_text == text
-    assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is False
+    assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is (not expected_reply_expected)
