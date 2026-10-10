@@ -106,7 +106,7 @@ def _head_containing(git_cmd, cwd, commit: str, repository: str) -> str | None:
     def run(*args):
         return subprocess.run(
             [*git_cmd, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env())
+            errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env(), check=False)
 
     head = run("rev-parse", "HEAD").stdout.strip()
     if not _SHA.fullmatch(head):
