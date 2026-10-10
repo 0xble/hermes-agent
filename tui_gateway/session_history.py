@@ -337,6 +337,11 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)
         if not content_text.strip() and not has_assistant_detail:
             continue
+        if role == "assistant":
+            # Display projection only: stored context keeps its markers, the reader sees the
+            # block bodies in place, exactly as the live reply rendered them.
+            from gateway.copy_blocks import render_copy_blocks_inline
+            content_text = render_copy_blocks_inline(content_text)
         msg = {"role": role, "text": content_text}
         # Authoring time (Unix seconds) for display.timestamps; display-only.
         # Display-only: never fed back into model context. See #41531.

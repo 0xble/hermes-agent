@@ -918,11 +918,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     run_id, loop = run.run_id, asyncio.get_running_loop()
     _run_started_at = time.perf_counter()
 
+    from gateway.copy_blocks import CopyMarkerStreamFilter, render_copy_blocks_inline
+    copy_filter = CopyMarkerStreamFilter()
+
     def _text_cb(delta: Optional[str]) -> None:
-        if delta is None or run_id not in self._run_streams:
+        if delta is None:
+            copy_filter.message_boundary()  # a new assistant message starts at a line start
+            return
+        if run_id not in self._run_streams:
+            return
+        filtered = copy_filter.feed(delta)
+        if not filtered:
             return
         with suppress(Exception):
-            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=delta))
+            loop.call_soon_threadsafe(run.put_event, _run_event(run_id, "message.delta", delta=filtered))
 
     def _interim_cb(text: str, *, already_streamed: bool = False) -> None:
         # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls),
@@ -932,7 +941,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         with suppress(Exception):
             loop.call_soon_threadsafe(run.put_event, _run_event(
-                run_id, "message.interim", text=text, already_streamed=bool(already_streamed)))
+                run_id, "message.interim", text=render_copy_blocks_inline(text),
+                already_streamed=bool(already_streamed)))
 
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
@@ -970,6 +980,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
+        trailing = copy_filter.flush()
+        if trailing and run_id in self._run_streams:
+            with suppress(Exception):
+                loop.call_soon(run.put_event, _run_event(run_id, "message.delta", delta=trailing))
         if status == "cancelled":
             _finish("cancelled", fields)
         elif result.get("failed"):
@@ -983,7 +997,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 runtime=served_runtime, requested_runtime=requested if any(requested.values()) else None,
                 route_source=("model_routes" if run.agent_kwargs.get("route")
                               else "raw_request" if any(requested.values()) else "global"))
-            _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
+            _finish(status, fields, output=render_copy_blocks_inline(result.get("final_response", "")), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
