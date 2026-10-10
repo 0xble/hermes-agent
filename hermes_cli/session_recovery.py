@@ -35,12 +35,36 @@ def _init_delivery_ledger_schema(conn: sqlite3.Connection) -> None:
     _initialize_schema(conn)
 
 
+def _init_async_delegation_events_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS async_delegation_events (
+            event_id TEXT PRIMARY KEY,
+            delegation_id TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            result_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            delivered_at REAL,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_async_delegation_events_delivery
+            ON async_delegation_events(delivery_state, updated_at);
+        """
+    )
+
+
 # state.db tables created lazily by a gateway module (base ``SessionDB`` never creates them on a fresh
 # destination) -> the initializer owning their DDL. Recovery creates them before copying so owed rows
 # don't silently vanish from a "complete" salvage. Register new lazy tables HERE, not as ``if table ==``.
 # See #100313, #86236.
 _AUXILIARY_TABLE_SCHEMAS: dict[str, Callable[[sqlite3.Connection], None]] = {
     "delivery_obligations": _init_delivery_ledger_schema,
+    "async_delegation_events": _init_async_delegation_events_schema,
 }
 _AUXILIARY_TABLES = tuple(_AUXILIARY_TABLE_SCHEMAS)
 _INVENTORY_TABLES = (*_CANONICAL_TABLES, "state_meta", *_TOPIC_TABLES, *_AUXILIARY_TABLES)
