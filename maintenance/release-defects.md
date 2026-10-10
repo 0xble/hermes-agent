@@ -8,7 +8,7 @@ snapshot pin, memory-provider config cloning, `/update` reporting, deferred slas
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
 session lifecycle, the alias-cache isolation guard, gateway orphan-reaper
-home scoping, and per-run cron terminal isolation.
+home scoping, per-run cron terminal isolation, and gateway subcommand exit codes.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -683,3 +683,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - Fork patch identity: `pm-shipped-extras`.
 - When a release payload had shipped optional dependencies but PM had no facts or frozen feature inventory yet, the first on-demand extra sync selected only the requested extra and replaced the payload environment. Infer concrete shipped extras from the payload's site-packages before creating the first PM generation, while excluding umbrella aliases that share anchors with their member extras.
 - Guard: `tests/pm/test_environment_build.py` (`test_first_on_demand_extra_preserves_payload_extras`).
+
+## Gateway Subcommand Exit Codes
+
+- Fork patch identity: `gateway-cli-exit-code`.
+- `gateway_command` returns the subcommand handler's result, and the fork's `gateway update` and `gateway guardian` handlers report failure as a non-zero int, but `cmd_gateway` discarded it. A rejected update reason or a failed guardian run therefore exited 0, so shell callers, cron and launchd saw success. `cmd_gateway` now returns the result to `main()`, which exits with a non-zero int and treats `None` or 0 as success.
+- Upstream status: `upstream/main` drops the result the same way, but none of its gateway handlers return an int, so the defect is only observable through the fork's subcommands.
+- Guard: `tests/hermes_cli/test_gateway_exit_code.py`.

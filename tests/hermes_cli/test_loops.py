@@ -365,6 +365,32 @@ class TestTickLifecycle:
         assert "one or two short lines" in wakeup
         assert "Report concisely what you found" not in wakeup
 
+    def test_loop_reply_rules_keep_goal_silence_but_not_goal_evidence(self, hermes_home):
+        """Loop wakeups share the goal contract's no-change silence paragraph verbatim, but a
+        visible loop reply, including the completing one, stays one or two short lines with no
+        Evidence section. Goal continuations keep their own done-with-evidence wording."""
+        from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE, _AUTONOMOUS_REPLY_RULES
+        from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE
+
+        silence = _AUTONOMOUS_REPLY_RULES.split("\n", 1)[0]
+        assert "Claiming done (with an Evidence section)" in CONTINUATION_PROMPT_TEMPLATE
+        for template in (WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE):
+            assert silence + "\n" in template
+            assert "Evidence section)" not in template
+            assert "with the evidence" not in template
+            assert "No Evidence section" in template
+            assert "say so in the same one or two short lines, then put LOOP_COMPLETE on its own line" in template
+
+    def test_every_stored_wakeup_wording_is_still_a_quiet_wakeup(self, hermes_home):
+        import hermes_cli.loops as loops
+
+        fields = {"tick": 3, "cadence": ", every 5m", "prompt": "check CI", "until": "CI is green"}
+        for name in ("_ORIGINAL_WAKEUP_PROMPT_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
+                     "_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE"):
+            for suffix in ("", "_WITH_UNTIL"):
+                template = getattr(loops, name.replace("_PROMPT_TEMPLATE", f"_PROMPT{suffix}_TEMPLATE"))
+                assert loops.is_quiet_wakeup_prompt(template.format(**fields)), name + suffix
+
     def test_until_wakeup_prompt_no_longer_demands_evidence_every_tick(self, hermes_home):
         from hermes_cli.loops import LoopManager
 

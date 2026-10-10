@@ -1950,12 +1950,12 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
-    """Chain exhausted (always False). A non-empty chain walked on a non-rate-limit failure arms a
-    short cooldown so next turn's restore_primary_runtime stays gated instead of replaying the whole
-    context across every provider again."""
-    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-    if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
+def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
+    """Chain exhausted (always False). A non-empty chain walked without an armed primary cooldown
+    arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
+    whole context across every provider again. A rate limit or overload from an active fallback
+    arms nothing shared, so it still gets this short window."""
+    if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
     return False
@@ -2119,8 +2119,8 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
     announced. Missing shared state (a failed write) or a move to a different model than the
     one announced keeps a notice.
     """
-    from agent.fallback_cooldown import _RATE_LIMIT_FAILOVER_REASONS
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return True, None
     if shared_adoption:
         return False, None  # one notice per outage: another session already announced it
@@ -2135,9 +2135,10 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
         if claim_outage_notice(route, outage_id, fallback=target):
             try:
                 reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
-            except (KeyError, TypeError, ValueError, OSError):
+            except (KeyError, TypeError, ValueError, OSError, OverflowError):
                 reset_label = "the cooldown expiry"
-            return False, f"⚠️ {old_model} is rate-limited until {reset_label}; using {fb_model} via {fb_provider} until then."
+            state = "overloaded" if record.get("reason") == FailoverReason.overloaded.value else "rate-limited"
+            return False, f"⚠️ {old_model} is {state} until {reset_label}; using {fb_model} via {fb_provider} until then."
         if announced_fallback(route, outage_id) == target:
             return False, None
     except Exception:
@@ -2170,7 +2171,7 @@ def try_activate_fallback(
         cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
-            return _fallback_chain_exhausted(agent, reason)
+            return _fallback_chain_exhausted(agent, reason, cooldown_armed=cooldown_seconds is not None)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)

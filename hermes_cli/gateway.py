@@ -8,6 +8,7 @@ import contextlib
 from hermes_cli.cli_output import line_input  # noqa: F401 — resolved lazily by siblings through the facade
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -3408,7 +3409,9 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         _append_node_dir_for_service(path_entries)
 
     # TimeoutStopSec must cover the full stop budget (cron drain + cleanup) or systemd SIGKILLs mid-drain.
-    restart_timeout = resolve_systemd_timeout_stop_sec(_get_restart_drain_timeout(), _get_cron_drain_timeout())
+    # An unbounded drain budget resolves to math.inf; systemd spells that "infinity" and rejects "inf".
+    stop_budget = resolve_systemd_timeout_stop_sec(_get_restart_drain_timeout(), _get_cron_drain_timeout())
+    restart_timeout = stop_budget if math.isfinite(stop_budget) else "infinity"
 
     if system:
         username, group_name, home_dir, uid = _system_service_identity(run_as_user)

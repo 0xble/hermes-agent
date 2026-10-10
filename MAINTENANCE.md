@@ -140,6 +140,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
+| Proactive tool-result prune default | Enable the existing deterministic no-LLM tool-result prune at 48000 tokens while protecting the recent tail | `compression.proactive_prune_tokens`, its config/docs, and proactive-prune regressions | [Proactive tool-result prune default](maintenance/proactive-tool-result-prune.md) |
 
 ## Active patch record: relay silence (S1)
 
@@ -206,9 +207,9 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: shared primary cooldown
 
 - **Patch identity:** `shared-primary-cooldown`.
-- **Behavior:** A primary route that is rate-limited, billing-limited, or upstream-rate-limited writes an atomic, file-locked cooldown under `$HERMES_HOME/state/model_cooldowns.json`. Fresh agents adopt the configured fallback without calling the primary while the shared record is active. One process claims the outage notice; one successful primary response clears the record and emits the recovery notice.
+- **Behavior:** A primary route that is rate-limited, billing-limited, upstream-rate-limited, or overloaded (`FailoverReason.overloaded`, chiefly HTTP 529 and 503) writes an atomic, file-locked cooldown under `$HERMES_HOME/state/model_cooldowns.json`. Fresh agents adopt the configured fallback without calling the primary while the shared record is active. One process claims the outage notice; one successful primary response clears the record and emits the recovery notice. Generic 5xx and timeouts do not arm. Records with a non-finite `reset_at` or `recorded_at` are malformed and pruned.
 - **Source surfaces:** `agent/shared_primary_cooldown.py`, `agent/fallback_cooldown.py`, `agent/agent_runtime_helpers.py`, `agent/chat_completion_helpers.py`, `agent/chat_completion_nonstream.py`, and `hermes_cli/fallback_cmd.py`.
-- **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py tests/hermes_cli/test_fallback_cmd.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py` (three `PROBE_OK` lines).
 - **Retirement:** Remove when upstream provides equivalent shared cooldown, fresh-agent adoption, notice ownership, recovery clearing, and CLI status/clear controls.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shared-primary-cooldown`.
 
@@ -232,6 +233,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream spools and restores the internal flag and `reply_expected` for every queued event.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-turn-contract`.
 
+## Active patch record: proactive tool-result prune default
+
+- **Patch identity:** `proactive-tool-result-prune-default`.
+- **Behavior:** Enable the existing deterministic no-LLM tool-result prune by default at `compression.proactive_prune_tokens: 48000`; retain the 8000-character eligibility floor, 4096-token minimum reclaim gate, and recent-tail protection. `0` remains the explicit opt-out.
+- **Source surfaces:** `hermes_cli/config_defaults.py`, `agent/agent_init.py` configuration attachment (unchanged), `website/docs/user-guide/configuration.md`, and proactive-prune regression tests.
+- **Upstream status:** The pruning implementation is already present upstream, but upstream retains a zero default; no equivalent nonzero default was found during preflight.
+- **Focused regression:** `python -m pytest -q tests/agent/test_proactive_prune_config.py tests/agent/test_proactive_tool_result_pruning.py tests/agent/test_proactive_prune_rearm_threshold.py tests/agent/test_proactive_prune_loop_wiring.py`.
+- **Retirement:** Remove the fork-only default, documentation, and default-specific regression when released upstream enables an equivalent nonzero default with the same tail protection and reclaim gating.
+- **Rollback:** Revert the commit carrying `Fork-Patch: proactive-tool-result-prune-default`.
+
 ## Active patch record: state.db compaction at next gateway start
 
 - **Patch identity:** `state-db-compact-at-start`.
@@ -242,6 +253,26 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_compact_at_next_start.py tests/hermes_cli/test_sessions_held_store_gate.py tests/hermes_state/test_auto_vacuum_holder_gate.py tests/hermes_state/test_startup_maintenance_lease.py`.
 - **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
 - **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
+
+## Active patch record: shutdown spool fidelity
+
+- **Patch identity:** `shutdown-spool-fidelity`.
+- **Behavior:** a queued caption-less attachment (image, voice, file) is spooled and recovered: flush and recovery both reject only slots with neither text nor `media_urls`/`media`, and the transcript-append fallback writes the gateway's media placeholder when text is empty. Every spooled `MessageEvent` also keeps `message_type`, `media_text_inlined`, `reply_to_text`, `reply_to_author_id`, `reply_to_author_name`, and `reply_to_is_own_message`, and startup replay restores them, so a queued reply keeps its quoted context and voice/audio/document routing and text-inlining replay as they arrived. Old spool files without these keys recover as before (TEXT, no reply context).
+- **Source surfaces:** `gateway/shutdown_flush.py` (`has_user_content`, `_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Upstream status:** upstream v0.21.6 (`818c13be`) writes media-only events but its recovery still rejects empty text, so they stay spooled forever; it also drops reply context, `media_text_inlined`, and `message_type`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Retirement:** Remove when upstream spools and replays media-only events and reply context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-fidelity`.
+
+## Active patch record: release-owned config writes
+
+- **Patch identity:** `release-owned-config-writes`.
+- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. Agent-authored edits through the file tool are out of scope: they never stamp a schema. The refusal names the config path, running root and schema, live release and schema, and the live release directory whose hermes to run.
+- **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` `_atomic_write` (the primitive under every atomic config.yaml writer), `hermes_cli/config.py` `_write_config_state` (refuses before read-back checks), `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
 
 ## Update
 

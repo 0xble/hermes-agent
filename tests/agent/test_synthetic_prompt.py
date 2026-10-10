@@ -295,17 +295,21 @@ def test_crafted_near_miss_is_classified_in_linear_time(module_name, template_na
 @pytest.mark.parametrize("module_name,template_name,fields", [
     ("hermes_cli.heartbeat", "HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
     ("hermes_cli.heartbeat", "_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "WAKEUP_PROMPT_TEMPLATE", {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
-    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
+    *[("hermes_cli.loops", name, {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}) for name in (
+        "WAKEUP_PROMPT_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
+        "_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE",
+        "_ORIGINAL_WAKEUP_PROMPT_TEMPLATE",
+    )],
+    *[("hermes_cli.loops", name, {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"})
+      for name in (
+        "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+        "_SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+        "_ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+    )],
 ])
-def test_current_and_pre_silence_wakeup_wording_stay_generated(module_name, template_name, fields):
-    """Stored heartbeat and /loop rows rendered before the [SILENT] contract have no display_kind,
-    so their old wording must still classify as generated or memory would ingest it as user text."""
+def test_current_and_earlier_wakeup_wording_stay_generated(module_name, template_name, fields):
+    """Stored heartbeat and /loop rows rendered with any earlier wording have no display_kind,
+    so their wording must still classify as generated or memory would ingest it as user text."""
     import importlib
 
     from agent.synthetic_prompt import text_after_generated_prefix
