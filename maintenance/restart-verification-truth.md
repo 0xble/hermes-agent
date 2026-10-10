@@ -9,11 +9,14 @@ Load when changing updater fleet restart snapshots, gateway restart observer dea
 - Intentional infinite chat or cron drain yields an infinite observer budget rather
   than crashing during integer conversion. CLI progress formatting accepts that budget.
   The upstream #124009 fix is adopted while retaining the fork's delegation deferral.
+- The stop envelope keeps `math.inf` for numeric callers. The systemd unit writer
+  spells it `TimeoutStopSec=infinity`, since systemd rejects Python's `inf`; finite
+  envelopes stay integer seconds.
 - A saved pending marker or failed receipt is historical evidence of an unresolved obligation, not proof of the current fleet's state. The warning names the obligation and suggests `hermes update --plan`, with a conditional update if stale. Marker generation, conservative retention, live verification, and receipt fallback stay unchanged. A plan is not exhaustive proof of every possible holder.
 
 ## Provenance and verification
 
-Fork patch identity: `restart-verification-truth`.
+Fork patch identities: `restart-verification-truth`, `systemd-infinite-stop-timeout` (unit spelling of an unbounded stop envelope).
 Archived HERMES-138 (`runtime-lifecycle.md`, archived fork): cron observer budget, outgoing PID identity and historical warning. On `origin/main` `649e2585bdf7`, two new focused tests failed RED: configured cron drain returned 50 seconds rather than covering a 90-second cron plus deferral, and the startup warning asserted "did not restart running gateways". A third test on the same base showed an outgoing gateway PID `17178` inventoried over its socket omitted from the updater's verification snapshot because the process scan excludes ancestors. The collector then missed that stopped gateway's down row.
 
 Upstream contributions: [#123878](https://github.com/NousResearch/hermes-agent/pull/123878) (cron stop envelope and warning) and [#123893](https://github.com/NousResearch/hermes-agent/pull/123893) (outgoing inventory identity), both against upstream main. As of 2026-09-26, #123878 is closed after its changes were merged through [#124009](https://github.com/NousResearch/hermes-agent/pull/124009), which additionally fixes infinite cron timeout handling. #123893 remains open. Fork adaptation preserves its additional delegation deferral and reconciles existing fork assertions.

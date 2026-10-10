@@ -156,12 +156,13 @@ def test_current_updater_entrypoints_declare_the_handoff_sentinel():
     # hermes_cli.main probes the checkout's payload manifest, which the
     # in-process home-I/O guard refuses for worktrees under ~/.hermes.
     code = (
+        "import inspect\n"
         "from hermes_cli import main as hermes_main\n"
         "from hermes_cli import update_cmd\n"
         "print('_hermes_current_updater_frame' in "
         "update_cmd._cmd_update_impl.__code__.co_varnames)\n"
         "print('_hermes_current_updater_frame' in "
-        "hermes_main.cmd_update.__wrapped__.__code__.co_varnames)\n"
+        "inspect.unwrap(hermes_main.cmd_update).__code__.co_varnames)\n"
     )
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True,

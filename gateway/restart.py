@@ -348,12 +348,13 @@ def resolve_systemd_timeout_stop_sec(
     drain_timeout: float, cron_drain_timeout: float = DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, *,
     cleanup_reserve_s: float = CRON_DRAIN_CLEANUP_RESERVE_S, headroom_s: float = SYSTEMD_STOP_HEADROOM_S,
     floor_s: float = SYSTEMD_TIMEOUT_STOP_SEC_FLOOR,
-) -> int:
+) -> int | float:
     """Seconds systemd ``TimeoutStopSec`` must cover: the stop path may first wait
     ``cron_drain_timeout`` + ``cleanup_reserve_s`` for cron work, so sizing from the chat drain
     alone lets systemd SIGKILL an in-budget drain.  A zero cron timeout is an opt-out.
 
     ``restart_drain_timeout`` is only the chat-turn interrupt budget (default 0). See #94759.
+    ``math.inf`` when either budget is unbounded; unit writers must spell that ``infinity``.
     """
     drain = _seconds(drain_timeout)
     cron = _seconds(cron_drain_timeout)

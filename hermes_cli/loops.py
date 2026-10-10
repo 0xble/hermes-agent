@@ -47,7 +47,20 @@ _INTERVAL_TOKEN_RE = re.compile(
 WAKEUP_PROMPT_PREFIX = "[/loop wakeup #"
 # Shared wakeup contract. A wakeup is machinery, not a conversation: the user hears from the loop
 # only when something new needs them, so a no-change tick ends with the bare silence marker.
-_WAKEUP_REPLY_RULES = _AUTONOMOUS_REPLY_RULES
+# The silence paragraph is the goal contract's verbatim. Its update and done wording is goal
+# specific (a goal claims done with an Evidence section), so loops carry their own: every visible
+# loop reply, including the completing one, is one or two short lines.
+_WAKEUP_SILENCE_RULE = _AUTONOMOUS_REPLY_RULES.split("\n", 1)[0] + "\n"
+_WAKEUP_REPLY_RULES = (
+    _WAKEUP_SILENCE_RULE
+    + "When something changed, reply in one or two short lines: the new fact, and the user's "
+    "needed action if any. No Evidence section, recap, or notes on what you did not do. Being "
+    "blocked or needing input still requires a visible reply.\n"
+)
+_WAKEUP_DONE_REPLY = (
+    "say so in the same one or two short lines, then put "
+    f"{LOOP_COMPLETE_MARKER} on its own line; that stops the loop. "
+)
 _WAKEUP_REVISE_RULE = (
     "If the cadence, run count, or stop condition no longer fits, revise the loop with the "
     "loop_set tool (action=revise) instead of stopping it."
@@ -58,8 +71,8 @@ WAKEUP_PROMPT_TEMPLATE = (
     "This is an automatic wakeup from the /loop. "
     + _WAKEUP_REPLY_RULES
     + "If the task is complete, no longer applicable, or the thing you were watching has "
-    f"finished, say so briefly with the evidence and end with {LOOP_COMPLETE_MARKER} on its own "
-    "line; that stops the loop. "
+    "finished, "
+    + _WAKEUP_DONE_REPLY
     + _WAKEUP_REVISE_RULE
 )
 
@@ -69,13 +82,83 @@ WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
     "Stop condition: {until}\n\n"
     "This is an automatic wakeup from the /loop. "
     + _WAKEUP_REPLY_RULES
-    + "If the stop condition is met, or the task is no longer applicable, say so briefly with "
-    f"the evidence and end with {LOOP_COMPLETE_MARKER} on its own line; that stops the loop. "
+    + "If the stop condition is met, or the task is no longer applicable, "
+    + _WAKEUP_DONE_REPLY
     + _WAKEUP_REVISE_RULE
 )
 
-# Wording before the silence contract. Stored rows still carry it, so the generated-turn
-# classifier (agent/synthetic_prompt.py) keeps recognizing it; never render these.
+# Earlier wordings. Stored rows still carry them and legacy rows have no display_kind, so the
+# generated-turn classifier (agent/synthetic_prompt.py) keeps recognizing every one; never render
+# these. Each pair is (no-until, with-until), oldest first after the pre-silence pair below.
+_SILENCE_CONTRACT_WAKEUP_REPLY_RULES = (
+    "Check the CURRENT state now; re-check fresh and assume nothing from earlier wakeups. "
+    "If nothing new and material happened since your last visible update and nothing needs the "
+    f"user's action, reply with exactly {SILENCE_MARKER} and nothing else. That includes plain "
+    "acknowledgements and anything that changes nothing for the user. Never send status like "
+    "\"still waiting\", \"nothing new\", or what you did not do.\n"
+    "If something did change, reply in one or two short lines with only the new fact or the "
+    "action the user needs to take.\n"
+)
+
+
+def _evidence_wakeup_templates(reply_rules: str) -> Tuple[str, str]:
+    return (
+        f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+        "Recurring task: {prompt}\n\n"
+        "This is an automatic wakeup from the /loop. "
+        + reply_rules
+        + "If the task is complete, no longer applicable, or the thing you were watching has "
+        f"finished, say so briefly with the evidence and end with {LOOP_COMPLETE_MARKER} on its own "
+        "line; that stops the loop. "
+        + _WAKEUP_REVISE_RULE,
+        f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+        "Recurring task: {prompt}\n\n"
+        "Stop condition: {until}\n\n"
+        "This is an automatic wakeup from the /loop. "
+        + reply_rules
+        + "If the stop condition is met, or the task is no longer applicable, say so briefly with "
+        f"the evidence and end with {LOOP_COMPLETE_MARKER} on its own line; that stops the loop. "
+        + _WAKEUP_REVISE_RULE,
+    )
+
+
+# The first silence-contract wording, then the wording shared verbatim with goal continuations.
+(
+    _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE,
+    _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
+) = _evidence_wakeup_templates(_SILENCE_CONTRACT_WAKEUP_REPLY_RULES)
+(
+    _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE,
+    _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
+) = _evidence_wakeup_templates(_AUTONOMOUS_REPLY_RULES)
+
+# The original wording, before loop revisions added the revise sentence.
+_ORIGINAL_WAKEUP_PROMPT_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "task now against the CURRENT state (re-check files, processes, or "
+    "services fresh — do not assume anything from earlier iterations still "
+    "holds). Report concisely what you found or did this iteration.\n"
+    "If the task is now complete, no longer applicable, or the thing you "
+    "were watching has finished, say so and end your reply with "
+    f"{LOOP_COMPLETE_MARKER} on its own line — that stops the loop."
+)
+_ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE = (
+    f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
+    "Recurring task: {prompt}\n\n"
+    "Stop condition: {until}\n\n"
+    "This is an automatic wakeup from the /loop the user set. Perform the "
+    "task now against the CURRENT state (re-check files, processes, or "
+    "services fresh — do not assume anything from earlier iterations still "
+    "holds). Report concisely what you found or did this iteration, and "
+    "show concrete evidence of the stop condition's status.\n"
+    "If the stop condition is met, or the task is no longer applicable, say "
+    f"so and end your reply with {LOOP_COMPLETE_MARKER} on its own line — "
+    "that stops the loop."
+)
+
+# Wording before the silence contract.
 _PREVIOUS_WAKEUP_PROMPT_TEMPLATE = (
     f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
     "Recurring task: {prompt}\n\n"

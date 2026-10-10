@@ -614,12 +614,12 @@ DEFAULT_CONFIG = {
         # max_attempts: retry rounds before a turn gives up with "max compression attempts reached".
         # Raise (e.g. 6) for tool-schema-heavy sessions. Validated >= 1, cap 10.
         "max_attempts": 3,
-        # proactive_prune_tokens: opt-in trigger (tokens) for the deterministic no-LLM tool-result
+        # proactive_prune_tokens: default trigger (tokens) for the deterministic no-LLM tool-result
         # prune, independent of `threshold` (which rarely fires on large windows, so old tool output
-        # is re-sent every turn); e.g. 48000 reclaims early. 0 = off. Tail protected by
+        # is re-sent every turn). 48000 reclaims early; set 0 to disable. Tail protected by
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
         # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
-        "proactive_prune_tokens": 0,
+        "proactive_prune_tokens": 48000,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,

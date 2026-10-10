@@ -6,8 +6,10 @@ This maintenance unit owns the fork patch identity `shared-primary-cooldown`.
 
 ## Required behavior
 
-A rate-limited, billing-limited, or upstream-rate-limited primary route records its
-wall-clock cooldown under `$HERMES_HOME/state/model_cooldowns.json`. New agents,
+A rate-limited, billing-limited, upstream-rate-limited, or overloaded primary route
+records its wall-clock cooldown under `$HERMES_HOME/state/model_cooldowns.json`. The
+arming set is `_SHARED_COOLDOWN_REASONS` in `agent/fallback_cooldown.py`; the writer,
+the outage notice and the chain-exhaustion guard all read it. New agents,
 subagents, cron runs, and gateway-created agents adopt the first configured fallback
 without retrying the primary while that record is active. The outage notice is
 atomically claimed once per outage; the recovery notice is emitted only after a
@@ -23,6 +25,24 @@ start. While the record is active, the agent stays on the fallback and its in-me
 deadline follows the record, so a longer window that another process re-armed wins.
 Restore only proceeds once the shared window has passed or the record is gone, and
 restore never rewrites the record.
+
+Overload (`FailoverReason.overloaded`: HTTP 529 or 503 unless the body reads as context
+overflow, any 5xx or 400 whose body names a local memory ceiling, a 429 with overload
+wording, a status-less overload message, Gemini `unavailable`, and 403
+`upstream_unavailable`) arms exactly like a rate limit. A `Retry-After` on the overload response is the
+provider reset; without one the shared no-reset backoff applies. The record's `reason`
+is `overloaded`, so `hermes fallback status` shows it and the outage notice reads
+"is overloaded until HH:MM". Generic 500/502 (`server_error`), timeouts and connection
+errors do not arm; they keep the per-session retry, the generic fallback notice and the
+short chain-exhaustion cooldown. `switch_deferred_by_reset` still applies only to rate
+limits.
+
+Readers treat a record whose `reset_at` or `recorded_at` is not a finite number (NaN,
+±Infinity, junk), or whose `reset_at` is more than 31 days out, as malformed and prune it.
+`arm_cooldown` ignores such a provider reset and falls back to the shared backoff. The
+31-day ceiling admits weekly and monthly usage caps. `hermes fallback status` prints
+`unknown` for a reset it cannot format instead of raising. A corrupted state file
+therefore cannot pin a route forever or crash the status listing.
 
 A 429 that arrives while the record is still active came from a request already in
 flight before the outage was recorded, not from a fresh probe. It keeps the current
@@ -61,12 +81,16 @@ which finds no record and lets the agent retry the primary.
   non-streaming and `direct_api_call` wrappers, and notice-retention tests. It also covers a
   cross-process regression (a cached fallback agent must honor a longer window that another
   process re-armed), stale-outage grace and pruning, the stranded fallback index, and exact
-  clearing that reaches a cached agent at its next turn.
+  clearing that reaches a cached agent at its next turn. Overload cases cover 529 with
+  Retry-After and 503 without it through `run_conversation`, in-flight versus lapsed
+  overload backoff, non-arming 500 and timeout, and non-finite record pruning.
 - `tests/hermes_cli/test_fallback_cmd.py`: the `cooldowns` list and clear surface, plus `clear`
-  keeping its chain meaning.
-- `tests/agent/_shared_cooldown_stub.py`: loopback OpenAI-compatible stub and child runner.
+  keeping its chain meaning, and `status` on a non-finite record.
+- `tests/agent/_shared_cooldown_stub.py`: loopback OpenAI-compatible stub and child runner;
+  `failure_status` selects 429, 529, 503 (overload body) or 500.
 - `evals/provider_fallback/probe_shared_primary_cooldown.py`: isolated multi-process E2E; every turn
-  runs through `run_conversation`. A pass prints two `PROBE_OK:` lines.
+  runs through `run_conversation`. A pass prints three `PROBE_OK:` lines; the third is the 529
+  overload phase.
 
 ## Upstream status
 

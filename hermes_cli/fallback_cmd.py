@@ -246,8 +246,11 @@ def cmd_fallback_status(args) -> None:  # noqa: ARG001
         return
     print("  Shared primary-model cooldowns:\n")
     for record in records:
-        reset_at = float(record.get("reset_at", 0) or 0)
-        reset = datetime.fromtimestamp(reset_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        try:
+            reset_at = float(record.get("reset_at", 0) or 0)
+            reset = datetime.fromtimestamp(reset_at).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        except (TypeError, ValueError, OSError, OverflowError):
+            reset = "unknown"
         print(
             f"  {record.get('model', '?')} via {record.get('provider', '?')} "
             f"(reset {reset}; reason {record.get('reason', '?')}; "
