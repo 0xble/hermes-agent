@@ -4977,10 +4977,15 @@ class BasePlatformAdapter(ABC):
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(
-        self, session_key: str, generation: int | None,
+        self, session_key: str, generation: int | None, *, preregistered_callback: Callable | None = None,
     ) -> None:
-        """Run the one-shot callback for the generation captured after this handler returned."""
+        """Run callbacks owned by this task, including its claimed legacy one-shot."""
         _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
+        if preregistered_callback is not None:
+            _post_cb = (
+                self._chain_callbacks(preregistered_callback, _post_cb)
+                if callable(_post_cb) else preregistered_callback
+            )
         if callable(_post_cb):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
@@ -5063,13 +5068,23 @@ class BasePlatformAdapter(ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
-        delivery_generation = None
+        # Capture ownership before the handler can be cancelled or replaced by a successor turn.
+        delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+        # A bare callback already present belongs to this turn, even before generation binding.
+        # Claim it now: an unowned pop in finally could consume a successor's registration.
+        entry_generation, preregistered_callback = _split_post_delivery_entry(
+            self._post_delivery_callbacks.get(session_key))
+        if entry_generation is None and callable(preregistered_callback):
+            self._post_delivery_callbacks.pop(session_key)
+        else:
+            preregistered_callback = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
             bind_event_turn(event)
-            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            # Queued handoffs reuse the guard; a successful handler may advance its generation.
+            delivery_generation = getattr(interrupt_event, "_hermes_run_generation", delivery_generation)
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -5181,13 +5196,18 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if delivery_generation is None:
+                # The gateway can bind its generation inside the handler. Use only this turn's
+                # retained guard, never an unowned pop of the session's sole successor callback.
+                delivery_generation = getattr(interrupt_event, "_hermes_run_generation", 0)
             restore_turn(turn_token)
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, delivery_generation)
+            await self._fire_post_delivery_callback(
+                session_key, delivery_generation, preregistered_callback=preregistered_callback)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
