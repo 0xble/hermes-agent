@@ -10,7 +10,8 @@ treated it as a typed message. A message the user types must still get the fallb
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
 
 import pytest
@@ -86,3 +87,88 @@ def test_heartbeat_and_loop_prompts_keep_their_existing_contract():
 
     event = GatewayRunner._synthetic_prompt_event(_slack_thread_source(), "loop tick")
     assert event.reply_expected is None
+
+
+class _TurnContextBuilt(Exception):
+    """Stop at the real wiring seam before executor, model or delivery tasks start."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["initial", "eventless", "goal-event", "human-event"])
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, path, defer):
+    """#419: initial and recursive turns retain provenance when no event survives the drain."""
+    from gateway.run import GatewayRunner
+    from gateway.turn_context import TurnContext
+
+    runner, _, entry, src, key = _runner_with_goal(hermes_home)
+    runner._get_proxy_url = lambda: None
+    defaults = TurnContext()
+    display = SimpleNamespace(**{name: getattr(defaults, name) for name in runner._DISPLAY_TO_TURN_CTX})
+    display.platform_key = "slack"
+    display.resolve_display_setting = lambda *args: False
+    runner._run_agent_display_settings = lambda source: display
+    contexts = []
+
+    def observe_context(ctx, *args):
+        contexts.append(ctx)
+        raise _TurnContextBuilt
+
+    runner._run_agent_bind_turn_wiring = observe_context
+    runner._run_agent = runner._run_agent_inner
+    adapter = SimpleNamespace(_active_sessions={}, send_typing=AsyncMock())
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._intake_adapter_for = lambda source: None
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="next turn")
+    runner._session_key_for_source = lambda source: key
+    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+    runner._persist_prompt_pins = AsyncMock()
+    runner._reply_anchor_for_event = lambda event: None
+    metadata = {"goal_continuation": True, "origin": "initial"}
+    with pytest.raises(_TurnContextBuilt):
+        await runner._run_agent_inner(
+            message="initial turn", context_prompt="", history=[], source=src,
+            session_id=entry.session_id, session_key=key, internal=True,
+            event_metadata=metadata, reply_expected=False,
+        )
+
+    expected_internal = True
+    expected_metadata = metadata
+    if path != "initial":
+        pending_event = None
+        if path != "eventless":
+            expected_internal = path == "goal-event"
+            expected_metadata = {"goal_continuation": True, "origin": "queued"} if expected_internal else {"origin": "human"}
+            pending_event = MessageEvent(
+                text="next turn", source=src, internal=expected_internal,
+                metadata=expected_metadata, reply_expected=False if expected_internal else True,
+            )
+        with pytest.raises(_TurnContextBuilt):
+            await runner._run_agent_queued_followup(
+                contexts[0], adapter, "next turn", pending_event,
+                response={}, result={"interrupted": True, "messages": []}, stream_task=None,
+            )
+        assert len(contexts) == 2
+
+    ctx = contexts[-1]
+    result = {"final_response": "done", "messages": []}
+    if defer == "depth-cap":
+        ctx._interrupt_depth = runner._MAX_INTERRUPT_DEPTH
+        queued = []
+
+        def queue_message(session_key, text, **contract):
+            queued.append(MessageEvent(text=text, source=src, **contract))
+
+        adapter.queue_message = queue_message
+    else:
+        adapter._pending_messages = {}
+        runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    await runner._run_agent_queued_followup(
+        ctx, adapter, "requeued turn", None, response=result, result=result, stream_task=None,
+    )
+    event = queued[0] if defer == "depth-cap" else adapter._pending_messages[key]
+    assert ctx.internal is expected_internal
+    assert ctx.event_metadata == expected_metadata
+    assert event.internal is expected_internal
+    assert event.metadata == expected_metadata
