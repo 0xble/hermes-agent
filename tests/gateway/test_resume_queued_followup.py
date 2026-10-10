@@ -545,6 +545,70 @@ def test_boot_snapshot_records_once_across_recovery_and_schedule(tmp_path, monke
     recorded.assert_called_once()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_boots", [1, 3])
+async def test_startup_records_one_boot_and_preserves_breaker_verdict(tmp_path, monkeypatch, prior_boots):
+    """Both startup snapshots belong to one boot, including a genuinely tripped loop."""
+    from gateway import restart_loop_guard as guard
+
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner.config.restart_resume_policy = "continue"
+    runner._restart_loop_guard_config = lambda: (
+        guard.DEFAULT_MAX_RESTARTS, guard.DEFAULT_WINDOW_SECONDS, guard.DEFAULT_MAX_GAP_SECONDS,
+    )
+    runner._start_post_connect_services = AsyncMock()
+    runner._claim_pending_obligations = AsyncMock(return_value=[])
+    runner._await_startup_boot_sends = AsyncMock()
+    runner._await_mcp_discovery = AsyncMock()
+    runner._schedule_auto_resume_delegations = MagicMock()
+    runner._send_session_db_warning_notifications = AsyncMock()
+    monkeypatch.setattr("gateway.run._restart_notification_pending", lambda: False)
+    monkeypatch.setattr("gateway.run._planned_restart_notification_pending", lambda: False)
+    monkeypatch.setattr("tools.process_registry.process_registry.pending_watchers", [])
+    # Use the real persisted breaker, not a mocked check that misses duplicate budget spending.
+    import time
+    now = time.time()
+    for offset in range(prior_boots, 0, -1):
+        guard.record_restart_interrupted_boot(now=now - offset)
+    recorded_before = guard._load_boots()
+    assert len(recorded_before) == prior_boots
+    assert flush_pending_to_file({key: MessageEvent(
+        text="B: answer separately", source=replace(source, message_id="102"), user_id="u1",
+    )}) == 1
+
+    replies = []
+    async def handle(event):
+        if event.internal:
+            replies.append("A answer")
+            runner.session_store._entries[key].resume_pending = False
+        else:
+            replies.append(event.text)
+            event._gateway_accepted = True
+    adapter.handle_message = handle
+    recovery = AsyncMock(wraps=runner._recover_pending_shutdown_flush_off_loop)
+    runner._recover_pending_shutdown_flush_off_loop = recovery
+    schedule = MagicMock(wraps=runner._schedule_resume_pending_sessions)
+    runner._schedule_resume_pending_sessions = schedule
+
+    await asyncio.wait_for(runner._start_finish_wiring(0), timeout=5)
+
+    recorded_after = guard._load_boots()
+    assert len(recorded_after) == prior_boots + 1
+    assert recorded_after[:-1] == recorded_before
+    if prior_boots == 1:
+        assert recovery.call_args.kwargs["candidates"] is not None
+        assert schedule.call_args.kwargs["candidates"] is not None
+        assert replies == ["A answer", "B: answer separately"]
+        assert not list((tmp_path / "pending_messages").glob("*.json"))
+    else:
+        assert recovery.call_args.kwargs["candidates"] is None
+        assert schedule.call_args.kwargs["candidates"] is None
+        assert replies == []
+        assert runner.session_store._entries[key].resume_pending
+        assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
+    db.append_message.assert_not_called()
+
+
 def test_failed_boot_snapshot_is_not_reenumerated_by_recovery_or_scheduler(tmp_path, monkeypatch):
     runner, _, _, _, _ = _spooled_runner(tmp_path, monkeypatch)
     runner._resume_pending_candidates = MagicMock(return_value=None)
