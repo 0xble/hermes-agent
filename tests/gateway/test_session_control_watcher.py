@@ -477,3 +477,94 @@ def test_replace_notices_show_old_and_new_goal(state):
     approved = resolve_request(request["id"], "approve", "42")
     assert "(approved in Telegram)\ngoal: ship now -> write docs" in runner._control_notice(approved)
     assert "after Telegram approval. (goal: ship now -> write docs)" in runner._requester_notice(approved)
+
+
+@pytest.mark.asyncio
+async def test_pause_cleanup_cannot_delete_human_arriving_in_drained_adapter_slot(state):
+    import threading
+    from types import MethodType
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.run_busy import GatewayBusySessionMixin
+    from hermes_cli.goals import GoalManager
+    from tests.gateway.test_goal_continuation_identity import _apply, _post_turn_event
+
+    runner = _runner(state)
+    GoalManager("target").set("old objective")
+    old = await _post_turn_event(runner)
+    _apply(state, "pause")
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    replaced = threading.Event()
+    cleanup_threads = []
+    human = MessageEvent(text="my next instruction", source=runner.target.origin)
+    key = runner.target.session_key
+    runner._prefetch_queued_voice_transcript = lambda event, adapter: None
+    runner._enqueue_fifo = MethodType(GatewayBusySessionMixin._enqueue_fifo, runner)
+    runner._overflow_queue = lambda key: []
+    runner._is_goal_continuation_event = GatewayBusySessionMixin._is_goal_continuation_event
+    runner._clear_goal_pending_continuations = MethodType(
+        GatewayBusySessionMixin._clear_goal_pending_continuations, runner,
+    )
+    runner._run_in_executor_with_context = MethodType(GatewayRunner._run_in_executor_with_context, runner)
+    runner._get_executor = lambda: None  # Real gateway offload, using the loop-owned default pool.
+
+    def adapter_drain_and_human_arrival():
+        runner.adapter._pending_messages.pop(key, None)
+        runner._enqueue_fifo(key, human, runner.adapter)
+        replaced.set()
+
+    class HandoffSlot(dict):
+        def get(self, lookup_key, default=None):
+            item = super().get(lookup_key, default)
+            if item is old and not replaced.is_set():
+                cleanup_threads.append(threading.get_ident())
+                loop.call_soon_threadsafe(adapter_drain_and_human_arrival)
+                if threading.get_ident() != loop_thread:
+                    assert replaced.wait(5), "event-loop handoff did not run"
+            return item
+
+    runner.adapter._pending_messages = HandoffSlot()
+    runner._enqueue_fifo(key, old, runner.adapter)
+    await runner._drain_session_controls()
+    assert replaced.is_set()
+    assert runner.adapter._pending_messages.get(key) is human
+    assert cleanup_threads == [loop_thread]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["resume", "replace", "pause", "clear"])
+async def test_control_outbox_retries_persisted_origin_when_adapter_is_unavailable(state, action):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+    from tests.gateway.test_goal_continuation_identity import _apply
+
+    GoalManager("target").set("old objective")
+    if action == "resume":
+        GoalManager("target").pause()
+    record = _apply(state, action, **({"goal": "new objective"} if action == "replace" else {}))
+    disconnected = _runner(state, target_route=False)
+    await disconnected._drain_session_controls()
+    persisted = session_controls._load_record(record["id"])
+    assert not persisted.get("continuation_enqueued")
+    assert not persisted.get("target_notice_skipped")
+    assert not persisted.get("target_notice_sent")
+    assert not persisted.get("continuations_cleared")
+    assert not persisted.get("outbox_done")
+
+    # A replacement watcher reads the same durable receipt after reconnect/restart.
+    reconnected = _runner(state)
+    accepted = []
+
+    async def accept(_adapter, event):
+        accepted.append(event)
+        event._gateway_accepted = True
+
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=accept)):
+        await reconnected._drain_session_controls()
+        await reconnected._drain_session_controls()
+    assert len(accepted) == (1 if action in {"resume", "replace"} else 0)
+    assert len(reconnected.adapter.sends) == 1
+    assert session_controls._load_record(record["id"])["outbox_done"] is True
+    assert session_controls.pending_outbox() == []
+
