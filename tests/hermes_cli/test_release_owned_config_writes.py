@@ -102,6 +102,55 @@ def test_newer_foreign_build_is_refused(home, live_release, tmp_path, monkeypatc
     assert (home / "config.yaml").read_bytes() == before
 
 
+def test_foreign_build_cannot_seed_missing_config(home, live_release, tmp_path, monkeypatch):
+    from hermes_cli.release_config_owner import ForeignBuildConfigWriteError
+
+    dev_root = _make_release(tmp_path, "d" * 40, schema=50)
+    _run_from(monkeypatch, dev_root, schema=50)
+    target = home / "config.yaml"
+    target.unlink()
+    template = tmp_path / "cli-config.yaml.example"
+    template.write_text("_config_version: 50\n", encoding="utf-8")
+
+    with pytest.raises(ForeignBuildConfigWriteError, match="refusing to write"):
+        config.seed_config_file(target, template)
+
+    assert not target.exists()
+
+
+def test_release_schema_version_reads_the_repository_defaults():
+    from hermes_cli import config_defaults, release_config_owner
+
+    repository_root = Path(config_defaults.__file__).resolve().parents[1]
+    assert release_config_owner._release_schema_version(repository_root) == (
+        config_defaults.DEFAULT_CONFIG["_config_version"]
+    )
+
+
+def test_live_release_can_seed_missing_config(home, live_release, tmp_path, monkeypatch):
+    target = home / "config.yaml"
+    target.unlink()
+    template = tmp_path / "cli-config.yaml.example"
+    template.write_text("_config_version: 50\n", encoding="utf-8")
+    _run_from(monkeypatch, live_release)
+
+    assert config.seed_config_file(target, template) is True
+    assert target.read_text(encoding="utf-8") == template.read_text(encoding="utf-8")
+
+
+def test_unmanaged_home_can_seed_missing_config(home, tmp_path, monkeypatch):
+    target = home / "config.yaml"
+    target.unlink()
+    template = tmp_path / "cli-config.yaml.example"
+    template.write_text("_config_version: 50\n", encoding="utf-8")
+    dev_root = tmp_path / "dev-worktree"
+    dev_root.mkdir()
+    _run_from(monkeypatch, dev_root, schema=50)
+
+    assert config.seed_config_file(target, template) is True
+    assert target.read_text(encoding="utf-8") == template.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("writer", ["import-agent dump_yaml_file", "atomic_write_text"])
 def test_direct_atomic_config_writers_are_guarded(home, live_release, tmp_path, monkeypatch, writer):
     from hermes_cli.agent_import import dump_yaml_file
