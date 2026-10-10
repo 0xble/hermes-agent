@@ -56,6 +56,10 @@ FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit 
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 # One tier per in-process retry; the last budgeted attempt is left to the boot sweep (retry_not_before).
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
+# How long an in-flight ('attempting') row of this process holds later rows for its chat. A send
+# cancelled mid-flight (/stop, /new) leaves its row 'attempting' with no finalize, so the hold must
+# expire on its own rather than starve the chat's later replies.
+ATTEMPT_ORDER_HOLD_SECONDS = 120.0
 assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
 # A final send the platform refused with flood control is the other transient case: a 429 means the
@@ -585,7 +589,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             if owner_pid != pid or owner_started_at != started:
                 continue
             if state != "failed":
-                if state == "attempting":
+                if state == "attempting" and now - (updated_at or 0) < ATTEMPT_ORDER_HOLD_SECONDS:
                     held_chats.add(chat_key)  # this process is sending it right now
                 continue
             due = retry_not_before(updated_at, last_error, attempts)

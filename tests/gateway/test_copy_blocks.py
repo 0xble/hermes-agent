@@ -619,3 +619,11 @@ async def test_auto_tts_never_speaks_inline_copy_bodies() -> None:
     assert "rm -rf build" in extracted.text_content  # shown inline on Discord
     spoken_text = adapter._spoken_reply_text(extracted)
     assert "rm -rf build" not in spoken_text and "Run this:" in spoken_text and "Then retry." in spoken_text
+
+
+def test_only_separate_send_platforms_promise_separate_copy_messages() -> None:
+    from agent.prompt_builder import PLATFORM_HINTS
+    from gateway.copy_blocks import platform_sends_copy_blocks
+    for platform, hint in PLATFORM_HINTS.items():
+        promises = "its own plain-text message" in hint
+        assert promises == platform_sends_copy_blocks(platform), platform

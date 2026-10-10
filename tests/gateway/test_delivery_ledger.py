@@ -347,6 +347,18 @@ class TestRuntimeFailedSweep:
         assert [row["obligation_id"] for row in claimed] == ["ob-2"]
         assert _row("ob-1")["state"] == "failed"
 
+    def test_orphaned_in_flight_row_holds_its_chat_only_briefly(self, monkeypatch):
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 202))
+        _record(oid="ob-1", platform="telegram", content="cancelled mid-send")
+        time.sleep(0.002)
+        _record(oid="ob-2", platform="telegram", content="later reply")
+        dl.mark_attempting("ob-1")  # a /stop cancelled this send: it is never finalized
+        dl.mark_failed("ob-2", "timed out")
+        soon = time.time() + 31
+        assert dl.sweep_failed_for_runtime("telegram", now=soon) == []
+        later = time.time() + dl.ATTEMPT_ORDER_HOLD_SECONDS + 31
+        assert [r["obligation_id"] for r in dl.sweep_failed_for_runtime("telegram", now=later)] == ["ob-2"]
+
     def test_profile_scope_never_claims_another_bot_identity(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
