@@ -1047,11 +1047,23 @@ class LoopManager:
 
         self._save_tick_outcome(fired, settle)
 
-    def _stop(self, status: str, reason: str, message: str) -> Dict[str, Any]:
-        """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result."""
+    def _stop(self, status: str, reason: str, message: str, *, judged_version: int,
+              digest: str = "") -> Dict[str, Any]:
+        """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result.
+
+        The verdict was reached against definition ``judged_version``. If a revise changed the
+        definition while the tick was being evaluated, the verdict no longer describes the loop:
+        settle the tick as a normal continue instead, and the next tick judges the new definition.
+        """
         s = self._state
+        superseded = False
 
         def settle(state: LoopState) -> None:
+            nonlocal superseded
+            if state.version != judged_version:
+                superseded = True
+                self._settle_continue(state, digest, time.time())
+                return
             state.awaiting_response = False
             state.status = status
             if status == "done":
@@ -1061,7 +1073,25 @@ class LoopManager:
 
         if s is None or not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
+        if superseded:
+            return {"status": "active", "stopped": False,
+                    "reason": "loop revised during evaluation", "message": ""}
         return {"status": status, "stopped": True, "reason": reason, "message": message}
+
+    @staticmethod
+    def _settle_continue(state: LoopState, digest: str, now: float) -> None:
+        """Clear the in-flight tick and schedule the next one on the stored cadence."""
+        state.awaiting_response = False
+        if state.mode == "self_paced":
+            floor = self_paced_floor_seconds()
+            if digest and digest == state.last_response_digest:
+                state.current_delay = min(max(state.current_delay, floor) * 2, self_paced_ceiling_seconds())
+            else:
+                state.current_delay = float(floor)
+            state.last_response_digest = digest
+        else:
+            state.current_delay = state.interval_seconds
+        state.next_due_at = now + state.current_delay
 
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
@@ -1076,11 +1106,13 @@ class LoopManager:
             return {"status": s.status if s else None, "stopped": False, "reason": "no tick in flight", "message": ""}
         now = time.time()
         ticks = _ticks_label(s.ticks_fired)
+        # Verdicts below judge this definition; a revise landing mid-evaluation supersedes them.
+        judged = {"judged_version": s.version, "digest": _digest_response(last_response)}
 
         # 1. Agent self-stop marker.
         if response_signals_complete(last_response):
             return self._stop("done", "agent signaled the task is complete",
-                              f"✓ Loop finished after {ticks} — task complete.")
+                              f"✓ Loop finished after {ticks} — task complete.", **judged)
 
         # 2. Evidence-based --until judge (reuses the /goal judge; fail-open). A bare silence
         # marker is the prompt's "nothing changed" reply: no evidence to judge, so no model call.
@@ -1093,17 +1125,17 @@ class LoopManager:
                 verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
             if verdict == "done":
                 return self._stop("done", f"stop condition met: {reason}",
-                                  f"✓ Loop finished after {ticks} — {reason}")
+                                  f"✓ Loop finished after {ticks} — {reason}", **judged)
             if verdict == "blocked":
                 # Unachievable stop condition: pause so the user can re-scope, don't spin.
                 why = f"stop condition judged unachievable: {reason}"
                 return self._stop("paused", why,
-                                  f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.")
+                                  f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.", **judged)
 
         # 3. --times user cap.
         if s.times and s.ticks_fired >= s.times:
             return self._stop("done", f"completed the requested {s.times} runs",
-                              f"✓ Loop finished — ran {s.times}/{s.times} times.")
+                              f"✓ Loop finished — ran {s.times}/{s.times} times.", **judged)
 
         # 4. Config backstop budget → pause (recoverable), not done.
         if s.max_ticks and s.ticks_fired >= s.max_ticks:
@@ -1111,24 +1143,13 @@ class LoopManager:
                 "paused", f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})",
                 f"⏸ Loop paused — {s.ticks_fired}/{s.max_ticks} ticks used "
                 "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.",
+                **judged,
             )
 
         # 5. Still looping — schedule the next tick from turn end, using the stored cadence so a
         # revise that landed during this tick takes effect now.
-        digest = _digest_response(last_response)
-
         def settle(state: LoopState) -> None:
-            state.awaiting_response = False
-            if state.mode == "self_paced":
-                floor = self_paced_floor_seconds()
-                if digest and digest == state.last_response_digest:
-                    state.current_delay = min(max(state.current_delay, floor) * 2, self_paced_ceiling_seconds())
-                else:
-                    state.current_delay = float(floor)
-                state.last_response_digest = digest
-            else:
-                state.current_delay = state.interval_seconds
-            state.next_due_at = now + state.current_delay
+            self._settle_continue(state, judged["digest"], now)
 
         if not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()

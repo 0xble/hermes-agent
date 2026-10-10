@@ -544,6 +544,33 @@ class TestTickLifecycle:
         assert after.awaiting_response is False
         assert LoopManager(session_id="t-judge").is_due(time.time() + 86400)
 
+    @pytest.mark.parametrize("verdict", ["done", "blocked"])
+    def test_condition_revised_during_judge_discards_stale_verdict(self, hermes_home, verdict):
+        """A done/blocked verdict on the old condition must not end or pause the revised loop."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-cond")
+        state = mgr.set("poll", interval_seconds=300, until="the build finishes")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+
+        def judge(*_args, **_kwargs):
+            quote = "watch the production deploy instead"
+            revised = LoopManager(session_id="t-cond").revise(
+                reason="watch the deploy instead", until="production deploy finishes",
+                user_quote=quote, user_messages=[quote])
+            assert revised["ok"] is True
+            return (verdict, "the build finished", False, None, False)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge):
+            decision = mgr.complete_tick("Build finished green.")
+        after = load_loop("t-cond")
+        assert decision["stopped"] is False
+        assert after.status == "active"
+        assert after.until == "production deploy finishes"
+        assert after.awaiting_response is False
+        assert LoopManager(session_id="t-cond").is_due(time.time() + 86400)
+
     def test_abandon_after_external_pause_keeps_pause(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 
