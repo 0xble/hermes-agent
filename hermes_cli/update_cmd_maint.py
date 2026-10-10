@@ -1070,7 +1070,11 @@ def strict_immutable_maintenance(project_root: Path) -> bool:
     from hermes_cli.profiles import list_profiles, seed_profile_skills
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    if not seed_cache_from_checkout(Path(project_root)):
+    try:
+        seeded = seed_cache_from_checkout(Path(project_root), raise_errors=True)
+    except OSError as exc:
+        raise RuntimeError(f"immutable maintenance: model catalog seed failed: {exc}") from exc
+    if not seeded:
         raise RuntimeError("immutable maintenance: model catalog seed failed")
 
     profile_list = list_profiles(lazy_skill_count=True)
@@ -1083,6 +1087,11 @@ def strict_immutable_maintenance(project_root: Path) -> bool:
         if (not isinstance(result, dict) or "copied" not in result or
                 not (result.get("total_bundled", 0) or result.get("skipped_opt_out"))):
             raise RuntimeError(f"immutable maintenance: bundled skills sync failed for {profile.name}")
+        if result.get("failed"):
+            raise RuntimeError(
+                f"immutable maintenance: bundled skills sync failed for {profile.name}: "
+                + "; ".join(result["failed"])
+            )
         token = set_hermes_home_override(profile.path)
         try:
             current, latest = check_config_version(raise_on_parse_error=True)
