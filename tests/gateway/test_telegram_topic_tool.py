@@ -459,17 +459,37 @@ async def test_edit_refuses_a_model_change_mid_turn_and_the_general_topic(home):
     assert adapter.renamed == []
 
 
-def test_tool_is_available_when_only_a_multiplexed_profile_has_telegram(monkeypatch):
-    """A secondary profile's Telegram bot lives in ``_profile_adapters``, not the primary's map."""
-    from tools import telegram_topic_tool as tool
+def test_tool_survives_schemas_built_before_telegram_connects(monkeypatch):
+    """The boot warm-up and the first turns build tool schemas before the Telegram adapter connects,
+    and ``get_tool_definitions`` memoizes by toolset selection. The tool must be in those schemas,
+    or it stays missing for every Telegram session until the gateway restarts."""
+    import gateway.run as gateway_run
+    import model_tools
+    from tools import telegram_topic_tool  # noqa: F401  # registers the tool
+    from tools.registry import invalidate_check_fn_cache
 
-    runner = SimpleNamespace(adapters={Platform.DISCORD: object()}, _profile_adapters={"work": {}})
-    monkeypatch.setattr(tool, "_live_runner", lambda: runner)
-    assert tool.check_telegram_topic_tool() is False
-    runner._profile_adapters["work"] = {Platform.TELEGRAM: object()}
-    assert tool.check_telegram_topic_tool() is True
-    monkeypatch.setattr(tool, "_live_runner", lambda: None)
-    assert tool.check_telegram_topic_tool() is False
+    def visible():
+        invalidate_check_fn_cache()
+        model_tools._clear_tool_defs_cache()
+        return [t["function"]["name"] for t in model_tools.get_tool_definitions(
+            ["telegram_topic"], quiet_mode=True, skip_tool_search_assembly=True)]
+
+    booting = SimpleNamespace(adapters={}, _profile_adapters={})  # no adapter connected yet
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: booting)
+    assert visible() == ["telegram_topic"]
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: None)  # CLI, external cron worker
+    assert visible() == []
+
+
+@pytest.mark.asyncio
+async def test_a_call_fails_closed_when_the_profile_has_no_telegram_adapter(home):
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    runner._delivery_adapter_for = lambda source: None  # disconnected, or a secondary that failed
+
+    with pytest.raises(TopicRequestError, match="unavailable right now"):
+        await create_topic_session(runner, _source(), TopicSpec(name="Room"))
+    assert adapter.created == []
 
 
 def test_tool_reaches_only_telegram_sessions():
