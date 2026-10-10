@@ -111,6 +111,8 @@ class MessageEvent:
     _owned_local_pending: Optional[int] = field(default=None, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Run-owned identity of a queued chain's terminal turn, for the chain's single post-turn judge.
+    _post_turn_goal_identity: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other*: addressed human input wins over autonomous unknown input."""

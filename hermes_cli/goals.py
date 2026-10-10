@@ -2252,7 +2252,15 @@ class GoalManager:
         replacement or re-set reuse the previous instance's value.
         """
         prior = self._state.created_at if self._state is not None else getattr(self, "_cleared_instance", 0.0)
-        return max(time.time(), float(prior or 0.0) + 1e-6)
+        # Another manager may have set a newer instance since this one loaded: include the stored
+        # row (cleared rows stay stored) so two instances never share a created_at.
+        try:
+            stored = load_goal(self.session_id) if self._cursor is None else load_goal(
+                self.session_id, cursor=self._cursor)
+        except Exception:
+            stored = None
+        prior = max(float(prior or 0.0), float(getattr(stored, "created_at", 0.0) or 0.0))
+        return max(time.time(), prior + 1e-6)
 
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()

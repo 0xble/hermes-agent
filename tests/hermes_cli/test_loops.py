@@ -643,6 +643,30 @@ class TestTickLifecycle:
         assert decision["stopped"] is False
         assert stored.status == "active" and stored.prompt == "new task" and stored.ticks_fired == 0
 
+    @pytest.mark.parametrize("cap", ["times", "max_ticks"])
+    @pytest.mark.parametrize("response", ["check complete", "All done.\nLOOP_COMPLETE"])
+    def test_cadence_revise_mid_tick_does_not_lift_run_caps(self, hermes_home, cap, response):
+        """A revise changes the definition version but never grants extra runs."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        mgr = LoopManager(session_id="t-cap")
+        state = mgr.set("poll", interval_seconds=60, times=1 if cap == "times" else 0)
+        if cap == "max_ticks":
+            state.max_ticks = 1
+        state.next_due_at = time.time() - 1
+        save_loop("t-cap", state)
+        assert mgr.fire_tick()
+        revised = LoopManager(session_id="t-cap").revise(
+            reason="slow down", interval_seconds=120,
+            user_quote="slow the loop down to every two minutes",
+            user_messages=["Please slow the loop down to every two minutes"])
+        assert revised["ok"] is True, revised
+        decision = mgr.complete_tick(response)
+        stored = load_loop("t-cap")
+        expected = "done" if cap == "times" else "paused"
+        assert decision["stopped"] is True and stored.status == expected
+        assert stored.awaiting_response is False and stored.interval_seconds == 120
+
     def test_revise_during_tick_survives_completion(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 

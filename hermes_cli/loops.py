@@ -1126,6 +1126,21 @@ class LoopManager:
 
         self._save_tick_outcome(fired, settle)
 
+    @staticmethod
+    def _cap_stop(state: LoopState) -> Optional[Tuple[str, str, str]]:
+        """The run-count or backstop cap the stored definition has reached, if any.
+
+        Caps count ticks, not response content, so a revise cannot excuse them: they are always
+        judged against the current stored definition, never the fired version."""
+        if state.times and state.ticks_fired >= state.times:
+            return ("done", f"completed the requested {state.times} runs",
+                    f"✓ Loop finished — ran {state.times}/{state.times} times.")
+        if state.max_ticks and state.ticks_fired >= state.max_ticks:
+            return ("paused", f"tick budget exhausted ({state.ticks_fired}/{state.max_ticks})",
+                    f"⏸ Loop paused — {state.ticks_fired}/{state.max_ticks} ticks used "
+                    "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.")
+        return None
+
     def _stop(self, status: str, reason: str, message: str, *, judged_version: int,
               digest: str = "") -> Dict[str, Any]:
         """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result.
@@ -1137,10 +1152,16 @@ class LoopManager:
         s = self._state
         superseded = False
 
+        cap: Optional[Tuple[str, str, str]] = None
+
         def settle(state: LoopState) -> None:
-            nonlocal superseded
+            nonlocal superseded, cap
             if state.version != judged_version:
                 superseded = True
+                cap = self._cap_stop(state)
+                if cap is not None:
+                    self._apply_stop(state, cap[0], cap[1])
+                    return
                 self._settle_continue(state, digest, time.time())
                 return
             state.awaiting_response = False
@@ -1152,10 +1173,21 @@ class LoopManager:
 
         if s is None or not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
+        if cap is not None:
+            return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
         if superseded:
             return {"status": "active", "stopped": False,
                     "reason": "loop revised during evaluation", "message": ""}
         return {"status": status, "stopped": True, "reason": reason, "message": message}
+
+    @staticmethod
+    def _apply_stop(state: LoopState, status: str, reason: str) -> None:
+        state.awaiting_response = False
+        state.status = status
+        if status == "done":
+            state.last_stop_reason = reason
+        else:
+            state.paused_reason = reason
 
     @staticmethod
     def _settle_continue(state: LoopState, digest: str, now: float) -> None:
@@ -1222,27 +1254,24 @@ class LoopManager:
                 return self._stop("paused", why,
                                   f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.", **judged)
 
-        # 3. --times user cap.
-        if s.times and s.ticks_fired >= s.times:
-            return self._stop("done", f"completed the requested {s.times} runs",
-                              f"✓ Loop finished — ran {s.times}/{s.times} times.", **judged)
+        # 3-4. --times user cap (done) and config backstop budget (paused, recoverable), judged at
+        # settle time against the stored definition so a revise mid-tick cannot lift either.
+        cap: Optional[Tuple[str, str, str]] = None
 
-        # 4. Config backstop budget → pause (recoverable), not done.
-        if s.max_ticks and s.ticks_fired >= s.max_ticks:
-            return self._stop(
-                "paused", f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})",
-                f"⏸ Loop paused — {s.ticks_fired}/{s.max_ticks} ticks used "
-                "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.",
-                **judged,
-            )
-
-        # 5. Still looping — schedule the next tick from turn end, using the stored cadence so a
-        # revise that landed during this tick takes effect now.
         def settle(state: LoopState) -> None:
+            nonlocal cap
+            cap = self._cap_stop(state)
+            if cap is not None:
+                self._apply_stop(state, cap[0], cap[1])
+                return
+            # 5. Still looping — schedule the next tick from turn end, using the stored cadence so
+            # a revise that landed during this tick takes effect now.
             self._settle_continue(state, judged["digest"], now)
 
         if not self._save_tick_outcome(s.ticks_fired, settle):
             return self._superseded_result()
+        if cap is not None:
+            return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 

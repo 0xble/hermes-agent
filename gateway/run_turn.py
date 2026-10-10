@@ -2369,6 +2369,9 @@ class GatewayTurnMixin:
                     event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
+                if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
+                    # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
+                    event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -4185,6 +4188,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_origin": (
                     (pending_event.metadata or {}).get("notification_origin")
                     if pending_event is not None and pending_event.internal else None),
+                # The chain's single post-turn judge evaluates the TERMINAL turn's response, so it
+                # must see that turn's goal-continuation identity and origin, not the head's.
+                "queued_terminal_goal_identity": self._post_turn_goal_identity(pending_event),
             }
         return merged
 

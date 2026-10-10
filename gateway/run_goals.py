@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext, suppress
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 
@@ -486,6 +486,16 @@ class GatewayGoalsMixin:
                 logger.debug("goal stop: notice failed: %s", exc)
             return True
 
+    def _post_turn_goal_identity(self, event) -> Dict[str, Any]:
+        """Plain-data identity of the turn whose response the post-turn goal judge evaluates."""
+        if event is None:
+            return {"user_turn": False, "goal_instance": None}
+        metadata = getattr(event, "metadata", None) or {}
+        instance = metadata.get("goal_continuation_instance") if metadata.get(
+            GOAL_CONTINUATION_METADATA_KEY) else None
+        return {"user_turn": self._is_user_turn_event(event),
+                "goal_instance": instance if type(instance) in (int, float) else None}
+
     def _is_user_turn_event(self, event) -> bool:
         """An admitted turn the user sent, not a wake, continuation, heartbeat or relayed message."""
         return not (getattr(event, "internal", False)
@@ -610,11 +620,15 @@ class GatewayGoalsMixin:
             # metadata, never derived from message text.
             metadata = getattr(event, "metadata", None) or {}
             external_event = metadata.get("notification_origin") == "process_registry_synthetic"
-            turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
-            goal_kwargs = {"user_initiated": turn_is_user, "external_event": external_event}
+            # A queued chain is judged once, on its terminal turn's response: take that turn's
+            # origin and goal identity rather than the chain head's.
+            identity = getattr(event, "_post_turn_goal_identity", None)
+            if not isinstance(identity, dict):
+                identity = (self._post_turn_goal_identity(event) if event is not None
+                            else {"user_turn": not is_internal, "goal_instance": None})
+            goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
             # A stamped continuation turn is judged only against the goal instance it served.
-            instance = metadata.get("goal_continuation_instance") if metadata.get(
-                GOAL_CONTINUATION_METADATA_KEY) else None
+            instance = identity.get("goal_instance")
             if type(instance) in (int, float):
                 goal_kwargs["goal_instance"] = instance
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))

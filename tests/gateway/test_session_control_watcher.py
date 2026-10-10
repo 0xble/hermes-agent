@@ -90,6 +90,10 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
         def _queue_depth(self, _key, adapter=None):
             return 0
 
+        def _is_goal_continuation_event(self, event):
+            from gateway.platforms.event import is_goal_continuation_event
+            return is_goal_continuation_event(event)
+
         async def _dispatch_plugin_message_injection(self, **kwargs):
             self.injections.append(kwargs)
             return injection_result

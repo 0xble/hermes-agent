@@ -501,3 +501,33 @@ async def test_superseded_continuation_turn_is_not_judged_against_the_new_goal(s
     assert after.status == "active" and after.goal == "new objective"
     assert after.turns_used == before.turns_used == 0
     assert runner.target.session_key not in runner.adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_post_turn_judges_the_terminal_queued_turn_not_the_chain_head(state):
+    """A current continuation drained behind a superseded head is still judged for its own goal."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    runner = _runner(state)
+    GoalManager("target").set("old objective")
+    head = await _post_turn_event(runner)
+    _apply(state, "replace", goal="new objective")
+    runner.adapter._pending_messages.clear()
+    terminal = await _post_turn_event(runner)
+    runner.adapter._pending_messages.clear()
+    head._post_turn_goal_identity = runner._post_turn_goal_identity(terminal)
+    runner.async_session_store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=runner.target))
+    runner._final_text_for_post_turn_hooks = lambda result, event=None: "progress on the new objective"
+    runner._post_turn_loop_completion = AsyncMock()
+    before = load_goal("target").turns_used
+    with patch("hermes_cli.goals.judge_goal",
+               return_value=("continue", "work remains", True, None, False)) as judged:
+        await runner._run_post_turn_hooks(
+            agent_result={"final_response": "progress on the new objective"},
+            source=runner.target.origin, is_internal=True, event=head,
+        )
+    judged.assert_called_once()
+    after = load_goal("target")
+    assert after.goal == "new objective" and after.turns_used == before + 1
+    assert runner.target.session_key in runner.adapter._pending_messages

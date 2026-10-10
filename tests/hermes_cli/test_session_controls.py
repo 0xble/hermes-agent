@@ -751,3 +751,16 @@ def test_direct_replace_quote_must_ask_for_a_replacement(state):
                                            user_quote="pause the goal while I think about it")
     assert (result["ok"], result["error_code"]) == (False, "user_quote_mismatch")
     assert load_goal("target").goal == "migrate database"
+
+
+def test_stale_manager_set_cannot_reuse_a_newer_goal_instance(state, monkeypatch):
+    import time as _time
+    from hermes_cli.goals import GoalManager
+
+    monkeypatch.setattr(_time, "time", lambda: 1_800_000_000.0)
+    GoalManager("target").set("goal A")
+    stale = GoalManager("target")
+    GoalManager("target").set("goal B")
+    b = GoalManager("target").state.created_at
+    stale.set("goal C")
+    assert GoalManager("target").state.created_at > b
