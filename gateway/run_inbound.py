@@ -16,12 +16,12 @@ import os
 import re
 import shutil
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
-from gateway.platforms.base import EphemeralReply, as_command_reply
+from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
@@ -1672,14 +1672,26 @@ class GatewayInboundMixin:
             return await self._enrich_message_with_vision(message_text, image_paths)
 
     async def _echo_stt_transcripts(
-        self, adapter, source: SessionSource, transcripts: List[str], *, metadata=None, log_context: str = "Transcript"
+        self, adapter, source: SessionSource, transcripts: List[str], *, event: MessageEvent,
+        metadata=None, log_context: str = "Transcript",
     ) -> None:
         """Send each transcript back as ``🎙️ "…"`` (best-effort; failures are logged, never raised)."""
-        for tx in transcripts:
-            try:
-                await adapter.send(source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata)
-            except Exception as echo_exc:
-                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+        # A user's echo is a direct response, even when a busy background turn spawned its task.
+        # Give it answer priority based on the originating event, not the ambient outbound class
+        # or trigger. Keep _interim_send metadata: stream sealing and quota priority are separate.
+        # Internal producers retain their existing budget classification; this is no blanket STT
+        # exemption for background traffic.
+        echo_scope = nullcontext() if event.internal else outbound_class(OUTBOUND_FINAL)
+        with echo_scope:
+            for tx in transcripts:
+                try:
+                    result = await adapter.send(
+                        source.chat_id, t("gateway.voice.transcript_echo_short", text=tx), metadata=metadata,
+                    )
+                    if getattr(result, "success", True) is False:
+                        logger.warning("%s echo failed (non-fatal): %s", log_context, result.error)
+                except Exception as echo_exc:
+                    logger.warning("%s echo failed (non-fatal): %s", log_context, echo_exc)
 
     async def _enrich_inbound_voice(
         self, event: MessageEvent, source: SessionSource, message_text: str, audio_paths: list[str]
@@ -1694,7 +1706,9 @@ class GatewayInboundMixin:
             _echo_adapter = self._delivery_adapter_for(source)
             if _echo_adapter:
                 _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                await self._echo_stt_transcripts(_echo_adapter, source, _successful_transcripts, metadata=_echo_meta)
+                await self._echo_stt_transcripts(
+                    _echo_adapter, source, _successful_transcripts, event=event, metadata=_echo_meta,
+                )
         return message_text
 
     @staticmethod
@@ -2373,7 +2387,7 @@ class GatewayInboundMixin:
         already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
         event._gateway_pending_stt_echoed = max(already_echoed, len(transcripts))
         await self._echo_stt_transcripts(
-            adapter, source, transcripts[already_echoed:], metadata=metadata, log_context=log_context,
+            adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
         )
 
     async def _transcribe_and_echo_pending_voice(
