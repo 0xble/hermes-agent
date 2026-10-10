@@ -13,13 +13,13 @@ reducing the grace for children that still own their spawn incarnation.
 ## Invariants and update rule
 
 - Cache psutil PID/create-time handles while stdio children are being tracked.
-  Retain descendant witnesses through release, including after the group leader
-  exits; expand a group only while a previously recorded witness is verified, or
-  while a member is still in the leader's recorded session.
+  Retain descendant witnesses through release. The release path may use the
+  recorded-session check once to discover a late-spawned member; later refreshes
+  and reaping require a previously recorded live, create-time-verified witness.
 - Numeric PID/PGID ledgers alone never authorize a signal. A late-spawned member
-  is adopted only when the recorded group session is verified for every discovered
-  member; a recycled PGID with an unrelated session is rejected. Missing or
-  unreadable witnesses fail closed.
+  is adopted only when the release-time session check records it or a live witness
+  verifies the group; a recycled PGID with an unrelated session is rejected.
+  Missing or unreadable witnesses fail closed.
 - Give all owned survivors one shared two-second SIGTERM grace using
   `psutil.wait_procs`, then revalidate before escalation. Never kill the gateway's
   own group. Windows tree signalling receives the original verified parent handle.

@@ -87,10 +87,54 @@ def test_recycled_pgid_with_unrelated_session_is_not_signalled(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid, raising=False)
     monkeypatch.setattr(lifecycle.os, "getsid", lambda _: 200, raising=False)
     monkeypatch.setattr(lifecycle.os, "killpg", Mock(), raising=False)
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool._update_death_supervisor",
+        lambda verb, pgids: calls.append((verb, set(pgids))),
+    )
 
     lifecycle._kill_orphaned_mcp_children()
 
     original.send_signal.assert_not_called()
+    assert any(pid in pgids for verb, pgids in calls if verb == "unregister")
+
+
+def test_recycled_setsid_group_with_recorded_leader_is_not_signalled(monkeypatch):
+    """A recycled setsid leader cannot authorize its later surviving members."""
+    pid = 747474
+    original = Mock(pid=pid)
+    original.is_running.return_value = False
+    original.status.return_value = psutil.STATUS_ZOMBIE
+    original.create_time.return_value = 100.0
+    recycled_leader = Mock(pid=pid)
+    recycled_leader.is_running.return_value = True
+    recycled_leader.status.return_value = psutil.STATUS_RUNNING
+    recycled_leader.create_time.return_value = 200.0
+    survivor = Mock(pid=747475)
+    survivor.is_running.return_value = True
+    survivor.status.return_value = psutil.STATUS_RUNNING
+    survivor.create_time.return_value = 300.0
+    lifecycle._stdio_processes[pid] = {pid: original}
+    lifecycle._stdio_pgids[pid] = pid
+    lifecycle._stdio_sessions[pid] = pid  # start_new_session: sid == pgid == leader pid
+    lifecycle._orphan_stdio_pids.add(pid)
+    monkeypatch.setattr(
+        psutil,
+        "process_iter",
+        Mock(side_effect=[[recycled_leader, survivor], [recycled_leader, survivor], [survivor]]),
+    )
+    monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid, raising=False)
+    monkeypatch.setattr(lifecycle.os, "getsid", lambda _: pid, raising=False)
+    killpg = Mock(side_effect=AssertionError("recycled setsid group was signalled"))
+    monkeypatch.setattr(lifecycle.os, "killpg", killpg, raising=False)
+
+    # Release sees the recycled setsid leader and rejects its changed create-time;
+    # after that leader exits, its same-session survivor must remain untouched.
+    server = type("Server", (transport.MCPServerTransportMixin,), {"name": "test"})()
+    transport.MCPServerTransportMixin._release_spawned_children(server, {pid})
+    lifecycle._kill_orphaned_mcp_children()
+
+    killpg.assert_not_called()
 
 
 def test_unverifiable_live_group_is_not_unregistered(monkeypatch):

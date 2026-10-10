@@ -74,13 +74,23 @@ def _remember_mcp_processes(pids: set) -> None:
             _stdio_processes[pid] = members
 
 
+class _McpGroupScan(dict):
+    """Live group members plus a distinction for a positively foreign group."""
+
+    def __init__(self, members=None, *, foreign: bool = False):
+        super().__init__(members or {})
+        self.foreign = foreign
+
+
 def _enumerate_mcp_group(pgid: int, session_id: Optional[int]) -> Optional[dict]:
-    """Return live members of *pgid*, or ``None`` when group identity is unverifiable.
+    """Return live members, or ``None`` when group identity is unverifiable.
 
     A recorded MCP group is safe to signal after its leader exits only when every
     member we can inspect is still in the original session.  A recycled group has
     a different session (and normally a new leader incarnation), so it is rejected
-    rather than adopted from its numeric PGID.
+    rather than adopted from its numeric PGID.  The empty result for a positively
+    foreign group carries ``foreign=True`` so its supervisor registration can be
+    released without confusing it with an unreadable group.
     """
     import psutil
     discovered = {}
@@ -91,7 +101,7 @@ def _enumerate_mcp_group(pgid: int, session_id: Optional[int]) -> Optional[dict]
             if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
                 continue
             if session_id is not None and os.getsid(proc.pid) != session_id:
-                return None
+                return _McpGroupScan(foreign=True)
             proc.create_time()
             discovered[proc.pid] = proc
         except psutil.NoSuchProcess:
@@ -113,33 +123,34 @@ def _enumerate_mcp_group(pgid: int, session_id: Optional[int]) -> Optional[dict]
 
 def _owned_mcp_processes(members: dict, pgid: Optional[int], my_pgid: Optional[int],
                          *, leader_pid: Optional[int] = None,
-                         session_id: Optional[int] = None) -> dict:
+                         session_id: Optional[int] = None,
+                         allow_unwitnessed_session: bool = False) -> dict:
     """Refresh descendants/groups through verified process incarnations.
 
-    A live witness allows a group refresh.  If the recorded leader has already
-    exited, the same refresh is allowed only when current members still carry the
-    recorded session ID and a recycled leader PID still has the original
-    create-time identity.
+    A live witness allows a group refresh.  Once any process incarnation has
+    been recorded, a refresh requires a live verified witness.  The release path
+    may use the recorded-session check once to discover a late-spawned member;
+    the reaper never uses it after a recorded incarnation has gone away.
     """
     import psutil
     alive = {pid: proc for pid, proc in members.items() if _mcp_process_alive(proc)}
     if pgid is not None and pgid != my_pgid:
         witnesses = [proc for proc in alive.values() if _mcp_process_in_group(proc, pgid)]
-        leader = members.get(leader_pid if leader_pid is not None else pgid)
-        leader_state = _mcp_process_state(leader)
-        if witnesses or (leader is not None and leader_state is False and session_id is not None):
+        if witnesses or (session_id is not None and (allow_unwitnessed_session or not members)):
             discovered = _enumerate_mcp_group(pgid, session_id)
-            if discovered is None:
+            if discovered is None or getattr(discovered, "foreign", False):
                 return {}
-            if session_id is not None and leader is not None and pgid in discovered:
-                try:
-                    if discovered[pgid].create_time() != leader.create_time():
+            if allow_unwitnessed_session and session_id is not None and leader_pid is not None:
+                leader = members.get(leader_pid)
+                if leader is not None and pgid in discovered:
+                    try:
+                        if discovered[pgid].create_time() != leader.create_time():
+                            return {}
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                         return {}
-                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                    return {}
-            # Enumeration is not atomic: retain only if the original witness is
-            # still in the group, or the leader incarnation is verified gone and
-            # a member in its original session remains.
+            # A live witness keeps the enumeration tied to the original group.
+            # The release-only session check is allowed to discover late members,
+            # but the reaper never adopts them without a recorded live witness.
             if witnesses:
                 if not any(_mcp_process_in_group(proc, pgid) for proc in witnesses):
                     return {}
@@ -468,12 +479,14 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
                 _signal_mcp_processes(alive, sigkill, pgids.get(pid), my_pgid)
                 logger.warning("Force-killed MCP process group for %d (%s) after SIGTERM timeout", pid, pids[pid])
     finally:
-        # Release only groups whose current membership can be verified empty.
-        # An unreadable/live group stays registered with the death supervisor.
-        empty = [
-            pgid for pid, pgid in pgids.items()
-            if _enumerate_mcp_group(pgid, sessions.get(pid)) == {}
-        ]
+        # Release groups whose current membership is verified empty or positively
+        # identified as foreign. An unreadable/live group stays registered with
+        # the death supervisor.
+        empty = []
+        for pid, pgid in pgids.items():
+            scan = _enumerate_mcp_group(pgid, sessions.get(pid))
+            if scan == {} or getattr(scan, "foreign", False):
+                empty.append(pgid)
         _core._update_death_supervisor("unregister", empty)
 
 

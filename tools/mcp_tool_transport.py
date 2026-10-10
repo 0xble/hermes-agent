@@ -337,16 +337,20 @@ class MCPServerTransportMixin:
                 members = _lifecycle._owned_mcp_processes(
                     original, pgid, os.getpgrp() if hasattr(os, "getpgrp") else None,
                     leader_pid=pid, session_id=session_id,
+                    allow_unwitnessed_session=True,
                 )
                 # Keep the original leader handle as well as any late-discovered
-                # members: a dead leader plus a recorded session is the evidence
-                # needed to refresh the group on the next sweep.
+                # members so a later sweep refreshes only through live witnesses.
                 retained = dict(original)
                 retained.update(members)
                 _stdio_processes[pid] = retained
+                group_scan = (
+                    _lifecycle._enumerate_mcp_group(pgid, session_id)
+                    if pgid is not None else None
+                )
                 group_empty = (
                     pgid is not None
-                    and _lifecycle._enumerate_mcp_group(pgid, session_id) == {}
+                    and (group_scan == {} or getattr(group_scan, "foreign", False))
                 )
                 if members or (pgid is not None and not group_empty):
                     _orphan_stdio_pids.add(pid)
