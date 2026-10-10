@@ -972,19 +972,66 @@ class LoopManager:
         s = self._state
         if s is None or not self.is_due():
             return None
-        s.ticks_fired += 1
-        s.last_fired_at = time.time()
-        s.awaiting_response = True
-        # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
-        # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
-        s.next_due_at = s.last_fired_at + (s.current_delay or s.interval_seconds or self_paced_floor_seconds())
-        self._save()
+
+        def claim(state: LoopState) -> None:
+            state.ticks_fired += 1
+            state.last_fired_at = time.time()
+            state.awaiting_response = True
+            # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
+            # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
+            state.next_due_at = state.last_fired_at + (
+                state.current_delay or state.interval_seconds or self_paced_floor_seconds())
+
+        if not self._claim_tick(claim):
+            return None
+        s = self._state
 
         if s.prompt.lstrip().startswith("/"):
             return s.prompt.strip()
         cadence = f", {s.cadence_label()}" if s.mode == "interval" else ", self-paced"
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
+
+    def _claim_tick(self, claim) -> bool:
+        """Claim the due tick on the stored loop inside one write transaction.
+
+        A scheduler loads its manager before awaiting the executor that fires the tick, so a pause,
+        stop, revise or re-set can commit in between; saving the cached copy would resurrect it. The
+        claim applies only while the stored row is still this loop instance, active and idle. A
+        revise in between fires the stored (revised) definition; otherwise the caller's copy fires."""
+        s = self._state
+        db = _get_session_db() if self._cursor is None else None
+        if db is None:
+            claim(s)
+            self._save()
+            return True
+
+        def write(conn) -> Optional[LoopState]:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
+            ).fetchone()
+            stored = _parse_state(row[0]) if row and row[0] else None
+            if (
+                stored is None or stored.status != "active" or stored.awaiting_response
+                or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+            ):
+                return None
+            base = s if stored.version == s.version else stored
+            claimed = _parse_state(base.to_json())
+            claim(claimed)
+            save_loop(self.session_id, claimed, cursor=conn)
+            return claimed
+
+        try:
+            claimed = db._execute_write(write)
+        except Exception as exc:
+            logger.debug("LoopManager: tick claim write failed: %s", exc)
+            return False
+        if claimed is None:
+            self.refresh()
+            return False
+        self._state = claimed
+        return True
 
     def _save_tick_outcome(self, fired_ticks: int, settle) -> bool:
         """Settle the fired tick on the stored loop inside one write transaction.

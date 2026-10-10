@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -78,8 +79,18 @@ _NEGATION_TOKENS = frozenset({"not", "don't", "dont", "never", "no", "shouldn't"
 _NEGATION_WINDOW_WORDS = 3
 
 
+# Characters that wrap or punctuate a word without changing it: sentence punctuation plus Markdown
+# and chat emphasis (**not**, _not_, `not`, ~~not~~), so formatting cannot hide a negation.
+_WORD_WRAPPERS = ".,;:!?\"'()[]{}<>*_`~|"
+
+
 def _negation_words(text: str) -> list[str]:
-    return [w.replace("\u2019", "'").strip(".,;:!?\"'()[]").lower() for w in text.split()]
+    words = []
+    for raw in text.split():
+        word = raw.replace("\u2019", "'").strip(_WORD_WRAPPERS).lower()
+        # Emphasis inside a token ("do**not**", "`don't`clear") still separates words.
+        words.extend(part.strip(_WORD_WRAPPERS) for part in re.split(r"[*_`~|]+", word) if part)
+    return words
 
 
 def _is_negated(quote: str, source: str) -> bool:

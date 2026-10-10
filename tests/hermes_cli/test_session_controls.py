@@ -394,6 +394,12 @@ def test_request_control_refuses_target_without_approval_surface(state):
     ("No, clear the target goal is wrong", "clear the target goal is wrong"),
     ("I shouldn't clear the target goal myself", "clear the target goal myself"),
     ("Clear the target goal? Not now", "Clear the target goal? Not now"),
+    ("Please do **not** clear the target goal immediately", "clear the target goal immediately"),
+    ("Please do *not* clear the target goal immediately", "clear the target goal immediately"),
+    ("Please do _not_ clear the target goal immediately", "clear the target goal immediately"),
+    ("Please `don't` clear the target goal immediately", "clear the target goal immediately"),
+    ("Please do ~~not~~ clear the target goal immediately", "clear the target goal immediately"),
+    ("Please do**not**clear the target goal immediately", "clear the target goal immediately"),
 ])
 def test_negated_quote_is_refused(state, message, quote):
     from hermes_cli.goals import GoalManager, load_goal

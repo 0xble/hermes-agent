@@ -499,6 +499,55 @@ class TestTickLifecycle:
             assert stored.prompt == "a different task"
             assert stored.awaiting_response is False
 
+    @pytest.mark.parametrize("change, expected", [
+        ("pause", "paused"),
+        ("clear", "cleared"),
+        ("stop_then_set", "active"),
+    ])
+    def test_change_before_fire_is_not_resurrected(self, hermes_home, change, expected):
+        """A scheduler's preloaded manager cannot fire a loop paused, stopped or re-set since load."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-pre").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-pre", state)
+        scheduler = LoopManager(session_id="t-pre")
+        assert scheduler.is_due()
+        other = LoopManager(session_id="t-pre")
+        if change == "pause":
+            other.pause("paused from another session")
+        elif change == "clear":
+            other.clear()
+        else:
+            other.clear()
+            time.sleep(0.01)
+            LoopManager(session_id="t-pre").set("a different task", interval_seconds=600)
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-pre")
+        assert stored.status == expected
+        assert stored.awaiting_response is False
+        assert stored.ticks_fired == 0
+        if change == "stop_then_set":
+            assert stored.prompt == "a different task"
+
+    def test_revise_before_fire_fires_the_revised_prompt(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-prerev").set("poll", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        save_loop("t-prerev", state)
+        scheduler = LoopManager(session_id="t-prerev")
+        quote = "Please switch the loop to polling the revised target"
+        revised = LoopManager(session_id="t-prerev").revise(
+            reason="new target", prompt="poll the revised target",
+            user_quote="switch the loop to polling the revised target", user_messages=[quote])
+        assert revised["ok"] is True, revised
+        wakeup = scheduler.fire_tick()
+        assert wakeup and "poll the revised target" in wakeup
+        after = load_loop("t-prerev")
+        assert after.awaiting_response is True and after.ticks_fired == 1
+        assert after.prompt == "poll the revised target" and after.version == 2
+
     def test_revise_during_tick_survives_completion(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 
