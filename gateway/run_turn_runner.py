@@ -1379,6 +1379,7 @@ class TurnRunner:
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
+        agent._voice_turn_pending = ctx.voice_turn  # auxiliary.voice_chat route
         agent.reasoning_override = runner._session_reasoning_override(ctx.session_key)
         expiry_loader = getattr(runner, "_session_service_tier_expiry", None)
         try:

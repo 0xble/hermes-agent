@@ -15,15 +15,16 @@ import pytest
 from gateway.run_turn_runner import TurnRunner
 
 
-def _wire(user_config):
+def _wire(user_config, *, voice_turn=False, agent=None):
     """Run `_wire_turn_agent_callbacks` over minimal fakes; return the agent."""
-    agent = types.SimpleNamespace()
+    if agent is None:
+        agent = types.SimpleNamespace()
     ctx = types.SimpleNamespace(
         progress_callback=None,
         native_tool_start_callback=None,
         voice_ack_callback=None,
         _voice_ack_guild=[None],
-        voice_turn=False,
+        voice_turn=voice_turn,
         _native_slack_task_cards=False,
         native_tool_complete_callback=None,
         _step_callback_sync=None,
@@ -68,3 +69,11 @@ def test_null_or_missing_display_falls_back_to_on(user_config):
 def test_memory_notifications_setting_still_applies():
     agent = _wire({"display": {"memory_notifications": "verbose"}})
     assert agent.memory_notifications == "verbose"
+
+
+@pytest.mark.parametrize("voice_turn", [True, False])
+def test_voice_route_flag_is_rebound_per_turn(voice_turn):
+    """A reused agent must take this turn's voice route, not its previous flag."""
+    agent = types.SimpleNamespace(_voice_turn_pending=not voice_turn)
+    assert _wire({}, voice_turn=voice_turn, agent=agent) is agent
+    assert agent._voice_turn_pending is voice_turn

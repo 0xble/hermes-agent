@@ -763,6 +763,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   dimensions; the regression checks both versions. The fork release-owner test
   also follows upstream's renamed `read_config_version_stamp()` export without
   weakening its migration and write-refusal assertions.
+- The sync also dropped upstream's per-turn `_voice_turn_pending = ctx.voice_turn`
+  assignment in `gateway/run_turn_runner.py`. Restore it unconditionally so voice
+  turns use `auxiliary.voice_chat` and a reused agent resets the flag on typed
+  turns. Guard: `scripts/run_tests.sh tests/gateway/test_display_null_turn_wiring.py tests/agent/test_voice_turn_route.py`.
 
 ## Gateway Subcommand Exit Codes
 
