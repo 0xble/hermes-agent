@@ -56,6 +56,10 @@ FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit 
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 # One tier per in-process retry; the last budgeted attempt is left to the boot sweep (retry_not_before).
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
+# How long an in-flight ('attempting') row of this process holds later rows for its chat. A send
+# cancelled mid-flight (/stop, /new) leaves its row 'attempting' with no finalize, so the hold must
+# expire on its own rather than starve the chat's later replies.
+ATTEMPT_ORDER_HOLD_SECONDS = 120.0
 assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
 # A final send the platform refused with flood control is the other transient case: a 429 means the
@@ -360,24 +364,43 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                             thread_id: Optional[str], content: str, since: float,
                             adapter_profile: Optional[str] = None,
-                            resume_turn_id: Optional[str] = None) -> None:
+                            resume_turn_id: Optional[str] = None, part: bool = False) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
     since *since* (the turn start), and idempotent across boots that die before their sweep."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO delivery_obligations
+    values = (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
+              content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id)
+    insert = """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile, resume_turn_id)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?
+               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?"""
+    with _DB_LOCK, _transaction() as conn:
+        if part:
+            # A copy part the caller already found missing: its per-part id is the only identity,
+            # since another part may share its body.
+            conn.execute(insert, values)
+            return
+        conn.execute(
+            insert + """
                WHERE NOT EXISTS (SELECT 1 FROM delivery_obligations
                                  WHERE session_key = ? AND content = ? AND created_at >= ?)""",
-            (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-             content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
-            session_key, content, since))
+            (*values, session_key, content, since))
+
+
+def recorded_contents_since(session_key: str, since: float) -> Dict[str, int]:
+    """How many obligations with each content were recorded for *session_key* since *since*, any
+    state. A count, not a set: two copy parts with the same body are two distinct messages."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            "SELECT content FROM delivery_obligations WHERE session_key = ? AND created_at >= ?",
+            (session_key, since)).fetchall()
+    counts: Dict[str, int] = {}
+    for (content,) in rows:
+        counts[content] = counts.get(content, 0) + 1
+    return counts
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -479,7 +502,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
                       resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+               ORDER BY created_at, rowid"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
@@ -510,6 +534,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "last_error": last_error,
                         "resume_marker": _resume_marker_from_row(
                             marker_session_id, marker_token, marker_marked_at),
                         "resume_turn_id": resume_turn_id})
@@ -562,13 +587,29 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at,
                       resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
+                      , state
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?""", (platform,)).fetchall()
+               WHERE state IN ('pending', 'attempting', 'failed') AND platform=?
+               ORDER BY created_at, rowid""", (platform,)).fetchall()
+        # Messages to one chat leave in the order they were recorded: a row waits while an
+        # earlier row of this process for its chat is in flight or will retry soon. A row parked
+        # for boot recovery, abandoned, or owned elsewhere never holds a chat, so the wait is
+        # always bounded by one backoff.
+        held_chats: set = set()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
-             marker_session_id, marker_token, marker_marked_at, resume_turn_id) in rows:
+             marker_session_id, marker_token, marker_marked_at, resume_turn_id, state) in rows:
+            if adapter_profile != expected_profile:
+                continue  # another bot identity: its own order, its own sweep
+            chat_key = (chat_id, thread_id)
+            if chat_key in held_chats:
+                continue
             # Exact process-start matching prevents PID reuse from stealing work.
-            if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
+            if owner_pid != pid or owner_started_at != started:
+                continue
+            if state != "failed":
+                if state == "attempting" and now - (updated_at or 0) < ATTEMPT_ORDER_HOLD_SECONDS:
+                    held_chats.add(chat_key)  # this process is sending it right now
                 continue
             due = retry_not_before(updated_at, last_error, attempts)
             owner_guard = (now, oid, owner_pid, owner_started_at)
@@ -585,7 +626,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
             if due is None:
-                continue
+                continue  # parked for boot recovery or dead: never a runtime predecessor
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations
@@ -594,6 +635,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
             if now < due:
+                held_chats.add(chat_key)
                 continue  # the platform's wait or the backoff has not passed; the timer comes back for it
             # The claim clears the stale error: this is a fresh attempt, and if it is interrupted the next
             # boot must see 'attempting' with no proof of non-delivery, hence the marker.

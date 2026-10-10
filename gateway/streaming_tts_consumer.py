@@ -77,6 +77,17 @@ class StreamingTTSConsumer:
         """Receive text, or flush a ``None`` segment boundary without ending audio. Non-blocking."""
         if self._aborted or not self.active or self._finished:
             return
+        # Paste-ready copy blocks are read, never spoken. One filter per turn, like the display's.
+        copy_filter = getattr(self, "_copy_filter", None)
+        if copy_filter is None:
+            from gateway.copy_blocks import CopyMarkerStreamFilter
+            copy_filter = self._copy_filter = CopyMarkerStreamFilter(drop_bodies=True)
+        if text is None:
+            copy_filter.message_boundary()
+        else:
+            text = copy_filter.feed(text)
+            if not text:
+                return
         clauses = self._chunker.flush() if text is None else self._chunker.feed(text)
         self._enqueue_clauses(clauses, "streaming TTS queue full, dropping clause",
                               log_errors=True)
@@ -89,6 +100,10 @@ class StreamingTTSConsumer:
         self._finished = True
         if self._aborted or not self.active:
             return
+        copy_filter = getattr(self, "_copy_filter", None)
+        if copy_filter is not None and (tail := copy_filter.flush()):
+            self._enqueue_clauses(self._chunker.feed(tail), "streaming TTS queue full while flushing tail",
+                                  log_errors=False)
         self._enqueue_clauses(self._chunker.flush(), "streaming TTS queue full while flushing tail",
                               log_errors=False)
         # The load-bearing _DONE sentinel must never be lost: evict clauses until it fits.

@@ -34,6 +34,7 @@ from gateway.response_filters import (
     is_partial_silence_marker as _is_partial_silence_marker,
     strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
     strip_trailing_silence_marker as _strip_trailing_silence_marker)
+from gateway.copy_blocks import CopyMarkerStreamFilter, adapter_sends_copy_blocks, copy_free_text_for
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -168,6 +169,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
+        # Copy blocks are delivered as separate messages after the turn, so they never
+        # enter the stream buffers; every preview, split, and fallback send inherits that.
+        # One filter per turn: a block or fence may span a segment break, and a held
+        # partial marker line carries into the next segment instead of being flushed.
+        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=adapter_sends_copy_blocks(adapter))
         self._before_finalize_notified = False
         self._reset_message_state()
 
@@ -292,6 +298,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _append_accumulated(self, text: str) -> None:
         """Append to the live buffer and the split-stable stream ledger."""
+        text = self._copy_filter.feed(text)
         if not text:
             return
         if self._tool_progress_lines:  # real text overwrites the overlay
@@ -342,6 +349,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must not confirm delivery).  True: recorded payload (or an earlier segment /
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
+        final_text = copy_free_text_for(self.adapter, final_text or "")  # buffers never hold copy blocks
         target = self._display_payload(final_text)
         if not target:
             return None
@@ -368,7 +376,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def has_delivered_text(self, text: str) -> bool:
         """Return True if *text* was already delivered as visible chat content."""
-        target = self._clean_for_display(text or "").strip()
+        target = self._clean_for_display(copy_free_text_for(self.adapter, text or "")).strip()
         seen = (self._visible_prefix(), *self._delivered_commentary_texts,
                 *self._delivered_segment_texts)
         return bool(target) and any(sent.strip() == target for sent in seen)
@@ -378,7 +386,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         finalized segments always count; the visible prefix only once ``_already_sent`` (a draft frame
         sets ``_last_sent_text`` but is ephemeral — a failed finalize send after it must still fall
         back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
-        target = self._clean_for_display(text or "").strip()
+        target = self._clean_for_display(copy_free_text_for(self.adapter, text or "")).strip()
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
         if self._already_sent:
             seen.append(self._visible_prefix())
@@ -573,6 +581,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     self._flush_think_buffer()
+                    self._flush_copy_filter()
                     # Strip a trailing standalone marker only from substantive interactive
                     # replies. A bare marker remains unchanged for the existing silence path.
                     self._strip_final_marker_from_state()
@@ -612,6 +621,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if tick.commentary_text is not None:
                     await self._deliver_commentary(tick.commentary_text)
                 if tick.got_segment_break:
+                    self._copy_filter.message_boundary()
                     await self._end_segment(tick)
 
                 # Done last so the waiter unblocks only once everything queued
@@ -702,6 +712,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             else:
                 self._filter_and_accumulate(item)
 
+    def _flush_copy_filter(self) -> None:
+        """On stream end, release a held line that did not become a copy marker."""
+        tail = self._copy_filter.flush()
+        if tail:
+            self._accumulated += tail
+            self._stream_ledger += tail
+
     def _strip_final_silence_marker(self, text: str) -> str:
         """Apply the interactive trailing-marker filter at the final delivery boundary."""
         if not self.cfg.strip_trailing_silence_markers:
@@ -728,6 +745,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         strictly prefix-extends the ledger."""
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
+        final_raw = copy_free_text_for(self.adapter, final_raw)  # the buffers never hold copy blocks
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:

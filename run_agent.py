@@ -1577,7 +1577,8 @@ def main(
     print("\n" + "=" * 50 + "\n📋 CONVERSATION SUMMARY\n" + "=" * 50)
     print(f"✅ Completed: {result['completed']}\n📞 API Calls: {result['api_calls']}\n💬 Messages: {len(result['messages'])}")
     if result['final_response']:
-        print("\n🎯 FINAL RESPONSE:\n" + "-" * 30 + "\n" + result['final_response'])
+        from gateway.copy_blocks import render_copy_blocks_inline
+        print("\n🎯 FINAL RESPONSE:\n" + "-" * 30 + "\n" + render_copy_blocks_inline(result['final_response']))
     if save_sample:
         _save_sample_trajectory(agent, result, user_query, model)
     print("\n👋 Agent execution completed!")
