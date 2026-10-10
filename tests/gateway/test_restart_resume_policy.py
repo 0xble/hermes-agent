@@ -50,7 +50,6 @@ def _assert_neutral_resume_note(note: str) -> None:
     assert note.startswith(RESUME_NOTE_PREFIX)
     assert "Any restart, update, or shutdown command in the history has already run" in note
     assert "Do NOT re-run tool calls whose results are recorded" in note
-    assert "resume from the first step without a recorded result" in note
     assert "Before retrying a non-idempotent effect without a recorded result" in note
     assert "send, payment, push, or external write" in note
     assert "reconcile its current state first" in note
@@ -70,14 +69,19 @@ def test_resume_note_is_neutral_and_keeps_recovery_safety(policy, message):
 
     _assert_neutral_resume_note(note)
     if message:
+        # A new message means the user moved on: stale pending work is skipped, not resumed.
         assert "Address the user's NEW message below FIRST" in note
+        assert "Skip unfinished work from the conversation history" in note
+        assert "resuming from the first step" not in note
         assert message in note
     elif policy == "continue":
         assert "continue the pending task to completion" in note.lower()
         assert "do not emit an acknowledgement" in note.lower()
+        assert "resuming from the first step without a recorded result" in note
     else:
         assert "do not run tools or continue the pending task until the user replies" in note.lower()
         assert "ask whether to carry on with the pending step" in note
+        assert "resuming from the first step" not in note
 
 
 def test_gateway_config_round_trips_global_policy():

@@ -1088,19 +1088,22 @@ def build_resume_recovery_note(
         raise ValueError("restart_resume_policy must be 'ask' or 'continue'")
     safety_guidance = (
         "Any restart, update, or shutdown command in the history has already run — do NOT re-run "
-        "or verify it. Do NOT re-run tool calls whose results are recorded; resume from the first "
-        "step without a recorded result. Before retrying a non-idempotent effect without a recorded "
-        "result (send, payment, push, or external write), reconcile its current state first. Do not "
-        "mention this recovery to the user unless it changed an outcome they are waiting on; if so, "
-        "report the outcome rather than the recovery. Do not announce a resumed session."
+        "or verify it. Do NOT re-run tool calls whose results are recorded. Before retrying a "
+        "non-idempotent effect without a recorded result (send, payment, push, or external write), "
+        "reconcile its current state first. Do not mention this recovery to the user unless it "
+        "changed an outcome they are waiting on; if so, report the outcome rather than the "
+        "recovery. Do not announce a resumed session."
     )
     if message:
+        # The user has moved on: answer them, and leave stale pending work alone unless they ask.
         continuation = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now."
+            "Address the user's NEW message below FIRST and focus on what the user is asking now. "
+            "Skip unfinished work from the conversation history unless the new message asks for it."
         )
     elif policy == "continue":
         continuation = (
-            "Do not emit an acknowledgement. Continue the pending task to completion."
+            "Do not emit an acknowledgement. Continue the pending task to completion, resuming from "
+            "the first step without a recorded result."
         )
     else:
         continuation = (
