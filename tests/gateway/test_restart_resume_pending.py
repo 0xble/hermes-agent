@@ -545,7 +545,9 @@ async def test_drain_timeout_marks_resume_pending():
 
     # Plug a mock session_store that records marks.
     session_store = MagicMock()
-    session_store.mark_resume_pending = MagicMock(return_value=True)
+    session_store.mark_resume_pending_many = MagicMock(
+        side_effect=lambda markers, _reason: [key for key, _turn_id, _human in markers],
+    )
     runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
@@ -554,11 +556,12 @@ async def test_drain_timeout_marks_resume_pending():
         await runner.stop()
 
     # Both active sessions were marked with the shutdown_timeout reason.
-    calls = session_store.mark_resume_pending.call_args_list
-    marked = {args[0][0] for args in calls}
-    assert marked == {session_key_one, session_key_two}
+    calls = session_store.mark_resume_pending_many.call_args_list
+    assert len(calls) == 2  # pre-drain and the timeout pass both use the bulk boundary
     for args in calls:
-        assert args[0][1] == "shutdown_timeout"
+        markers, reason = args[0]
+        assert {key for key, _turn_id, _human in markers} == {session_key_one, session_key_two}
+        assert reason == "shutdown_timeout"
 
 
 # ---------------------------------------------------------------------------

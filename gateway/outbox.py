@@ -117,6 +117,9 @@ def active_turn():
 
 
 def transport_id(event) -> str | None:
+    admission_id = getattr(event, "_outbox_admission_id", None)
+    if admission_id is not None:
+        return str(admission_id)
     update_id = getattr(event, "platform_update_id", None)
     if update_id is not None:
         return f"update:{update_id}"

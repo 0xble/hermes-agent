@@ -212,6 +212,122 @@ def test_ceiling_comes_from_platform_extra(tmp_path):
     assert _adapter(tmp_path, ceiling=1234)._daily_quota().soft_ceiling == 1234
 
 
+def _voice_runner_and_event(adapter):
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(stt_enabled=True)
+    runner._queued_events = {}
+    runner._draining = False
+    runner._session_run_generation = {}
+    runner._should_echo_stt_transcripts = lambda: True
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._reply_anchor_for_event = lambda event: None
+    runner._thread_metadata_for_source = lambda source, anchor: {"thread_id": source.thread_id}
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT, thread_id="42", chat_type="group")
+    event = MessageEvent(
+        text="", message_type=MessageType.VOICE, source=source,
+        media_urls=["/voice.ogg"], media_types=["audio/ogg"],
+    )
+    runner._enrich_message_with_transcription = AsyncMock(return_value=('"queued words"', ["queued words"]))
+    return runner, event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["prefetch", "overflow-drain", "idle"])
+@pytest.mark.parametrize("trigger", ["goal", "untagged"])
+async def test_busy_voice_echo_survives_background_daily_pressure(tmp_path, path, trigger):
+    """Use the real gateway queue/drain and Telegram send, faking only STT and the Bot API."""
+    from plugins.platforms.telegram.chat_budget import bind_trigger, current_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 11)  # already above the soft ceiling
+    runner, event = _voice_runner_and_event(adapter)
+    session_key = "telegram:group:voice-topic"
+    token = (
+        bind_trigger(SimpleNamespace(text="[Continuing toward your standing goal]", internal=True))
+        if trigger == "goal" else None
+    )
+    try:
+        assert current_trigger() == trigger
+        with outbound_class(OUTBOUND_NOTICE):  # inherit the busy background turn's outbound context too
+            if path == "prefetch":
+                adapter.send = AsyncMock(wraps=adapter.send)
+                runner._enqueue_fifo(session_key, event, adapter)
+                await event._gateway_pending_stt_prefetch
+                assert adapter._pending_messages[session_key] is event
+                assert adapter.send.await_args.kwargs["metadata"]["_interim_send"] is True
+            elif path == "idle":
+                assert await runner._enrich_inbound_voice(
+                    event, event.source, "", event.media_urls,
+                ) == '"queued words"'
+            else:
+                # Overflow promotion bypasses Telegram.get_pending_message's trigger rebinding.
+                runner._session_state(session_key).conversation.queued_events.append(event)
+                drained, text = await runner._run_agent_drain_pending(
+                    {"final_response": "done"}, adapter, event.source, session_key,
+                )
+                assert drained is event and text == '"queued words"'
+        adapter._bot.send_message.assert_awaited_once()
+        sent = adapter._bot.send_message.await_args.kwargs
+        assert "🎙️" in sent["text"] and "queued words" in sent["text"]
+        assert sent["message_thread_id"] == 42
+        runner._enrich_message_with_transcription.assert_awaited_once()
+        assert current_trigger() == trigger  # no echo exemption leaks into background sends
+        with outbound_class(OUTBOUND_NOTICE):
+            assert (await adapter.send(CHAT, "goal notice")).error == "daily_budget_shed"
+        with outbound_class(OUTBOUND_PROGRESS):
+            assert (await adapter.send(CHAT, "background progress")).error == "daily_budget_shed"
+        adapter._bot.send_message.assert_awaited_once()
+    finally:
+        if token is not None:
+            reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_internal_voice_echo_does_not_gain_user_priority(tmp_path, caplog):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 11)
+    runner, event = _voice_runner_and_event(adapter)
+    event.internal = True
+    token = bind_trigger(SimpleNamespace(text="[Continuing toward your standing goal]", internal=True))
+    try:
+        with outbound_class(OUTBOUND_NOTICE):
+            await runner._echo_pending_stt_transcripts_once(
+                event, adapter, event.source, ["internal words"], metadata={"_interim_send": True},
+            )
+    finally:
+        reset_trigger(token)
+    adapter._bot.send_message.assert_not_awaited()
+    assert any("daily_budget_shed" in r.getMessage() and r.levelno >= logging.INFO for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["daily_budget_shed", "raised"])
+async def test_failed_voice_echo_is_visible_without_debug_logging(tmp_path, caplog, failure):
+    adapter = _adapter(tmp_path)
+    runner, event = _voice_runner_and_event(adapter)
+    adapter.send = AsyncMock(
+        side_effect=RuntimeError("echo transport failed") if failure == "raised" else None,
+        return_value=SendResult(success=False, error="daily_budget_shed"),
+    )
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    await runner._echo_pending_stt_transcripts_once(
+        event, adapter, event.source, ["private transcript"], log_context="Voice-queue",
+    )
+    assert any(
+        r.levelno >= logging.INFO and "Voice-queue echo failed" in r.getMessage()
+        and ("daily_budget_shed" if failure == "daily_budget_shed" else "echo transport failed") in r.getMessage()
+        for r in caplog.records
+    )
+    assert all("private transcript" not in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_installed_request_limiter_shares_the_adapter_quota(tmp_path):
     """The PTB limiter built for the live bot must meter and shed with the adapter's own ledger."""

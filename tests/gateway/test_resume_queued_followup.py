@@ -92,6 +92,155 @@ def _spooled_runner(tmp_path, monkeypatch, *, pending=True, session_id="sid"):
 
 
 @pytest.mark.asyncio
+async def test_reconnect_restore_gate_is_set_before_interrupted_note_delivery(tmp_path, monkeypatch):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    entry = runner.session_store._entries[key]
+    entry.resume_turn_id = "resume-reconnect"
+    queued = MessageEvent(text="older spooled follow-up", source=source, user_id="u1")
+    assert flush_pending_to_file({key: queued}, reason="reconnect") == 1
+
+    note_started = asyncio.Event()
+    release_note = asyncio.Event()
+    resumed = asyncio.Event()
+    handled = []
+
+    async def send_notes(*_args, **_kwargs):
+        note_started.set()
+        await release_note.wait()
+
+    async def handle(event):
+        handled.append(event)
+        if event.internal:
+            resumed.set()
+            entry.resume_pending = False
+
+    runner._send_interrupted_turn_notes = send_notes
+    runner._auto_resume_ready = lambda _entry, **_kwargs: (adapter, source)
+    adapter.handle_message = handle
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, _source: event)
+    runner._is_user_authorized_for_source = lambda _source: True
+    runner._admit_bot_message_for_source = lambda _source: True
+    runner._normalize_source_for_session_key = lambda value: value
+    runner._session_key_for_source = lambda _source: key
+    runner._startup_restore_queue = []
+    runner._reconnect_restore_keys = {}
+
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(note_started.wait(), 2)
+    assert key in runner._reconnect_restore_keys
+
+    fresh = MessageEvent(text="arrived during reconnect", source=source, user_id="u1")
+    assert await runner._hm_admit_event(fresh) is None
+    assert runner._startup_restore_queue[-1] is fresh
+    assert runner._startup_restore_queue[0].text == "older spooled follow-up"
+    assert not resumed.is_set()
+
+    release_note.set()
+    await asyncio.wait_for(recovery, 10)
+    assert resumed.is_set()
+    assert [event.text for event in handled if not event.internal] == [
+        "older spooled follow-up", "arrived during reconnect",
+    ]
+    assert runner._reconnect_restore_keys == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["primary", "secondary"])
+async def test_reconnect_note_scan_failure_still_drains_spool(tmp_path, monkeypatch, caplog, route):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._reconnect_restore_keys = {}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    spool_home = tmp_path
+    entry = runner.session_store._entries.pop(key)
+    if route == "secondary":
+        spool_home = tmp_path / "other"
+        spool_home.mkdir()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._primary_profile_name = "default"
+        runner._served_profile_homes = {"default": tmp_path, "other": spool_home}
+        source = replace(source, profile="other")
+        key = runner._session_key_for_source(source)
+        entry.origin = source
+        entry.session_key = key
+    entry.resume_turn_id = "resume-reconnect"
+    runner.session_store._entries[key] = entry
+    with _profile_runtime_scope(spool_home, prepared_secret_scope={}):
+        assert flush_pending_to_file({key: MessageEvent(text="owed follow-up", source=source, user_id="u1")}) == 1
+    spool, = (spool_home / "pending_messages").glob("*.json")
+
+    def ready(_entry, *, require_adapter=True):
+        # Spool admission succeeds; the later interrupted-note scan fails.
+        if require_adapter:
+            raise RuntimeError("note candidate identity failed")
+        return adapter, source
+
+    async def handle(event):
+        assert runner._reconnect_restore_keys == {key: 1}
+        event._gateway_accepted = True
+
+    runner._auto_resume_ready = MagicMock(side_effect=ready)
+    runner._send_interrupted_turn_notes = AsyncMock()
+    runner._sync_voice_mode_state_to_adapter = MagicMock()
+    runner._schedule_planned_restart_replay = MagicMock()
+    runner._redeliver_failed_obligations_for_platform = AsyncMock()
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    # Stop a regressed secondary reconnect immediately instead of waiting for its retry backoff.
+    adapter.disconnect = AsyncMock(side_effect=lambda: setattr(runner, "_running", False))
+    if route == "primary":
+        runner._failed_platforms = {source.platform: {}}
+        runner._publish_primary_adapter = lambda platform, adapter: runner.adapters.__setitem__(platform, adapter)
+        runner._update_platform_runtime_status = MagicMock()
+        await runner._install_reconnected_adapter(source.platform, adapter)
+        await runner._reconnect_spool_tasks[source.platform]
+        assert runner.adapters[source.platform] is adapter
+    else:
+        runner._secondary_reconnect_attempt = AsyncMock(return_value=(adapter, True))
+        await runner._run_secondary_profile_reconnect("other", source.platform)
+        assert runner._profile_adapters["other"][source.platform] is adapter
+    adapter.disconnect.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.call_args.args[0].text == "owed follow-up"
+    assert not spool.exists()
+    assert runner._startup_restore_queue == []
+    assert runner._reconnect_restore_keys == {}
+    runner._send_interrupted_turn_notes.assert_not_awaited()
+    assert "Pending auto-resume after telegram reconnect failed" in caplog.text
+    db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restore_gate_is_released_when_note_delivery_is_cancelled(tmp_path, monkeypatch):
+    runner, adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    entry = runner.session_store._entries[key]
+    entry.resume_turn_id = "resume-reconnect"
+
+    note_started = asyncio.Event()
+
+    async def send_notes(*_args, **_kwargs):
+        note_started.set()
+        await asyncio.Event().wait()
+
+    runner._send_interrupted_turn_notes = send_notes
+    runner._auto_resume_ready = lambda _entry, **_kwargs: (adapter, source)
+    runner._session_key_for_source = lambda _source: key
+    runner._normalize_source_for_session_key = lambda value: value
+    runner._reconnect_restore_keys = {}
+
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(note_started.wait(), 2)
+    assert runner._reconnect_restore_keys == {key: 1}
+
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    assert runner._reconnect_restore_keys == {}
+
+
+@pytest.mark.asyncio
 async def test_reconnect_during_drain_retains_arrival_for_boot(tmp_path, monkeypatch):
     runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=False)
     runner._startup_restore_in_progress = False
