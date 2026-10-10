@@ -1662,7 +1662,9 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # otherwise the new child is indistinguishable from a manual process and the sweep
     # SIGTERMs it before launchd's throttle window can settle.
     from hermes_cli.gateway_supervised_restart import gateway_declares_external_supervisor
-    service_pids = _get_service_pids(all_profiles=True)
+    from hermes_cli.update_cmd_posix_pause import already_restarted
+    # Plus gateways this update paused and already resumed on the new code.
+    service_pids = _get_service_pids(all_profiles=True) | already_restarted()["pids"]
     candidate_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
     mapped_processes = {
         proc.pid: proc

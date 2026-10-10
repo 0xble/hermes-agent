@@ -767,6 +767,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   assignment in `gateway/run_turn_runner.py`. Restore it unconditionally so voice
   turns use `auxiliary.voice_chat` and a reused agent resets the flag on typed
   turns. Guard: `scripts/run_tests.sh tests/gateway/test_display_null_turn_wiring.py tests/agent/test_voice_turn_route.py`.
+- Restore upstream's `already_restarted()["pids"]` exclusion in the manual/stuck
+  gateway sweep: POSIX gateways resumed by this update are healthy successors,
+  not stale manual PIDs. Keep the fork's external-supervisor protection and
+  cover both mapped and unmapped resumed gateways. Guard:
+  `scripts/run_tests.sh tests/hermes_cli/test_update_external_supervisor_sweep.py tests/hermes_cli/test_update_outgoing_gateway_identity.py`.
+  The outgoing-identity test's service-PID double returns a set, matching the
+  production helper and upstream's set-union contract.
 
 ## Gateway Subcommand Exit Codes
 
