@@ -315,8 +315,8 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
 
 
 _STATE_PHRASE = {
-    "unknown": "its owning process exited before recording a result, so its outcome is unknown",
-    "interrupted": "it was interrupted before finishing (shutdown, restart, or an explicit stop)",
+    "unknown": "no terminal result was recorded, so its outcome is unknown",
+    "interrupted": "it stopped before finishing",
     "stalled": "it stopped making progress and was force-finalized as stalled",
 }
 
