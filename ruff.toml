@@ -454,6 +454,7 @@ select = [
   #  "TRY201",
   #  "TRY203",
   #  "TRY401",
+  "TID251"
 ]
 
 [lint.mccabe]
