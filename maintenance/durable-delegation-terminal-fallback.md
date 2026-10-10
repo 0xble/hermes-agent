@@ -12,9 +12,15 @@ notices or terminal results that could not be written to the lifecycle row
   lifecycle write raised (`terminal_fallback`) are stored as durable outbox
   rows in `async_delegation_events`, each with its own event id and delivery
   state. Restart and orphan recovery replay them like lifecycle rows.
-- A `terminal_fallback` row marks the delegation lifecycle row terminal in the
-  same transaction, so owner-death recovery does not also replay a synthetic
-  `unknown` completion for the same unit.
+- A `terminal_fallback` row claims the delegation lifecycle row in the same
+  transaction as its outbox insert. A zero-row conditional transition rolls
+  the insert back, so a competing terminal writer cannot create a redundant
+  deliverable.
+- Ambiguous completion writes reconcile the lifecycle payload and fallback
+  outbox before queueing. The authoritative payload is delivered once; a losing
+  terminal writer does not enqueue its result beside the winner. If durable
+  state is unavailable or absent, the real result remains an explicitly
+  in-memory-only event without a phantom outbox identity.
 - Index-less task notices get collision-safe event ids.
 - Session recovery registers `async_delegation_events`, so a rebuilt
   `state.db` keeps undelivered outbox rows.
@@ -37,19 +43,20 @@ The gateway settlement side is owned by
 and the interim notice contract by
 [Internal notification silence](internal-notification-silence.md).
 
-## Known gaps
+## Resolved race coverage
 
-- If a competing terminal transition already won, the conditional lifecycle
-  update matches no row but the fallback outbox row still commits, so the
-  parent can receive two completions. This needs the first terminal write to
-  raise, so it is rare.
-- A stale pending `task_failure` notice can replay after the unit's final
-  result on restart.
+- A commit-then-raise completion is reconciled against the terminal lifecycle
+  row before fallback creation, so it cannot gain a second outbox replay.
+- A competing terminal transition owns the durable payload; the losing worker
+  does not enqueue a second terminal notification.
+- A fallback insert and its lifecycle claim are one conditional transaction.
+- Ordinary terminal failures, interim notices, duplicate fallback invocation,
+  and unavailable/missing persistence retain their existing behavior and are
+  covered by focused regression tests.
 
 ## Verification
 
-Run `scripts/run_tests.sh tests/tools/test_async_batch_task_failure_notice.py
-tests/hermes_cli/test_session_recovery.py tests/gateway/test_completion_delivery.py`.
+Run `scripts/run_tests.sh tests/tools/test_async_terminal_fallback_ownership.py tests/tools/test_async_batch_task_failure_notice.py tests/hermes_cli/test_session_recovery.py tests/gateway/test_completion_delivery.py`.
 
 ## Retirement and rollback
 

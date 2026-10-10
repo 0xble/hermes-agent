@@ -389,38 +389,87 @@ def _persist_outbox_event(
     event: Dict[str, Any], result: Optional[Dict[str, Any]], *, event_kind: str,
     terminal_status: Optional[str] = None, expected_state: Optional[str] = None,
 ) -> str:
-    """Persist a non-terminal or fallback event before it enters a process-local queue.
+    """Persist one event, conditionally claiming terminal-fallback ownership.
 
-    The parent lifecycle row remains the source of truth for ordinary terminal
-    completions. This small outbox is for events that must have their own
-    delivery identity: interim child failures must not claim the final row, and
-    a terminal write failure must not degrade to a memory-only result.
+    A fallback is one transaction: its outbox insert is committed only when the
+    expected lifecycle row is still active.  A zero-row transition rolls back
+    the insert, so a competing terminal writer cannot acquire a second durable
+    delivery identity.
     """
     event_id = _outbox_event_id(event, event_kind)
     persisted = dict(event)
     persisted["_delivery_event_id"] = event_id
     now = time.time()
+    result_json = json.dumps(result) if result is not None else None
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO async_delegation_events
                (event_id, delegation_id, event_kind, event_json, result_json, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, event["delegation_id"], event_kind, json.dumps(persisted),
-             json.dumps(result) if result is not None else None, now, now),
+            (event_id, event["delegation_id"], event_kind, json.dumps(persisted), result_json, now, now),
         )
         if terminal_status is not None:
-            # The outbox owns delivery, but the lifecycle row must still become
-            # terminal. Otherwise a dead-owner restart classifies it as unknown
-            # and replays a second, synthetic completion beside this outbox event.
-            conn.execute(
+            # The lifecycle transition is the ownership check.  Do it after the
+            # insert inside the same transaction so a competing winner rolls the
+            # INSERT back instead of leaving a redundant fallback row.
+            changed = conn.execute(
                 """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?, result_json=?
                    WHERE delegation_id=? AND state=?""",
-                (terminal_status, event.get("completed_at", now), now,
-                 json.dumps(result) if result is not None else None,
+                (terminal_status, event.get("completed_at", now), now, result_json,
                  event["delegation_id"], expected_state or "running"),
-            )
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    f"async delegation {event['delegation_id']} terminal fallback lost ownership "
+                    f"of expected state {expected_state or 'running'} (changed {changed} rows)"
+                )
     event["_delivery_event_id"] = event_id
     return event_id
+
+
+def _terminal_payload_matches(raw: Optional[str], payload: Optional[Dict[str, Any]]) -> bool:
+    if raw is None or payload is None:
+        return raw is None and payload is None
+    try:
+        return json.loads(raw) == payload
+    except (TypeError, ValueError):
+        return False
+
+
+def _reconcile_terminal_write(
+    event: Dict[str, Any], result: Dict[str, Any], expected_state: str,
+) -> str:
+    """Classify an ambiguous terminal write without creating a second event.
+
+    ``lifecycle`` and ``outbox`` mean the supplied payload already won.  A
+    different terminal payload means another writer won.  ``active`` and
+    ``missing`` preserve the live result in memory when no durable owner exists.
+    """
+    event_id = _outbox_event_id(event, "terminal_fallback")
+    persisted_event = dict(event)
+    persisted_event["_delivery_event_id"] = event_id
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        state, event_json, result_json = row
+        if state in _TERMINAL_STATES:
+            if _terminal_payload_matches(result_json, result):
+                if event_json is not None and _terminal_payload_matches(event_json, event):
+                    return "lifecycle"
+                outbox = conn.execute(
+                    "SELECT event_json, result_json FROM async_delegation_events "
+                    "WHERE event_id=? AND delivery_state IN ('pending', 'delivered')",
+                    (event_id,),
+                ).fetchone()
+                if outbox and _terminal_payload_matches(outbox[0], persisted_event) \
+                        and _terminal_payload_matches(outbox[1], result):
+                    return "outbox"
+            return "competing"
+        return "active" if state == expected_state else "competing"
 
 
 def _outbox_event_id_from_claim(claim_id: str) -> Optional[str]:
@@ -1818,33 +1867,60 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
                     label, record.get("delegation_id"), record["superseded_by"])
         return
+    queue_event = False
+    expected_state = record.get("_durable_state") or "running"
+    terminal_status = record.get("_terminal_state") or status
     try:
         persist_evt = dict(evt)
-        persist_evt["status"] = record.get("_terminal_state") or status
-        ok = _persist_completion(persist_evt, result, expected_state=record.get("_durable_state") or "running")
-        if not ok:
-            # Explicit reconcile: a competing terminal transition won the
-            # conditional update. Never replace its event/result payload.
-            durable = _record_context_run(record, _durable_state, record["delegation_id"])
-            logger.error("Async delegation %s terminal reconcile found durable state %s",
-                         record.get("delegation_id"), durable.get("state") if durable else None)
+        persist_evt["status"] = terminal_status
+        ok = _persist_completion(persist_evt, result, expected_state=expected_state)
+        if ok:
+            queue_event = True
+        else:
+            # A competing terminal writer owns delivery.  Only a missing or
+            # mismatched row gets an in-memory copy; never enqueue a loser beside
+            # an authoritative durable terminal result.
+            disposition = _record_context_run(
+                record, _reconcile_terminal_write, evt, result, expected_state)
+            queue_event = disposition in {"missing", "active"}
+            logger.error("Async delegation %s terminal reconcile after zero-row write: %s",
+                         record.get("delegation_id"), disposition)
     except Exception as exc:  # noqa: BLE001 — retain the result in the durable outbox
-        logger.error("Async delegation%s %s: durable terminal row write failed; persisting a delivery outbox event: %s",
+        logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
                      label, record.get("delegation_id"), exc)
         try:
-            _persist_outbox_event(
-                evt, result, event_kind="terminal_fallback",
-                terminal_status=record.get("_terminal_state") or status,
-                expected_state=record.get("_durable_state") or "running",
-            )
+            disposition = _record_context_run(
+                record, _reconcile_terminal_write, evt, result, expected_state)
         except Exception:
-            logger.error("Async delegation%s %s: durable terminal outbox write failed; delivering in-memory only: %s",
-                         label, record.get("delegation_id"), exc, exc_info=True)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
-                     "result lost: %s", record.get("delegation_id"), exc)
+            disposition = "unavailable"
+        if disposition in {"lifecycle", "outbox"}:
+            queue_event = True
+        elif disposition == "active":
+            try:
+                _persist_outbox_event(
+                    evt, result, event_kind="terminal_fallback",
+                    terminal_status=terminal_status, expected_state=expected_state,
+                )
+            except Exception as fallback_exc:
+                logger.error("Async delegation%s %s: durable terminal outbox write failed; "
+                             "delivering in-memory only: %s", label, record.get("delegation_id"),
+                             fallback_exc, exc_info=True)
+                queue_event = True
+            else:
+                queue_event = True
+        elif disposition in {"missing", "unavailable"}:
+            # Preserve the real result for the live consumer, but do not stamp
+            # an outbox identity for a row that does not exist or cannot be read.
+            queue_event = True
+        else:
+            logger.error("Async delegation %s terminal fallback lost ownership to a competing result",
+                         record.get("delegation_id"))
+    if queue_event:
+        try:
+            process_registry.completion_queue.put(evt)
+        except Exception as exc:  # pragma: no cover
+            logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
+                         "result lost: %s", record.get("delegation_id"), exc)
 
 
 def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tasks: int) -> None:
