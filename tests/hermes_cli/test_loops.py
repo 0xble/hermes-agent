@@ -620,6 +620,29 @@ class TestTickLifecycle:
         stored = load_loop("t-pr")
         assert stored.ticks_fired == 0 and stored.awaiting_response is False
 
+    def test_reset_under_a_frozen_clock_is_a_new_instance(self, hermes_home, monkeypatch):
+        """Clear-then-set at the same clock reading must not let the old scheduler or tick match."""
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        frozen = 1_800_000_000.0
+        monkeypatch.setattr(time, "time", lambda: frozen)
+        state = LoopManager(session_id="t-frz").set("old task", interval_seconds=300)
+        state.next_due_at = frozen - 1
+        save_loop("t-frz", state)
+        scheduler = LoopManager(session_id="t-frz")
+        inflight = LoopManager(session_id="t-frz")
+        assert inflight.fire_tick()
+        LoopManager(session_id="t-frz").clear()
+        fresh = LoopManager(session_id="t-frz").set("new task", interval_seconds=300)
+        assert fresh.created_at > state.created_at
+        fresh.next_due_at = frozen - 1
+        save_loop("t-frz", fresh)
+        assert scheduler.fire_tick() is None
+        decision = inflight.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-frz")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "new task" and stored.ticks_fired == 0
+
     def test_revise_during_tick_survives_completion(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 

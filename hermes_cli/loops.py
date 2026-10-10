@@ -642,7 +642,16 @@ class LoopManager:
         if not prompt:
             raise ValueError("loop prompt is empty")
 
-        now = time.time()
+        # created_at is the loop-instance fence for tick claims and outcomes, so a new instance
+        # must be strictly later than the stored one (cleared rows stay stored) even when the
+        # clock is coarse or frozen; otherwise a stale scheduler or completion could match it.
+        stored = load_loop(self.session_id) if self._cursor is None else load_loop(
+            self.session_id, cursor=self._cursor)
+        prior = max(
+            float(getattr(self._state, "created_at", 0.0) or 0.0),
+            float(getattr(stored, "created_at", 0.0) or 0.0),
+        )
+        now = max(time.time(), prior + 1e-6)
         self_paced = interval_seconds is None
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         state = LoopState(
