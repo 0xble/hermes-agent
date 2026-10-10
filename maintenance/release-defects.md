@@ -704,7 +704,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   its own update marker. Root-home requests keep their original socket and payload.
 - Guards: `tests/hermes_cli/test_gateway_agent_update_owner.py` uses a real isolated owner
   socket and rendezvous record; its named-profile case fails on the base while the root
-  control passes. `tests/gateway/test_agent_update_profile_scope.py` distinguishes identical
-  session IDs in two real profile databases and rejects unserved/traversal profile names.
+  control passes. `tests/gateway/test_agent_update_profile_scope.py` restores
+  `hermes_state.DEFAULT_DB_PATH` to its import-time sentinel after proving call-time
+  resolution remains inside the sandbox, then distinguishes identical session IDs in two
+  real profile databases and rejects unserved/traversal profile names.
 - Retire with `update-lifecycle` only when a released upstream provides equivalent
   owner-routed, profile-scoped agent handoff and reason-bearing update notifications.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -24,6 +25,16 @@ def test_agent_update_uses_only_the_served_profiles_session_store(tmp_path, monk
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr("hermes_constants._default_hermes_root_memo", None)
+    # The hermetic conftest pins ``hermes_state.DEFAULT_DB_PATH`` at one sandbox store whenever
+    # hermes_state is already imported, and that pin WINS over ``get_hermes_home()`` inside
+    # ``_default_db_path()`` — exactly the per-profile resolution this test exists to prove.
+    # Restore the import-time sentinel so the two seed rows land in their own stores.
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    # Disabling the hermetic pin is only safe while the sentinel still resolves INSIDE the sandbox:
+    # a resolution that escaped to the real home would have this test writing the live store.
+    resolved = Path(hermes_state._default_db_path())
+    assert resolved.is_relative_to(tmp_path), f"unpinned store escaped the sandbox: {resolved}"
     runner = object.__new__(GatewayRunner)
     runner._session_db_pinned = _SESSION_DB_UNPINNED
     runner._session_db_handles = {}
