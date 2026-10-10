@@ -425,9 +425,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
     quote_check = check_user_quote(requester_sid, user_quote)
     if isinstance(quote_check, str):
-        code = quote_check
-        if user_quote:
-            return {"ok": False, "error_code": code, "error": code}
+        # A missing or refused quote (stale, paraphrased, relayed, negated) never authorizes the
+        # control; it falls back to an Approve/Deny request so Brian decides.
         try:
             record = request_control(kind, action, target_sid, requester_sid=requester_sid,
                                      reason=reason, payload=payload)
@@ -435,7 +434,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             return {"ok": False, "error_code": str(exc), "error": str(exc)}
         if not record.get("id"):
             return record
-        return {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
+        outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
+        if user_quote:
+            outcome["quote_refused"] = quote_check
+        return outcome
     def apply(conn):
         # Recheck after acquiring the write lock: a newer message must not inherit an older quote.
         checked = check_user_quote(requester_sid, user_quote, cursor=conn)

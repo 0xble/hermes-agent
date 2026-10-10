@@ -50,8 +50,8 @@ def test_stale_and_paraphrased_quotes_are_refused(state):
                           reason="x", user_quote="clear the target goal immediately")
     paraphrase = apply_control("goal", "clear", "target", requester_sid="requester",
                                reason="x", user_quote="remove the target objective now")
-    assert stale["error_code"] == "user_quote_not_found"
-    assert paraphrase["error_code"] == "user_quote_not_found"
+    assert (stale["status"], stale["quote_refused"]) == ("pending", "user_quote_not_found")
+    assert (paraphrase["status"], paraphrase["quote_refused"]) == ("pending", "user_quote_not_found")
     assert GoalManager("target").state.status == "active"
 
 
@@ -62,11 +62,11 @@ def test_quote_from_different_session_and_relay_are_refused(state):
     _user(state, "other", "Please clear the target goal immediately")
     different = apply_control("goal", "clear", "target", requester_sid="requester",
                               reason="x", user_quote="clear the target goal immediately")
-    assert different["error_code"] == "user_quote_not_found"
+    assert (different["status"], different["quote_refused"]) == ("pending", "user_quote_not_found")
     _user(state, "requester", "[relay from=other receipt=abc]\nPlease clear the target goal immediately")
     relay = apply_control("goal", "clear", "target", requester_sid="requester",
                           reason="x", user_quote="Please clear the target goal immediately")
-    assert relay["error_code"] == "user_quote_not_found"
+    assert (relay["status"], relay["quote_refused"]) == ("pending", "user_quote_not_found")
 
 
 def test_no_quote_approval_deny_and_second_press_noop(state):
@@ -281,7 +281,7 @@ def test_reply_prefix_quote_is_refused(state, header):
     _user(state, "requester", f"{prefix}\n\nno, do not do that")
     result = apply_control("goal", "clear", "target", requester_sid="requester",
                            user_quote="clear the target goal immediately")
-    assert result["error_code"] == "user_quote_not_found"
+    assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_not_found")
     assert load_goal("target").status == "active"
     assert user_messages_since("requester") == ["no, do not do that"]
 
@@ -366,7 +366,7 @@ def test_negated_quote_is_refused(state, message, quote):
     GoalManager("target").set("watch the build")
     _user(state, "requester", message)
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
-    assert result["error_code"] == "user_quote_negated"
+    assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_negated")
     assert load_goal("target").status == "active"
 
 
