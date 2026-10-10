@@ -320,6 +320,13 @@ class TestContentExtraction:
         ]}
         assert _extract_message_content(msg) == "A\nB"
 
+    def test_assistant_copy_blocks_render_inline(self):
+        from mcp_serve import _extract_message_content
+        msg = {"role": "assistant", "content": "hi\n[[copy]]\nprompt\n[[/copy]]"}
+        assert _extract_message_content(msg) == "hi\nprompt\n"
+        user = {"role": "user", "content": "[[copy]]\nliteral\n[[/copy]]"}
+        assert _extract_message_content(user) == user["content"]
+
     def test_empty(self):
         from mcp_serve import _extract_message_content
         assert _extract_message_content({"content": ""}) == ""
@@ -347,6 +354,12 @@ class TestAttachmentExtraction:
         from mcp_serve import _extract_attachments
         msg = {"content": "MEDIA: /a.png and MEDIA: /b.mp3"}
         assert len(_extract_attachments(msg)) == 2
+
+    def test_media_line_inside_assistant_copy_block_is_literal_text(self):
+        from mcp_serve import _extract_attachments
+        msg = {"role": "assistant",
+               "content": "MEDIA: /real.png\n[[copy]]\nMEDIA:/paste/literal.txt\n[[/copy]]"}
+        assert _extract_attachments(msg) == [{"type": "media", "path": "/real.png"}]
 
     def test_no_attachments(self):
         from mcp_serve import _extract_attachments
