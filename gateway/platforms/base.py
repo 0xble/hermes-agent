@@ -4357,6 +4357,12 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
+        # Busy admission bypasses the normal inbound path, so apply the same relay-origin contract
+        # before any branch can queue, debounce, or merge the event. Once each complete event carries
+        # ``reply_expected=False``, MessageEvent.absorb_reply_expected preserves it only when every
+        # merged event is likewise unaddressed; a typed human event restores the visible fallback.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
         # calling the message handler directly and sending the response.  Do NOT use
