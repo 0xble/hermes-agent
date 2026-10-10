@@ -756,6 +756,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   50 removes them and its regression requires they stay absent; no bundled
   scanner is resurrected. The auto-merged legacy handoff keeps upstream's root
   receipt directory while adding fork main's `handoff_path()` discovery helper.
+- The merge verification caught schema drift outside the conflict hunk: the v3
+  efficiency toolset enum omitted `setup`, and v4 omitted `telegram_topic` plus
+  fork browser/setup tools from unavailable-tool counters. Both shipped schemas
+  now agree with the current contract for efficiency and unavailable-tool
+  dimensions; the regression checks both versions. The fork release-owner test
+  also follows upstream's renamed `read_config_version_stamp()` export without
+  weakening its migration and write-refusal assertions.
 
 ## Gateway Subcommand Exit Codes
 

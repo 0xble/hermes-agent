@@ -230,14 +230,17 @@ def test_turn_activity_buckets_reach_long_agentic_loops(count, bucket):
     assert bucket in contract.TURN_ACTIVITY_BUCKETS
 
 
-def test_v3_schema_accepts_exactly_the_contract_values():
+@pytest.mark.parametrize("schema_version", (3, 4))
+def test_efficiency_schema_accepts_exactly_the_contract_values(schema_version):
     import hermes_cli.observability as observability
 
-    schema = json.loads((Path(observability.__file__).parent / "schemas/hermes.shared_metrics.v4.schema.json").read_text())
+    schema = json.loads((Path(observability.__file__).parent /
+                         f"schemas/hermes.shared_metrics.v{schema_version}.schema.json").read_text())
     by_name = {d["properties"]["name"]["const"]: d for d in schema["$defs"].values() if "properties" in d}
     refs = {item["$ref"].rsplit("/", 1)[1] for item in schema["properties"]["metrics"]["items"]["oneOf"]}
     for metric in (contract.TASK_COST_METRIC, contract.WASTED_TOKENS_METRIC, contract.TOOL_OUTPUT_TRUNCATION_METRIC,
-                   contract.TOOL_OVERHEAD_METRIC, contract.TOOL_ENABLED_UNUSED_METRIC, contract.CACHE_BREAK_METRIC):
+                   contract.TOOL_OVERHEAD_METRIC, contract.TOOL_ENABLED_UNUSED_METRIC, contract.CACHE_BREAK_METRIC,
+                   contract.TOOL_UNAVAILABLE_METRIC):
         assert any(schema["$defs"][r]["properties"]["name"]["const"] == metric for r in refs if r.endswith("_counter"))
         dims = by_name[metric]["properties"]["dimensions"]["properties"]
         expected = contract._COUNTER_DIMENSION_VALUES[metric]
