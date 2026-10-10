@@ -243,6 +243,26 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
 - **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
 
+## Active patch record: shutdown spool fidelity
+
+- **Patch identity:** `shutdown-spool-fidelity`.
+- **Behavior:** a queued caption-less attachment (image, voice, file) is spooled and recovered: flush and recovery both reject only slots with neither text nor `media_urls`/`media`, and the transcript-append fallback writes the gateway's media placeholder when text is empty. Every spooled `MessageEvent` also keeps `message_type`, `media_text_inlined`, `reply_to_text`, `reply_to_author_id`, `reply_to_author_name`, and `reply_to_is_own_message`, and startup replay restores them, so a queued reply keeps its quoted context and voice/audio/document routing and text-inlining replay as they arrived. Old spool files without these keys recover as before (TEXT, no reply context).
+- **Source surfaces:** `gateway/shutdown_flush.py` (`has_user_content`, `_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Upstream status:** upstream v0.21.6 (`818c13be`) writes media-only events but its recovery still rejects empty text, so they stay spooled forever; it also drops reply context, `media_text_inlined`, and `message_type`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Retirement:** Remove when upstream spools and replays media-only events and reply context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-fidelity`.
+
+## Active patch record: release-owned config writes
+
+- **Patch identity:** `release-owned-config-writes`.
+- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. Agent-authored edits through the file tool are out of scope: they never stamp a schema. The refusal names the config path, running root and schema, live release and schema, and the live release directory whose hermes to run.
+- **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` `_atomic_write` (the primitive under every atomic config.yaml writer), `hermes_cli/config.py` `_write_config_state` (refuses before read-back checks), `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

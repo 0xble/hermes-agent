@@ -26,7 +26,7 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   persisted marker token is additive and older routing entries remain readable.
   This strengthens open upstream [#120758](https://github.com/NousResearch/hermes-agent/pull/120758)
   with a conditional clear instead of an unconditional write after awaits.
-- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. Empty text is not written as an invalid pending payload; errors are logged rather than silently claiming preservation.
+- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. A slot with neither text nor attachments is not written as an invalid pending payload (a caption-less attachment is kept); errors are logged rather than silently claiming preservation.
 - A tool-result tail interrupted before an assistant reply closes with a non-empty
   internal marker, not the legacy `Operation interrupted.` text. Exact marker
   echoes and legacy diagnostics are suppressed at delivery; unrelated prose is
