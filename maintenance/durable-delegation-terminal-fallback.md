@@ -47,12 +47,21 @@ and the interim notice contract by
 
 - A commit-then-raise completion is reconciled against the terminal lifecycle
   row before fallback creation, so it cannot gain a second outbox replay.
-- A competing terminal transition owns the durable payload; the losing worker
-  does not enqueue a second terminal notification.
+- A competing terminal transition owns the durable payload, including a winner
+  committed after the initial active-state read. Raised and zero-row writes use
+  the same conditional fallback path, and fallback exceptions reconcile again
+  before offering an event. The losing worker does not enqueue a notification.
+- A fallback commit-then-raise recovers its existing outbox delivery identity
+  before queueing, so acknowledging the live copy also settles restart replay.
 - A fallback insert and its lifecycle claim are one conditional transaction.
 - Ordinary terminal failures, interim notices, duplicate fallback invocation,
   and unavailable/missing persistence retain their existing behavior and are
   covered by focused regression tests.
+
+## Known gaps
+
+- A stale pending `task_failure` notice can replay after the unit's final
+  result on restart. This patch does not resolve interim-notice ordering.
 
 ## Verification
 

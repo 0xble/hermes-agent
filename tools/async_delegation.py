@@ -1867,35 +1867,29 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
                     label, record.get("delegation_id"), record["superseded_by"])
         return
-    queue_event = False
     expected_state = record.get("_durable_state") or "running"
     terminal_status = record.get("_terminal_state") or status
     try:
         persist_evt = dict(evt)
         persist_evt["status"] = terminal_status
         ok = _persist_completion(persist_evt, result, expected_state=expected_state)
-        if ok:
-            queue_event = True
-        else:
-            # A competing terminal writer owns delivery.  Only a missing or
-            # mismatched row gets an in-memory copy; never enqueue a loser beside
-            # an authoritative durable terminal result.
-            disposition = _record_context_run(
-                record, _reconcile_terminal_write, evt, result, expected_state)
-            queue_event = disposition in {"missing", "active"}
-            logger.error("Async delegation %s terminal reconcile after zero-row write: %s",
-                         record.get("delegation_id"), disposition)
-    except Exception as exc:  # noqa: BLE001 — retain the result in the durable outbox
+    except Exception as exc:  # noqa: BLE001 — reconcile an ambiguous terminal write
         logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
                      label, record.get("delegation_id"), exc)
-        try:
-            disposition = _record_context_run(
-                record, _reconcile_terminal_write, evt, result, expected_state)
-        except Exception:
-            disposition = "unavailable"
-        if disposition in {"lifecycle", "outbox"}:
-            queue_event = True
-        elif disposition == "active":
+        ok = False
+    queue_event = ok
+    if not ok:
+        def reconcile():
+            try:
+                return _record_context_run(
+                    record, _reconcile_terminal_write, evt, result, expected_state)
+            except Exception:
+                return "unavailable"
+
+        disposition = reconcile()
+        if disposition == "active":
+            # An active read is not ownership: both raised and zero-row writes
+            # must acquire the lifecycle row in the fallback transaction.
             try:
                 _persist_outbox_event(
                     evt, result, event_kind="terminal_fallback",
@@ -1903,16 +1897,20 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
                 )
             except Exception as fallback_exc:
                 logger.error("Async delegation%s %s: durable terminal outbox write failed; "
-                             "delivering in-memory only: %s", label, record.get("delegation_id"),
+                             "reconciling ownership: %s", label, record.get("delegation_id"),
                              fallback_exc, exc_info=True)
-                queue_event = True
+                # The CAS may have lost to a terminal writer after the active
+                # read, or this fallback may have committed before raising.
+                disposition = reconcile()
             else:
-                queue_event = True
-        elif disposition in {"missing", "unavailable"}:
-            # Preserve the real result for the live consumer, but do not stamp
-            # an outbox identity for a row that does not exist or cannot be read.
-            queue_event = True
+                disposition = "outbox"
+        queue_event = disposition in {"lifecycle", "outbox", "active", "missing", "unavailable"}
+        if disposition == "outbox":
+            # A commit-then-raise can precede _persist_outbox_event's stamp.
+            evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
         else:
+            evt.pop("_delivery_event_id", None)
+        if not queue_event:
             logger.error("Async delegation %s terminal fallback lost ownership to a competing result",
                          record.get("delegation_id"))
     if queue_event:
