@@ -58,16 +58,15 @@ def _live_runner():
 
 
 def check_telegram_topic_tool() -> bool:
-    """Reachability, not surface: a live gateway with a Telegram adapter under any profile it serves
-    (the primary's ``adapters`` or a multiplexed secondary's ``_profile_adapters``). The calling
-    profile's own adapter is resolved per call through ``_delivery_adapter_for``, which fails closed
-    for a disconnected secondary. The ``telegram_topic`` toolset (Telegram's platform bundle only)
-    is the surface gate."""
-    runner = _live_runner()
-    if runner is None:
-        return False
-    maps = [getattr(runner, "adapters", None) or {}, *(getattr(runner, "_profile_adapters", None) or {}).values()]
-    return any(Platform.TELEGRAM in (adapters or {}) for adapters in maps)
+    """A live gateway, nothing more. The ``telegram_topic`` toolset (Telegram's platform bundle only)
+    is the surface gate, and each call resolves the calling profile's own adapter through
+    ``_delivery_adapter_for``, failing closed when it is not connected.
+
+    The answer must not change while the gateway runs: ``get_tool_definitions`` memoizes its result
+    by toolset selection, not by check outcome, and the boot warm-up builds tool schemas before any
+    adapter connects. A check on connected adapters is False at that moment, and the first turns'
+    memoized schemas then drop the tool until the gateway restarts."""
+    return _live_runner() is not None
 
 
 def _calling_source(runner) -> Optional[SessionSource]:
