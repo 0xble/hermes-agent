@@ -40,6 +40,17 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   Delegated-child summaries skip this synthetic row and retain earlier real output.
 - All remaining adapter slots, runner pending slots, and FIFO overflow tails are spooled under the session key's owning served profile (including a secondary reached via the primary bot). Startup recovery walks the launch home and every served home in that home's runtime scope; a failed profile replay retains its spool without stopping other profiles.
 
+The `routine-restart-resume-note` patch also covers background process completion
+notices and delegation interruption/recovery text in
+`tools/process_registry_notifications.py`, `tools/async_delegation.py`, and
+`tools/delegation_resume.py`, plus `/goal` lifted-barrier text in
+`hermes_cli/goals.py`. Routine lifecycle stops report only the unfinished
+outcome, preserve exit codes and partial results, and require reconciliation of
+non-idempotent effects before retrying; diagnostic cause metadata remains intact.
+Untracked processes report unknown outcomes without guessing a cause.
+Explicit user-kill attribution, backend-loss wording, and failed-start wording
+remain unchanged.
+
 ## Provenance and patches
 
 - Fork patch identities: `restart-continuation`, `crash-left-media-resume`. Local narrow patch; no upstream
