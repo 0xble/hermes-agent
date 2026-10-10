@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.platforms.base import SendResult
 from gateway.copy_blocks import (
     CopyMarkerStreamFilter,
     extract_copy_blocks,
@@ -683,3 +684,21 @@ def test_partial_marker_still_carries_across_a_message_boundary() -> None:
     f.message_boundary()
     out += f.feed("py]]\nbody\n[[/copy]]\nafter\n") + f.flush()
     assert out == "intro\nbody\nafter\n"
+
+
+@pytest.mark.asyncio
+async def test_refused_copy_block_is_never_resent_with_a_fallback_banner() -> None:
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    sends = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append(content)
+        return SendResult(success=False, error="Bad Request: message rejected", retryable=False)
+
+    adapter.send = send
+    result = await adapter._send_with_retry(
+        chat_id="chat", content="exact body", reply_to=None,
+        metadata={"copy_block": True, "copy_block_index": 0, "plain": True})
+    assert result.success is False
+    assert sends == ["exact body"]

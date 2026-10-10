@@ -4004,6 +4004,12 @@ class BasePlatformAdapter(ABC):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
+        if isinstance(metadata, dict) and metadata.get("copy_block"):
+            # A copy block already went out as plain text, so formatting is not the cause, and a
+            # banner-prefixed resend would no longer be the exact text to copy. The failure stands
+            # and the delivery ledger owns the retry.
+            logger.warning("[%s] Copy block send failed: %s — not re-sending with a fallback banner", self.name, error_str)
+            return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
