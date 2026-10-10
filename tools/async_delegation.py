@@ -438,13 +438,18 @@ def _terminal_payload_matches(raw: Optional[str], payload: Optional[Dict[str, An
 
 def _reconcile_terminal_write(
     event: Dict[str, Any], result: Dict[str, Any], expected_state: str,
+    lifecycle_payload: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Classify an ambiguous terminal write without creating a second event.
 
-    ``lifecycle`` and ``outbox`` mean the supplied payload already won.  A
-    different terminal payload means another writer won.  ``active`` and
-    ``missing`` preserve the live result in memory when no durable owner exists.
+    ``event`` is the live event and ``lifecycle_payload`` the canonical lifecycle
+    payload, whose status can differ (a queued cancellation persists
+    ``cancelled`` but reports ``interrupted``).  ``lifecycle`` and ``outbox``
+    mean this writer's payload already won; a different terminal payload means
+    another writer won.  ``active`` means no terminal owner exists yet and
+    ``missing`` that no durable row exists at all.
     """
+    lifecycle_event = event if lifecycle_payload is None else lifecycle_payload
     event_id = _outbox_event_id(event, "terminal_fallback")
     persisted_event = dict(event)
     persisted_event["_delivery_event_id"] = event_id
@@ -458,7 +463,7 @@ def _reconcile_terminal_write(
         state, event_json, result_json = row
         if state in _TERMINAL_STATES:
             if _terminal_payload_matches(result_json, result):
-                if event_json is not None and _terminal_payload_matches(event_json, event):
+                if event_json is not None and _terminal_payload_matches(event_json, lifecycle_event):
                     return "lifecycle"
                 outbox = conn.execute(
                     "SELECT event_json, result_json FROM async_delegation_events "
@@ -806,9 +811,10 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
     the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
     callers bind the owning profile first."""
+    held = reoffer_unresolved_completions(target_queue)  # unproven terminal events whose retry is due
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
-        return 0  # never create a ledger just to sweep it
+        return held  # never create a ledger just to sweep it
     recover_abandoned_delegations()
     now = time.time() if now is None else now
     home = hermes_home_key(get_hermes_home())
@@ -860,7 +866,7 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                 )
                 continue
             outbox_orphans.append((event_id, payload, created_at, updated_at))
-        return restored + _replay_outbox_pending(conn, outbox_orphans, target_queue, now)
+        return held + restored + _replay_outbox_pending(conn, outbox_orphans, target_queue, now)
 
 
 def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
@@ -910,6 +916,87 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+# In-memory marker on a terminal event whose producer could not prove which durable identity, if
+# any, owns it (reconciliation failed). Its delegation_id alone proves nothing: a competing writer
+# may own the lifecycle row. Never persisted; stripped once ownership is resolved.
+_TERMINAL_OWNERSHIP_KEY = "_terminal_ownership"
+_OWNERSHIP_RETRY_BASE_S = 5.0
+_OWNERSHIP_RETRY_MAX_S = 300.0
+# (home key, delegation_id) -> unresolved event held off the queue until its retry is due.
+_unresolved: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _hold_unresolved(evt: Dict[str, Any], meta: Dict[str, Any], exc: BaseException) -> None:
+    meta["attempts"] = int(meta.get("attempts") or 0) + 1
+    delay = min(_OWNERSHIP_RETRY_BASE_S * 2 ** (meta["attempts"] - 1), _OWNERSHIP_RETRY_MAX_S)
+    meta["retry_at"] = time.time() + delay
+    evt[_TERMINAL_OWNERSHIP_KEY] = meta
+    logger.error("Async delegation %s: terminal ownership is still unproven (attempt %d, retry in %.0fs); "
+                 "holding the result undelivered: %s", evt.get("delegation_id"), meta["attempts"], delay, exc)
+    with _orphan_lock:
+        _unresolved[(meta["home"], str(evt.get("delegation_id") or ""))] = evt
+
+
+def reoffer_unresolved_completions(target_queue, *, now: Optional[float] = None) -> int:
+    """Put held terminal events whose ownership retry is due back on ``target_queue``."""
+    now = time.time() if now is None else now
+    with _orphan_lock:
+        due = [key for key, evt in _unresolved.items()
+               if (evt.get(_TERMINAL_OWNERSHIP_KEY) or {}).get("retry_at", 0.0) <= now]
+        events = [_unresolved.pop(key) for key in due]
+    for evt in events:
+        target_queue.put(evt)
+    return len(events)
+
+
+def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    """Resolve an unproven terminal event to its durable identity, acquiring the lifecycle row
+    through the conditional fallback transaction when no terminal owner exists yet."""
+    # The producer's snapshots, not ``evt``: consumers enrich their copy (e.g. gateway routing
+    # fields) before claiming, and the durable payloads were written from the originals.
+    event, persisted, result, expected = meta["event"], meta["persisted_event"], meta["result"], meta["expected_state"]
+    disposition = _reconcile_terminal_write(event, result, expected, persisted)
+    if disposition == "active":
+        try:
+            _persist_outbox_event(dict(event), result, event_kind="terminal_fallback",
+                                  terminal_status=meta["terminal_status"], expected_state=expected)
+            return "outbox"
+        except Exception as exc:  # noqa: BLE001 — lost the CAS, or committed before raising
+            logger.error("Async delegation %s: deferred terminal fallback write failed; reconciling: %s",
+                         evt.get("delegation_id"), exc)
+            disposition = _reconcile_terminal_write(event, result, expected, persisted)
+            if disposition == "active":
+                raise
+    return disposition
+
+
+def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
+    """True when ``evt`` may be delivered: it carries no unproven terminal ownership, or that
+    ownership now resolves to this event. A proven loser is discarded; an event whose ledger is
+    still unreadable is held and re-offered later (``reoffer_unresolved_completions``). Either way
+    the caller must drop its copy without showing it."""
+    meta = evt.pop(_TERMINAL_OWNERSHIP_KEY, None)
+    if not meta:
+        return True
+    evt.pop("_delivery_event_id", None)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(meta["home"])
+    try:
+        disposition = _resolve_terminal_ownership(evt, meta)
+    except Exception as exc:  # noqa: BLE001 — unavailable ledger: ownership stays unproven
+        _hold_unresolved(evt, meta, exc)
+        return False
+    finally:
+        reset_hermes_home_override(token)
+    if disposition == "outbox":
+        evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
+    elif disposition not in {"lifecycle", "missing"}:
+        logger.error("Async delegation %s: unproven terminal result lost ownership to a competing "
+                     "result; discarding it", evt.get("delegation_id"))
+        return False
+    return True
+
+
 def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
     """An early per-task notice for a batch that is still running.
 
@@ -920,7 +1007,12 @@ def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; legacy in-memory notices remain unclaimable."""
+    """Claim a durable delegation event; legacy in-memory notices remain unclaimable.
+
+    ``None`` means this copy must not be delivered: another consumer holds it, or its terminal
+    ownership is unproven (held for a later offer) or lost to a competing writer."""
+    if not resolve_event_ownership(evt):
+        return None
     event_id = str(evt.get("_delivery_event_id") or "")
     if event_id:
         return _claim_outbox_delivery(event_id, consumer)
@@ -1882,8 +1974,10 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         def reconcile():
             try:
                 return _record_context_run(
-                    record, _reconcile_terminal_write, evt, result, expected_state)
+                    record, _reconcile_terminal_write, evt, result, expected_state, persist_evt)
             except Exception:
+                logger.error("Async delegation%s %s: terminal ownership reconciliation failed",
+                             label, record.get("delegation_id"), exc_info=True)
                 return "unavailable"
 
         disposition = reconcile()
@@ -1905,11 +1999,18 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
             else:
                 disposition = "outbox"
         queue_event = disposition in {"lifecycle", "outbox", "active", "missing", "unavailable"}
+        evt.pop("_delivery_event_id", None)
         if disposition == "outbox":
             # A commit-then-raise can precede _persist_outbox_event's stamp.
             evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
-        else:
-            evt.pop("_delivery_event_id", None)
+        elif disposition in {"active", "unavailable"}:
+            # Unproven: neither this writer's lifecycle row, its outbox row, nor a competing
+            # winner could be verified. Its delegation_id must not claim (and so settle or
+            # consume) a row another writer may own; consumers resolve it first.
+            evt[_TERMINAL_OWNERSHIP_KEY] = {
+                "home": str(_record_context_run(record, get_hermes_home)), "event": dict(evt),
+                "persisted_event": persist_evt, "result": result, "expected_state": expected_state,
+                "terminal_status": terminal_status, "attempts": 0}
         if not queue_event:
             logger.error("Async delegation %s terminal fallback lost ownership to a competing result",
                          record.get("delegation_id"))
@@ -2385,3 +2486,4 @@ def _reset_for_tests() -> None:
     with _orphan_lock:
         _offered.clear()
         _last_orphan_sweep.clear()
+        _unresolved.clear()

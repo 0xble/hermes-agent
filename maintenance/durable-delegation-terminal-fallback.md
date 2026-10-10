@@ -17,10 +17,19 @@ notices or terminal results that could not be written to the lifecycle row
   the insert back, so a competing terminal writer cannot create a redundant
   deliverable.
 - Ambiguous completion writes reconcile the lifecycle payload and fallback
-  outbox before queueing. The authoritative payload is delivered once; a losing
-  terminal writer does not enqueue its result beside the winner. If durable
-  state is unavailable or absent, the real result remains an explicitly
-  in-memory-only event without a phantom outbox identity.
+  outbox before queueing, comparing the canonical persisted status (a queued
+  cancellation persists `cancelled`) while the live event keeps its intended
+  status. The authoritative payload is delivered once; a losing terminal
+  writer does not enqueue its result beside the winner.
+- Ownership that cannot be proven (reconciliation unavailable, or a still
+  active row) is never inferred from `delegation_id`. The event carries the
+  in-memory `_terminal_ownership` marker, and `claim_event_delivery` (every
+  consumer's claim; the TUI also checks before its status row) resolves it
+  first: this writer's lifecycle or outbox identity, or a conditional fallback
+  acquisition. A proven loser is discarded. A still-unreadable ledger holds the
+  event off the queue with backoff; the existing drain and orphan-sweep paths
+  re-offer it. Only a proven-missing lifecycle row delivers in memory only,
+  without a phantom outbox identity.
 - Index-less task notices get collision-safe event ids.
 - Session recovery registers `async_delegation_events`, so a rebuilt
   `state.db` keeps undelivered outbox rows.
@@ -54,14 +63,21 @@ and the interim notice contract by
 - A fallback commit-then-raise recovers its existing outbox delivery identity
   before queueing, so acknowledging the live copy also settles restart replay.
 - A fallback insert and its lifecycle claim are one conditional transaction.
+- Unavailable reconciliation cannot claim or settle a competing winner's
+  lifecycle row, and a fallback commit-then-raise behind unavailable
+  reconciliation still settles its own outbox row once recovered.
 - Ordinary terminal failures, interim notices, duplicate fallback invocation,
-  and unavailable/missing persistence retain their existing behavior and are
-  covered by focused regression tests.
+  and missing persistence retain their existing behavior and are covered by
+  focused regression tests.
 
 ## Known gaps
 
 - A stale pending `task_failure` notice can replay after the unit's final
   result on restart. This patch does not resolve interim-notice ordering.
+- A held unproven event lives only in the producing process. If that process
+  exits before the ledger is readable again, the result is lost unless its
+  write committed; a lifecycle row left active is then classified by
+  abandoned-delegation recovery, not delivered with the real result.
 
 ## Verification
 
