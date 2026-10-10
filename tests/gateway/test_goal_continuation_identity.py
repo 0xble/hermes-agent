@@ -287,6 +287,7 @@ async def test_idle_continuation_cannot_enter_replacement_conversation(
 
     runner = _runner(state)
     store = SessionStore(tmp_path / "gateway-sessions", GatewayConfig())
+    store._db = state  # Documented pin: route rows and goals share the fixture's SessionDB.
     runner.session_store = store
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = MethodType(GatewayTurnMixin._hmwa_resolve_session, runner)
