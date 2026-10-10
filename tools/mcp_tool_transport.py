@@ -78,15 +78,6 @@ def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name:
     return mounts or None
 
 
-def _pgroup_alive(pgid: Optional[int]) -> bool:
-    """Signal 0 to the group succeeds iff any member is alive (POSIX only)."""
-    try:
-        os.killpg(pgid, 0)  # windows-footgun: ok — guarded by AttributeError below
-        return True
-    except (AttributeError, TypeError, OSError):  # non-POSIX / pgid None / gone
-        return False
-
-
 class LiveEndpointUnavailable(ConnectionError):
     """A declared runtime file did not provide a usable live endpoint."""
 
@@ -295,6 +286,7 @@ class MCPServerTransportMixin:
         """Ledger the freshly spawned stdio children (pids, pgids, machine spawn ledger). pgids are
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
         new_pgids: Dict[int, int] = {}
+        _lifecycle._remember_mcp_processes(new_pids)
         for pid in new_pids:
             try:
                 new_pgids[pid] = os.getpgid(pid)
@@ -333,11 +325,17 @@ class MCPServerTransportMixin:
         with _core._lock:
             for pid in new_pids:
                 _stdio_pids.pop(pid, None)
-                # Windows-safe pid probe; the child may be gone while descendants remain in its pgroup.
-                if _pid_exists(pid) or _pgroup_alive(_stdio_pgids.get(pid)):
+                pgid = _stdio_pgids.get(pid)
+                members = _lifecycle._owned_mcp_processes(
+                    _lifecycle._stdio_processes.get(pid, {}), pgid,
+                    os.getpgrp() if hasattr(os, "getpgrp") else None,
+                )
+                _lifecycle._stdio_processes[pid] = members
+                if _pid_exists(pid) or members:
                     _orphan_stdio_pids.add(pid)
                     _orphan_stdio_pid_servers[pid] = self.name
-                else:  # nothing to reap — drop the pgid so PID reuse can't surface stale pgroup state
+                else:  # nothing verified to reap — never retain recycled PID/group authority
+                    _lifecycle._stdio_processes.pop(pid, None)
                     dropped = _stdio_pgids.pop(pid, None)
                     if dropped is not None:
                         released_pgids.append(dropped)

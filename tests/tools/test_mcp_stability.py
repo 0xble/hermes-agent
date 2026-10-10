@@ -10,6 +10,21 @@ from tools import mcp_tool_lifecycle as _mcp_lifecycle
 from tools import mcp_tool_loop as _mcp_loop
 
 
+def _track_fake_incarnation(pid, monkeypatch, pgid=None):
+    """Mock process identity as well as signal delivery; PID-only ledgers are unsafe."""
+    proc = MagicMock(pid=pid)
+    proc.is_running.return_value = True
+    proc.status.return_value = "running"
+    proc.children.return_value = []
+    proc.send_signal.side_effect = lambda sig: os.kill(pid, sig)
+    _mcp_lifecycle._stdio_processes[pid] = {pid: proc}
+    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
+    if pgid is not None:
+        existing = getattr(os, "getpgid", lambda _: None)
+        monkeypatch.setattr(os, "getpgid", lambda p: pgid if p == pid else existing(p), raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Fix 1: MCP event loop exception handler
 # ---------------------------------------------------------------------------
@@ -190,7 +205,7 @@ class TestStdioPidTracking:
              patch("tools.mcp_tool.time.sleep"):
             _kill_orphaned_mcp_children(server_name="feishu")
 
-        mock_kill.assert_called_once_with(target_pid, signal.SIGTERM)
+        mock_kill.assert_not_called()  # PID-only ledger is not signal authority
         with _lock:
             assert target_pid not in _orphan_stdio_pids
             assert target_pid not in _orphan_stdio_pid_servers
@@ -231,6 +246,7 @@ class TestStdioPgroupReaping:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
             _stdio_pgids[fake_pid] = fake_pgid
+        _track_fake_incarnation(fake_pid, monkeypatch, fake_pgid)
 
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
@@ -277,6 +293,8 @@ class TestStdioPgroupReaping:
             _stdio_pgids[fake_pid] = gateway_pgid  # == gateway's own pgid
             _orphan_stdio_pids.add(other_pid)
             _stdio_pgids[other_pid] = other_pgid  # distinct group → killpg OK
+        _track_fake_incarnation(fake_pid, monkeypatch, gateway_pgid)
+        _track_fake_incarnation(other_pid, monkeypatch, other_pgid)
 
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
@@ -313,6 +331,7 @@ class TestStdioPgroupReaping:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
             # No entry in _stdio_pgids.
+        _track_fake_incarnation(fake_pid, monkeypatch)
 
         with patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=False), \
