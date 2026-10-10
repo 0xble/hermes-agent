@@ -632,7 +632,7 @@ def test_updater_waits_for_deferred_gateway_ack_without_second_reload(tmp_path, 
             [str(candidate / ".venv/bin/python"), "-m", "hermes_cli.main", "gateway", "run"],
             cwd=candidate, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
-                        lambda _: processes[0].pid if processes else None)
+                        lambda _, **_kw: processes[0].pid if processes else None)
     wait = update_cmd._await_release_acknowledgement
     monkeypatch.setattr(update_cmd, "_await_release_acknowledgement",
                         lambda path: wait(path, timeout_seconds=4))
