@@ -160,6 +160,64 @@ def test_boundary_commit_preserves_only_destination_prefetch(queued_session_id):
         mm.shutdown_all()
 
 
+@pytest.mark.parametrize(
+    ("new_session_id", "rewound"),
+    [("same-sid", True), ("same-sid", False), ("new-sid", True)],
+    ids=["undo", "in-place-compaction", "rewound-destination"],
+)
+def test_session_switch_invalidates_queued_prefetch_after_transcript_change(new_session_id, rewound):
+    """Undo and in-place compaction must not dispatch recall keyed on the pre-switch transcript."""
+    syncing, release = threading.Event(), threading.Event()
+
+    class _SlowSync(_RecordingProvider):
+        def __init__(self):
+            super().__init__()
+            self.buffer = ""
+            self.queued = []
+            self.switched_to = []
+
+        def sync_turn(self, *args, **kwargs):
+            syncing.set()
+            assert release.wait(5), "turn sync was not released"
+            super().sync_turn(*args, **kwargs)
+
+        def queue_prefetch(self, query, *, session_id=""):
+            self.queued.append(query)
+            self.buffer = f"recall for: {query}"
+
+        def prefetch(self, query, *, session_id=""):
+            result, self.buffer = self.buffer, ""
+            return result
+
+        def discard_prefetch(self):
+            self.buffer = ""
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            self.switched_to.append((new_session_id, kwargs.get("rewound", False)))
+
+    provider = _SlowSync()
+    mm = _make_manager(provider)
+    mm.initialize_all("same-sid")
+    try:
+        mm.sync_all("undone topic", "Done.", session_id="same-sid")
+        assert syncing.wait(5), "turn sync did not start"
+        mm.queue_prefetch_all("undone topic", session_id=new_session_id)
+        mm.on_session_switch(new_session_id, rewound=rewound)
+        release.set()
+        assert mm.flush_pending(timeout=5)
+
+        assert provider.switched_to == [(new_session_id, rewound)]
+        assert mm.prefetch_all("next turn", session_id=new_session_id) == ""
+        assert provider.queued == []  # the invalidated query never reaches the provider
+
+        mm.queue_prefetch_all("fresh topic", session_id=new_session_id)
+        assert mm.flush_pending(timeout=5)
+        assert mm.prefetch_all("follow-up", session_id=new_session_id) == "recall for: fresh topic"
+    finally:
+        release.set()
+        mm.shutdown_all()
+
+
 def test_boundary_commit_switch_still_fires_when_end_raises():
     """A failing provider extraction must not strand providers on the old sid."""
 

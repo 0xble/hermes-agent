@@ -811,12 +811,14 @@ class MemoryManager:
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
 
-        # Obsolete only a prefetch from outside the destination session. /new can still be extracting
-        # the old session when a new turn queues its recall; keep that token and its age timestamp.
+        # Preserve destination recall only across a real, non-rewound session-id change. /new can
+        # still be extracting the old session when a new turn queues its recall. Same-id switches
+        # (in-place compaction) and /undo invalidate queries from the pre-switch transcript.
         # Switching under the dispatch lock keeps the old-session fence: it either dispatches before
         # the switch (whose discard then drops it) or sees the obsolete token and never reaches it.
         def _switch_providers() -> bool:
-            stale = self._prefetch_session_id != new_session_id
+            stale = (rewound or self._session_id == new_session_id
+                     or self._prefetch_session_id != new_session_id)
             if stale:
                 self._prefetch_queued_at = None
             if self._session_id != new_session_id:
