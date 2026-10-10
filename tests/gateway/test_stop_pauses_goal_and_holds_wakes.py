@@ -151,7 +151,7 @@ async def test_completions_from_a_stop_are_held_until_the_user_sends_a_turn(monk
     # The user's next admitted turn releases the hold; internal wakes never do.
     assert runner._is_user_turn_event(MessageEvent(text="internal", source=source, internal=True)) is False
     assert runner._is_user_turn_event(MessageEvent(text="continue", source=source)) is True
-    runner._clear_user_stop_latch(key)
+    await runner._clear_user_stop_latch(key)
     assert await runner._deliver_async_delegation_group(group) is True
     for task in list(adapter._background_tasks):
         await task
@@ -203,7 +203,7 @@ async def test_compression_ancestor_completion_stays_held_after_restart(monkeypa
     row = ad.get_durable_delegation(evt["delegation_id"])
     assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
 
-    restarted._clear_user_stop_latch(key)
+    await restarted._clear_user_stop_latch(key)
     assert await restarted._deliver_async_delegation_group([evt]) is True
     for task in list(adapter._background_tasks):
         await asyncio.wait_for(task, timeout=2)
@@ -212,7 +212,11 @@ async def test_compression_ancestor_completion_stays_held_after_restart(monkeypa
     # A compression chain ending at a user reset must not carry its ancestor's stop hold.
     replacement = await restarted.async_session_store.reset_session(key)
     assert replacement is not None and replacement.session_id != tip_id
+    assert not restarted._user_stop_latched(key)
+    assert not await restarted._completion_held_by_stop(evt)
     await restarted._handle_stop_command(MessageEvent(text="/stop", source=source))
+    assert restarted._user_stop_latched(key, session_ids=(replacement.session_id,))
+    assert not await restarted._completion_held_by_stop(evt)  # live must agree with restart
     after_reset, _, _, _, reset_id = await _runner(monkeypatch)
     assert reset_id == replacement.session_id
     assert after_reset._user_stop_latched(key, session_ids=(reset_id,))
@@ -275,19 +279,21 @@ async def test_stop_pause_after_await_does_not_touch_newer_turn_goal(monkeypatch
 @pytest.mark.parametrize("claim_kind", ["generation", "route"])
 async def test_stop_pause_write_is_atomic_with_owner_claim(monkeypatch, claim_kind):
     import threading
-    from hermes_cli.goals import GoalManager
+    from hermes_cli.goals import GoalManager, GoalState
 
     runner, _adapter, source, key, session_id = await _runner(monkeypatch)
     _active_goal(session_id)
     writing = threading.Event()
     release = threading.Event()
     claiming = threading.Event()
-    original_pause = GoalManager.pause
+    setting = threading.Event()
+    original_json = GoalState.to_json
 
-    def suspended_pause(manager, reason):
-        writing.set()
-        assert release.wait(timeout=5), "stop write was not released"
-        return original_pause(manager, reason=reason)
+    def suspended_json(state):
+        if state.status == "paused" and state.paused_reason == "user-interrupted (/stop)":
+            writing.set()
+            assert release.wait(timeout=5), "stop write was not released"
+        return original_json(state)
 
     def claim_newer_owner():
         claiming.set()
@@ -295,26 +301,41 @@ async def test_stop_pause_write_is_atomic_with_owner_claim(monkeypatch, claim_ki
             return runner._begin_session_run_generation(key)
         return runner.session_store.reset_session(key)
 
-    monkeypatch.setattr(GoalManager, "pause", suspended_pause)
+    def set_newer_goal():
+        setting.set()
+        return GoalManager(session_id).set("new goal after the owner claim")
+
+    monkeypatch.setattr(GoalState, "to_json", suspended_json)
     stop_task = asyncio.create_task(runner._handle_stop_command(MessageEvent(text="/stop", source=source)))
-    claim_task = None
+    claim_task = set_task = None
     try:
         assert await asyncio.wait_for(asyncio.to_thread(writing.wait, 2), timeout=3)
         claim_task = asyncio.create_task(asyncio.to_thread(claim_newer_owner))
         assert await asyncio.wait_for(asyncio.to_thread(claiming.wait, 2), timeout=3)
-        # Once the ownership check has won, neither a turn nor /new can interleave the goal write.
+        if claim_kind == "generation":
+            # Admission itself cannot block: the *goal writes* are serialized by SQLite instead.
+            assert await asyncio.wait_for(claim_task, timeout=2) == 1
+            set_task = asyncio.create_task(asyncio.to_thread(set_newer_goal))
+            assert await asyncio.wait_for(asyncio.to_thread(setting.wait, 2), timeout=3)
+            blocked_task = set_task
+        else:
+            blocked_task = claim_task  # route replacement still shares the off-loop store lock
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(asyncio.shield(claim_task), timeout=2)
+            await asyncio.wait_for(asyncio.shield(blocked_task), timeout=2)
     finally:
         release.set()
         await asyncio.wait_for(stop_task, timeout=2)
         if claim_task is not None:
             await asyncio.wait_for(claim_task, timeout=2)
+        if set_task is not None:
+            await asyncio.wait_for(set_task, timeout=2)
 
     current_id = await asyncio.to_thread(runner._lookup_session_id_under_store_lock, runner.session_store, key)
-    await asyncio.to_thread(GoalManager(current_id).set, "new goal after the owner claim")
+    if claim_kind == "route":
+        await asyncio.to_thread(lambda: GoalManager(current_id).set("new goal after the owner claim"))
     state = GoalManager(current_id).state
     assert state is not None and state.status == "active"
+    assert state.goal == "new goal after the owner claim"
 
 
 @pytest.mark.asyncio

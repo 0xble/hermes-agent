@@ -1944,7 +1944,10 @@ class GatewayNotificationsMixin:
             with self.session_store._lock:
                 self.session_store._ensure_loaded_locked()
                 entry = self.session_store._entries.get(key)
-                return dataclasses.replace(entry) if entry is not None and entry.stop_latched else None
+                state = self._peek_session_state(key)
+                memory_hold = (state is not None and state.conversation.stop_latched
+                               and state.conversation.stop_latched_session_entry is entry)
+                return dataclasses.replace(entry) if entry is not None and (entry.stop_latched or memory_hold) else None
 
         for key in keys:
             if not key:

@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
@@ -932,14 +932,25 @@ class SessionStore(
 
 
 
-    def set_stop_latched(self, session_key: str, latched: bool, *, session_id: Optional[str] = None) -> bool:
-        """Persist the gateway /stop hold, fenced to the owning session id."""
+    def set_stop_latched(
+        self, session_key: str, latched: bool, *, session_id: Optional[str] = None,
+        is_current: Optional[Callable[[], bool]] = None,
+        expected_entry: Optional[SessionEntry] = None,
+    ) -> bool:
+        """Persist the hold under a route/revision fence; same-entry compression may advance SID."""
         if not session_key:
             return False
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
-            if entry is None or (session_id and entry.session_id != session_id):
+            if entry is None:
+                return False
+            if expected_entry is not None:
+                if entry is not expected_entry:
+                    return False  # reset/resume replaced the owner, unlike compression
+            elif session_id and entry.session_id != session_id:
+                return False
+            if is_current is not None and not is_current():
                 return False
             if entry.stop_latched == bool(latched):
                 return True  # no write on every user turn when nothing is held

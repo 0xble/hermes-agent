@@ -60,6 +60,8 @@ class ConversationState:
     # completions (delegations, processes, watch patterns) stay queued instead of waking the
     # session, so a stop is not immediately undone by the completions the stop itself produced.
     stop_latched: bool = False
+    # Compression mutates this entry in place; reset/resume replaces it. Not durable state.
+    stop_latched_session_entry: Any = field(default=None, repr=False, compare=False)
     # Wall-clock start of the most recent turn of any kind. A routine completion result arriving
     # within the batch window of it is held for fan-in rather than waking the session again.
     last_turn_started_at: float = 0.0
@@ -80,8 +82,10 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
-    # Serializes generation claims with ownership-fenced executor mutations, not whole turns.
+    # Only short in-memory checks/claims. NEVER hold over store/goal I/O: ingress uses it on-loop.
     run_generation_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+    # Monotonic across conversation resets; rejects delayed durable latch writes (no ABA).
+    stop_latch_revision: int = 0
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.
