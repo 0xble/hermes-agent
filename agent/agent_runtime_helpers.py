@@ -1340,6 +1340,11 @@ def restore_primary_runtime(agent) -> bool:
         if shared_state == "active":
             return False  # another process holds the primary in cooldown, stay on fallback
     cleared_elsewhere = held_shared_record and shared_state == "absent"
+    if shared_state == "expired":
+        # The shared record is authoritative and its window has passed. A later provider reset may
+        # have shortened the outage below this agent's cached deadline, so drop the stale local
+        # deadline. The record itself stays: the primary probe's success clears it with one notice.
+        agent._rate_limited_until = 0
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic() and not cleared_elsewhere:
         return False  # primary still in rate-limit cooldown, stay on fallback
     rt = agent._primary_runtime
