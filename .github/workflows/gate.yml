@@ -1,13 +1,91 @@
 name: Repository gate
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 permissions:
   contents: read
 concurrency:
   group: repository-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 jobs:
+  profile:
+    # Ready pull requests run the bounded `pr-checks` (./bin/ci preflight) on
+    # their exact head; that admits them to the Mergify queue but never earns
+    # `qualification`. The full gate (static/Node plus all ten Python shards)
+    # runs on Mergify merge-queue batch drafts, whose exact head is the commit
+    # main fast-forwards to, and on bootstrap pull requests while main has no
+    # .mergify.yml (they land on their own exact-head `qualification`).
+    # Ordinary drafts run no lane and fail `qualification`.
+    if: >-
+      ${{ !github.event.pull_request.draft || (github.event.pull_request.user.login == 'mergify[bot]' && startsWith(github.event.pull_request.head.ref, 'mergify/merge-queue/')) }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      full_gate: ${{ steps.profile.outputs.full_gate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          filter: blob:none
+      - name: Assert checked-out PR head
+        run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+      - name: Select full gate or bounded ready checks
+        id: profile
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          full_gate=true
+          if [ "$PR_AUTHOR" = 'mergify[bot]' ] && [ "${HEAD_REF#mergify/merge-queue/}" != "$HEAD_REF" ]; then
+            reason=merge-queue-batch
+          elif ! printf '%s' "$BASE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "unusable base SHA: $BASE_SHA" >&2
+            exit 1
+          else
+            # Trees only: the probe never needs file contents.
+            git fetch --no-tags --quiet --depth=1 --filter=blob:none origin "$BASE_SHA" '+refs/heads/main:refs/remotes/origin/main'
+            git cat-file -e "$BASE_SHA^{commit}" || { echo "base commit unavailable: $BASE_SHA" >&2; exit 1; }
+            git cat-file -e 'refs/remotes/origin/main^{commit}' || { echo 'live main unavailable' >&2; exit 1; }
+            # Bootstrap only while neither the PR base nor live main has a queue,
+            # so a pre-queue base SHA cannot reopen a direct full-gate landing.
+            if [ -z "$(git ls-tree "$BASE_SHA" -- .mergify.yml)" ] && [ -z "$(git ls-tree refs/remotes/origin/main -- .mergify.yml)" ]; then
+              reason=bootstrap-no-queue-on-main
+            else
+              full_gate=false
+              reason=ready-pull-request
+            fi
+          fi
+          printf 'full_gate=%s (%s)\n' "$full_gate" "$reason"
+          echo "full_gate=$full_gate" >>"$GITHUB_OUTPUT"
+  pr-checks:
+    name: pr-checks
+    needs: [profile]
+    if: ${{ needs.profile.outputs.full_gate == 'false' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      # The Fork-Patch ownership check in preflight reads commit history.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - name: Assert checked-out PR head
+        run: test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+      - name: Bounded ready checks
+        run: ./bin/ci preflight
+      - name: Assert exact clean head after checks
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha }}'
+          test -z "$(git status --porcelain --untracked-files=no)"
   linux:
+    needs: [profile]
+    if: ${{ needs.profile.outputs.full_gate == 'true' }}
     name: Static and Node gate
     runs-on: ubuntu-latest
     container:
@@ -50,6 +128,8 @@ jobs:
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
   python-shard:
+    needs: [profile]
+    if: ${{ needs.profile.outputs.full_gate == 'true' }}
     name: Python and e2e (${{ matrix.shard }}/10)
     runs-on: ubuntu-latest
     strategy:
@@ -93,24 +173,20 @@ jobs:
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
   qualification:
     if: always()
-    needs: [linux, python-shard]
-    runs-on: ubuntu-latest
+    needs: [profile, linux, python-shard]
+    runs-on: ubuntu-slim
     steps:
-      - name: Require every gate job
+      - name: Require every full gate job
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          DRAFT_PR: ${{ github.event.pull_request.draft }}
+          FULL_GATE: ${{ needs.profile.outputs.full_gate }}
         run: |
           python3 - <<'PY'
           import json, os, sys
           results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
           print(results)
-          if results and all(result == 'success' for result in results.values()):
+          if os.environ.get('FULL_GATE') == 'true' and results and all(result == 'success' for result in results.values()):
               sys.exit(0)
-          not_run = [name for name, result in results.items() if result != 'success']
-          only_skipped = bool(not_run) and all(results[name] == 'skipped' for name in not_run)
-          draft_skip = os.environ.get('DRAFT_PR') == 'true' and only_skipped
-          message = 'draft: gate not run' if draft_skip else 'gate not qualified'
-          print(message, file=sys.stderr)
+          print('gate not qualified: full gate required', file=sys.stderr)
           sys.exit(1)
           PY
