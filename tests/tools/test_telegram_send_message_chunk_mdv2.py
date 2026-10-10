@@ -121,3 +121,19 @@ def test_chunked_code_fence_indicator_separated(monkeypatch: pytest.MonkeyPatch)
             assert not re.match(r"^```\s*", line) or "(" not in line, (
                 f"Chunk {idx} has indicator glued to closing fence: {line!r}"
             )
+
+
+def test_oversized_copy_block_is_sent_whole_as_document(monkeypatch):
+    """A standalone copy block over Telegram's limit is never chunked or suffixed."""
+    bot = _make_bot()
+    bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=9))
+    _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
+    _no_proxy(monkeypatch)
+    from tools.send_message_senders import _send_telegram
+
+    body = "line (1/2) *x*\n" * 400
+    result = asyncio.run(_send_telegram("tok", "123", body, copy_block=True))
+    assert result.get("success"), result
+    bot.send_message.assert_not_called()
+    doc = bot.send_document.call_args.kwargs["document"]
+    assert doc.getvalue().decode("utf-8") == body

@@ -266,6 +266,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if is_autonomous_silence_response(content):
             logger.info("[webhook] Response for %s is a silence marker — not delivering", chat_id)
             return SendResult(success=True)
+        from gateway.copy_blocks import render_copy_blocks_inline
+        content = render_copy_blocks_inline(content)
         delivery = self._delivery_info.get(chat_id, {})
         deliver_type = delivery.get("deliver", "log")
         if deliver_type == "log":

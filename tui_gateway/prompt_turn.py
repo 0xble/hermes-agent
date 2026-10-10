@@ -441,8 +441,10 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
     # everything otherwise); barge-aware. Speaks the delivered text: a quiet wakeup's bare
     # [SILENT] stays in ``raw`` for the /loop hook above but is never spoken.
     if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
+        from gateway.copy_blocks import strip_copy_blocks
         spoken = (_bot_mode_delivery_text(raw, successful=True)
                   if _silence_hidden_turn(session, getattr(st, "prompt_text", "")) else raw)
+        spoken = strip_copy_blocks(spoken)  # paste-ready text is read, not spoken
         try:
             if spoken.strip():
                 threading.Thread(target=_speak_text_with_barge, args=(spoken,), daemon=True).start()
@@ -844,6 +846,10 @@ def _invoke_agent(
     # Heartbeat and /loop wakeups ask for a bare [SILENT] on a no-change tick: hold it the same way.
     hold = {"buf": "", "held": ""} if _silence_hidden_turn(session, prompt) else None
     loop_hold = {"text": "", "seen": ""}
+    from gateway.copy_blocks import CopyMarkerStreamFilter
+    copy_filter = CopyMarkerStreamFilter()
+    # Speech gets its own filter that drops bodies: paste-ready text is read, never spoken.
+    speech_filter = CopyMarkerStreamFilter(drop_bodies=True)
 
     def _deliver_delta(delta):
         with session["history_lock"]:
@@ -851,13 +857,23 @@ def _invoke_agent(
         payload = {"text": delta}
         if streamer and (r := streamer.feed(delta)) is not None:
             payload["rendered"] = r
-        if st.tts_queue is not None and isinstance(delta, str):
-            st.tts_queue.put(delta)
         _emit("message.delta", sid, payload)
+
+    def _speak(raw):
+        if st.tts_queue is None:
+            return
+        if raw is None:
+            speech_filter.message_boundary()
+        elif spoken := speech_filter.feed(raw):
+            st.tts_queue.put(spoken)
 
     def _stream(delta):
         if getattr(agent, "_mute_notification_reply", False):
             return
+        if delta is None:
+            # A new assistant message starts on a new line for copy-marker detection.
+            copy_filter.message_boundary()
+            _speak(None)
         if isinstance(delta, str):
             from gateway.response_filters import (
                 ends_with_partial_loop_complete_marker,
@@ -880,6 +896,12 @@ def _invoke_agent(
             from gateway.response_filters import hold_silence_delta
             if not (delta := hold_silence_delta(hold, delta)):
                 return
+        if isinstance(delta, str):
+            # Control markers are already withheld here; speech then drops copy bodies and
+            # display renders them inline.
+            _speak(delta)
+            if not (delta := copy_filter.feed(delta)):
+                return
         _deliver_delta(delta)
 
     # Interim assistant text (commentary beside tool calls, pre-nudge final answer) is sealed
@@ -887,7 +909,9 @@ def _invoke_agent(
     def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
         if getattr(agent, "_mute_notification_reply", False):
             return
-        _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
+        from gateway.copy_blocks import render_copy_blocks_inline
+        _emit("message.interim", sid, {
+            "text": render_copy_blocks_inline(text or ""), "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
         _interim_assistant_cb if _load_interim_assistant_messages() else None)
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
@@ -919,6 +943,10 @@ def _invoke_agent(
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            if copy_tail := copy_filter.flush():
+                _deliver_delta(copy_tail)
+            if st.tts_queue is not None and (spoken_tail := speech_filter.flush()):
+                st.tts_queue.put(spoken_tail)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
@@ -1034,8 +1062,10 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         raw = delivered
     # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
     # only the rendered text is emptied.
+    from gateway.copy_blocks import render_copy_blocks_inline
     from gateway.response_filters import strip_trailing_loop_complete_marker
-    visible_raw = strip_trailing_loop_complete_marker(delivered)
+    # The TUI shows one message per turn, so copy blocks render inline without markers.
+    visible_raw = render_copy_blocks_inline(strip_trailing_loop_complete_marker(delivered))
     payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
