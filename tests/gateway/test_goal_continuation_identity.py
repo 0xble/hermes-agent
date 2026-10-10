@@ -531,3 +531,40 @@ async def test_post_turn_judges_the_terminal_queued_turn_not_the_chain_head(stat
     after = load_goal("target")
     assert after.goal == "new objective" and after.turns_used == before + 1
     assert runner.target.session_key in runner.adapter._pending_messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healed_to", ["other", "pinned"])
+async def test_strict_event_is_dropped_when_topic_heal_moves_it_to_another_session(state, healed_to):
+    """Topic-binding recovery must never carry a pinned continuation into a different session."""
+    from types import MethodType
+    from gateway.run_turn import GatewayTurnMixin
+    from hermes_cli.goals import GoalManager
+
+    from gateway.platforms.event import MessageEvent, MessageType
+
+    runner = _runner(state)
+    GoalManager("target").set("watch the build")
+    goal_event = await _post_turn_event(runner)
+    # A pinned plugin injection (e.g. a session-control requester notice) has no goal identity,
+    # so only the strict session pin can keep it in its own conversation.
+    event = MessageEvent(
+        text="outcome notice", message_type=MessageType.TEXT, source=goal_event.source, internal=True,
+        allow_gateway_control=False,
+        metadata={"hermes_plugin_injection": True, "gateway_session_strict": True,
+                  "gateway_session_key": runner.target.session_key, "gateway_session_id": "target"},
+    )
+    other = SimpleNamespace(session_id="other", session_key=runner.target.session_key)
+    runner.async_session_store = SimpleNamespace(
+        lookup_by_session_key=AsyncMock(return_value=runner.target))
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._cache_session_source = lambda key, source: None
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._hmwa_heal_telegram_topic_binding = AsyncMock(
+        return_value=other if healed_to == "other" else runner.target)
+    runner._session_key_for_source = lambda source: runner.target.session_key
+    resolved = await MethodType(GatewayTurnMixin._hmwa_resolve_session, runner)(event, event.source)
+    if healed_to == "other":
+        assert resolved is None
+    else:
+        assert resolved is not None and resolved[1].session_id == "target"

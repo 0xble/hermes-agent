@@ -457,6 +457,14 @@ class GatewayTurnMixin:
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+            if strict_session and session_entry.session_id != pinned_session_id:
+                # Topic-binding recovery may switch conversations; a pinned event belongs only to
+                # the session it was admitted for, never to whatever the topic now points at.
+                logger.warning(
+                    "Dropping internally routed event: topic binding moved pinned session=%s to %s",
+                    pinned_session_id, session_entry.session_id,
+                )
+                return
         from gateway.platforms.event import is_goal_continuation_event
         if is_goal_continuation_event(event):
             from hermes_cli.session_controls import refresh_goal_continuation
