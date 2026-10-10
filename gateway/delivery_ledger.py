@@ -384,6 +384,15 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
             session_key, content, since))
 
 
+def recorded_contents_since(session_key: str, since: float) -> set:
+    """Contents of every obligation recorded for *session_key* since *since*, any state."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            "SELECT content FROM delivery_obligations WHERE session_key = ? AND created_at >= ?",
+            (session_key, since)).fetchall()
+    return {row[0] for row in rows}
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

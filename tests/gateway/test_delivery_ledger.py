@@ -514,6 +514,36 @@ class TestGatewayRedeliverySweep:
         assert _row("ob-2")["attempts"] == 0 and _row("ob-3")["attempts"] == 0
 
     @pytest.mark.asyncio
+    async def test_recovery_renders_copy_blocks_inline_where_unsupported(self):
+        _record(content="Explanation\n[[copy]]\nexact\n[[/copy]]\n")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.platform = "slack"
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 1
+        assert [c.kwargs["content"] for c in adapter.send.call_args_list] == ["Explanation\nexact\n"]
+
+    def test_crash_adoption_owes_only_unrecorded_parts_of_a_split_reply(self):
+        from types import SimpleNamespace
+        from gateway.copy_blocks import wrap_copy_block
+        from gateway.run import GatewayRunner
+        started = time.time() - 1
+        key = "agent:main:telegram:dm:C1"
+        _record(oid="reply", session_key=key, platform="telegram", content="Intro")
+        _record(oid="copy0", session_key=key, platform="telegram", content=wrap_copy_block("one"))
+        origin = SimpleNamespace(platform="telegram")
+        text = "Intro\n[[copy]]\none\n[[/copy]]\n[[copy]]\ntwo\n[[/copy]]\n"
+        parts = GatewayRunner._crash_left_parts(key, "tok", text, started, origin)
+        assert parts == [("crash:tok#copy1", wrap_copy_block("two"))]
+        # Nothing of this turn was ledgered yet: the whole reply is owed, as before.
+        assert GatewayRunner._crash_left_parts("agent:other", "tok", text, started, origin) == [
+            ("crash:tok", text)]
+        # Inline platforms never split.
+        slack = SimpleNamespace(platform="slack")
+        assert GatewayRunner._crash_left_parts(key, "tok", text, started, slack) == [("crash:tok", text)]
+
+    @pytest.mark.asyncio
     async def test_pending_redelivers_plain_and_clears_resume(self):
         _record()  # pending
         _orphan("ob-1")

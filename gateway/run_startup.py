@@ -632,8 +632,10 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             note_event = await self._redelivery_restart_note_event(row)
-            from gateway.copy_blocks import extract_copy_blocks
-            content, copy_blocks = extract_copy_blocks(row["content"])
+            from gateway.copy_blocks import split_copy_blocks_for
+            # Separate copy messages only where the adapter sends them plain; elsewhere the
+            # recovered reply renders its blocks inline, as normal delivery does.
+            content, copy_blocks = split_copy_blocks_for(adapter, row["content"])
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
@@ -1050,15 +1052,35 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
-                await asyncio.to_thread(
-                    record_crash_left_reply,
-                    obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
-                    platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
-                    resume_turn_id=token)
+                for ref, content in await asyncio.to_thread(
+                        self._crash_left_parts, key, token, text, started, origin):
+                    await asyncio.to_thread(
+                        record_crash_left_reply,
+                        obligation_id=compute_obligation_id(key, ref, content), session_key=key,
+                        platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+                        thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
+                        resume_turn_id=token)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
+
+    @staticmethod
+    def _crash_left_parts(key: str, token: str, text: str, started: float, origin) -> list:
+        """The ``(message_ref, content)`` rows a crash-left reply still owes. A reply whose copy
+        blocks go out as separate messages is ledgered per part as it is sent: once any part of
+        this turn is in the ledger, only the copy blocks not yet recorded are owed, never the
+        whole reply again."""
+        from gateway.copy_blocks import extract_copy_blocks, platform_sends_copy_blocks, wrap_copy_block
+        from gateway.delivery_ledger import recorded_contents_since
+        whole = [(f"crash:{token}", text)]
+        if not platform_sends_copy_blocks(getattr(origin, "platform", None)):
+            return whole
+        _, blocks = extract_copy_blocks(text)
+        recorded = recorded_contents_since(key, started) if blocks else set()
+        if not recorded:
+            return whole
+        return [(f"crash:{token}#copy{index}", wrap_copy_block(block))
+                for index, block in enumerate(blocks) if wrap_copy_block(block) not in recorded]
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
