@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 from tui_gateway import server
 
@@ -216,6 +218,18 @@ def _neutral_session(**compression_ctor):
 def _sync_with_cfg(monkeypatch, session, cfg):
     monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
     server._sync_agent_compression_with_config("sid-unset", session)
+
+
+@pytest.mark.parametrize("raw", [None, True, "garbage"])
+def test_invalid_prune_trigger_matches_fresh_build(monkeypatch, raw):
+    """Null, boolean or garbage `proactive_prune_tokens` live-syncs to what a rebuilt agent installs."""
+    from agent.agent_init import _parse_config_int
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    default = DEFAULT_CONFIG["compression"]["proactive_prune_tokens"]
+    session, compressor = _neutral_session(proactive_prune_tokens=0)
+    _sync_with_cfg(monkeypatch, session, {"compression": {"proactive_prune_tokens": raw}})
+    assert compressor.proactive_prune_tokens == _parse_config_int(raw, default) == default
 
 
 def test_removing_compressor_keys_restores_fresh_build_values(monkeypatch):

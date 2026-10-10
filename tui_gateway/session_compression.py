@@ -85,13 +85,14 @@ def _default_compression_int(key: str, fallback: int) -> int:
     return int(_compressor_ctor_default(key, fallback))
 
 
-# (config key == compressor attr, ctor-default fallback, min_value)
+# (config key == compressor attr, ctor-default fallback, min_value, strict). strict keys use agent_init's
+# _parse_config_int, so null, booleans and garbage land on the default exactly as on a fresh build.
 _COMPRESSION_INT_KEYS = (
-    ("proactive_prune_tokens", 0, 0),
-    ("proactive_prune_min_result_chars", 8000, 0),
-    ("proactive_prune_min_reclaim_tokens", 4096, 0),
-    ("protect_last_n", 20, 0),
-    ("min_tail_user_messages", 1, 1),
+    ("proactive_prune_tokens", 0, 0, True),
+    ("proactive_prune_min_result_chars", 8000, 0, True),
+    ("proactive_prune_min_reclaim_tokens", 4096, 0, True),
+    ("protect_last_n", 20, 0, False),
+    ("min_tail_user_messages", 1, 1, True),
 )
 
 
@@ -131,9 +132,13 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     default_tail = str(_compressor_ctor_default("tail_mode", "lean"))
     mode = str(compression.get("tail_mode", default_tail) or default_tail).strip().lower()
     cc.tail_mode = mode if mode in ("legacy", "lean") else default_tail
-    for key, fallback, min_value in _COMPRESSION_INT_KEYS:
+    from agent.agent_init import _parse_config_int
+    for key, fallback, min_value, strict in _COMPRESSION_INT_KEYS:
         default = _default_compression_int(key, fallback)
         raw = compression.get(key, default)
+        if strict:
+            setattr(cc, key, max(min_value, _parse_config_int(raw, default)))
+            continue
         with contextlib.suppress(TypeError, ValueError):
             setattr(cc, key, max(min_value, default if raw is None else int(raw)))
     with contextlib.suppress(TypeError, ValueError):

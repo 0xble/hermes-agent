@@ -63,6 +63,10 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
 
 class TestProactivePruneConfig:
 
+    def test_explicit_null_trigger_uses_default(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=None)
+        assert agent.context_compressor.proactive_prune_tokens == 48_000
+
     def test_default_values_enable_prune(self, monkeypatch, tmp_path):
         agent = _make_agent(monkeypatch, tmp_path)
         cc = agent.context_compressor
@@ -123,9 +127,9 @@ class TestProactivePruneConfig:
 
     def test_boolean_is_rejected_not_coerced(self, monkeypatch, tmp_path):
         # bool subclasses int: YAML `proactive_prune_tokens: true` must fall
-        # back to disabled, never coerce to 1 token.
+        # back to the shipped default, never coerce to 1 token.
         agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
-        assert agent.context_compressor.proactive_prune_tokens == 0
+        assert agent.context_compressor.proactive_prune_tokens == 48_000
 
 
 
