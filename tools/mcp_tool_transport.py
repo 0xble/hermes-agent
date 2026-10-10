@@ -13,7 +13,10 @@ from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
-from tools.mcp_tool_lifecycle import _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
+from tools.mcp_tool_lifecycle import (
+    _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids,
+    _stdio_pgids, _stdio_processes, _stdio_sessions, _stdio_pids,
+)
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
 from tools import mcp_tool_config as _config
@@ -76,15 +79,6 @@ def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name:
         mounts[f"{scheme}://"] = _make_mcp_body_cap_transport(httpx_mod, httpx_mod.AsyncHTTPTransport(
             proxy=proxy_url, verify=ssl_verify, **_present(cert=client_cert)))
     return mounts or None
-
-
-def _pgroup_alive(pgid: Optional[int]) -> bool:
-    """Signal 0 to the group succeeds iff any member is alive (POSIX only)."""
-    try:
-        os.killpg(pgid, 0)  # windows-footgun: ok — guarded by AttributeError below
-        return True
-    except (AttributeError, TypeError, OSError):  # non-POSIX / pgid None / gone
-        return False
 
 
 class LiveEndpointUnavailable(ConnectionError):
@@ -295,9 +289,13 @@ class MCPServerTransportMixin:
         """Ledger the freshly spawned stdio children (pids, pgids, machine spawn ledger). pgids are
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
         new_pgids: Dict[int, int] = {}
+        new_sessions: Dict[int, int] = {}
+        _lifecycle._remember_mcp_processes(new_pids)
         for pid in new_pids:
             try:
                 new_pgids[pid] = os.getpgid(pid)
+                if hasattr(os, "getsid"):
+                    new_sessions[pid] = os.getsid(pid)
             except ProcessLookupError:
                 # Raced and already exited. The SDK spawns with start_new_session=True, so the
                 # child was its own group leader (pgid == pid): keep that group covered — any
@@ -309,6 +307,7 @@ class MCPServerTransportMixin:
         with _core._lock:
             _stdio_pids.update(dict.fromkeys(new_pids, self.name))
             _stdio_pgids.update(new_pgids)
+            _stdio_sessions.update(new_sessions)
         # Machine spawn ledger (startup sweeps reap orphans after an unclean exit); best-effort.
         for _pid in new_pids:
             try:
@@ -325,22 +324,46 @@ class MCPServerTransportMixin:
     def _release_spawned_children(self, new_pids: Set[int]) -> None:
         """Drop the ledger entries; a child (or its pgroup) still alive means SDK teardown failed
         (common on mid-way cancel on Linux: setsid() children escape) — mark it orphaned for the sweep."""
-        from gateway.status import _pid_exists
-        # Groups with nothing left alive; the supervisor forgets them after the lock is released.
-        # Groups still alive stay registered on purpose, so the supervisor still reaps them if this
-        # process dies before the orphan sweep runs.
+        # A child (or its pgroup) still alive means SDK teardown failed; mark it
+        # orphaned for the sweep.  A recorded session that enumerates empty is
+        # the only case where release may unregister the group immediately.
         released_pgids: list = []
         with _core._lock:
             for pid in new_pids:
                 _stdio_pids.pop(pid, None)
-                # Windows-safe pid probe; the child may be gone while descendants remain in its pgroup.
-                if _pid_exists(pid) or _pgroup_alive(_stdio_pgids.get(pid)):
+                pgid = _stdio_pgids.get(pid)
+                session_id = _stdio_sessions.get(pid)
+                original = _stdio_processes.get(pid, {})
+                members = _lifecycle._owned_mcp_processes(
+                    original, pgid, os.getpgrp() if hasattr(os, "getpgrp") else None,
+                    leader_pid=pid, session_id=session_id,
+                    allow_unwitnessed_session=True,
+                )
+                # Keep the original leader handle as well as any late-discovered
+                # members so a later sweep refreshes only through live witnesses.
+                retained = dict(original)
+                retained.update(members)
+                _stdio_processes[pid] = retained
+                group_scan = (
+                    _lifecycle._enumerate_mcp_group(pgid, session_id)
+                    if pgid is not None else None
+                )
+                group_empty = (
+                    pgid is not None
+                    and (group_scan == {} or getattr(group_scan, "foreign", False))
+                )
+                if members or (pgid is not None and not group_empty):
                     _orphan_stdio_pids.add(pid)
                     _orphan_stdio_pid_servers[pid] = self.name
-                else:  # nothing to reap — drop the pgid so PID reuse can't surface stale pgroup state
+                else:  # no group and no verified process left to reap
+                    _lifecycle._stdio_processes.pop(pid, None)
                     dropped = _stdio_pgids.pop(pid, None)
+                    _stdio_sessions.pop(pid, None)
                     if dropped is not None:
                         released_pgids.append(dropped)
+        # Do not unregister a recorded POSIX group merely because its current
+        # members were temporarily unverifiable; the death supervisor remains
+        # the safety net for that group.
         _core._update_death_supervisor("unregister", released_pgids)
 
     async def _run_stdio(self, config: dict):

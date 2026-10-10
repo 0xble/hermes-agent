@@ -10,6 +10,21 @@ from tools import mcp_tool_lifecycle as _mcp_lifecycle
 from tools import mcp_tool_loop as _mcp_loop
 
 
+def _track_fake_incarnation(pid, monkeypatch, pgid=None):
+    """Mock process identity as well as signal delivery; PID-only ledgers are unsafe."""
+    proc = MagicMock(pid=pid)
+    proc.is_running.return_value = True
+    proc.status.return_value = "running"
+    proc.children.return_value = []
+    proc.send_signal.side_effect = lambda sig: os.kill(pid, sig)
+    _mcp_lifecycle._stdio_processes[pid] = {pid: proc}
+    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
+    if pgid is not None:
+        existing = getattr(os, "getpgid", lambda _: None)
+        monkeypatch.setattr(os, "getpgid", lambda p: pgid if p == pid else existing(p), raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Fix 1: MCP event loop exception handler
 # ---------------------------------------------------------------------------
@@ -190,7 +205,7 @@ class TestStdioPidTracking:
              patch("tools.mcp_tool.time.sleep"):
             _kill_orphaned_mcp_children(server_name="feishu")
 
-        mock_kill.assert_called_once_with(target_pid, signal.SIGTERM)
+        mock_kill.assert_not_called()  # PID-only ledger is not signal authority
         with _lock:
             assert target_pid not in _orphan_stdio_pids
             assert target_pid not in _orphan_stdio_pid_servers
@@ -212,13 +227,17 @@ class TestStdioPgroupReaping:
     """_kill_orphaned_mcp_children reaps via killpg when a pgid is tracked."""
 
     def _reset_state(self):
-        from tools.mcp_tool_lifecycle import _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids
+        from tools.mcp_tool_lifecycle import (
+            _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids,
+            _stdio_pids, _stdio_sessions,
+        )
         from tools.mcp_tool import _lock
         with _lock:
             _stdio_pids.clear()
             _orphan_stdio_pids.clear()
             _orphan_stdio_pid_servers.clear()
             _stdio_pgids.clear()
+            _stdio_sessions.clear()
 
     def test_killpg_used_when_pgid_tracked(self, monkeypatch):
         """SIGTERM and SIGKILL route through killpg when pgid is known."""
@@ -231,6 +250,7 @@ class TestStdioPgroupReaping:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
             _stdio_pgids[fake_pid] = fake_pgid
+        _track_fake_incarnation(fake_pid, monkeypatch, fake_pgid)
 
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
@@ -277,6 +297,8 @@ class TestStdioPgroupReaping:
             _stdio_pgids[fake_pid] = gateway_pgid  # == gateway's own pgid
             _orphan_stdio_pids.add(other_pid)
             _stdio_pgids[other_pid] = other_pgid  # distinct group → killpg OK
+        _track_fake_incarnation(fake_pid, monkeypatch, gateway_pgid)
+        _track_fake_incarnation(other_pid, monkeypatch, other_pgid)
 
         fake_sigkill = 9
         monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
@@ -313,6 +335,7 @@ class TestStdioPgroupReaping:
         with _lock:
             _orphan_stdio_pids.add(fake_pid)
             # No entry in _stdio_pgids.
+        _track_fake_incarnation(fake_pid, monkeypatch)
 
         with patch("tools.mcp_tool.os.kill") as mock_kill, \
              patch("gateway.status._pid_exists", return_value=False), \
@@ -331,95 +354,81 @@ class TestStdioPgroupReaping:
         reason="POSIX-only: requires os.killpg and os.setsid",
     )
     def test_grandchild_reaped_via_pgroup(self, tmp_path):
-        """End-to-end: parent spawns grandchild, parent exits, killpg reaps grandchild.
+        """A late child of a tracked wrapper is reaped after the wrapper exits.
 
-        Mirrors issue #23799: a stdio MCP wrapper (parent) launches a long-lived
-        helper subprocess (grandchild) in the same process group, then the
-        wrapper exits while the grandchild keeps running.  killpg on the pgid
-        captured at spawn time must still deliver the signal to the grandchild.
-
-        Marked ``live_system_guard_bypass`` because this test genuinely needs
-        real signal delivery to its own subprocess tree (the conftest guard
-        only knows the test's *initial* children; the spawned tree here is
-        outside that allowlist).
+        The wrapper is tracked before it creates the long-lived helper, matching
+        mcp-remote/npx: the spawn-time ledger has no descendant witness, so the
+        release-time session check must discover the helper without trusting a
+        recycled numeric PGID.
         """
         import subprocess
         import sys
         import time as _time
 
         psutil = pytest.importorskip("psutil")
-
-        # Grandchild: sleep forever, write its pid then wait.  The pid file
-        # is written to a temp path and os.replace()d into place so the
-        # polling reader below can never observe a created-but-empty file
-        # (CI flake: int('') ValueError when the reader won the race between
-        # open('w') creating the file and write() filling it).
-        grandchild_pid_file = tmp_path / "grandchild.pid"
-        grandchild_script = tmp_path / "grandchild.py"
-        grandchild_script.write_text(
-            "import os, sys, time\n"
-            f"tmp = {str(grandchild_pid_file)!r} + '.tmp'\n"
-            "with open(tmp, 'w') as f:\n"
-            "    f.write(str(os.getpid()))\n"
-            f"os.replace(tmp, {str(grandchild_pid_file)!r})\n"
-            "while True:\n"
-            "    time.sleep(0.5)\n"
-        )
-
-        # Parent: spawn grandchild, exit immediately (without killing it).
         parent_script = tmp_path / "parent.py"
         parent_script.write_text(
             "import subprocess, sys\n"
-            f"subprocess.Popen([sys.executable, {str(grandchild_script)!r}])\n"
-            # Parent exits — grandchild reparents to init.
+            "print('ready', flush=True)\n"
+            "sys.stdin.readline()\n"
+            f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+            "print(child.pid, flush=True)\n"
+            "sys.stdin.read()\n"
         )
-
-        # Spawn parent in its own session (mirrors stdio_client behaviour).
         parent = subprocess.Popen(
-            [sys.executable, str(parent_script)],
-            start_new_session=True,
+            [sys.executable, str(parent_script)], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, start_new_session=True,
         )
-        parent_pgid = os.getpgid(parent.pid)
-        # Wait for parent to exit and grandchild to spin up.
-        parent.wait(timeout=15)
-        deadline = _time.time() + 15  # fresh CPython spinup dilates under CI load
-        while _time.time() < deadline and not grandchild_pid_file.exists():
-            _time.sleep(0.05)
-        assert grandchild_pid_file.exists(), "grandchild did not start"
-        grandchild_pid = int(grandchild_pid_file.read_text().strip())
-
-        # Sanity: grandchild is alive and shares the parent's pgid.
-        assert psutil.pid_exists(grandchild_pid)
-        assert os.getpgid(grandchild_pid) == parent_pgid
-
-        # Drive the reaper: register the parent pid + pgid as an orphan.
-        from tools.mcp_tool_lifecycle import (
-            _kill_orphaned_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids)
-        from tools.mcp_tool import _lock
-        with _lock:
-            _stdio_pids.clear()
-            _orphan_stdio_pids.clear()
-            _orphan_stdio_pid_servers.clear()
-            _stdio_pgids.clear()
-            _orphan_stdio_pids.add(parent.pid)
-            _orphan_stdio_pid_servers[parent.pid] = "orphan"
-            _stdio_pgids[parent.pid] = parent_pgid
+        grandchild_pid = None
         try:
-            _kill_orphaned_mcp_children()
-        finally:
-            # Belt-and-suspenders: ensure grandchild is dead even if test fails.
-            try:
-                os.kill(grandchild_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            assert parent.stdout.readline().strip() == "ready"
+            parent_pgid = os.getpgid(parent.pid)
+            from tools.mcp_tool_lifecycle import (
+                _kill_orphaned_mcp_children, _orphan_stdio_pid_servers,
+                _orphan_stdio_pids, _stdio_pgids, _stdio_pids,
+            )
+            from tools.mcp_tool import _lock
+            from tools.mcp_tool_transport import MCPServerTransportMixin
 
-        # Grandchild should be gone — SIGTERM via killpg in phase 1 reached it.
-        deadline = _time.time() + 10
-        while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
-            _time.sleep(0.05)
-        assert not psutil.pid_exists(grandchild_pid), (
-            "grandchild survived killpg-based reaping (issue #23799 regression)"
-        )
+            with _lock:
+                _stdio_pids.clear()
+                _orphan_stdio_pids.clear()
+                _orphan_stdio_pid_servers.clear()
+                _stdio_pgids.clear()
+            server = type("Server", (), {"name": "orphan"})()
+            MCPServerTransportMixin._track_spawned_children(server, {parent.pid})
+            parent.stdin.write("spawn\n")
+            parent.stdin.flush()
+            grandchild_pid = int(parent.stdout.readline())
+            assert psutil.pid_exists(grandchild_pid)
+            assert os.getpgid(grandchild_pid) == parent_pgid
+
+            parent.stdin.close()
+            parent.wait(timeout=15)
+            MCPServerTransportMixin._release_spawned_children(server, {parent.pid})
+            assert parent.pid in _orphan_stdio_pids
+            assert psutil.pid_exists(grandchild_pid), "grandchild died before the reaper ran"
+
+            _kill_orphaned_mcp_children()
+            deadline = _time.time() + 10
+            while _time.time() < deadline and psutil.pid_exists(grandchild_pid):
+                _time.sleep(0.05)
+            assert not psutil.pid_exists(grandchild_pid), (
+                "grandchild survived killpg-based reaping (issue #23799 regression)"
+            )
+        finally:
+            if grandchild_pid is not None:
+                try:
+                    os.kill(grandchild_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if parent.poll() is None:
+                parent.kill()
+            parent.wait(timeout=10)
+            if parent.stdin is not None and not parent.stdin.closed:
+                parent.stdin.close()
+            if parent.stdout is not None:
+                parent.stdout.close()
 
 
 # ---------------------------------------------------------------------------
