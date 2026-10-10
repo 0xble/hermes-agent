@@ -698,11 +698,22 @@ class GatewayNotificationsMixin:
             if any(getattr(result, "success", False) for result in copy_results):
                 delivered_confirmed = True
             if any(not getattr(result, "success", False) for result in copy_results):
-                # Each block has its own ledger row, so a refused block is redelivered from
-                # the ledger. A whole-response fallback here would resend delivered parts.
-                logger.warning(
-                    "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
-                    source.chat_id)
+                from gateway.delivery_ledger import ledger_enabled
+                if not await asyncio.to_thread(ledger_enabled):
+                    # No ledger owns the refused blocks. With nothing landed, the caller's
+                    # whole-response fallback is the only retry; after a partial delivery it would
+                    # duplicate, so the gap is reported and the turn stops here.
+                    if not delivered_confirmed:
+                        return False
+                    logger.error(
+                        "Queued-lane copy block delivery incomplete for %s and no delivery ledger "
+                        "is enabled; the undelivered blocks are lost.", source.chat_id)
+                else:
+                    # Each block has its own ledger row, so a refused block is redelivered from
+                    # the ledger. A whole-response fallback here would resend delivered parts.
+                    logger.warning(
+                        "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
+                        source.chat_id)
         else:
             for copy_block_index, copy_block in enumerate(copy_blocks):
                 copy_metadata = dict(metadata or {})

@@ -1059,7 +1059,7 @@ class GatewayStartupMixin:
                         obligation_id=compute_obligation_id(key, ref, content), session_key=key,
                         platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
                         thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
-                        resume_turn_id=token)
+                        resume_turn_id=token, part="#copy" in ref)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
@@ -1076,11 +1076,19 @@ class GatewayStartupMixin:
         if not platform_sends_copy_blocks(getattr(origin, "platform", None)):
             return whole
         _, blocks = extract_copy_blocks(text)
-        recorded = recorded_contents_since(key, started) if blocks else set()
+        recorded = recorded_contents_since(key, started) if blocks else {}
         if not recorded:
             return whole
-        return [(f"crash:{token}#copy{index}", wrap_copy_block(block))
-                for index, block in enumerate(blocks) if wrap_copy_block(block) not in recorded]
+        # Blocks go out in order, so the recorded ones are the first occurrences of each body:
+        # consume one recorded row per block, and every block left over is still owed.
+        owed = []
+        for index, block in enumerate(blocks):
+            wrapped = wrap_copy_block(block)
+            if recorded.get(wrapped, 0) > 0:
+                recorded[wrapped] -= 1
+            else:
+                owed.append((f"crash:{token}#copy{index}", wrapped))
+        return owed
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
@@ -1117,16 +1125,21 @@ class GatewayStartupMixin:
             return "" if silent_ok else _unexpected_silence_reply()
         # The ledger redelivers text only, so a reply that carries attachments is not settled here:
         # it stays marked and resumes, instead of being redelivered with its attachments dropped.
+        from gateway.copy_blocks import map_outside_copy_blocks, strip_copy_blocks
         from gateway.platforms.base import BasePlatformAdapter
-        media, rest = BasePlatformAdapter.extract_media(last["content"])
+        # Copy bodies are literal paste-ready text: only text outside them can carry attachments
+        # or directives, as in live delivery.
+        outside = strip_copy_blocks(last["content"])
+        media, rest = BasePlatformAdapter.extract_media(outside)
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
         from gateway.response_filters import strip_trailing_loop_complete_marker
         # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
-        # normal and queued delivery lanes.
-        return _strip_media_directives(strip_trailing_loop_complete_marker(
-            _sanitize_gateway_final_response(origin.platform, last["content"]))).strip() or None
+        # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
+        sanitized = strip_trailing_loop_complete_marker(
+            _sanitize_gateway_final_response(origin.platform, last["content"]))
+        return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():

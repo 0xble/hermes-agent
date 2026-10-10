@@ -536,6 +536,17 @@ class TestGatewayRedeliverySweep:
         text = "Intro\n[[copy]]\none\n[[/copy]]\n[[copy]]\ntwo\n[[/copy]]\n"
         parts = GatewayRunner._crash_left_parts(key, "tok", text, started, origin)
         assert parts == [("crash:tok#copy1", wrap_copy_block("two"))]
+        # Two blocks with the same body are two messages: one recorded leaves the other owed.
+        same = "Intro\n[[copy]]\nsame\n[[/copy]]\n[[copy]]\nsame\n[[/copy]]\n"
+        key2 = "agent:main:telegram:dm:C2"
+        _record(oid="r2", session_key=key2, platform="telegram", content="Intro")
+        _record(oid="c2", session_key=key2, platform="telegram", content=wrap_copy_block("same"))
+        assert GatewayRunner._crash_left_parts(key2, "tok", same, started, origin) == [
+            ("crash:tok#copy1", wrap_copy_block("same"))]
+        dl.record_crash_left_reply(
+            obligation_id="adopted", session_key=key2, platform="telegram", chat_id="C1", thread_id=None,
+            content=wrap_copy_block("same"), since=started, part=True)
+        assert _row("adopted") is not None
         # Nothing of this turn was ledgered yet: the whole reply is owed, as before.
         assert GatewayRunner._crash_left_parts("agent:other", "tok", text, started, origin) == [
             ("crash:tok", text)]

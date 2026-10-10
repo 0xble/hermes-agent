@@ -627,3 +627,42 @@ def test_only_separate_send_platforms_promise_separate_copy_messages() -> None:
     for platform, hint in PLATFORM_HINTS.items():
         promises = "its own plain-text message" in hint
         assert promises == platform_sends_copy_blocks(platform), platform
+
+
+@pytest.mark.parametrize("body", ["[[as_document]]", "![literal](https://example.com/literal.png)"])
+def test_crash_left_reply_keeps_copy_bodies_literal(body) -> None:
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    origin = SimpleNamespace(platform="telegram", chat_id="c")
+    content = f"Intro\n[[copy]]\n{body}\n[[/copy]]\n"
+    history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": content, "timestamp": 10**10}]
+    text = runner._crash_left_reply(history, 0, origin)
+    assert text is not None
+    assert extract_copy_blocks(text)[1] == [body]
+
+
+@pytest.mark.asyncio
+async def test_queued_copy_refusal_without_a_ledger_keeps_the_completion_fallback(monkeypatch) -> None:
+    import gateway.delivery_ledger as ledger
+    runner = object.__new__(GatewayNotificationsMixin)
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    adapter._final_delivery_adapter = lambda _source: adapter
+    adapter.gateway_runner = None
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda *_a: False)
+
+    async def send_with_retry(*, chat_id, content, reply_to, metadata):
+        return SimpleNamespace(success=False, message_id=None, pre_send=True, error="send_path_degraded")
+
+    adapter._send_with_retry = send_with_retry
+
+    async def _no_media(*args, **kwargs):
+        return False
+
+    runner._deliver_media_from_response = _no_media
+    source = SimpleNamespace(chat_id="chat", platform="telegram", thread_id=None)
+    delivered = await runner._deliver_queued_first_response(
+        "[[copy]]\nonly copy\n[[/copy]]", source, adapter, event_message_id="e",
+        session_key="session", inbound_message_id="in")
+    assert delivered is False
