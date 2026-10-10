@@ -123,8 +123,9 @@ class CopyMarkerStreamFilter:
         return False
 
     def _is_marker(self, line: str) -> bool:
+        # Inside a block an open marker is body text, as in extract_copy_blocks.
         return self._fence is None and (
-            _line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)
+            (_line_marker(line, _COPY_OPEN) and not self._in_copy) or _line_marker(line, _COPY_CLOSE)
         )
 
     def _on_marker(self, line: str) -> None:
@@ -208,12 +209,10 @@ def map_outside_copy_blocks(text: str, transform, *, keep_markers: bool = False)
             ordinary.clear()
 
     for line in text.splitlines(keepends=True):
-        if fence is None and (_line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)):
+        if fence is None and (
+                (_line_marker(line, _COPY_OPEN) and not in_copy) or _line_marker(line, _COPY_CLOSE)):
             _flush_ordinary()
-            if _line_marker(line, _COPY_OPEN):
-                in_copy = True
-            elif in_copy:
-                in_copy = False
+            in_copy = _line_marker(line, _COPY_OPEN)
             if keep_markers:
                 out.append(line)
             continue

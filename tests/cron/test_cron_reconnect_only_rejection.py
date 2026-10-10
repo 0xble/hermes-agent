@@ -116,9 +116,10 @@ def test_reconnect_queue_preserves_copy_block_markers_and_order(monkeypatch):
     errors = []
     sd._queue_for_live_reconnect(t, "reply", [], errors, copy_blocks=["first", "second"])
     claimed = dl.sweep_failed_for_runtime("telegram", profile=None)
-    assert len(claimed) == 1
-    assert claimed[0]["content"] == (
-        "reply\n[[copy]]\nfirst\n[[/copy]]\n[[copy]]\nsecond\n[[/copy]]")
+    # One row per logical message: a replay that fails one part retries only that part.
+    assert sorted(row["content"] for row in claimed) == sorted([
+        "reply", "[[copy]]\nfirst\n[[/copy]]", "[[copy]]\nsecond\n[[/copy]]"])
+    assert len({row["obligation_id"] for row in claimed}) == 3
 
 
 def test_reconnect_only_rejection_retries_live_before_standalone(monkeypatch, gateway_loop):

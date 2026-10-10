@@ -154,6 +154,14 @@ def test_map_outside_copy_blocks_never_rewrites_bodies() -> None:
     assert map_outside_copy_blocks("plain MEDIA:/a.png", resolve) == "plain data:image/png"
 
 
+def test_literal_open_marker_inside_body_is_body_on_every_renderer() -> None:
+    text = "a\n[[copy]]\nx\n[[copy]]\ny\n[[/copy]]\nb\n"
+    assert extract_copy_blocks(text) == ("a\nb\n", ["x\n[[copy]]\ny"])
+    assert render_copy_blocks_inline(text) == "a\nx\n[[copy]]\ny\nb\n"
+    stream = CopyMarkerStreamFilter(drop_bodies=True)
+    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "a\nb\n"
+
+
 def test_extracted_response_keeps_legacy_constructor() -> None:
     from gateway.platforms.base import _ExtractedResponse
     extracted = _ExtractedResponse(
@@ -307,7 +315,7 @@ async def test_copy_block_ledger_rows_are_distinct_and_wrapped(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_retry_together(monkeypatch) -> None:
+async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_never_resend_delivered_parts(monkeypatch) -> None:
     import gateway.delivery_ledger as ledger
 
     runner = object.__new__(GatewayNotificationsMixin)
@@ -338,19 +346,17 @@ async def test_queued_copy_blocks_keep_distinct_ledger_rows_and_retry_together(m
     runner._deliver_media_from_response = _no_media
     source = SimpleNamespace(chat_id="chat", platform="telegram", thread_id=None)
     response = "same\n[[copy]]\nsame\n[[/copy]]\n[[copy]]\nsame\n[[/copy]]"
-    first = await runner._deliver_queued_first_response(
-        response, source, adapter, event_message_id="reply", session_key="session", inbound_message_id="inbound")
-    second = await runner._deliver_queued_first_response(
+    delivered = await runner._deliver_queued_first_response(
         response, source, adapter, event_message_id="reply", session_key="session", inbound_message_id="inbound")
 
-    assert first is False
-    assert second is True
-    copy_sends = [item for item in sends if item[1].get("copy_block")]
-    assert [content for content, _metadata in copy_sends] == ["same", "same", "same", "same"]
+    # The reply text landed, so the caller must not replay the whole response: the refused
+    # blocks each hold their own failed ledger row and are redelivered from there.
+    assert delivered is True
+    assert [content for content, _metadata in sends] == ["same", "same", "same"]
     copy_rows = [row for row in rows if row["content"] == "[[copy]]\nsame\n[[/copy]]"]
-    assert len(copy_rows) == 4
-    assert len({row["obligation_id"] for row in copy_rows}) == 2
-    assert all(copy_rows.count(row) == 2 for row in copy_rows[:2])
+    assert len(copy_rows) == 2
+    reply_rows = [row for row in rows if row["content"] == "same"]
+    assert len({row["obligation_id"] for row in copy_rows + reply_rows}) == 3
 
 
 @pytest.mark.asyncio

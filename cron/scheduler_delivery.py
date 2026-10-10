@@ -1863,19 +1863,19 @@ def _queue_for_live_reconnect(
         if not is_reconnect_only(t.live_error) or not ledger_enabled():
             return
         session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        queued_content = content
-        if copy_blocks:
-            queued_content = "\n".join(
-                part for part in [content, *(
-                    f"[[copy]]\n{block}\n[[/copy]]" for block in copy_blocks
-                )] if part
-            )
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", queued_content)
-        record_obligation(
-            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
-            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-        mark_failed(obligation_id, str(t.live_error))
+        job_ref = f"job:{t.job.get('id', '?')}"
+        # One row per logical message, so a replay that lands some and fails one retries only
+        # that one. Copy rows keep their markers so replay re-extracts and sends them plain.
+        rows = [(job_ref, content)] if content else []
+        rows += [(f"{job_ref}#copy{index}", f"[[copy]]\n{block}\n[[/copy]]")
+                 for index, block in enumerate(copy_blocks or [])]
+        for message_ref, queued_content in rows:
+            obligation_id = compute_obligation_id(session_key, message_ref, queued_content)
+            record_obligation(
+                obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
+                chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
+                adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
+            mark_failed(obligation_id, str(t.live_error))
     except Exception:
         logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
                        t.job.get("id"), t.where, exc_info=True)

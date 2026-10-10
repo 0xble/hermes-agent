@@ -698,7 +698,11 @@ class GatewayNotificationsMixin:
             if any(getattr(result, "success", False) for result in copy_results):
                 delivered_confirmed = True
             if any(not getattr(result, "success", False) for result in copy_results):
-                return False
+                # Each block has its own ledger row, so a refused block is redelivered from
+                # the ledger. A whole-response fallback here would resend delivered parts.
+                logger.warning(
+                    "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
+                    source.chat_id)
         else:
             for copy_block_index, copy_block in enumerate(copy_blocks):
                 copy_metadata = dict(metadata or {})
@@ -710,7 +714,11 @@ class GatewayNotificationsMixin:
                 if not getattr(_sent, "success", False):
                     logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
                                    getattr(_sent, "error", None) or "no result")
-                    return False
+                    # Only a turn where nothing landed may fall back to the whole-response send;
+                    # after a partial delivery that resend would duplicate what already arrived.
+                    if not delivered_confirmed:
+                        return False
+                    break
                 delivered_confirmed = True
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
