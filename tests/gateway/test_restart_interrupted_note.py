@@ -720,6 +720,57 @@ def _configure_real_final_delivery(adapter, store):
 
 
 @pytest.mark.asyncio
+async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
+    """Synthetic resumes share their reply anchor but not their durable admission identity."""
+    import sqlite3
+
+    from gateway.run_inbound import _admit_outbox_event
+    from gateway.run_startup import GatewayStartupMixin
+
+    source = _source("resume-admission")
+    source.message_id = "reply-anchor"
+    entries = [
+        SimpleNamespace(session_key=f"resume-key-{i}", origin=source, resume_turn_id=f"resume-{i}")
+        for i in range(2)
+    ]
+    runner = object.__new__(GatewayStartupMixin)
+    runner.config = GatewayConfig(
+        restart_resume_policy="continue", durable_outbox_enabled=True,
+    )
+    runner._resume_pending_candidates = lambda _platform=None: entries
+    runner._auto_resume_ready = lambda _entry: (adapter, source)
+    runner._session_states = {}
+    runner._session_state = lambda key: runner._session_states.setdefault(
+        key, SimpleNamespace(turn=SimpleNamespace(agent=None, started_ts=None))
+    )
+    runner._peek_session_state = runner._session_state
+    runner._release_running_agent_state = lambda key: setattr(
+        runner._session_state(key).turn, "agent", None
+    )
+    runner._persist_active_agents = lambda: None
+    tasks = []
+    runner._retain_background_task = lambda task: tasks.append(task) or task
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
+
+    class _Adapter:
+        _session_tasks = {}
+
+        async def handle_message(self, event):
+            await _admit_outbox_event(runner, event, event.source)
+
+    adapter = _Adapter()
+    scheduled = runner._schedule_resume_pending_sessions()
+    assert scheduled == 2
+    await asyncio.gather(*tasks)
+
+    with sqlite3.connect(tmp_path / "gateway-outbox.db") as db:
+        admitted = sorted(row[0] for row in db.execute(
+            "SELECT transport_event_id FROM admissions"
+        ))
+    assert admitted == ["resume:resume-0", "resume:resume-1"]
+
+
+@pytest.mark.asyncio
 async def test_real_nonstream_delivery_reconciles_after_runner_clears_resume_pending(tmp_path, monkeypatch):
     """The runner returns text, clears resume_pending, then the adapter performs final delivery."""
     from gateway import run_turn
