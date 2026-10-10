@@ -166,7 +166,7 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
                 if (not honor_parent_interrupt and batch.unit_id and entry.get("status") in SUBAGENT_FAILURE_STATUSES
                         and len(results) < n_here):
                     # Detached unit, a sibling is still running: tell the parent NOW, not when the last one finishes.
-                    # Non-durable and separate from the unit's final result (which is still delivered once).
+                    # Durable child-failure notice, separate from the unit's final result (which is still delivered once).
                     with _quiet("task failure notice failed", exc_info=True):
                         from tools.async_delegation import push_task_failure_notice
                         _i = entry.get("task_index", -1)

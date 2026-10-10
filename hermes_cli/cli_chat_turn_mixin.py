@@ -716,7 +716,8 @@ class CLIChatTurnMixin:
             _render_final_assistant_content,
         )
         from gateway.response_filters import strip_trailing_loop_complete_marker
-        response = strip_trailing_loop_complete_marker(response)
+        from gateway.copy_blocks import render_copy_blocks_inline
+        response = render_copy_blocks_inline(strip_trailing_loop_complete_marker(response))
         if response and not (turn.result and turn.result.get("response_previewed", False)):
             try:
                 from hermes_cli.skin_engine import get_active_skin

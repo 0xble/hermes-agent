@@ -53,6 +53,20 @@ def _valid_manifest() -> dict:
     }
 
 
+@pytest.mark.parametrize("raise_errors", [False, True])
+def test_checkout_seed_real_write_failure_preserves_best_effort(isolated_home, raise_errors):
+    from hermes_cli import model_catalog
+
+    (isolated_home / "cache").write_text("not-a-directory", encoding="utf-8")
+    repo_root = Path(__file__).resolve().parents[2]
+    if raise_errors:
+        with pytest.raises(OSError):
+            model_catalog.seed_cache_from_checkout(repo_root, raise_errors=True)
+    else:
+        assert model_catalog.seed_cache_from_checkout(repo_root) is True
+    assert not (isolated_home / "cache" / "model_catalog.json").exists()
+
+
 class TestValidation:
     def test_accepts_well_formed_manifest(self, isolated_home):
         from hermes_cli.model_catalog import _validate_manifest

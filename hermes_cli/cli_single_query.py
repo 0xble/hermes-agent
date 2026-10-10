@@ -83,7 +83,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
     def _quiet_turn(prompt: str) -> dict:
         result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
         _sync_cli_session_id_from_agent(cli)
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        from gateway.copy_blocks import render_copy_blocks_inline
+        resp = render_copy_blocks_inline(result.get("final_response", "") if isinstance(result, dict) else str(result))
         if resp:
             print(resp)
         # Carry failed/failure_reason so run_kanban_goal_loop can stop on a failed
@@ -301,7 +302,8 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 result = continued
                 # A teammate's reply displaced the answer this run prints; tell the spawner.
                 _report_turn(result)
-        response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        from gateway.copy_blocks import render_copy_blocks_inline
+        response = render_copy_blocks_inline(result.get("final_response", "") if isinstance(result, dict) else str(result))
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
     if emitter is not None:

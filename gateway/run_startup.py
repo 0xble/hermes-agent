@@ -635,8 +635,19 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
+        blocked_chats: dict = {}
         for row in claimed:
+            # Ordering is per bot identity: one bot's refusal never holds another bot's messages.
+            chat_key = (row.get("platform"), row.get("profile") or "default", row.get("chat_id"), row.get("thread_id"))
+            if chat_key in blocked_chats and not row.get("adopted"):
+                # An earlier message to this chat was refused: sending this one now would put it
+                # ahead of that one. It goes back to failed and is retried after it, in order.
+                await self._release_runtime_claim_quiet(
+                    row["obligation_id"], "failed to release held obligation %s", error=blocked_chats[chat_key])
+                continue
             if row.get("adopted"):
+                # Later messages to this chat must wait for it, so they are released behind it.
+                blocked_chats.setdefault(chat_key, row.get("last_error") or "send_path_degraded")
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
@@ -644,15 +655,24 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             note_event = await self._redelivery_restart_note_event(row)
-            content = row["content"]
+            from gateway.copy_blocks import split_copy_blocks_for
+            # Separate copy messages only where the adapter sends them plain; elsewhere the
+            # recovered reply renders its blocks inline, as normal delivery does.
+            content, copy_blocks = split_copy_blocks_for(adapter, row["content"])
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
-            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
-            except Exception as send_err:
-                logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
-                result = None
+            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
+            payloads = [(content, metadata)] if content.strip() else []
+            payloads.extend((block, {**metadata, "copy_block": True, "plain": True}) for block in copy_blocks)
+            result = None
+            for payload, payload_metadata in payloads:
+                try:
+                    result = await adapter.send(chat_id=row["chat_id"], content=payload, metadata=payload_metadata)
+                except Exception as send_err:
+                    logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
+                    result = None
+                if result is None or not getattr(result, "success", False):
+                    break
             with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
                 if result is not None and getattr(result, "success", False):
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
@@ -672,8 +692,9 @@ class GatewayStartupMixin:
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
+                    blocked_chats[chat_key] = str(getattr(result, "error", "") or "send failed")
                     await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        mark_failed, row["obligation_id"], blocked_chats[chat_key]
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
@@ -1054,15 +1075,46 @@ class GatewayStartupMixin:
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:
-                await asyncio.to_thread(
-                    record_crash_left_reply,
-                    obligation_id=compute_obligation_id(key, f"crash:{token}", text), session_key=key,
-                    platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
-                    thread_id=origin.thread_id, content=text, since=started, adapter_profile=profile,
-                    resume_turn_id=token)
+                for ref, content in await asyncio.to_thread(
+                        self._crash_left_parts, key, token, text, started, origin):
+                    await asyncio.to_thread(
+                        record_crash_left_reply,
+                        obligation_id=compute_obligation_id(key, ref, content), session_key=key,
+                        platform=str(getattr(origin.platform, "value", origin.platform)), chat_id=origin.chat_id,
+                        thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
+                        # Parts were matched against the ledger above; only a single whole-reply
+                        # row still needs the content-based duplicate check.
+                        resume_turn_id=token, part=ref != f"crash:{token}" or text != content)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered
+
+    @staticmethod
+    def _crash_left_parts(key: str, token: str, text: str, started: float, origin) -> list:
+        """The ``(message_ref, content)`` rows a crash-left reply still owes.
+
+        Where copy blocks go out as separate messages, the reply is owed as one ledger row per
+        message (its ordinary text, then each block), so a retry of one refused part never
+        resends parts that landed. Live delivery records the same rows as it sends; a part this
+        turn already recorded (matched by exact content, one row per occurrence) is not owed
+        again. Elsewhere the reply is one message and one row."""
+        from gateway.copy_blocks import extract_copy_blocks, platform_sends_copy_blocks, wrap_copy_block
+        from gateway.delivery_ledger import recorded_contents_since
+        if not platform_sends_copy_blocks(getattr(origin, "platform", None)):
+            return [(f"crash:{token}", text)]
+        ordinary, blocks = extract_copy_blocks(text)
+        if not blocks:
+            return [(f"crash:{token}", text)]
+        parts = [(f"crash:{token}", ordinary.strip())] if ordinary.strip() else []
+        parts += [(f"crash:{token}#copy{index}", wrap_copy_block(block)) for index, block in enumerate(blocks)]
+        recorded = recorded_contents_since(key, started)
+        owed = []
+        for ref, content in parts:
+            if recorded.get(content, 0) > 0:
+                recorded[content] -= 1  # this exact message was already ledgered by live delivery
+            else:
+                owed.append((ref, content))
+        return owed
 
     def _crash_left_reply(self, history: list, started: float, origin) -> Optional[str]:
         """What a crash-left turn owes, judged as live delivery would have: ``None`` when it never
@@ -1099,16 +1151,21 @@ class GatewayStartupMixin:
             return "" if silent_ok else _unexpected_silence_reply()
         # The ledger redelivers text only, so a reply that carries attachments is not settled here:
         # it stays marked and resumes, instead of being redelivered with its attachments dropped.
+        from gateway.copy_blocks import map_outside_copy_blocks, strip_copy_blocks
         from gateway.platforms.base import BasePlatformAdapter
-        media, rest = BasePlatformAdapter.extract_media(last["content"])
+        # Copy bodies are literal paste-ready text: only text outside them can carry attachments
+        # or directives, as in live delivery.
+        outside = strip_copy_blocks(last["content"])
+        media, rest = BasePlatformAdapter.extract_media(outside)
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
         from gateway.response_filters import strip_trailing_loop_complete_marker
         # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
-        # normal and queued delivery lanes.
-        return _strip_media_directives(strip_trailing_loop_complete_marker(
-            _sanitize_gateway_final_response(origin.platform, last["content"]))).strip() or None
+        # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
+        sanitized = strip_trailing_loop_complete_marker(
+            _sanitize_gateway_final_response(origin.platform, last["content"]))
+        return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
     def _start_hosted_room_worker_sync():

@@ -24,6 +24,8 @@ from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
+from gateway.copy_blocks import (
+    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
 logger = logging.getLogger(__name__)
 
@@ -1674,6 +1676,7 @@ class _ExtractedResponse:
     local_files: list
     force_document_attachments: bool
     pre_extract: str
+    copy_blocks: list[str] = field(default_factory=list)
 
 
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -4535,6 +4538,15 @@ class BasePlatformAdapter(ABC):
         lo, hi = bounds
         return random.uniform(lo / 1000.0, hi / 1000.0)
 
+    def _spoken_reply_text(self, extracted: "_ExtractedResponse") -> str:
+        """The reply as auto-TTS speaks it: paste-ready copy bodies are read, never spoken."""
+        raw = extracted.pre_extract or ""
+        without_copy = strip_copy_blocks(raw)
+        if without_copy == raw:
+            return extracted.text_content
+        _, spoken = self.extract_images(self.extract_media(without_copy)[1])
+        return _strip_media_directives(spoken).strip()
+
     async def _synthesize_auto_tts(self, text_content: str) -> Tuple[List[str], Optional[str]]:
         """Synthesize auto-TTS audio -> ``(existing_paths, requested_path)``; empty/None on failure
         (logged, never raised). Path built platform-aware HERE: HERMES_SESSION_PLATFORM is cleared
@@ -4595,7 +4607,7 @@ class BasePlatformAdapter(ABC):
     async def _record_delivery_obligation(
         self, event: MessageEvent, session_key: str, text_content: str,
         delivery_adapter: "BasePlatformAdapter", is_ephemeral_response: bool, *,
-        outbox_refused: bool = False) -> Optional[str]:
+        metadata: Optional[Dict[str, Any]] = None, outbox_refused: bool = False) -> Optional[str]:
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None. ``outbox_refused`` ledgers an outbox-covered final after the adapter refused it
@@ -4610,18 +4622,26 @@ class BasePlatformAdapter(ABC):
             if not await asyncio.to_thread(ledger_enabled):
                 return None
             source = event.source
-            # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
-            # of the chain, not the event that opened it (see ``MessageEvent.ledger_message_id``).
-            _ledger_id = getattr(event, "ledger_message_id", None)
-            if _ledger_id is None:
-                _ledger_id = getattr(event, "message_id", "")
+            # The ledger identity for the ordinary reply stays unchanged for compatibility. Copy
+            # blocks derive a per-part message ref below, so identical bodies never overwrite each
+            # other's obligations (and a block equal to the reply remains distinct).
+            _ledger_message_ref = getattr(event, "ledger_message_id", None)
+            if _ledger_message_ref is None:
+                _ledger_message_ref = getattr(event, "message_id", "")
+            _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
+            if _copy_index is not None:
+                _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
             obligation_id = compute_obligation_id(
-                session_key, str(_ledger_id or ""), text_content)
+                session_key, str(_ledger_message_ref or ""), text_content)
+            from gateway.copy_blocks import wrap_copy_block
+            ledger_content = (
+                wrap_copy_block(text_content) if (metadata or {}).get("copy_block") else text_content
+            )
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
+                content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
                 resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
@@ -4735,6 +4755,7 @@ class BasePlatformAdapter(ABC):
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
+        on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4747,7 +4768,8 @@ class BasePlatformAdapter(ABC):
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
-            event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+            event, session_key, text_content, delivery_adapter, is_ephemeral_response,
+            metadata=metadata)
         if obligation_id is not None and release_marker:
             # The ledger now owns the crash recovery. It carries text only, so a caller with
             # attachments still to send keeps the marker until they are delivered.
@@ -4758,8 +4780,12 @@ class BasePlatformAdapter(ABC):
                 and self._outbox_covers_final(event, delivery_adapter)):
             obligation_id = await self._record_delivery_obligation(
                 event, session_key, text_content, delivery_adapter, is_ephemeral_response,
-                outbox_refused=True)
+                metadata=metadata, outbox_refused=True)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if on_refused is not None and not getattr(result, "success", False):
+            # Ledger whatever must follow this message BEFORE finalizing it: finalizing can run a
+            # recovery sweep right away, and that sweep must see the followers too.
+            await on_refused(result, delivery_adapter)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
@@ -4818,6 +4844,74 @@ class BasePlatformAdapter(ABC):
         record_delivery(result)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+
+    async def _send_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], metadata: Dict[str, Any],
+        record_delivery: Callable, *, attachments_pending: bool = False,
+        is_ephemeral_response: bool = False, ephemeral_ttl: int = 0,
+    ) -> None:
+        """Deliver copy blocks in source order through the final delivery ledger, without pacing."""
+        previous_send_started = None
+        for index, block in enumerate(copy_blocks):
+            send_started = time.monotonic()
+            if previous_send_started is not None:
+                logger.debug(
+                    "[%s] Copy block %d/%d inter-message start gap: %.3fs",
+                    self.name, index, len(copy_blocks), send_started - previous_send_started)
+            previous_send_started = send_started
+            copy_metadata = dict(metadata)
+            copy_metadata["copy_block"] = True
+            copy_metadata["copy_block_index"] = index
+            copy_metadata["plain"] = True
+            deferred: list = []
+
+            async def _defer_rest(refused, refusing_adapter, _index=index, _metadata=copy_metadata):
+                # A later block must never overtake an undelivered earlier one: the rest wait
+                # in the ledger behind the refused block, and redelivery keeps their order.
+                deferred.extend(await self._defer_copy_blocks(
+                    event, session_key, copy_blocks, _index + 1, _metadata, refusing_adapter,
+                    str(refused.error or "send failed"), is_ephemeral_response=is_ephemeral_response))
+
+            result, delivery_adapter = await self.send_final_ledgered(
+                event, session_key, block, copy_metadata,
+                reply_to=_reply_anchor_for_event(event),
+                is_ephemeral_response=is_ephemeral_response,
+                release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
+                on_refused=_defer_rest,
+            )
+            record_delivery(result)
+            if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
+                delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
+            if not getattr(result, "success", False):
+                logger.error(
+                    "[%s] Copy block %d/%d failed for %s: %s",
+                    self.name, index + 1, len(copy_blocks), event.source.chat_id,
+                    result.error or "unknown delivery error",
+                )
+                for held in deferred:
+                    record_delivery(held)
+                return
+
+    async def _defer_copy_blocks(
+        self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
+        metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
+        *, is_ephemeral_response: bool,
+    ) -> list:
+        """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
+        from gateway.delivery_ledger import mark_failed
+        held: list = []
+        for index in range(start, len(copy_blocks)):
+            block_metadata = {**metadata, "copy_block_index": index}
+            # Never sent, so the durable outbox will not replay it: the ledger must own it.
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, copy_blocks[index], delivery_adapter, is_ephemeral_response,
+                metadata=block_metadata, outbox_refused=True)
+            if obligation_id is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(mark_failed, obligation_id, error)
+            held.append(SendResult(
+                success=False, error=f"copy block {index + 1} held behind an undelivered earlier block"))
+        return held
 
     async def _notify_turn_error(
         self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,
@@ -4891,14 +4985,22 @@ class BasePlatformAdapter(ABC):
 
     async def _extract_response_content(self, response: str, event: MessageEvent, session_key: str,
                                         *, is_ephemeral_response: bool) -> "_ExtractedResponse":
-        """Split a handler response into deliverable text + attachments. Order matters: MEDIA tags →
-        image URLs → residual directives → bare local paths (skipped for command replies and
-        ephemeral notices so paths they mention stay text; unknown-extension MEDIA tags survive for
-        the bare-path detector). History
-        dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
-        # Captured before extract_media strips it: images then go via send_document (no recompression).
-        force_document = "[[as_document]]" in response
+        """Split a handler response into deliverable text, copy blocks and attachments. Order matters:
+        copy blocks are removed first so MEDIA/image/file directives inside a block remain literal body text.
+        Remaining text then follows the existing MEDIA → image → residual directive → bare local path
+        pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
+        recovered."""
         pre_extract = response
+        # Platforms without a plain copy send keep blocks inline; their bodies ride through
+        # directive extraction as opaque tokens, so literal text never becomes an attachment.
+        if getattr(event, "_copy_blocks_inline_only", False):
+            # Interrupted turn: a block may be partial, so it stays inline, still literal.
+            response, inline_bodies = protect_inline_copy_bodies(response)
+            copy_blocks = []
+        else:
+            response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
+        # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
+        force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
         skip_bare_paths = is_ephemeral_response or isinstance(response, CommandReply)
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
@@ -4930,7 +5032,7 @@ class BasePlatformAdapter(ABC):
         # A2 (#29346): extraction can reduce a non-empty response to empty text with no attachment, and the
         # `if text_content` guard below then drops it silently. Recover on every platform (#33842 was
         # Discord-only); the guard avoids duplicating an attachment.
-        if not (text_content or images or local_files or media_files):
+        if not (text_content or copy_blocks or images or local_files or media_files):
             _recovered = _strip_media_directives(response).strip()
             if _recovered:
                 logger.warning("[%s] response_delivery_recovered: extract pipeline "
@@ -4938,8 +5040,11 @@ class BasePlatformAdapter(ABC):
                                "no attachment; delivering recovered original to %s", self.name,
                                len(pre_extract), event.source.chat_id)
                 text_content = _recovered
+        if inline_bodies:
+            # Same outer trim as text without blocks; bodies inside stay byte-exact.
+            text_content = restore_inline_copy_bodies(text_content, inline_bodies).strip()
         return _ExtractedResponse(
-            text_content=text_content, images=images, media_files=media_files,
+            text_content=text_content, copy_blocks=copy_blocks, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(
@@ -5013,13 +5118,15 @@ class BasePlatformAdapter(ABC):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
-        delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+        def _record_delivery(result, *, required: bool = False):
+            nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
             if result is not None:
                 delivery_attempted = True
                 delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
+                if required and not getattr(result, "success", False):
+                    required_delivery_failed = True
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
@@ -5056,9 +5163,10 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
+                _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
-                        event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
+                        event, session_key, interrupt_event, _spoken_text, media_files):
+                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
@@ -5081,7 +5189,7 @@ class BasePlatformAdapter(ABC):
                 # _stop_typing_refresh's finally discards it, so it cannot leak into the next
                 # turn. No new await on the delivery path (a fire-and-forget stop task was
                 # measured to have no effect).
-                if text_content or extracted.images or extracted.media_files or extracted.local_files \
+                if text_content or extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
@@ -5089,14 +5197,20 @@ class BasePlatformAdapter(ABC):
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery,
                         attachments_pending=bool(
-                            extracted.images or extracted.media_files or extracted.local_files))
+                            extracted.copy_blocks or extracted.images or extracted.media_files or extracted.local_files))
+                if extracted.copy_blocks:
+                    await self._send_copy_blocks(
+                        event, session_key, extracted.copy_blocks, _final_thread_metadata,
+                        lambda result: _record_delivery(result, required=True),
+                        attachments_pending=bool(extracted.images or extracted.media_files or extracted.local_files),
+                        is_ephemeral_response=is_ephemeral_response, ephemeral_ttl=_ephemeral_ttl)
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery, session_key=session_key,
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),

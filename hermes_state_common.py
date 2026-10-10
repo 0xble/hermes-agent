@@ -625,6 +625,24 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     auto_resume_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS async_delegation_events (
+    event_id TEXT PRIMARY KEY,
+    delegation_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    result_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    delivery_state TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_async_delegation_events_delivery
+    ON async_delegation_events(delivery_state, updated_at);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
