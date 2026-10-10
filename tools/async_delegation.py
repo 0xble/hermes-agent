@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -338,6 +339,11 @@ def _prune_durable_records() -> None:
                        AND NOT {_RESUMABLE_RETENTION_SQL}
                      ORDER BY updated_at ASC LIMIT ?
                    )""", (cutoff, pending_count - _MAX_DURABLE_PENDING))
+        conn.execute(
+            """DELETE FROM async_delegation_events
+               WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?""",
+            (cutoff,),
+        )
 
 
 def _persist_completion(
@@ -358,6 +364,219 @@ def _persist_completion(
                      event.get("delegation_id"), expected_state, event.get("status"), changed)
         return False
     return True
+
+
+def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
+    """Stable delivery identity for an event that is not the unit's terminal row."""
+    delegation_id = str(event.get("delegation_id") or "")
+    if not delegation_id:
+        raise ValueError("durable async delegation events require a delegation_id")
+    if event_kind == "task_failure":
+        results = event.get("results") or [{}]
+        task_index = results[0].get("task_index") if isinstance(results[0], dict) else None
+        if task_index is not None:
+            return f"{delegation_id}:task-failure:{task_index}"
+        # Older callers can omit task_index. Hash the complete event instead of
+        # collapsing every such notice onto one INSERT OR IGNORE identity.
+        payload = dict(event)
+        payload.pop("_delivery_event_id", None)
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return f"{delegation_id}:task-failure:{digest}"
+    return f"{delegation_id}:{event_kind}"
+
+
+def _persist_outbox_event(
+    event: Dict[str, Any], result: Optional[Dict[str, Any]], *, event_kind: str,
+    terminal_status: Optional[str] = None, expected_state: Optional[str] = None,
+) -> str:
+    """Persist one event, conditionally claiming terminal-fallback ownership.
+
+    A fallback is one transaction: its outbox insert is committed only when the
+    expected lifecycle row is still active.  A zero-row transition rolls back
+    the insert, so a competing terminal writer cannot acquire a second durable
+    delivery identity.
+    """
+    event_id = _outbox_event_id(event, event_kind)
+    persisted = dict(event)
+    persisted["_delivery_event_id"] = event_id
+    now = time.time()
+    result_json = json.dumps(result) if result is not None else None
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO async_delegation_events
+               (event_id, delegation_id, event_kind, event_json, result_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, event["delegation_id"], event_kind, json.dumps(persisted), result_json, now, now),
+        )
+        if terminal_status is not None:
+            # The lifecycle transition is the ownership check.  Do it after the
+            # insert inside the same transaction so a competing winner rolls the
+            # INSERT back instead of leaving a redundant fallback row.
+            changed = conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?, result_json=?
+                   WHERE delegation_id=? AND state=?""",
+                (terminal_status, event.get("completed_at", now), now, result_json,
+                 event["delegation_id"], expected_state or "running"),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    f"async delegation {event['delegation_id']} terminal fallback lost ownership "
+                    f"of expected state {expected_state or 'running'} (changed {changed} rows)"
+                )
+    event["_delivery_event_id"] = event_id
+    return event_id
+
+
+def _terminal_payload_matches(raw: Optional[str], payload: Optional[Dict[str, Any]]) -> bool:
+    if raw is None or payload is None:
+        return raw is None and payload is None
+    try:
+        return json.loads(raw) == payload
+    except (TypeError, ValueError):
+        return False
+
+
+def _reconcile_terminal_write(
+    event: Dict[str, Any], result: Dict[str, Any], expected_state: str,
+    lifecycle_payload: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Classify an ambiguous terminal write without creating a second event.
+
+    ``event`` is the live event and ``lifecycle_payload`` the canonical lifecycle
+    payload, whose status can differ (a queued cancellation persists
+    ``cancelled`` but reports ``interrupted``).  ``lifecycle`` and ``outbox``
+    mean this writer's payload already won; a different terminal payload means
+    another writer won.  ``active`` means no terminal owner exists yet and
+    ``missing`` that no durable row exists at all.
+    """
+    lifecycle_event = event if lifecycle_payload is None else lifecycle_payload
+    event_id = _outbox_event_id(event, "terminal_fallback")
+    persisted_event = dict(event)
+    persisted_event["_delivery_event_id"] = event_id
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, event_json, result_json FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        state, event_json, result_json = row
+        if state in _TERMINAL_STATES:
+            if _terminal_payload_matches(result_json, result):
+                if event_json is not None and _terminal_payload_matches(event_json, lifecycle_event):
+                    return "lifecycle"
+                outbox = conn.execute(
+                    "SELECT event_json, result_json FROM async_delegation_events "
+                    "WHERE event_id=? AND delivery_state IN ('pending', 'delivered')",
+                    (event_id,),
+                ).fetchone()
+                if outbox and _terminal_payload_matches(outbox[0], persisted_event) \
+                        and _terminal_payload_matches(outbox[1], result):
+                    return "outbox"
+            return "competing"
+        return "active" if state == expected_state else "competing"
+
+
+def _outbox_event_id_from_claim(claim_id: str) -> Optional[str]:
+    if not claim_id.startswith("outbox:"):
+        return None
+    value = claim_id[len("outbox:"):]
+    return value.split("|", 1)[0] or None
+
+
+def _claim_outbox_delivery(event_id: str, consumer: str) -> Optional[str]:
+    now = time.time()
+    claim_id = f"outbox:{event_id}|{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegation_events SET delivery_claim=?, delivery_claimed_at=?,
+                      delivery_attempts=delivery_attempts+1, updated_at=?
+               WHERE event_id=? AND delivery_state='pending'
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            (claim_id, now, now, event_id, now - _CLAIM_LEASE_S),
+        )
+    return claim_id if cur.rowcount == 1 else None
+
+
+def _update_outbox_delivery(event_id: str, claim_id: str, action: str) -> bool:
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        if action == "complete":
+            cur = conn.execute(
+                """UPDATE async_delegation_events SET delivery_state='delivered', delivered_at=?,
+                          updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                (now, now, event_id, claim_id),
+            )
+        elif action == "release":
+            capped = conn.execute(
+                """UPDATE async_delegation_events SET delivery_state='dropped',
+                          updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?
+                     AND delivery_attempts>=?""",
+                (now, event_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
+            )
+            if capped.rowcount == 1:
+                logger.warning("Async delegation outbox event %s exhausted its %d delivery attempts; "
+                               "marking terminally dropped.", event_id, _MAX_DELIVERY_ATTEMPTS)
+                return True
+            cur = conn.execute(
+                """UPDATE async_delegation_events SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL, updated_at=?
+                   WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                (now, event_id, claim_id),
+            )
+        elif action == "defer":
+            cur = conn.execute(
+                """UPDATE async_delegation_events SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
+                          updated_at=?
+                   WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                (now, event_id, claim_id),
+            )
+        elif action == "drop":
+            cur = conn.execute(
+                """UPDATE async_delegation_events SET delivery_state='dropped',
+                          updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
+                   WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
+                (now, event_id, claim_id),
+            )
+        else:
+            raise ValueError(f"unknown outbox delivery action: {action}")
+    return cur.rowcount == 1
+
+
+def _replay_outbox_pending(conn, rows, target_queue, now: float) -> int:
+    """Replay pending outbox events, preserving their event-specific delivery identity."""
+    home, restored = hermes_home_key(get_hermes_home()), 0
+    for event_id, payload, created_at, updated_at in rows:
+        age_basis = updated_at or created_at
+        if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+            conn.execute(
+                """UPDATE async_delegation_events SET delivery_state='dropped',
+                          delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                   WHERE event_id=? AND delivery_state='pending'""",
+                (now, event_id),
+            )
+            continue
+        evt = json.loads(payload)
+        if isinstance(evt, dict):
+            evt["_delivery_event_id"] = event_id
+            evt["restored"] = True
+        target_queue.put(evt)
+        with _orphan_lock:
+            _offered.add((home, event_id))
+        restored += 1
+    return restored
+
+
+def _outbox_delivery_rows(conn):
+    return conn.execute(
+        """SELECT event_id, event_json, created_at, updated_at
+           FROM async_delegation_events
+           WHERE delivery_state='pending' AND event_json IS NOT NULL
+           ORDER BY created_at, event_id"""
+    ).fetchall()
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -549,7 +768,9 @@ def restore_undelivered_completions(target_queue) -> int:
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        return _replay_pending(conn, rows, target_queue, now)
+        restored = _replay_pending(conn, rows, target_queue, now)
+        restored += _replay_outbox_pending(conn, _outbox_delivery_rows(conn), target_queue, now)
+        return restored
 
 
 def _replay_pending(conn, rows, target_queue, now: float) -> int:
@@ -590,9 +811,10 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
     the atomic cross-process gate, so two processes offering one row never both deliver it. Rows past
     the delivery budget or the replay age converge to ``dropped``. Reads the current profile's ledger:
     callers bind the owning profile first."""
+    held = reoffer_unresolved_completions(target_queue)  # unproven terminal events whose retry is due
     alive = _owner_liveness()
     if alive is None or not _db_path().exists():
-        return 0  # never create a ledger just to sweep it
+        return held  # never create a ledger just to sweep it
     recover_abandoned_delegations()
     now = time.time() if now is None else now
     home = hermes_home_key(get_hermes_home())
@@ -620,7 +842,31 @@ def sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> 
                                delegation_id, _MAX_DELIVERY_ATTEMPTS)
                 continue
             orphans.append((delegation_id, payload, completed_at, dispatched_at))
-        return _replay_pending(conn, orphans, target_queue, now)
+        restored = _replay_pending(conn, orphans, target_queue, now)
+        outbox_rows = conn.execute(
+            """SELECT e.event_id, e.event_json, e.created_at, e.updated_at,
+                      d.owner_pid, d.owner_started_at, e.delivery_attempts
+               FROM async_delegation_events e
+               LEFT JOIN async_delegations d ON d.delegation_id=e.delegation_id
+               WHERE e.delivery_state='pending' AND e.event_json IS NOT NULL AND e.updated_at < ?
+                 AND (e.delivery_claim IS NULL OR e.delivery_claimed_at < ?)
+               ORDER BY e.created_at, e.event_id""",
+            (now - _ORPHAN_STALE_S, now - _CLAIM_LEASE_S),
+        ).fetchall()
+        outbox_orphans = []
+        for event_id, payload, created_at, updated_at, pid, started, attempts in outbox_rows:
+            if event_id in offered or alive(pid, started):
+                continue
+            if (attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+                conn.execute(
+                    """UPDATE async_delegation_events SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE event_id=? AND delivery_state='pending'""",
+                    (now, event_id),
+                )
+                continue
+            outbox_orphans.append((event_id, payload, created_at, updated_at))
+        return held + restored + _replay_outbox_pending(conn, outbox_orphans, target_queue, now)
 
 
 def maybe_sweep_orphaned_completions(target_queue, *, now: Optional[float] = None) -> int:
@@ -670,15 +916,113 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+# In-memory marker on a terminal event whose producer could not prove which durable identity, if
+# any, owns it (reconciliation failed). Its delegation_id alone proves nothing: a competing writer
+# may own the lifecycle row. Never persisted; only proven deliverable ownership is stripped.
+# A rejected marker stays on every retained/copyable event, even after its ledger disappears.
+_TERMINAL_OWNERSHIP_KEY = "_terminal_ownership"
+_OWNERSHIP_RETRY_BASE_S = 5.0
+_OWNERSHIP_RETRY_MAX_S = 300.0
+# (home key, delegation_id) -> unresolved event held off the queue until its retry is due.
+_unresolved: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _hold_unresolved(evt: Dict[str, Any], meta: Dict[str, Any], exc: BaseException) -> None:
+    meta["attempts"] = int(meta.get("attempts") or 0) + 1
+    delay = min(_OWNERSHIP_RETRY_BASE_S * 2 ** (meta["attempts"] - 1), _OWNERSHIP_RETRY_MAX_S)
+    meta["retry_at"] = time.time() + delay
+    evt[_TERMINAL_OWNERSHIP_KEY] = meta
+    logger.error("Async delegation %s: terminal ownership is still unproven (attempt %d, retry in %.0fs); "
+                 "holding the result undelivered: %s", evt.get("delegation_id"), meta["attempts"], delay, exc)
+    with _orphan_lock:
+        _unresolved[(meta["home"], str(evt.get("delegation_id") or ""))] = evt
+
+
+def reoffer_unresolved_completions(target_queue, *, now: Optional[float] = None) -> int:
+    """Put held terminal events whose ownership retry is due back on ``target_queue``."""
+    now = time.time() if now is None else now
+    with _orphan_lock:
+        due = [key for key, evt in _unresolved.items()
+               if (evt.get(_TERMINAL_OWNERSHIP_KEY) or {}).get("retry_at", 0.0) <= now]
+        events = [_unresolved.pop(key) for key in due]
+    for evt in events:
+        target_queue.put(evt)
+    return len(events)
+
+
+def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    """Resolve an unproven terminal event to its durable identity, acquiring the lifecycle row
+    through the conditional fallback transaction when no terminal owner exists yet."""
+    # The producer's snapshots, not ``evt``: consumers enrich their copy (e.g. gateway routing
+    # fields) before claiming, and the durable payloads were written from the originals.
+    event, persisted, result, expected = meta["event"], meta["persisted_event"], meta["result"], meta["expected_state"]
+    disposition = _reconcile_terminal_write(event, result, expected, persisted)
+    if disposition == "active":
+        try:
+            _persist_outbox_event(dict(event), result, event_kind="terminal_fallback",
+                                  terminal_status=meta["terminal_status"], expected_state=expected)
+            return "outbox"
+        except Exception as exc:  # noqa: BLE001 — lost the CAS, or committed before raising
+            logger.error("Async delegation %s: deferred terminal fallback write failed; reconciling: %s",
+                         evt.get("delegation_id"), exc)
+            disposition = _reconcile_terminal_write(event, result, expected, persisted)
+            if disposition == "active":
+                raise
+    return disposition
+
+
+def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
+    """True when ``evt`` may be delivered: it carries no unproven terminal ownership, or that
+    ownership now resolves to this event. A proven loser remains permanently rejected, including
+    on copies/requeues. An event whose ledger is still unreadable is held and re-offered later
+    (``reoffer_unresolved_completions``); neither may be shown by this caller."""
+    meta = evt.get(_TERMINAL_OWNERSHIP_KEY)
+    if not meta:
+        return True
+    if meta.get("rejected"):
+        return False
+    evt.pop("_delivery_event_id", None)
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(meta["home"])
+    try:
+        disposition = _resolve_terminal_ownership(evt, meta)
+    except Exception as exc:  # noqa: BLE001 — unavailable ledger: ownership stays unproven
+        _hold_unresolved(evt, meta, exc)
+        return False
+    finally:
+        reset_hermes_home_override(token)
+    if disposition == "outbox":
+        evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
+    elif disposition not in {"lifecycle", "missing"}:
+        # A failed batch can requeue this very dict after skipping it. Keep rejection
+        # in the existing marker (shared by shallow copies), not in the mutable ledger.
+        meta["rejected"] = True
+        logger.error("Async delegation %s: unproven terminal result lost ownership to a competing "
+                     "result; permanently rejecting it", evt.get("delegation_id"))
+        return False
+    evt.pop(_TERMINAL_OWNERSHIP_KEY, None)
+    return True
+
+
 def is_interim_delegation_event(evt: Dict[str, Any]) -> bool:
-    """An early per-task notice for a batch that is still running. It shares the batch's
-    ``delegation_id`` but is NOT the durable completion: it must never claim, acknowledge or
-    dedup against the final result's row (independent review reproduced exactly that loss)."""
+    """An early per-task notice for a batch that is still running.
+
+    It has its own durable outbox identity, so claiming or acknowledging it can
+    never consume the batch's terminal completion row.
+    """
     return evt.get("type") == "async_delegation" and bool(evt.get("task_failure_notice"))
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events (and interim notices) need no token."""
+    """Claim a durable delegation event; legacy in-memory notices remain unclaimable.
+
+    ``None`` means this copy must not be delivered: another consumer holds it, or its terminal
+    ownership is unproven (held for a later offer) or lost to a competing writer."""
+    if not resolve_event_ownership(evt):
+        return None
+    event_id = str(evt.get("_delivery_event_id") or "")
+    if event_id:
+        return _claim_outbox_delivery(event_id, consumer)
     if is_interim_delegation_event(evt):
         return ""
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
@@ -689,9 +1033,10 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Release a failed delivery claim so another consumer may retry. Attempts are
-    counted at claim time; once the budget is exhausted the row converges to
-    terminal ``dropped`` (only pending rows replay on restart)."""
+    """Release a failed delivery claim so another consumer may retry."""
+    event_id = _outbox_event_id_from_claim(claim_id)
+    if event_id:
+        return _update_outbox_delivery(event_id, claim_id, "release")
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -713,6 +1058,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Return an unadmitted completion to pending without spending a delivery attempt."""
+    event_id = _outbox_event_id_from_claim(claim_id)
+    if event_id:
+        return _update_outbox_delivery(event_id, claim_id, "defer")
     return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
                   delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
                   updated_at=?
@@ -721,10 +1069,10 @@ def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Terminally drop a claimed completion whose target is permanently gone (the
-    spawning session ended at an explicit user boundary such as /new or reset).
-    ``dropped`` — not ``delivered`` — keeps the ack honest; not ``pending`` keeps
-    restart recovery from replaying it into a fail-closed drop forever."""
+    """Terminally drop a claimed completion whose target is permanently gone."""
+    event_id = _outbox_event_id_from_claim(claim_id)
+    if event_id:
+        return _update_outbox_delivery(event_id, claim_id, "drop")
     return _update_delivery("""UPDATE async_delegations SET delivery_state='dropped',
                   updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
@@ -734,6 +1082,9 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
+    event_id = _outbox_event_id_from_claim(claim_id)
+    if event_id:
+        return _update_outbox_delivery(event_id, claim_id, "complete")
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -759,10 +1110,11 @@ def return_completion_offer(evt: Dict[str, Any]) -> None:
     session poller drains one process-wide queue). The next sweep may offer the row again. Delegation ids
     are unique across profiles, so this clears the offer in every home."""
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
-    if not delegation_id or is_interim_delegation_event(evt):
+    event_id = str(evt.get("_delivery_event_id") or "")
+    if not delegation_id and not event_id:
         return
     with _orphan_lock:
-        _offered.difference_update({key for key in _offered if key[1] == delegation_id})
+        _offered.difference_update({key for key in _offered if key[1] in {delegation_id, event_id}})
 
 
 def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
@@ -1614,24 +1966,67 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
                     label, record.get("delegation_id"), record["superseded_by"])
         return
+    expected_state = record.get("_durable_state") or "running"
+    terminal_status = record.get("_terminal_state") or status
     try:
         persist_evt = dict(evt)
-        persist_evt["status"] = record.get("_terminal_state") or status
-        ok = _persist_completion(persist_evt, result, expected_state=record.get("_durable_state") or "running")
-        if not ok:
-            # Explicit reconcile: a competing terminal transition won the
-            # conditional update. Never replace its event/result payload.
-            durable = _record_context_run(record, _durable_state, record["delegation_id"])
-            logger.error("Async delegation %s terminal reconcile found durable state %s",
-                         record.get("delegation_id"), durable.get("state") if durable else None)
-    except Exception as exc:  # noqa: BLE001 — a lost durable row is recoverable; a lost result + leaked slot is not
-        logger.error(f"Async delegation{label} %s: durable completion write failed; delivering in-memory "
-                     "only (a restart may report this unit as unknown): %s", record.get("delegation_id"), exc)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
-                     "result lost: %s", record.get("delegation_id"), exc)
+        persist_evt["status"] = terminal_status
+        ok = _persist_completion(persist_evt, result, expected_state=expected_state)
+    except Exception as exc:  # noqa: BLE001 — reconcile an ambiguous terminal write
+        logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
+                     label, record.get("delegation_id"), exc)
+        ok = False
+    queue_event = ok
+    if not ok:
+        def reconcile():
+            try:
+                return _record_context_run(
+                    record, _reconcile_terminal_write, evt, result, expected_state, persist_evt)
+            except Exception:
+                logger.error("Async delegation%s %s: terminal ownership reconciliation failed",
+                             label, record.get("delegation_id"), exc_info=True)
+                return "unavailable"
+
+        disposition = reconcile()
+        if disposition == "active":
+            # An active read is not ownership: both raised and zero-row writes
+            # must acquire the lifecycle row in the fallback transaction.
+            try:
+                _persist_outbox_event(
+                    evt, result, event_kind="terminal_fallback",
+                    terminal_status=terminal_status, expected_state=expected_state,
+                )
+            except Exception as fallback_exc:
+                logger.error("Async delegation%s %s: durable terminal outbox write failed; "
+                             "reconciling ownership: %s", label, record.get("delegation_id"),
+                             fallback_exc, exc_info=True)
+                # The CAS may have lost to a terminal writer after the active
+                # read, or this fallback may have committed before raising.
+                disposition = reconcile()
+            else:
+                disposition = "outbox"
+        queue_event = disposition in {"lifecycle", "outbox", "active", "missing", "unavailable"}
+        evt.pop("_delivery_event_id", None)
+        if disposition == "outbox":
+            # A commit-then-raise can precede _persist_outbox_event's stamp.
+            evt["_delivery_event_id"] = _outbox_event_id(evt, "terminal_fallback")
+        elif disposition in {"active", "unavailable"}:
+            # Unproven: neither this writer's lifecycle row, its outbox row, nor a competing
+            # winner could be verified. Its delegation_id must not claim (and so settle or
+            # consume) a row another writer may own; consumers resolve it first.
+            evt[_TERMINAL_OWNERSHIP_KEY] = {
+                "home": str(_record_context_run(record, get_hermes_home)), "event": dict(evt),
+                "persisted_event": persist_evt, "result": result, "expected_state": expected_state,
+                "terminal_status": terminal_status, "attempts": 0}
+        if not queue_event:
+            logger.error("Async delegation %s terminal fallback lost ownership to a competing result",
+                         record.get("delegation_id"))
+    if queue_event:
+        try:
+            process_registry.completion_queue.put(evt)
+        except Exception as exc:  # pragma: no cover
+            logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
+                         "result lost: %s", record.get("delegation_id"), exc)
 
 
 def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tasks: int) -> None:
@@ -1663,6 +2058,11 @@ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tas
         "toolsets": snapshot.get("toolsets"), "role": snapshot.get("role"), "model": snapshot.get("model"),
         "status": "running", "dispatched_at": snapshot.get("dispatched_at") or time.time(), "completed_at": time.time(),
         **{k: snapshot[k] for k in _ROUTING_KEYS if snapshot.get(k)}}
+    try:
+        _persist_outbox_event(evt, None, event_kind="task_failure")
+    except Exception as exc:
+        logger.error("Async delegation batch %s: durable task failure notice write failed; notice dropped: %s", delegation_id, exc)
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -2093,3 +2493,4 @@ def _reset_for_tests() -> None:
     with _orphan_lock:
         _offered.clear()
         _last_orphan_sweep.clear()
+        _unresolved.clear()

@@ -2063,25 +2063,29 @@ class GatewayNotificationsMixin:
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
             claim.proceed, claim.early_result = False, False
             return claim
-        # An interim per-task notice shares the batch's delegation_id but is not the durable
-        # completion; claiming that row here would acknowledge the FINAL result before it exists.
-        if evt_type == "async_delegation" and not evt.get("task_failure_notice"):
+        # Every tagged async event owns its delivery identity. Outbox events (interim notices and
+        # terminal fallbacks) must claim that exact event row; legacy untagged finals retain their
+        # delegation lifecycle-row claim for compatibility. An untagged legacy interim notice returns
+        # an empty claim and remains process-local, as it predates durable outbox delivery.
+        if evt_type == "async_delegation":
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery, defer_completion_delivery
-                    delegation_id = claim.delegation_id
+                    from tools.async_delegation import claim_event_delivery, defer_completion_delivery
                     claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    def _defer_claim(token):
+                        if token:
+                            defer_completion_delivery(claim.delegation_id, token)
                     claimed = await claim_off_loop(
-                        lambda: claim_completion_delivery(delegation_id, claim_id),
-                        lambda ok: ok and defer_completion_delivery(delegation_id, claim_id),
+                        lambda: claim_event_delivery(evt, claim_id),
+                        _defer_claim,
                     )
-                    if not claimed:
+                    if claimed is None:
                         claim.proceed = False
                         return claim
-                    # Recorded only once held: a claim abandoned mid-flight has ONE cleanup (the
-                    # deferred refund above), never also the caller's attempt-spending release.
-                    claim.claim_id = claim_id
+                    # Empty tokens are the compatibility result for legacy in-memory notices; only
+                    # a real claim needs durable settlement in the caller's finally block.
+                    claim.claim_id = claimed or ""
                 except Exception as exc:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
                     claim.proceed, claim.early_result = False, False
