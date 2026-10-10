@@ -548,6 +548,62 @@ class TestTickLifecycle:
         assert after.awaiting_response is True and after.ticks_fired == 1
         assert after.prompt == "poll the revised target" and after.version == 2
 
+    def test_revise_after_fire_does_not_inherit_the_old_stop_verdict(self, hermes_home):
+        """LOOP_COMPLETE answering prompt A cannot finish the loop after it was revised to B."""
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-oldv")
+        state = mgr.set("poll prompt A", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert mgr.fire_tick()
+        revised = LoopManager(session_id="t-oldv").revise(
+            reason="new target", prompt="poll prompt B",
+            user_quote="switch the loop to polling prompt B",
+            user_messages=["Please switch the loop to polling prompt B now"])
+        assert revised["ok"] is True, revised
+        decision = mgr.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-oldv")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "poll prompt B"
+        assert stored.awaiting_response is False
+
+    def test_old_manager_completion_cannot_settle_a_new_instance_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        old = LoopManager(session_id="t-newi")
+        state = old.set("old task", interval_seconds=300)
+        state.next_due_at = time.time() - 1
+        assert old.fire_tick()
+        LoopManager(session_id="t-newi").clear()
+        time.sleep(0.01)
+        fresh = LoopManager(session_id="t-newi")
+        new_state = fresh.set("new task", interval_seconds=300)
+        new_state.next_due_at = time.time() - 1
+        assert fresh.fire_tick()
+        decision = old.complete_tick("All done.\nLOOP_COMPLETE")
+        stored = load_loop("t-newi")
+        assert decision["stopped"] is False
+        assert stored.status == "active" and stored.prompt == "new task"
+        assert stored.awaiting_response is True
+
+    def test_cadence_revise_before_fire_postpones_the_tick(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, save_loop
+
+        state = LoopManager(session_id="t-cad").set("poll", interval_seconds=30)
+        state.next_due_at = time.time() - 1
+        save_loop("t-cad", state)
+        scheduler = LoopManager(session_id="t-cad")
+        assert scheduler.is_due()
+        revised = LoopManager(session_id="t-cad").revise(
+            reason="slow down", interval_seconds=900,
+            user_quote="slow the loop down to every fifteen minutes",
+            user_messages=["Please slow the loop down to every fifteen minutes"])
+        assert revised["ok"] is True, revised
+        assert load_loop("t-cad").next_due_at > time.time() + 60
+        assert scheduler.fire_tick() is None
+        stored = load_loop("t-cad")
+        assert stored.ticks_fired == 0 and stored.awaiting_response is False
+
     def test_revise_during_tick_survives_completion(self, hermes_home):
         from hermes_cli.loops import LoopManager, load_loop
 

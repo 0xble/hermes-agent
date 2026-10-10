@@ -1016,6 +1016,10 @@ class LoopManager:
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
             ):
                 return None
+            # A revise since load fires the stored definition, and only when its own schedule
+            # (a cadence change can postpone the tick) is due; otherwise the caller's copy fires.
+            if stored.version != s.version and time.time() < stored.next_due_at:
+                return None
             base = s if stored.version == s.version else stored
             claimed = _parse_state(base.to_json())
             claim(claimed)
@@ -1146,15 +1150,24 @@ class LoopManager:
         Returns ``{"status": "active|done|paused", "stopped": bool, "reason": str, "message": str}``;
         ``message`` is a user-visible one-liner, "" in the common still-looping case.
         """
-        # Decide on the stored loop: a pause, stop or revise during the turn must govern this tick.
+        # The response answers the tick this manager fired (or, for a fresh manager, the tick in
+        # flight when it loaded): pin that tick's instance, count and definition version before
+        # reading the stored loop, so a revise, re-set or newer tick never inherits its verdict.
+        fired = self._state
+        if fired is None or not fired.awaiting_response:
+            return {"status": fired.status if fired else None, "stopped": False,
+                    "reason": "no tick in flight", "message": ""}
         self.refresh()
         s = self._state
-        if s is None or not s.awaiting_response:
-            return {"status": s.status if s else None, "stopped": False, "reason": "no tick in flight", "message": ""}
+        if (
+            s is None or not s.awaiting_response or s.created_at != fired.created_at
+            or s.ticks_fired != fired.ticks_fired
+        ):
+            return self._superseded_result()
         now = time.time()
         ticks = _ticks_label(s.ticks_fired)
-        # Verdicts below judge this definition; a revise landing mid-evaluation supersedes them.
-        judged = {"judged_version": s.version, "digest": _digest_response(last_response)}
+        # Verdicts judge the fired definition; a revise since the fire supersedes stop verdicts.
+        judged = {"judged_version": fired.version, "digest": _digest_response(last_response)}
 
         # 1. Agent self-stop marker.
         if response_signals_complete(last_response):
