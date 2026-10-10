@@ -46,7 +46,8 @@ def test_invalid_platform_override_fails_at_config_construction():
 
 
 def _assert_neutral_resume_note(note: str) -> None:
-    assert note.startswith("[System note: Resume the pending turn.")
+    from gateway.run import RESUME_NOTE_PREFIX
+    assert note.startswith(RESUME_NOTE_PREFIX)
     assert "Any restart, update, or shutdown command in the history has already run" in note
     assert "Do NOT re-run tool calls whose results are recorded" in note
     assert "resume from the first step without a recorded result" in note
@@ -75,8 +76,8 @@ def test_resume_note_is_neutral_and_keeps_recovery_safety(policy, message):
         assert "continue the pending task to completion" in note.lower()
         assert "do not emit an acknowledgement" in note.lower()
     else:
-        assert "if the next step is clear, continue the pending task" in note.lower()
-        assert "wait for the user's next message" in note
+        assert "do not run tools or continue the pending task until the user replies" in note.lower()
+        assert "ask whether to carry on with the pending step" in note
 
 
 def test_gateway_config_round_trips_global_policy():
@@ -105,7 +106,7 @@ def test_yaml_startup_preserves_restart_policy(tmp_path, monkeypatch, yaml_text,
     assert policy == expected
     note = build_resume_recovery_note("restart_timeout", restart_resume_policy=policy)
     assert ("continue the pending task to completion" in note.lower()) == (expected == "continue")
-    assert ("if the next step is clear, continue the pending task" in note.lower()) == (expected == "ask")
+    assert ("until the user replies" in note.lower()) == (expected == "ask")
 
 
 @pytest.mark.parametrize("value", ["discard", "true", "''"])
@@ -158,7 +159,7 @@ def test_turn_runner_continue_policy_reaches_the_recovery_note():
     persisted, _ = turn._prepare_turn_message(agent_history=[])
 
     assert "continue the pending task to completion" in ctx.message.lower()
-    assert "wait for the user's next message" not in ctx.message
+    assert "until the user replies" not in ctx.message
     assert persisted == ctx.message  # the empty auto-resume turn persists the note itself
 
 
@@ -169,7 +170,7 @@ def test_turn_runner_default_policy_still_asks_on_interactive_adapter():
 
     turn._prepare_turn_message(agent_history=[])
 
-    assert "wait for the user's next message" in ctx.message
+    assert "until the user replies" in ctx.message
     assert "continue the pending task to completion" not in ctx.message.lower()
 
 
@@ -199,3 +200,11 @@ def test_yaml_startup_honours_auto_resume_on_boot(tmp_path, monkeypatch, yaml_te
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(yaml_text)
     assert load_gateway_config().auto_resume_on_boot is expected
+
+
+def test_telegram_trigger_classifier_matches_the_resume_note_prefix():
+    """The classifier copies the prefix as a literal; keep it in lockstep with the builder."""
+    from gateway.run import RESUME_NOTE_PREFIX
+    from plugins.platforms.telegram.chat_budget import _TRIGGER_PREFIXES
+
+    assert (RESUME_NOTE_PREFIX, "restart") in _TRIGGER_PREFIXES

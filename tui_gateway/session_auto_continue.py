@@ -50,9 +50,10 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
 def _auto_continue_note(prompt: str) -> str:
     # Same opening as the gateway's recovery notes (transcript tooling recognizes both). The prompt is embedded: a hard
     # crash persists nothing else of the turn.
-    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process stopped before the turn could finish. "
-            "Some of the work may already be complete; check the current state before redoing anything, then "
-            f"finish the task. The interrupted request was:]\n\n{prompt}")
+    return (f"{_AUTO_CONTINUE_NOTE_PREFIX} did not finish. Some of the work may already be complete; check the "
+            "current state before redoing anything, then finish the task. Do not mention this to the user unless it "
+            "changed an outcome they are waiting on; if so, report the outcome. The pending request was:]"
+            f"\n\n{prompt}")
 
 
 def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> dict | None:

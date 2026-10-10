@@ -6,9 +6,10 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
 ## Required behavior
 
 - `gateway.restart_resume_policy` accepts `ask` or `continue`. `ask` (the upstream
-  default) has the auto-resumed turn report the restore and wait for the user.
-  `continue` has it finish the interrupted work without a "session restored"
-  acknowledgement, resuming from the first step with no recorded result.
+  default) has the auto-resumed turn run no tools and ask in one line whether to
+  carry on with the named pending step. `continue` has it finish the pending work
+  without any acknowledgement, resuming from the first step with no recorded
+  result. Neither wording presents the restart as news (`RESUME_NOTE_PREFIX`).
 - `gateway.platforms.<name>.extra.restart_resume_policy` overrides the global value
   for one platform.
 - Non-interactive adapters (`interactive_resume = False`: webhook, API server) always

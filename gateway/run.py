@@ -1070,6 +1070,11 @@ def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
     return str(configured) if configured is not None else "ask"
 
 
+# Opening of every resume note. Classifiers (Telegram trigger budget, e2e fakes) import this rather
+# than copying the wording.
+RESUME_NOTE_PREFIX = "[System note: Resume the pending turn."
+
+
 def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: Optional[bool] = None,
     restart_resume_policy: Optional[str] = None) -> str:
@@ -1099,11 +1104,11 @@ def build_resume_recovery_note(
         )
     else:
         continuation = (
-            "If the next step is clear, continue the pending task; otherwise wait for the user's "
-            "next message. Do not emit an acknowledgement."
+            "Do not run tools or continue the pending task until the user replies. In one short "
+            "line, ask whether to carry on with the pending step, naming that step."
         )
     return (
-        f"[System note: Resume the pending turn. {safety_guidance} {continuation}]"
+        f"{RESUME_NOTE_PREFIX} {safety_guidance} {continuation}]"
         + (f"\n\n{message}" if message else ""))
 
 

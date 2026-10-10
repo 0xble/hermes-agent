@@ -40,7 +40,6 @@ _MAX_ROWS = 500
 # post-rejection retry) — honest at-least-once. The marker is intentionally neutral: it preserves the
 # only user-relevant fact (the reply may already have arrived) without exposing transport lifecycle.
 RECOVERED_MARKER = "♻️ Recovered reply — this may be a duplicate:\n\n"
-RECONNECTED_MARKER = RECOVERED_MARKER
 # A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
 # and MarkdownV2 escaping alone can push a reply that fits one message into two), and the platform may have
 # accepted the first chunk(s) before refusing the rest; the send result does not say which landed. The raw
@@ -440,7 +439,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
     other ambiguous redeliveries get the neutral duplicate hint. ``last_error`` is the row's pre-claim
     error, carried so a runtime claim that is released unsent goes back to ``failed`` with the same error
     and keeps its retry eligibility."""
-    marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
+    marker = FLOOD_MARKER if flood else (RECOVERED_MARKER if runtime else None)
     row = {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
            "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
            **({"marker": marker} if needs_marker and marker else {}), "profile": profile,

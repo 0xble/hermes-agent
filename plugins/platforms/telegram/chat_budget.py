@@ -384,7 +384,7 @@ _TRIGGER_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("[relay", "relay"),
     ("[IMPORTANT: Background process", "process"),
     ("[ASYNC DELEGATION", "delegation"),
-    ("[System note: Resume the pending turn.", "restart"),
+    ("[System note: Resume the pending turn.", "restart"),  # gateway.run.RESUME_NOTE_PREFIX
 )
 _TRIGGER_FRAGMENTS: Tuple[Tuple[str, str], ...] = (
     ("background process", "process"),
