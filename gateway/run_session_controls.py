@@ -146,15 +146,10 @@ class GatewaySessionControlsMixin:
 
         # A target with no persisted gateway origin is a CLI/TUI session, not a retryable route.
         source, adapter = await self._session_control_route(target_entry)
-        if source is not None and adapter is None:
-            # A persisted gateway origin can reconnect. Do not invent delivery/cleanup receipts.
-            # Still fence a saved wake against goal supersession while its adapter is offline.
-            if record.get("continuation_prompt") and not record.get("continuation_enqueued"):
-                await self._run_in_executor_with_context(
-                    session_controls.continuation_is_current, request_id,
-                )
-            return
-        if not record.get("continuations_cleared"):
+        # An applied outcome whose gateway origin persists but whose adapter is offline is
+        # retryable: target-side flags stay unset until reconnect, supersession or TTL expiry.
+        target_offline = status == "applied" and source is not None and adapter is None
+        if not target_offline and not record.get("continuations_cleared"):
             # Only an applied pause/clear stops the goal; a denied, expired or failed request
             # must leave the target's queued continuation alone.
             needs_cleanup = status == "applied" and (record.get("kind"), record.get("action")) in {
@@ -182,6 +177,12 @@ class GatewaySessionControlsMixin:
                 record = await self._mark_and_finish(
                     session_controls, record, "continuation_enqueued"
                 )
+            elif target_offline:
+                # Persist supersession while offline so a stale wake is never delivered later.
+                if not await self._run_in_executor_with_context(
+                    session_controls.continuation_is_current, request_id,
+                ):
+                    record = dict(record, continuation_enqueued=True, continuation_discarded="target_changed")
             elif source is None or adapter is None:
                 record = await self._mark_and_finish(
                     session_controls, record, "continuation_enqueued"
@@ -215,7 +216,8 @@ class GatewaySessionControlsMixin:
                         return
 
         notice = self._control_notice(record)
-        if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
+        if (not target_offline and not record.get("target_notice_sent")
+                and not record.get("target_notice_skipped")):
             if source is None or adapter is None:
                 record = await self._mark_and_finish(
                     session_controls, record, "target_notice_skipped"
