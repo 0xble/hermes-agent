@@ -2483,9 +2483,11 @@ def _update_preflight_handled(args) -> bool:
 
 
 from hermes_cli.update_receipt import update_receipt_scope
+from hermes_cli.release_config_owner import updater_owns_config_writes
 
 
 @update_receipt_scope()
+@updater_owns_config_writes()
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
     if not (getattr(args, "post_swap", None) or getattr(args, "rollback", False)) and not (PROJECT_ROOT / ".git").exists():
