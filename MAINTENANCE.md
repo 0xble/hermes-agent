@@ -148,9 +148,9 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 - **Patch identity:** `relay-silence`.
 - **Behavior:** Treat registered agent-origin headers, beginning with relay's `[relay from=... receipt=... (task=...)?]`, as unaddressed inbound prompts so a bare `NO_REPLY` remains silent; preserve explicit addressed messages.
-- **Source surfaces:** `gateway/response_filters.py`, `gateway/run_inbound.py`, `gateway/run_busy.py`, locale `gateway.errors.unexpected_silence` strings, and gateway silence/response-filter/busy regression tests.
+- **Source surfaces:** `gateway/platforms/base.py` busy admission, `gateway/response_filters.py`, `gateway/run_inbound.py`, `gateway/run_busy.py`, locale `gateway.errors.unexpected_silence` strings, and gateway silence/response-filter/busy regression tests.
 - **Upstream status:** NousResearch #117354 covers group chats only; no relay-equivalent DM behavior.
-- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_redirect_anchor.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_response_filters.py tests/gateway/test_gateway_silence_tokens.py tests/gateway/test_busy_relay_silence.py tests/gateway/test_busy_redirect_anchor.py`.
 - **Retirement:** Remove this patch when upstream supports equivalent agent-origin silence behavior across normal, queued, and recovery paths.
 - **Rollback:** Revert the relay-silence fix commit.
 
