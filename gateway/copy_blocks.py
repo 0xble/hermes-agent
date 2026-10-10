@@ -236,6 +236,13 @@ def wrap_copy_block(body: str) -> str:
     side; a body that itself starts or ends with a newline therefore survives a ledger replay.
     """
     lead = "\n" if body.startswith(("\n", "\r")) else ""
+    fence: str | None = None
+    for line in body.splitlines(keepends=True):
+        fence = _next_fence(fence, line)
+    if fence is not None:
+        # A body ending inside an open fence came from a block that ran to the end of the
+        # reply (its close marker was fenced body text). Store it the same way, unclosed.
+        return f"{_COPY_OPEN}\n{lead}{body}"
     # A trailing lone CR would fuse with the close marker's LF into one CRLF line ending.
     trail = "\r" if body.endswith("\r") else ""
     return f"{_COPY_OPEN}\n{lead}{body}{trail}\n{_COPY_CLOSE}"

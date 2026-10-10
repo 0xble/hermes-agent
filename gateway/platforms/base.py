@@ -4675,6 +4675,7 @@ class BasePlatformAdapter(ABC):
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False, release_marker: bool = True,
+        on_refused: Optional[Callable[["SendResult", "BasePlatformAdapter"], Awaitable[None]]] = None,
     ) -> "tuple[SendResult, BasePlatformAdapter]":
         """The delivery-ledger bracket every final text goes through, on the CURRENT transport
         (a reconnect may have replaced this adapter): record the obligation before the send,
@@ -4701,6 +4702,10 @@ class BasePlatformAdapter(ABC):
                 event, session_key, text_content, delivery_adapter, is_ephemeral_response,
                 metadata=metadata, outbox_refused=True)
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
+        if on_refused is not None and not getattr(result, "success", False):
+            # Ledger whatever must follow this message BEFORE finalizing it: finalizing can run a
+            # recovery sweep right away, and that sweep must see the followers too.
+            await on_refused(result, delivery_adapter)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
         return result, delivery_adapter
@@ -4778,11 +4783,21 @@ class BasePlatformAdapter(ABC):
             copy_metadata["copy_block"] = True
             copy_metadata["copy_block_index"] = index
             copy_metadata["plain"] = True
+            deferred: list = []
+
+            async def _defer_rest(refused, refusing_adapter, _index=index, _metadata=copy_metadata):
+                # A later block must never overtake an undelivered earlier one: the rest wait
+                # in the ledger behind the refused block, and redelivery keeps their order.
+                deferred.extend(await self._defer_copy_blocks(
+                    event, session_key, copy_blocks, _index + 1, _metadata, refusing_adapter,
+                    str(refused.error or "send failed"), is_ephemeral_response=is_ephemeral_response))
+
             result, delivery_adapter = await self.send_final_ledgered(
                 event, session_key, block, copy_metadata,
                 reply_to=_reply_anchor_for_event(event),
                 is_ephemeral_response=is_ephemeral_response,
                 release_marker=(index == len(copy_blocks) - 1 and not attachments_pending),
+                on_refused=_defer_rest,
             )
             record_delivery(result)
             if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
@@ -4793,21 +4808,18 @@ class BasePlatformAdapter(ABC):
                     self.name, index + 1, len(copy_blocks), event.source.chat_id,
                     result.error or "unknown delivery error",
                 )
-                # A later block must never overtake an undelivered earlier one. The rest wait in
-                # the ledger behind the failed block, and redelivery keeps their order.
-                await self._defer_copy_blocks(
-                    event, session_key, copy_blocks, index + 1, copy_metadata, delivery_adapter,
-                    str(result.error or "send failed"), record_delivery,
-                    is_ephemeral_response=is_ephemeral_response)
+                for held in deferred:
+                    record_delivery(held)
                 return
 
     async def _defer_copy_blocks(
         self, event: MessageEvent, session_key: str, copy_blocks: list[str], start: int,
         metadata: Dict[str, Any], delivery_adapter: "BasePlatformAdapter", error: str,
-        record_delivery: Callable, *, is_ephemeral_response: bool,
-    ) -> None:
-        """Ledger blocks ``start..`` as failed, in order, without sending them."""
+        *, is_ephemeral_response: bool,
+    ) -> list:
+        """Ledger blocks ``start..`` as failed, in order, without sending them; one result each."""
         from gateway.delivery_ledger import mark_failed
+        held: list = []
         for index in range(start, len(copy_blocks)):
             block_metadata = {**metadata, "copy_block_index": index}
             # Never sent, so the durable outbox will not replay it: the ledger must own it.
@@ -4817,8 +4829,9 @@ class BasePlatformAdapter(ABC):
             if obligation_id is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(mark_failed, obligation_id, error)
-            record_delivery(SendResult(
+            held.append(SendResult(
                 success=False, error=f"copy block {index + 1} held behind an undelivered earlier block"))
+        return held
 
     async def _notify_turn_error(
         self, event: MessageEvent, e: BaseException, session_key: Optional[str] = None,

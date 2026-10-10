@@ -164,3 +164,21 @@ def test_live_stream_voice_never_speaks_copy_bodies(monkeypatch):
         items.append(spoken.get_nowait())
     said = "".join(i for i in items if isinstance(i, str))
     assert "Paste exactly." not in said and "before" in said and "after" in said
+
+
+def test_live_stream_voice_restarts_copy_detection_per_message(monkeypatch):
+    import queue
+    spoken = queue.Queue()
+    _stream_turn(monkeypatch, ["Checking now.", None, "[[copy]]\nPaste exactly.\n[[/copy]]"], tts_queue=spoken)
+    items = []
+    while not spoken.empty():
+        items.append(spoken.get_nowait())
+    said = "".join(i for i in items if isinstance(i, str))
+    assert "Paste exactly." not in said and "[[" not in said and "Checking now." in said
+
+
+def test_history_display_renders_copy_blocks_inline_without_touching_storage():
+    stored = {"role": "assistant", "content": "before\n[[copy]]\nbody\n[[/copy]]\nafter"}
+    shown = srv._history_to_messages([stored])
+    assert [m["text"] for m in shown if m["role"] == "assistant"] == ["before\nbody\nafter"]
+    assert stored["content"] == "before\n[[copy]]\nbody\n[[/copy]]\nafter"

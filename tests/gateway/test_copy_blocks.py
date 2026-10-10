@@ -529,3 +529,43 @@ def test_streaming_tts_never_speaks_copy_bodies() -> None:
     for delta in ["before\n[[copy]]\nPaste ", "exactly.\n[[/copy]]\nafter\n"]:
         consumer.on_delta(delta)
     assert "".join(spoken) == "before\nafter\n"
+
+
+@pytest.mark.parametrize("body", ["```python\nprint(1)", "~~~\nopen [[/copy]]\n", "``` \nx\n```\ny\n```"])
+def test_ledger_wrapping_round_trips_bodies_ending_in_an_open_fence(body) -> None:
+    from gateway.copy_blocks import wrap_copy_block
+    _, blocks = extract_copy_blocks("[[copy]]\n" + body)
+    for extracted in blocks:
+        assert extract_copy_blocks(wrap_copy_block(extracted)) == ("", [extracted])
+
+
+@pytest.mark.asyncio
+async def test_held_copy_blocks_are_ledgered_before_recovery_can_sweep(monkeypatch) -> None:
+    import gateway.delivery_ledger as ledger
+
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    adapter._final_delivery_adapter = lambda _source: adapter
+    adapter.gateway_runner = None
+    rows, seen_at_finalize = [], []
+    monkeypatch.setattr(ledger, "ledger_enabled", lambda: True)
+    monkeypatch.setattr(ledger, "record_obligation", lambda **kwargs: rows.append(kwargs))
+    monkeypatch.setattr(ledger, "mark_attempting", lambda _oid: None)
+    monkeypatch.setattr(ledger, "mark_failed", lambda _oid, _error: None)
+
+    async def finalize(obligation_id, result, event, delivery_adapter):
+        # A recovered adapter sweeps right here: every follower must already be in the ledger.
+        seen_at_finalize.append(len(rows))
+
+    adapter._finalize_delivery_obligation = finalize
+
+    async def send_with_retry(*, chat_id, content, reply_to, metadata):
+        return SimpleNamespace(success=False, message_id=None, pre_send=True, error="send_path_degraded")
+
+    adapter._send_with_retry = send_with_retry
+    source = SimpleNamespace(chat_id="chat", platform="telegram", thread_id=None)
+    event = SimpleNamespace(source=source, message_id="m", ledger_message_id="m", text="")
+    results = []
+    await adapter._send_copy_blocks(event, "session", ["one", "two", "three"], {}, results.append)
+    assert seen_at_finalize == [3]
+    assert len(results) == 3 and not any(r.success for r in results)

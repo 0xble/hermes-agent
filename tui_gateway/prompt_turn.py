@@ -873,6 +873,7 @@ def _invoke_agent(
         if delta is None:
             # A new assistant message starts on a new line for copy-marker detection.
             copy_filter.message_boundary()
+            _speak(None)
         if isinstance(delta, str):
             _speak(delta)
             delta = copy_filter.feed(delta)
