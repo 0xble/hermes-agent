@@ -17,7 +17,7 @@ from tools import mcp_tool_transport as transport
 
 @pytest.fixture(autouse=True)
 def isolated_ledger(monkeypatch):
-    for name, value in (("_stdio_pids", {}), ("_stdio_pgids", {}),
+    for name, value in (("_stdio_pids", {}), ("_stdio_pgids", {}), ("_stdio_sessions", {}),
                         ("_orphan_stdio_pids", set()), ("_orphan_stdio_pid_servers", {})):
         monkeypatch.setattr(lifecycle, name, value)
         if hasattr(transport, name):
@@ -66,6 +66,53 @@ def test_reaper_skips_wait_and_signals_without_a_live_owned_incarnation(monkeypa
     kill.assert_not_called()
     if ledger != "empty":
         original.send_signal.assert_not_called()
+
+
+def test_recycled_pgid_with_unrelated_session_is_not_signalled(monkeypatch):
+    """A numeric PGID reused by a new session is not MCP group authority."""
+    pid = 727272
+    original = Mock(pid=pid)
+    original.is_running.return_value = False
+    original.status.return_value = psutil.STATUS_ZOMBIE
+    unrelated = Mock(pid=pid)
+    unrelated.is_running.return_value = True
+    unrelated.status.return_value = psutil.STATUS_RUNNING
+    unrelated.create_time.return_value = 200.0
+    original.send_signal.side_effect = AssertionError("recycled PGID was signalled")
+    lifecycle._stdio_processes[pid] = {pid: original}
+    lifecycle._stdio_pgids[pid] = pid
+    lifecycle._stdio_sessions[pid] = 100.0
+    lifecycle._orphan_stdio_pids.add(pid)
+    monkeypatch.setattr(psutil, "process_iter", lambda: [unrelated])
+    monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid, raising=False)
+    monkeypatch.setattr(lifecycle.os, "getsid", lambda _: 200, raising=False)
+    monkeypatch.setattr(lifecycle.os, "killpg", Mock(), raising=False)
+
+    lifecycle._kill_orphaned_mcp_children()
+
+    original.send_signal.assert_not_called()
+
+
+def test_unverifiable_live_group_is_not_unregistered(monkeypatch):
+    """A live group whose member identity cannot be read stays supervised."""
+    pid = 737373
+    proc = Mock(pid=pid)
+    proc.is_running.side_effect = psutil.AccessDenied(pid)
+    lifecycle._stdio_processes[pid] = {pid: proc}
+    lifecycle._stdio_pgids[pid] = pid
+    lifecycle._stdio_sessions[pid] = pid
+    lifecycle._orphan_stdio_pids.add(pid)
+    monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid, raising=False)
+    monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool._update_death_supervisor",
+        lambda verb, pgids: calls.append((verb, set(pgids))),
+    )
+
+    lifecycle._kill_orphaned_mcp_children()
+
+    assert not any(pid in pgids for verb, pgids in calls if verb == "unregister")
 
 
 @pytest.mark.platforms("posix")

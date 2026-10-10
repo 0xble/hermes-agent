@@ -22,17 +22,29 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.
 # Separate from _stdio_pids so the PGID survives the child's removal. Empty on Windows.
 _stdio_pgids: Dict[int, int] = {}
+# POSIX session IDs captured with the PGID. A surviving member in the original session
+# proves a recorded group was not recycled into an unrelated session.
+_stdio_sessions: Dict[int, int] = {}
 # psutil handles cache (PID, create-time) at spawn; retain descendant witnesses
 # after the direct child exits. A numeric PID/PGID alone is never signal authority.
 _stdio_processes: dict[int, dict] = {}
 
 
-def _mcp_process_alive(proc) -> bool:
+def _mcp_process_state(proc):
+    """Return True/False/None for alive/dead/unverifiable incarnation state."""
     import psutil
+    if proc is None:
+        return False
     try:
         return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+    except (psutil.NoSuchProcess, ProcessLookupError):
         return False
+    except (psutil.AccessDenied, PermissionError, OSError):
+        return None
+
+
+def _mcp_process_alive(proc) -> bool:
+    return _mcp_process_state(proc) is True
 
 
 def _mcp_process_in_group(proc, pgid: int) -> bool:
@@ -62,32 +74,79 @@ def _remember_mcp_processes(pids: set) -> None:
             _stdio_processes[pid] = members
 
 
-def _owned_mcp_processes(members: dict, pgid: Optional[int], my_pgid: Optional[int]) -> dict:
-    """Refresh descendants/groups only through a live, birth-verified witness.
+def _enumerate_mcp_group(pgid: int, session_id: Optional[int]) -> Optional[dict]:
+    """Return live members of *pgid*, or ``None`` when group identity is unverifiable.
 
-    A retained descendant proves the old group still exists after its leader exits;
-    without one, fail closed rather than interpreting a recycled PGID as ownership.
+    A recorded MCP group is safe to signal after its leader exits only when every
+    member we can inspect is still in the original session.  A recycled group has
+    a different session (and normally a new leader incarnation), so it is rejected
+    rather than adopted from its numeric PGID.
+    """
+    import psutil
+    discovered = {}
+    for proc in psutil.process_iter():
+        try:
+            if os.getpgid(proc.pid) != pgid:
+                continue
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                continue
+            if session_id is not None and os.getsid(proc.pid) != session_id:
+                return None
+            proc.create_time()
+            discovered[proc.pid] = proc
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            # An inaccessible member could be the recycled process we must not
+            # signal.  Fail closed only after it has matched the target group.
+            try:
+                if os.getpgid(proc.pid) == pgid:
+                    return None
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+        except PermissionError:
+            return None
+        except OSError:
+            continue
+    return discovered
+
+
+def _owned_mcp_processes(members: dict, pgid: Optional[int], my_pgid: Optional[int],
+                         *, leader_pid: Optional[int] = None,
+                         session_id: Optional[int] = None) -> dict:
+    """Refresh descendants/groups through verified process incarnations.
+
+    A live witness allows a group refresh.  If the recorded leader has already
+    exited, the same refresh is allowed only when current members still carry the
+    recorded session ID and a recycled leader PID still has the original
+    create-time identity.
     """
     import psutil
     alive = {pid: proc for pid, proc in members.items() if _mcp_process_alive(proc)}
-    if not alive:
-        return {}
     if pgid is not None and pgid != my_pgid:
-        if any(_mcp_process_in_group(proc, pgid) for proc in alive.values()):
-            witnesses = list(alive.values())
-            discovered = {}
-            for proc in psutil.process_iter():
+        witnesses = [proc for proc in alive.values() if _mcp_process_in_group(proc, pgid)]
+        leader = members.get(leader_pid if leader_pid is not None else pgid)
+        leader_state = _mcp_process_state(leader)
+        if witnesses or (leader is not None and leader_state is False and session_id is not None):
+            discovered = _enumerate_mcp_group(pgid, session_id)
+            if discovered is None:
+                return {}
+            if session_id is not None and leader is not None and pgid in discovered:
                 try:
-                    if os.getpgid(proc.pid) == pgid and _mcp_process_alive(proc):
-                        proc.create_time()
-                        discovered[proc.pid] = proc
+                    if discovered[pgid].create_time() != leader.create_time():
+                        return {}
                 except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                    continue
-            # Enumeration is not atomic: don't adopt members of a group that
-            # was recycled while its last original witness exited.
-            if any(_mcp_process_in_group(proc, pgid) for proc in witnesses):
+                    return {}
+            # Enumeration is not atomic: retain only if the original witness is
+            # still in the group, or the leader incarnation is verified gone and
+            # a member in its original session remains.
+            if witnesses:
+                if not any(_mcp_process_in_group(proc, pgid) for proc in witnesses):
+                    return {}
                 alive.update(discovered)
-    else:
+            elif discovered:
+                alive = discovered
+    elif alive:
         for proc in list(alive.values()):
             try:
                 for child in proc.children(recursive=True):
@@ -294,8 +353,8 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         _close_mcp_stderr_logs(scope=scope)
 
 
-def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[dict, dict, dict]:
-    """Atomically pop selected owners, groups and spawn-incarnation witnesses."""
+def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[dict, dict, dict, dict]:
+    """Atomically pop selected owners, groups, session IDs and spawn witnesses."""
     def _owned(entries: Dict[int, str]) -> Dict[int, str]:
         return {pid: owner for pid, owner in entries.items() if server_name is None or owner == server_name}
 
@@ -310,8 +369,9 @@ def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tup
             for pid in active:
                 _stdio_pids.pop(pid, None)
         pgids = {pid: _stdio_pgids.pop(pid) for pid in pids if pid in _stdio_pgids}
+        sessions = {pid: _stdio_sessions.pop(pid) for pid in pids if pid in _stdio_sessions}
         processes = {pid: _stdio_processes.pop(pid, {}) for pid in pids}
-    return pids, pgids, processes
+    return pids, pgids, sessions, processes
 
 
 def _signal_mcp_processes(members: dict, sig: int, pgid: Optional[int], my_pgid: Optional[int]) -> None:
@@ -375,7 +435,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     server (stdio reconnects cleaning up their old transport)."""
     import signal as _signal
     import psutil
-    pids, pgids, processes = _take_reapable_pids(include_active, server_name)
+    pids, pgids, sessions, processes = _take_reapable_pids(include_active, server_name)
     if not pids:
         return
 
@@ -385,8 +445,13 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         my_pgid = None  # Windows or restricted environment
 
     try:
-        owned = {pid: _owned_mcp_processes(processes[pid], pgids.get(pid), my_pgid)
-                 for pid in pids}
+        owned = {
+            pid: _owned_mcp_processes(
+                processes[pid], pgids.get(pid), my_pgid,
+                leader_pid=pid, session_id=sessions.get(pid),
+            )
+            for pid in pids
+        }
         survivors = {member_pid: proc for members in owned.values() for member_pid, proc in members.items()}
         if not survivors:  # empty, dead, reused or unverified ledgers pay no grace
             return
@@ -403,9 +468,13 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
                 _signal_mcp_processes(alive, sigkill, pgids.get(pid), my_pgid)
                 logger.warning("Force-killed MCP process group for %d (%s) after SIGTERM timeout", pid, pids[pid])
     finally:
-        # Release even dead/unverifiable entries, so stale numeric groups aren't
-        # handed to the parent-death supervisor after this graceful sweep.
-        _core._update_death_supervisor("unregister", pgids.values())
+        # Release only groups whose current membership can be verified empty.
+        # An unreadable/live group stays registered with the death supervisor.
+        empty = [
+            pgid for pid, pgid in pgids.items()
+            if _enumerate_mcp_group(pgid, sessions.get(pid)) == {}
+        ]
+        _core._update_death_supervisor("unregister", empty)
 
 
 def _stop_mcp_loop_if_idle() -> bool:
