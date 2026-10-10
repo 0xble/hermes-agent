@@ -157,7 +157,7 @@ async def test_queued_handoff_fires_each_generation(adapter):
     async def handler(event):
         guard = adapter._active_sessions[key]
         generation = 1 if event.text == "first" else 2
-        guard._hermes_run_generation = generation
+        setattr(guard, "_hermes_run_generation", generation)
         adapter.register_post_delivery_callback(
             key, lambda: fired.append(event.text), generation=generation,
         )
@@ -173,6 +173,79 @@ async def test_queued_handoff_fires_each_generation(adapter):
         await asyncio.sleep(0.01)
     assert fired == ["first", "second"]
     assert adapter._post_delivery_callbacks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+async def test_failed_or_cancelled_drained_followup_fires_own_callback(adapter, outcome):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1234", chat_type="private")
+    first = MessageEvent(text="first", message_type=MessageType.TEXT, source=source, message_id="1")
+    second = MessageEvent(text="second", message_type=MessageType.TEXT, source=source, message_id="2")
+    key = "agent:main:telegram:dm:1234"
+    guard = asyncio.Event()
+    adapter._active_sessions[key] = guard
+    started = asyncio.Event()
+    release = asyncio.Event()
+    fired = []
+
+    async def handler(event):
+        generation = 1 if event.text == "first" else 2
+        setattr(guard, "_hermes_run_generation", generation)
+        adapter.register_post_delivery_callback(
+            key, lambda: fired.append(event.text), generation=generation,
+        )
+        if generation == 1:
+            adapter._pending_messages[key] = second
+            return "first done"
+        started.set()
+        await release.wait()
+        raise RuntimeError("follow-up failed")
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(first, key)
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task = adapter._session_tasks[key]
+    if outcome == "cancelled":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert fired == ["first", "second"]
+    assert adapter._post_delivery_callbacks == {}
+    assert adapter._post_delivery_callbacks_by_generation == {}
+
+
+@pytest.mark.asyncio
+async def test_unbound_in_turn_bare_callback_fires_once(adapter):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1234", chat_type="private")
+    event = MessageEvent(text="first", message_type=MessageType.TEXT, source=source, message_id="1")
+    key = "agent:main:telegram:dm:1234"
+    guard = asyncio.Event()
+    adapter._active_sessions[key] = guard
+    fired = []
+
+    async def handler(_event):
+        adapter.register_post_delivery_callback(key, lambda: fired.append("callback"))
+        return None
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(event, key)
+    assert fired == ["callback"]
+    assert adapter._post_delivery_callbacks == {}
+
+    async def no_callback(_event):
+        return None
+
+    adapter.set_message_handler(no_callback)
+    adapter._active_sessions[key] = asyncio.Event()
+    await adapter._process_message_background(event, key)
+
+    assert fired == ["callback"]
+    assert adapter._post_delivery_callbacks == {}
+    assert adapter._post_delivery_callbacks_by_generation == {}
 
 
 @pytest.mark.asyncio
@@ -224,7 +297,10 @@ async def test_preregistered_legacy_callback_fires_once_after_send(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["cancelled", "failed"])
-async def test_predecessor_claims_legacy_callback_without_consuming_successor(adapter, outcome):
+@pytest.mark.parametrize("registration", ["preregistered", "in_turn"])
+async def test_predecessor_claims_legacy_callback_without_consuming_successor(
+    adapter, outcome, registration,
+):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="1234", chat_type="private")
     event = MessageEvent(text="first", message_type=MessageType.TEXT, source=source, message_id="1")
     key = "agent:main:telegram:dm:1234"
@@ -232,10 +308,13 @@ async def test_predecessor_claims_legacy_callback_without_consuming_successor(ad
     adapter._active_sessions[key] = guard
     started, release = asyncio.Event(), asyncio.Event()
     fired = []
-    adapter.register_post_delivery_callback(key, lambda: fired.append("predecessor"))
+    if registration == "preregistered":
+        adapter.register_post_delivery_callback(key, lambda: fired.append("predecessor"))
 
     async def handler(_event):
         setattr(guard, "_hermes_run_generation", 1)
+        if registration == "in_turn":
+            adapter.register_post_delivery_callback(key, lambda: fired.append("predecessor"))
         started.set()
         await release.wait()
         raise RuntimeError("handler failed")
