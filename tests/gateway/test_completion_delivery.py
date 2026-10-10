@@ -997,8 +997,9 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     answering liveness probes while the ledger is slow."""
     import contextlib
     import time
+    from itertools import pairwise
 
-    import hermes_cli.sqlite_util as sqlite_util
+    from hermes_cli import sqlite_util
     from tools import async_delegation
 
     events = [_distinct_async_event(f"deleg_slow_{i}") for i in range(2)]
@@ -1033,7 +1034,7 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
         finally:
             delivery_done.set()
             await heartbeat
-        return result, max(b - a for a, b in zip(ticks, ticks[1:]))
+        return result, max(b - a for a, b in pairwise(ticks))
 
     result, worst_gap = asyncio.run(_exercise())
 
@@ -1042,6 +1043,114 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     for event in events:
         assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
     assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
+
+
+@pytest.mark.parametrize("siblings", [False, True])
+def test_cancelled_claim_refunds_during_executor_shutdown(monkeypatch, siblings):
+    """asyncio.run teardown must refund claims without keeping the loop alive for release."""
+    import concurrent.futures
+    import threading
+
+    from gateway.run_notifications_ledger import claim_off_loop, claim_siblings_off_loop
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_shutdown_{i}") for i in range(2 if siblings else 1)]
+    for event in events:
+        _persist_pending_completion(event)
+    entered, shutting_down = threading.Event(), threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    real_shutdown = pool.shutdown
+    real_claim = async_delegation.claim_event_delivery
+
+    def _shutdown(*args, **kwargs):
+        # asyncio has forbidden new executor submissions before it calls shutdown.
+        shutting_down.set()
+        return real_shutdown(*args, **kwargs)
+
+    def _slow_claim(event, consumer):
+        entered.set()
+        assert shutting_down.wait(5)
+        return real_claim(event, consumer)
+
+    monkeypatch.setattr(pool, "shutdown", _shutdown)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _slow_claim)
+
+    async def _exercise():
+        asyncio.get_running_loop().set_default_executor(pool)
+        if siblings:
+            claiming = claim_siblings_off_loop([(event, "result") for event in events], "old")
+        else:
+            claiming = claim_off_loop(
+                lambda: _slow_claim(events[0], "old"),
+                lambda claim_id: async_delegation.defer_completion_delivery(
+                    events[0]["delegation_id"], claim_id,
+                ),
+            )
+        task = asyncio.create_task(claiming)
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # Return immediately; only asyncio.run's executor teardown unblocks the claim.
+
+    asyncio.run(_exercise())
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+        assert async_delegation.claim_event_delivery(event, "next-consumer")
+
+
+def test_cancelled_finished_claim_refunds_after_executor_shutdown(monkeypatch):
+    """A finished worker whose result is not consumed needs an executor-independent refund."""
+    import concurrent.futures
+    import contextvars
+    import threading
+
+    from gateway.run_notifications_ledger import claim_off_loop
+    from tools import async_delegation
+
+    event = _distinct_async_event("deleg_finished_shutdown")
+    _persist_pending_completion(event)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    real_submit = pool.submit
+    submitted = []
+    released = threading.Event()
+    release_contexts = []
+    scope = contextvars.ContextVar("claim_release_scope", default=None)
+
+    def _submit(*args, **kwargs):
+        future = real_submit(*args, **kwargs)
+        submitted.append(future)
+        return future
+
+    def _release(claim_id):
+        async_delegation.defer_completion_delivery(event["delegation_id"], claim_id)
+        release_contexts.append((scope.get(), threading.current_thread().daemon))
+        released.set()
+
+    monkeypatch.setattr(pool, "submit", _submit)
+
+    async def _exercise():
+        asyncio.get_running_loop().set_default_executor(pool)
+        scope.set("owning-profile")
+        task = asyncio.create_task(claim_off_loop(
+            lambda: async_delegation.claim_event_delivery(event, "old"), _release,
+        ))
+        await asyncio.sleep(0)  # The claimant submits and suspends at its await.
+        # Block this test's loop so the worker finishes before its result can be consumed.
+        assert submitted[0].result(timeout=5)
+        pool.shutdown(wait=True)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_exercise())
+    assert released.wait(5), "finished claim was not refunded after executor shutdown"
+    assert release_contexts == [("owning-profile", False)]
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", 0)
+    assert async_delegation.claim_event_delivery(event, "next-consumer")
 
 
 def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_registry):
