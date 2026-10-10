@@ -110,10 +110,11 @@ DEFAULT_CONFIG = {
         # so turns finish BEFORE stop().
         "restart_drain_timeout": 0,
         # Floor under the stop()/drain wait (seconds) for cron jobs and api_server runs. Interrupted
-        # chat turns resume on the next message, but an interrupted cron run is recorded as a
-        # permanent failure and an interrupted /v1 run fails its waiting caller, so neither may
-        # inherit restart_drain_timeout's 0 (#82161, #132989). Clamped to the shutdown-watchdog
-        # leash minus teardown headroom (~50s unless TimeoutStopSec is raised). 0 = opt out.
+        # chat turns resume on the next message without announcing the restart, but an interrupted
+        # cron run is recorded as a permanent failure and an interrupted /v1 run fails its waiting
+        # caller, so neither may inherit restart_drain_timeout's 0 (#82161, #132989). Clamped to
+        # the shutdown-watchdog leash minus teardown headroom (~50s unless TimeoutStopSec is raised).
+        # 0 = opt out.
         "cron_drain_timeout": 30,
         # In-band restart (/restart, SIGUSR1): refuse new work, then wait up to this many seconds
         # for in-flight agents/cron/api runs to finish before stop(). 0 = enter stop() at once. 30
@@ -253,7 +254,7 @@ DEFAULT_CONFIG = {
         # circuit breaker. 0 = disable.
         "reconnect_attention_after": 7200,
         # Freshness window (seconds) for the auto-continue note. After a crash/restart mid-run the
-        # next user message gets "[System note: your previous turn was interrupted...]" prepended;
+        # next user message gets the resume note ("[System note: Resume the pending turn...]") prepended;
         # only when the last persisted transcript row is younger than this, so stale markers don't
         # revive an unrelated old task. Covers gateway_timeout (1800) plus slack. 0 = always inject.
         "gateway_auto_continue_freshness": 3600,
@@ -612,12 +613,12 @@ DEFAULT_CONFIG = {
         # max_attempts: retry rounds before a turn gives up with "max compression attempts reached".
         # Raise (e.g. 6) for tool-schema-heavy sessions. Validated >= 1, cap 10.
         "max_attempts": 3,
-        # proactive_prune_tokens: opt-in trigger (tokens) for the deterministic no-LLM tool-result
+        # proactive_prune_tokens: default trigger (tokens) for the deterministic no-LLM tool-result
         # prune, independent of `threshold` (which rarely fires on large windows, so old tool output
-        # is re-sent every turn); e.g. 48000 reclaims early. 0 = off. Tail protected by
+        # is re-sent every turn). 48000 reclaims early; set 0 to disable. Tail protected by
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
         # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
-        "proactive_prune_tokens": 0,
+        "proactive_prune_tokens": 48000,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,

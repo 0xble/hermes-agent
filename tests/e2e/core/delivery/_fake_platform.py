@@ -628,8 +628,8 @@ RECOVERY_MARKER_PREFIXES: tuple = ()
 
 
 def recovery_markers() -> tuple:
-    from gateway.delivery_ledger import FLOOD_MARKER, RECONNECTED_MARKER, RECOVERED_MARKER
-    return (RECOVERED_MARKER, RECONNECTED_MARKER, FLOOD_MARKER)
+    from gateway.delivery_ledger import FLOOD_MARKER, RECOVERED_MARKER
+    return (RECOVERED_MARKER, FLOOD_MARKER)
 
 
 _CHUNK_INDICATOR = re.compile(r"\s\(\d+/\d+\)\s*$")

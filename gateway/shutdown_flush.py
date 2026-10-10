@@ -22,6 +22,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
-        if serialised is None or not serialised.get("text"):
+        if serialised is None or not has_user_content(serialised):
             return False
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
@@ -208,6 +209,26 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool = 
     return replayed, remaining
 
 
+def payload_media_urls(data: Dict[str, Any]) -> list:
+    """Attachment paths from a pending payload; legacy ``media`` may hold one stringified value."""
+    urls = data.get("media_urls") or data.get("media") or []
+    return [urls] if isinstance(urls, str) else list(urls)
+
+
+def has_user_content(data: Dict[str, Any]) -> bool:
+    """A caption-less attachment is still a message; only text- and media-free slots are empty."""
+    return bool(data.get("text")) or bool(payload_media_urls(data))
+
+
+def recovered_message_type(data: Dict[str, Any]):
+    """Restore the spooled ``MessageType``; spools written before it was kept replay as TEXT."""
+    from gateway.platforms.event import MessageType
+    try:
+        return MessageType(data.get("message_type") or MessageType.TEXT.value)
+    except ValueError:
+        return MessageType.TEXT
+
+
 def _json_safe(value: Any) -> bool:
     try:
         json.dumps(value)
@@ -225,17 +246,29 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
-        for attr in ("user_id", "user_name", "media_urls", "media_types", "reply_to_message_id"):
+        for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
+                     "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)
             if val is not None and _json_safe(val):
                 result[attr] = val
+        # Voice vs audio-file vs document routing reads the message-level type, not just MIME.
+        message_type = getattr(getattr(value, "message_type", None), "value", None)
+        if isinstance(message_type, str):
+            result["message_type"] = message_type
+        if getattr(value, "reply_to_is_own_message", False) is True:
+            result["reply_to_is_own_message"] = True
         if getattr(value, "_drain_deferred", False):
             result["drain_deferred"] = True
-            result["internal"] = bool(getattr(value, "internal", False))
-            result["allow_gateway_control"] = bool(getattr(value, "allow_gateway_control", False))
-            metadata = getattr(value, "metadata", None)
-            if isinstance(metadata, dict) and _json_safe(metadata):
-                result["metadata"] = metadata
+        # Every queued event keeps its turn contract: a machinery notice recovered without
+        # ``internal``/``reply_expected`` would be judged a human turn on replay.
+        result["internal"] = getattr(value, "internal", False) is True
+        result["allow_gateway_control"] = getattr(value, "allow_gateway_control", False) is True
+        reply_expected = getattr(value, "reply_expected", None)
+        if isinstance(reply_expected, bool):
+            result["reply_expected"] = reply_expected
+        metadata = getattr(value, "metadata", None)
+        if isinstance(metadata, dict) and metadata and _json_safe(metadata):
+            result["metadata"] = metadata
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
@@ -497,7 +530,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         if command and resolve_command(command) is not None:
             logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
             return DROP_PENDING
-    if not text or not session_key:
+    if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)
         return False
@@ -533,8 +566,26 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             return False
         if claim:
             return CLAIMED_FOLLOWUP
+    # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
+    # reply judgement, display filters) does not treat it as a human prompt.
+    row_display: Dict[str, Any] = {}
+    if data.get("internal") is True:
+        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
+        from gateway.warning_notifications import diagnostic_metadata
+        row_display["display_kind"] = INTERNAL_NOTIFICATION_DISPLAY_KIND
+        row_display["display_metadata"] = diagnostic_metadata(
+            SimpleNamespace(internal=True, metadata=data.get("metadata")))
+    if isinstance(data.get("reply_expected"), bool):
+        row_display.setdefault("display_metadata", {})["reply_expected"] = data["reply_expected"]
+    if not row_display.get("display_metadata"):
+        row_display.pop("display_metadata", None)
+    if not text:
+        from gateway.run import _build_media_placeholder
+        text = _build_media_placeholder(SimpleNamespace(
+            media_urls=payload_media_urls(data), media_types=data.get("media_types") or [],
+            message_type=recovered_message_type(data)))
     target_db.append_message(session_id=session_id, role="user", content=text,
-                             timestamp=payload.get("ts", int(time.time())))
+                             timestamp=payload.get("ts", int(time.time())), **row_display)
     return True
 
 

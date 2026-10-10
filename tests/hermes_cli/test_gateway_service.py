@@ -379,6 +379,31 @@ class TestGeneratedSystemdUnits:
         unit = gateway_cli.generate_systemd_unit(system=False)
         assert "TimeoutStopSec=60" in unit
 
+    @pytest.mark.parametrize(
+        ("agent_config", "expected"),
+        [
+            ("restart_drain_timeout: .inf", "TimeoutStopSec=infinity"),
+            ("cron_drain_timeout: .inf", "TimeoutStopSec=infinity"),
+            ("restart_drain_timeout: 180\n  cron_drain_timeout: 0",
+             f"TimeoutStopSec={resolve_systemd_timeout_stop_sec(180, 0)}"),
+        ],
+    )
+    def test_unbounded_stop_budget_is_spelled_the_way_systemd_parses_it(
+        self, monkeypatch, agent_config, expected
+    ):
+        """systemd accepts ``infinity`` but rejects ``inf`` (Python's str(math.inf)), so an
+        unlimited drain config must not write an invalid unit; finite budgets stay integers."""
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_CRON_DRAIN_TIMEOUT", raising=False)
+        (hermes_constants.get_hermes_home() / "config.yaml").write_text(
+            f"agent:\n  {agent_config}\n", encoding="utf-8"
+        )
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+        timeout_lines = [line for line in unit.splitlines() if line.startswith("TimeoutStopSec=")]
+        assert timeout_lines == [expected]
+        assert not re.search(r"=inf\b", unit)
+
     def test_restart_exit_code_is_also_declared_a_success_status(self):
         """#104251: a planned restart (gateway/restart.py's exit 75) is force-restarted
         via RestartForceExitStatus, but without SuccessExitStatus=75 too, systemd still

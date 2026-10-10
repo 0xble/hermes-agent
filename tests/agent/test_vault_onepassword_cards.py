@@ -65,13 +65,13 @@ def test_card_secret_ignores_malformed_expiry_and_blank_values():
 
 
 def test_listing_exposes_cards_as_payment_handles_without_secrets(backend):
-    backend._run.return_value = json.dumps([_login(), _card()])
+    backend._run.side_effect = [json.dumps([_login(), _card()]), json.dumps(_card())]
     metas = {m.id: m for m in backend.list_items()}
     assert metas["op:login-a"].kind == "login" and metas["op:login-a"].origin == "https://example.com"
     card = metas["op:card-a"]
     assert (card.kind, card.label, card.origin, card.identifier_type, card.identifier) == \
         ("payment", "Visa", None, "card_last4", "1111")
-    assert backend._run.call_args.args == _LIST
+    assert backend._run.call_args_list[0].args == _LIST
     assert backend.get_meta("op:card-a") == card
     assert _PAN not in json.dumps([m.to_dict() for m in metas.values()])
 
@@ -83,33 +83,35 @@ def test_card_without_masked_number_still_lists(backend):
 
 
 def test_resolve_secret_reads_card_in_its_vault_and_returns_payment_shape(backend):
-    backend._run.side_effect = [json.dumps([_login(), _card(vault="vault-b")]),
+    backend._run.side_effect = [json.dumps([_card(vault="vault-b")]),
+                                json.dumps(_card(vault="vault-b")),
                                 json.dumps({"id": "card-a", "category": "CREDIT_CARD", "fields": _card_fields()})]
     secret = backend.resolve_secret("op:card-a")
     assert secret["card_number"] == _PAN and secret["cvc"] == _CVV and (secret["exp_month"], secret["exp_year"]) == ("07", "2029")
-    assert backend._run.call_args_list[1].args == (
+    assert backend._run.call_args_list[2].args == (
         "item", "get", "card-a", "--vault", "vault-b", "--format", "json", "--reveal")
 
 
 def test_resolve_secret_on_a_login_keeps_password_only_shape(backend):
-    backend._run.side_effect = [json.dumps([_login(), _card()]), "pw\n"]
+    backend._run.side_effect = [json.dumps([_login()]), json.dumps(_login()), "pw\n"]
     assert backend.resolve_secret("op:login-a") == {"password": "pw"}
-    assert backend._run.call_count == 2  # one listing serves both the category branch and the vault selector
+    assert backend._run.call_count == 3  # display hint, metadata and one secret read
     assert backend._run.call_args.args == ("item", "get", "login-a", "--vault", "vault-a", "--fields", "label=password", "--reveal")
 
 
 def test_card_handle_never_resolves_as_a_login_password(backend):
     # A card handle passed to the login path must fail closed rather than reveal any field.
-    backend._run.return_value = json.dumps([_login(), _card()])
+    backend._run.side_effect = [json.dumps([_card()]), json.dumps(_card())]
     with pytest.raises(RuntimeError):
         backend.resolve_password("op:card-a")
     assert backend.resolve_otp("op:card-a") is None
-    assert all(c.args[:2] != ("item", "get") for c in backend._run.call_args_list)
+    assert all(c.args[:2] == ("item", "get") or c.args[:2] == ("item", "list") for c in backend._run.call_args_list)
+    assert all("--reveal" not in c.args for c in backend._run.call_args_list)
 
 
 @pytest.mark.parametrize("missing", ["ccnum", "cvv", "expiry"])
 def test_incomplete_card_fails_closed(backend, missing):
-    backend._run.side_effect = [json.dumps([_card()]),
+    backend._run.side_effect = [json.dumps([_card()]), json.dumps(_card()),
                                 json.dumps({"id": "card-a", "fields": _card_fields(**{missing: None})})]
     with pytest.raises(RuntimeError, match="missing"):
         backend.resolve_secret("op:card-a")

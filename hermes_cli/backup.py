@@ -1625,9 +1625,10 @@ def _prune_incomplete_zips(backup_dir: Path, prefix: str, what: str) -> int:
 
 def _create_prefixed_full_backup(
     hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str,
-    *, outcome: Optional[dict] = None) -> Optional[Path]:
+    *, outcome: Optional[dict] = None, raise_errors: bool = False) -> Optional[Path]:
     """Write ``<HERMES_HOME>/backups/<prefix><timestamp>.zip`` and prune older same-prefix zips.
-    Returns the path, or ``None`` if nothing to back up or the write failed. Never raises."""
+    Returns the path, or ``None`` if nothing to back up or the write failed. Never raises unless
+    ``raise_errors`` (see :func:`_write_full_zip_backup`)."""
     hermes_root = hermes_home or get_default_hermes_root()
     if not hermes_root.is_dir():
         return None
@@ -1636,10 +1637,12 @@ def _create_prefixed_full_backup(
         backup_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         logger.warning("Could not create %s backup dir %s: %s", what, backup_dir, exc)
+        if raise_errors:
+            raise
         return None
     out_path = backup_dir / f"{prefix}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
     result: dict = {}
-    written_path = _write_full_zip_backup(out_path, hermes_root, outcome=result)
+    written_path = _write_full_zip_backup(out_path, hermes_root, outcome=result, raise_errors=raise_errors)
     if written_path is None:
         return None
     out_path = written_path
@@ -1660,11 +1663,15 @@ def _create_prefixed_full_backup(
 
 def create_pre_update_backup(
     hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP,
-    *, outcome: Optional[dict] = None) -> Optional[Path]:
+    *, outcome: Optional[dict] = None, raise_errors: bool = False) -> Optional[Path]:
     """Full zip backup to ``backups/pre-update-<timestamp>.zip``, auto-pruned; ``None`` if nothing
-    was found or the backup failed. Never raises — ``hermes update`` continues anyway."""
+    was found or the backup failed. Never raises — ``hermes update`` continues anyway.
+
+    ``raise_errors=True`` narrows ``None`` to "nothing to back up" and raises the reason there is
+    no archive instead (:class:`BackupInProgressError`, ``OSError``, a SQLite snapshot failure),
+    so the updater can tell its user and receipt which one it was."""
     return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update",
-                                       "backup", outcome=outcome)
+                                       "backup", outcome=outcome, raise_errors=raise_errors)
 
 
 def create_pre_migration_backup(
@@ -2304,30 +2311,40 @@ def run_quick_backup(args) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_full_zip_backup(
-        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None,
+        raise_errors: bool = False) -> Optional[Path]:
     """Full zip snapshot of ``hermes_root`` to ``out_path`` under the backup slot (same rules as
     :func:`run_backup`); None when nothing to back up, another backup running, or write error.
 
     ``outcome``, when given, is filled with ``selected``/``errors``/``vanished`` counts so the
     caller can tell a complete archive from one that is merely readable. Returning the path
     alone cannot carry that, and the caller rotates older archives out on the strength of it.
+
+    ``raise_errors=True`` keeps None for "nothing to back up" only and re-raises the other two
+    causes after logging them, for a caller that must report which one it was.
     """
     try:
         with _backup_operation_lock(hermes_root):
-            return _write_full_zip_backup_locked(out_path, hermes_root, outcome=outcome)
+            return _write_full_zip_backup_locked(out_path, hermes_root, outcome=outcome,
+                                                 raise_errors=raise_errors)
     except BackupInProgressError as exc:
         logger.warning("Full-zip backup skipped: %s", exc)
+        if raise_errors:
+            raise
         return None
 
 
 def _write_full_zip_backup_locked(
-        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None,
+        raise_errors: bool = False) -> Optional[Path]:
     scan_started = time.monotonic()
     logger.info("automatic backup phase=scan status=started")
     try:
         files_to_add = list(_iter_backup_files(hermes_root, out_path))
     except OSError as exc:
         logger.warning("Full-zip backup: walk failed: %s", exc)
+        if raise_errors:
+            raise
         return None
     if not files_to_add:
         return None
@@ -2367,8 +2384,14 @@ def _write_full_zip_backup_locked(
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)
+        if raise_errors:
+            raise
         return None
     if published is None:
+        if raise_errors:
+            # Files were selected and none landed: a failed archive, not an empty home.
+            raise OSError(f"no file could be archived ({len(errors)} unreadable, "
+                          f"{len(vanished)} vanished of {len(files_to_add)})")
         return None
     out_path = published
     # Every failure is named, not just counted: a summary alone cannot tell an

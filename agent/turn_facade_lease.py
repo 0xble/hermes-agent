@@ -457,6 +457,9 @@ def _lease_not_acquired_result(agent, session_id: str, conversation_history) -> 
             result["_hard_interrupted"] = True
         if getattr(agent, "_interrupt_message", None):
             result["interrupt_message"] = agent._interrupt_message
+            from agent.interrupt_control import interrupt_issuer
+            if (issuer := interrupt_issuer(agent)):
+                result["interrupt_source"] = issuer
         # The finalizer never runs on this early return; clear so a cached agent doesn't
         # fail-close the next turn.
         try:

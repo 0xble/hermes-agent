@@ -6,7 +6,10 @@ from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
 from gateway.session_recovery import SessionRecoveryMixin
-from gateway.shutdown_flush import DROP_PENDING, OTHER_PLATFORM_PENDING, recover_pending_spool
+from gateway.shutdown_flush import (
+    DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
+    recovered_message_type,
+)
 
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
@@ -91,7 +94,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     adapter, source = ready
     if adapter is None:
         return None
-    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.platforms.event import MessageEvent
     from gateway.session_identity import replace_source
     message_id = data.get("message_id")
     source = replace_source(
@@ -102,16 +105,22 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         role_authorized=bool(data.get("source_role_authorized", False)),
     )
     event = MessageEvent(
-        text=data["text"], message_type=MessageType.TEXT, source=source,
+        text=data.get("text") or "", message_type=recovered_message_type(data), source=source,
         user_id=data.get("user_id") or author_id,
         user_name=data.get("user_name") or source.user_name,
         message_id=message_id,
-        media_urls=data.get("media_urls") or data.get("media") or [],
+        media_urls=payload_media_urls(data),
         media_types=data.get("media_types") or [],
+        media_text_inlined=data.get("media_text_inlined") or [],
         reply_to_message_id=data.get("reply_to_message_id") or data.get("reply_to"),
+        reply_to_text=data.get("reply_to_text"),
+        reply_to_author_id=data.get("reply_to_author_id"),
+        reply_to_author_name=data.get("reply_to_author_name"),
+        reply_to_is_own_message=data.get("reply_to_is_own_message") is True,
         internal=bool(data.get("internal", False)),
         allow_gateway_control=bool(data.get("allow_gateway_control", True)),
         metadata=data.get("metadata") or {},
+        reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)

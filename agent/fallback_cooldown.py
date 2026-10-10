@@ -9,22 +9,34 @@ from agent.error_classifier import FailoverReason
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit})
+# Reasons that arm the shared primary cooldown. An overloaded primary (529, or 503 with an
+# overload body) is as unusable for the next minutes as a rate-limited one, so it takes the same
+# shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
+_SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
 
 
 def _provider_reset_epoch(reset_at) -> float | None:
     """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""
     from agent.credential_pool import _parse_absolute_timestamp
-    parsed = _parse_absolute_timestamp(reset_at)
+    try:
+        parsed = _parse_absolute_timestamp(reset_at)
+    except (OverflowError, ValueError, TypeError):
+        return None  # malformed provider metadata falls back to exponential backoff
     if parsed is not None and math.isfinite(parsed) and parsed > time.time():
         return float(parsed)
     return None
 
 
 def _provider_reset_delay(reset_at) -> float | None:
-    """Seconds until the provider-declared reset, or None when missing/invalid/expired."""
+    """Seconds until the provider-declared reset, or None when missing/invalid/expired/implausible.
+
+    Shares the shared record's ceiling so the in-memory cooldown can never outlive what the
+    record would accept, even when the shared state write fails.
+    """
+    from agent.shared_primary_cooldown import _MAX_PROVIDER_RESET_SECONDS
     parsed = _provider_reset_epoch(reset_at)
     delay = parsed - time.time() if parsed is not None else None
-    if delay is not None and math.isfinite(delay) and delay > 0:
+    if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_PROVIDER_RESET_SECONDS:
         return delay
     return None
 
@@ -61,12 +73,14 @@ def _arm_rate_limit_cooldown(
     Only arm when leaving the primary: chain-switching from an active fallback means the primary
     was not the failing source. Return the armed cooldown in seconds, or None when not armed.
     """
-    if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+    if reason not in _SHARED_COOLDOWN_REASONS:
         return None
-    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
-    primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
-        return None
+    if getattr(agent, "_fallback_activated", False):
+        # Compare the whole route: a same-provider fallback (another model or endpoint) failing
+        # says nothing about the primary and must not arm the primary's shared window.
+        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
+        if live_route_from_agent(agent) != route_from_agent(agent):
+            return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)

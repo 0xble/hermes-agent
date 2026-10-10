@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
@@ -23,6 +24,27 @@ HEARTBEAT_PROMPT_PREFIX = "[Heartbeat — recurring instruction, fires every "
 # Canonical successful no-op reply for gateway-authored recurring checks. The gateway recognizes
 # this exact marker and suppresses it on machinery turns while retaining the turn in history.
 SILENCE_MARKER = "[SILENT]"
+_SILENCE_RESPONSE_MARKERS = frozenset({
+    "[SILENT]", "SILENT", "NO_REPLY", "NO REPLY",
+    "[静默]", "静默", "[沉默]", "沉默",
+})
+
+
+def is_intentional_silence_response(response: Any) -> bool:
+    """Return True only for a complete autonomous no-reply marker."""
+    if not isinstance(response, str) or not 0 < len(response.strip()) <= 64:
+        return False
+    candidates = [response.strip()]
+    depunctuated = candidates[0]
+    while depunctuated and unicodedata.category(depunctuated[0]).startswith("P") and depunctuated[0] not in "[]":
+        depunctuated = depunctuated[1:]
+    while depunctuated and unicodedata.category(depunctuated[-1]).startswith("P") and depunctuated[-1] not in "[]":
+        depunctuated = depunctuated[:-1]
+    if depunctuated != candidates[0]:
+        candidates.append(depunctuated.strip())
+    return any(" ".join(candidate.upper().split()) in _SILENCE_RESPONSE_MARKERS for candidate in candidates)
+
+
 HEARTBEAT_PROMPT_TEMPLATE = (
     f"{HEARTBEAT_PROMPT_PREFIX}{{interval}}]\n{{prompt}}\n\n"
     "If there is nothing meaningful to do or report for this instruction "

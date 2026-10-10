@@ -40,8 +40,14 @@ from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE, _PREVIOUS_HEARTBEAT_
 from hermes_cli.loops import (
     WAKEUP_PROMPT_TEMPLATE,
     WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
+    _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE,
+    _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
+    _ORIGINAL_WAKEUP_PROMPT_TEMPLATE,
+    _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
     _PREVIOUS_WAKEUP_PROMPT_TEMPLATE,
     _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
+    _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE,
+    _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE,
 )
 from tools.delegation_resume import AUTO_RESUME_NOTICE_OPEN
 from tools.process_registry_notifications import (
@@ -127,11 +133,17 @@ _INJECTED_TURN_PATTERNS = tuple((kind, template, _TemplateMatcher(template)) for
     ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE),
     ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
     ("loop", WAKEUP_PROMPT_TEMPLATE),
-    # Stored rows rendered before the silence contract keep their wording; legacy rows carry no
-    # display_kind, so only these literals keep them out of memory recall and retention.
+    # Stored rows rendered with earlier wording keep it; legacy rows carry no display_kind, so
+    # only these literals keep them out of memory recall and retention.
     ("heartbeat", _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE),
     ("loop", _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
     ("loop", _PREVIOUS_WAKEUP_PROMPT_TEMPLATE),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_TEMPLATE),
 ))
 # Opens the revision history GoalManager appends after a revised goal's continuation. Its lines
 # carry earlier goal text, revision reasons and quoted user messages, any of which may span lines

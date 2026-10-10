@@ -131,6 +131,11 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "optimize", help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)")
     _flag(sessions_optimize, "--force",
         help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped")
+    _flag(sessions_optimize, "--at-next-start",
+        help="Don't optimize now: record a one-shot request that the next gateway start honors before "
+             "it opens the store (safe while the gateway runs; deferred while other processes hold state.db)")
+    _flag(sessions_optimize, "--cancel-next-start",
+        help="Withdraw a pending --at-next-start request")
 
     sessions_clean_markers = sessions_subparsers.add_parser("clean-markers",
         help="Permanently clear stale tool-call marker content left by sessions from before #78148",

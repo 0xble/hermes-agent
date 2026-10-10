@@ -8,7 +8,8 @@ snapshot pin, memory-provider config cloning, `/update` reporting, deferred slas
 commands, portable CI and its source guards, launchd test scoping, desktop E2E
 wiring, Telegram media and album flood control, the delivery ledger, the Hindsight
 session lifecycle, the alias-cache isolation guard, gateway orphan-reaper
-home scoping, per-run cron terminal isolation, and the `v0.21.6` merge integration.
+home scoping, per-run cron terminal isolation, gateway subcommand exit codes, and
+the `v0.21.6` merge integration.
 
 Each section is a narrow fix for a defect found while syncing to upstream
 `v2026.9.24`, either shipped by upstream or exposed in fork code by that sync, and
@@ -747,3 +748,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   a git too old to write one. Guard: `scripts/run_tests.sh` on the hosted-failing
   files, with `tests/hermes_cli/test_update_head_moved_gate.py` failing on both
   parents.
+- The follow-on merge of fork main keeps the upstream pause-stop checkpoint and
+  bounded pending-spool replay alongside fork planned-restart markers and full
+  media/reply-context recovery. Both `start_chat` and `telegram_topic` remain in
+  the shared-metrics toolset enum. Config keys are combined except the four
+  intentionally retired `security.tirith_*` defaults: v0.21.6 config migration
+  50 removes them and its regression requires they stay absent; no bundled
+  scanner is resurrected. The auto-merged legacy handoff keeps upstream's root
+  receipt directory while adding fork main's `handoff_path()` discovery helper.
+
+## Gateway Subcommand Exit Codes
+
+- Fork patch identity: `gateway-cli-exit-code`.
+- `gateway_command` returns the subcommand handler's result, and the fork's `gateway update` and `gateway guardian` handlers report failure as a non-zero int, but `cmd_gateway` discarded it. A rejected update reason or a failed guardian run therefore exited 0, so shell callers, cron and launchd saw success. `cmd_gateway` now returns the result to `main()`, which exits with a non-zero int and treats `None` or 0 as success.
+- Upstream status: `upstream/main` drops the result the same way, but none of its gateway handlers return an int, so the defect is only observable through the fork's subcommands.
+- Guard: `tests/hermes_cli/test_gateway_exit_code.py`.

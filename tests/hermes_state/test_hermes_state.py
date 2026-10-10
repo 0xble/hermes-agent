@@ -5036,9 +5036,10 @@ class TestApplyWalProbe:
             for fd_name in os.listdir(fd_dir):
                 try:
                     target = os.readlink(os.path.join(fd_dir, fd_name))
-                    if "(deleted)" in target and (
-                        "wal" in target.lower() or "shm" in target.lower()
-                    ):
+                    # Judge the file name, not the whole path: a random tmp directory such
+                    # as r-ngwal6_8 made unrelated unlinked temp files (#10019569) match.
+                    name = os.path.basename(target.removesuffix(" (deleted)"))
+                    if target.endswith(" (deleted)") and name.endswith(("-wal", "-shm")):
                         deleted_fds.append(target)
                 except OSError:
                     pass

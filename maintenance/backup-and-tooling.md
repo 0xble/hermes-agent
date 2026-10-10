@@ -67,7 +67,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `cron-profile-timezone-reanchor`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
-  `sqlite-close-guard-upstream`,
+  `sqlite-close-guard-upstream`, `update-backup-outcome`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
@@ -94,6 +94,14 @@ Fork-Patch-Backfill: 0ed2d3b8d7f2587be3dfe4b54aaa43b570102f62; candidate-tooling
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
   one cross-process slot, which is the fix the message exists to compensate for.
+- `update-backup-outcome`: `create_pre_update_backup(raise_errors=True)`, used only by
+  `_run_full_backup`, keeps `None` for "nothing to back up" and raises the held slot or the
+  archive failure, so the `HERMES-123` message and "Backup failed" are reachable and the
+  receipt records `pre_update_full_backup` as a step (created or failed) or a skip (empty
+  home). Other callers keep the swallowing default. Verify with
+  `scripts/run_tests.sh tests/hermes_cli/test_update_receipt_truthfulness.py -k FullBackup`.
+  Retire when upstream reports why there is no pre-update archive. Rollback restores the
+  generic "Backup skipped" for all three causes.
 - `sqlite-close-guard-upstream`: exact upstream commits `87bb0d3827a0` and
   `c451cd1bba80`, from merged
   [PR #121433](https://github.com/NousResearch/hermes-agent/pull/121433), preserve

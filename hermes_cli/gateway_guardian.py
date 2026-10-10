@@ -207,6 +207,10 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
         import psutil
         from hermes_cli.gateway_launchd import _launchctl_bootstrap, _launchctl_supervised_pid
         old_pid = _launchctl_supervised_pid(label, timeout=_bounded_timeout(10, deadline))
+        if old_pid is not None:
+            # The rollback is a reload, not a crash: the gateway takes its bounded restart path.
+            from gateway.status import write_planned_restart_marker
+            write_planned_restart_marker(old_pid, hermes_home=home)
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
                        timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
         if old_pid is not None:

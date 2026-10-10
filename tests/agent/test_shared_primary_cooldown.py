@@ -543,3 +543,153 @@ def test_bedrock_stream_success_runs_primary_recovery(monkeypatch):
 
     assert stream._poll() is stream.result["response"]
     assert recovered == [agent]
+
+
+# ── Overload shares the primary cooldown ────────────────────────────────────────────────────
+#
+# A 529, or a 503 whose body says overloaded, classifies as ``overloaded``. It arms the same
+# shared record as a 429: fresh processes skip the primary, one outage notice per outage, and the
+# no-reset backoff follows the rate-limit rules. Generic 500s and timeouts keep their old
+# per-session behavior.
+
+def _overload_turns(home, stub, mode="stream"):
+    first = run_turn(home, stub.url, mode)
+    first_primary = stub.primary_requests()
+    second = run_turn(home, stub.url, mode)
+    return first, second, first_primary, len(stub.primary_requests()) - len(first_primary)
+
+
+@pytest.mark.parametrize(("status", "retry_after"), [(529, "7200"), (503, None)])
+def test_overload_arms_the_shared_cooldown_across_processes(tmp_path, status, retry_after):
+    home = tmp_path / ".hermes"
+    write_home_config(home)
+    with StubProvider() as stub:
+        stub.failure_status = status
+        stub.retry_after = retry_after
+        first, second, first_primary, second_calls = _overload_turns(home, stub)
+    assert first["final_response"] == second["final_response"] == "OK from fallback-model"
+    # A streaming 5xx is re-issued once without streaming inside the same request (the existing
+    # unmask probe), so the arming turn may hit the primary twice; both are the one outage.
+    assert first_primary and {r["status"] for r in first_primary} == {status}
+    assert second_calls == 0, "a fresh process called the overloaded primary"
+    assert _record_path(home).exists(), "an overload did not arm the shared record"
+    (entry,) = json.loads(_record_path(home).read_text(encoding="utf-8-sig"))["routes"].values()
+    assert entry["reason"] == "overloaded"
+    window = entry["reset_at"] - entry["recorded_at"]
+    if retry_after:
+        assert window > 7000, entry  # Retry-After on a 529 goes through the provider-reset path
+    else:
+        assert 59 <= window <= 61, entry
+    notices = first["notices"] + second["notices"]
+    assert len([n for n in notices if "is overloaded until" in n]) == 1, notices
+    assert not [n for n in notices if "Model fallback:" in n], notices
+
+
+def test_overload_no_reset_backoff_escalates_only_after_the_window_lapses():
+    first = _agent_with_chain(_CHAIN)
+    _activate(first, reason=FailoverReason.overloaded)
+    route = spc.route_from_agent(first)
+    armed = spc.active_cooldown(route)
+    assert armed is not None and armed["reason"] == "overloaded"
+    assert 59 <= armed["reset_at"] - armed["recorded_at"] <= 61
+    # An overload that was already in flight lands inside the window: same level, same outage.
+    with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
+        in_flight = _agent_with_chain(_CHAIN)
+    _activate(in_flight, reason=FailoverReason.overloaded)
+    held = spc.active_cooldown(route)
+    assert held is not None
+    assert held["outage_id"] == armed["outage_id"] and held["backoff_count"] == 1
+    assert 59 <= held["reset_at"] - held["recorded_at"] <= 61
+    assert _pending(in_flight) == []  # the claimed outage notice already covers it
+    # The window lapsed and a real re-probe is overloaded again: 120 s.
+    _age_record(route, reset_ago=1, window=60)
+    with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
+        probe = _agent_with_chain(_CHAIN)
+    _activate(probe, reason=FailoverReason.overloaded)
+    later = spc.active_cooldown(route)
+    assert later is not None
+    assert later["outage_id"] == armed["outage_id"] and later["backoff_count"] == 2
+    assert 119 <= later["reset_at"] - later["recorded_at"] <= 121
+
+
+@pytest.mark.parametrize("reason", [FailoverReason.server_error, FailoverReason.timeout])
+def test_generic_server_errors_and_timeouts_do_not_arm(reason):
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent, reason=reason)
+    assert spc.list_cooldowns() == []
+    assert not spc._state_path().exists()
+    notices = _pending(agent)
+    assert len(notices) == 1 and "Model fallback:" in notices[0], notices
+
+
+def test_generic_500_on_the_real_path_does_not_arm(tmp_path):
+    home = tmp_path / ".hermes"
+    write_home_config(home)
+    with StubProvider() as stub:
+        stub.failure_status = 500
+        stub.retry_after = None
+        result = run_turn(home, stub.url)
+    assert result["final_response"] == "OK from fallback-model"
+    assert not _record_path(home).exists()
+
+
+# ── Malformed records: non-finite or implausibly distant resets ──────────────────────────────────────────
+
+def _write_routes(entries):
+    routes = {
+        spc.route_key(provider=e["provider"], base_url=e["base_url"], model=e["model"]): e for e in entries
+    }
+    path = spc._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "routes": routes}), encoding="utf-8")
+
+
+def test_non_finite_records_are_pruned_by_readers():
+    now = time.time()
+    base = {"provider": "custom:fixture", "base_url": "http://127.0.0.1:8317/v1", "reason": "rate_limit",
+            "outage_id": "x", "backoff_count": 1}
+    _write_routes([
+        {**base, "model": "reset-inf", "reset_at": float("inf"), "recorded_at": now},
+        {**base, "model": "reset-nan", "reset_at": float("nan"), "recorded_at": now},
+        {**base, "model": "reset-neg-inf", "reset_at": float("-inf"), "recorded_at": now},
+        {**base, "model": "recorded-inf", "reset_at": now + 600, "recorded_at": float("inf")},
+        {**base, "model": "healthy", "reset_at": now + 600, "recorded_at": now},
+    ])
+    assert [r["model"] for r in spc.list_cooldowns()] == ["healthy"]
+    routes = json.loads(spc._state_path().read_text(encoding="utf-8-sig"))["routes"]
+    assert [entry["model"] for entry in routes.values()] == ["healthy"]
+
+
+def test_implausibly_distant_reset_is_pruned_but_a_weekly_cap_is_kept():
+    now = time.time()
+    base = {"provider": "custom:fixture", "base_url": "http://127.0.0.1:8317/v1", "reason": "rate_limit",
+            "outage_id": "x", "backoff_count": 1, "recorded_at": now}
+    _write_routes([
+        {**base, "model": "huge", "reset_at": 1e20},
+        {**base, "model": "past-ceiling", "reset_at": now + spc._MAX_PROVIDER_RESET_SECONDS + 3600},
+        {**base, "model": "weekly-cap", "reset_at": now + 6 * 86_400},
+    ])
+    assert [r["model"] for r in spc.list_cooldowns()] == ["weekly-cap"]
+    assert spc.active_cooldown(("custom:fixture", "http://127.0.0.1:8317/v1", "huge")) is None
+
+
+def test_arm_keeps_a_multi_day_provider_reset():
+    """The original motivating case: a usage cap that resets days away must be honored."""
+    days = time.time() + 5 * 86_400
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=days)
+    assert entry["source"] == "provider_reset"
+    assert abs(entry["reset_at"] - days) < 1
+
+
+def test_arm_ignores_an_implausible_provider_reset():
+    entry = spc.arm_cooldown(_ROUTE, reason="overloaded", reset_at=1e20)
+    assert entry is not None
+    assert entry["source"] == "backoff"
+    assert 59 <= entry["reset_at"] - entry["recorded_at"] <= 61
+
+
+def test_arm_ignores_a_non_finite_provider_reset():
+    entry = spc.arm_cooldown(_ROUTE, reason="overloaded", reset_at=float("inf"))
+    assert entry is not None
+    assert 59 <= entry["reset_at"] - entry["recorded_at"] <= 61
+    assert entry["source"] == "backoff"

@@ -1651,6 +1651,8 @@ _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
 _TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
 _PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 _PLANNED_STOP_MARKER_TTL_S = 60
+_PLANNED_RESTART_MARKER_FILENAME = ".gateway-planned-restart.json"
+_PLANNED_RESTART_MARKER_TTL_S = 60
 
 
 def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
@@ -1661,6 +1663,10 @@ def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
 
 def _get_planned_stop_marker_path() -> Path:
     return _get_process_hermes_home() / _PLANNED_STOP_MARKER_FILENAME
+
+
+def _get_planned_restart_marker_path(hermes_home: Optional[Path] = None) -> Path:
+    return (hermes_home or _get_process_hermes_home()) / _PLANNED_RESTART_MARKER_FILENAME
 
 
 def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
@@ -2007,6 +2013,25 @@ def consume_planned_stop_marker_for_self() -> bool:
         logger.warning("Planned-stop checkpoint skipped (%s); the stop request stays on disk", exc)
         return _consume_pid_marker_for_self(_get_planned_stop_marker_path(), ttl_s=_PLANNED_STOP_MARKER_TTL_S,
                                             keep=True, on_consume=update_pause_record.mark_stop_accepted)
+
+
+def write_planned_restart_marker(target_pid: int, *, hermes_home: Optional[Path] = None) -> bool:
+    """Record that ``target_pid`` is about to be booted out only so launchd re-reads its plist. The
+    bootout SIGTERM then takes the bounded restart path instead of the unplanned-signal shutdown.
+    ``hermes_home`` names the target's home when the writer's own home differs (guardian)."""
+    marker_home = _canonical_hermes_home(hermes_home or _get_process_hermes_home())
+    return _write_marker(_get_planned_restart_marker_path(marker_home), {
+        "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
+        "target_hermes_home": str(marker_home), "writer_pid": os.getpid(),
+        "written_at": _utc_now_iso(),
+    })
+
+
+def consume_planned_restart_marker_for_self() -> bool:
+    """Return True when the current process is being booted out for a planned service reload."""
+    return _consume_pid_marker_for_self(
+        _get_planned_restart_marker_path(), ttl_s=_PLANNED_RESTART_MARKER_TTL_S
+    )
 
 
 def planned_stop_marker_targets_self() -> bool:

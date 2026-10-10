@@ -29,13 +29,17 @@ def is_post_swap_child() -> bool:
     return os.environ.get(POST_SWAP_ENV) == "1"
 
 
-def write_handoff(payload: dict[str, Any]) -> Path:
-    """Persist the post-swap payload beside the receipts (the ROOT home); returns its path."""
+def handoff_path() -> Path:
+    """Where this process writes its post-swap payload."""
     from hermes_constants import get_default_hermes_root
 
-    directory = get_default_hermes_root() / "logs" / "update_receipts"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"post_swap_{os.getpid()}.json"
+    return  get_default_hermes_root() / "logs" / "update_receipts" / f"post_swap_{os.getpid()}.json"
+
+
+def write_handoff(payload: dict[str, Any]) -> Path:
+    """Persist the post-swap payload beside the receipts (the ROOT home); returns its path."""
+    path = handoff_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return path
 

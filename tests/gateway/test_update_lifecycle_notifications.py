@@ -34,6 +34,47 @@ def test_native_wrapper_records_real_process_exit_only_after_termination(tmp_pat
     assert not pre_restart_exit.exists()
 
 
+@pytest.mark.live_system_guard_bypass  # Fixed python -c only: no updater, git, service or runtime access.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX detached wrapper")
+def test_native_wrapper_never_exposes_incomplete_process_exit_marker(tmp_path):
+    """Watchers poll for the marker's existence, so it must appear only once it holds the code.
+    A shell function shadowing ``printf`` observes the marker at the moment the code is written:
+    a direct ``> marker`` redirect has already created it empty by then."""
+    import subprocess
+    from gateway.slash_commands import _spawn_detached_update
+    final_exit = tmp_path / ".update_process_exit_code"
+    with patch("gateway.slash_commands._systemd_scope_wrap_if_supervised", side_effect=lambda argv: (argv, None)), \
+            patch("subprocess.Popen") as popen:
+        _spawn_detached_update([sys.executable, "-c", "raise SystemExit(7)"],
+                               tmp_path / ".update_output.txt", tmp_path / ".update_exit_code")
+    update_cmd = popen.call_args.args[0][-1]
+    probe = (f"printf() {{ if [ -e '{final_exit}' ]; then echo early > '{tmp_path}/visible'; fi; "
+             'builtin printf "$@"; }; ')
+    subprocess.run(["bash", "-c", probe + update_cmd], check=True, timeout=30)
+    assert not (tmp_path / "visible").exists()
+    assert final_exit.read_text() == "7"
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_windows_helper_publishes_process_exit_marker_atomically(tmp_path):
+    from gateway.slash_commands import _WINDOWS_UPDATE_HELPER
+    output, final_exit = tmp_path / "out.txt", tmp_path / ".update_process_exit_code"
+    replaced = []
+    import os
+    real_replace = os.replace
+
+    def spy(src, dst):
+        replaced.append((src, dst, final_exit.exists()))
+        real_replace(src, dst)
+
+    with patch("subprocess.Popen") as popen, patch("os.replace", side_effect=spy):
+        popen.return_value.wait.return_value = 7
+        with patch.object(sys, "argv", ["-c", str(output), str(final_exit), "hermes"]):
+            exec(compile(_WINDOWS_UPDATE_HELPER, "<helper>", "exec"), {"__name__": "__main__"})
+    assert replaced == [(str(final_exit) + ".tmp", str(final_exit), False)]
+    assert final_exit.read_text(encoding="utf-8") == "7"
+
+
 def pending(home, *, reason=True):
     data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
             "session_key": "agent:main:telegram:dm:42:thread:77",

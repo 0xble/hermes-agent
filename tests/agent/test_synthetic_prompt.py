@@ -127,7 +127,7 @@ def test_structured_provenance_is_never_overridden_by_text(build, display_kind, 
 
 
 def test_recovery_note_wrapping_a_generated_notice_is_fully_synthetic():
-    note = "[System note: The previous turn was interrupted by a gateway restart.]\n\n"
+    note = "[System note: Resume the pending turn. Any restart, update, or shutdown command has already run.]\n\n"
 
     assert human_prompt_text(note + _delegation_notice()) is None
     assert human_prompt_text(note + _delegation_notice() + "\n\n" + HUMAN) == HUMAN
@@ -295,17 +295,21 @@ def test_crafted_near_miss_is_classified_in_linear_time(module_name, template_na
 @pytest.mark.parametrize("module_name,template_name,fields", [
     ("hermes_cli.heartbeat", "HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
     ("hermes_cli.heartbeat", "_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE", {"interval": "30m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "WAKEUP_PROMPT_TEMPLATE", {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}),
-    ("hermes_cli.loops", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
-    ("hermes_cli.loops", "_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
-     {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"}),
+    *[("hermes_cli.loops", name, {"tick": 3, "cadence": " · every 5m", "prompt": "check CI"}) for name in (
+        "WAKEUP_PROMPT_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
+        "_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE",
+        "_ORIGINAL_WAKEUP_PROMPT_TEMPLATE",
+    )],
+    *[("hermes_cli.loops", name, {"tick": 3, "cadence": " · every 5m", "prompt": "check CI", "until": "CI is green"})
+      for name in (
+        "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+        "_SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "_GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+        "_ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+    )],
 ])
-def test_current_and_pre_silence_wakeup_wording_stay_generated(module_name, template_name, fields):
-    """Stored heartbeat and /loop rows rendered before the [SILENT] contract have no display_kind,
-    so their old wording must still classify as generated or memory would ingest it as user text."""
+def test_current_and_earlier_wakeup_wording_stay_generated(module_name, template_name, fields):
+    """Stored heartbeat and /loop rows rendered with any earlier wording have no display_kind,
+    so their wording must still classify as generated or memory would ingest it as user text."""
     import importlib
 
     from agent.synthetic_prompt import text_after_generated_prefix
@@ -836,6 +840,28 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
     import agent.memory_manager as memory_manager
     stale_now = memory_manager._now
     fresh = threading.Thread(target=manager.queue_prefetch_all, args=(HUMAN,), kwargs={"session_id": "s-1"})
+    fresh_blocked = threading.Event()
+    allow_fresh = threading.Event()
+    generation_lock = manager._prefetch_generation.lock
+
+    class _ObservedGenerationLock:
+        def __enter__(self):
+            if threading.current_thread() is fresh:
+                # Prove that the fresh queue is actually waiting behind the stale check's lock. Keep
+                # it there until the current prefetch has consumed the stale buffer; the timeout is
+                # only a hang guard, not the ordering mechanism.
+                if generation_lock.acquire(blocking=False):
+                    generation_lock.release()
+                    raise AssertionError("fresh queue was not blocked by the stale check")
+                fresh_blocked.set()
+                assert allow_fresh.wait(5), "fresh queue did not receive its release"
+            generation_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            generation_lock.release()
+
+    manager._prefetch_generation.lock = _ObservedGenerationLock()  # type: ignore[assignment]
     raced = []
 
     def now_with_a_fresh_queue_in_flight():
@@ -844,7 +870,7 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
         if not raced:
             raced.append(True)
             fresh.start()
-            fresh.join(0.3)
+            assert fresh_blocked.wait(5), "fresh queue did not reach the generation lock"
         return stale_now()
 
     memory_manager._now = now_with_a_fresh_queue_in_flight
@@ -852,7 +878,9 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
         assert manager.prefetch_all("follow-up", session_id="s-1") == ""  # the stale recall is dropped
     finally:
         memory_manager._now = stale_now
+        allow_fresh.set()
     fresh.join(5)
+    assert not fresh.is_alive(), "fresh queue did not finish"
     assert manager.flush_pending(timeout=5) is True
     assert provider.queued[-1] == HUMAN
     assert manager.prefetch_all("next", session_id="s-1") != ""  # the fresh recall survived

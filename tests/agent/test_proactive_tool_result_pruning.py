@@ -171,7 +171,7 @@ def test_successful_full_compression_resets_proactive_runway():
 
 # ---------------------------------------------------------------------------
 # Salvage follow-ups: no-op caller contract, prompt-cache hysteresis gate,
-# no-orphan pairing invariant, and the default-off behavior pin.
+# no-orphan pairing invariant, and the constructor's explicit-zero behavior pin.
 # ---------------------------------------------------------------------------
 
 

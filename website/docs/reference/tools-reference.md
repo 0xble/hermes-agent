@@ -388,6 +388,14 @@ Registered on the `hermes-discord` platform toolset. Moderation actions require 
 |------|-------------|----------------------|
 | `discord_admin` | Manage a Discord server via the REST API: list guilds/channels/roles, create/edit/delete channels, manage role grants, timeouts, kicks, and bans. | `DISCORD_BOT_TOKEN` + bot permissions |
 
+## `telegram_topic` toolset
+
+Registered on the `hermes-telegram` platform toolset (gateway only). Topic creation needs the bot's Threaded Mode enabled in BotFather.
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `telegram_topic` | `create` opens a topic in the user's Telegram DM as its own Hermes session, with a name, an optional native icon, model, provider and reasoning effort, and an optional opening brief the session receives as its first message. Returns the `thread_id`, `session_id` and relay address. `edit` changes a topic's name or icon and its session's model or reasoning. Settings persist across gateway restarts. | Telegram adapter |
+
 ## `spotify` toolset
 
 Registered by the bundled `spotify` plugin. Requires an OAuth token — run `hermes auth spotify` once to authorize.

@@ -41,11 +41,24 @@ item = {"personal": ("item-p", "vault-p", "https://personal.example/login"),
         "business": ("item-b", "vault-b", "https://business.example/login")}[account]
 if account == "personal" and (root / "new-item").exists():
     item = ("item-new", "vault-new", "https://new.personal.example/login")
+if account == "personal" and (root / "fresh-url").exists():
+    item = ("item-p", "vault-p", "https://fresh.personal.example/login")
 if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
     print(json.dumps([{"id": item[0], "title": account, "category": "LOGIN", "vault": {"id": item[1]},
                        "urls": [{"href": item[2]}], "additional_information": account + "@example.com"}]))
+elif args == ["item", "get", item[0], "--vault", item[1], "--format", "json"]:
+    print(json.dumps({"id": item[0], "title": account, "category": "LOGIN", "state": "ACTIVE",
+                      "vault": {"id": item[1]}, "urls": [{"href": item[2]}],
+                      "additional_information": account + "@example.com",
+                      "fields": [{"id": "password", "value": "must-not-be-retained"}]}))
 elif args == ["item", "get", item[0], "--vault", item[1], "--fields", "label=password", "--reveal"]:
     print("dummy-" + account + "-password")
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", item[0]]:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown item", file=sys.stderr)
     sys.exit(2)
@@ -114,11 +127,23 @@ def test_one_vault_list_over_two_accounts_lists_each_once_then_reuses(env, clock
     assert len(calls()) == 2
 
 
-def test_one_fill_lists_the_account_once(env):
+def test_one_fill_reads_fresh_item_metadata_without_listing(env):
     _op, calls = env
     out = _fill("op:item-p", "https://personal.example")
     assert out["success"] is True and "dummy-personal-password" not in json.dumps(out)
-    assert [c["argv"][:2] for c in calls()] == [["item", "list"], ["item", "get"]]
+    assert [c["argv"][:2] for c in calls()] == [["item", "list"], ["item", "get"], ["item", "get"]]
+    assert calls()[1]["argv"] == ["item", "get", "item-p", "--vault", "vault-p", "--format", "json"]
+
+
+def test_stale_display_url_cannot_authorize_fill(env):
+    from tools.browser_vault_tool import browser_vault_list
+    op, calls = env
+    backend = backend_for_handle("op:item-p")
+    with patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+        browser_vault_list()
+        op.with_name("fresh-url").write_text("")
+        assert backend.get_meta("op:item-p").origin == "https://fresh.personal.example"
+    assert [row["argv"][:2] for row in calls()] == [["item", "list"], ["item", "get"]]
 
 
 def test_origin_filtered_cache_miss_refetches_once_and_finds_new_item(env):
@@ -173,7 +198,7 @@ def test_concurrent_display_listings_share_one_op_call(env):
     assert len(calls("list")) == 1  # (b)
 
 
-def test_concurrent_fresh_listings_share_one_op_call(env):
+def test_concurrent_item_metadata_reads_share_one_op_call(env):
     op, calls = env
     op.with_name("delay").write_text("0.5")
     backend = backend_for_handle("op:item-p")
@@ -183,6 +208,7 @@ def test_concurrent_fresh_listings_share_one_op_call(env):
     def worker():
         barrier.wait()
         results.append(backend.get_meta("op:item-p").origin)
+
     threads = [threading.Thread(target=worker) for _ in range(3)]
     for t in threads:
         t.start()
@@ -190,24 +216,22 @@ def test_concurrent_fresh_listings_share_one_op_call(env):
         t.join(10)
     assert results == ["https://personal.example"] * 3
     assert len(calls("list")) == 1
+    assert len([row for row in calls() if row["argv"][:2] == ["item", "get"]]) == 1
 
 
-def test_fill_reuses_its_fresh_listing_only_inside_the_short_window(env, clock):
+def test_fill_consumes_authorized_metadata_for_one_secret_read(env):
     _op, calls = env
     backend = backend_for_handle("op:item-p")
-    backend.list_items()  # a display listing never authorizes a fill
+    backend.list_items()  # A display listing never authorizes a fill.
     assert backend.get_meta("op:item-p") is not None
-    assert len(calls("list")) == 2
-    backend._locate("op:item-p", ("LOGIN",))  # (c) same fill: reuses get_meta's fresh listing
-    assert len(calls("list")) == 2
-    clock[0] += onepassword._FRESH_LISTING_REUSE_SECONDS + 0.01
-    backend.get_meta("op:item-p")  # (d) a later fill lists again
-    assert len(calls("list")) == 3
-    backend.list_items()  # the fresh listing also refreshed the display cache
-    assert len(calls("list")) == 3
-    clock[0] += onepassword._LISTING_TTL_SECONDS + 0.01
-    backend.list_items()
-    assert len(calls("list")) == 4
+    backend.resolve_password("op:item-p")
+    assert len(calls("list")) == 1
+    assert [row["argv"][:2] for row in calls() if row["argv"][:2] == ["item", "get"]] == [
+        ["item", "get"], ["item", "get"]
+    ]
+    # A later fill gets fresh metadata again rather than reusing a prior authorization.
+    backend.resolve_password("op:item-p")
+    assert len([row for row in calls() if row["argv"][:2] == ["item", "get"]]) == 4
 
 
 def test_failed_listing_is_never_cached(env, clock):
@@ -220,7 +244,7 @@ def test_failed_listing_is_never_cached(env, clock):
     op.with_name("fail").unlink()
     assert [m.id for m in backend.list_items()] == ["op:item-p"]  # (e)
     assert backend.get_meta("op:item-p") is not None
-    assert len(calls("list")) == 4
+    assert len(calls("list")) == 3
 
 
 def test_accounts_and_credentials_never_share_listings(env, monkeypatch):
@@ -229,13 +253,13 @@ def test_accounts_and_credentials_never_share_listings(env, monkeypatch):
     assert [m.id for m in personal.list_items()] == ["op:item-p"]
     assert [m.id for m in business.list_items()] == ["op@business:item-b"]  # (f) other account
     assert personal.get_meta("op:item-p") and business.get_meta("op@business:item-b")
-    assert len(calls("list")) == 4
+    assert len(calls("list")) == 2
     # A rotated token is a new identity even for the same backend and account.
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "dummy-personal-token")
     rotated = backend_for_handle("op@business:item-b")
     assert [m.id for m in rotated.list_items()] == ["op@business:item-p"]
     assert rotated.get_meta("op@business:item-p") is not None
-    assert len(calls("list")) == 6
+    assert len(calls("list")) == 3
 
 
 def test_invalidation_forgets_listings_and_drops_a_fetch_in_flight(env):

@@ -88,6 +88,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Cron restart survival | Keep launchd-managed macOS cron workers alive through gateway process-group termination | Cron external worker dispatch, liveness recovery, or launchd restart changes | [Cron restart survival](maintenance/cron-restart-survival.md) |
 | Immutable releases S2 | Pin code and venv to immutable releases behind an atomic pointer; preserve migration and rollback receipts | Update, release staging, launchd path resolution, cron worker pins or retention changes | [Immutable releases and activation runbook](maintenance/seamless-restart-s2.md) |
 | Telegram ingress non-blocking | The update consumer never waits on outbound pacing, the pending-update probe requires no dispatch progress, and reconnect waits for the old poller to release | Telegram update handlers, busy or inline command replies, the heartbeat pending probe, or poller token ownership | [Telegram ingress non-blocking](maintenance/telegram-ingress-nonblocking.md) |
+| Telegram first-poll health | Each new polling generation proves health from a non-blocking first getUpdates; steady-state polls keep the long poll | The instrumented getUpdates request, polling-generation fencing, `start_polling` arguments, or a PTB upgrade | [Telegram first-poll health](maintenance/telegram-first-poll-health.md) |
 | Stdio wrapper chain | Agent builds and thread-scoped silencing never stack or loop `sys.stdout`/`sys.stderr` wrappers, and wrapper attribute lookup cannot recurse | `_SafeWriter`, `_install_safe_stdio`, `thread_scoped_output`, or other process-lifetime stdio rebinding | [Stdio wrapper chain](maintenance/stdio-wrapper-chain.md) |
 | Telegram delivery | Preserve flood coherence, split-send recovery, and legacy emphasis | Telegram send/edit/typing, delivery ledger, or emphasis changes | [Telegram delivery](maintenance/telegram-delivery.md) |
 | Telegram stale final delivery | Recover completed replies from deleted private DM topics without duplicating partially sent content or moving interim output | Telegram private-topic final sends and recovery | [Telegram stale final delivery](maintenance/telegram-stale-final-delivery.md) |
@@ -112,6 +113,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Live gateway inference controls | Apply busy `/reasoning` and `/fast` at the live agent's next model request without eviction | Gateway inference controls, agent request overrides, or cache wiring | [Live inference controls](maintenance/live-inference-controls.md) |
 | Session reasoning persistence | Persist session `/reasoning` picks in the routing entry so a gateway restart keeps them, like `/model` pins | Session reasoning override storage, rehydration, or conversation-boundary clears | [Session reasoning persistence](maintenance/session-reasoning-persistence.md) |
 | Session-scoped Fast expiry | Switch session `/fast fast` and `/fast ultrafast` overrides to explicit normal after a configurable wall-clock deadline | `agent.fast_expiry_seconds`, session tier resolution, cached-agent request overrides, or Fast status/notice changes | [Session-scoped Fast expiry](maintenance/session-fast-expiry.md) |
+| Native Telegram topic tool | Let an agent create or edit a Telegram DM topic and bind its settings, opening brief, and relay address to a native Hermes session | `telegram_topic`, Telegram DM topic creation/editing, topic bindings, or opening-brief delivery | [Native Telegram topic tool](maintenance/telegram-topic-tool.md) |
 | Queued voice transcription | Transcribe and echo queued voice immediately with bounded concurrency, reuse it at drain | Busy queueing, pending-event STT cache, transcript echo, or drain changes | [Queued voice STT](maintenance/queued-voice-stt.md) |
 | Worktree GC Git isolation | Host Git config never hides files from the reclaim safety check; every listed path is archived exactly or the worktree is kept | Worktree-GC dirty checks, archiving, or reclaim changes | [Worktree GC Git isolation](maintenance/worktree-gc-git-isolation.md) |
 | Camofox accounts and vault | Preserve named accounts, Connect/secret-safe fills, shadow-DOM login forms | Browser account, vault, or 1Password backend changes | [Camofox and vault](maintenance/camofox-vault.md) |
@@ -142,6 +144,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | MCP caller identity | Opted-in MCP servers receive the calling session's ContextVar identity as per-call request `_meta`, never the model's arguments or `os.environ` | MCP tool-call dispatch, per-server opt-ins, or session identity reads for MCP | [MCP caller identity](maintenance/mcp-caller-identity.md) |
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
+| Proactive tool-result prune default | Enable the existing deterministic no-LLM tool-result prune at 48000 tokens while protecting the recent tail | `compression.proactive_prune_tokens`, its config/docs, and proactive-prune regressions | [Proactive tool-result prune default](maintenance/proactive-tool-result-prune.md) |
 
 ## Active patch record: relay silence (S1)
 
@@ -208,9 +211,9 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: shared primary cooldown
 
 - **Patch identity:** `shared-primary-cooldown`.
-- **Behavior:** A primary route that is rate-limited, billing-limited, or upstream-rate-limited writes an atomic, file-locked cooldown under `$HERMES_HOME/state/model_cooldowns.json`. Fresh agents adopt the configured fallback without calling the primary while the shared record is active. One process claims the outage notice; one successful primary response clears the record and emits the recovery notice.
+- **Behavior:** A primary route that is rate-limited, billing-limited, upstream-rate-limited, or overloaded (`FailoverReason.overloaded`, chiefly HTTP 529 and 503) writes an atomic, file-locked cooldown under `$HERMES_HOME/state/model_cooldowns.json`. Fresh agents adopt the configured fallback without calling the primary while the shared record is active. One process claims the outage notice; one successful primary response clears the record and emits the recovery notice. Generic 5xx and timeouts do not arm. Records with a non-finite `reset_at` or `recorded_at` are malformed and pruned.
 - **Source surfaces:** `agent/shared_primary_cooldown.py`, `agent/fallback_cooldown.py`, `agent/agent_runtime_helpers.py`, `agent/chat_completion_helpers.py`, `agent/chat_completion_nonstream.py`, and `hermes_cli/fallback_cmd.py`.
-- **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_shared_primary_cooldown.py tests/agent/test_provider_fallback.py tests/agent/test_fallback_exhaustion_cooldown.py tests/hermes_cli/test_fallback_cmd.py` plus `evals/provider_fallback/probe_shared_primary_cooldown.py` (three `PROBE_OK` lines).
 - **Retirement:** Remove when upstream provides equivalent shared cooldown, fresh-agent adoption, notice ownership, recovery clearing, and CLI status/clear controls.
 - **Rollback:** Revert the commits carrying `Fork-Patch: shared-primary-cooldown`.
 
@@ -223,6 +226,77 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/gateway/test_background_process_notifications.py tests/tools/test_terminal_watcher_arming.py`.
 - **Retirement:** Remove when upstream arms live watchers outside the caller's context.
 - **Rollback:** Revert the commits carrying `Fork-Patch: process-watcher-context-isolation`.
+
+## Active patch record: shutdown spool turn contract
+
+- **Patch identity:** `shutdown-spool-turn-contract`.
+- **Behavior:** `gateway/shutdown_flush.py` serialises `internal`, `allow_gateway_control`, `reply_expected` (when known), and JSON-safe `metadata` for every spooled `MessageEvent`, not only drain-deferred arrivals. Startup replay (`gateway/run_pending_recovery.py`) restores `reply_expected`, and the transcript-append fallback stamps `display_kind=internal_notification` and `display_metadata.reply_expected`. Previously a process-completion notice queued at shutdown came back as a human turn, so the agent's correct `NO_REPLY` drew "No reply was written for this message" after each restart. Old spool files without these keys recover as before.
+- **Source surfaces:** `gateway/shutdown_flush.py` (`_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_resume_queued_followup.py`.
+- **Upstream status:** upstream `_serialise_value` keeps only text and routing fields; open upstream PR NousResearch/hermes-agent#95217 serialises internal routing for a different replay design and does not cover `reply_expected`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_resume_queued_followup.py -k machinery_silence`.
+- **Retirement:** Remove when upstream spools and restores the internal flag and `reply_expected` for every queued event.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-turn-contract`.
+
+## Active patch record: proactive tool-result prune default
+
+- **Patch identity:** `proactive-tool-result-prune-default`.
+- **Behavior:** Enable the existing deterministic no-LLM tool-result prune by default at `compression.proactive_prune_tokens: 48000`; retain the 8000-character eligibility floor, 4096-token minimum reclaim gate, and recent-tail protection. `0` remains the explicit opt-out.
+- **Source surfaces:** `hermes_cli/config_defaults.py`, `agent/agent_init.py` configuration attachment (unchanged), `website/docs/user-guide/configuration.md`, and proactive-prune regression tests.
+- **Upstream status:** The pruning implementation is already present upstream, but upstream retains a zero default; no equivalent nonzero default was found during preflight.
+- **Focused regression:** `python -m pytest -q tests/agent/test_proactive_prune_config.py tests/agent/test_proactive_tool_result_pruning.py tests/agent/test_proactive_prune_rearm_threshold.py tests/agent/test_proactive_prune_loop_wiring.py`.
+- **Retirement:** Remove the fork-only default, documentation, and default-specific regression when released upstream enables an equivalent nonzero default with the same tail protection and reclaim gating.
+- **Rollback:** Revert the commit carrying `Fork-Patch: proactive-tool-result-prune-default`.
+
+## Active patch record: state.db compaction at next gateway start
+
+- **Patch identity:** `state-db-compact-at-start`.
+- **Behavior:** `hermes sessions optimize --at-next-start` records a one-shot request in `state.db.compact-at-start.json` beside the store without opening it, so it works while the gateway runs (`--cancel-next-start` withdraws it). `start_gateway` honors it right after the PID-file claim, before the control socket, adapters, cron, the housekeeping worker or any SessionDB handle exist, running the same `SessionDB.vacuum()` as `hermes sessions optimize` (FTS merge, VACUUM, TRUNCATE checkpoint) and logging before/after size at INFO. It keeps the request and logs a WARNING instead when a foreign process holds the store, a release promotion awaits this gateway's acknowledgement (`release-txn.json`), or free disk is below about twice the live data plus 1 GiB. The rewrite renews the startup-watchdog lease (and systemd `EXTEND_TIMEOUT_USEC`) every 60s only while SQLite's VM or the store/WAL files show progress. Attempts are counted before the rewrite and the request is dropped after three, so a start killed mid-VACUUM cannot loop. It never raises into startup.
+- **Why core:** the held-store refusal (#110054) correctly blocks a live rewrite, and automatic VACUUM needs a fresh prune plus a quiet store, so a gateway-owned install had no supported way to reclaim space after a bulk delete. Only the gateway's own startup can run before its own handles exist.
+- **Source surfaces:** `hermes_state_compaction.py`, `gateway/run.py` (`_run_requested_state_db_compaction` and its call in `start_gateway`), `hermes_cli/sessions_cmd.py`, `hermes_cli/subcommands/sessions.py`, `website/docs/user-guide/sessions.md`, and `tests/hermes_state/test_compact_at_next_start.py`.
+- **Upstream status:** no upstream issue or PR proposes deferred compaction. Related: #84525 (optimize under live holders, fixed by the refusal), #121324/#121783 (prune exempted from the held-store guard), #57752 and #112105 (auto-VACUUM gating). Candidate for an upstream contribution.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_compact_at_next_start.py tests/hermes_cli/test_sessions_held_store_gate.py tests/hermes_state/test_auto_vacuum_holder_gate.py tests/hermes_state/test_startup_maintenance_lease.py`.
+- **Retirement:** Remove when upstream provides a supported way to compact a gateway-held store, either at startup or by an equivalent quiesced path.
+- **Rollback:** Revert the commits carrying `Fork-Patch: state-db-compact-at-start`. A leftover `state.db.compact-at-start.json` is then inert and can be deleted.
+
+## Active patch record: shutdown spool fidelity
+
+- **Patch identity:** `shutdown-spool-fidelity`.
+- **Behavior:** a queued caption-less attachment (image, voice, file) is spooled and recovered: flush and recovery both reject only slots with neither text nor `media_urls`/`media`, and the transcript-append fallback writes the gateway's media placeholder when text is empty. Every spooled `MessageEvent` also keeps `message_type`, `media_text_inlined`, `reply_to_text`, `reply_to_author_id`, `reply_to_author_name`, and `reply_to_is_own_message`, and startup replay restores them, so a queued reply keeps its quoted context and voice/audio/document routing and text-inlining replay as they arrived. Old spool files without these keys recover as before (TEXT, no reply context).
+- **Source surfaces:** `gateway/shutdown_flush.py` (`has_user_content`, `_serialise_value`, `_recover_one_payload`), `gateway/run_pending_recovery.py` (`_defer_followup`), and `tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Upstream status:** upstream v0.21.6 (`818c13be`) writes media-only events but its recovery still rejects empty text, so they stay spooled forever; it also drops reply context, `media_text_inlined`, and `message_type`. Contribute upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_shutdown_spool_fidelity.py`.
+- **Retirement:** Remove when upstream spools and replays media-only events and reply context.
+- **Rollback:** Revert the commits carrying `Fork-Patch: shutdown-spool-fidelity`.
+
+## Active patch record: release-owned config writes
+
+- **Patch identity:** `release-owned-config-writes`.
+- **Behavior:** Refuse config.yaml writes from a Hermes build whose config schema is newer than the live immutable release's, so a dev worktree or sync candidate cannot stamp `_config_version` past what `hermes update` accepts. The live release, older or equal-schema builds (such as a previously-live release still running after promotion), and the process-local updater context write normally. Agent-authored edits through the file tool are out of scope: they never stamp a schema. The refusal names the config path, running root and schema, live release and schema, and the live release directory whose hermes to run.
+- **Source surfaces:** `hermes_cli/release_config_owner.py`, `utils.py` `_atomic_write` (the primitive under every atomic config.yaml writer), `hermes_cli/config.py` `_write_config_state` (refuses before read-back checks), `hermes_cli/main.py` updater boundary, and `tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Upstream status:** Upstream `main` has no equivalent guard. The stamp that blocked the 2026-10-09 update came from the v0.21.6 sync candidate's schema 50, written into a home on release schema 49.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_release_owned_config_writes.py`.
+- **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
+
+## Active patch record: Telegram first-poll health
+
+- **Patch identity:** `telegram-first-poll-health`.
+- **Behavior:** While the current polling generation has not proven progress, its getUpdates requests use Telegram `timeout=0`, and the read timeout drops by the matching allowance. A new gateway or reconnect then logs `Telegram polling confirmed healthy` within about 1s instead of after a 10s idle long poll. Health still requires a real successful current-generation getUpdates response. Stale or untagged generations and every post-progress poll keep PTB's long poll.
+- **Source surfaces:** `plugins/platforms/telegram/adapter.py` (`_non_blocking_get_updates_kwargs`, `_polling_health_unproven`, `_instrument_polling_request`), `tests/plugins/test_telegram_first_poll_fast_ptb.py`, and [Telegram first-poll health](maintenance/telegram-first-poll-health.md).
+- **Upstream status:** Upstream has no polling-generation health gate. PTB 22.8 `Updater.start_polling` uses one timeout for every poll. No equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/plugins/test_telegram_first_poll_fast_ptb.py tests/plugins/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_polling_progress.py`.
+- **Retirement:** Remove when upstream or PTB proves first-poll health without an idle long poll. Review on any PTB 23+ upgrade (private `RequestParameter`).
+- **Rollback:** Revert the commit carrying `Fork-Patch: telegram-first-poll-health`.
+
+## Active patch record: update post-swap claim
+
+- **Patch identity:** `update-post-swap-claim`.
+- **Behavior:** The immutable post-swap child claims the update receipt and the Windows resume token by unlinking its hand-off file before it resumes them. After the child exits, `_hand_off_post_swap` (`hermes_cli/update_cmd.py`) asks `reclaim_handoff` (`hermes_cli/immutable_update_handoff.py`) whether the hand-off is still on disk. If it is, whatever the exit code, the parent restores the receipt, records `post_swap_handoff` as failed, writes the incomplete marker and the gateway exit code, and keeps the resume token. Previously any integer exit code moved ownership to the child, so a staged interpreter that crashed while starting (exit 1) lost the receipt and recorded no failure. A claiming child's receipt and exit code stay authoritative. The payload format is unchanged.
+- **Source surfaces:** `hermes_cli/update_cmd.py` (`_hand_off_post_swap`, `_run_post_swap_phase`), `hermes_cli/immutable_update_handoff.py` (`reclaim_handoff`), `hermes_cli/update_handoff.py` (`handoff_path`), and `tests/hermes_cli/test_update_post_swap_claim.py`.
+- **Upstream status:** Fork-only. The immutable release hand-off does not exist upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_update_post_swap_claim.py`.
+- **Retirement:** Remove with the immutable post-swap hand-off.
+- **Rollback:** Revert the commits carrying `Fork-Patch: update-post-swap-claim`.
 
 ## Update
 
@@ -279,6 +353,16 @@ branch must allow merges while retaining its required App-bound local CI, strict
 admin enforcement, and prohibition on force pushes. Conflict resolution and review happen
 on a candidate branch before normal protected landing. Unattended sync disables rerere
 so unreviewed remembered resolutions cannot silently resolve a new release conflict.
+
+## Active patch record: routine restart resume note
+
+- **Patch identity:** `routine-restart-resume-note`.
+- **Behavior:** Present pending-turn recovery as a neutral continuation instruction, not as news about a restart, shutdown, interruption, or the gateway's availability. Preserve command/tool replay safety and reconcile-before-retry guidance for ambiguous non-idempotent effects. A new user message remains first priority and stale unfinished work is skipped unless that message asks for it; `continue` completes the pending task from its first unrecorded step without acknowledgement, while `ask` runs no tools and asks in one plain line whether to carry on with the named pending step. Redelivered replies retain only a neutral duplicate hint; flood-control markers keep their partial-delivery warning.
+- **Source surfaces:** `gateway/run.py`, `gateway/delivery_ledger.py`, `gateway/run_startup.py` marker consumption, `plugins/platforms/telegram/chat_budget.py`, `tui_gateway/session_auto_continue.py` (TUI crash auto-continue note), `gateway/config.py` and `maintenance/restart-continuation.md` policy wording, and resume, delivery-ledger, synthetic-prompt, queued-follow-up, and Telegram trigger tests.
+- **Upstream status:** Upstream issue search found related restart-resume work including #57056, #111644, #117711, #120963, and #127919; no exact upstream equivalent for neutral model-visible wording and transport-neutral duplicate markers was identified. Related open PRs #117711 and #118031 explicitly retain restart-cause wording, so this fork patch intentionally diverges pending a broader upstream design decision.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_resume_queued_followup.py tests/gateway/test_delivery_ledger.py tests/gateway/test_delivery_ledger_process_home.py tests/gateway/test_telegram_internal_delivery_recovery.py tests/gateway/test_telegram_daily_call_counter.py tests/agent/test_synthetic_prompt.py tests/tui_gateway/test_auto_continue.py tests/e2e/core/delivery/test_messaging_exactly_once.py`.
+- **Retirement:** Remove when released upstream provides equivalent neutral resume instructions, preserves all replay/reconciliation safety clauses, and uses a transport-neutral duplicate marker for ambiguous redelivery.
+- **Rollback:** Revert the commit carrying `Fork-Patch: routine-restart-resume-note`.
 
 ## Eager plugin tools
 

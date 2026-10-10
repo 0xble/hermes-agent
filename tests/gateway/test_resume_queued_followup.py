@@ -54,7 +54,7 @@ async def test_spooled_followup_waits_for_resumed_answer_with_own_reply_anchor(t
         if event.internal:
             note, _ = _prepare_resume_pending_message(
                 "restart_interrupted", event.text, restart_resume_policy="continue")
-            assert "CONTINUE the interrupted task" in note
+            assert "continue the pending task to completion" in note.lower()
             assert "B: answer separately" not in note
             rows.extend([{"role": "user", "content": note}, {"role": "assistant", "content": "A answer"}])
             replies.append(("A answer", runner._reply_anchor_for_event(event)))
@@ -622,3 +622,45 @@ async def test_reconnect_keeps_other_platforms_followup_until_its_resume(tmp_pat
     await runner._recover_spool_after_reconnect(Platform.TELEGRAM)
     assert list((tmp_path / "pending_messages").glob("*.json"))
     assert not runner._startup_restore_queue
+
+
+@pytest.mark.parametrize("route", ["replay", "append"])
+@pytest.mark.parametrize("kind", ["internal", "reply_not_expected", "human"])
+def test_shutdown_spool_keeps_machinery_silence_contract(tmp_path, monkeypatch, route, kind):
+    """A process-completion notice spooled at shutdown must come back as machinery.
+
+    Losing ``internal``/``reply_expected`` made the recovered notice a human turn, so the
+    agent's correct NO_REPLY drew the "No reply was written" fallback after every restart.
+    """
+    from gateway.response_filters import (
+        INTERNAL_NOTIFICATION_DISPLAY_KIND, display_kind_for_event, silence_allowed,
+    )
+    runner, _, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=route == "replay")
+    event = MessageEvent(
+        text="[INTERNAL NOTIFICATION] proc exited" if kind == "internal" else "typed by a person",
+        source=source, user_id="u1", internal=kind == "internal",
+        reply_expected=False if kind == "reply_not_expected" else None,
+        metadata={"notification_origin": "process_registry_synthetic",
+                  "notification_category": "diagnostic"} if kind == "internal" else {},
+    )
+    assert flush_pending_to_file({key: event}, reason="shutdown") == 1
+    assert recover_pending_shutdown_flush(runner) == 1
+    expect_silent = kind != "human"
+    if route == "replay":
+        recovered, = runner._startup_restore_queue
+        assert recovered.internal is (kind == "internal")
+        assert recovered.reply_expected is (False if kind == "reply_not_expected" else None)
+        if kind == "internal":
+            assert recovered.metadata["notification_origin"] == "process_registry_synthetic"
+        assert silence_allowed(display_kind_for_event(recovered), recovered.reply_expected) is expect_silent
+        db.append_message.assert_not_called()
+    else:
+        assert runner._startup_restore_queue == []
+        row = db.append_message.call_args.kwargs
+        assert row["content"] == event.text
+        display_kind = row.get("display_kind")
+        assert display_kind == (INTERNAL_NOTIFICATION_DISPLAY_KIND if kind == "internal" else None)
+        reply_expected = (row.get("display_metadata") or {}).get("reply_expected")
+        if kind == "internal":  # diagnostic muting reads the persisted category after a crash
+            assert row["display_metadata"] == {"notification_category": "diagnostic"}
+        assert silence_allowed(display_kind, reply_expected) is expect_silent

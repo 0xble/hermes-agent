@@ -1065,51 +1065,49 @@ def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
     return str(configured) if configured is not None else "ask"
 
 
+# Opening of every resume note. Classifiers (Telegram trigger budget, e2e fakes) import this rather
+# than copying the wording.
+RESUME_NOTE_PREFIX = "[System note: Resume the pending turn."
+
+
 def build_resume_recovery_note(
     reason: Optional[str], message: str = "", *, interactive: Optional[bool] = None,
     restart_resume_policy: Optional[str] = None) -> str:
-    """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
+    """Build the neutral continuation instruction for a pending turn.
 
-    Under ``ask`` the note reports the restore and asks what next; under ``continue`` it finishes the work.
-
-    ``restart_resume_policy`` is the resolved policy from ``resolve_restart_resume_policy``. When omitted
-    the adapter-derived default applies: non-interactive platforms (webhook, API server — adapters with
-    ``interactive_resume = False``) continue, everything else asks (#57056). The continue guidance is
-    platform-neutral because an interactive platform can opt into ``continue``.
+    The note is model-visible scaffolding, not a status announcement. ``reason`` remains part of
+    the recovery API for callers and persistence, but it intentionally does not change the wording.
     """
-    reason_phrase = (
-        "a gateway restart" if reason == "restart_timeout"
-        else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
     policy = restart_resume_policy or ("continue" if interactive is False else "ask")
     if policy not in ("ask", "continue"):
         raise ValueError("restart_resume_policy must be 'ask' or 'continue'")
+    safety_guidance = (
+        "Any restart, update, or shutdown command in the history has already run — do NOT re-run "
+        "or verify it. Do NOT re-run tool calls whose results are recorded. Before retrying a "
+        "non-idempotent effect without a recorded result (send, payment, push, or external write), "
+        "reconcile its current state first. Do not mention this recovery to the user unless it "
+        "changed an outcome they are waiting on; if so, report the outcome rather than the "
+        "recovery. Do not announce a resumed session."
+    )
     if message:
-        resume_guidance = (
-            "Address the user's NEW message below FIRST and focus on what the user is asking now.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+        # The user has moved on: answer them, and leave stale pending work alone unless they ask.
+        continuation = (
+            "Address the user's NEW message below FIRST and focus on what the user is asking now. "
+            "Skip unfinished work from the conversation history unless the new message asks for it; "
+            "if it does, resume from the first step without a recorded result."
         )
-    elif policy == "ask":
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
+    elif policy == "continue":
+        continuation = (
+            "Do not emit an acknowledgement. Continue the pending task to completion, resuming from "
+            "the first step without a recorded result."
         )
     else:
-        resume_guidance = (
-            "No new user message is attached to this recovery turn, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask what to do next. Review the conversation history and "
-            "CONTINUE the interrupted task to completion.")
-        tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step that has no recorded result.")
+        continuation = (
+            "Do not run tools or continue the pending task until the user replies. In one short "
+            "line, ask whether to carry on with the pending step, naming that step."
+        )
     return (
-        f"[System note: The previous turn was interrupted by "
-        f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} {tail_guidance}]"
+        f"{RESUME_NOTE_PREFIX} {safety_guidance} {continuation}]"
         + (f"\n\n{message}" if message else ""))
 
 
@@ -2799,18 +2797,10 @@ def _watch_gateway_turn_inactivity(
         return
 
 
-_CONTROL_INTERRUPT_MESSAGES = frozenset({
-    _INTERRUPT_REASON_STOP.lower(), _INTERRUPT_REASON_RESET.lower(),
-    _INTERRUPT_REASON_TIMEOUT.lower(), _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
-    _INTERRUPT_REASON_EVICTED.lower(), _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
-    _INTERRUPT_REASON_GATEWAY_RESTART.lower()})
-
-
 def _is_control_interrupt_message(message: Optional[str]) -> bool:
     """Return True when an interrupt message is internal control flow."""
-    if not message:
-        return False
-    return " ".join(str(message).strip().split()).lower() in _CONTROL_INTERRUPT_MESSAGES
+    from agent.interrupt_control import is_system_interrupt_message
+    return is_system_interrupt_message(message)
 
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
@@ -4088,7 +4078,11 @@ class GatewayRunner(
             cached_sources = OrderedDict()
             self._session_sources = cached_sources
         try:
-            cached_sources[session_key] = dataclasses.replace(source)
+            # replace_source keeps the wire-invisible routing provenance (receiving bot, identity)
+            # that a plain dataclasses.replace drops, so every reader of the cache — tool calls,
+            # goal and process notices, shutdown notices — reaches the bot that received the turn.
+            from gateway.session_identity import replace_source
+            cached_sources[session_key] = replace_source(source)
         except Exception:
             logger.debug("Failed to cache live session source for %s", session_key, exc_info=True)
             return
@@ -5321,6 +5315,11 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             from gateway.status import consume_planned_stop_marker_for_self
             return consume_planned_stop_marker_for_self()
 
+        # Planned reload: a launchd bootout issued only to re-read the plist (update, guardian rollback).
+        def _planned_restart() -> bool:
+            from gateway.status import consume_planned_restart_marker_for_self
+            return consume_planned_restart_marker_for_self()
+
         # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
         def _snapshot():
             from gateway.shutdown_forensics import snapshot_shutdown_context
@@ -5335,6 +5334,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             planned_stop_seen[0] = True
         elif planned_stop_seen[0] and not planned_takeover:
             planned_stop = True
+        planned_restart = not (planned_takeover or planned_stop) and bool(
+            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
@@ -5342,6 +5343,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:
             logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
+        elif planned_restart:
+            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
+                        sig_name or "SIGTERM")
         else:
             # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
             # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
@@ -5369,7 +5373,12 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
             # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
             runner._stop_requested_by_signal = True
-        asyncio.create_task(runner.stop())
+        if planned_restart:
+            # The SIGUSR1 restart's stop() without its after-turn wait, which launchd's ExitTimeOut
+            # would not allow: bounded post-interrupt sweep, exit 75.
+            asyncio.create_task(runner.stop(restart=True, service_restart=True))
+        else:
+            asyncio.create_task(runner.stop())
     return shutdown_signal_handler
 
 
@@ -5397,6 +5406,23 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     atexit.register(release_gateway_runtime_lock)
     _claim_host_gateway_role(force=force)
     return True
+
+
+def _run_requested_state_db_compaction() -> None:
+    """Honor a pending ``hermes sessions optimize --at-next-start`` request (no-op otherwise).
+
+    Runs synchronously on purpose: nothing else in this process may touch state.db while VACUUM
+    rewrites it. The startup watchdog lease is renewed inside. Never raises.
+    """
+    try:
+        from hermes_state import _default_db_path
+        from hermes_state_compaction import request_path, run_pending_compaction
+
+        db_path = Path(_default_db_path())
+        if request_path(db_path).exists():
+            run_pending_compaction(db_path)
+    except Exception as exc:
+        logger.warning("state.db compaction request could not be processed: %s", exc)
 
 
 def _claim_host_gateway_role(force: bool = False) -> None:
@@ -5963,6 +5989,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
     if not _start_gateway_claim_pid_file(force=force):
         return False
+
+    # Only the authoritative gateway may rewrite the store, and only before adapters, cron, the
+    # housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
+    _run_requested_state_db_compaction()
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)

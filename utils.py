@@ -306,6 +306,12 @@ def _atomic_write(path: Path, write, *, prefix: str, encoding: str = "utf-8", mo
     # A profile delete leaves a tombstone beside its removed home.  Background
     # writers may retain that home in a context variable, so a plain mkdir here
     # would resurrect the profile before the write can fail.
+    if path.name == "config.yaml":
+        # Hermes's own config writers (config set/unset, save_config, migrate_config, import-agent)
+        # all funnel here, so one check stops a newer-schema build stamping a release-managed
+        # config. Agent-authored file edits use tools/file_operations.py and are out of scope.
+        from hermes_cli.release_config_owner import ensure_release_owns_config_write
+        ensure_release_owns_config_write(path)
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)
@@ -466,6 +472,7 @@ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: A
     ``value=None`` removes the key (a ``key: null`` leftover reads as absent everywhere but
     litters the file and diverges from whole-document writers that drop the key).
     """
+    path = Path(path)
     from ruamel.yaml.comments import CommentedMap
     # Honor escaped dots and prefer existing literal dotted keys (model IDs like ``glm-5.3``) over
     # blind splitting — same navigation as ``hermes config set``'s ``_set_nested``; otherwise
@@ -473,7 +480,6 @@ def atomic_roundtrip_yaml_update(path: Union[str, Path], key_path: str, value: A
     # See #91607.
     from hermes_cli.config import _greedy_literal_match, _split_key_path
 
-    path = Path(path)
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)
@@ -540,10 +546,10 @@ def atomic_roundtrip_yaml_save(path: Union[str, Path], new_state: dict, *,
     being created — re-appending it on every rewrite is how the stock boilerplate replaced
     users' own comments (#92554).
     """
+    path = Path(path)
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from hermes_cli.config import require_readable_config_before_write
 
-    path = Path(path)
     from hermes_constants import mkdir_under_hermes_home
 
     mkdir_under_hermes_home(path.parent)

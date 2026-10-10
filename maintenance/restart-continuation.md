@@ -6,9 +6,10 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
 ## Required behavior
 
 - `gateway.restart_resume_policy` accepts `ask` or `continue`. `ask` (the upstream
-  default) has the auto-resumed turn report the restore and wait for the user.
-  `continue` has it finish the interrupted work without a "session restored"
-  acknowledgement, resuming from the first step with no recorded result.
+  default) has the auto-resumed turn run no tools and ask in one line whether to
+  carry on with the named pending step. `continue` has it finish the pending work
+  without any acknowledgement, resuming from the first step with no recorded
+  result. Neither wording presents the restart as news (`RESUME_NOTE_PREFIX`).
 - `gateway.platforms.<name>.extra.restart_resume_policy` overrides the global value
   for one platform.
 - Non-interactive adapters (`interactive_resume = False`: webhook, API server) always
@@ -20,13 +21,17 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   configured behavior survives an update: the loader omitting the key was the
   archived fork's original regression.
 - When a real user message arrives while resume is pending, the note addresses
-  that message first regardless of policy.
+  that message first regardless of policy and skips stale unfinished work unless
+  the message asks for it, as upstream's note always has. Only `continue` with no
+  new message automatically resumes the pending task, from its first unrecorded
+  step. An explicit continuation request in a new message can resume it under
+  either policy.
 - Explicit `/stop` retires the recovery marker captured before adapter cancellation.
   A newer marker or replaced session created during the cancellation survives. The
   persisted marker token is additive and older routing entries remain readable.
   This strengthens open upstream [#120758](https://github.com/NousResearch/hermes-agent/pull/120758)
   with a conditional clear instead of an unconditional write after awaits.
-- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. Empty text is not written as an invalid pending payload; errors are logged rather than silently claiming preservation.
+- A follow-up dequeued as a turn finishes during shutdown is flushed through `gateway/shutdown_flush.py` before its local reference is cleared, so startup recovery can restore its user message. A slot with neither text nor attachments is not written as an invalid pending payload (a caption-less attachment is kept); errors are logged rather than silently claiming preservation.
 - A tool-result tail interrupted before an assistant reply closes with a non-empty
   internal marker, not the legacy `Operation interrupted.` text. Exact marker
   echoes and legacy diagnostics are suppressed at delivery; unrelated prose is

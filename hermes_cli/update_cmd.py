@@ -2235,27 +2235,33 @@ def _sibling_snapshots_module():
 def _hand_off_post_swap(args, **payload_kwargs) -> None:
     """Re-execute ``hermes update --post-swap`` on the pulled tree and exit with its code.
 
-    The parent detaches from the receipt and its Windows resume hook — the child owns both —
-    and only relays the exit code (``hermes_cli/update_handoff.py``).
+    The parent detaches from the receipt and its Windows resume hook. A child that claims the
+    hand-off owns both and the parent only relays its exit code (``hermes_cli/update_handoff.py``).
     """
     from hermes_cli.update_completion import _resume_receipt as resume_update_receipt
 
     payload = _post_swap_payload(**payload_kwargs)
-    from hermes_cli.immutable_update_handoff import continue_update_in_fresh_interpreter
+    from hermes_cli.immutable_update_handoff import continue_update_in_fresh_interpreter, reclaim_handoff
     code = continue_update_in_fresh_interpreter(
         payload, argv_tail=_post_swap_argv_tail(args))
+    # Exit codes cannot tell a child that resumed the receipt and then failed from one that
+    # crashed while starting (an ImportError in the staged interpreter); only the claim can.
+    claimed = not reclaim_handoff() and code is not None
     token = payload_kwargs.get("_windows_gateway_resume")
-    if token and code is not None:
+    if token and claimed:
         # The child got its own copy (serialized before this flip) and owns the resume; every
         # parent-side hook (atexit, the ZIP path's ``finally``) reads this flag and stays out
-        # of the way. When no child ran, the parent still resumes what it paused.
+        # of the way. When no child claimed it, the parent still resumes what it paused.
         token["resume_needed"] = False
-    if code is None:
-        # No child ran: take the receipt back so this failure is recorded, and leave the
+    if not claimed:
+        # No child took over: take the receipt back so this failure is recorded, and leave the
         # install breadcrumb so the next launch finishes the dependency sync (new code, old deps).
         if payload["receipt"]:
             resume_update_receipt(payload["receipt"])
-        _record_update_step("post_swap_handoff", False, "child interpreter could not start")
+        _record_update_step(
+            "post_swap_handoff", False,
+            "child interpreter could not start" if code is None
+            else f"child interpreter exited {code} before claiming the hand-off")
         _m()._write_update_incomplete_marker()
         if payload_kwargs.get("gateway_mode"):
             _write_gateway_update_exit_code(False)
@@ -2269,10 +2275,14 @@ def _run_post_swap_phase(args, gateway_mode: bool) -> None:
     from hermes_cli.update_completion import _resume_receipt as resume_update_receipt
 
     payload = _update_handoff.read_handoff(args.post_swap)
-    with suppress(OSError):
-        Path(args.post_swap).unlink()
+    # Unlinking the hand-off claims the receipt and the Windows resume from the parent
+    # (``immutable_update_handoff.reclaim_handoff``); a failed unlink leaves both with it.
+    Path(args.post_swap).unlink()
     if payload.get("receipt"):
         resume_update_receipt(payload["receipt"])
+    if payload.get("windows_gateway_resume"):
+        import atexit as _atexit
+        _atexit.register(_m()._resume_windows_gateways_after_update, payload["windows_gateway_resume"])
     _execute_post_swap(payload, args, gateway_mode)
 
 
@@ -2295,9 +2305,6 @@ def _execute_post_swap(payload: dict, args, gateway_mode: bool) -> None:
     _cfg._LAST_SIBLING_SNAPSHOTS = dict(payload.get("sibling_snapshots") or {})
     _pre_update_plan = UpdatePlan.from_dict(payload["plan"]) if payload.get("plan") else None
     _windows_gateway_resume = payload.get("windows_gateway_resume")
-    if _windows_gateway_resume:
-        import atexit as _atexit
-        _atexit.register(_m()._resume_windows_gateways_after_update, _windows_gateway_resume)
     # Flags and config resolve here exactly as they did pre-swap; the three pre-update
     # snapshots come from the payload (the new tree would report the NEW version).
     opts = _replace(
