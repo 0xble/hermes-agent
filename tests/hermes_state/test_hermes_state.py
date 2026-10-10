@@ -2060,6 +2060,16 @@ class TestAsyncDelegationsSchemaAgreement:
             "auto_resume_state",
             "auto_resume_claim",
             "auto_resume_claimed_at",
+            "retry_state",
+            "retry_reason",
+            "retry_due_at",
+            "retry_notices",
+            "retry_claim",
+            "retry_claimed_at",
+            "retry_root",
+            "retry_attempt",
+            "retry_root_started_at",
+            "retry_replacement",
         ):
             legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.M)
         legacy_sql = legacy_sql.replace(

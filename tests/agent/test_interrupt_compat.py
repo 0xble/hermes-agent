@@ -58,9 +58,10 @@ def test_safe_tool_reason_only_reaches_supporting_modern_agent() -> None:
 def test_explicit_producer_falls_back_to_old_interrupt_signature() -> None:
     agent = _LegacyAgent()
 
-    assert request_hard_interrupt(agent, "stop now") is True
+    assert request_hard_interrupt(agent, "stop now", delegation_reason="stop_command") is True
 
     assert agent.calls == [("legacy", "stop now")]
+    assert agent._delegation_interrupt_reason == "stop_command"
 
 
 def test_explicit_producer_reports_unsupported_agent() -> None:

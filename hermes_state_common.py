@@ -616,7 +616,21 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     -- or reconstructs the child itself.
     auto_resume_state TEXT NOT NULL DEFAULT 'none',
     auto_resume_claim TEXT,
-    auto_resume_claimed_at REAL
+    auto_resume_claimed_at REAL,
+    -- Durable automatic retry (tools/delegation_resume.py). retry_state walks
+    -- none -> scheduled -> noticing -> notified -> dispatching -> dispatched, or
+    -- -> terminal -> reporting -> reported. Rows in a pending retry state are
+    -- never pruned. retry_root/attempt/root_started_at carry the lineage budget.
+    retry_state TEXT NOT NULL DEFAULT 'none',
+    retry_reason TEXT,
+    retry_due_at REAL,
+    retry_notices INTEGER NOT NULL DEFAULT 0,
+    retry_claim TEXT,
+    retry_claimed_at REAL,
+    retry_root TEXT,
+    retry_attempt INTEGER NOT NULL DEFAULT 0,
+    retry_root_started_at REAL,
+    retry_replacement TEXT
 );
 
 CREATE TABLE IF NOT EXISTS async_delegation_events (

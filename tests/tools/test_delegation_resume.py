@@ -61,6 +61,10 @@ def _dispatch_row(delegation_id="deleg_resume_1", *, goal="port the widget", con
         record["is_batch"] = True
         record["goals"] = goals or ["a", "b"]
     ad._persist_dispatch(record)
+    # These tests cover the legacy one-shot path, which now applies only to rows written before the
+    # durable retry engine existed (retry_state='none'); new rows are owned by tests/tools/test_delegation_retry.py.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='none' WHERE delegation_id=?", (delegation_id,))
     return delegation_id
 
 

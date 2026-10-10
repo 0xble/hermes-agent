@@ -954,7 +954,7 @@ class CLITuiMixin:
                 return
             self._last_ctrl_c_time = now
             print("\n" + t("cli.tui.interrupting_again_hint"))
-            request_hard_interrupt(self.agent)
+            request_hard_interrupt(self.agent, delegation_reason="user_stop")
         else:
             self._tui_clear_or_exit(event)
 
@@ -971,7 +971,7 @@ class CLITuiMixin:
             return
         if self._agent_running and self.agent:
             print("\n" + t("cli.tui.interrupting"))
-            request_hard_interrupt(self.agent)
+            request_hard_interrupt(self.agent, delegation_reason="user_stop")
         else:
             self._tui_clear_or_exit(event)
 

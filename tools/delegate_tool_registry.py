@@ -99,7 +99,12 @@ def interrupt_subagent(subagent_id: str) -> bool:
     if agent is None:
         return False
     try:
-        return bool(request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"))
+        try:
+            agent._delegation_interrupt_reason = "stop_command"
+        except (AttributeError, TypeError):
+            pass  # a legacy immutable facade must still receive the stop request
+        return bool(request_hard_interrupt(
+            agent, f"Interrupted via TUI ({subagent_id})", delegation_reason="stop_command"))
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
@@ -276,6 +281,21 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             })
     except Exception:
         logger.debug("Could not list queued async delegations", exc_info=True)
+    # Retry-pending units are not live but are still Hermes's job: show them so the parent does not
+    # dispatch a duplicate (the notice will arrive when the retry is due).
+    try:
+        from tools.delegation_resume import list_retry_pending
+        for r in list_retry_pending():
+            if not _owns_durable_delegation(r, parent_agent):
+                continue
+            entries.append({
+                "subagent_id": r["delegation_id"], "delegation_id": r["delegation_id"],
+                "goal": (r.get("task") or {}).get("goal"), "status": f"retry_{r['retry_state']}",
+                "retry_reason": r["retry_reason"], "retry_due_at": r["retry_due_at"],
+                "retry_attempt": r["retry_attempt"] + 1, "accepting_steer": False,
+            })
+    except Exception:
+        logger.debug("Could not list retry-pending delegations", exc_info=True)
     payload: Dict[str, Any] = {"action": "list", "count": len(entries), "subagents": entries}
     if not entries:
         payload["note"] = (
@@ -357,6 +377,29 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
             "action='resume' requires subagent_id set to the delegation_id of the interrupted "
             "background delegation (it appears in its completion message)."
         )
+    from tools.delegation_resume import RETRY_PENDING_STATES, claim_retry_dispatch, retry_status
+    retry = retry_status(sid)
+    if retry is not None and retry["retry_state"] in RETRY_PENDING_STATES + ("dispatched", "reported"):
+        # Owned by the durable retry engine (every row dispatched since it landed).
+        if not _owns_durable_delegation(retry, parent_agent):
+            return tool_error(
+                f"Delegation '{sid}' does not belong to this conversation. Only the session that "
+                "dispatched a delegation can recover it.")
+        record, reason = claim_retry_dispatch(sid)
+        if reason is not None or record is None:
+            state = (record or retry)["retry_state"]
+            detail = {"dispatched": f"already re-dispatched as {(record or retry)['retry_replacement']}",
+                      "dispatching": "another resume claim is in flight"}.get(state, f"retry state is '{state}'")
+            return tool_error(f"Delegation '{sid}' is not awaiting a retry: {detail}. Do not spawn a duplicate.")
+        return json.dumps({
+            "action": "resume", "delegation_id": sid, "status": "retry_claimed",
+            "attempt": record["retry_attempt"] + 1, "reason": record["retry_reason"],
+            "goal": (record.get("task") or {}).get("goal"),
+            "recovery_context": build_recovery_instruction(record),
+            "note": ("Nothing has been spawned yet. Now call delegate_task with this goal and pass "
+                     "'recovery_context' verbatim as the task's context; that spawn is linked to this retry "
+                     "lineage automatically. If you do not spawn it, Hermes reports the task as stopped."),
+        }, ensure_ascii=False)
     record, reason = inspect_resumable(sid)
     if reason is None and record is not None and not _owns_durable_delegation(record, parent_agent):
         # Ownership is checked BEFORE the claim so a foreign caller cannot burn
@@ -402,12 +445,16 @@ def _handle_control_action(action: str, subagent_id: Optional[str], message: Opt
     if record is None and action == "stop":
         try:
             from tools.async_delegation import interrupt_delegation, list_async_delegations
-            owned = next((r for r in list_async_delegations()
+            from tools.delegation_resume import retry_status
+            candidates = list_async_delegations()
+            if durable := retry_status(sid):
+                candidates.append(durable)
+            owned = next((r for r in candidates
                           if r.get("delegation_id") == sid
                           and _owns_durable_delegation(r, parent_agent)), None)
-            if owned is not None and interrupt_delegation(sid, reason="stopped via delegate_task"):
+            if owned is not None and interrupt_delegation(sid, reason="stop_command"):
                 return json.dumps({"action": "stop", "subagent_id": sid, "status": "interrupt_requested",
-                                   "note": "Queued background delegation cancelled; no child was started."}, ensure_ascii=False)
+                                   "note": "Stop requested; pending automatic recovery is cancelled."}, ensure_ascii=False)
         except Exception:
             logger.debug("Could not stop queued async delegation %s", sid, exc_info=True)
 
