@@ -4,11 +4,11 @@ Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
 List: ``op item list --categories Login,"Credit Card" --format json`` → title,
-urls, username / masked card number. Listings are reused (15 minutes for display, 5 seconds
-for a fill) and fetched single-flight: every ``op`` call spends a daily account quota.
-Resolve: ``op item get <id> --vault <vault-id> ...``, selecting the item's vault from fresh listing metadata
-(required for service accounts). Cards carry no origin: the browser fill
-binds them to the page it is on and the user confirms that origin per fill.
+urls, username / masked card number. Display listings are reused for 15 minutes and fetched
+single-flight. Fill authorization instead resolves exactly one handle with a fresh metadata-only
+``op item get <id> --vault <vault-id> --format json``; its verified vault is then used for the
+secret read. Cards carry no origin: the browser binds them to the page it is on and the user
+confirms that origin per fill.
 
 Additional accounts (``vault.onepassword.accounts``) are separate backend instances
 with ``op@<alias>:`` handles. Each authenticates only with its own service-account
@@ -34,7 +34,14 @@ from typing import Dict, List, Optional, Tuple
 from agent.secret_sources._cache import fingerprint as _fingerprint
 from agent.secret_sources.base import run_cli
 from agent.secret_sources.onepassword import _OP_ENV_ALLOWLIST, _scrub, find_op
-from agent.vault_backends.base import LoginBackend, MissingCredential, UnlockRequired, run_with_stdin_secret
+from agent.vault_backends.base import (
+    FILL_METADATA_NOT_APPLICABLE,
+    FILL_METADATA_TTL_SECONDS,
+    LoginBackend,
+    MissingCredential,
+    UnlockRequired,
+    run_with_stdin_secret,
+)
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin, normalize_otp_secret, totp_now
 
@@ -46,28 +53,28 @@ _ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vault selector
 # `op item list` output (metadata only, never secrets), keyed per backend, account and
 # credential fingerprint. Every `op` call spends the account's daily request quota.
-# Display listings (browser_vault_list) reuse an answer for 15 minutes; fresh=True bypasses it.
+# Display listings (browser_vault_list) reuse an answer for 15 minutes.
 _LISTING_TTL_SECONDS = 900.0
+_FILL_METADATA_TTL_SECONDS = FILL_METADATA_TTL_SECONDS
 _LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
-# Fill authorization (get_meta's origins, then _locate's vault) never reads the display cache.
-# It reuses only a listing that was itself fetched fresh, and only for 5 seconds: long enough
-# for get_meta and the secret read of the same fill (milliseconds apart, plus one `op` round
-# trip) to share one listing, and short enough that a website or vault change made by hand is
-# seen by the next fill in practice. The age is measured from when the fetch started.
-_FRESH_LISTING_REUSE_SECONDS = 5.0
-_FRESH_LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
-# Single flight: concurrent callers wanting the same (kind, key) listing wait on one `op` call.
+# Single flight: concurrent callers wanting the same listing or item metadata wait on one
+# `op` call. Fill authorization does not use the display cache as authority.
 _LISTING_INFLIGHT: Dict[Tuple[str, Tuple[str, str, str]], Future] = {}
+_ITEM_META_INFLIGHT: Dict[Tuple[Tuple[str, str, str], str], Future] = {}
 _LISTING_LOCK = threading.Lock()
 _LISTING_GENERATION = [0]  # bumped on invalidation so a fetch already in flight is not stored
+
+
+class _ItemMetadataRetry(RuntimeError):
+    """The item may have moved or disappeared since the cached vault hint was made."""
 
 
 def invalidate_listing_cache() -> None:
     """Forget every reused listing. Call after anything changes 1Password items."""
     with _LISTING_LOCK:
         _LISTING_CACHE.clear()
-        _FRESH_LISTING_CACHE.clear()
         _LISTING_INFLIGHT.clear()
+        _ITEM_META_INFLIGHT.clear()
         _LISTING_GENERATION[0] += 1
 # A bare "host[.tld][:port][/path]" website. Anything else without "://" (mailto:, user@host,
 # javascript:) stays unparseable rather than being coerced into an https origin.
@@ -120,6 +127,9 @@ class OnePasswordLoginBackend(LoginBackend):
         from agent.secret_scope import get_secret
         self._token_env = str(self.cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV)
         self._service_token = get_secret(self._token_env, "") or ""
+        # A get_meta call authorizes the browser page, then the same thread's immediately
+        # following secret read consumes this item metadata. It is never a general-purpose cache.
+        self._fill_metadata = threading.local()
 
     @classmethod
     def additional_accounts(cls, cfg: Dict) -> List["OnePasswordLoginBackend"]:
@@ -319,26 +329,21 @@ class OnePasswordLoginBackend(LoginBackend):
 
     def _item_list_json(self) -> str:
         """Display listing: reuses any listing younger than ``_LISTING_TTL_SECONDS``."""
-        return self._shared_listing("display", _LISTING_TTL_SECONDS)
+        return self._shared_listing(_LISTING_TTL_SECONDS)
 
-    def _list_json_fresh(self) -> str:
-        """Fill-authorizing listing: reuses only a fresh fetch younger than
-        ``_FRESH_LISTING_REUSE_SECONDS``, so one fill (get_meta, then _locate) lists once."""
-        return self._shared_listing("fresh", _FRESH_LISTING_REUSE_SECONDS)
-
-    def _shared_listing(self, kind: str, max_age: float) -> str:
-        """One ``op item list`` per key and kind at a time; concurrent callers share its answer.
-        Failures are never cached: every waiter sees the error and the next caller retries."""
+    def _shared_listing(self, max_age: float) -> str:
+        """One display ``op item list`` per credential at a time; concurrent callers share it.
+        Fill authorization intentionally has a different path: it reads one item's current
+        metadata instead of treating this account-wide, display-oriented cache as authority."""
         key = self._listing_key()
-        cache = _FRESH_LISTING_CACHE if kind == "fresh" else _LISTING_CACHE
         with _LISTING_LOCK:
-            hit = cache.get(key)
+            hit = _LISTING_CACHE.get(key)
             if hit and time.monotonic() - hit[0] < max_age:
                 return hit[1]
-            pending = _LISTING_INFLIGHT.get((kind, key))
+            pending = _LISTING_INFLIGHT.get(("display", key))
             owner = pending is None
             if owner:
-                pending = _LISTING_INFLIGHT[(kind, key)] = Future()
+                pending = _LISTING_INFLIGHT[("display", key)] = Future()
             generation = _LISTING_GENERATION[0]
         if not owner:
             return pending.result()
@@ -347,19 +352,195 @@ class OnePasswordLoginBackend(LoginBackend):
             out = self._run("item", "list", "--categories", _CATEGORIES, "--format", "json")
         except BaseException as exc:
             with _LISTING_LOCK:
-                if _LISTING_INFLIGHT.get((kind, key)) is pending:
-                    del _LISTING_INFLIGHT[(kind, key)]
+                if _LISTING_INFLIGHT.get(("display", key)) is pending:
+                    del _LISTING_INFLIGHT[("display", key)]
             pending.set_exception(exc)
             raise
         with _LISTING_LOCK:
-            if _LISTING_INFLIGHT.get((kind, key)) is pending:
-                del _LISTING_INFLIGHT[(kind, key)]
+            if _LISTING_INFLIGHT.get(("display", key)) is pending:
+                del _LISTING_INFLIGHT[("display", key)]
             if generation == _LISTING_GENERATION[0]:
-                _LISTING_CACHE[key] = (started, out)  # a fresh answer also serves display listings
-                if kind == "fresh":
-                    _FRESH_LISTING_CACHE[key] = (started, out)
+                _LISTING_CACHE[key] = (started, out)
         pending.set_result(out)
         return out
+
+    def _list_json_fresh(self) -> str:
+        """Explicitly refresh the display listing for a vault hint or origin filter."""
+        return self._shared_listing(0.0)
+
+    def _metadata_handle_id(self, handle: str) -> str:
+        if not handle.startswith(self.prefix):
+            raise ValueError("Invalid 1Password item handle")
+        item_id = handle[len(self.prefix):]
+        if not item_id or not item_id[0].isalnum() or not all(
+            c.isascii() and (c.isalnum() or c == "-") for c in item_id
+        ):
+            raise ValueError("Invalid 1Password item handle")
+        return item_id
+
+    def _listing_vault_hint(self, item_id: str, *, fresh: bool = False) -> Optional[str]:
+        """Return the item's vault from the display cache, or one fresh listing when cold."""
+        key = self._listing_key()
+        raw_text = None
+        loaded_fresh = fresh
+        if not fresh:
+            with _LISTING_LOCK:
+                hit = _LISTING_CACHE.get(key)
+                if hit and time.monotonic() - hit[0] < _LISTING_TTL_SECONDS:
+                    raw_text = hit[1]
+        if raw_text is None:
+            raw_text = self._list_json_fresh()
+            loaded_fresh = True
+        try:
+            raw = json.loads(raw_text or "[]")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid 1Password item metadata") from exc
+        if not isinstance(raw, list):
+            raise RuntimeError("Invalid 1Password item metadata")
+        matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id]
+        if len(matches) != 1:
+            if not loaded_fresh:
+                return self._listing_vault_hint(item_id, fresh=True)
+            return None
+        vault = matches[0].get("vault")
+        if not isinstance(vault, dict):
+            if not loaded_fresh:
+                return self._listing_vault_hint(item_id, fresh=True)
+            return None
+        vault_id = vault.get("id")
+        if not isinstance(vault_id, str) or not vault_id:
+            if not loaded_fresh:
+                return self._listing_vault_hint(item_id, fresh=True)
+            return None
+        return vault_id
+
+    @staticmethod
+    def _metadata_error_is_retryable(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return any(term in text for term in (
+            "isn't an item",
+            "not found",
+            "not_found",
+            "no item",
+            "isn't in vault",
+            "could not find",
+            "does not exist",
+            "item moved",
+        ))
+
+    def _read_item_metadata(self, item_id: str, vault_id: str, categories) -> Optional[dict]:
+        try:
+            raw = json.loads(self._run(
+                "item", "get", item_id, "--vault", vault_id, "--format", "json"
+            ) or "{}")
+        except BaseException as exc:
+            if self._metadata_error_is_retryable(exc):
+                raise _ItemMetadataRetry(str(exc)) from exc
+            raise
+        if not isinstance(raw, dict):
+            raise RuntimeError("Invalid 1Password item metadata")
+        # Never retain or inspect concealed fields from a metadata response, even if a
+        # future CLI version includes them without --reveal.
+        item = {key: raw[key] for key in (
+            "id", "title", "category", "state", "vault", "urls", "created_at",
+            "createdAt", "additional_information") if key in raw}
+        returned_vault = item.get("vault")
+        returned_vault_id = returned_vault.get("id") if isinstance(returned_vault, dict) else None
+        if item.get("id") != item_id or returned_vault_id != vault_id:
+            raise _ItemMetadataRetry("1Password item identity or vault mismatch")
+        if item.get("state", "ACTIVE") != "ACTIVE" or item.get("category") not in categories:
+            return None
+        return item
+
+    def _fresh_item_metadata(self, handle: str, categories=("LOGIN", "CREDIT_CARD"), *,
+                             _retry=True) -> Optional[dict]:
+        """Read authoritative metadata for exactly one item, always scoped to a vault.
+
+        The display listing supplies only a vault hint. If that hint is stale because an item
+        moved or disappeared, invalidate all listing caches and retry once using a fresh list.
+        """
+        item_id = self._metadata_handle_id(handle)
+        # Any new metadata lookup starts a new operation; do not let an authorization context
+        # from an earlier, unrelated handle leak into this fill.
+        self._clear_fill_metadata()
+        key = (self._listing_key(), item_id)
+        with _LISTING_LOCK:
+            pending = _ITEM_META_INFLIGHT.get(key)
+            owner = pending is None
+            if owner:
+                pending = _ITEM_META_INFLIGHT[key] = Future()
+        if not owner:
+            return pending.result()
+        try:
+            vault_id = self._listing_vault_hint(item_id)
+            if vault_id is None:
+                item = None
+            else:
+                try:
+                    item = self._read_item_metadata(item_id, vault_id, categories)
+                except _ItemMetadataRetry:
+                    if not _retry:
+                        item = None
+                    else:
+                        invalidate_listing_cache()
+                        fresh_vault_id = self._listing_vault_hint(item_id, fresh=True)
+                        if fresh_vault_id:
+                            try:
+                                item = self._read_item_metadata(item_id, fresh_vault_id, categories)
+                            except _ItemMetadataRetry:
+                                item = None
+                        else:
+                            item = None
+        except BaseException as exc:
+            with _LISTING_LOCK:
+                if _ITEM_META_INFLIGHT.get(key) is pending:
+                    del _ITEM_META_INFLIGHT[key]
+            pending.set_exception(exc)
+            raise
+        with _LISTING_LOCK:
+            if _ITEM_META_INFLIGHT.get(key) is pending:
+                del _ITEM_META_INFLIGHT[key]
+        pending.set_result(item)
+        return item
+
+    def _clear_fill_metadata(self, handle: Optional[str] = None) -> None:
+        cached = getattr(self._fill_metadata, "item", None)
+        if cached is not None and (handle is None or cached[1] == handle):
+            del self._fill_metadata.item
+
+    def discard_fill_metadata(self, handle: Optional[str] = None) -> None:
+        """Drop per-fill authorization when a caller will not read a secret."""
+        self._clear_fill_metadata(handle)
+
+    def _remember_fill_metadata(self, handle: str, item: dict) -> None:
+        self._fill_metadata.item = (time.monotonic(), handle, item)
+
+    def refresh_fill_metadata(self, handle: str) -> object:
+        """Refresh stale per-fill metadata without consulting the account-wide listing."""
+        if self._connect_credentials()[1]:
+            return FILL_METADATA_NOT_APPLICABLE
+        cached = getattr(self._fill_metadata, "item", None)
+        if cached is None or cached[1] != handle:
+            return FILL_METADATA_NOT_APPLICABLE
+        stored_at, _handle, old_item = cached
+        if time.monotonic() - stored_at <= _FILL_METADATA_TTL_SECONDS:
+            return None
+        item_id = self._metadata_handle_id(handle)
+        vault = old_item.get("vault")
+        vault_id = vault.get("id") if isinstance(vault, dict) else None
+        if not isinstance(vault_id, str) or not vault_id:
+            self._clear_fill_metadata(handle)
+            return None
+        try:
+            item = self._read_item_metadata(item_id, vault_id, ("LOGIN", "CREDIT_CARD"))
+        except Exception:
+            self._clear_fill_metadata(handle)
+            return None
+        if item is None or item.get("category") != old_item.get("category"):
+            self._clear_fill_metadata(handle)
+            return None
+        self._remember_fill_metadata(handle, item)
+        return self._cli_meta(handle, item)
 
     # ── backend contract ───────────────────────────────────────────────────
     def list_items(self, *, fresh: bool = False) -> List[VaultItemMeta]:
@@ -420,46 +601,77 @@ class OnePasswordLoginBackend(LoginBackend):
             ))
         return out
 
+    def _cli_meta(self, handle: str, item: dict) -> Optional[VaultItemMeta]:
+        category = item.get("category")
+        if category == "CREDIT_CARD":
+            return _card_meta(handle, item, str(item.get("created_at") or item.get("createdAt") or ""),
+                              _card_last4(str(item.get("additional_information") or "")))
+        if category != "LOGIN":
+            return None
+        urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
+        origins = _all_origins(urls)
+        if not origins:
+            return None
+        username = str(item.get("additional_information") or "").strip() or None
+        return VaultItemMeta(
+            id=handle, kind="login", label=str(item.get("title") or origins[0]), origin=origins[0],
+            created_at=str(item.get("created_at") or item.get("createdAt") or ""),
+            identifier_type="username" if username else None, identifier=username,
+            allowed_origins=_web_origins(origins))
+
+    def _take_fill_metadata(self, handle: str, categories) -> Optional[dict]:
+        cached = getattr(self._fill_metadata, "item", None)
+        if cached is None:
+            return None
+        stored_at, cached_handle, item = cached
+        if cached_handle != handle or item.get("category") not in categories:
+            self._clear_fill_metadata()
+            return None
+        if time.monotonic() - stored_at > _FILL_METADATA_TTL_SECONDS:
+            self._clear_fill_metadata(handle)
+            return None
+        del self._fill_metadata.item
+        return item
+
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
+        self._clear_fill_metadata()
+        if ":field:" in handle and not handle.startswith(f"{self.prefix}field:"):
+            return None
         if handle.startswith(f"{self.prefix}field:"):
             return next((m for m in self.list_protected_fields() if m.id == handle), None)
         if self._connect_credentials()[1]:
             item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
-        # Fresh: this is the fill's origin authorization. _locate then resolves the secret from
-        # the same fresh listing (see _FRESH_LISTING_REUSE_SECONDS), so one fill lists once.
-        return next((m for m in self.list_items(fresh=True) if m.id == handle), None)
+        item = self._fresh_item_metadata(handle)
+        if item is None:
+            self._clear_fill_metadata()
+            return None
+        meta = self._cli_meta(handle, item)
+        if meta is None:
+            self._clear_fill_metadata()
+        else:
+            self._remember_fill_metadata(handle, item)
+        return meta
 
     def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
         return self._locate(handle, categories)[0]
 
     def _locate(self, handle: str, categories) -> tuple:
-        """``([item_id, "--vault", vault_id], category)`` for a CLI handle, from fresh listing metadata."""
-        # Keep existing op:<item-id> handles valid, including across backend instances.
-        # Resolve from fresh metadata (at most _FRESH_LISTING_REUSE_SECONDS old, never the display
-        # cache) rather than caching a vault or guessing the first one.
-        if not handle.startswith(self.prefix):
-            raise ValueError("Invalid 1Password item handle")
-        item_id = handle[len(self.prefix):]
-        if not item_id or not item_id[0].isalnum() or not all(
-            c.isascii() and (c.isalnum() or c == "-") for c in item_id
-        ):
-            raise ValueError("Invalid 1Password item handle")
-        raw = json.loads(self._list_json_fresh() or "[]")
-        if not isinstance(raw, list):
-            raise RuntimeError("Invalid 1Password item metadata")
-        matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id
-                   and item.get("category") in categories]
-        if len(matches) != 1:
-            raise RuntimeError("1Password item is missing or ambiguous; list items again")
-        category = str(matches[0].get("category") or "")
-        vault = matches[0].get("vault")
+        """``([item_id, "--vault", vault_id], category)`` from fresh per-item metadata."""
+        item_id = self._metadata_handle_id(handle)
+        item = self._take_fill_metadata(handle, categories)
+        if item is None:
+            item = self._fresh_item_metadata(handle)
+        if item is None:
+            raise RuntimeError("1Password item is missing, archived, or not an eligible category")
+        category = str(item.get("category") or "")
+        if item.get("id") != item_id or category not in categories:
+            raise RuntimeError("1Password item is missing or not an eligible category")
+        vault = item.get("vault")
         vault_id = vault.get("id") if isinstance(vault, dict) else None
         if isinstance(vault_id, str) and vault_id:
             return [item_id, "--vault", vault_id], category
-        if self._service_token:
-            raise RuntimeError("1Password item metadata is missing its vault ID; list items again")
-        return [item_id], category
+        raise RuntimeError("1Password item metadata is missing its verified vault ID")
 
     def resolve_password(self, handle: str) -> str:
         if self._connect_credentials()[1]:
