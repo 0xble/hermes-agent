@@ -60,21 +60,23 @@ one throttle later passes instead of failing. Regression:
 
 The helper bootstraps immediately once the old PID is gone and `launchctl print`
 confirms its label is unloaded. A still-loaded label is polled within the existing
-reload budget, rather than paying an unconditional post-exit second. Only actual
-EIO/EALREADY bootstrap failures (5/37) retry until that shared budget's deadline.
+reload budget, rather than paying an unconditional post-exit second. Every non-zero
+bootstrap failure retries until that shared budget's deadline, not only EIO/EALREADY
+(5/37), so a short-lived unknown launchd error cannot leave the gateway unregistered.
 The backoff starts at 0.2s, doubles to a 2s ceiling, and is clipped to the
-remaining budget; no attempt cap can cut the retry window short. A successful
-bootstrap waits for a positive supervised PID without registering again. Failure
-logs distinguish a label that never unloaded, a permanent bootstrap error,
-transient errors that exhausted the budget, and a bootstrapped job with no
-positive PID. Each includes the last bootstrap return code, or `not-attempted`
-when the label never unloaded. An old label's PID cannot suppress its unload
-failure. The old-PID exit ceiling and initial helper handoff delay are unchanged.
-Regression: `tests/hermes_cli/test_launchd_reload_handoff.py` executes the generated
-shell against fake launchctl for immediate success, sustained transient errors
-that outlast the previous attempt cap and then recover, retry-budget exhaustion,
-permanent failure, delayed or missing PID, and delayed or never-completed label
-unload. No host service is touched.
+remaining budget; the clipped sleep is followed by one final bootstrap attempt.
+A successful bootstrap waits for a positive supervised PID without registering
+again. Failure logs distinguish a label that never unloaded, bootstrap failures
+that exhausted the budget, and a bootstrapped job with no positive PID. Each
+includes the last bootstrap return code, or `not-attempted` when the label never
+unloaded. The `launchctl print` probe is best-effort on macOS-26 per-user domains
+and falls back to the same retry path. An old label's PID cannot suppress its
+unload failure. The old-PID exit ceiling and initial helper handoff delay are
+unchanged. Regression: `tests/hermes_cli/test_launchd_reload_handoff.py` executes
+the generated shell against fake launchctl for immediate success, unknown and
+sustained bootstrap errors that outlast the previous attempt cap and then recover,
+retry-budget exhaustion including the final attempt, delayed or missing PID, and
+delayed or never-completed label unload. No host service is touched.
 
 ## Planned restart on reload bootout
 

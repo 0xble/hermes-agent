@@ -58,8 +58,8 @@ def run_helper(tmp_path, monkeypatch):
             state["bootstrap_times"].append(time.monotonic())
             failure = int(os.environ["FAILURE"])
             elapsed = state["bootstrap_times"][-1] - state["bootstrap_times"][0]
-            if failure == 64 or (failure and (len(state["bootstrap_times"]) == 1 or
-                                             elapsed < float(os.environ["TRANSIENT_FOR"]))):
+            if failure and (len(state["bootstrap_times"]) == 1 or
+                             elapsed < float(os.environ["TRANSIENT_FOR"])):
                 rc = failure
             else:
                 state["registered"] = True
@@ -99,32 +99,37 @@ def run_helper(tmp_path, monkeypatch):
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("failure", [0, 5, 37, 64])
-def test_helper_bootstraps_without_blind_delay_and_retries_only_transients(run_helper, failure):
+@pytest.mark.parametrize("failure", [0, 5, 37])
+def test_helper_retries_bootstrap_failures_until_registered(run_helper, failure):
     outcome = run_helper(failure=failure)
     events = outcome.events
     first_bootstrap = events.index("bootstrap")
     assert events[:first_bootstrap] == ["sleep 2", "bootout", "print"]
-    if failure in (5, 37):
+    if failure:
         assert events.count("bootstrap") == 2
         between = events[first_bootstrap + 1:events.index("bootstrap", first_bootstrap + 1)]
-        assert "sleep 0.2" in between, "transient bootstrap failure must back off"
+        assert "sleep 0.2" in between, "bootstrap failure must back off before retrying"
     else:
         assert events.count("bootstrap") == 1
         assert not any(event.startswith("sleep") for event in events[first_bootstrap + 1:])
-    assert outcome.state["registered"] is (failure != 64)
-    if failure == 64:
-        assert "permanent bootstrap error" in outcome.log
-        assert "bootstrap rc=64" in outcome.log
-    else:
-        assert "FAILED" not in outcome.log
+    assert outcome.state["registered"]
+    assert "FAILED" not in outcome.log
+
+
+@pytest.mark.platforms("posix")
+def test_helper_retries_unknown_bootstrap_failure_until_registered(run_helper):
+    outcome = run_helper(budget=4, failure=1, transient_for=1.0, real_wait=True)
+    assert outcome.state["registered"], outcome.log
+    assert outcome.events.count("bootstrap") >= 3
+    assert "bootstrap failure (1)" in outcome.log
+    assert "FAILED" not in outcome.log
 
 
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("failure, recovers", [(5, True), (37, True), (5, False)])
 def test_helper_retries_transients_beyond_old_attempt_cap(run_helper, failure, recovers):
     # At this scaled budget the old cap gives up after ~0.8s; the failure lasts >=2s.
-    outcome = run_helper(budget=8 if recovers else 4, failure=failure,
+    outcome = run_helper(budget=8 if recovers else 6, failure=failure,
                          transient_for=4.0 if recovers else 60.0, real_wait=True)
     assert outcome.state["registered"] is recovers, outcome.log
     times = outcome.state["bootstrap_times"]
@@ -137,8 +142,17 @@ def test_helper_retries_transients_beyond_old_attempt_cap(run_helper, failure, r
         assert 2.0 in backoffs
         assert "FAILED" not in outcome.log
     else:
-        assert "transient bootstrap errors exhausted reload budget" in outcome.log
+        assert "bootstrap failures exhausted reload budget" in outcome.log
         assert f"bootstrap rc={failure}" in outcome.log
+
+
+@pytest.mark.platforms("posix")
+def test_helper_makes_final_bootstrap_attempt_after_clipped_backoff(run_helper):
+    outcome = run_helper(budget=4, failure=5, transient_for=60.0, real_wait=True)
+    sleep_indices = [i for i, event in enumerate(outcome.events) if event.startswith("sleep")]
+    assert outcome.events[sleep_indices[-1] + 1] == "bootstrap"
+    assert outcome.state["registered"] is False
+    assert "bootstrap rc=5" in outcome.log
 
 
 @pytest.mark.platforms("posix")

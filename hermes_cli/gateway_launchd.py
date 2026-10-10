@@ -541,7 +541,7 @@ def _spawn_deferred_launchd_reload(
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then probes label
-    unload and retries transient bootstrap errors with growing backoff until the separate reload
+    unload and retries every bootstrap failure with growing backoff until the separate reload
     deadline. A successful bootstrap waits for a positive PID without registering again."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
@@ -568,27 +568,25 @@ def _spawn_deferred_launchd_reload(
         f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
         # Probe unregister completion, rather than delaying every already-unloaded job.
-        # EIO under load can outlast an attempt cap: only the shared reload deadline
-        # bounds transient retries. Backoff is in tenths so Bash needs no float math.
+        # The probe is best-effort: it fails on macOS-26 per-user domains and degrades to this retry path.
+        # The shared reload deadline bounds every bootstrap failure. Backoff is in tenths so Bash needs no float math.
         f"_deadline=$(($(date +%s) + {_reload_budget})); _unloaded=1; _supervised=0; "
         f"_rc=not-attempted; _reason='label never unloaded'; "
         f"while launchctl print {q_target} >/dev/null 2>&1; do "
         f"  if [ $(date +%s) -ge $_deadline ]; then _unloaded=0; break; fi; sleep 0.2; done; "
         f"if [ $_unloaded -eq 1 ]; then _backoff=2; "
-        f"  _reason='transient bootstrap errors exhausted reload budget'; "
+        f"  _reason='bootstrap failures exhausted reload budget'; "
         f"  while :; do "
         f"    launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; _rc=$?; "
         f"    if [ $_rc -eq 0 ]; then _supervised=1; _reason='bootstrapped with no positive PID'; "
         # Successful registration may not yet have a PID. Wait for supervision, not another bootstrap.
         f"      while :; do if {listed}; then break; fi; "
         f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; break; fi; "
-        f"    case $_rc in 5|37) ;; *) _reason='permanent bootstrap error'; break;; esac; "
         f"    _remaining=$((_deadline - $(date +%s))); if [ $_remaining -le 0 ]; then break; fi; "
-        f"    echo \"[{stamp}] transient bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
-        # Clip the growing delay to the remaining budget, including the last retry.
+        f"    echo \"[{stamp}] bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
+        # Clip the growing delay to the remaining budget, then make one final attempt after that sleep.
         f"    _delay=$_backoff; if [ $_delay -gt $((_remaining * 10)) ]; then _delay=$((_remaining * 10)); fi; "
         f"    sleep $(printf '%d.%d' $((_delay / 10)) $((_delay % 10))); "
-        f"    if [ $(date +%s) -ge $_deadline ]; then break; fi; "
         f"    _backoff=$((_backoff * 2)); if [ $_backoff -gt 20 ]; then _backoff=20; fi; done; fi; "
         f"if [ $_supervised -eq 0 ]; then "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — $_reason (bootstrap rc=$_rc; reload budget {_reload_budget}s)\" >> {q_log}; "
