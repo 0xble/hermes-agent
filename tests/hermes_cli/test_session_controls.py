@@ -161,10 +161,10 @@ def test_loop_controls_and_goal_replace(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.loops import LoopManager, load_loop
     from hermes_cli.session_controls import apply_control, resolve_request
-    _user(state, "requester", "Please update the goal to ship the release now")
+    _user(state, "requester", "Please update the target goal to ship the release now")
     GoalManager("target").set("old")
     replaced = apply_control("goal", "replace", "target", requester_sid="requester", reason="user request",
-                             user_quote="update the goal to ship the release now",
+                             user_quote="update the target goal to ship the release now",
                              payload={"goal": "ship the release now"})
     assert replaced["status"] == "applied"
     assert replaced["state"].goal == "ship the release now"
@@ -189,25 +189,25 @@ def test_noop_controls_are_failed_for_quote_and_approval_paths(state):
     from hermes_cli.loops import LoopManager
     from hermes_cli.session_controls import apply_control, request_control, resolve_request
 
-    state.append_message("requester", "user", "Please pause the empty goal right now")
+    state.append_message("requester", "user", "Please pause the empty target goal right now")
     quoted = apply_control(
         "goal", "pause", "target", requester_sid="requester",
-        user_quote="pause the empty goal right now",
+        user_quote="pause the empty target goal right now",
     )
     assert quoted["status"] == "failed"
     assert quoted["error"] == "nothing_to_pause"
 
     GoalManager("target").set("temporary")
-    state.append_message("requester", "user", "Please clear the temporary goal now")
+    state.append_message("requester", "user", "Please clear the temporary target goal now")
     cleared = apply_control(
         "goal", "clear", "target", requester_sid="requester",
-        user_quote="clear the temporary goal now",
+        user_quote="clear the temporary target goal now",
     )
     assert cleared["status"] == "applied"
-    state.append_message("requester", "user", "Please clear the temporary goal again")
+    state.append_message("requester", "user", "Please clear the temporary target goal again")
     repeated = apply_control(
         "goal", "clear", "target", requester_sid="requester",
-        user_quote="clear the temporary goal again",
+        user_quote="clear the temporary target goal again",
     )
     assert repeated["status"] == "failed"
     assert repeated["error"] == "nothing_to_clear"
@@ -379,9 +379,9 @@ def test_request_control_refuses_target_without_approval_surface(state):
         == "target_unapprovable"
     assert apply_control("goal", "clear", "slack-target", requester_sid="requester")["error_code"] \
         == "target_unapprovable"
-    _user(state, "requester", "Please clear the slack goal right now")
+    _user(state, "requester", "Please clear the slack-target goal right now")
     quoted = apply_control("goal", "clear", "slack-target", requester_sid="requester",
-                           user_quote="clear the slack goal right now")
+                           user_quote="clear the slack-target goal right now")
     assert quoted["status"] == "applied"
     assert load_goal("slack-target").status == "cleared"
 
@@ -664,9 +664,9 @@ def test_replace_refuses_done_goal_on_quote_and_approval_paths(state):
                               payload={"goal": "brand new objective"})
     approved = resolve_request(pending["id"], "approve", "admin")
     assert approved["status"] == "failed"
-    _user(state, "requester", "Please replace the goal with brand new objective")
+    _user(state, "requester", "Please replace the target goal with brand new objective")
     quoted = apply_control("goal", "replace", "target", requester_sid="requester",
-                           user_quote="replace the goal with brand new objective",
+                           user_quote="replace the target goal with brand new objective",
                            payload={"goal": "brand new objective"})
     assert quoted["ok"] is False
     assert load_goal("target").status == "done"
@@ -699,3 +699,55 @@ def test_new_goal_instance_is_strictly_later_under_a_frozen_clock(state, monkeyp
         GoalManager("target").set("watch the release")
         assert again is None
         assert GoalManager("target").state.created_at > before
+
+
+@pytest.mark.parametrize("kind,action,message,quote,payload", [
+    # The quote states a different action than the one the agent requested.
+    ("goal", "clear", "Please pause the target goal right now", "pause the target goal right now", None),
+    ("loop", "stop", "Please pause the target loop right now", "pause the target loop right now", None),
+    # Two actions in one quote are ambiguous.
+    ("goal", "clear", "Pause the target goal or clear it, whichever", "Pause the target goal or clear it", None),
+    # The quote names a different kind.
+    ("goal", "clear", "Please clear the target loop right now", "clear the target loop right now", None),
+    # The quote never names the target session.
+    ("goal", "clear", "Please clear the other goal right now", "clear the other goal right now", None),
+    # Replace needs a replace instruction, not just a goal mention.
+    ("goal", "replace", "Please look at the target goal again", "look at the target goal again", {"goal": "x"}),
+])
+def test_quote_must_state_this_control_or_it_falls_back_to_approval(state, kind, action, message, quote, payload):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.loops import LoopManager, load_loop
+    from hermes_cli.session_controls import apply_control
+
+    GoalManager("target").set("watch the build")
+    LoopManager("target").set("poll the build", interval_seconds=300)
+    _user(state, "requester", message)
+    result = apply_control(kind, action, "target", requester_sid="requester", reason="x",
+                           user_quote=quote, payload=payload)
+    assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_mismatch")
+    assert load_goal("target").status == "active" and load_goal("target").goal == "watch the build"
+    assert load_loop("target").status == "active"
+
+
+def test_quote_may_name_the_target_by_its_title(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    state.set_session_title("target", "Eval Pipeline")
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please clear the Eval Pipeline goal now")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the Eval Pipeline goal now")
+    assert result["status"] == "applied"
+    assert load_goal("target").status == "cleared"
+
+
+def test_direct_replace_quote_must_ask_for_a_replacement(state):
+    from hermes_cli.goals import GoalManager, load_goal
+
+    GoalManager("target").set("migrate database")
+    _user(state, "target", "Please pause the goal while I think about it")
+    result = GoalManager("target").replace(reason="pivot", goal="ship the release",
+                                           user_quote="pause the goal while I think about it")
+    assert (result["ok"], result["error_code"]) == (False, "user_quote_mismatch")
+    assert load_goal("target").goal == "migrate database"

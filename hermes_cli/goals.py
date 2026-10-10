@@ -2426,10 +2426,15 @@ class GoalManager:
             if not quote:
                 return {"ok": False, "error_code": "user_authority_required", "error": "goal replacement needs user_quote", "state": old, "revision": None}
             try:
-                from hermes_cli.session_controls import check_user_quote
+                from hermes_cli.session_controls import check_user_quote, quote_matches_control
                 checked = check_user_quote(self.session_id, quote)
                 if isinstance(checked, str):
                     return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
+                if not quote_matches_control("goal", "replace", self.session_id, self.session_id,
+                                             checked[0], {"goal": goal}):
+                    return {"ok": False, "error_code": "user_quote_mismatch",
+                            "error": "the quote must be the user asking to replace or change the goal",
+                            "state": old, "revision": None}
                 quote, source = checked
                 # A quote validated here is the same user authority apply_control records.
                 authority = {"via": "quote", "quote": quote, "message": source}

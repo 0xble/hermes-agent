@@ -157,6 +157,47 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
     return normalized, source
 
 
+# A quote authorizes only the control it states. Each control has disjoint verb sets within its
+# kind, the quote must name the kind, and a cross-session quote must name the target session, so
+# "pause the goal" never authorizes a clear and "pause the goal or clear it" (two actions)
+# authorizes neither. Anything ambiguous falls back to an Approve/Deny request.
+_KIND_WORDS = {"goal": frozenset({"goal", "goals", "objective"}), "loop": frozenset({"loop", "loops"})}
+_ACTION_VERBS = {
+    "goal": {
+        "clear": frozenset({"clear", "remove", "drop", "delete", "cancel", "end", "stop", "kill"}),
+        "pause": frozenset({"pause", "hold", "suspend"}),
+        "resume": frozenset({"resume", "unpause", "continue", "restart"}),
+        "replace": frozenset({"replace", "change", "switch", "update", "swap"}),
+    },
+    "loop": {
+        "stop": frozenset({"stop", "end", "kill", "cancel", "clear", "remove", "delete", "drop"}),
+        "pause": frozenset({"pause", "hold", "suspend"}),
+        "resume": frozenset({"resume", "unpause", "continue", "restart"}),
+    },
+}
+
+
+def _quote_matches_control(kind: str, action: str, target_sid: str, requester_sid: str,
+                           quote: str, payload: Optional[Dict[str, Any]], *, cursor=None) -> bool:
+    """True when the quoted words state this exact control: kind, action, target and payload."""
+    words = set(_negation_words(quote))
+    if not words & _KIND_WORDS.get(kind, frozenset()):
+        return False
+    stated = {name for name, verbs in _ACTION_VERBS.get(kind, {}).items() if words & verbs}
+    if stated != {action}:
+        return False
+    lowered = quote.lower()
+    if target_sid != requester_sid:
+        # Another session must be named: its id, or its title as the user sees it.
+        title = _normalize(_session_title(target_sid, cursor=cursor)).lower()
+        if target_sid.lower() not in lowered and not (len(title) >= 3 and title in lowered):
+            return False
+    # A replacement's new objective is agent-authored from the user's request (the user asks for a
+    # better goal; the agent writes it), so the quote binds the replace intent and target, and the
+    # revision records the quote beside the new objective for audit.
+    return True
+
+
 def _load_record(request_id: str) -> Optional[Dict[str, Any]]:
     db = _db()
     if db is None:
@@ -496,6 +537,8 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     quote_check = check_user_quote(requester_sid, user_quote)
     if isinstance(quote_check, str):
         return request_approval(quote_check)
+    if not _quote_matches_control(kind, action, target_sid, requester_sid, quote_check[0], payload):
+        return request_approval("user_quote_mismatch")
     _REFUSED = "_quote_refused_in_transaction"
 
     def apply(conn):
@@ -503,6 +546,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
         checked = check_user_quote(requester_sid, user_quote, cursor=conn)
         if isinstance(checked, str):
             return {_REFUSED: checked}
+        if not _quote_matches_control(kind, action, target_sid, requester_sid, checked[0], payload,
+                                      cursor=conn):
+            return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
         authority = {"via": "quote", "quote": quote, "message": message}
         raw = _meta_value(conn, _definition_key(kind, target_sid))
@@ -751,6 +797,8 @@ CONTROLS = {
 }
 
 __all__ = [
-    "CONTROLS", "resolve_target", "check_user_quote", "apply_control", "request_control",
+    "CONTROLS", "resolve_target", "check_user_quote", "quote_matches_control", "apply_control", "request_control",
     "resolve_request", "fail_request", "expire_request", "pending_outbox", "mark_outbox", "continuation_is_current",
 ]
+
+quote_matches_control = _quote_matches_control
