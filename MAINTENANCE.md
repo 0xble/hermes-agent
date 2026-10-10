@@ -274,6 +274,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove this patch when upstream prevents foreign Hermes builds from writing release-managed config or makes config schema ownership independent of the running release.
 - **Rollback:** Revert the commit carrying `Fork-Patch: release-owned-config-writes`.
 
+## Active patch record: update post-swap claim
+
+- **Patch identity:** `update-post-swap-claim`.
+- **Behavior:** The immutable post-swap child claims the update receipt and the Windows resume token by unlinking its hand-off file before it resumes them. After the child exits, `_hand_off_post_swap` (`hermes_cli/update_cmd.py`) asks `reclaim_handoff` (`hermes_cli/immutable_update_handoff.py`) whether the hand-off is still on disk. If it is, whatever the exit code, the parent restores the receipt, records `post_swap_handoff` as failed, writes the incomplete marker and the gateway exit code, and keeps the resume token. Previously any integer exit code moved ownership to the child, so a staged interpreter that crashed while starting (exit 1) lost the receipt and recorded no failure. A claiming child's receipt and exit code stay authoritative. The payload format is unchanged.
+- **Source surfaces:** `hermes_cli/update_cmd.py` (`_hand_off_post_swap`, `_run_post_swap_phase`), `hermes_cli/immutable_update_handoff.py` (`reclaim_handoff`), `hermes_cli/update_handoff.py` (`handoff_path`), and `tests/hermes_cli/test_update_post_swap_claim.py`.
+- **Upstream status:** Fork-only. The immutable release hand-off does not exist upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_update_post_swap_claim.py`.
+- **Retirement:** Remove with the immutable post-swap hand-off.
+- **Rollback:** Revert the commits carrying `Fork-Patch: update-post-swap-claim`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
