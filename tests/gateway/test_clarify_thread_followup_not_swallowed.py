@@ -19,7 +19,7 @@ adapter's numbered-text fallback (which flips ``awaiting_text`` at send time)
 keep accepting free text.
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -116,6 +116,33 @@ async def _dispatch(runner, event):
     with patch("hermes_cli.plugins.invoke_hook", return_value=[]), \
             patch.object(slash_confirm_mod, "get_pending", _tripwire):
         return await runner._handle_message(event)
+
+
+@pytest.mark.asyncio
+async def test_drain_gate_does_not_swallow_open_ended_clarify_reply():
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    runner._draining = True
+    event = _event("answer")
+    event.allow_gateway_control = True
+    runner._hm_admit_event = AsyncMock(return_value=(event, event.source, False))
+    runner._hm_is_registered_command = lambda _event: False
+    runner._preserve_drain_event = MagicMock()
+    runner._quick_command_alias_text = lambda _event: None
+    runner._hm_estop_gate = lambda *_args: None
+    runner._peek_session_state = lambda _key: None
+    entry = cm.register("cl-drain-open", SESSION_KEY, "What should I use?", None)
+
+    result = await runner._handle_admitted_message(event)
+
+    assert result == ""
+    assert entry.event.is_set()
+    assert entry.response == "answer"
+    runner._preserve_drain_event.assert_not_called()
+    _clear_clarify_state()
 
 
 @pytest.mark.asyncio
