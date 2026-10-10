@@ -379,6 +379,7 @@ class MemoryManager:
         # memory.prefetch_max_age_seconds (None = unbounded) and when the buffered recall was queued.
         self._prefetch_max_age = prefetch_max_age_seconds
         self._prefetch_queued_at: Optional[float] = None
+        self._prefetch_session_id = ""  # session owning the current generation, under its lock
         # Session the providers are on (initialize_all / on_session_switch) and the one they last
         # switched away from, both guarded by the generation lock. A prefetch for the session just
         # left cannot start after the switch. Only that session is refused, so a session id that
@@ -598,6 +599,7 @@ class MemoryManager:
             if session_id and session_id == self._left_session_id and session_id != self._session_id:
                 return False
             self._prefetch_queued_at = _now()
+            self._prefetch_session_id = session_id
             return True
 
         generation = self._prefetch_generation.begin_if(_accept)
@@ -809,11 +811,16 @@ class MemoryManager:
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
 
-        # A queued prefetch captured the previous session's query. Obsolete its token and switch the
-        # providers under the same lock its dispatch holds, so it either dispatches before the switch
-        # (whose reset then drops it) or sees the obsolete token and never reaches the new session.
-        def _switch_providers() -> None:
-            self._prefetch_queued_at = None
+        # Preserve destination recall only across a real, non-rewound session-id change. /new can
+        # still be extracting the old session when a new turn queues its recall. Same-id switches
+        # (in-place compaction) and /undo invalidate queries from the pre-switch transcript.
+        # Switching under the dispatch lock keeps the old-session fence: it either dispatches before
+        # the switch (whose discard then drops it) or sees the obsolete token and never reaches it.
+        def _switch_providers() -> bool:
+            stale = (rewound or self._session_id == new_session_id
+                     or self._prefetch_session_id != new_session_id)
+            if stale:
+                self._prefetch_queued_at = None
             if self._session_id != new_session_id:
                 self._left_session_id = self._session_id
             self._session_id = new_session_id
@@ -826,8 +833,9 @@ class MemoryManager:
                 lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id,
                                               reset=reset, **kwargs),
             )
+            return stale
 
-        self._prefetch_generation.discard(_switch_providers)
+        self._prefetch_generation.discard_if(_switch_providers)
 
     @staticmethod
     def _checkpoint_api_version(provider: MemoryProvider) -> Optional[int]:

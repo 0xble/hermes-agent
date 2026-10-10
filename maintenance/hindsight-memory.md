@@ -76,6 +76,24 @@ strategy and cron-exclusion behavior.
   already drops it on /new, /resume, /branch and compression. In a shared chat it can carry one
   participant's recall to another's next turn, which every async turn already did before this gate. Proof:
   `tests/agent/test_synthetic_prompt.py` (`test_buffered_recall_*`).
+- Session switches keep a manager prefetch generation only across a real session-id change,
+  with `rewound=False` and its queued `session_id` equal to the destination, preserving its age
+  timestamp as well. Same-id switches (including in-place compaction) and all rewound switches
+  (`/undo`, even if the destination id differs) invalidate queued recall: a matching session id
+  does not make a query from the pre-switch transcript current. `/new` queues end-of-session
+  extraction and rebinding together, so a destination turn may queue recall while extraction is
+  still running; that dispatch must survive the boundary and run after rebinding. Generations for
+  old or unrelated sessions (including an unscoped request for a scoped destination) are invalidated
+  under the same lock held by provider dispatch. An obsolete dispatch either finishes before the
+  switch or never reaches the switched provider.
+  The switch still calls `discard_prefetch()` on every provider to drop old buffers and in-flight
+  workers, even when the latest manager generation belongs to the destination: the provider slot
+  may still hold an older session's result. This hook, and provider-owned switch resets such as
+  Hindsight's, can drop destination recall already dispatched before the switch; preserving those
+  buffers is not part of the manager-token guarantee. Proof:
+  `tests/agent/test_memory_boundary_commit.py::test_boundary_commit_preserves_only_destination_prefetch`,
+  `::test_session_switch_invalidates_queued_prefetch_after_transcript_change`,
+  and `tests/agent/test_synthetic_prompt.py` (`test_session_switch_*`).
 
 ## Proof surface
 
