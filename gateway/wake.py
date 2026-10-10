@@ -88,11 +88,11 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     """
     event._gateway_accepted = False
     metadata = getattr(event, "metadata", None)
-    control_id = metadata.get("session_control_continuation_id") if isinstance(metadata, dict) else None
-    if control_id:
-        from hermes_cli.session_controls import continuation_is_current
-        if not await asyncio.to_thread(continuation_is_current, control_id):
-            raise WakeSuperseded("session-control continuation superseded before admission")
+    from gateway.platforms.event import is_goal_continuation_event
+    if is_goal_continuation_event(event):
+        from hermes_cli.session_controls import goal_continuation_is_current
+        if not await asyncio.to_thread(goal_continuation_is_current, metadata):
+            raise WakeSuperseded("goal continuation superseded before admission")
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
         raise WakeNotAccepted("internal wake not accepted by adapter")

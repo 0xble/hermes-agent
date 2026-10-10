@@ -25,6 +25,21 @@ Session controls let one Hermes session pause, resume, clear, or replace another
   marks undeliverable CLI/TUI rows skipped/done rather than growing the outbox forever. The watcher drains only the launch
   profile's SessionDB and `session_store`; it does not discover or drain another profile's store.
 
+## Continuation lifecycle fence
+
+Every gateway goal continuation is stamped by the shared synthetic-event constructor with its
+session ID, authored-definition fingerprint, and creation time. The fingerprint reuses the control
+card definition identity (creation time plus objective, contract, criteria, gates and revisions),
+not progress counters or the active/paused status. Wake admission, idle ingress (including ordinary
+non-internal continuations), busy ingress and FIFO follow-up all require the goal to be active and
+the stamped definition to match. Unstamped legacy continuations fail closed.
+
+Restart-persisted control outbox records use that same check, retaining their durable discard
+receipt. An applied historical pause/clear only removes queued continuations created no later than
+the control, leaving a later resume's continuation and human queue items intact. A busy session or
+arbitrary queue depth is not an enqueue receipt: the outbox retries until its own continuation is
+accepted or superseded.
+
 ## Proof surface
 
 Core regression tests cover quote freshness, relay rejection, target resolution, immediate controls, pending approval, atomic resolution/expiry, goal replacement, revision isolation, and loop actions. Gateway tests cover the non-blocking watcher/outbox behavior, Telegram-topic metadata, route skipping, continuation cleanup, and goal-resume admission. Telegram tests cover callback authorization, callback rendering that preserves the request text, and no-op second presses.

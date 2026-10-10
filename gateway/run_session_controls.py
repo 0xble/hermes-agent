@@ -159,7 +159,8 @@ class GatewaySessionControlsMixin:
             else:
                 try:
                     await self._run_in_executor_with_context(
-                        self._clear_goal_pending_continuations, target_entry.session_key, adapter
+                        self._clear_goal_pending_continuations, target_entry.session_key, adapter,
+                        record.get("resolved_at", record["created_at"]),
                     )
                 except Exception:
                     logger.debug("goal continuation cleanup failed", exc_info=True)
@@ -187,25 +188,23 @@ class GatewaySessionControlsMixin:
                         or self._queue_depth(key, adapter=adapter) > 0
                     )
 
-                if await self._run_in_executor_with_context(busy):
+                is_busy = await self._run_in_executor_with_context(busy)
+                # The routing/idle probes may yield; persist the same definition fence afterwards.
+                current = await self._run_in_executor_with_context(
+                    session_controls.continuation_is_current, request_id
+                )
+                if not current:
                     record = await self._mark_and_finish(
                         session_controls, record, "continuation_enqueued"
                     )
+                elif is_busy:
+                    return  # Unrelated/stale queued work is not proof that this continuation landed.
                 else:
-                    # This runs after routing and the idle probe, both of which may yield.
-                    current = await self._run_in_executor_with_context(
-                        session_controls.continuation_is_current, request_id
+                    record = await self._admit_control_continuation(
+                        record, session_controls, source, adapter, key, prompt
                     )
-                    if not current:
-                        record = await self._mark_and_finish(
-                            session_controls, record, "continuation_enqueued"
-                        )
-                    else:
-                        record = await self._admit_control_continuation(
-                            record, session_controls, source, adapter, key, prompt
-                        )
-                        if not record.get("continuation_enqueued"):
-                            return
+                    if not record.get("continuation_enqueued"):
+                        return
 
         notice = self._control_notice(record)
         if not record.get("target_notice_sent") and not record.get("target_notice_skipped"):
@@ -256,12 +255,17 @@ class GatewaySessionControlsMixin:
     async def _admit_control_continuation(self, record, session_controls, source, adapter, key, prompt):
         from gateway.wake import WakeNotAccepted, WakeSuperseded, admit_internal_event
 
-        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
+        event = self._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+            goal_session_id=record["target_session_id"],
+            goal_fingerprint=record.get("continuation_fingerprint", ""),
+        )
         event.metadata["gateway_session_key"] = key
         event.metadata["session_control_continuation_id"] = record["id"]
         try:
             await admit_internal_event(adapter, event)
         except WakeSuperseded:
+            await self._run_in_executor_with_context(session_controls.continuation_is_current, record["id"])
             return await self._mark_and_finish(session_controls, record, "continuation_enqueued")
         except WakeNotAccepted:
             logger.info("session-control continuation for %s not accepted; retrying", record["id"])

@@ -286,6 +286,28 @@ def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
         return ""
 
 
+def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=None) -> bool:
+    """One fail-closed fence for every goal continuation, regardless of its producer."""
+    if not isinstance(metadata, dict):
+        return False
+    sid = metadata.get("goal_continuation_session_id")
+    expected = metadata.get("goal_continuation_fingerprint")
+    if not isinstance(sid, str) or not sid or (session_id and sid != session_id):
+        return False
+    if not isinstance(expected, str) or not expected.startswith("v2:"):
+        return False
+    try:
+        db = _db() if cursor is None else None
+        raw = _meta_value(cursor, _definition_key("goal", sid)) if cursor is not None else (
+            db.get_meta(_definition_key("goal", sid)) if db is not None else None
+        )
+        return bool(raw and json.loads(raw).get("status") == "active"
+                    and expected == _definition_fingerprint("goal", raw))
+    except Exception:
+        logger.debug("goal continuation definition check failed", exc_info=True)
+        return False
+
+
 def _meta_value(cursor, key: str) -> Optional[str]:
     row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
@@ -523,14 +545,10 @@ def continuation_is_current(request_id: str) -> bool:
             return False
         if record.get("continuation_discarded"):
             return False
-        live = _meta_value(conn, _definition_key("goal", record["target_session_id"]))
-        expected = record.get("continuation_fingerprint")
-        try:
-            active = bool(live) and json.loads(live).get("status") == "active"
-        except (TypeError, ValueError, AttributeError):
-            active = False
-        valid = (active and isinstance(expected, str) and expected.startswith("v2:")
-                 and expected == _definition_fingerprint("goal", live))
+        valid = goal_continuation_is_current({
+            "goal_continuation_session_id": record["target_session_id"],
+            "goal_continuation_fingerprint": record.get("continuation_fingerprint"),
+        }, cursor=conn)
         if not valid:
             record["continuation_enqueued"] = True
             record["continuation_discarded"] = "target_changed"

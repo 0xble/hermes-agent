@@ -29,9 +29,9 @@ def state(tmp_path, monkeypatch):
 
 def _runner(state, *, target_route=True, request_success=True, send_success=True, injection_result=True):
     from gateway.run_session_controls import GatewaySessionControlsMixin
+    from gateway.run_goals import GatewayGoalsMixin
     from gateway.session import Platform, SessionEntry, SessionSource
     from hermes_cli import session_controls
-    from hermes_state_registry import acquire
 
     class Adapter:
         def __init__(self):
@@ -58,7 +58,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
     target = SessionEntry("target-key", "target", now, now, origin=source)
     requester = SessionEntry("requester-key", "requester", now, now, origin=requester_source)
 
-    class Runner(GatewaySessionControlsMixin):
+    class Runner(GatewaySessionControlsMixin, GatewayGoalsMixin):
         session_store = SimpleNamespace(
             lookup_by_session_id=lambda sid: {"target": target, "requester": requester}.get(sid)
         )
@@ -79,7 +79,7 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
         def _thread_metadata_for_source(self, source):
             return {"direct_messages_topic_id": source.thread_id, "thread_id": source.thread_id}
 
-        def _clear_goal_pending_continuations(self, key, _adapter):
+        def _clear_goal_pending_continuations(self, key, _adapter, before=None):
             self.cleared = key
             return 1
 
@@ -88,10 +88,6 @@ def _runner(state, *, target_route=True, request_success=True, send_success=True
 
         def _queue_depth(self, _key, adapter=None):
             return 0
-
-        def _synthetic_prompt_event(self, source, prompt, **kwargs):
-            event = SimpleNamespace(source=source, text=prompt, metadata={})
-            return event
 
         async def _dispatch_plugin_message_injection(self, **kwargs):
             self.injections.append(kwargs)
@@ -402,7 +398,6 @@ async def test_watcher_discards_superseded_continuation_at_admission_boundary(st
 @pytest.mark.parametrize("subsequent", ["pause", "clear", "replace"])
 async def test_control_continuation_revalidated_at_idle_runner_ingress(state, subsequent):
     from gateway.run_inbound import GatewayInboundMixin
-    from gateway.platforms.event import MessageEvent
     from hermes_cli.goals import GoalManager
     from hermes_cli import session_controls
 
@@ -412,8 +407,10 @@ async def test_control_continuation_revalidated_at_idle_runner_ingress(state, su
     record = session_controls.resolve_request(request["id"], "approve", "admin")
     runner = _runner(state)
     source = runner.session_store.lookup_by_session_id("target").origin
-    event = MessageEvent(source=source, text=record["continuation_prompt"], internal=True, reply_expected=False,
-                         metadata={"goal_continuation": True, "session_control_continuation_id": record["id"]})
+    event = runner._synthetic_prompt_event(
+        source, record["continuation_prompt"], reply_expected=False, goal_continuation=True,
+        goal_session_id="target", goal_fingerprint=record["continuation_fingerprint"],
+    )
     # Adapter accepted the wake, then a new control arrived before its idle handler task ran.
     event._gateway_accepted = True
     if subsequent == "replace":
@@ -423,13 +420,13 @@ async def test_control_continuation_revalidated_at_idle_runner_ingress(state, su
     with patch("gateway.run_inbound._admit_outbox_event", new=AsyncMock()) as admit:
         assert await GatewayInboundMixin._hm_admit_event(runner, event) is None
     admit.assert_not_awaited()
+    await runner._drain_session_controls()  # Durable receipt belongs to the restart-persisted outbox.
     assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
 
 
 @pytest.mark.asyncio
 async def test_control_continuation_revalidated_for_active_replacement_in_followup(state):
     from gateway.run_turn import GatewayTurnMixin
-    from gateway.platforms.event import MessageEvent
     from gateway.turn_context import TurnContext
     from hermes_cli.goals import GoalManager
     from hermes_cli import session_controls
@@ -441,12 +438,13 @@ async def test_control_continuation_revalidated_for_active_replacement_in_follow
     runner = _runner(state)
     source = runner.session_store.lookup_by_session_id("target").origin
     prompt = record["continuation_prompt"]
-    event = MessageEvent(source=source, text=prompt, internal=True, reply_expected=False,
-                         metadata={"goal_continuation": True, "session_control_continuation_id": record["id"]})
+    event = runner._synthetic_prompt_event(
+        source, prompt, reply_expected=False, goal_continuation=True,
+        goal_session_id="target", goal_fingerprint=record["continuation_fingerprint"],
+    )
     GoalManager("target").set("superseding objective")
     runner._MAX_INTERRUPT_DEPTH = 5
     runner._is_goal_continuation_event = lambda value: value.metadata.get("goal_continuation", False)
-    runner._goal_still_active_for_session = lambda sid: GoalManager(sid).state.status == "active"
     runner._run_agent = AsyncMock()
     ctx = TurnContext(source=source, session_key="target-key", session_id="target", run_generation=1, history=[])
     result = {"interrupted": True, "messages": []}
@@ -455,6 +453,7 @@ async def test_control_continuation_revalidated_for_active_replacement_in_follow
     )
     assert returned is result
     runner._run_agent.assert_not_awaited()
+    await runner._drain_session_controls()
     assert session_controls._load_record(record["id"])["continuation_discarded"] == "target_changed"
 
 

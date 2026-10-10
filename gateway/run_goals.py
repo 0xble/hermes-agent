@@ -151,7 +151,8 @@ class GatewayGoalsMixin:
     @staticmethod
     def _synthetic_prompt_event(
         source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
-        goal_continuation: bool = False,
+        goal_continuation: bool = False, goal_session_id: str = "",
+        goal_state: Any = None, goal_fingerprint: Optional[str] = None,
     ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
@@ -163,11 +164,24 @@ class GatewayGoalsMixin:
         continuation on a no-change tick). A typed message absorbed into the same turn still
         restores the human contract through ``MessageEvent.absorb_reply_expected``.
         """
+        metadata = {}
+        if goal_continuation:
+            from hermes_cli.session_controls import _definition_fingerprint
+            # created_at + authored revisions fence replace, clear/set and prompt-changing revise.
+            fingerprint = goal_fingerprint if goal_fingerprint is not None else _definition_fingerprint(
+                "goal", goal_state.to_json() if goal_state is not None else None,
+            )
+            metadata = {
+                GOAL_CONTINUATION_METADATA_KEY: True,
+                "goal_continuation_session_id": goal_session_id,
+                "goal_continuation_fingerprint": fingerprint,
+                "goal_continuation_created_at": time.time(),
+            }
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
-            metadata={GOAL_CONTINUATION_METADATA_KEY: True} if goal_continuation else {},
+            metadata=metadata,
         )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -551,7 +565,10 @@ class GatewayGoalsMixin:
             if adapter and _quick_key:
                 # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True), adapter,
+                    _quick_key, self._synthetic_prompt_event(
+                        source, prompt, reply_expected=False, goal_continuation=True,
+                        goal_session_id=mgr.session_id, goal_state=mgr.state,
+                    ), adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -791,7 +808,10 @@ class GatewayGoalsMixin:
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
+        event = self._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+            goal_session_id=sid, goal_state=mgr.state,
+        )
         event.metadata["gateway_session_key"] = key
         if resume_marker is not None:
             cleared = await self.async_session_store.clear_resume_pending(

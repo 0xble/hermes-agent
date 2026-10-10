@@ -176,40 +176,37 @@ class GatewayBusySessionMixin:
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
-        text = getattr(event_or_text, "text", event_or_text) or ""
-        try:
-            from hermes_cli.goals import is_goal_continuation_text
-            return is_goal_continuation_text(str(text))
-        except Exception:
-            return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        from gateway.platforms.event import is_goal_continuation_event
+        return is_goal_continuation_event(event_or_text)
 
-    def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
-        """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
+    def _clear_goal_pending_continuations(
+        self, session_key: str, adapter: Any, before: Optional[float] = None,
+    ) -> int:
+        """Remove continuations predating a control; keep real items and later resumptions."""
+        def remove(event):
+            if not self._is_goal_continuation_event(event):
+                return False
+            metadata = getattr(event, "metadata", None) or {}
+            try:
+                created_at = float(metadata.get("goal_continuation_created_at", 0))
+            except (TypeError, ValueError):
+                created_at = 0
+            return before is None or created_at <= before
+
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
-            if self._is_goal_continuation_event(pending_event):
+            if remove(pending_event):
                 pending_slot.pop(session_key, None)
                 removed += 1
 
         overflow = self._overflow_queue(session_key)
         if overflow:
-            kept = [e for e in overflow if not self._is_goal_continuation_event(e)]
+            kept = [e for e in overflow if not remove(e)]
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
         return removed
-
-    def _goal_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued continuation."""
-        if not session_id:
-            return False
-        try:
-            from hermes_cli.goals import GoalManager
-            return GoalManager(session_id=session_id).is_active()
-        except Exception as exc:
-            logger.debug("goal continuation: active-state recheck failed: %s", exc)
-            return False
 
     def _get_max_concurrent_sessions(self) -> Optional[int]:
         """Return the configured active chat session cap, if enabled."""
@@ -370,7 +367,8 @@ class GatewayBusySessionMixin:
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict",
-        "notification_category",
+        "notification_category", "goal_continuation", "goal_continuation_session_id",
+        "goal_continuation_fingerprint", "goal_continuation_created_at",
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
@@ -835,6 +833,11 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        from gateway.platforms.event import is_goal_continuation_event
+        if is_goal_continuation_event(event):
+            from hermes_cli.session_controls import goal_continuation_is_current
+            if not await self._run_in_executor_with_context(goal_continuation_is_current, getattr(event, "metadata", None)):
+                return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if self._draining and event.internal and not self._hm_is_registered_command(event):

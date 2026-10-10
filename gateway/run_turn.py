@@ -4060,18 +4060,13 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
-                return result
-            # A replacement stays active, so status alone cannot authorize a queued old prompt.
-            metadata = getattr(pending_event, "metadata", None)
-            control_id = metadata.get("session_control_continuation_id") if isinstance(metadata, dict) else None
-            if control_id:
-                from hermes_cli.session_controls import continuation_is_current
-                if not await self._run_in_executor_with_context(continuation_is_current, control_id):
+            from gateway.platforms.event import is_goal_continuation_event
+            if is_goal_continuation_event(pending_event):
+                from hermes_cli.session_controls import goal_continuation_is_current
+                if not await self._run_in_executor_with_context(
+                    goal_continuation_is_current, getattr(pending_event, "metadata", None), session_id,
+                ):
+                    logger.info("Discarding stale goal continuation for session %s", session_key or "?")
                     return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.

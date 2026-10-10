@@ -303,14 +303,13 @@ class GatewayInboundMixin:
             self._queue_startup_restore_event(event)
             return None
 
+        # Adapter admission can precede this task by an arbitrary delay on an idle lane.
+        from gateway.platforms.event import is_goal_continuation_event
+        if is_goal_continuation_event(event):
+            from hermes_cli.session_controls import goal_continuation_is_current
+            if not await self._run_in_executor_with_context(goal_continuation_is_current, getattr(event, "metadata", None)):
+                return None
         if is_internal:
-            # Adapter admission can precede this task by an arbitrary delay on an idle lane.
-            metadata = getattr(event, "metadata", None)
-            control_id = metadata.get("session_control_continuation_id") if isinstance(metadata, dict) else None
-            if control_id:
-                from hermes_cli.session_controls import continuation_is_current
-                if not await self._run_in_executor_with_context(continuation_is_current, control_id):
-                    return None
             await _admit_outbox_event(self, event, source)
             return event, source, True
 
