@@ -557,6 +557,62 @@ def test_repeated_rollback_is_noop_without_fleet_relaunch(tmp_path, monkeypatch,
     assert (home / "current").resolve() == first
 
 
+@pytest.mark.platforms("macos")
+@pytest.mark.parametrize("damage", [None, "journal", "plist", "missing_record"])
+def test_repeated_first_migration_rollback_is_verified_noop(tmp_path, monkeypatch, capsys, damage):
+    from types import SimpleNamespace
+    from hermes_cli import gateway, gateway_launchd, update_cmd, forward_only_guard
+
+    monkeypatch.setattr(forward_only_guard, "_loaded_forward_labels", lambda **kw: [])
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    source, home = tmp_path / "source", tmp_path / "profile"
+    source.mkdir()
+    (source / "tracked.txt").write_text("source")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "source"], check=True)
+    candidate = home / "releases" / "A"
+    _fake_release(candidate, "A")
+    plist = tmp_path / "source.plist"
+    import plistlib
+    plist.write_bytes(plistlib.dumps({"Label": plist.stem, "EnvironmentVariables": {"HERMES_HOME": str(home)}}))
+    monkeypatch.setattr(releases, "_source_python_valid", lambda *a: True)
+    releases.activate_release(home, candidate, source=source, source_python=Path(sys.executable),
+                              plist_path=plist, plist_body=b"release plist")
+    releases.rollback(home)
+    assert not (home / "current").exists() and not (home / "previous").exists()
+    if damage == "journal":
+        (home / "release-layout.json").write_text("{}")
+    elif damage == "plist":
+        plist.write_bytes(b"different plist")
+    elif damage == "missing_record":
+        (home / "release-last-txn.json").unlink()
+    before = {path: path.read_bytes() for path in home.glob("*.json")}
+    before_plist = plist.read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    calls = []
+    monkeypatch.setattr(gateway_launchd, "_reload_installed_launchd_plist",
+                        lambda *a: calls.append("reload") or True)
+    monkeypatch.setattr(update_cmd, "_restart_gateway_fleet_after_update",
+                        lambda *a, **kw: calls.append("fleet") or SimpleNamespace(incomplete=False))
+    if damage:
+        with pytest.raises(RuntimeError, match="cannot roll back without a current release"):
+            update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+    else:
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=True), gateway_mode=False)
+        assert capsys.readouterr().out.count("Already rolled back, nothing changed") == 2
+    assert calls == []
+    assert plist.read_bytes() == before_plist
+    assert {path: path.read_bytes() for path in home.glob("*.json")} == before
+    assert not (home / "current").exists() and not (home / "previous").exists()
+
+
 @pytest.mark.parametrize("pointer", [
     pytest.param("dangling", marks=pytest.mark.platforms("macos")),
     "outside", "unready", "missing_python",
@@ -1260,6 +1316,69 @@ def test_promote_and_rollback_refuse_mismatched_build_stamp(tmp_path):
 
 
 @pytest.mark.platforms("macos")
+@pytest.mark.parametrize("immutable", [True, False])
+def test_fetch_only_update_preserves_source_churn(tmp_path, monkeypatch, immutable):
+    from types import SimpleNamespace
+    from hermes_cli import gateway, update_cmd
+
+    from hermes_cli import forward_only_guard
+    monkeypatch.setattr(forward_only_guard, "_loaded_forward_labels", lambda **kw: [])
+    # Linked-worktree hooks can export selectors that override git -C.
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    source, home, remote = tmp_path / "source", tmp_path / "profile", tmp_path / "origin.git"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "--initial-branch=main", str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(source), "remote", "add", "origin", str(remote)], check=True)
+    lock = source / "web" / "package-lock.json"
+    lock.parent.mkdir()
+    lock.write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    managed = source / "pyproject.toml"
+    managed.write_bytes(b"[project]\nname='probe'\n")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=test@example.com",
+                    "-c", "user.name=Test", "-c", "commit.gpgsign=false", "commit", "-qm", "A"], check=True)
+    sha_a = releases.release_sha(source)
+    subprocess.run(["git", "-C", str(source), "push", "-q", "origin", "main"], check=True)
+    subprocess.run(["git", "-C", str(source), "config", "core.autocrlf", "true"], check=True)
+    pristine = {path: path.read_bytes() for path in (lock, managed)}
+    lock.write_text('{"lockfileVersion": 3, "local": true}\n', encoding="utf-8")
+    managed.write_bytes(pristine[managed].replace(b"\n", b"\r\n"))
+    dirty = {path: path.read_bytes() for path in (lock, managed)}
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": immutable})
+    monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", source)
+    monkeypatch.setattr(update_cmd._m(), "_run_pre_update_backup", lambda *args: None)
+    monkeypatch.setattr(update_cmd._m(), "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(update_cmd._m(), "_resolve_update_branch", lambda *args: "main")
+    monkeypatch.setattr(update_cmd._m(), "_warn_orphaned_update_autostashes", lambda *args: None)
+    monkeypatch.setattr(update_cmd, "_resolve_update_options", lambda *args: SimpleNamespace(
+        gw_input_fn=None, assume_yes=True, switch_branch=False, pre_update_version="old",
+        no_gateway_restart=False))
+    monkeypatch.setattr(update_cmd, "_begin_update_receipt_and_plan", lambda *args: None)
+    monkeypatch.setattr(update_cmd._m(), "_desktop_packaged_executable", lambda *args: None)
+    monkeypatch.setattr(update_cmd._m(), "_desktop_dist_exists", lambda *args: False)
+    monkeypatch.setattr(update_cmd._m(), "_installed_desktop_apps", lambda *args: [])
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
+    reached = []
+
+    def inspect_source(*args, **kwargs):
+        reached.append(True)
+        assert releases.release_sha(source) == sha_a
+        assert {path: path.read_bytes() for path in (lock, managed)} == (dirty if immutable else pristine)
+        raise RuntimeError("source inspected after fetch")
+
+    monkeypatch.setattr(releases, "stage_release", inspect_source)
+    monkeypatch.setattr(update_cmd, "_prepare_checkout_for_update", inspect_source)
+    with pytest.raises(RuntimeError, match="source inspected after fetch"):
+        update_cmd._cmd_update_impl(SimpleNamespace(rollback=False, branch="main"), gateway_mode=False)
+    assert reached == [True]
+
+
+@pytest.mark.platforms("macos")
 def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway, update_cmd
@@ -1294,7 +1413,7 @@ def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, m
     monkeypatch.setattr(update_cmd._m(), "_desktop_packaged_executable", lambda *args: None)
     monkeypatch.setattr(update_cmd._m(), "_desktop_dist_exists", lambda *args: False)
     monkeypatch.setattr(update_cmd._m(), "_installed_desktop_apps", lambda *args: [])
-    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
+    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda **kwargs: (False, ["git"], False))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
     def inspect_before_stage(*args, **kwargs):
         assert not (home / "release-layout.json").exists()

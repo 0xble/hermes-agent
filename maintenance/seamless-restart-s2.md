@@ -2,6 +2,25 @@
 
 Patch identity: `seamless-restart-s2`.
 
+Immutable fetch preparation preserves source-file bytes: npm lockfile restoration
+and managed-EOL normalization remain legacy-checkout-only operations. Resolve the
+immutable gate before preparation and use that same decision after fetch; neither
+staging nor a failed candidate build may clean local source churn.
+
+Stale-service repair, pending release-transaction replay, and rollback all apply
+the withdrawn forward-only leftover guard before pointer/plist writes or reloads.
+A nonterminal `forward-update.json` or an owning generation label blocks these
+paths without automatic cleanup. A completed first-migration rollback may be
+retried with both release pointers absent only when the release manager verifies
+its completed transaction against the pointers, journal, and exact plist bytes.
+That retry reports a no-op and never reloads or restarts the fleet; mismatched or
+missing completion evidence still refuses rollback without a current release.
+
+Regressions: `test_fetch_only_update_preserves_source_churn`,
+`test_leftovers_block_service_repair_and_transaction_replay`, and
+`test_repeated_first_migration_rollback_is_verified_noop` (next to the existing
+release-to-release retry test).
+
 ## Contract and current gate
 
 Detached cron dispatch freezes both the physical tree and immutable-release module

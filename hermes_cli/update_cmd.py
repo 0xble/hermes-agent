@@ -246,6 +246,7 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
     paths = ReleasePaths.for_home(home)
     if not (paths.home / "release-txn.json").exists():
         return None
+    refuse_if_forward_only_leftovers(home)
     from hermes_cli import gateway, gateway_launchd
     plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
     callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
@@ -1453,9 +1454,10 @@ def _record_update_initiator() -> None:
             _completion_receipt.record_fact("initiator", "desktop")
 
 
-def _prepare_git_command() -> tuple[bool, list, bool]:
+def _prepare_git_command(*, preserve_source: bool = False) -> tuple[bool, list, bool]:
     """Return ``(use_zip_update, git_cmd, is_fork)``; ``sys.exit(1)`` when not a git repo
-    on a non-Windows host (Windows falls back to ZIP: broken git file I/O, AV, NTFS filters)."""
+    on a non-Windows host (Windows falls back to ZIP: broken git file I/O, AV, NTFS filters).
+    Fetch-only release updates set ``preserve_source`` to bypass checkout cleanup."""
     git_dir = _m().PROJECT_ROOT / ".git"
     use_zip_update = not git_dir.exists()
     if use_zip_update and sys.platform != "win32":
@@ -1480,8 +1482,9 @@ def _prepare_git_command() -> tuple[bool, list, bool]:
 
     # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
     # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if not preserve_source:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -1710,6 +1713,7 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
         print(f"  Release {sha} still awaits reconciliation; --no-gateway-restart keeps the running gateway active.")
         return
     if action == "repair-service":
+        refuse_if_forward_only_leftovers(paths.home)
         from hermes_cli import gateway
         if state.service not in {"none", "current"}:
             from hermes_cli import gateway_launchd
@@ -2090,7 +2094,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     _require_immutable_launchd()
 
     if getattr(args, "rollback", False):
-        from hermes_cli.immutable_releases import ReleasePaths, read_pointer, rollback
+        from hermes_cli.immutable_releases import ReleasePaths, completed_rollback, read_pointer, rollback
         from hermes_cli.update_receipt import begin_update_receipt
         begin_update_receipt()
         home = get_hermes_home()
@@ -2100,14 +2104,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pending_path = paths.home / "release-txn.json"
         pending_operation = (json.loads(pending_path.read_text(encoding="utf-8-sig"))["operation"]
                              if pending_path.exists() else None)
+        refuse_if_forward_only_leftovers(home)
         before = read_pointer(paths.current)
         recovered = _finish_pending_release_transaction(home)
         if pending_operation in {"rollback", "first-migration-rollback"} and recovered is not None:
             result = recovered
             before = Path(recovered["previous"]) if recovered.get("previous") else before
-        else:
-            if before is None:
+        elif before is None:
+            result = completed_rollback(home)
+            if result is None or result["current"] is None:
                 raise RuntimeError("cannot roll back without a current release")
+            before = Path(result["current"])
+        else:
             from hermes_cli import gateway, gateway_launchd
             plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
             previous = read_pointer(paths.previous)
@@ -2199,7 +2207,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         or _m()._desktop_dist_exists(desktop_dir)
         or bool(_m()._installed_desktop_apps()))
 
-    use_zip_update, git_cmd, is_fork = _prepare_git_command()
+    immutable_mode = _immutable_release_enabled()
+    use_zip_update, git_cmd, is_fork = (
+        _prepare_git_command(preserve_source=True) if immutable_mode else _prepare_git_command()
+    )
 
     completion_request = _source_completion_request(
         opts, _pre_update_plan, pre_update_snapshot_id, _windows_gateway_resume,
@@ -2305,7 +2316,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(1)
 
-        if _immutable_release_enabled():
+        if immutable_mode:
             _apply_fetched_immutable_update(
                 git_cmd, branch, opts, args, gateway_mode=gateway_mode,
                 had_desktop_app_before_update=had_desktop_app_before_update,
