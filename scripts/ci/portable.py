@@ -254,7 +254,19 @@ def windows_appdata_environment(home: Path) -> dict[str, str]:
     }
 
 
+def require_checkout_venv_isolation() -> None:
+    venv = ROOT / '.venv'
+    target = venv.resolve()
+    if venv.is_symlink() or not target.is_relative_to(ROOT.resolve()):
+        raise RuntimeError(
+            f'Checkout .venv is a symlink or resolves outside the checkout: {venv} -> {target}; '
+            "the gate could resync another checkout's environment. "
+            'Remove the symlink and run bin/ci setup.'
+        )
+
+
 def environment(home: Path) -> dict[str, str]:
+    require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
     env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
@@ -383,6 +395,7 @@ def require_tools(names: tuple[str, ...], env: dict[str, str]) -> None:
 
 
 def python(env: dict[str, str]) -> str:
+    require_checkout_venv_isolation()
     executable = ROOT / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if not executable.is_file():
         raise RuntimeError('Checkout Python environment missing. Run bin/ci setup first.')
@@ -426,6 +439,7 @@ def provision_rg(env: dict[str, str]) -> None:
 
 
 def setup(env: dict[str, str]) -> None:
+    require_checkout_venv_isolation()
     require_tools(('uv', 'node'), env)
     provision_npm(env)
     # npm is created after the initial resolver pass on a fresh checkout; refresh
