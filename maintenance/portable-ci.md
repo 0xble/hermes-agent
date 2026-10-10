@@ -41,7 +41,12 @@ fixtures use a unique directory under the runner's original disk-backed HOME,
 outside the isolated child HOME. Temporary parents with Git or Node dependency
 ancestry are rejected. Only invocation-owned directories are cleaned. A kernel lock prevents concurrent setup/check in that checkout and is
 released automatically on process exit. Checkouts never use another checkout's
-venv or personal pytest plugin. Credential and test-selection environment
+venv or personal pytest plugin. Setup and checks reject a symlinked checkout
+`.venv` before syncing dependencies or selecting its interpreter, including
+chained and dangling links. Remove the symlink explicitly and run `bin/ci setup`
+to create a checkout-owned environment; the gate never removes it for you.
+This isolation guard extends `fork-ci-reliability`; focused regressions live in
+`scripts/ci/tests/test_portable.py`. Credential and test-selection environment
 variables are absent from the child environment. Installed rustup users share
 only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and
