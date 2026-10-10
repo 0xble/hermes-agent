@@ -622,6 +622,8 @@ class GatewayStartupMixin:
                     row["obligation_id"], "failed to release held obligation %s", error=blocked_chats[chat_key])
                 continue
             if row.get("adopted"):
+                # Later messages to this chat must wait for it, so they are released behind it.
+                blocked_chats.setdefault(chat_key, row.get("last_error") or "send_path_degraded")
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue

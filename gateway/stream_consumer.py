@@ -621,6 +621,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if tick.commentary_text is not None:
                     await self._deliver_commentary(tick.commentary_text)
                 if tick.got_segment_break:
+                    self._copy_filter.message_boundary()
                     await self._end_segment(tick)
 
                 # Done last so the waiter unblocks only once everything queued

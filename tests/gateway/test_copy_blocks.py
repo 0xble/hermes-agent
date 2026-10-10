@@ -260,6 +260,14 @@ async def test_streamed_copy_blocks_use_ledgered_delivery() -> None:
     assert returned is None
     assert sent == [(["body"], {"thread_id": "t"}, {"is_ephemeral_response": True, "ephemeral_ttl": 7})]
 
+    # The queued lane already sent (or ledgered) this response's blocks: completion must not.
+    sent.clear()
+    result = {"already_sent": True, "copy_already_delivered": True}
+    await runner._hmwa_deliver_turn_response(
+        event, event.source, None, "session", None, result, [], "[[copy]]\nbody\n[[/copy]]", None, False,
+    )
+    assert sent == []
+
 
 @pytest.mark.asyncio
 async def test_interrupted_turn_does_not_send_partial_copy_block() -> None:
@@ -418,3 +426,31 @@ async def test_failed_copy_block_holds_later_blocks_in_order(monkeypatch) -> Non
     assert [row["content"] for row in rows] == [f"[[copy]]\n{b}\n[[/copy]]" for b in ("one", "two", "three", "four")]
     assert len(failed) == 3 and len(set(failed)) == 3
     assert [getattr(r, "success", None) for r in results] == [True, False, False, False]
+
+
+@pytest.mark.parametrize("body", ["\nlead", "trail\n", "\r\nboth\r\n", "lone cr\r", "plain"])
+def test_ledger_wrapping_round_trips_body_bytes(body) -> None:
+    from gateway.copy_blocks import wrap_copy_block
+    assert extract_copy_blocks(wrap_copy_block(body)) == ("", [body])
+
+
+def test_new_assistant_message_starts_on_a_new_line_for_copy_markers() -> None:
+    stream = CopyMarkerStreamFilter(drop_bodies=True)
+    out = stream.feed("Checking now.")
+    stream.message_boundary()
+    out += stream.feed("[[copy]]\nPASTE BODY\n[[/copy]]\nafter\n") + stream.flush()
+    assert out == "Checking now.after\n"
+
+
+@pytest.mark.asyncio
+async def test_inline_copy_bodies_never_become_attachments(tmp_path) -> None:
+    literal = tmp_path / "literal.txt"
+    literal.write_text("x")
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "discord"
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="c", platform="discord"), text="")
+    text = f"Intro\n[[copy]]\nMEDIA:{literal}\n[[/copy]]\n"
+    extracted = await adapter._extract_response_content(text, event, "", is_ephemeral_response=True)
+    assert extracted.media_files == [] and extracted.local_files == []
+    assert extracted.copy_blocks == []
+    assert extracted.text_content == f"Intro\nMEDIA:{literal}"

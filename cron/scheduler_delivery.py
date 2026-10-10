@@ -1867,7 +1867,8 @@ def _queue_for_live_reconnect(
         # One row per logical message, so a replay that lands some and fails one retries only
         # that one. Copy rows keep their markers so replay re-extracts and sends them plain.
         rows = [(job_ref, content)] if content else []
-        rows += [(f"{job_ref}#copy{index}", f"[[copy]]\n{block}\n[[/copy]]")
+        from gateway.copy_blocks import wrap_copy_block
+        rows += [(f"{job_ref}#copy{index}", wrap_copy_block(block))
                  for index, block in enumerate(copy_blocks or [])]
         for message_ref, queued_content in rows:
             obligation_id = compute_obligation_id(session_key, message_ref, queued_content)

@@ -24,7 +24,8 @@ from utils import normalize_proxy_url
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
-from gateway.copy_blocks import split_copy_blocks_for
+from gateway.copy_blocks import (
+    adapter_sends_copy_blocks, extract_copy_blocks, protect_inline_copy_bodies, restore_inline_copy_bodies)
 
 logger = logging.getLogger(__name__)
 
@@ -4552,9 +4553,9 @@ class BasePlatformAdapter(ABC):
                 _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_message_ref or ""), text_content)
+            from gateway.copy_blocks import wrap_copy_block
             ledger_content = (
-                f"[[copy]]\n{text_content}\n[[/copy]]"
-                if (metadata or {}).get("copy_block") else text_content
+                wrap_copy_block(text_content) if (metadata or {}).get("copy_block") else text_content
             )
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
@@ -4897,7 +4898,13 @@ class BasePlatformAdapter(ABC):
         pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
         recovered."""
         pre_extract = response
-        response, copy_blocks = split_copy_blocks_for(self, response)
+        # Platforms without a plain copy send keep blocks inline; their bodies ride through
+        # directive extraction as opaque tokens, so literal text never becomes an attachment.
+        inline_bodies: Dict[str, str] = {}
+        if adapter_sends_copy_blocks(self):
+            response, copy_blocks = extract_copy_blocks(response)
+        else:
+            (response, inline_bodies), copy_blocks = protect_inline_copy_bodies(response), []
         # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
         force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
@@ -4939,6 +4946,9 @@ class BasePlatformAdapter(ABC):
                                "no attachment; delivering recovered original to %s", self.name,
                                len(pre_extract), event.source.chat_id)
                 text_content = _recovered
+        if inline_bodies:
+            # Same outer trim as text without blocks; bodies inside stay byte-exact.
+            text_content = restore_inline_copy_bodies(text_content, inline_bodies).strip()
         return _ExtractedResponse(
             text_content=text_content, copy_blocks=copy_blocks, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)

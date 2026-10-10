@@ -174,6 +174,14 @@ class CopyMarkerStreamFilter:
             cursor = end
         return "".join(output)
 
+    def message_boundary(self) -> None:
+        """A new assistant message starts here, so it starts on a new line.
+
+        Block, fence, and held-marker state carry over (a block may span a tool call), but an
+        unterminated ordinary line ends, so a following ``[[copy]]`` is at line start.
+        """
+        self._line = ""
+
     def flush(self) -> str:
         """Release a non-marker tail, or drop it when it is a complete marker line."""
         pending, self._pending = self._pending, ""
@@ -206,6 +214,60 @@ def split_copy_blocks_for(adapter, text: str) -> tuple[str, list[str]]:
 def copy_free_text_for(adapter, text: str) -> str:
     """The streamed body *adapter* shows: bodies removed where they go out separately."""
     return strip_copy_blocks(text) if adapter_sends_copy_blocks(adapter) else render_copy_blocks_inline(text)
+
+
+def wrap_copy_block(body: str) -> str:
+    """Marker-wrap one extracted body so :func:`extract_copy_blocks` returns it byte-exact.
+
+    Extraction strips one line ending next to each marker, so the wrapper adds one on each
+    side; a body that itself starts or ends with a newline therefore survives a ledger replay.
+    """
+    lead = "\n" if body.startswith(("\n", "\r")) else ""
+    # A trailing lone CR would fuse with the close marker's LF into one CRLF line ending.
+    trail = "\r" if body.endswith("\r") else ""
+    return f"{_COPY_OPEN}\n{lead}{body}{trail}\n{_COPY_CLOSE}"
+
+
+def protect_inline_copy_bodies(text: str) -> tuple[str, dict[str, str]]:
+    """Render blocks inline with each body swapped for an opaque token.
+
+    Directive processing (MEDIA tags, image links, bare paths) then cannot see a body;
+    :func:`restore_inline_copy_bodies` puts the exact bodies back afterwards.
+    """
+    bodies: dict[str, str] = {}
+
+    def _token() -> str:
+        return f"\x00COPYBODY{len(bodies)}\x00"
+
+    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+        return text, bodies
+    out: list[str] = []
+    body: list[str] = []
+    fence: str | None = None
+    in_copy = False
+    for line in text.splitlines(keepends=True):
+        if fence is None and (
+                (_line_marker(line, _COPY_OPEN) and not in_copy) or _line_marker(line, _COPY_CLOSE)):
+            if in_copy and body:
+                token = _token()
+                bodies[token] = "".join(body)
+                out.append(token)
+                body = []
+            in_copy = _line_marker(line, _COPY_OPEN)
+            continue
+        (body if in_copy else out).append(line)
+        fence = _next_fence(fence, line)
+    if body:
+        token = _token()
+        bodies[token] = "".join(body)
+        out.append(token)
+    return "".join(out), bodies
+
+
+def restore_inline_copy_bodies(text: str, bodies: dict[str, str]) -> str:
+    for token, body in bodies.items():
+        text = text.replace(token, body)
+    return text
 
 
 def strip_copy_blocks(text: str) -> str:

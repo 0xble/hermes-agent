@@ -1978,7 +1978,8 @@ class GatewayTurnMixin:
             media_delivered = False
             copy_failed = False
             copy_delivered = False
-            if adapter and copy_blocks and not agent_result.get("interrupted"):
+            if (adapter and copy_blocks and not agent_result.get("interrupted")
+                    and not agent_result.get("copy_already_delivered")):
                 copy_results = []
                 await adapter._send_copy_blocks(
                     event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},
@@ -3933,6 +3934,9 @@ class GatewayTurnMixin:
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+                    # Its copy blocks went out (or wait in the ledger) on that lane too; the
+                    # completion path must not send them a second time.
+                    result["copy_already_delivered"] = True
                 return bool(_text_delivered)
         return True
 

@@ -511,6 +511,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "chat_id": chat_id, "thread_id": thread_id, "content": content,
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "last_error": last_error,
                         "resume_marker": _resume_marker_from_row(
                             marker_session_id, marker_token, marker_marked_at),
                         "resume_turn_id": resume_turn_id})
@@ -563,14 +564,24 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at,
                       resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
+                      , state
                FROM delivery_obligations
-               WHERE state='failed' AND platform=?
+               WHERE state IN ('pending', 'attempting', 'failed') AND platform=?
                ORDER BY created_at, rowid""", (platform,)).fetchall()
+        # Messages to one chat leave in the order they were recorded: a row waits while any
+        # earlier row for its chat is still outstanding (in flight, or failed and not yet due).
+        held_chats: set = set()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
-             marker_session_id, marker_token, marker_marked_at, resume_turn_id) in rows:
+             marker_session_id, marker_token, marker_marked_at, resume_turn_id, state) in rows:
+            if (adapter_profile or "default") != expected_profile:
+                continue  # another bot identity: its own order, its own sweep
+            chat_key = (chat_id, thread_id)
+            if chat_key in held_chats:
+                continue
             # Exact process-start matching prevents PID reuse from stealing work.
-            if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
+            if state != "failed" or owner_pid != pid or owner_started_at != started:
+                held_chats.add(chat_key)
                 continue
             due = retry_not_before(updated_at, last_error, attempts)
             owner_guard = (now, oid, owner_pid, owner_started_at)
@@ -587,6 +598,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
             if due is None:
+                held_chats.add(chat_key)
                 continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
@@ -596,6 +608,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
             if now < due:
+                held_chats.add(chat_key)
                 continue  # the platform's wait or the backoff has not passed; the timer comes back for it
             # The claim clears the stale error: this is a fresh attempt, and if it is interrupted the next
             # boot must see 'attempting' with no proof of non-delivery, hence the marker.

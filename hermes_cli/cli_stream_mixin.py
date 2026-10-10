@@ -335,6 +335,7 @@ class CLIStreamMixin:
             # The copy filter spans the whole turn: a block, fence, or held partial marker
             # line may continue after the tool call.
             copy_filter = self._turn_copy_filter()
+            copy_filter.message_boundary()
             self._reset_stream_state()
             self._copy_filter = copy_filter
             return

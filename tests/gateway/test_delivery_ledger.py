@@ -317,6 +317,22 @@ class TestRuntimeFailedSweep:
         assert dl.sweep_failed_for_runtime("telegram") == []
         assert _row("ob-1")["state"] == "failed"
 
+    def test_runtime_sweep_never_claims_past_an_outstanding_earlier_row(self, monkeypatch):
+        monkeypatch.setattr(dl, "_owner_stamp", lambda: (os.getpid(), 202))
+        for oid in ("ob-1", "ob-2", "ob-3"):
+            _record(oid=oid, platform="telegram", content=oid)
+            time.sleep(0.002)
+        for oid in ("ob-1", "ob-2", "ob-3"):
+            dl.mark_failed(oid, "timed out")
+        # ob-1 already spent a retry, so its backoff is longer than ob-2/ob-3's first one.
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET attempts=1 WHERE obligation_id='ob-1'")
+        now = time.time() + 31  # past the first backoff, inside the second
+        assert dl.sweep_failed_for_runtime("telegram", now=now) == []
+        assert [_row(oid)["state"] for oid in ("ob-1", "ob-2", "ob-3")] == ["failed"] * 3
+        claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 10_000)
+        assert [row["obligation_id"] for row in claimed][:1] == ["ob-1"]
+
     def test_profile_scope_never_claims_another_bot_identity(self):
         _record(platform="telegram")
         dl.mark_failed("ob-1", "send_path_degraded")
