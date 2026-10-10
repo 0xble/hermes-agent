@@ -1166,7 +1166,9 @@ def _pdf_page_range(rid, params):
 # ── side agents (background / btw / preview.restart) ────────────────────────
 
 def _final_response_text(result) -> str:
-    return (result.get("final_response", str(result)) if isinstance(result, dict) else str(result))
+    from gateway.copy_blocks import render_copy_blocks_inline
+    text = result.get("final_response", str(result)) if isinstance(result, dict) else str(result)
+    return render_copy_blocks_inline(text or "")
 
 
 def _spawn_side_agent(

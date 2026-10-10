@@ -19,6 +19,7 @@ from rich.markup import escape as _escape
 
 from agent.i18n import t
 from agent.think_scrubber import THINK_CLOSE_TAGS, THINK_OPEN_TAGS
+from gateway.copy_blocks import CopyMarkerStreamFilter
 
 # Model-generated reasoning tags: suppressed during streaming (they'd display as raw XML;
 # the agent strips them from final_response too) unless show_reasoning routes them to the box.
@@ -306,6 +307,13 @@ class CLIStreamMixin:
         if not getattr(self, "_stream_box_live", False):
             self._release_held_status_lines()
 
+    def _turn_copy_filter(self):
+        """The turn's copy-marker filter, created on first use."""
+        copy_filter = getattr(self, "_copy_filter", None)
+        if copy_filter is None:
+            copy_filter = self._copy_filter = CopyMarkerStreamFilter()
+        return copy_filter
+
     def _stream_delta(self, text) -> None:
         """Line-buffered streaming callback for real-time token rendering.
 
@@ -323,9 +331,17 @@ class CLIStreamMixin:
             self._loop_complete_hold = ""
             if held:
                 self._emit_unheld(held)
-            self._flush_stream()
+            self._flush_stream(turn_end=False)
+            # The copy filter spans the whole turn: a block, fence, or held partial marker
+            # line may continue after the tool call.
+            copy_filter = self._turn_copy_filter()
+            copy_filter.message_boundary()
             self._reset_stream_state()
+            self._copy_filter = copy_filter
             return
+        if not text:
+            return
+        text = self._turn_copy_filter().feed(text)
         if not text:
             return
         if getattr(self, "_silence_hold_active", False):
@@ -556,7 +572,7 @@ class CLIStreamMixin:
             except Exception:
                 pass
 
-    def _flush_stream(self) -> None:
+    def _flush_stream(self, *, turn_end: bool = True) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
         from agent.markdown_tables import is_table_divider, looks_like_table_row
         from cli import _ACCENT, _RST, _cprint, _strip_markdown_syntax
@@ -570,6 +586,11 @@ class CLIStreamMixin:
         # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
         # anything else held (a partial prefix, a marker inside an open fence) is content.
         self._resolve_loop_complete_hold()
+        # Only the turn's end resolves a held copy-marker line; at a tool boundary it may
+        # still complete in the next segment.
+        copy_tail = self._turn_copy_filter().flush() if turn_end else ""
+        if copy_tail:
+            self._emit_unheld(copy_tail)
         # Still inside a "reasoning block" at end-of-stream = false positive (the model
         # mentioned a tag in prose and never closed it): recover the buffer as regular text.
         if getattr(self, "_in_reasoning_block", False) and getattr(self, "_stream_prefilt", ""):
@@ -609,6 +630,7 @@ class CLIStreamMixin:
         self._stream_box_opened = False
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
+        self._copy_filter = CopyMarkerStreamFilter()
         self._in_reasoning_block = False
         self._stream_last_was_newline = True
         self._reasoning_box_opened = False
@@ -729,7 +751,7 @@ class CLIStreamMixin:
         cleared when a tool actually starts (``tool.started``), i.e. on the next batch."""
         from cli import _cprint
         if getattr(self, '_stream_box_opened', False):
-            self._flush_stream()
+            self._flush_stream(turn_end=False)
             self._stream_box_opened = False
         self._close_reasoning_box()
         announced = self.__dict__.setdefault("_tool_gen_announced", set())

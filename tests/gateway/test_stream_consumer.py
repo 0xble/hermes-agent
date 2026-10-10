@@ -1184,6 +1184,8 @@ class TestUtf16OverflowDetection:
         # abstract methods set after class creation.
         TelegramLikeAdapter.__abstractmethods__ = frozenset()
         adapter = TelegramLikeAdapter.__new__(TelegramLikeAdapter)
+        from gateway.config import Platform
+        adapter.platform = Platform.TELEGRAM
         adapter._typing_paused = set()
         adapter._fatal_error_message = None
         return adapter
@@ -1566,3 +1568,95 @@ class TestFlushPendingSync:
         consumer.finish()
         await task
 
+
+
+class TestCopyBlocksNeverStream:
+
+    @pytest.mark.asyncio
+    async def test_overflow_split_and_previews_never_send_copy_syntax(self):
+        """Copy blocks are delivered separately, so no streamed send carries their markers
+        or bodies, including sealed overflow heads and the finalize edit."""
+        adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
+        msg_ids = iter(f"msg_{i}" for i in range(100))
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(msg_ids)))
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_x"))
+        setattr(adapter, "MAX_MESSAGE_LENGTH", 700)
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_copy", config)
+        body = "SECRET line\n" * 120
+        text = "intro\n" + ("words " * 150) + "\n[[copy]]\n" + body + "[[/copy]]\nafter\n" + ("more " * 150)
+        task = asyncio.create_task(consumer.run())
+        for i in range(0, len(text), 7):
+            consumer.on_delta(text[i:i + 7])
+            if i % 140 == 0:
+                await asyncio.sleep(0.02)
+        consumer.finish(text)
+        await task
+
+        visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
+        visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
+        assert visible
+        assert not any("[[" in t and "copy" in t for t in visible)
+        assert not any("SECRET" in t for t in visible)
+        assert any("after" in t for t in visible)
+
+    @pytest.mark.asyncio
+    async def test_copy_block_and_partial_marker_spanning_segment_break_stay_hidden(self):
+        """The copy filter lives for the turn: a block, fence, or partial marker line that
+        spans a tool-call segment break never leaks into either segment."""
+        adapter = TestUtf16OverflowDetection()._make_telegram_like_adapter()
+        msg_ids = iter(f"msg_{i}" for i in range(100))
+        adapter.send = AsyncMock(
+            side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(msg_ids)))
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_x"))
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor="")
+        consumer = GatewayStreamConsumer(adapter, "chat_seg", config)
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("intro\n[[copy]]\nPART1\n")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("PART2\n[[/copy]]\nmiddle\n[[co")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("py]]\nPART3\n[[/copy]]\n```\n")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        consumer.on_delta("[[copy]]\nliteral in fence\n```\nafter")
+        consumer.finish()
+        await task
+
+        visible = [c.kwargs["content"] for c in adapter.send.call_args_list]
+        visible += [c.kwargs["content"] for c in adapter.edit_message.call_args_list]
+        joined = "\n".join(visible)
+        assert "PART1" not in joined and "PART2" not in joined and "PART3" not in joined
+        assert "[[co" not in joined.replace("```\n[[copy]]\nliteral in fence", "")
+        assert "middle" in joined and "after" in joined
+        assert "literal in fence" in joined
+
+
+class TestStreamedReconcileEditsOmitCopyBlocks:
+
+    @pytest.mark.parametrize("transformed", [False, True])
+    def test_reconcile_edit_never_carries_copy_syntax(self, transformed):
+        from gateway.run_turn import GatewayTurnMixin
+        adapter = MagicMock()
+        adapter.platform = "telegram"
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        consumer = SimpleNamespace(
+            adapter=adapter, message_id="m1", final_content_delivered=True,
+            final_response_sent=True, _turn_split_delivery=False,
+            delivered_final_matches=lambda _t: False,
+        )
+        final = "visible\nmore\n[[copy]]\nSECRET\n[[/copy]]\n"
+        response = {"final_response": final, "response_transformed": transformed}
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[consumer], source=SimpleNamespace(platform="telegram", chat_id="c1"),
+            session_key="s1",
+        )
+        asyncio.run(GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx))
+        edited = adapter.edit_message.call_args.kwargs["content"]
+        assert edited == "visible\nmore\n"
+        assert response.get("already_sent") is True

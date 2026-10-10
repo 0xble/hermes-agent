@@ -344,7 +344,10 @@ class StreamFallbackMixin:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        # Commentary is a whole message, so whole-text extraction is exact here; copy
+        # blocks belong only to the final answer's separate deliveries.
+        from gateway.copy_blocks import render_copy_blocks_inline
+        text = self._clean_for_display(render_copy_blocks_inline(text))
         if not text.strip():
             return False
         try:
