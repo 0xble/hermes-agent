@@ -473,6 +473,20 @@ class TestFullBackupReportsWhyThereIsNoArchive:
         assert [s["ok"] for s in steps] == [False]
         assert "OSError: disk full" in steps[0]["detail"]
 
+    def test_unloadable_backup_module_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
+        import sys
+
+        import hermes_cli.backup  # noqa: F401 — imported so _run can still patch it
+
+        (receipt_home / "config.yaml").write_text("model: x\n")
+        monkeypatch.setitem(sys.modules, "hermes_cli.backup", None)
+        out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
+
+        assert "could not load backup module" in out and "continuing update" in out
+        assert not skips
+        assert [s["ok"] for s in steps] == [False]
+        assert "ModuleNotFoundError" in steps[0]["detail"] and "hermes_cli.backup" in steps[0]["detail"]
+
     def test_nothing_to_back_up_is_still_a_skip(self, receipt_home, monkeypatch, capsys):
         out, steps, skips = self._run(monkeypatch, receipt_home, capsys)
 

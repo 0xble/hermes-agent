@@ -755,6 +755,7 @@ def _run_full_backup() -> None:
     try:
         from hermes_cli.backup import BackupInProgressError, create_pre_update_backup
     except Exception as exc:
+        _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         print(f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update.")
         print()
         return
