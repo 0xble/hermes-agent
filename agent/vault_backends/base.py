@@ -29,6 +29,10 @@ class MissingCredential(RuntimeError):
     """The backend's own credential is not configured; never silently treated as an empty result."""
 
 
+FILL_METADATA_TTL_SECONDS = 30.0
+FILL_METADATA_NOT_APPLICABLE = object()
+
+
 class LoginBackend(ABC):
     name: str                # config key: local | onepassword | bitwarden
     display_name: str        # user-facing
@@ -66,6 +70,20 @@ class LoginBackend(ABC):
         """Full payload of a payment/address item (server-side only). External managers list only
         logins, so the base returns the password-only shape."""
         return {"password": self.resolve_password(handle)}
+
+    def refresh_fill_metadata(self, handle: str) -> object:
+        """Revalidate delayed fill metadata when this backend keeps per-fill state.
+
+        Backends without an authorization context must preserve the pre-refresh fill behavior;
+        the browser tool treats this distinct result as "not applicable" rather than as a
+        changed or missing item.
+        """
+        return FILL_METADATA_NOT_APPLICABLE
+
+    def discard_fill_metadata(self, handle: Optional[str] = None) -> None:
+        """Discard delayed-fill authorization state, if this backend has any."""
+        return None
+
 
 
 def run_with_stdin_secret(argv: Sequence[str], *, env: Dict[str, str], secret: str, timeout: float,

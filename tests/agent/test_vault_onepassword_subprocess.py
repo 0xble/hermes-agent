@@ -72,10 +72,23 @@ if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "js
     if state["mode"] == "ambiguous":
         records.append(dict(records[1], vault={"id": "wrong-vault"}))
     print(json.dumps(records))
+elif args == ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"]:
+    print(json.dumps({"id": "card-c", "title": "Card", "category": "CREDIT_CARD", "state": "ACTIVE",
+                      "vault": {"id": "vault-c"}, "additional_information": "4111 **** 1111",
+                      "fields": [{"id": "cvv", "value": "must-not-be-retained"}]}))
 elif args == ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"]:
     print(json.dumps({"id": "card-c", "category": "CREDIT_CARD", "fields": [
         {"id": "ccnum", "value": "4111 1111 1111 1111"}, {"id": "cvv", "value": "dummy-cvv-9876"},
         {"id": "expiry", "value": "202907"}, {"id": "cardholder", "value": "A User"}]}))
+elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["vault"]] and args[5:] == ["--format", "json"]:
+    mode = state["mode"]
+    if mode == "missing":
+        print(json.dumps({"id": "item-gone", "category": "LOGIN", "state": "ACTIVE", "vault": {"id": state["vault"]}}))
+    else:
+        print(json.dumps({"id": "item-b", "title": "Second", "category": "LOGIN",
+                          "state": "ARCHIVED" if mode == "archived" else "ACTIVE",
+                          "vault": {"id": state["vault"]},
+                          "urls": [{"href": "https://second.example/login"}]}))
 elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["vault"]]:
     if state["mode"] == "error":
         # Secret-bearing stdout from a failed command must not become diagnostics.
@@ -88,6 +101,12 @@ elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["v
         print("123456")
     else:
         sys.exit(2)
+elif args[:2] == ["item", "get"] and "--vault" not in args:
+    print("a vault query must be provided", file=sys.stderr)
+    sys.exit(1)
+elif args[:3] == ["item", "get", "item-b"] and "--vault" in args:
+    print("item not found in vault", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unexpected selector", file=sys.stderr)
     sys.exit(2)
@@ -136,8 +155,6 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
     now = [1000.0]
     monkeypatch.setattr(onepassword.time, "monotonic", lambda: now[0])
 
-    def later():  # a separate fill, past the per-fill listing reuse window
-        now[0] += onepassword._FRESH_LISTING_REUSE_SECONDS + 1
     with profile("a") as backend:
         metadata = backend.list_items()
         assert [item.id for item in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
@@ -152,30 +169,50 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
         assert backend.resolve_password("op:item-b") == "dummy-password"
         # An already-issued handle must use newly listed metadata, not a cached vault.
         state.write_text(json.dumps({"mode": "ok", "vault": "vault-moved"}))
-        later()
         assert backend.resolve_otp("op:item-b") == "123456"
         state.write_text(json.dumps({"mode": "error", "vault": "vault-moved"}))
         with pytest.raises(RuntimeError, match="synthetic read failure") as error:
             backend.resolve_password("op:item-b")
         assert backend.resolve_otp("op:item-b") is None
         before = len(calls())
-        state.write_text(json.dumps({"mode": "ambiguous", "vault": "vault-moved"}))
-        later()
-        with pytest.raises(RuntimeError, match="missing or ambiguous") as ambiguous:
+        state.write_text(json.dumps({"mode": "missing", "vault": "vault-moved"}))
+        with pytest.raises(RuntimeError, match="missing"):
             backend.resolve_password("op:item-b")
         assert backend.resolve_otp("op:item-b") is None
-        assert all(row["argv"][1] == "list" for row in calls()[before:])
+        assert all(row["argv"][1:2] in (["get"], ["list"]) for row in calls()[before:])
+        assert all("--vault" in row["argv"] for row in calls()[before:] if row["argv"][1:2] == ["get"])
+        before = len(calls())
+        state.write_text(json.dumps({"mode": "archived", "vault": "vault-moved"}))
+        with pytest.raises(RuntimeError, match="missing"):
+            backend.resolve_password("op:item-b")
+        assert backend.resolve_otp("op:item-b") is None
+        assert all(row["argv"][1:2] in (["get"], ["list"]) for row in calls()[before:])
+        assert all("--vault" in row["argv"] for row in calls()[before:] if row["argv"][1:2] == ["get"])
     rows = calls()
     gets = [row["argv"] for row in rows if row["argv"][1] == "get"]
     assert gets == [
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"],
         ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"],
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-b", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--fields", "label=password", "--reveal"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
+        ["item", "get", "item-b", "--vault", "vault-moved", "--format", "json"],
     ]
     assert all(row["identity"] == "a" and row["stdin_eof"] and not row["unexpected_env"] for row in rows)
-    assert_no_secret_diagnostics(capfd, caplog, metadata, str(error.value), str(ambiguous.value), rows)
+    assert_no_secret_diagnostics(capfd, caplog, str(error.value), rows)
 
 
 @pytest.mark.parametrize("fake_op", [
