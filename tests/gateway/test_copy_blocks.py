@@ -702,3 +702,26 @@ async def test_refused_copy_block_is_never_resent_with_a_fallback_banner() -> No
         metadata={"copy_block": True, "copy_block_index": 0, "plain": True})
     assert result.success is False
     assert sends == ["exact body"]
+
+
+@pytest.mark.asyncio
+async def test_copy_block_recovered_from_a_deleted_topic_stays_exact() -> None:
+    from gateway.config import Platform
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = Platform.TELEGRAM
+    sends = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append((content, dict(metadata or {})))
+        if (metadata or {}).get("thread_id"):
+            return SendResult(success=False, error="Bad Request: message thread not found", retryable=False)
+        return SendResult(success=True, message_id="9")
+
+    adapter.send = send
+    result = await adapter._send_with_retry(
+        chat_id="chat", content="exact body", reply_to=None,
+        metadata={"copy_block": True, "plain": True, "notify": True, "thread_id": "77",
+                  "telegram_dm_topic_reply_fallback": True})
+    assert result.success is True
+    assert sends[-1][0] == "exact body"
+    assert "thread_id" not in sends[-1][1] and sends[-1][1]["copy_block"] is True

@@ -3989,10 +3989,14 @@ class BasePlatformAdapter(ABC):
             }}
             root_meta["telegram_stale_topic_recovery"] = True
             partial = self._is_partial_delivery(result)
-            root_content = (
-                "A response was partially delivered before its Telegram topic was deleted. "
-                "The complete response remains in Hermes session history."
-                if partial else "Recovered response from a deleted Telegram topic:\n\n" + content)
+            if partial:
+                root_content = ("A response was partially delivered before its Telegram topic was deleted. "
+                                "The complete response remains in Hermes session history.")
+            elif topic_meta.get("copy_block"):
+                # A copy block moves to the root unchanged: a banner would break the exact text.
+                root_content = content
+            else:
+                root_content = "Recovered response from a deleted Telegram topic:\n\n" + content
             logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
                            self.name, chat_id, thread_id)
             return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
