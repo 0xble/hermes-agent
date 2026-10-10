@@ -850,6 +850,11 @@ class GatewayStartupMixin:
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
                                  message_id=getattr(source, "message_id", None), internal=True)
+            resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
+            if resume_marker:
+                # Keep the transport reply anchor for threading, but admit each interruption marker
+                # independently so a second restart cannot dedupe the next synthetic resume.
+                event._outbox_admission_id = f"resume:{resume_marker}"
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )
