@@ -71,12 +71,11 @@ def resolve_target(target: str) -> str:
     return raw
 
 
-# Deterministic negation guard: a quoted span preceded (within three words) by, or containing, one
+# Deterministic negation guard: a quoted span preceded (earlier in its sentence) by, or containing, one
 # of these tokens is refused so "do NOT clear the goal" cannot authorize a clear. "stop" is not a
 # negation: it is itself a control verb.
 _NEGATION_TOKENS = frozenset({"not", "don't", "dont", "never", "no", "shouldn't", "shouldnt",
                               "can't", "cant", "cannot", "won't", "wont", "didn't", "didnt", "doesn't"})
-_NEGATION_WINDOW_WORDS = 3
 
 
 # Characters that wrap or punctuate a word without changing it: sentence punctuation plus Markdown
@@ -93,8 +92,16 @@ def _negation_words(text: str) -> list[str]:
     return words
 
 
+_CLAUSE_BREAK = re.compile(r"[.!?;\n]+")
+
+
 def _is_negated(quote: str, source: str) -> bool:
-    """True when the quote contains a negation or one appears within 3 words before it."""
+    """True when the quote contains a negation, or one appears earlier in its sentence.
+
+    Conservative by design: a refused quote only falls back to an Approve/Deny request, so any
+    negation before the quoted span in the same sentence ("do not, under any circumstances,
+    clear ...") refuses it. Only a sentence break (. ! ? ; newline) ends the governing clause.
+    """
     def negates(words: list[str]) -> bool:
         return any(w in _NEGATION_TOKENS for w in words)
 
@@ -109,7 +116,8 @@ def _is_negated(quote: str, source: str) -> bool:
         if idx and not source[idx - 1].isspace():
             # The quote starts mid-word ("t clear ..." inside "don't clear ..."): judge the whole word.
             prefix += quote.split(" ", 1)[0]
-        if negates(_negation_words(prefix)[-_NEGATION_WINDOW_WORDS:]):
+        clause = _CLAUSE_BREAK.split(prefix)[-1]
+        if negates(_negation_words(clause)):
             return True
         start = idx + 1
 

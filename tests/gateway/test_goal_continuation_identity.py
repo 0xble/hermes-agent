@@ -467,3 +467,37 @@ async def test_control_continuation_pins_its_destination_session(state):
     event = await _control_event(runner, _apply(state, "resume"))
     assert event.metadata.get("gateway_session_id") == "target"
     assert event.metadata.get("gateway_session_strict") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["replace", "clear_then_set"])
+async def test_superseded_continuation_turn_is_not_judged_against_the_new_goal(state, change):
+    """An old continuation already running when the goal is replaced must not spend the new goal."""
+    from hermes_cli.goals import GoalManager, load_goal
+
+    runner = _runner(state)
+    GoalManager("target").set("old objective")
+    old = await _post_turn_event(runner)
+    if change == "replace":
+        _apply(state, "replace", goal="new objective", max_turns=1)
+    else:
+        GoalManager("target").clear()
+        GoalManager("target").set("new objective", max_turns=1)
+    before = load_goal("target")
+    runner.adapter._pending_messages.clear()
+    runner.async_session_store = SimpleNamespace(
+        get_or_create_session=AsyncMock(return_value=runner.target))
+    runner._final_text_for_post_turn_hooks = lambda result, event=None: "finished the old objective"
+    runner._is_user_turn_event = lambda event: False
+    runner._post_turn_loop_completion = AsyncMock()
+    judge = patch("hermes_cli.goals.judge_goal", return_value=("done", "old work done", True, None, False))
+    with judge as judged:
+        await runner._run_post_turn_hooks(
+            agent_result={"final_response": "finished the old objective"},
+            source=runner.target.origin, is_internal=True, event=old,
+        )
+    after = load_goal("target")
+    judged.assert_not_called()
+    assert after.status == "active" and after.goal == "new objective"
+    assert after.turns_used == before.turns_used == 0
+    assert runner.target.session_key not in runner.adapter._pending_messages

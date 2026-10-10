@@ -518,6 +518,7 @@ class GatewayGoalsMixin:
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
         user_initiated: bool = False, external_event: bool = False,
+        goal_instance: Optional[float] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -534,6 +535,12 @@ class GatewayGoalsMixin:
         if mgr is None:
             return
         if not mgr.is_active():
+            return
+        # A continuation turn answers the goal instance it was stamped for. If that goal was
+        # replaced or cleared and re-set while the turn ran, its response is not evidence for the
+        # new goal: judging it would spend the new goal's turns and verdicts on old work.
+        if goal_instance is not None and getattr(mgr.state, "created_at", None) != goal_instance:
+            logger.info("goal continuation: turn answered a superseded goal instance; not judged")
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -604,10 +611,13 @@ class GatewayGoalsMixin:
             metadata = getattr(event, "metadata", None) or {}
             external_event = metadata.get("notification_origin") == "process_registry_synthetic"
             turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
-            hooks.insert(0, (
-                "goal continuation", self._post_turn_goal_continuation,
-                {"user_initiated": turn_is_user, "external_event": external_event},
-            ))
+            goal_kwargs = {"user_initiated": turn_is_user, "external_event": external_event}
+            # A stamped continuation turn is judged only against the goal instance it served.
+            instance = metadata.get("goal_continuation_instance") if metadata.get(
+                GOAL_CONTINUATION_METADATA_KEY) else None
+            if type(instance) in (int, float):
+                goal_kwargs["goal_instance"] = instance
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(

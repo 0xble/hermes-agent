@@ -400,6 +400,10 @@ def test_request_control_refuses_target_without_approval_surface(state):
     ("Please `don't` clear the target goal immediately", "clear the target goal immediately"),
     ("Please do ~~not~~ clear the target goal immediately", "clear the target goal immediately"),
     ("Please do**not**clear the target goal immediately", "clear the target goal immediately"),
+    ("Please do not, under any circumstances, clear the target goal immediately.",
+     "clear the target goal immediately"),
+    ("Never, even if the build passes and the deploy is green, clear the target goal",
+     "clear the target goal"),
 ])
 def test_negated_quote_is_refused(state, message, quote):
     from hermes_cli.goals import GoalManager, load_goal
