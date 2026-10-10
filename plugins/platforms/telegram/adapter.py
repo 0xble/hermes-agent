@@ -12,6 +12,7 @@ import os
 import html as _html
 import re
 import sqlite3
+import tempfile
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -4237,11 +4238,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal(), pre_send=True)
         return None
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any]):
-        """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: Dict[str, Any], *, plain: bool = False):
+        """Send plain text for copy blocks; otherwise MarkdownV2 with parse fallback."""
         refusal = self._text_send_refusal()
         if refusal is not None:
             return refusal
+        if plain:
+            return await _await_with_thread_deadline(
+                self._bot.send_message(text=chunk, parse_mode=None, **send_kwargs),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         try:
             return await _await_with_thread_deadline(
                 self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
@@ -4290,7 +4295,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                message = await self._send_chunk_markdown_or_plain(chunk, send_kwargs)
+                message = await self._send_chunk_markdown_or_plain(
+                    chunk, send_kwargs, plain=bool(metadata and metadata.get("copy_block")))
                 if isinstance(message, SendResult):
                     return message
                 return message, used_thread_fallback
@@ -4422,7 +4428,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
-        content = _normalize_dollar_entities(content)
+        if not (isinstance(metadata, dict) and metadata.get("copy_block")):
+            content = _normalize_dollar_entities(content)
+        # Copy blocks are intentionally opaque: preserve the body byte-for-byte and bypass all rich rendering.
         outbound = current_outbound_class() or (
             OUTBOUND_PROGRESS if isinstance(metadata, dict) and metadata.get("_interim_send") else None)
         if self._daily_sheds(chat_id, outbound):
@@ -4483,6 +4491,27 @@ class TelegramAdapter(BasePlatformAdapter):
         chunks: List[str] = []
         delivered: List[str] = []
         try:
+            if isinstance(metadata, dict) and metadata.get("copy_block"):
+                if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+                    # Telegram cannot carry this body as one text message. Preserve it intact in a
+                    # UTF-8 .txt document instead of adding chunk suffixes or altering the body.
+                    temp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as copy_file:
+                            copy_file.write(content.encode("utf-8"))
+                            temp_path = copy_file.name
+                        # Native upload only: the generic fallback sends a warning text whose success
+                        # would wrongly acknowledge the copy body itself as delivered.
+                        return await self._send_local_file(
+                            "File", temp_path, chat_id, reply_to, metadata, "document",
+                            lambda f: {"document": f, "filename": "copy.txt"},
+                            self._copy_document_failed)
+                    finally:
+                        if temp_path:
+                            with contextlib.suppress(OSError):
+                                os.unlink(temp_path)
+                chunks = [content]
+                return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
             if self._should_attempt_rich(content, metadata=metadata):
@@ -6374,6 +6403,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return _flood_cap_result(flood.wait)
         except Exception as e:
             return await on_error(e)
+
+    async def _copy_document_failed(self, e: Exception) -> SendResult:
+        logger.warning("[%s] Failed to send copy block document: %s", self.name, _redact_telegram_error_text(e))
+        return SendResult(success=False, error=f"copy block document upload failed: {_redact_telegram_error_text(e)}")
 
     async def _warn_then(self, media_key: str, e: Exception, fallback) -> SendResult:
         logger.warning("[%s] Failed to send %s: %s", self.name, media_key, _redact_telegram_error_text(e))

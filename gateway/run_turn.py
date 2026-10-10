@@ -1944,14 +1944,34 @@ class GatewayTurnMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
+        from gateway.platforms.base import EphemeralReply
+        is_ephemeral_response = isinstance(response, EphemeralReply) or bool(
+            agent_result.get("is_ephemeral_response", getattr(event, "_is_ephemeral_response", False)))
+        ephemeral_ttl = getattr(response, "ttl_seconds", None)
+        if isinstance(response, EphemeralReply):
+            response = response.text
+        if ephemeral_ttl is None:
+            try:
+                ephemeral_ttl = int(agent_result.get("ephemeral_ttl", getattr(event, "_ephemeral_ttl", 0)) or 0)
+            except (TypeError, ValueError):
+                ephemeral_ttl = 0
+        from gateway.copy_blocks import render_copy_blocks_inline, split_copy_blocks_for
+        response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response) if response else (response, [])
+        if agent_result.get("interrupted") and response:
+            # An interrupted model may end inside a copy block. Never promote that partial
+            # fragment to a separate copy message; inline degradation also keeps markers hidden.
+            response_without_copy, copy_blocks = render_copy_blocks_inline(response), []
+        # Copy blocks are separate finals even when the ordinary body was streamed.
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
+        # Paste-ready text is read, never spoken, on every platform.
+        from gateway.copy_blocks import strip_copy_blocks
+        _spoken = strip_copy_blocks(response) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+            event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            await self._send_voice_reply(event, _spoken)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
@@ -1959,8 +1979,37 @@ class GatewayTurnMixin:
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             media_delivered = False
-            if response and adapter and not agent_result.get("media_already_delivered"):
-                media_delivered = bool(await self._deliver_media_from_response(response, event, adapter))
+            copy_failed = False
+            copy_delivered = False
+            if (adapter and copy_blocks and not agent_result.get("interrupted")
+                    and not agent_result.get("copy_already_delivered")):
+                copy_results = []
+                await adapter._send_copy_blocks(
+                    event, session_key, copy_blocks, self._event_thread_metadata(event, source) or {},
+                    copy_results.append, is_ephemeral_response=is_ephemeral_response,
+                    ephemeral_ttl=ephemeral_ttl,
+                )
+                copy_delivered = any(getattr(result, "success", False) for result in copy_results)
+                copy_failed = any(not getattr(result, "success", False) for result in copy_results)
+            if adapter and agent_result.get("interrupted") and response:
+                from gateway.copy_blocks import adapter_sends_copy_blocks, extract_copy_blocks
+                _, _partial_bodies = extract_copy_blocks(response)
+                if _partial_bodies and adapter_sends_copy_blocks(adapter):
+                    # The stream hid these bodies for separate sending, but an interrupted block
+                    # may be partial: show them as ordinary reply text instead of dropping them.
+                    try:
+                        await adapter.send(source.chat_id, "\n".join(_partial_bodies),
+                                           metadata=self._event_thread_metadata(event, source))
+                    except Exception as _e:
+                        logger.warning("interrupted copy text send failed: %s", _e)
+            if copy_failed:
+                agent_result["failed"] = True
+                agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
+            if response_without_copy and adapter and not agent_result.get("media_already_delivered"):
+                # Attachments come only from text outside copy blocks: a body is literal text.
+                from gateway.copy_blocks import strip_copy_blocks
+                media_delivered = bool(await self._deliver_media_from_response(
+                    strip_copy_blocks(response), event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
@@ -1972,13 +2021,13 @@ class GatewayTurnMixin:
             # later delivery can still reconcile it (the queued lane reconciles its own uploads).
             if adapter and hasattr(adapter, "_reconcile_restart_note_after_delivery"):
                 streamed_text = False
-                if response:
+                if response_without_copy:
                     try:
                         from gateway.run import _strip_response_attachments_for_direct_send
                         streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
                     except Exception:
                         streamed_text = True  # fail open to the historical unconditional reconcile
-                if streamed_text or media_delivered:
+                if streamed_text or media_delivered or (copy_delivered and not copy_failed):
                     await adapter._reconcile_restart_note_after_delivery(event, session_key)
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
@@ -1986,6 +2035,11 @@ class GatewayTurnMixin:
                 event._streamed_final_response = str(raw_response or "")
             return None
 
+        if agent_result.get("interrupted") and response:
+            # The adapter renders the blocks inline, keeping each body opaque to directive
+            # extraction, instead of promoting a possibly partial block to its own message.
+            with suppress(Exception):
+                event._copy_blocks_inline_only = True
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
@@ -2604,13 +2658,24 @@ class GatewayTurnMixin:
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
             images, media_files, text_content = [], [], ""
+            from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
+            response, copy_blocks, inline_bodies = split_copy_blocks_protected(adapter, response)
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
+                text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
+            for copy_block in copy_blocks:
+                copy_metadata = dict(_thread_metadata or {})
+                copy_metadata["copy_block"] = True
+                copy_metadata["plain"] = True
+                copy_result = await adapter.send(chat_id=source.chat_id, content=copy_block, metadata=copy_metadata)
+                if not getattr(copy_result, "success", False):
+                    logger.error("Background copy block delivery failed for %s: %s", source.chat_id,
+                                 getattr(copy_result, "error", None) or "no result")
+            if not text_content and not copy_blocks and not images and not media_files:
                 await adapter.send(
                     chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
                 )
@@ -3892,6 +3957,9 @@ class GatewayTurnMixin:
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+                    # Its copy blocks went out (or wait in the ledger) on that lane too; the
+                    # completion path must not send them a second time.
+                    result["copy_already_delivered"] = True
                 return bool(_text_delivered)
         return True
 
@@ -4163,6 +4231,9 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
+        # The streamed message is the body only; copy blocks go out as separate messages.
+        from gateway.copy_blocks import copy_free_text_for
+        content = copy_free_text_for(_sc.adapter, content or "")
         try:
             _res = await _sc.adapter.edit_message(
                 chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
