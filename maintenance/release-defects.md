@@ -690,3 +690,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - `gateway_command` returns the subcommand handler's result, and the fork's `gateway update` and `gateway guardian` handlers report failure as a non-zero int, but `cmd_gateway` discarded it. A rejected update reason or a failed guardian run therefore exited 0, so shell callers, cron and launchd saw success. `cmd_gateway` now returns the result to `main()`, which exits with a non-zero int and treats `None` or 0 as success.
 - Upstream status: `upstream/main` drops the result the same way, but none of its gateway handlers return an int, so the defect is only observable through the fork's subcommands.
 - Guard: `tests/hermes_cli/test_gateway_exit_code.py`.
+
+## Agent update from a served profile dialed a nonexistent socket
+
+- Fork patch identity: `update-lifecycle`.
+- Terminal subprocesses inherit the routed profile's `HERMES_HOME`, but a multiplexer owns
+  only the control socket at its launch home. `gateway update` used the routed home and
+  returned "gateway update handoff unavailable" for a healthy served named profile.
+- The CLI now reuses `host_multiplexer_serving()` (verified owner identity and same-tenant
+  filtering), addresses that owner's home, and falls back to the caller's home without an
+  owner. Cross-home handoffs identify the requesting profile; the owner validates it against
+  its live served-home map, scopes the SQLite lineage lookup, and retains that profile in
+  its own update marker. Root-home requests keep their original socket and payload.
+- Guards: `tests/hermes_cli/test_gateway_agent_update_owner.py` uses a real isolated owner
+  socket and rendezvous record; its named-profile case fails on the base while the root
+  control passes. `tests/gateway/test_agent_update_profile_scope.py` distinguishes identical
+  session IDs in two real profile databases and rejects unserved/traversal profile names.
+- Retire with `update-lifecycle` only when a released upstream provides equivalent
+  owner-routed, profile-scoped agent handoff and reason-bearing update notifications.
