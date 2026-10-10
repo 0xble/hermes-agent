@@ -146,6 +146,72 @@ async def test_reconnect_restore_gate_is_set_before_interrupted_note_delivery(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["primary", "secondary"])
+async def test_reconnect_note_scan_failure_still_drains_spool(tmp_path, monkeypatch, caplog, route):
+    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    runner._reconnect_restore_keys = {}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    spool_home = tmp_path
+    entry = runner.session_store._entries.pop(key)
+    if route == "secondary":
+        spool_home = tmp_path / "other"
+        spool_home.mkdir()
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._primary_profile_name = "default"
+        runner._served_profile_homes = {"default": tmp_path, "other": spool_home}
+        source = replace(source, profile="other")
+        key = runner._session_key_for_source(source)
+        entry.origin = source
+        entry.session_key = key
+    entry.resume_turn_id = "resume-reconnect"
+    runner.session_store._entries[key] = entry
+    with _profile_runtime_scope(spool_home, prepared_secret_scope={}):
+        assert flush_pending_to_file({key: MessageEvent(text="owed follow-up", source=source, user_id="u1")}) == 1
+    spool, = (spool_home / "pending_messages").glob("*.json")
+
+    def ready(_entry, *, require_adapter=True):
+        # Spool admission succeeds; the later interrupted-note scan fails.
+        if require_adapter:
+            raise RuntimeError("note candidate identity failed")
+        return adapter, source
+
+    async def handle(event):
+        assert runner._reconnect_restore_keys == {key: 1}
+        event._gateway_accepted = True
+
+    runner._auto_resume_ready = MagicMock(side_effect=ready)
+    runner._send_interrupted_turn_notes = AsyncMock()
+    runner._sync_voice_mode_state_to_adapter = MagicMock()
+    runner._schedule_planned_restart_replay = MagicMock()
+    runner._redeliver_failed_obligations_for_platform = AsyncMock()
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    # Stop a regressed secondary reconnect immediately instead of waiting for its retry backoff.
+    adapter.disconnect = AsyncMock(side_effect=lambda: setattr(runner, "_running", False))
+    if route == "primary":
+        runner._failed_platforms = {source.platform: {}}
+        runner._publish_primary_adapter = lambda platform, adapter: runner.adapters.__setitem__(platform, adapter)
+        runner._update_platform_runtime_status = MagicMock()
+        await runner._install_reconnected_adapter(source.platform, adapter)
+        await runner._reconnect_spool_tasks[source.platform]
+        assert runner.adapters[source.platform] is adapter
+    else:
+        runner._secondary_reconnect_attempt = AsyncMock(return_value=(adapter, True))
+        await runner._run_secondary_profile_reconnect("other", source.platform)
+        assert runner._profile_adapters["other"][source.platform] is adapter
+    adapter.disconnect.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.call_args.args[0].text == "owed follow-up"
+    assert not spool.exists()
+    assert runner._startup_restore_queue == []
+    assert runner._reconnect_restore_keys == {}
+    runner._send_interrupted_turn_notes.assert_not_awaited()
+    assert "Pending auto-resume after telegram reconnect failed" in caplog.text
+    db.append_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_reconnect_restore_gate_is_released_when_note_delivery_is_cancelled(tmp_path, monkeypatch):
     runner, adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
     runner._startup_restore_in_progress = False

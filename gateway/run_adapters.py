@@ -920,12 +920,17 @@ class GatewayAdapterLifecycleMixin:
                     for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
         reconnect_note_keys = []
         for entry in candidates or ():
-            if (platform is not None and getattr(entry.origin, "platform", None) != platform):
-                continue
-            if not getattr(entry, "resume_turn_id", None):
-                continue
-            if self._auto_resume_ready(entry) is not None:
-                reconnect_note_keys.append(entry.session_key)
+            try:
+                if (platform is not None and getattr(entry.origin, "platform", None) != platform):
+                    continue
+                if not getattr(entry, "resume_turn_id", None):
+                    continue
+                if self._auto_resume_ready(entry) is not None:
+                    reconnect_note_keys.append(entry.session_key)
+            except Exception:
+                # A bad note candidate must not strand follow-ups already claimed above.
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
         keys.update(reconnect_note_keys)
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
