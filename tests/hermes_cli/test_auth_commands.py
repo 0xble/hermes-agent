@@ -1046,6 +1046,8 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
     import hermes_cli.auth_openrouter as orm
 
     seen: dict = {}
+    workers = []
+    errors = []
 
     def _browser(url):
         callback = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["callback_url"][0]
@@ -1054,20 +1056,34 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
 
         def _redirects():
             try:
-                urllib.request.urlopen(forged, timeout=5)
-            except urllib.error.HTTPError as exc:
-                seen["forged_status"] = exc.code
-            with urllib.request.urlopen(f"{callback}?code=good-code", timeout=5) as resp:
-                seen["genuine_status"] = resp.status
+                try:
+                    urllib.request.urlopen(forged, timeout=5)
+                except urllib.error.HTTPError as exc:
+                    seen["forged_status"] = exc.code
+                with urllib.request.urlopen(f"{callback}?code=good-code", timeout=5) as resp:
+                    seen["genuine_status"] = resp.status
+            except Exception as exc:
+                errors.append(exc)
 
-        threading.Thread(target=_redirects, daemon=True).start()
+        worker = threading.Thread(target=_redirects, daemon=True)
+        workers.append(worker)
+        worker.start()
         return True
 
     monkeypatch.setattr(orm, "_can_open_graphical_browser", lambda: True)
     monkeypatch.setattr(orm.webbrowser, "open", _browser)
 
-    code = orm._openrouter_loopback_code(
-        {"code_challenge": "c", "code_challenge_method": "S256"}, open_browser=True, timeout_seconds=10)
+    try:
+        code = orm._openrouter_loopback_code(
+            {"code_challenge": "c", "code_challenge_method": "S256"}, open_browser=True, timeout_seconds=10)
+    finally:
+        # The server publishing a code does not mean the browser thread has
+        # observed its HTTP response. Join that owner before reading its results
+        # (and before monkeypatch restores the client on any failure).
+        for worker in workers:
+            worker.join(timeout=12)
+            assert not worker.is_alive(), "OpenRouter browser redirects did not finish"
+    assert not errors, f"OpenRouter browser redirect failed: {errors!r}"
 
     parsed = urllib.parse.urlparse(seen["callback"])
     assert parsed.hostname == "127.0.0.1" and parsed.path.startswith("/callback/") and len(parsed.path) > 20
