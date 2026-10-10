@@ -372,6 +372,7 @@ class _ResponsesStream:
         item stays clean (#67580). Closes any open reasoning item first so a reasoning item
         never straddles a message item."""
         await self.close_reasoning_item()
+        text = render_copy_blocks_inline(text)
         item = {"id": f"msg_{uuid.uuid4().hex[:24]}", "status": "completed", "phase": "commentary",
                 **_message_item(text)}
         idx = self.output_index

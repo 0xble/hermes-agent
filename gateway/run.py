@@ -2834,10 +2834,13 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     Queued follow-up resends only replay explicit ``MEDIA:`` attachments in this path. Keep bare local paths
     and ordinary image URLs visible because the post-stream uploader intentionally ignores them (#20834).
     """
-    from gateway.copy_blocks import copy_free_text_for
-    response = copy_free_text_for(adapter, response)
+    # Copy bodies are literal text: separately sent ones are dropped, inline ones are opaque
+    # to directive extraction and restored byte-exact.
+    from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
+    response, _, inline_bodies = split_copy_blocks_protected(adapter, response)
     _, cleaned = adapter.extract_media(response)
-    return cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "").strip()
+    cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
+    return restore_inline_copy_bodies(cleaned, inline_bodies).strip()
 
 
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:

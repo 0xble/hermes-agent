@@ -639,9 +639,9 @@ class GatewayNotificationsMixin:
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
         from gateway.copy_blocks import split_copy_blocks_for
-        response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response)
+        _, copy_blocks = split_copy_blocks_for(adapter, response)
         if not text_already_delivered:
-            text_content = _strip_response_attachments_for_direct_send(response_without_copy, adapter)
+            text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
@@ -728,8 +728,10 @@ class GatewayNotificationsMixin:
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
+        # Attachments come only from text outside copy blocks: a body is literal text.
+        from gateway.copy_blocks import strip_copy_blocks
         media_delivered = await self._deliver_media_from_response(
-            response_without_copy, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            strip_copy_blocks(response), MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
         # Attachment-only answer: no text was sent, so the note is reconciled only once an upload

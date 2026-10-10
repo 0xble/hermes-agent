@@ -454,3 +454,47 @@ async def test_inline_copy_bodies_never_become_attachments(tmp_path) -> None:
     assert extracted.media_files == [] and extracted.local_files == []
     assert extracted.copy_blocks == []
     assert extracted.text_content == f"Intro\nMEDIA:{literal}"
+
+
+@pytest.mark.asyncio
+async def test_queued_inline_copy_body_never_sends_an_attachment(tmp_path) -> None:
+    literal = tmp_path / "literal.txt"
+    literal.write_text("x")
+    runner = object.__new__(GatewayNotificationsMixin)
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "discord"
+    sends, media_texts = [], []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append(content)
+        return SimpleNamespace(success=True, message_id="m")
+
+    async def media_from(response, *_args, **_kwargs):
+        media_texts.append(response)
+        return False
+
+    adapter.send = send
+    runner._deliver_media_from_response = media_from
+    source = SimpleNamespace(chat_id="chat", platform="discord", thread_id=None)
+    response = f"Intro\n[[copy]]\nMEDIA:{literal}\n[[/copy]]\n"
+    assert await runner._deliver_queued_first_response(response, source, adapter, event_message_id="e")
+    assert sends == [f"Intro\nMEDIA:{literal}"]
+    assert all("MEDIA:" not in text for text in media_texts)
+
+
+@pytest.mark.asyncio
+async def test_api_commentary_renders_copy_blocks_inline() -> None:
+    from gateway.platforms.api_server_openai_routes import _ResponsesStream
+    stream = object.__new__(_ResponsesStream)
+    stream.output_index, stream.emitted_items, written = 0, [], []
+
+    async def _noop():
+        return None
+
+    async def _write(event, payload):
+        written.append(payload)
+
+    stream.close_reasoning_item, stream.write_event = _noop, _write
+    await stream.emit_commentary("Note:\n[[copy]]\nexact\n[[/copy]]\n")
+    assert "[[" not in repr(stream.emitted_items) and "[[" not in repr(written)
+    assert "exact" in repr(stream.emitted_items)

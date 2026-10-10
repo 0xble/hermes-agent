@@ -1965,10 +1965,13 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
+        # Paste-ready text is read, never spoken, on every platform.
+        from gateway.copy_blocks import strip_copy_blocks
+        _spoken = strip_copy_blocks(response) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
-            event, response_without_copy, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+            event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response_without_copy)
+            await self._send_voice_reply(event, _spoken)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
@@ -1992,7 +1995,10 @@ class GatewayTurnMixin:
                 agent_result["failed"] = True
                 agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
             if response_without_copy and adapter and not agent_result.get("media_already_delivered"):
-                media_delivered = bool(await self._deliver_media_from_response(response_without_copy, event, adapter))
+                # Attachments come only from text outside copy blocks: a body is literal text.
+                from gateway.copy_blocks import strip_copy_blocks
+                media_delivered = bool(await self._deliver_media_from_response(
+                    strip_copy_blocks(response), event, adapter))
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
@@ -2007,7 +2013,7 @@ class GatewayTurnMixin:
                 if response_without_copy:
                     try:
                         from gateway.run import _strip_response_attachments_for_direct_send
-                        streamed_text = bool(_strip_response_attachments_for_direct_send(response_without_copy, adapter))
+                        streamed_text = bool(_strip_response_attachments_for_direct_send(response, adapter))
                     except Exception:
                         streamed_text = True  # fail open to the historical unconditional reconcile
                 if streamed_text or media_delivered or (copy_delivered and not copy_failed):
@@ -2636,12 +2642,13 @@ class GatewayTurnMixin:
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
             images, media_files, text_content = [], [], ""
-            from gateway.copy_blocks import split_copy_blocks_for
-            response, copy_blocks = split_copy_blocks_for(adapter, response)
+            from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
+            response, copy_blocks, inline_bodies = split_copy_blocks_protected(adapter, response)
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
+                text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             for copy_block in copy_blocks:

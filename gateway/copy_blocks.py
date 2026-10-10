@@ -211,6 +211,19 @@ def split_copy_blocks_for(adapter, text: str) -> tuple[str, list[str]]:
     return render_copy_blocks_inline(text), []
 
 
+def split_copy_blocks_protected(adapter, text: str) -> tuple[str, list[str], dict[str, str]]:
+    """:func:`split_copy_blocks_for` for callers that run directive extraction next.
+
+    Inline bodies come back as opaque tokens plus the map that restores them, so MEDIA
+    tags, image links, and paths inside a body are never acted on.
+    """
+    if adapter_sends_copy_blocks(adapter):
+        remaining, blocks = extract_copy_blocks(text)
+        return remaining, blocks, {}
+    protected, bodies = protect_inline_copy_bodies(text)
+    return protected, [], bodies
+
+
 def copy_free_text_for(adapter, text: str) -> str:
     """The streamed body *adapter* shows: bodies removed where they go out separately."""
     return strip_copy_blocks(text) if adapter_sends_copy_blocks(adapter) else render_copy_blocks_inline(text)

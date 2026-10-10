@@ -938,7 +938,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             return
         with suppress(Exception):
             loop.call_soon_threadsafe(run.put_event, _run_event(
-                run_id, "message.interim", text=text, already_streamed=bool(already_streamed)))
+                run_id, "message.interim", text=render_copy_blocks_inline(text),
+                already_streamed=bool(already_streamed)))
 
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
