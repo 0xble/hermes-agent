@@ -97,7 +97,11 @@ class _TurnContextBuilt(Exception):
 @pytest.mark.parametrize("path", ["initial", "eventless", "goal-event", "human-event"])
 @pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
 async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, path, defer):
-    """#419: initial and recursive turns retain provenance when no event survives the drain."""
+    """#419/#444: event-backed turns retain provenance; eventless follow-ups are human.
+
+    A leftover steer/interrupt is new authored text, not the previous goal tick,
+    so a missing event must not confer internal status or goal metadata.
+    """
     from gateway.run import GatewayRunner
     from gateway.turn_context import TurnContext
 
@@ -136,6 +140,8 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
     expected_internal = True
     expected_metadata = metadata
     if path != "initial":
+        expected_internal = False
+        expected_metadata = {}
         pending_event = None
         if path != "eventless":
             expected_internal = path == "goal-event"
@@ -164,11 +170,68 @@ async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, 
     else:
         adapter._pending_messages = {}
         runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    requeued_event = None if path == "eventless" else MessageEvent(
+        text="requeued turn", source=src, internal=expected_internal, metadata=expected_metadata,
+        reply_expected=ctx.reply_expected,
+    )
     await runner._run_agent_queued_followup(
-        ctx, adapter, "requeued turn", None, response=result, result=result, stream_task=None,
+        ctx, adapter, "requeued turn", requeued_event, response=result, result=result, stream_task=None,
     )
     event = queued[0] if defer == "depth-cap" else adapter._pending_messages[key]
     assert ctx.internal is expected_internal
     assert ctx.event_metadata == expected_metadata
+    expected_reply_expected = False if expected_internal else True
+    assert ctx.reply_expected is expected_reply_expected
     assert event.internal is expected_internal
     assert event.metadata == expected_metadata
+    assert event.reply_expected is expected_reply_expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["steer", "interrupt"])
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+async def test_eventless_human_followup_after_goal_tick_requeues_as_human(hermes_home, origin, defer):
+    """A person's leftover text must never acquire the completed goal tick's silence contract."""
+    from gateway.response_filters import display_kind_for_event
+    from gateway.turn_context import TurnContext
+
+    runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
+    runner._draining = False
+    text = "please show me the current status"
+    result: dict[str, object] = {"messages": []}
+    if origin == "interrupt":
+        result.update(interrupted=True, interrupt_message=text)
+    else:
+        result["pending_steer"] = text
+    pending_event, pending = await runner._run_agent_drain_pending(result, adapter, src, key)
+    assert pending_event is None
+    assert pending == text
+
+    ctx = TurnContext(
+        source=src, session_id=entry.session_id, session_key=key, internal=True,
+        event_metadata={"goal_continuation": True, "origin": "goal-tick"}, reply_expected=False,
+    )
+    if defer == "depth-cap":
+        ctx._interrupt_depth = runner._MAX_INTERRUPT_DEPTH
+
+        def queue_message(session_key, text, **contract):
+            adapter._pending_messages[session_key] = MessageEvent(text=text, source=src, **contract)
+
+        setattr(adapter, "queue_message", queue_message)
+    else:
+        runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    # Deferral is reached after a completed recursive turn too, even for an interrupt.
+    completed = {"final_response": "done", "messages": []}
+    await runner._run_agent_queued_followup(
+        ctx, adapter, pending, pending_event, response=completed, result=completed, stream_task=None,
+    )
+    queued = adapter._pending_messages[key]
+    assert queued.text == text
+    assert queued.internal is False
+    assert queued.metadata == {}
+    assert queued.reply_expected is True
+    # Exercise the real second drain and the predicate used by final delivery.
+    drained, drained_text = await runner._run_agent_drain_pending(completed, adapter, src, key)
+    assert drained is queued
+    assert drained_text == text
+    assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is False

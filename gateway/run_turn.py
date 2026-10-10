@@ -4002,10 +4002,16 @@ class GatewayTurnMixin:
                 # Legacy adapters expose only a text queue API. Pass the event contract when the
                 # adapter supports keyword metadata, then fall back without changing old adapters.
                 try:
-                    adapter.queue_message(
-                        session_key, pending, reply_expected=turn_ctx.reply_expected,
-                        internal=turn_ctx.internal, metadata=dict(turn_ctx.event_metadata or {}),
-                    )
+                    if pending_event is not None:
+                        adapter.queue_message(
+                            session_key, pending, reply_expected=pending_event.reply_expected,
+                            internal=pending_event.internal, metadata=dict(pending_event.metadata or {}),
+                        )
+                    else:
+                        adapter.queue_message(
+                            session_key, pending, reply_expected=True,
+                            internal=False, metadata={},
+                        )
                 except TypeError:
                     adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
@@ -4019,8 +4025,8 @@ class GatewayTurnMixin:
                 from gateway.platforms.base import MessageEvent, MessageType
                 deferred = pending_event or MessageEvent(
                     text=str(pending), message_type=MessageType.TEXT, source=source,
-                    internal=turn_ctx.internal, reply_expected=turn_ctx.reply_expected,
-                    metadata=dict(turn_ctx.event_metadata or {}),
+                    internal=False, reply_expected=True,
+                    metadata={},
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
                     existing = adapter._pending_messages.get(session_key)
@@ -4049,7 +4055,10 @@ class GatewayTurnMixin:
         # Queued Discord turns carry the same routing note as first turns; persist the authored text.
         next_persist_message = None
         next_display_kind = display_kind_for_event(pending_event)
-        next_reply_expected = pending_event.reply_expected if pending_event is not None else None
+        # A pending event is authoritative. Without one, the only remaining
+        # follow-up text is an interrupt/steer payload; default it to human
+        # provenance rather than inheriting a prior internal goal tick.
+        next_reply_expected = pending_event.reply_expected if pending_event is not None else True
         if (
             pending_event is not None
             and isinstance(getattr(pending_event, "metadata", None), dict)
@@ -4140,9 +4149,9 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
-                internal=pending_event.internal if pending_event is not None else turn_ctx.internal,
+                internal=pending_event.internal if pending_event is not None else False,
                 event_metadata=dict(
-                    (pending_event.metadata if pending_event is not None else turn_ctx.event_metadata) or {}),
+                    (pending_event.metadata if pending_event is not None else {}) or {}),
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
                 persist_user_display_kind=next_display_kind,
