@@ -51,7 +51,7 @@ def test_extract_copy_blocks_crlf_and_inline_degrade() -> None:
     remaining, blocks = extract_copy_blocks("before\r\n[[copy]]\r\nbody\r\n[[/copy]]")
     assert remaining == "before\r\n"
     assert blocks == ["body"]
-    assert render_copy_blocks_inline("before\n[[copy]]\nbody\n[[/copy]]") == "before\n\nbody"
+    assert render_copy_blocks_inline("before\n[[copy]]\nbody\n[[/copy]]") == "before\nbody\n"
 
 
 def test_copy_marker_stream_filter_hides_split_markers_and_preserves_fences() -> None:
@@ -124,6 +124,21 @@ def test_strip_copy_blocks_leaves_marker_free_text_unchanged() -> None:
     assert strip_copy_blocks(text) == text
     stream = CopyMarkerStreamFilter(drop_bodies=True)
     assert stream.feed(text) + stream.flush() == text
+
+
+def test_inline_render_matches_streamed_render_for_any_split() -> None:
+    import random
+    rng = random.Random(7)
+    pieces = ["a\n", "[[copy]]\n", "[[/copy]]\n", "```\n", "~~~~\n", "x [[copy]]\n", "\r\n", "[[co", "b"]
+    for _ in range(300):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 14)))
+        stream = CopyMarkerStreamFilter()
+        i, out = 0, []
+        while i < len(text):
+            n = rng.randint(1, 5)
+            out.append(stream.feed(text[i:i + n]))
+            i += n
+        assert "".join(out) + stream.flush() == render_copy_blocks_inline(text), repr(text)
 
 
 class _FakeAdapter(BasePlatformAdapter):

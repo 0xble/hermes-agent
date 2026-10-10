@@ -190,15 +190,15 @@ def strip_copy_blocks(text: str) -> str:
 def render_copy_blocks_inline(text: str) -> str:
     """Render copy blocks inline for response surfaces that cannot send separate messages.
 
-    Marker lines are control syntax on those surfaces, so retain each block body in source
-    order and separate it from the ordinary response with a blank line. This helper does
-    not mutate persisted transcript text; callers should apply it only to their output.
+    Marker lines are removed and each body stays where it was, exactly as
+    :class:`CopyMarkerStreamFilter` renders the same text when streamed, so a
+    surface's streamed and final text match. Callers apply this only to their output,
+    never to persisted transcript text.
     """
-    remaining, blocks = extract_copy_blocks(text)
-    if not blocks:
-        return remaining
-    inline_parts = (remaining.rstrip("\r\n"), *blocks)
-    return "\n\n".join(part for part in inline_parts if part)
+    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+        return text
+    stream = CopyMarkerStreamFilter()
+    return stream.feed(text) + stream.flush()
 
 
 __all__ = [

@@ -323,7 +323,7 @@ class TestContentExtraction:
     def test_assistant_copy_blocks_render_inline(self):
         from mcp_serve import _extract_message_content
         msg = {"role": "assistant", "content": "hi\n[[copy]]\nprompt\n[[/copy]]"}
-        assert _extract_message_content(msg) == "hi\n\nprompt"
+        assert _extract_message_content(msg) == "hi\nprompt\n"
         user = {"role": "user", "content": "[[copy]]\nliteral\n[[/copy]]"}
         assert _extract_message_content(user) == user["content"]
 

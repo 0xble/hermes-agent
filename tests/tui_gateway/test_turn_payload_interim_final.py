@@ -51,11 +51,16 @@ def test_final_distinct_from_interim_commentary_is_not_previewed(monkeypatch):
 
 
 def test_message_complete_renders_copy_blocks_inline(monkeypatch):
-    payload = _payload(monkeypatch, _Agent(), "before\n[[copy]]\nbody\n[[/copy]]\nafter")
-    assert payload["text"] == "before\nafter\n\nbody"
+    text = "before\n[[copy]]\nbody\n[[/copy]]\nafter"
+    payload = _payload(monkeypatch, _Agent(), text)
+    # Must equal the streamed rendering, or the TUI shows the answer twice.
+    from gateway.copy_blocks import CopyMarkerStreamFilter
+    stream = CopyMarkerStreamFilter()
+    streamed = "".join(stream.feed(ch) for ch in text) + stream.flush()
+    assert payload["text"] == streamed == "before\nbody\nafter"
 
 
 def test_side_agent_text_renders_copy_blocks_inline():
     from tui_gateway.methods_prompt import _final_response_text
     text = _final_response_text({"final_response": "done\n[[copy]]\ncmd\n[[/copy]]"})
-    assert text == "done\n\ncmd"
+    assert text == "done\ncmd\n"
