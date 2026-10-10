@@ -11,6 +11,7 @@ the new release was serving.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
 import subprocess
@@ -54,6 +55,62 @@ def test_deferred_helper_waits_the_exit_budget_not_the_bootstrap_budget(tmp_path
     assert f"_deadline=$(($(date +%s) + 30))" in script  # bootstrap retries keep their own budget
 
 
+def test_deferred_reload_marks_planned_restart_before_bootout(tmp_path, monkeypatch):
+    """The helper's bootout SIGTERM must reach the gateway as a planned restart, not a crash."""
+    from gateway import status
+
+    seen_at_submit = []
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: 30.0)
+    monkeypatch.setattr(gateway_launchd, "_launchd_reload_log_path", lambda: tmp_path / "reload.log")
+    monkeypatch.setattr(gateway_launchd, "_gw", lambda: SimpleNamespace(_append_launchd_reload_log=lambda *_: None))
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", lambda args, **_: seen_at_submit.append(
+        status.consume_planned_restart_marker_for_self()) or subprocess.CompletedProcess(args, 0))
+
+    assert gateway_launchd._spawn_deferred_launchd_reload(
+        domain="gui/501", label="ai.hermes.gateway", target="gui/501/ai.hermes.gateway",
+        plist_path=tmp_path / "ai.hermes.gateway.plist", gateway_pid=os.getpid(),
+    )
+    assert seen_at_submit == [True]
+
+
+def _bootstrap_over_stale_label(monkeypatch, label):
+    """``launchctl bootstrap`` hits EIO once on a label still supervising this process; returns the
+    launchctl verbs run and whether a planned-restart marker named us when the recovery bootout fired."""
+    from gateway import status
+
+    verbs, marked_at_bootout = [], []
+
+    def run(argv, **_):
+        verbs.append(argv[1])
+        if argv[1] == "bootstrap" and verbs.count("bootstrap") == 1:
+            raise subprocess.CalledProcessError(5, argv)
+        if argv[1] == "bootout":
+            marked_at_bootout.append(status.consume_planned_restart_marker_for_self())
+        stdout = f'{{\n\t"PID" = {os.getpid()};\n}}' if argv[1] == "list" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(gateway_launchd.subprocess, "run", run)
+    gateway_launchd._launchctl_bootstrap("gui/501", Path("/tmp/stale.plist"), label, timeout=30)
+    return verbs, marked_at_bootout
+
+
+def test_bootstrap_eio_recovery_marks_planned_restart_before_bootout(monkeypatch):
+    """`install --force` over a live service reaches the stale-label bootout: a reload, not a crash."""
+    verbs, marked_at_bootout = _bootstrap_over_stale_label(monkeypatch, gateway_launchd.get_launchd_label())
+
+    assert marked_at_bootout == [True]
+    assert verbs[-1] == "bootstrap"
+
+
+def test_bootstrap_eio_recovery_for_guardian_label_writes_no_gateway_marker(monkeypatch):
+    from hermes_cli.gateway_guardian import GUARDIAN_LABEL
+
+    verbs, marked_at_bootout = _bootstrap_over_stale_label(monkeypatch, GUARDIAN_LABEL)
+
+    assert marked_at_bootout == [False]
+    assert "list" not in verbs
+
+
 def test_supervision_window_outlasts_the_generated_throttle_interval(monkeypatch, tmp_path):
     """A replacement that exits early is relaunched one ThrottleInterval later, a healthy outcome."""
     gw = gateway_launchd._gw()
@@ -90,3 +147,33 @@ def test_helper_supervision_probe_matches_real_launchctl_output(tmp_path, monkey
     result = real_run(["/bin/bash", "-c", f"if {probe}; then echo MATCH; fi"],
                             capture_output=True, text=True, env={"PATH": f"{fake}:/usr/bin:/bin"})
     assert (result.stdout.strip() == "MATCH") is matches
+
+
+def test_restart_with_deferred_reload_does_not_also_signal_the_gateway(tmp_path, monkeypatch):
+    """The deferred helper's bootout IS the restart. Signalling the gateway too retires the pid the
+    marker names, so the helper would then boot out the replacement as an unplanned SIGTERM."""
+    from gateway import status
+
+    gw = gateway_launchd._gw()
+    plist_path = tmp_path / "ai.hermes.gateway.plist"
+    plist_path.write_text("<plist/>", encoding="utf-8")
+    launchctl, signalled = [], []
+    monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gw, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gw, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: os.getpid())
+    monkeypatch.setattr(gw, "refresh_launchd_plist_if_needed",
+                        lambda: gateway_launchd._reload_installed_launchd_plist(plist_path))
+    monkeypatch.setattr(gateway_launchd.subprocess, "run",
+                        lambda argv, **_: launchctl.append(argv[:2]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signalled.append(("kill", pid, sig)))
+    monkeypatch.setattr(gw, "_request_gateway_self_restart", lambda pid: signalled.append("self") or True)
+    monkeypatch.setattr(gw, "_graceful_restart_via_sigusr1",
+                        lambda pid, timeout, **_: signalled.append("sigusr1") or True)
+    monkeypatch.setattr(gw, "_wait_for_launchd_service_pid", lambda *a, **k: True)
+
+    gateway_launchd.launchd_restart()
+
+    assert signalled == []
+    assert launchctl == [["launchctl", "submit"]], "only the deferred helper may restart the gateway"
+    assert status.consume_planned_restart_marker_for_self(), "the marker must still name the original pid"
