@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
 from agent.deadline import run_bounded_async
+from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
@@ -193,6 +194,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.rich_messages import project_rich_message
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
+from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
@@ -300,7 +302,7 @@ def _probe_voice_duration_seconds(path: str) -> Optional[int]:
         if shutil.which("ffprobe"):
             proc = subprocess.run(
                 ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
             if proc.returncode == 0:
                 return _coerce_duration_seconds(proc.stdout.strip())
     except Exception:
@@ -324,7 +326,7 @@ def _probe_video_geometry(path: str) -> Dict[str, int]:
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-show_entries", "format=duration",
              "-of", "json", path],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
         if proc.returncode != 0:
             return {}
         blob = json.loads(proc.stdout or "{}")
@@ -360,7 +362,7 @@ def _video_thumbnail_jpeg(path: str, duration: Optional[int]) -> Optional[str]:
         proc = subprocess.run(
             ["ffmpeg", "-y", "-ss", str(seek), "-i", path, "-frames:v", "1",
              "-vf", "scale=320:-2", "-q:v", "6", out],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         if proc.returncode != 0 or not os.path.getsize(out):
             with contextlib.suppress(OSError):
                 os.remove(out)
@@ -424,10 +426,10 @@ def check_telegram_requirements() -> bool:
 
 # Every char MarkdownV2 requires backslash-escaped outside code spans/fences.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
-# A one-line CommonMark code span delimited by two or more backticks, and the real (line-start) fenced
-# blocks such a span must never be matched inside.
+# A one-line CommonMark code span delimited by two or more backticks. The MarkdownV2 fenced-block
+# pass shares its boundaries with the inline pass so code inside a block is never rewritten.
 _MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
-_LINE_START_FENCE_RE = re.compile(r'^ {0,3}(?P<f>`{3,})[^`\n]*\n[\s\S]*?(?:^ {0,3}(?P=f)`*[ \t]*$|\Z)', re.MULTILINE)
+_MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 _BACKTICK_RUN_RE = re.compile(r'`+')
 
 
@@ -471,7 +473,6 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
 from gateway.platforms.helpers import (
     TABLE_SEPARATOR_RE as _TABLE_SEPARATOR_RE, compile_mention_patterns, convert_table_to_bullets as _wrap_markdown_tables)
-from gateway.platforms.helpers import cancel_task
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
@@ -818,10 +819,13 @@ _POLLING_PROGRESS_TIMEOUT = 60.0  # generation unhealthy until getUpdates return
 # #92991) and no other probe can see it. ~3x the worst-case poll window leaves ample margin against false
 # positives while still recovering within a few heartbeat intervals.
 _POLLING_STALL_TIMEOUT = 150.0
-# Ingress dispatch stall (#102260): the transport probes prove getUpdates round-trips complete, not
-# that PTB's dispatcher ever handed the fetched updates to a handler. Two heartbeats (180s) with a
-# backlog and no dispatch progress: diagnostic only, never drives recovery (#71240 owns that).
-_INGRESS_DISPATCH_STALL_HEARTBEATS = 2
+# Ingress dispatch stall (#102260, #130407): the transport probes prove getUpdates round-trips complete, not
+# that PTB's dispatcher ever handed the fetched updates to a handler. A backlog with no dispatch progress for
+# four heartbeats (360s) hands the adapter to the supervisor for a rebuild (an in-place restart keeps the
+# wedged dispatcher). Sized past _POLLING_ERROR_TASK_STUCK_TIMEOUT (300s), the bound on a slow handler: updates
+# of one chat still dispatch in order (PerChatUpdateProcessor), so e.g. a sticker vision_analyze (120s default)
+# must not trip it. Re-arms on progress.
+_INGRESS_DISPATCH_STALL_HEARTBEATS = 4
 
 
 def _non_blocking_get_updates_kwargs(kwargs: dict) -> dict:
@@ -910,7 +914,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(BasePlatformAdapter):
+class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -1202,111 +1206,10 @@ class TelegramAdapter(BasePlatformAdapter):
         Callers must NOT destroy the event (PTB already advanced the offset) — hold and redispatch."""
         return bool(getattr(self, "_drop_delayed_deliveries", False))
 
-    def _schedule_held_inbound_redispatch(self) -> None:
-        """Ensure a tracked drain runs when held events exist and delivery is live (no-op while
-        down or after permanent fatal; an in-flight drain schedules its own follow-up)."""
-        if self._is_permanent_fatal() or self._should_drop_delayed_delivery():
-            return
-        if not getattr(self, "_held_inbound_events", None):
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        prior = getattr(self, "_held_inbound_redispatch_task", None)
-        try:
-            current = asyncio.current_task()
-        except RuntimeError:
-            current = None
-        if prior is not None and not prior.done() and prior is not current:
-            return
-        self._held_inbound_redispatch_task = loop.create_task(self._redispatch_held_inbound(prior=None if prior is current else prior))
-
-    def _hold_inbound_event(self, event: "MessageEvent", *, where: str, schedule: bool = True) -> None:
-        """Preserve an inbound event that cannot be dispatched now (PTB already acked the update, so dropping is silent loss).
-        Capped, identity-deduped; permanent fatal discards. ``schedule=False`` inside a drain avoids poison-event loops.
-
-        The disconnect drop-guard (#55971) correctly prevents dispatch into a torn-down session. Destroying
-        the event is wrong: by the time we reach enqueue/flush, python-telegram-bot has already acked the
-        update and advanced the offset — silent permanent loss, no log, no error.
-        """
-        if self._is_permanent_fatal():
-            logger.warning(
-                "[Telegram] Discarding inbound under non-retryable fatal (%s, %d chars)", where, len(getattr(event, "text", None) or ""))
-            return
-        held = getattr(self, "_held_inbound_events", None)
-        if held is None:
-            self._held_inbound_events = held = []
-        if any(existing is event for existing in held):
-            return
-        max_n = int(getattr(self, "HELD_INBOUND_MAX", 64) or 64)
-        while len(held) >= max_n:
-            dropped = held.pop(0)
-            logger.warning(
-                "[Telegram] Held-inbound queue full (%d); dropping oldest (%d chars)", max_n, len(getattr(dropped, "text", None) or ""))
-        held.append(event)
-        self._accept_update()
-        logger.warning(
-            "[Telegram] Holding inbound (%s, %d chars, queue=%d)%s", where, len(getattr(event, "text", None) or ""), len(held),
-            " - will redispatch on reconnect" if self._should_drop_delayed_delivery() else (" - scheduling redispatch" if schedule else ""))
-        # A live-path hold must not orphan the event waiting for a reconnect that never comes.
-        if schedule and not self._should_drop_delayed_delivery():
-            self._schedule_held_inbound_redispatch()
-
-    def _rehold_from(self, events: list, idx: int, where: str) -> None:
-        """Re-hold ``events[idx:]`` without rescheduling (drain interrupted / failed / cancelled)."""
-        for rest in events[idx:]:
-            self._hold_inbound_event(rest, where=where, schedule=False)
-
-    async def _redispatch_held_inbound(self, prior: Optional[asyncio.Task] = None) -> None:
-        """Drain the hold queue after reconnect or a connected-path hold; ``prior`` (previous
-        redispatch task) is cancelled+awaited here so ``_mark_connected`` stays synchronous."""
-        if prior is not asyncio.current_task():  # a self-redispatch must not cancel itself
-            await cancel_task(prior)
-        held = getattr(self, "_held_inbound_events", None)
-        if self._is_permanent_fatal():
-            if held:
-                n = len(held)
-                held.clear()
-                logger.warning("[Telegram] Redispatch aborted; discarded %d held inbound under non-retryable fatal", n)
-            return
-        if not held:
-            return
-        # Take ownership atomically; concurrent holds append to the fresh list for a follow-up.
-        events = list(held)
-        held.clear()
-        logger.warning("[Telegram] Redispatching %d held inbound message(s)", len(events))
-        allow_followup_schedule = True
-        try:
-            for idx, event in enumerate(events):
-                if self._is_permanent_fatal() or self._should_drop_delayed_delivery():
-                    self._rehold_from(events, idx, "redispatch-interrupted")
-                    return
-                try:
-                    await self.handle_message(event)
-                except asyncio.CancelledError:
-                    self._rehold_from(events, idx, "redispatch-cancelled")
-                    raise
-                except Exception:
-                    # Retryable failure: re-hold but do NOT reschedule now (a poison event would
-                    # tight-loop); the next mark_connected/live hold drains.
-                    logger.exception(
-                        "[Telegram] Failed to redispatch held inbound (%d chars); re-holding", len(getattr(event, "text", None) or ""))
-                    self._rehold_from(events, idx, "redispatch-failed")
-                    allow_followup_schedule = False
-                    return
-        finally:
-            # Events that arrived mid-drain while still connected need another pass.
-            if (
-                allow_followup_schedule
-                and getattr(self, "_held_inbound_events", None)
-                and not self._should_drop_delayed_delivery()
-                and not self._is_permanent_fatal()):
-                self._schedule_held_inbound_redispatch()
-
     def _notification_kwargs(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """In "important" mode return disable_notification=True unless ``metadata["notify"]``."""
-        if getattr(self, "_notifications_mode", "important") != "important" or (metadata or {}).get("notify"):
+        """In "important" mode return disable_notification=True unless ``notify`` or ``is_approval_prompt`` (#132516)."""
+        if getattr(self, "_notifications_mode", "important") != "important" or (metadata or {}).get("notify") \
+                or (metadata or {}).get("is_approval_prompt"):
             return {}
         return {"disable_notification": True}
 
@@ -2650,8 +2553,8 @@ class TelegramAdapter(BasePlatformAdapter):
             # Not a retry: no counter bump, no backoff, no in-place stop/drain. The supervisor's rebuild
             # runs disconnect(), which performs the same bounded updater.stop() and app.shutdown().
             message = (
-                "Telegram polling stall confirmed (getUpdates made no progress); "
-                "rebuilding the adapter instead of reusing an Updater whose long-poll action did not quiesce."
+                "Telegram polling stall confirmed (%s); rebuilding the adapter instead of reusing "
+                "a wedged Updater/dispatcher in place." % _redact_telegram_error_text(error)
             )
             await self._go_fatal_network(message, "[%s] %s (rebuilding adapter via supervisor)", self.name, message)
             return
@@ -2931,14 +2834,15 @@ class TelegramAdapter(BasePlatformAdapter):
         logger.warning("[Telegram] deaf-dispatcher diagnostics: %s", details[:7_500])
 
     def _check_ingress_dispatch_stall(self) -> None:
-        """Report fetched updates PTB's dispatcher is not handing to handlers (#102260).
+        """Escalate fetched updates PTB's dispatcher is not handing to handlers (#102260, #130407).
 
         ``received`` and ``dispatched`` count the same population (every fetched update reaches the
         group-99 catch-all: no handler raises ApplicationHandlerStop, no error handler is registered),
         so a backlog with no dispatch progress across ``_INGRESS_DISPATCH_STALL_HEARTBEATS`` heartbeats
-        is a wedged dispatcher at any traffic rate. Reports once per stall, re-arms on progress.
+        is a wedged dispatcher at any traffic rate. Hands the adapter to the supervisor for a rebuild once
+        per stall (``_PollingStallError``: an in-place restart keeps the wedged dispatcher); re-arms on progress.
         """
-        if self._webhook_mode or self._teardown_started or self.has_fatal_error:
+        if self._webhook_mode or self._teardown_started or self.has_fatal_error or self._recovery_in_flight():
             return
         received = getattr(self, "_updates_received_total", 0)
         dispatched = getattr(self, "_updates_dispatched_total", 0)
@@ -2952,16 +2856,20 @@ class TelegramAdapter(BasePlatformAdapter):
         self._ingress_stalled_heartbeats = stalled + 1
         if stalled + 1 < _INGRESS_DISPATCH_STALL_HEARTBEATS:
             return
-        logger.warning(
-            "[%s] Telegram ingress is healthy but deaf: %d update(s) fetched by getUpdates have not been "
-            "dispatched to any handler across %d heartbeats (%d received, %d dispatched, generation %d). "
-            "Polling is fine; PTB's dispatcher is not draining its queue.",
-            self.name, received - dispatched, _INGRESS_DISPATCH_STALL_HEARTBEATS, received, dispatched,
-            getattr(self, "_polling_generation", 0))
+        # Log the blocked await chains before the rebuild tears the wedged dispatcher's tasks down.
         try:
             self._log_ingress_dispatch_diagnostics()
         except Exception:
             logger.debug("[%s] Telegram deaf-dispatcher diagnostics failed", self.name, exc_info=True)
+        # No separate stall announcement: the handoff warning and ``_go_fatal_network`` carry this text
+        # (see _check_polling_stall).
+        generation = getattr(self, "_polling_generation", 0)
+        self._schedule_polling_recovery(
+            _PollingStallError(
+                "ingress healthy but deaf: PTB dispatcher made no progress for %d heartbeats with %d update(s) "
+                "fetched but not dispatched (%d received, %d dispatched, generation %d)"
+                % (_INGRESS_DISPATCH_STALL_HEARTBEATS, received - dispatched, received, dispatched, generation)),
+            reason="ingress dispatch stall watchdog")
 
     async def _check_polling_stall(self) -> None:
         """Watchdog the last successful getUpdates round-trip: a long-poll can wedge without raising
@@ -3750,13 +3658,12 @@ class TelegramAdapter(BasePlatformAdapter):
             configured=self.config.extra.get("proxy_url"))
 
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
-            return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
-                    HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=updates_httpx))
+            return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **general_httpx}),
+                    HTTPXRequest(**request_kwargs, **extra, httpx_kwargs={"verify": platform_ssl_context(), **updates_httpx}))
 
         if fallback_ips and not proxy_url and not disable_fallback:
             logger.info("[%s] Telegram fallback IPs active: %s", self.name, ", ".join(fallback_ips))
-            # Separate request/update pools reduce contention during polling reconnect + bootstrap calls.
-            _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options()}
+            _transport_kwargs: dict = {"socket_options": tcp_keepalive_socket_options(), "verify": platform_ssl_context()}
             # Keep request/update pools separate to reduce contention during polling reconnect + bot API
             # bootstrap/delete_webhook calls. httpx ignores the client-level `limits` kwarg when a custom
             # `transport` is supplied (#58790). Unlike the proxy/direct branches (which inject limits at the
@@ -3938,7 +3845,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
-            from plugins.platforms.telegram.update_admission import TelegramApplication
+            from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor
             builder = Application.builder().token(self.config.token)
             builder.application_class(TelegramApplication, {"adapter": self})
             custom_base_url = self.config.extra.get("base_url")
@@ -3956,6 +3863,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Every request to a chat (raw do_api_request included) spends that chat's one budget.
             # PTB builder setters mutate in place, so the rebuild-on-retry path keeps the limiter.
             builder.rate_limiter(self._chat_rate_limiter())
+            # PTB's default processor awaits each update inline, so one slow turn deafens every chat.
+            # Concurrent across chats, FIFO within a chat; the builder keeps this instance, so the
+            # connect-retry rebuild in _initialize_app_with_retries gets it too.
+            builder = builder.concurrent_updates(build_update_processor(self.config.extra, self.name))
             self._app = builder.build()
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
@@ -5894,7 +5805,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # A user script under HERMES_HOME the agent can write: scrubbed like cron and quick-command scripts.
             from tools.environments.local import build_subprocess_env
             proc = await asyncio.create_subprocess_exec(
-                str(script_path), arg, *extra_args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                str(script_path), arg, *extra_args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=build_subprocess_env(strip_launch_profile=True))
             _stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=60)
             if proc.returncode == 0:
@@ -6832,13 +6743,14 @@ class TelegramAdapter(BasePlatformAdapter):
         def _ph_wrap(open_: str, close: str):
             return lambda m: _ph(f"{open_}{_escape_mdv2(m.group(1))}{close}")
 
-        # 0) GFM pipe tables → Telegram-friendly row groups, before the MarkdownV2 conversions.
+        # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
+        #    before the normal MarkdownV2 conversions run.
         text = _wrap_markdown_tables(content)
         # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
         # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
-        # fenced pass, which would otherwise read a one-line ```a `` b``` span as a fence; spans inside a real
-        # line-start fence stay that fence's content.
-        fences = [m.span() for m in _LINE_START_FENCE_RE.finditer(text)]
+        # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside
+        # the protected span so multi-backtick inline code there still renders as code.
+        fences = [(m.start(2), m.end()) for m in _MDV2_FENCE_RE.finditer(text)]
 
         def _protect_multi_tick(m):
             if any(start <= m.start() < end for start, end in fences):
@@ -6849,14 +6761,31 @@ class TelegramAdapter(BasePlatformAdapter):
             return _ph('`' + body.replace('\\', '\\\\').replace('`', '\\`') + '`')
 
         text = _MULTI_TICK_CODE_SPAN_RE.sub(_protect_multi_tick, text)
-        # 1) Protect fenced code blocks; per MarkdownV2 spec \\ and ` inside pre/code must be escaped.
+        # 1) Protect fenced code blocks (``` ... ```)
+        #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
+        #    A fence still opens on its own line — the opening ``` must be the
+        #    first triple-backtick run on that line and must end it — but the
+        #    line may carry arbitrary leading whitespace (list/blockquote-
+        #    nested code indents fences by 4+ spaces) or lead-in prose
+        #    ("Here is the code: ```"), both of which the line-start-only
+        #    anchor silently downgraded from <pre> to escaped literal text.
+        #    Requiring the rest of the opening line to be backtick-free is
+        #    what keeps *inline* triple backticks (e.g. "the syntax is
+        #    ```x``` inline") out of the match: a closing run can never sit
+        #    on the same line as the opener, and the tempered prefix cannot
+        #    skip past an earlier run to a later one.  The closing fence must
+        #    sit on its own line (any indent), with optional trailing
+        #    whitespace and an optional ``\r`` so CRLF-terminated fences
+        #    (Windows-authored content) match too.
         def _protect_fenced(m):
-            raw = m.group(0)
-            open_end = raw.index('\n') + 1 if '\n' in raw[3:] else 3  # opening ``` (+ optional language)
-            body = raw[open_end:][:-3].replace('\\', '\\\\').replace('`', '\\`')
-            return _ph(raw[:open_end] + body + '```')
+            prefix = m.group(1)   # lead-in text / indent before the opening fence
+            opening = m.group(2)  # opening ``` (with optional language) and newline
+            body = m.group(3)     # code body (may be empty)
+            closing = m.group(4)   # closing fence (with its indent)
+            body = body.replace('\\', '\\\\').replace('`', '\\`')
+            return prefix + _ph(opening + body + closing)
 
-        text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _protect_fenced, text)
+        text = _MDV2_FENCE_RE.sub(_protect_fenced, text)
         # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
         text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.

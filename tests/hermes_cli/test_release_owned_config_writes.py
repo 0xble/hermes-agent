@@ -246,7 +246,7 @@ def test_updater_context_may_write_from_candidate_release(home, live_release, mo
     _run_from(monkeypatch, candidate, schema=50)
     with updater_owns_config_writes():
         config.migrate_config(interactive=False, quiet=True)
-    stamp, latest = config._read_config_version_stamp()
+    stamp, latest = config.read_config_version_stamp()
     assert stamp == latest > 1
 
     # The exemption is scoped: the same process refuses once the updater context exits.

@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -43,7 +44,7 @@ _LIVE_RECONNECT_BACKOFF_SECS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
 # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
-    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "matrix", "mattermost", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao"})
 
@@ -1492,13 +1493,13 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         if thread_id:
             media_metadata["thread_id"] = thread_id
 
-    # Relay egress needs metadata.scope_id (fail-closed tenant guard; scope cache is COLD after a
-    # restart; router stamps HOME only). Origin targets only: a wrong fan-out scope is worse than
-    # none.
-    if t.origin_target and t.origin.get("scope_id"):
-        route_metadata.setdefault("scope_id", str(t.origin["scope_id"]))
-        media_metadata.setdefault("scope_id", str(t.origin["scope_id"]))
+    # Relay egress discriminators (scope_id / user_id) from the persisted origin: the adapter's caches are cold
+    # after a restart. See cron/scheduler_delivery_origin.py.
+    _origin.stamp_origin_discriminators(t, route_metadata, media_metadata)
     return route_thread_id, route_metadata, media_metadata
+
+
+_LIVE_SEND_CONFIRM_TIMEOUT_SECS = 60
 
 
 def _short_reconnect_wait(error: BaseException, already_waited: float, attempt: int) -> Optional[float]:
@@ -1521,7 +1522,7 @@ def _live_send_text(
     """Schedule the text send on the gateway loop; returns ``(adapter_ok, timed_out, message_id)``.
     Re-raises a real send error so the caller falls through to standalone."""
     from agent.async_utils import safe_schedule_threadsafe
-    from gateway.delivery import DeliveryRouter, DeliveryTarget
+    from gateway.delivery import DeliveryRouter, DeliveryTarget, PartialDeliveryError
     job = t.job
     router = DeliveryRouter(t.config, t.target_adapters)
     route_target = DeliveryTarget(
@@ -1535,30 +1536,52 @@ def _live_send_text(
     reconnect_waited = 0.0
     reconnect_attempt = 0
     while True:
-        future = safe_schedule_threadsafe(
-            router._deliver_to_platform(
-                route_target, text_to_send, route_metadata, transport=t.transport), t.loop)
+        # ``Future.cancel()`` cannot distinguish a coroutine that never reached the gateway loop from
+        # one already sending. Record the coroutine's start before waiting so a wedged loop can fall
+        # back safely without cancelling an in-flight rich send.
+        dispatch_lock = threading.Lock()
+        dispatch = {"started": False, "abandoned": False}
+
+        async def _send_once():
+            with dispatch_lock:
+                if dispatch["abandoned"]:
+                    return None
+                dispatch["started"] = True
+            return await router._deliver_to_platform(
+                route_target, text_to_send, route_metadata, transport=t.transport)
+
+        future = safe_schedule_threadsafe(_send_once(), t.loop)
         if future is None:
             target_errors.append("live adapter event loop scheduling failed")
             return False, False, None
         try:
-            send_result = future.result(timeout=60)
+            send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
         except TimeoutError:
-            # Slow confirmation != failure; future.cancel() disambiguates. False -> already in flight,
-            # cannot be un-sent, standalone resend would DUPLICATE: assume delivered. True -> never
-            # started (loop wedged): MUST fall through to standalone or it is silently dropped.
-            if future.cancel():
+            # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
+            # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
+            # legitimately outlast the wait) — leave it running; a standalone resend would DUPLICATE.
+            with dispatch_lock:
+                dispatch["abandoned"] = not dispatch["started"]
+            if dispatch["abandoned"]:
+                future.cancel()
                 msg = f"live adapter send to {t.where} timed out before the coroutine was dispatched"
                 logger.warning("Job '%s': %s, falling back to standalone", job["id"], msg)
                 target_errors.append(msg)
                 return False, False, None
             logger.warning(
                 "Job '%s': live adapter send to %s:%s timed out "
-                "after 60s; already dispatched (in flight), "
+                "after %ss; already dispatched (in flight), "
                 "assuming delivered (skipping standalone fallback "
                 "to avoid duplicate)",
-                job["id"], t.platform_name, t.chat_id)
+                job["id"], t.platform_name, t.chat_id, _LIVE_SEND_CONFIRM_TIMEOUT_SECS)
             return True, True, None
+        except PartialDeliveryError as ex:
+            # The head of a split send is already on screen: a standalone resend would duplicate it.
+            raw = getattr(ex.result, "raw_response", None) or {}
+            _note_target_error(
+                job, f"live adapter send to {t.where} delivered {raw.get('delivered_chunks', '?')} of "
+                f"{raw.get('total_chunks', '?')} chunks, then failed: {ex}", delivery_errors)
+            return True, False, None
         except Exception as ex:
             # A short flood window is cheaper to sit out than the standalone lane, which cannot send
             # Telegram Rich Messages and degrades footnotes, tables and <details> to legacy markup.
@@ -2293,5 +2316,6 @@ def _deliver_result(
 # Late-bound origin namespace (see module docstring). Imported LAST so this module is fully
 # populated before ``scheduler`` re-exports from it.
 from cron import scheduler as _sched  # noqa: E402
+from cron import scheduler_delivery_origin as _origin  # noqa: E402
 from cron import scheduler_preflight as _preflight  # noqa: E402
 from cron import scheduler_script as _script  # noqa: E402

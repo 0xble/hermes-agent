@@ -138,7 +138,8 @@ def test_degraded_external_worker_remains_active_during_shutdown():
     try:
         assert sched.get_running_job_ids() == frozenset({"degraded-worker"})
         assert sched.get_running_job_details() == [
-            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321}
+            {"job_id": "degraded-worker", "elapsed_s": None, "worker_pid": 4321,
+             "restart_safe": False}
         ]
     finally:
         with sched._running_lock:
@@ -159,7 +160,8 @@ def test_acknowledged_restart_safe_worker_remains_in_ids_and_details():
     try:
         assert sched.get_running_job_ids() == frozenset({"restart-safe"})
         assert sched.get_running_job_details() == [
-            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321}
+            {"job_id": "restart-safe", "elapsed_s": None, "worker_pid": 4321,
+             "restart_safe": False}
         ]
     finally:
         with sched._running_lock:

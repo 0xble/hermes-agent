@@ -20,7 +20,11 @@ import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
 
 
-def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
+# Full object names: the pull refuses a target that does not resolve to one (F17).
+PRE_SHA, POST_SHA = "abc123" + "0" * 34, "def456" + "0" * 34
+
+
+def _make_head_moved_side_effect(pre_sha=PRE_SHA, post_sha=POST_SHA):
     """Simulate git commands where HEAD advances from pre_sha to post_sha."""
     state = {"merged": False}
 
@@ -32,6 +36,8 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
             return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+        if "rev-parse -q --verify" in joined:  # the pull's resolved target
+            return SimpleNamespace(returncode=0, stdout=f"{post_sha}\n", stderr="")
         if joined.endswith("rev-parse HEAD"):
             sha = post_sha if state["merged"] else pre_sha
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
@@ -39,7 +45,7 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
 
     return side_effect
 
-def _make_head_pinned_side_effect(sha="abc123"):
+def _make_head_pinned_side_effect(sha=PRE_SHA, target_sha=POST_SHA):
     """Simulate a detached checkout pinned to ``sha``: HEAD never moves."""
 
     def side_effect(cmd, **kwargs):
@@ -50,6 +56,9 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
         if "rev-list" in joined:
             return SimpleNamespace(returncode=0, stdout="3\n", stderr="")
+
+        if "rev-parse -q --verify" in joined:  # the pull's resolved target
+            return SimpleNamespace(returncode=0, stdout=f"{target_sha}\n", stderr="")
 
         if joined.endswith("rev-parse HEAD"):
             return SimpleNamespace(returncode=0, stdout=f"{sha}\n", stderr="")
@@ -117,7 +126,7 @@ def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     handoff.assert_called_once()
     request = handoff.call_args.args[0]
     assert request.get("apply_mode", "git") == "git"
-    assert request["expected_sha"] == "def456"
+    assert request["expected_sha"] == POST_SHA
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
@@ -132,4 +141,5 @@ def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     assert exc_info.value.code == 1
     handoff.assert_not_called()
     out = capsys.readouterr().out
+    assert "Code did not move" in out
     assert "✓ Code updated!" not in out

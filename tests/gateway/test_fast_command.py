@@ -136,6 +136,9 @@ async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    # /fast now resolves eligibility through the session runtime resolver; with
+    # no session override that path calls the real provider resolver, so stub it.
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
 
     response = await runner._handle_fast_command(_make_event("/fast fast --global"))
 
@@ -160,6 +163,9 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
         lambda: {"agent": {"service_tier": "fast"}},
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    # Eligibility routes through the session runtime resolver; stub the real
+    # provider resolution the no-override path would otherwise trigger.
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
 
     event = _make_event("/fast normal")
     session_key = runner._session_key_for_source(event.source)
@@ -303,6 +309,7 @@ async def test_prepare_turn_stages_expiry_notice_once_before_run_sync(monkeypatc
 
     session_entry = SimpleNamespace(
         session_key=session_key, session_id="session-1", created_at=100.0, updated_at=100.0,
+        yolo=False,
     )
     runner.config = SimpleNamespace(
         get_connected_platforms=lambda: [],
@@ -458,12 +465,12 @@ def test_non_static_fast_modes_never_get_a_deadline(monkeypatch, tmp_path, tier)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("base_url, provider, warned", [
-    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", True),   # proxy: params never sent
-    ("https://api.openai.com/v1", "openai", False),              # first-party: fast applies
+@pytest.mark.parametrize("base_url, provider, route_supported", [
+    ("http://127.0.0.1:8317/v1", "custom:codex-proxy", False),  # proxy: params never sent
+    ("https://api.openai.com/v1", "openai", True),              # first-party: fast applies
 ])
-async def test_fast_warns_when_the_route_never_receives_fast_params(monkeypatch, tmp_path, base_url, provider, warned):
-    """`/fast` on a route that strips fast params must say it has no effect, not imply it applied."""
+async def test_fast_follows_the_route_capability_gate(monkeypatch, tmp_path, route_supported, base_url, provider):
+    """`/fast` must refuse a route that cannot carry the selected fast-mode parameters."""
     runner = _make_runner()
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
@@ -471,8 +478,72 @@ async def test_fast_warns_when_the_route_never_receives_fast_params(monkeypatch,
     runner._resolve_session_agent_runtime = lambda **_: ("gpt-5.4", {"provider": provider, "base_url": base_url})
 
     response = await runner._handle_fast_command(_make_event("/fast fast"))
-    assert "FAST" in response
-    assert ("no effect" in response) is warned
+    assert response is not None
+    if route_supported:
+        assert "FAST" in response
+    else:
+        assert "only available" in response
+        assert runner._resolve_session_service_tier(
+            session_key=runner._session_key_for_source(_make_event("/fast fast").source)
+        ) is None
 
     off = await runner._handle_fast_command(_make_event("/fast normal"))
     assert "no effect" not in off
+_ASTRA_ON_CODEX = {"model": "gpt-6-astra", "provider": "openai-codex",
+                   "base_url": "https://chatgpt.com/backend-api/codex", "api_key": "***"}
+_GPT_ON_OPENROUTER = {"model": "openai/gpt-5.4", "provider": "openrouter",
+                      "base_url": "https://openrouter.ai/api/v1", "api_key": "***"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("default_model, override, command, accepted", [
+    # #118761: Astra picked with session /model over a default /fast can't serve.
+    ("claude-sonnet-4-6", _ASTRA_ON_CODEX, "/fast ultrafast", True),
+    # Converse: a fast-capable default must not admit a session route whose turns never carry the tier.
+    ("claude-opus-5-5", _GPT_ON_OPENROUTER, "/fast fast", False),
+])
+async def test_fast_gate_follows_the_session_route(monkeypatch, tmp_path, default_model, override, command, accepted):
+    """Real fast-mode tables: /fast accepts exactly the tiers the session's next turn would send."""
+    runner = _make_runner()
+    event = _make_event(command)
+    session_key = runner._session_key_for_source(event.source)
+    runner._session_model_overrides[session_key] = dict(override)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: default_model)
+
+    response = await runner._handle_fast_command(event)
+
+    tier = runner._resolve_session_service_tier(session_key=session_key)
+    model, runtime = runner._resolve_session_agent_runtime(source=event.source)
+    route = runner._resolve_turn_agent_config("hi", model, runtime)
+    if accepted:
+        assert tier == "ultrafast" and "only available" not in response
+        assert route["request_overrides"] == {"service_tier": "ultrafast"}
+    else:
+        assert "only available" in response
+        assert session_key not in runner._session_service_tier_overrides
+
+
+@pytest.mark.asyncio
+async def test_fast_override_lands_under_the_recovered_telegram_topic_key(monkeypatch, tmp_path):
+    """/fast keys its eligibility check AND its tier override by the topic-recovered source the next
+    turn uses (#30479), not the raw lobby-shaped event source."""
+    import dataclasses
+
+    runner = _make_runner()
+    source = _make_source()
+    monkeypatch.setattr(runner, "_recover_telegram_topic_thread_id", lambda src: "77")
+    raw_key = runner._session_key_for_source(source)
+    turn_key = runner._session_key_for_source(dataclasses.replace(source, thread_id="77"))
+    assert turn_key != raw_key
+    runner._session_model_overrides[turn_key] = dict(_ASTRA_ON_CODEX)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "claude-sonnet-4-6")
+
+    response = await runner._handle_fast_command(MessageEvent(text="/fast fast", source=source, message_id="m1"))
+
+    assert "FAST" in response
+    assert runner._resolve_session_service_tier(session_key=turn_key) == "priority"
+    assert raw_key not in runner._session_service_tier_overrides

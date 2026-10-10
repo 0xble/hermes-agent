@@ -618,8 +618,7 @@ def test_hindsight_discard_prefetch_drops_the_buffer_and_an_in_flight_worker():
     assert provider.prefetch("new topic") == ""
 
 
-def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
-    from plugins.memory.honcho import HonchoMemoryProvider
+def test_retaindb_discard_prefetch_drops_its_buffers():
     from plugins.memory.retaindb import RetainDBMemoryProvider
 
     retaindb = RetainDBMemoryProvider()
@@ -627,11 +626,6 @@ def test_retaindb_and_honcho_discard_prefetch_drop_their_buffers():
     retaindb._agent_model = {"memory_count": 1}
     retaindb.discard_prefetch()
     assert retaindb.prefetch("new topic") == ""
-
-    honcho = HonchoMemoryProvider()
-    honcho._prefetch_result, honcho._prefetch_result_fired_at = "old dialectic", 3
-    honcho.discard_prefetch()
-    assert honcho._consume_pending_dialectic() == ""
 
 
 def test_prefetch_generation_publishes_only_the_current_token():
@@ -697,56 +691,6 @@ def test_retaindb_current_batch_still_publishes():
         thread.join(timeout=5)
     result = provider.prefetch("next")
     assert "fresh memory" in result and "fresh synthesis" in result
-
-
-def _honcho_with_blocked_dialectic(answer):
-    import threading
-    from unittest.mock import MagicMock
-
-    from plugins.memory.honcho import HonchoMemoryProvider
-
-    provider = HonchoMemoryProvider()
-    provider._manager, provider._session_key, provider._session_initialized = MagicMock(), "s", True
-    provider._turn_count, provider._last_dialectic_turn, provider._dialectic_empty_streak = 5, 2, 3
-    entered, release = threading.Event(), threading.Event()
-
-    def dialectic_query(*_args, **_kwargs):
-        entered.set()
-        release.wait(5)
-        if isinstance(answer, BaseException):
-            raise answer
-        return answer
-
-    provider._manager.dialectic_query.side_effect = dialectic_query
-    provider._spawn_dialectic("old topic", thread_name="honcho-prefetch", fired_at=5, log_label="prefetch")
-    assert entered.wait(5)
-    return provider, release
-
-
-@pytest.mark.parametrize("answer", ["old dialectic", "", RuntimeError("timeout")],
-                         ids=["result", "empty", "failure"])
-def test_honcho_discard_prefetch_drops_a_running_dialectic_and_its_cadence_updates(answer):
-    """Review of fb3e903: a blocked dialectic released after the discard published its result. An
-    obsolete run must not touch the pending slot, ``_last_dialectic_turn`` or the empty streak."""
-    provider, release = _honcho_with_blocked_dialectic(answer)
-
-    provider.discard_prefetch()
-    release.set()
-    provider._prefetch_thread.join(timeout=5)
-
-    assert provider._consume_pending_dialectic() == ""
-    assert (provider._prefetch_result, provider._prefetch_result_fired_at) == ("", -999)
-    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (2, 3)
-
-
-def test_honcho_current_dialectic_still_publishes_and_advances_cadence():
-    provider, release = _honcho_with_blocked_dialectic("fresh dialectic")
-
-    release.set()
-    provider._prefetch_thread.join(timeout=5)
-
-    assert (provider._last_dialectic_turn, provider._dialectic_empty_streak) == (5, 0)
-    assert provider._consume_pending_dialectic() == "fresh dialectic"
 
 
 def test_queued_recall_still_waiting_behind_a_slow_sync_is_dropped_with_the_expired_buffer(clock):

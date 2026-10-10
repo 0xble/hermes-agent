@@ -102,25 +102,30 @@ class PluginAdmissionTests(unittest.TestCase):
             admission.changed_entries(self.catalog, "missing-base", head)
 
     def test_invalid_sources_fail_and_owned_clones_are_always_cleaned(self):
-        nested = self.source / "plugins" / "with space"
+        nested = self.source / "plugins" / "nested"
         nested.mkdir(parents=True)
         (nested / "plugin.yaml").write_text("name: nested\n", encoding="utf-8")
         (nested / "version.txt").write_text("nested plugin", encoding="utf-8")
         nested_pin = self.commit(self.source)
-        self.admit(self.entry(sha=nested_pin, subdir="plugins/with space"))
+        self.admit(self.entry(sha=nested_pin, subdir="plugins/nested"))
         self.assertEqual(json.loads(self.record.read_text(encoding="utf-8-sig"))["version"], "nested plugin")
         self.assertEqual(list(self.clones.iterdir()), [])
         for overrides, error in [
             ({"sha": "main"}, "40 lowercase"),
             ({"sha": "f" * 40}, "git exited"),
-            ({"subdir": "../source"}, "inside"),
-            ({"subdir": "C:/outside"}, "inside"),
-            ({"subdir": "/outside"}, "inside"),
+            # The catalog validator rejects escaping subdirs before any clone exists.
+            ({"subdir": "../source"}, "relative path"),
+            ({"subdir": "C:/outside"}, "relative path"),
+            ({"subdir": "/outside"}, "relative path"),
             ({"subdir": "missing"}, "directory"),
         ]:
             with self.subTest(overrides=overrides), self.assertRaisesRegex((ValueError, RuntimeError), error):
                 self.admit(self.entry(**overrides))
             self.assertEqual(list(self.clones.iterdir()), [])
+        # The clone-layer guard still holds on its own if the validator ever loosens.
+        for subdir in ("../source", "C:/outside", "/outside"):
+            with self.subTest(subdir=subdir), self.assertRaisesRegex(ValueError, "inside"):
+                admission.plugin_path(self.source, subdir)
         with self.assertRaisesRegex(RuntimeError, "exited 7"):
             admission.admit(self.entry(), validator=[sys.executable, "-c", "raise SystemExit(7)"], temporary_parent=self.clones)
         self.assertEqual(list(self.clones.iterdir()), [])
