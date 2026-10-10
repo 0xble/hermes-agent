@@ -237,6 +237,9 @@ def _make_text_cb(
                 update.message_id = message_ids.current()
             _send_update(conn, session_id, loop, update)
         elif text is None:
+            # A new message bubble: the held marker prefix is resolved here, and marker
+            # detection restarts at a line start.
+            marker_filter.message_boundary()
             if pending := marker_filter.flush():
                 update = wrap(pending)
                 if message_ids is not None:

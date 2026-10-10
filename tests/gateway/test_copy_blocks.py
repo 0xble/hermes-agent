@@ -498,3 +498,34 @@ async def test_api_commentary_renders_copy_blocks_inline() -> None:
     await stream.emit_commentary("Note:\n[[copy]]\nexact\n[[/copy]]\n")
     assert "[[" not in repr(stream.emitted_items) and "[[" not in repr(written)
     assert "exact" in repr(stream.emitted_items)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_keeps_partial_block_inline_and_literal() -> None:
+    runner = object.__new__(GatewayTurnMixin)
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    adapter._streaming_tts_turn_completed = lambda *_a, **_k: False
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat", platform="telegram"), text="")
+    text = "[[copy]]\n![paste this](https://example.com/literal.png)"
+    returned = await runner._hmwa_deliver_turn_response(
+        event, event.source, None, "session", None, {"interrupted": True}, [], text, None, False,
+    )
+    extracted = await adapter._extract_response_content(returned, event, "", is_ephemeral_response=True)
+    assert extracted.copy_blocks == [] and extracted.images == []
+    assert extracted.text_content == "![paste this](https://example.com/literal.png)"
+
+
+def test_streaming_tts_never_speaks_copy_bodies() -> None:
+    from gateway.streaming_tts_consumer import StreamingTTSConsumer
+    consumer = object.__new__(StreamingTTSConsumer)
+    consumer._aborted = consumer._finished = False
+    consumer._streamer = object()
+    spoken = []
+    consumer._chunker = SimpleNamespace(feed=lambda t: [t], flush=lambda: [])
+    consumer._enqueue_clauses = lambda clauses, *_a, **_k: spoken.extend(clauses)
+    for delta in ["before\n[[copy]]\nPaste ", "exactly.\n[[/copy]]\nafter\n"]:
+        consumer.on_delta(delta)
+    assert "".join(spoken) == "before\nafter\n"

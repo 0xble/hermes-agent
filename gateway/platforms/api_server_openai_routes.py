@@ -438,7 +438,12 @@ class _ResponsesStream:
         "__commentary__": ("emit_commentary", lambda p: p["text"]),
         "__reasoning__": ("emit_reasoning_delta", lambda p: p),
         "__status__": ("emit_status", lambda p: p),
+        "__message_boundary__": ("mark_message_boundary", lambda p: p),
     }
+
+    async def mark_message_boundary(self, _payload: Any = None) -> None:
+        """A new assistant message starts at a line start for copy-marker detection."""
+        self._copy_filter.message_boundary()
 
     async def dispatch(self, item: Any) -> None:
         """Route one queue item: tagged tuples emit immediately, strings are batched, others dropped."""
@@ -619,6 +624,9 @@ class OpenAICompatRoutesMixin:
             # the stream early. Called from the run_conversation worker thread: put_threadsafe.
             if delta is not None:
                 stream_q.put_threadsafe(delta)
+            else:
+                # A new assistant message: copy-marker detection restarts at a line start.
+                stream_q.put_threadsafe(("__message_boundary__", None))
         def _on_reasoning(text):
             # Structured reasoning deltas (#99552): the agent's reasoning_callback, not the
             # lossy 500-char ``reasoning.available`` progress preview. Tagged so the writers
@@ -939,6 +947,8 @@ class OpenAICompatRoutesMixin:
                     await response.write(_sse_frame(delta[1], event="hermes.status"))
                 elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__approval__":
                     await response.write(_sse_frame(delta[1], event="approval.request"))
+                elif isinstance(delta, tuple) and len(delta) == 2 and delta[0] == "__message_boundary__":
+                    copy_filter.message_boundary()
                 else:
                     if delta:
                         await _write_content_delta(str(delta))

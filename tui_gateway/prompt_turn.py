@@ -848,6 +848,8 @@ def _invoke_agent(
     loop_hold = {"text": "", "seen": ""}
     from gateway.copy_blocks import CopyMarkerStreamFilter
     copy_filter = CopyMarkerStreamFilter()
+    # Speech gets its own filter that drops bodies: paste-ready text is read, never spoken.
+    speech_filter = CopyMarkerStreamFilter(drop_bodies=True)
 
     def _deliver_delta(delta):
         with session["history_lock"]:
@@ -855,14 +857,24 @@ def _invoke_agent(
         payload = {"text": delta}
         if streamer and (r := streamer.feed(delta)) is not None:
             payload["rendered"] = r
-        if st.tts_queue is not None and isinstance(delta, str):
-            st.tts_queue.put(delta)
         _emit("message.delta", sid, payload)
+
+    def _speak(raw):
+        if st.tts_queue is None:
+            return
+        if raw is None:
+            speech_filter.message_boundary()
+        elif spoken := speech_filter.feed(raw):
+            st.tts_queue.put(spoken)
 
     def _stream(delta):
         if getattr(agent, "_mute_notification_reply", False):
             return
+        if delta is None:
+            # A new assistant message starts on a new line for copy-marker detection.
+            copy_filter.message_boundary()
         if isinstance(delta, str):
+            _speak(delta)
             delta = copy_filter.feed(delta)
             if not delta:
                 return
@@ -930,6 +942,8 @@ def _invoke_agent(
             st.result = agent.run_conversation(run_message, **st.run_kwargs)
             if copy_tail := copy_filter.flush():
                 _deliver_delta(copy_tail)
+            if st.tts_queue is not None and (spoken_tail := speech_filter.flush()):
+                st.tts_queue.put(spoken_tail)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).

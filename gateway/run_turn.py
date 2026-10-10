@@ -2024,7 +2024,12 @@ class GatewayTurnMixin:
                 event._streamed_final_response = str(raw_response or "")
             return None
 
-        return response_without_copy if agent_result.get("interrupted") else response
+        if agent_result.get("interrupted") and response:
+            # The adapter renders the blocks inline, keeping each body opaque to directive
+            # extraction, instead of promoting a possibly partial block to its own message.
+            with suppress(Exception):
+                event._copy_blocks_inline_only = True
+        return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).

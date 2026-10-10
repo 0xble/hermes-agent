@@ -3677,6 +3677,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
 
         def _delta(delta: str) -> None:
+            if delta is None:
+                copy_filter.message_boundary()  # a new assistant message starts at a line start
+                return
             filtered = copy_filter.feed(delta) if delta else ""
             if filtered:
                 events.enqueue("assistant.delta", {"message_id": message_id, "delta": filtered})

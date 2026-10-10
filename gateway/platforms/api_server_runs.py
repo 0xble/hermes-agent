@@ -922,7 +922,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     copy_filter = CopyMarkerStreamFilter()
 
     def _text_cb(delta: Optional[str]) -> None:
-        if delta is None or run_id not in self._run_streams:
+        if delta is None:
+            copy_filter.message_boundary()  # a new assistant message starts at a line start
+            return
+        if run_id not in self._run_streams:
             return
         filtered = copy_filter.feed(delta)
         if not filtered:
