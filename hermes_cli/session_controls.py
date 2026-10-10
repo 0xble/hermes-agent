@@ -581,7 +581,11 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     return outcome
 
 def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """Validate, mutate through the shared manager, and settle in one write transaction."""
+    """Validate, mutate through the shared manager, and settle in one write transaction.
+
+    The pending check, the manager mutation and the outcome receipt commit together, so a crash
+    at any point before commit leaves the request pending with no change applied; there is no
+    intermediate ``applying`` state to recover."""
     if decision not in {"approve", "deny"}:
         return None
     db = _db()
@@ -717,33 +721,10 @@ def expire_request(request_id: str) -> Optional[Dict[str, Any]]:
     return db._execute_write(_expire)
 
 
-def _recover_interrupted() -> None:
-    db = _db()
-    if db is None:
-        return
-    cutoff = _now() - 10 * 60
-
-    def _recover(conn):
-        rows = conn.execute(
-            "SELECT key, value FROM state_meta WHERE key LIKE ?", (_CONTROL_PREFIX + "%",)
-        ).fetchall()
-        for key, raw in rows:
-            try:
-                record = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if record.get("status") == "applying" and float(record.get("resolved_at") or 0) <= cutoff:
-                record["status"], record["error"] = "failed", "interrupted"
-                db.set_meta(key, json.dumps(record, ensure_ascii=False), cursor=conn)
-
-    db._execute_write(_recover)
-
-
 def pending_outbox() -> list[Dict[str, Any]]:
     db = _db()
     if db is None:
         return []
-    _recover_interrupted()
     out = []
     now = _now()
     for _key, raw in db.list_meta_prefix(_CONTROL_PREFIX):

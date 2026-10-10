@@ -23,8 +23,8 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
 - Telegram callbacks must pass the existing callback allowlist and resolve through a durable compare-and-set; a second, expired, or unauthorized press must not mutate state.
 - Gateway delivery is profile-scoped and drains durable request/outcome rows after restart. The watcher
   runs SessionDB and manager work in the gateway executor and expires requests with an in-transaction
-  CAS. Interrupted approvals are not retried: `applying` rows older than 10 minutes become
-  `failed` with error `interrupted`, and the mutation may already have happened. It
+  CAS. An approval's pending check, manager mutation and outcome receipt commit in one SessionDB
+  write transaction, so a crash before commit leaves the request pending with nothing applied. It
   marks undeliverable CLI/TUI rows skipped/done rather than growing the outbox forever. The watcher drains only the launch
   profile's SessionDB and `session_store`; it does not discover or drain another profile's store.
 

@@ -140,23 +140,6 @@ def test_session_controls_do_not_pollute_goal_or_loop_revisions(state):
     assert len(load_loop("target").revisions) == before_loop
 
 
-def test_stale_applying_request_is_recovered_as_interrupted(state):
-    import json
-    import time
-    from hermes_cli import session_controls
-
-    request = session_controls.request_control("goal", "clear", "target", requester_sid="requester")
-    key = session_controls._record_key(request["id"])
-    record = json.loads(state.get_meta(key))
-    record["status"] = "applying"
-    record["resolved_at"] = time.time() - 11 * 60
-    state.set_meta(key, json.dumps(record))
-    pending = session_controls.pending_outbox()
-    recovered = next(item for item in pending if item["id"] == request["id"])
-    assert recovered["status"] == "failed"
-    assert recovered["error"] == "interrupted"
-
-
 def test_loop_controls_and_goal_replace(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.loops import LoopManager, load_loop
@@ -782,3 +765,35 @@ def test_quote_source_fails_closed_when_summary_classifier_is_unavailable(state,
                            user_quote="clear the target goal immediately")
     assert result["status"] == "pending"
     assert load_goal("target").status == "active"
+
+
+@pytest.mark.parametrize("kind,action", [("goal", "clear"), ("goal", "replace"), ("loop", "stop")])
+def test_approval_crash_after_mutation_commits_nothing_and_stays_approvable_once(state, monkeypatch, kind, action):
+    """The mutation and its receipt commit together: a crash before the receipt leaves no change."""
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.loops import LoopManager, load_loop
+
+    GoalManager("target").set("watch the build")
+    LoopManager("target").set("poll the build", interval_seconds=300)
+    payload = {"goal": "ship the release"} if action == "replace" else None
+    request = session_controls.request_control(kind, action, "target", requester_sid="requester",
+                                               payload=payload)
+    real_save = session_controls._save_record
+
+    def crash_on_receipt(record, *, cursor=None):
+        if record.get("status") == "applied":
+            raise RuntimeError("process died before the receipt")
+        return real_save(record, cursor=cursor)
+
+    monkeypatch.setattr(session_controls, "_save_record", crash_on_receipt)
+    with pytest.raises(RuntimeError):
+        session_controls.resolve_request(request["id"], "approve", "admin")
+    monkeypatch.setattr(session_controls, "_save_record", real_save)
+
+    assert load_goal("target").status == "active" and load_goal("target").goal == "watch the build"
+    assert load_loop("target").status == "active"
+    assert session_controls._load_record(request["id"])["status"] == "pending"
+    applied = session_controls.resolve_request(request["id"], "approve", "admin")
+    assert applied["status"] == "applied"
+    assert session_controls.resolve_request(request["id"], "approve", "admin") is None
