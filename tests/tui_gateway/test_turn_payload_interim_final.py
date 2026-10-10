@@ -48,3 +48,14 @@ def test_final_distinct_from_interim_commentary_is_not_previewed(monkeypatch):
     agent._record_delivered_interim_text("Looking at the config first.")
 
     assert "response_previewed" not in _payload(monkeypatch, agent, "Here is the answer.")
+
+
+def test_message_complete_renders_copy_blocks_inline(monkeypatch):
+    payload = _payload(monkeypatch, _Agent(), "before\n[[copy]]\nbody\n[[/copy]]\nafter")
+    assert payload["text"] == "before\nafter\n\nbody"
+
+
+def test_side_agent_text_renders_copy_blocks_inline():
+    from tui_gateway.methods_prompt import _final_response_text
+    text = _final_response_text({"final_response": "done\n[[copy]]\ncmd\n[[/copy]]"})
+    assert text == "done\n\ncmd"

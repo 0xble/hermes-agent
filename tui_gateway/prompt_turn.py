@@ -441,8 +441,10 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
     # everything otherwise); barge-aware. Speaks the delivered text: a quiet wakeup's bare
     # [SILENT] stays in ``raw`` for the /loop hook above but is never spoken.
     if st.tts_queue is None and isinstance(raw, str) and raw.strip() and _voice_tts_enabled():
+        from gateway.copy_blocks import strip_copy_blocks
         spoken = (_bot_mode_delivery_text(raw, successful=True)
                   if _silence_hidden_turn(session, getattr(st, "prompt_text", "")) else raw)
+        spoken = strip_copy_blocks(spoken)  # paste-ready text is read, not spoken
         try:
             if spoken.strip():
                 threading.Thread(target=_speak_text_with_barge, args=(spoken,), daemon=True).start()
@@ -892,7 +894,9 @@ def _invoke_agent(
     def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
         if getattr(agent, "_mute_notification_reply", False):
             return
-        _emit("message.interim", sid, {"text": text, "already_streamed": already_streamed})
+        from gateway.copy_blocks import render_copy_blocks_inline
+        _emit("message.interim", sid, {
+            "text": render_copy_blocks_inline(text or ""), "already_streamed": already_streamed})
     agent.interim_assistant_callback = (
         _interim_assistant_cb if _load_interim_assistant_messages() else None)
     # A synthesized turn is typed at turn START so a crash persist writes a timeline event,
@@ -1041,8 +1045,10 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         raw = delivered
     # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
     # only the rendered text is emptied.
+    from gateway.copy_blocks import render_copy_blocks_inline
     from gateway.response_filters import strip_trailing_loop_complete_marker
-    visible_raw = strip_trailing_loop_complete_marker(delivered)
+    # The TUI shows one message per turn, so copy blocks render inline without markers.
+    visible_raw = render_copy_blocks_inline(strip_trailing_loop_complete_marker(delivered))
     payload = {"text": visible_raw, "usage": _get_usage(agent), "status": status}
     if receipt := _persisted_turn_receipt(st, raw, status):
         payload["persisted_turn"] = receipt
