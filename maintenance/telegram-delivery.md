@@ -145,6 +145,15 @@ requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls suc
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
 and progress bubbles update at most every 10s.
 
+**Daily volume shedding** (`daily_quota.py`, 2026-10-07). Per-chat message-creating calls are
+counted per Telegram day against `daily_message_soft_ceiling` (default 1500). Turns not typed by
+the user shed typing, interim edits, drafts and progress at 70% of it, and non-final notices at
+100%. Finals are never shed. Cleanup deletes are never shed either: they create no message, and
+shedding them stranded progress bubbles whenever a typed turn's cleanup ran after an in-band drain
+had relabelled the task as a background trigger (2026-10-08 to 10-10, ~170 failures/day). The
+Telegram adapter now runs post-delivery callbacks under the trigger of the turn that registered
+them. Regression: `tests/gateway/test_telegram_daily_quota.py`.
+
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
 classification by id, widening on the real error path plus its scope and expiry, the
