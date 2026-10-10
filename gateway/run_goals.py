@@ -43,13 +43,11 @@ def _goal_notice_kind(message: str) -> str:
     if text.startswith("✓"):
         return "achieved"
     if text.startswith("▶"):
-        return "wait-ended" if "wait ended" in lowered else "resumed"
+        return "resumed"
     if text.startswith("⏸"):
         return "blocked" if "blocked" in lowered else "paused"
     if "blocked" in lowered:
         return "blocked"
-    if "wait ended" in lowered:
-        return "wait-ended"
     return "status"
 
 
@@ -815,13 +813,8 @@ class GatewayGoalsMixin:
         except WakeNotAccepted:
             logger.info("goal wakeup: continuation for session %s not admitted; barrier kept for retry", sid)
             return
-        from hermes_cli.goals import is_continuation_gap_wait
-        gap_wait = is_continuation_gap_wait(mgr.state)
+        # Resuming is silent: the continuation turn itself is the visible signal.
         await self._run_in_executor_with_context(mgr.clear_lifted_wait, since)
-        if gap_wait:
-            return  # the routine pacing hold was never announced, so its end is not either
-        with suppress(Exception):
-            await self._send_goal_status_notice(source, "▶ Goal wait ended — resuming.", notice_kind="wait-ended")
 
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups and resume lifted /goal waits for idle gateway sessions: a coarse
