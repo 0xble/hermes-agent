@@ -122,6 +122,23 @@ Measured before activation: the checkout including all worktrees and generated a
 
 Unreachable rows without a pending transaction: absent pointer with a `current` service/process; different pointer with no journal. An in-progress journal with a ready `current` can be an interrupted pre-transaction migration and is not automatically unreachable. A rollback is represented by **absent `current` and `previous` plus journal `state=rolled-back`**; no source-targeting `current` pointer is valid. Unknown combinations fail closed. Service repair failure is partial. A no-restart request checks for a pending transaction **before** ordinary update recovery, including when restart prohibition comes from gateway/cron policy rather than the literal CLI flag. It may consume an already observed matching gateway acknowledgement, but otherwise returns a partial receipt and exit 1 without staging, changing pointers/plist or invoking launchctl. The no-pull catch-up path applies the same guard. A normal update also stops partial on an applied but unacknowledged reload instead of replaying it; the operator must resolve the supervised gateway mismatch. Pending fleet catch-up runs only after release reconciliation, and `--no-gateway-restart` does not restart the caller's gateway.
 
+## Strict maintenance filesystem failures
+
+The immutable activation gate requests fatal catalog-cache writes and rejects
+`sync_skills()` results carrying copy/update failures from each profile's real
+subprocess. Diagnostics identify the profile, skill destination and filesystem
+error. The gate keeps its existing exception contract: its caller blocks
+promotion on exceptions, not on a false return value. Legacy catalog seeding and
+skill sync remain best-effort; user-modified/deleted, suppressed, externally
+provided and opted-out skills retain their existing policy.
+
+Regression: `scripts/run_tests.sh tests/hermes_cli/test_update_immutable_maintenance.py
+tests/hermes_cli/test_model_catalog.py tests/tools/test_skills_sync.py`. Real files
+obstruct catalog parents, skill category parents and update backup directories;
+the gate accepted all three on the unfixed source and now rejects them. Helper
+regressions also prove non-strict calls keep returning normally. No live profile
+or service is used.
+
 ## Qualification before this runbook may be used
 
 Use a **throwaway launchd label and disposable HERMES_HOME**, never `ai.hermes.gateway` or a prefix enumerated by the updater's real fleet. Prove bootout/re-bootstrap and cleanup of the exact throwaway label; A-worker loaded paths across A→B; B gateway loaded SHA; failed submit/bootstrap and a crash after pointer/plist mutation leave a durable pending transaction; the intended gateway's startup acknowledgement, not a helper return or marker, consumes it after checking loaded plist hash, supervised PID, physical code root/SHA, executable and cwd. Prove that retry while unacknowledged does not re-bootout, and that `--no-gateway-restart` fails before service mutation with a partial receipt. Also prove hard-exit after every pointer, plist, journal, reload-ack and transaction-cleanup mutation for promote, rollback, first migration and first-migration rollback; A→B→A with receipt and fleet verification; first-migration reversal; and retention of real PID/cwd/exe and receipt pins. Run `scripts/run_tests.sh` focused files, `mise x uv@0.12.13 node@26.8.2 -- ./bin/ci preflight`, and the hosted Linux/qualification checks at the **same head SHA**. An ordinary process-group SIGTERM test does not substitute for actual `launchctl bootout` coalition behavior.

@@ -156,11 +156,13 @@ def _read_disk_cache() -> tuple[dict[str, Any] | None, float]:
     return (data, mtime) if _validate_manifest(data) else (None, 0.0)
 
 
-def _write_disk_cache(data: dict[str, Any]) -> None:
+def _write_disk_cache(data: dict[str, Any], *, raise_errors: bool = False) -> None:
     try:
         atomic_json_write(_cache_path(), data)
     except OSError as exc:
         logger.info("model catalog cache write failed: %s", exc)
+        if raise_errors:
+            raise
 
 
 # Stale-while-revalidate: at most one background manifest refresh in flight per cache file (i.e.
@@ -350,10 +352,12 @@ def get_default_model_from_cache(provider: str) -> str | None:
     return _default_model_from_block(_block_of(disk_data, provider)) if disk_data is not None else None
 
 
-def seed_cache_from_checkout(project_root: "Path | str") -> bool:
+def seed_cache_from_checkout(project_root: "Path | str", *, raise_errors: bool = False) -> bool:
     """Overwrite the disk cache with the checkout's ``website/static/api/model-catalog.json``.
     After ``hermes update`` that file IS the newest catalog, so the picker stays current even when
-    the remote fetch is bot-gated. Validated, then written via the same atomic writer."""
+    the remote fetch is bot-gated. Validated, then written via the same atomic writer.
+    ``raise_errors`` makes disk-write failures fatal for immutable maintenance; other
+    callers retain best-effort cache writes."""
     src = Path(project_root) / "website" / "static" / "api" / "model-catalog.json"
     try:
         with open(src, encoding="utf-8-sig") as fh:
@@ -364,7 +368,7 @@ def seed_cache_from_checkout(project_root: "Path | str") -> bool:
     if not _validate_manifest(data):
         logger.debug("model catalog seed from checkout skipped: invalid manifest at %s", src)
         return False
-    _write_disk_cache(data)
+    _write_disk_cache(data, raise_errors=raise_errors)
     reset_cache()  # drop the in-process copy so the next read picks up the seed
     return True
 
