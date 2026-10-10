@@ -146,6 +146,35 @@ async def test_reconnect_restore_gate_is_set_before_interrupted_note_delivery(tm
 
 
 @pytest.mark.asyncio
+async def test_reconnect_restore_gate_is_released_when_note_delivery_is_cancelled(tmp_path, monkeypatch):
+    runner, adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
+    runner._startup_restore_in_progress = False
+    entry = runner.session_store._entries[key]
+    entry.resume_turn_id = "resume-reconnect"
+
+    note_started = asyncio.Event()
+
+    async def send_notes(*_args, **_kwargs):
+        note_started.set()
+        await asyncio.Event().wait()
+
+    runner._send_interrupted_turn_notes = send_notes
+    runner._auto_resume_ready = lambda _entry, **_kwargs: (adapter, source)
+    runner._session_key_for_source = lambda _source: key
+    runner._normalize_source_for_session_key = lambda value: value
+    runner._reconnect_restore_keys = {}
+
+    recovery = asyncio.create_task(runner._recover_spool_after_reconnect(source.platform))
+    await asyncio.wait_for(note_started.wait(), 2)
+    assert runner._reconnect_restore_keys == {key: 1}
+
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    assert runner._reconnect_restore_keys == {}
+
+
+@pytest.mark.asyncio
 async def test_reconnect_during_drain_retains_arrival_for_boot(tmp_path, monkeypatch):
     runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=False)
     runner._startup_restore_in_progress = False

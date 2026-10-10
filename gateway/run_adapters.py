@@ -934,27 +934,27 @@ class GatewayAdapterLifecycleMixin:
             counts[key] = counts.get(key, 0) + 1
         counted_keys = set(keys)
         try:
-            # A platform that was offline at boot could not receive its S2 note. Before reconnect
-            # resumes any durable interruption marker, claim and send that marker's note through the
-            # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
-            if reconnect_note_keys:
-                await self._send_interrupted_turn_notes(
-                    reconnect_note_keys, cancel_on_timeout=True,
-                    timeout=_startup_restore_drain_timeout_secs(),
-                )
-            # Recovery scans all served homes, but only the newly available platform resumes.
-            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
-                                                   restore_tasks=tasks, restore_keys=keys)
-        except Exception:
-            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
-                           exc_info=True)
-        for key in keys:
-            if key not in counted_keys:
-                counts[key] = counts.get(key, 0) + 1
-                counted_keys.add(key)
-        if not keys and not tasks:
-            return
-        try:
+            try:
+                # A platform that was offline at boot could not receive its S2 note. Before reconnect
+                # resumes any durable interruption marker, claim and send that marker's note through the
+                # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
+                if reconnect_note_keys:
+                    await self._send_interrupted_turn_notes(
+                        reconnect_note_keys, cancel_on_timeout=True,
+                        timeout=_startup_restore_drain_timeout_secs(),
+                    )
+                # Recovery scans all served homes, but only the newly available platform resumes.
+                self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                       restore_tasks=tasks, restore_keys=keys)
+            except Exception:
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+            for key in keys:
+                if key not in counted_keys:
+                    counts[key] = counts.get(key, 0) + 1
+                    counted_keys.add(key)
+            if not keys and not tasks:
+                return
             if tasks:
                 await self._wait_bounded_or_release(
                     set(tasks), _startup_restore_drain_timeout_secs(),
