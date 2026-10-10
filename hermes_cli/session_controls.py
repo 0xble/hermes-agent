@@ -458,10 +458,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             raise ValueError("target_unroutable")
     except ValueError as exc:
         return {"ok": False, "error_code": str(exc), "error": str(exc)}
-    quote_check = check_user_quote(requester_sid, user_quote)
-    if isinstance(quote_check, str):
-        # A missing or refused quote (stale, paraphrased, relayed, negated) never authorizes the
-        # control; it falls back to an Approve/Deny request so Brian decides.
+    def request_approval(refused: str) -> Dict[str, Any]:
+        # A missing or refused quote (stale, paraphrased, relayed, negated, or overtaken by a newer
+        # message before the write lock) never authorizes the control; it falls back to an
+        # Approve/Deny request so Brian decides.
         try:
             record = request_control(kind, action, target_sid, requester_sid=requester_sid,
                                      reason=reason, payload=payload)
@@ -471,13 +471,19 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             return record
         outcome = {"ok": True, "status": "pending", "request_id": record["id"], "record": record}
         if user_quote:
-            outcome["quote_refused"] = quote_check
+            outcome["quote_refused"] = refused
         return outcome
+
+    quote_check = check_user_quote(requester_sid, user_quote)
+    if isinstance(quote_check, str):
+        return request_approval(quote_check)
+    _REFUSED = "_quote_refused_in_transaction"
+
     def apply(conn):
         # Recheck after acquiring the write lock: a newer message must not inherit an older quote.
         checked = check_user_quote(requester_sid, user_quote, cursor=conn)
         if isinstance(checked, str):
-            return {"ok": False, "error_code": checked, "error": checked}
+            return {_REFUSED: checked}
         quote, message = checked
         authority = {"via": "quote", "quote": quote, "message": message}
         raw = _meta_value(conn, _definition_key(kind, target_sid))
@@ -502,9 +508,12 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                 **({"error_code": code, "error": code} if code else {}), **result}
 
     try:
-        return _db()._execute_write(apply)
+        outcome = _db()._execute_write(apply)
     except Exception as exc:
         return {"ok": False, "error_code": "apply_failed", "error": str(exc)}
+    if _REFUSED in outcome:
+        return request_approval(outcome[_REFUSED])
+    return outcome
 
 def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Dict[str, Any]]:
     """Validate, mutate through the shared manager, and settle in one write transaction."""

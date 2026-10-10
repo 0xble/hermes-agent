@@ -55,6 +55,28 @@ def test_stale_and_paraphrased_quotes_are_refused(state):
     assert GoalManager("target").state.status == "active"
 
 
+def test_quote_overtaken_before_write_lock_falls_back_to_approval(state, monkeypatch):
+    """A quote valid at first check but stale under the write lock still requests approval."""
+    from hermes_cli.goals import GoalManager
+    from hermes_cli import session_controls
+    from hermes_cli.session_controls import apply_control, pending_outbox
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please clear the target goal immediately")
+    real = session_controls.check_user_quote
+
+    def overtaken(sid, quote, *, cursor=None):
+        if cursor is not None:
+            return "user_quote_not_found"
+        return real(sid, quote)
+
+    monkeypatch.setattr(session_controls, "check_user_quote", overtaken)
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           reason="x", user_quote="clear the target goal immediately")
+    assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_not_found")
+    assert [r["id"] for r in pending_outbox()] == [result["request_id"]]
+    assert GoalManager("target").state.status == "active"
+
+
 def test_quote_from_different_session_and_relay_are_refused(state):
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control
