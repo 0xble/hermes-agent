@@ -553,7 +553,10 @@ async def test_control_outbox_retries_persisted_origin_when_adapter_is_unavailab
     disconnected = _runner(state, target_route=False)
     await disconnected._drain_session_controls()
     persisted = session_controls._load_record(record["id"])
-    assert not persisted.get("continuation_enqueued")
+    if action in {"resume", "replace"}:
+        assert not persisted.get("continuation_enqueued")
+    else:
+        assert not persisted.get("continuations_cleared")
     assert not persisted.get("target_notice_skipped")
     assert not persisted.get("target_notice_sent")
     assert not persisted.get("continuations_cleared")
