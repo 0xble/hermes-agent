@@ -823,6 +823,40 @@ _POLLING_STALL_TIMEOUT = 150.0
 _INGRESS_DISPATCH_STALL_HEARTBEATS = 2
 
 
+def _non_blocking_get_updates_kwargs(kwargs: dict) -> dict:
+    """Return ``do_request`` kwargs for the same getUpdates with Telegram ``timeout=0``.
+
+    PTB closes over one long-poll timeout for every poll and widens ``read_timeout`` by it, so the
+    first poll of a generation sits idle for 10s before it can prove health. Keep offset, limit, and
+    allowed_updates; only drop the server-side wait and the matching read-timeout allowance. Any
+    unexpected PTB shape leaves the request untouched (normal long poll). Relies on PTB 22.x's
+    private ``RequestParameter``; review on PTB 23+.
+    """
+    request_data = kwargs.get("request_data")
+    url = kwargs.get("url")
+    if request_data is None or not isinstance(url, str) or not url.endswith("/getUpdates"):
+        return kwargs
+    try:
+        from telegram.request import RequestData
+        from telegram.request._requestparameter import RequestParameter
+
+        parameters = request_data.parameters
+        wait = parameters.get("timeout")
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait <= 0:
+            return kwargs
+        rebuilt = RequestData(parameters=[
+            RequestParameter.from_input(name, 0 if name == "timeout" else value)
+            for name, value in parameters.items()])
+    except Exception:
+        logger.debug("Telegram first-poll fast path unavailable; keeping long poll", exc_info=True)
+        return kwargs
+    fast = dict(kwargs, request_data=rebuilt)
+    read_timeout = kwargs.get("read_timeout")
+    if isinstance(read_timeout, (int, float)) and not isinstance(read_timeout, bool) and read_timeout > wait:
+        fast["read_timeout"] = read_timeout - wait
+    return fast
+
+
 def _await_chain(coro: Any, limit: int = 30) -> List[str]:
     """Render a suspended coroutine's await chain, outermost first, as ``func@file.py:line``.
 
@@ -2297,6 +2331,17 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._record_polling_progress(generation):
                 self._record_updates_received(envelope.get("result"))
 
+    def _polling_health_unproven(self, generation: Optional[int]) -> bool:
+        """True while ``generation`` is the live polling generation and has not yet proven progress.
+
+        Such getUpdates polls skip the idle long-poll wait so a new generation proves health in one
+        round trip instead of after PTB's 10s timeout; once progress is recorded, polls long-poll again."""
+        progress = getattr(self, "_polling_progress_event", None)
+        return (
+            generation is not None and progress is not None and not progress.is_set()
+            and not getattr(self, "_teardown_started", False) and getattr(self, "_polling_progress_accepting", False)
+            and generation == getattr(self, "_polling_generation", None))
+
     def _record_updates_received(self, result) -> None:
         """Count updates Telegram handed us on the getUpdates wire (#102260). Only reached for the
         accepted generation, so a late response from a fenced poll cannot inflate the backlog."""
@@ -2321,6 +2366,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             async def do_request(self, *args, **kwargs):
                 generation = _POLLING_GENERATION_CONTEXT.get()
+                if adapter._polling_health_unproven(generation):
+                    kwargs = _non_blocking_get_updates_kwargs(kwargs)
                 result = await super().do_request(*args, **kwargs)
                 adapter._observe_polling_request_result(self, generation, result)
                 return result

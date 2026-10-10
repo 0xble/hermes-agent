@@ -57,7 +57,9 @@ class _GetUpdatesRequest(BaseRequest):
         timeout_seconds = (
             timeout.total_seconds() if hasattr(timeout, "total_seconds") else timeout
         )
-        if timeout_seconds == 0:
+        if timeout_seconds == 0 and tg_adapter._POLLING_GENERATION_CONTEXT.get() is None:
+            # PTB's stop() cleanup poll runs outside any polling generation; a generation's own
+            # first poll is also timeout=0 (telegram-first-poll-health) and is a normal poll here.
             self.cleanup_calls += 1
             return 200, b'{"ok":true,"result":[]}'
         if not self.initial_conflict_sent:
