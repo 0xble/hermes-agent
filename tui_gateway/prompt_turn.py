@@ -875,10 +875,6 @@ def _invoke_agent(
             copy_filter.message_boundary()
             _speak(None)
         if isinstance(delta, str):
-            _speak(delta)
-            delta = copy_filter.feed(delta)
-            if not delta:
-                return
             from gateway.response_filters import (
                 ends_with_partial_loop_complete_marker,
                 split_trailing_loop_complete_marker,
@@ -899,6 +895,12 @@ def _invoke_agent(
         if hold is not None and isinstance(delta, str):
             from gateway.response_filters import hold_silence_delta
             if not (delta := hold_silence_delta(hold, delta)):
+                return
+        if isinstance(delta, str):
+            # Control markers are already withheld here; speech then drops copy bodies and
+            # display renders them inline.
+            _speak(delta)
+            if not (delta := copy_filter.feed(delta)):
                 return
         _deliver_delta(delta)
 

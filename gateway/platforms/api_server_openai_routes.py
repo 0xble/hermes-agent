@@ -499,6 +499,9 @@ class _ResponsesStream:
                 else:
                     self.transformed_final = render_copy_blocks_inline(agent_final)
             if agent_final and not self.final_text_parts:
+                # Nothing visible went out: replay the complete text from a clean filter, so a
+                # marker prefix still held from the stream is not emitted twice.
+                self._copy_filter.reset()
                 await self.emit_text_delta(agent_final)
             if agent_final and not self.final_response_text:
                 self.final_response_text = render_copy_blocks_inline(agent_final)
@@ -981,6 +984,9 @@ class OpenAICompatRoutesMixin:
                 fallback_text = map_outside_copy_blocks(
                     result.get("final_response") or "", _resolve_media_to_data_urls, keep_markers=True)
                 if fallback_text:
+                    # Nothing visible went out: a marker prefix the filter still holds from the
+                    # stream is part of this complete text, so replay it from a clean filter.
+                    copy_filter.reset()
                     await _write_content_delta(fallback_text)
             elif not presentation_muted:
                 # Chat chunks can only append: a non-append rewrite follows the streamed text (as in the CLI).

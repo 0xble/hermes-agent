@@ -1991,6 +1991,17 @@ class GatewayTurnMixin:
                 )
                 copy_delivered = any(getattr(result, "success", False) for result in copy_results)
                 copy_failed = any(not getattr(result, "success", False) for result in copy_results)
+            if adapter and agent_result.get("interrupted") and response:
+                from gateway.copy_blocks import adapter_sends_copy_blocks, extract_copy_blocks
+                _, _partial_bodies = extract_copy_blocks(response)
+                if _partial_bodies and adapter_sends_copy_blocks(adapter):
+                    # The stream hid these bodies for separate sending, but an interrupted block
+                    # may be partial: show them as ordinary reply text instead of dropping them.
+                    try:
+                        await adapter.send(source.chat_id, "\n".join(_partial_bodies),
+                                           metadata=self._event_thread_metadata(event, source))
+                    except Exception as _e:
+                        logger.warning("interrupted copy text send failed: %s", _e)
             if copy_failed:
                 agent_result["failed"] = True
                 agent_result["error"] = "one or more [[copy]] blocks failed to deliver"

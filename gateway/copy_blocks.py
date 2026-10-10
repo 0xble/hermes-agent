@@ -174,6 +174,13 @@ class CopyMarkerStreamFilter:
             cursor = end
         return "".join(output)
 
+    def reset(self) -> None:
+        """Forget all state, for replaying a complete text after nothing was emitted."""
+        self._in_copy = False
+        self._pending = ""
+        self._line = ""
+        self._fence = None
+
     def message_boundary(self) -> None:
         """A new assistant message starts here, so it starts on a new line.
 

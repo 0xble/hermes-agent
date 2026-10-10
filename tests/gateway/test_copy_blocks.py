@@ -569,3 +569,41 @@ async def test_held_copy_blocks_are_ledgered_before_recovery_can_sweep(monkeypat
     await adapter._send_copy_blocks(event, "session", ["one", "two", "three"], {}, results.append)
     assert seen_at_finalize == [3]
     assert len(results) == 3 and not any(r.success for r in results)
+
+
+def test_filter_reset_replays_complete_text_without_a_held_prefix() -> None:
+    stream = CopyMarkerStreamFilter()
+    assert stream.feed("[[copy]]") == ""  # held: may still become a marker line
+    stream.reset()
+    out = stream.feed("[[copy]]\nRecovered copy.\n[[/copy]]\n") + stream.flush()
+    assert out == "Recovered copy.\n"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_streamed_turn_shows_hidden_partial_copy_text() -> None:
+    runner = object.__new__(GatewayTurnMixin)
+    sends = []
+
+    async def send(chat_id, content, metadata=None, **_kwargs):
+        sends.append(content)
+        return SimpleNamespace(success=True, message_id="m")
+
+    adapter = SimpleNamespace(
+        platform="telegram", send=send,
+        _streaming_tts_turn_completed=lambda *_a, **_k: False,
+    )
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner._event_thread_metadata = lambda *_args: {}
+
+    async def no_media(*_args):
+        return False
+
+    runner._deliver_media_from_response = no_media
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    returned = await runner._hmwa_deliver_turn_response(
+        event, event.source, None, "session", None, {"already_sent": True, "interrupted": True}, [],
+        "Before\n[[copy]]\npartial paste text", None, False,
+    )
+    assert returned is None
+    assert sends == ["partial paste text"]
