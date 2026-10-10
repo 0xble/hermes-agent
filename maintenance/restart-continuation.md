@@ -21,7 +21,9 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   configured behavior survives an update: the loader omitting the key was the
   archived fork's original regression.
 - When a real user message arrives while resume is pending, the note addresses
-  that message first regardless of policy.
+  that message first regardless of policy and skips stale unfinished work unless
+  the message asks for it, as upstream's note always has. Only `continue` with no
+  new message resumes the pending task, from its first unrecorded step.
 - Explicit `/stop` retires the recovery marker captured before adapter cancellation.
   A newer marker or replaced session created during the cancellation survives. The
   persisted marker token is additive and older routing entries remain readable.

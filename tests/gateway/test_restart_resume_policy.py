@@ -72,6 +72,7 @@ def test_resume_note_is_neutral_and_keeps_recovery_safety(policy, message):
         # A new message means the user moved on: stale pending work is skipped, not resumed.
         assert "Address the user's NEW message below FIRST" in note
         assert "Skip unfinished work from the conversation history" in note
+        assert "if it does, resume from the first step without a recorded result" in note
         assert "resuming from the first step" not in note
         assert message in note
     elif policy == "continue":

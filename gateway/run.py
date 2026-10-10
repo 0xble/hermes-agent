@@ -1098,7 +1098,8 @@ def build_resume_recovery_note(
         # The user has moved on: answer them, and leave stale pending work alone unless they ask.
         continuation = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now. "
-            "Skip unfinished work from the conversation history unless the new message asks for it."
+            "Skip unfinished work from the conversation history unless the new message asks for it; "
+            "if it does, resume from the first step without a recorded result."
         )
     elif policy == "continue":
         continuation = (
