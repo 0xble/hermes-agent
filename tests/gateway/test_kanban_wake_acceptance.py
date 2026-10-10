@@ -1,5 +1,6 @@
 """Push admission and durable notifier retries use real adapter/SQLite lifecycles."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,23 @@ def setup_route(raft=False):
 async def drain(adapter):
     while adapter._background_tasks:
         await asyncio.gather(*list(adapter._background_tasks))
+        # gather() over tasks that are ALL already done completes without yielding (3.12+), so a
+        # finished task whose queued _background_tasks.discard callback has not run yet would spin
+        # this loop forever; yield once so those done-callbacks run before re-checking.
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_drain_yields_for_queued_done_callback():
+    """A done task's discard callback must run before drain checks the set again."""
+    adapter = SimpleNamespace(_background_tasks=set())
+    task = asyncio.get_running_loop().create_future()
+    task.set_result(None)
+    adapter._background_tasks.add(task)
+    task.add_done_callback(adapter._background_tasks.discard)
+
+    await asyncio.wait_for(drain(adapter), timeout=1)
+    assert not adapter._background_tasks
 
 
 @pytest.mark.asyncio
