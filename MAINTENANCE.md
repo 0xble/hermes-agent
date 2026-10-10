@@ -22,6 +22,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - Source checkout, installed personal checkout, and signed company releases are
   distinct identities. A source merge is not deployment or acceptance evidence.
 
+## Maintenance units
+
+| Unit | Required behavior | Load when | Contract |
+|---|---|---|---|
+| Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+
 ## Active patch record: shared primary cooldown
 
 - **Patch identity:** `shared-primary-cooldown`.

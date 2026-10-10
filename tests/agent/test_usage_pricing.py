@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     _OFFICIAL_DOCS_PRICING,
     CanonicalUsage,
@@ -962,3 +964,45 @@ def test_flat_entries_unaffected_by_tier_machinery():
     )
     # 250k * $0.25/M + 10k * $1.50/M
     assert result.amount_usd == Decimal("0.0775")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"cost_details": {"upstream_inference_cost": 0.0042}}, Decimal("0.0042")),  # Nous
+        ({"cost": 0.0042}, Decimal("0.0042")),  # OpenRouter flat
+        ({"cost": 0.0042, "cost_details": {"upstream_inference_cost": 0}}, Decimal("0.0042")),
+        ({"cost": 0.009, "cost_details": {"upstream_inference_cost": 0.003}}, Decimal("0.003")),
+        ({"cost": 0}, Decimal("0")),
+        ({"cost": -1}, None),
+        ({"cost": float("nan")}, None),
+        ({"cost": float("inf")}, None),
+        ({"cost": True}, None),
+        ({"cost": "0.01"}, None),
+        ({}, None),
+    ],
+)
+def test_provider_reported_cost_shapes(raw, expected):
+    from agent.usage_pricing import provider_reported_cost
+
+    usage = normalize_usage({"prompt_tokens": 10, "completion_tokens": 2, **raw})
+    assert provider_reported_cost(usage) == expected
+
+
+def test_provider_reported_cost_wins_over_table_estimate_and_is_actual():
+    usage = normalize_usage(SimpleNamespace(prompt_tokens=1_000_000, completion_tokens=0, cost=0.0123))
+    result = estimate_usage_cost("openai/gpt-5.4-mini", usage, provider="openrouter")
+    assert result.amount_usd == Decimal("0.0123")
+    assert (result.status, result.source) == ("actual", "provider_cost_api")
+    assert result.label == "$0.01"
+    # Without a reported amount the same call stays a local estimate.
+    plain = estimate_usage_cost("openai/gpt-5.4-mini", normalize_usage({"prompt_tokens": 1_000_000}),
+                                provider="openrouter")
+    assert plain.status != "actual"
+
+
+def test_format_cost_label_exact_variant_drops_the_tilde():
+    assert format_cost_label(Decimal("0.0046"), approx=False) == "$0.0046"
+    assert format_cost_label(Decimal("1.234"), approx=False) == "$1.23"
+    assert format_cost_label(Decimal("0.00001"), approx=False) == "$<0.0001"
+    assert format_cost_label(Decimal("1.234")) == "~$1.23"
