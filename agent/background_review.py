@@ -107,8 +107,8 @@ def _interrupt_background_review(review_agent: Any) -> None:
             from agent.interrupt_compat import request_hard_interrupt
 
             request_hard_interrupt(
-                review_agent, "superseded by a new live turn", tool_reason="background review superseded"
-            )
+                review_agent, "superseded by a new live turn", tool_reason="background review superseded",
+                delegation_reason="superseded")
         except Exception:
             logger.debug("Failed to cancel in-flight background review for a new turn", exc_info=True)
 

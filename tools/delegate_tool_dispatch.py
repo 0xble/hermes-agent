@@ -405,6 +405,10 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
     from tools.async_delegation import dispatch_async_delegation_batch
     child_agents = [c for (_, _, c) in unit.children]
+    # Child-scoped contexts carry resume briefs in the model-visible tasks API.
+    # Keep them at the durable boundary too, otherwise replacement lineage is lost.
+    contexts = dict.fromkeys(t["context"] for _, t, _ in unit.children if t.get("context"))
+    effective_context = "\n\n".join(contexts) or unit.context
 
     def _interrupt(reason: str = "Async delegation cancelled"):
         for c in child_agents:
@@ -415,7 +419,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
-        goals=[t["goal"] for t in unit.task_list], context=unit.context,
+        goals=[t["goal"] for t in unit.task_list], context=effective_context,
         toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
         role=unit.top_role, model=unit.creds["model"],
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
@@ -483,8 +487,8 @@ def _dispatch_background(batch: _Batch) -> str:
                 accepted_units = queued if dispatch.get("status") == "queued" else dispatched
                 accepted_units.append((unit, dispatch["delegation_id"]))
             continue
-        if dispatch.get("at_capacity"):
-            logger.warning("delegate_task: async pool at capacity and pending queue unavailable; rejecting without synchronous fallback: %s",
+        if dispatch.get("at_capacity") or dispatch.get("no_inline_fallback"):
+            logger.warning("delegate_task: async admission rejected without synchronous fallback: %s",
                            dispatch.get("error", "rejected"))
             rejected_units = [unit_id]
             for rejected_index in range(k + 1, len(units)):
@@ -496,8 +500,8 @@ def _dispatch_background(batch: _Batch) -> str:
                 rejected_units.append(rejected_unit_id)
             for rejected_unit in units[k:]:
                 _cleanup_unit(
-                    rejected_unit, "Async delegation capacity is full",
-                    {"status": "rejected", "exit_reason": "capacity"},
+                    rejected_unit, dispatch.get("error", "Async delegation was rejected"),
+                    {"status": "rejected", "exit_reason": "retry_budget" if dispatch.get("no_inline_fallback") else "capacity"},
                 )
             if not dispatched and not queued:
                 return json.dumps({
