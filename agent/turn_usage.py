@@ -243,6 +243,11 @@ def record_response_usage(
             _cost_delta = (_cost_delta or 0.0) + _moa_cost
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
+    # A provider-billed delta is persisted as "actual" only when it is exactly that billed
+    # amount; folded MoA advisor estimates make the delta an estimate again.
+    _persist_status = cost_result.status
+    if _persist_status == "actual" and _moa_ref_cost is not None:
+        _persist_status = "estimated"
 
     # Persist per-call token deltas for any session_id so non-CLI runs can't lose
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
@@ -263,7 +268,7 @@ def record_response_usage(
                 cache_write_tokens=canonical_usage.cache_write_tokens,
                 reasoning_tokens=canonical_usage.reasoning_tokens,
                 estimated_cost_usd=_cost_delta,
-                cost_status=cost_result.status,
+                cost_status=_persist_status,
                 cost_source=cost_result.source,
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
