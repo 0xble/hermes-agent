@@ -566,12 +566,22 @@ def _spawn_deferred_launchd_reload(
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
         f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
-        # Let launchd finish unregistering the label after the process exits.
-        f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
-        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-        f"  if {listed}; then break; fi; "
-        f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
-        f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
+        # Probe unregister completion, rather than delaying every already-unloaded job.
+        # Keep the separate reload budget and the old two-second retry cadence's
+        # maximum attempt count; only actual EIO/EALREADY failures retry bootstrap.
+        f"_deadline=$(($(date +%s) + {_reload_budget})); _unloaded=1; "
+        f"while launchctl print {q_target} >/dev/null 2>&1; do "
+        f"  if [ $(date +%s) -ge $_deadline ]; then _unloaded=0; break; fi; sleep 0.2; done; "
+        f"if [ $_unloaded -eq 1 ]; then _attempts=0; while :; do _attempts=$((_attempts + 1)); "
+        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; _rc=$?; "
+        f"  if [ $_rc -eq 0 ]; then "
+        # Successful registration may not yet have a PID. Wait for supervision, not another bootstrap.
+        f"    while :; do if {listed}; then break; fi; "
+        f"      if [ $(date +%s) -ge $_deadline ]; then break; fi; sleep 0.2; done; break; fi; "
+        f"  case $_rc in 5|37) ;; *) break;; esac; "
+        f"  echo \"[{stamp}] transient bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
+        f"  if [ $(date +%s) -ge $_deadline ] || [ $_attempts -ge {(_reload_budget + 1) // 2 + 1} ]; then break; fi; "
+        f"  sleep 0.2; done; fi; "
         f"if ! {listed}; then "
         f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
         f"fi; "

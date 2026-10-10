@@ -58,6 +58,18 @@ first bootstrap. The respawn window is derived from the generated
 one throttle later passes instead of failing. Regression:
 `tests/hermes_cli/test_launchd_reload_exit_budget.py`.
 
+The helper bootstraps immediately once the old PID is gone and `launchctl print`
+confirms its label is unloaded. A still-loaded label is polled within the existing
+reload budget, rather than paying an unconditional post-exit second. Only actual
+EIO/EALREADY bootstrap failures (5/37) retry with 0.2s backoff in that same budget;
+a successful bootstrap waits for a positive supervised PID without registering
+again. Retrying is also capped at the old two-second cadence's maximum attempt
+count, so the shorter backoff cannot increase registration attempts. The old-PID
+exit ceiling and initial helper handoff delay are unchanged.
+Regression: `tests/hermes_cli/test_launchd_reload_handoff.py` executes the generated
+shell against fake launchctl for immediate success, both transient errors and a
+permanent failure; no host service is touched.
+
 ## Planned restart on reload bootout
 
 Fork patch identity: `launchd-reload-planned-restart`.
