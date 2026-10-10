@@ -1345,7 +1345,14 @@ $psi.Arguments = "-NoProfile -Command Start-Sleep -Seconds $Hold"
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $grandchild = [System.Diagnostics.Process]::Start($psi)
-[System.IO.File]::WriteAllLines($PidFile, @([string]$grandchild.Id, [string][System.Diagnostics.Stopwatch]::GetTimestamp()))
+# Publish the two-line startup receipt in one rename.  The parent polls this
+# file while the child is starting; writing it in place lets the parent observe
+# only the PID line and report a false "never recorded grandchild startup".
+$receiptTemp = "$PidFile.tmp"
+[System.IO.File]::WriteAllLines($receiptTemp, @([string]$grandchild.Id, [string][System.Diagnostics.Stopwatch]::GetTimestamp()))
+# Two-argument Move: this child runs under Windows PowerShell 5.1 (.NET Framework),
+# which has no overwrite overload. $PidFile is unique per self-test stamp.
+[System.IO.File]::Move($receiptTemp, $PidFile)
 Write-Output "pipe-drain step output"
 [Console]::Out.Flush()
 exit 7
@@ -1407,12 +1414,14 @@ exit 3
     }
     $returnedAt = [System.Diagnostics.Stopwatch]::GetTimestamp()
     $elapsed = [double]::PositiveInfinity
+    $leakAfterSpawnElapsed = $null
     $leakPid = 0
     if (Test-Path -LiteralPath $pidFile) {
         $leakReceipt = @(Get-Content -LiteralPath $pidFile)
         [void][int]::TryParse($leakReceipt[0].Trim(), [ref]$leakPid)
         if ($leakReceipt.Count -eq 2) {
-            $elapsed = [Math]::Round(($returnedAt - [long]$leakReceipt[1]) / [double][System.Diagnostics.Stopwatch]::Frequency, 2)
+            $leakAfterSpawnElapsed = [Math]::Round(($returnedAt - [long]$leakReceipt[1]) / [double][System.Diagnostics.Stopwatch]::Frequency, 2)
+            $elapsed = $leakAfterSpawnElapsed
         }
     }
     $leakAlive = $false

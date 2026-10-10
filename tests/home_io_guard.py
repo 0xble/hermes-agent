@@ -4,6 +4,7 @@ from __future__ import annotations
 import builtins
 from functools import lru_cache, wraps
 import io
+import ntpath
 import os
 from pathlib import Path
 import shutil
@@ -74,7 +75,16 @@ class HomeIOGuard:
                 if parent is None:
                     raise AssertionError("TEST BUG: untracked dir_fd in guarded filesystem I/O")
                 candidate = os.path.join(os.fspath(parent), candidate)
-            absolute = _normcase(os.path.abspath(candidate))
+            # On Windows, some test fixtures hand the guard a path produced by
+            # a different path implementation (notably TemporaryDirectory
+            # under a patched HOME/LOCALAPPDATA).  ``os.path.abspath`` can
+            # prepend the current directory to that already-absolute DOS path
+            # in that situation.  Preserve both native and Windows-shaped
+            # absolute paths before doing any guarded-root comparisons.
+            if os.path.isabs(candidate) or ntpath.isabs(candidate):
+                absolute = _normcase(os.path.normpath(candidate))
+            else:
+                absolute = _normcase(os.path.abspath(candidate))
             # /proc/<pid>/fd/N is descriptor inspection (deleted-WAL holder scans stat the magic
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.

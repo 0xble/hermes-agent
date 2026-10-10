@@ -301,17 +301,27 @@ def _live_system_guard(request, monkeypatch):
         # inotify/SHA watchdogs.  Any test that legitimately needs to exercise
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
-        low = cmd_str.lower()
-        if "update" in low and (
-            # hermes update / hermes update --gateway / setsid bash -c ... hermes update
-            ("hermes" in low and "update" in low.split())
-            or
-            # python -m hermes_cli.main update --gateway
-            ("hermes_cli" in low and "update" in low.split())
-            or
-            # venv/bin/hermes update  (absolute path variant used in tests)
-            (".venv/bin/hermes" in low and "update" in low)
-        ):
+        try:
+            command_tokens = _shlex.split(cmd_str)
+        except ValueError:
+            command_tokens = cmd_str.split()
+        # Match executable/ module tokens, not arbitrary path components.  The
+        # CI home is deliberately named ``hermes-ci-home``; substring matching
+        # therefore misclassified an unrelated fixture command such as
+        # ``...\npm-fixture\npm.cmd update`` as the real ``hermes update``.
+        def token_basename(token: str) -> str:
+            return token.strip('"\'').replace('\\', '/').rsplit('/', 1)[-1].lower()
+
+        update_token = any(token.strip('"\'').lower() == "update" for token in command_tokens)
+        invokes_hermes = any(
+            token_basename(token) in {"hermes", "hermes.exe", "hermes.cmd"}
+            for token in command_tokens
+        )
+        invokes_hermes_cli = any(
+            token.strip('"\'').lower() in {"hermes_cli.main", "hermes_cli.main.py"}
+            for token in command_tokens
+        )
+        if update_token and (invokes_hermes or invokes_hermes_cli):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "

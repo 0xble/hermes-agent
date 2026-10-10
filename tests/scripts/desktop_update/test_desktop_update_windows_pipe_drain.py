@@ -106,6 +106,10 @@ def test_update_step_survives_pipe_leak_flood_and_live_child_stall(
         # TEMP; point that at tmp_path so the test leaves nothing behind.
         "TEMP": str(tmp_path),
         "TMP": str(tmp_path),
+        # The runner's autouse home guard exports HERMES_HOME under its own
+        # relocated home.  The script prefers HERMES_HOME over TEMP for its
+        # durable hand-off log, so pin it to this fixture root as well.
+        "HERMES_HOME": str(tmp_path),
         # Keep the test quick. The grace is what the fix bounds; the hold is
         # how long the leaking grandchild lives. hold >> grace is what makes a
         # regression measurable rather than lucky.
