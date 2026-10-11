@@ -20,6 +20,21 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   never follows a link target out of the worktree.
 - Reclaim is fail-safe: if any listed path cannot be found or copied into the
   archive, the worktree is kept rather than removed.
+- Regenerable directories are removed with the worktree instead of archived.
+  Any untracked or ignored path under `.venv`, `node_modules`, `__pycache__`,
+  `.pytest_cache`, `.pytest-cache`, `.ruff_cache`, `.mypy_cache` or `.direnv` is
+  skipped. `.ci`, `build`, `dist`, `target`, `.next` and `.turbo` are skipped
+  only when an ignore rule matches the directory itself (a single `!! dir/`
+  entry): an untracked directory with a generic name may be hand-made, and a
+  tracked source folder such as `scripts/build/` can hold an ignored `.env`.
+  Names match directory components exactly. An ignored parent is archived
+  whole, caches inside it included. Files and every other directory are still
+  archived.
+  Archiving these caches had copied out 1.6 GB of a 3.8 GB tree, so a prune
+  moved bytes instead of freeing them.
+- `hermes worktree prune --dry-run` reports, per tree and in total, how much
+  would be copied to the archive. It sizes only those paths, never whole trees;
+  the rest of each tree is freed.
 
 ## Provenance and patches
 
@@ -40,8 +55,12 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
 `scripts/run_tests.sh tests/hermes_cli/test_worktree_gc.py`. The regressions
 use real Git worktrees: a hostile global `excludesFile` must yield an archiving
 verdict, a mixed ordinary and quoted-name untracked directory must archive
-every file, a symlink inside an ignored directory must be archived as the same link, and a
-listed path that cannot be archived must keep the worktree.
+every file, a symlink inside an ignored directory must be archived as the same link, a
+listed path that cannot be archived must keep the worktree, regenerable directories must
+go with the tree while an ignored `.env` (including one inside a tracked `scripts/build/`),
+an untracked `dist/` file and an ignored parent holding a cache are archived, a tree with only
+regenerable dirt must reap with no archive, and a dry run must report archive size without
+sizing a whole tree.
 
 ## Retirement and rollback
 
