@@ -18,6 +18,19 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
 - A turn whose lease refresh stays blocked on a locked state.db past the row's expiry keeps
   running while a read shows the row still names it. It stops only on a real takeover. See
   [busy state.db turn survival](state-db-lock-turn-survival.md).
+- The periodic PASSIVE WAL checkpoint runs on a dedicated connection without `SessionDB._lock`
+  (one at a time). With `checkpoint_fullfsync` on macOS it waits for the whole device's dirty
+  data; under the writer lock that stalled every writer (2026-10-11 10:36: 20 turns and 41
+  threads queued behind one checkpoint). The connection is closed under the WAL lock guard in
+  `close()`, before the writer, and pinned beside a retired writer. The periodic incremental FTS
+  merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
+  maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
+  behind it); usermerge floor and bounded pages unchanged.
+- A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
+  with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
+- The turn-liveness watchdog does not count time the turn's execution thread spends inside a
+  SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
+  counts as activity. Nothing else (lease refresh included) feeds the activity clock.
 
 ## 2026-10-10 and 2026-10-11 incidents
 
@@ -32,12 +45,17 @@ disk. Upstream has no matching issue or PR (searched 2026-10-10).
 
 **Patch identity:** `gateway-loop-statedb-guard`. Source surfaces: `gateway/run_inbound.py`
 (reaped-session probe), `gateway/run_startup.py` (resume admission), `agent/turn_facade_lease.py` (post-expiry lock
-tolerance), `hermes_state_health.py`,
+tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, write marker),
+`hermes_state_gateway.py` (routing diff), `hermes_state_health.py`,
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound). Proof surface:
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
-the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`.
+the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
+`test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
+in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
+`tests/hermes_state/test_gateway_routing_replace_diff.py`, and
+`test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
 upstream bounds restart replay and cron catch-up itself.

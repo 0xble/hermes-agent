@@ -802,3 +802,43 @@ def test_host_sleep_is_not_a_stalled_turn(monkeypatch, during_sample):
         poll()
     abort.assert_called_once()
     assert clock.mono - 1000.0 == 600.0
+
+
+def test_waiting_on_a_contended_state_db_writer_is_not_a_stall():
+    """A turn queued behind other state.db writers is not wedged: time inside a SessionDB write
+    counts as activity up to its end (2026-10-11: turns aborted after 604s queued on the lock)."""
+    from types import SimpleNamespace
+
+    import hermes_state
+    from agent.turn_liveness import TurnLivenessWatchdog
+
+    agent = SimpleNamespace(_turn_liveness_activity_generation=1, _last_activity_ts=time.time() - 900,
+                            _execution_thread_id=None)
+    watchdog = TurnLivenessWatchdog(
+        agent, session_id="s1", timeout_s=600, poll_s=15, stop_event=threading.Event(),
+        activity_lock=threading.Lock(), is_turn_active=lambda: True,
+        commit_abort=lambda *_a: True, deactivate_turn=lambda: None)
+    assert watchdog._sample().idle_seconds >= 900  # control: no storage activity
+
+    inside, release, done, finish = (threading.Event() for _ in range(4))
+
+    def turn():
+        agent._execution_thread_id = threading.get_ident()
+        with hermes_state._storage_write_in_progress():
+            inside.set()
+            release.wait(10)
+        done.set()
+        finish.wait(10)  # stay alive so the thread is still registered
+
+    worker = threading.Thread(target=turn)
+    worker.start()
+    try:
+        assert inside.wait(10)
+        assert watchdog._sample().idle_seconds == 0.0
+        release.set()
+        assert done.wait(10)
+        assert watchdog._sample().idle_seconds < 5
+    finally:
+        release.set()
+        finish.set()
+        worker.join(10)

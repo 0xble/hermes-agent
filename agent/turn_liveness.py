@@ -153,7 +153,17 @@ class TurnLivenessWatchdog:
                 return None
             generation = getattr(self._agent, "_turn_liveness_activity_generation", 0)
             activity_ts = getattr(self._agent, "_last_activity_ts", None)
-        idle_seconds = 0.0 if activity_ts is None else max(0.0, time.time() - activity_ts)
+        now = time.time()
+        idle_seconds = 0.0 if activity_ts is None else max(0.0, now - activity_ts)
+        # Waiting on a contended state.db writer is not a stall: the turn is queued behind other
+        # writers, not wedged. Time inside a SessionDB write counts as activity up to its end.
+        from hermes_state import storage_write_activity
+
+        writing, write_ended_at = storage_write_activity(getattr(self._agent, "_execution_thread_id", None))
+        if writing:
+            idle_seconds = 0.0
+        elif write_ended_at is not None:
+            idle_seconds = min(idle_seconds, max(0.0, now - write_ended_at))
         return ActivitySnapshot(generation, activity_ts, idle_seconds)
 
     def _dump_turn_thread_stack(self) -> None:

@@ -309,15 +309,27 @@ class SessionGatewayMixin:
 
     def replace_gateway_routing_entries(self, entries: Dict[str, str], *, scope: str = "") -> None:
         """Atomically replace the routing index for *scope* (keys absent from *entries*
-        are removed); other scopes untouched."""
+        are removed); other scopes untouched.
+
+        Writes only the difference: every session update full-saves the index, and rewriting all
+        rows (thousands per scope) on each one multiplied WAL traffic under the shared writer lock."""
         now = time.time()
+        wanted = {k: v for k, v in entries.items() if k and v}
         def _do(conn):
-            conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
+            current = dict(conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ?", (scope,)).fetchall())
+            stale = [(scope, k) for k in current if k not in wanted]
+            if stale:
+                conn.executemany("DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", stale)
+            changed = [(scope, k, v, now) for k, v in wanted.items() if current.get(k) != v]
+            if changed:
                 conn.executemany(
-                    "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v])
+                    """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(scope, session_key) DO UPDATE SET
+                           entry_json = excluded.entry_json,
+                           updated_at = excluded.updated_at""",
+                    changed)
         self._execute_write(_do)
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
