@@ -350,12 +350,14 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
         os.unlink(pidfile)
     command = (
         f"{sys.executable} -c \"import subprocess,sys,time,signal,os; "
-        f"subprocess.Popen([sys.executable,'-c','import signal,time,os; "
-        f"signal.signal(signal.SIGTERM, signal.SIG_IGN); open(\\'{pidfile}\\',\\'w\\').write(str(os.getpid())); time.sleep(60)']); "
+        f"subprocess.Popen([sys.executable,'-c','import signal,time,os; from pathlib import Path; "
+        f"signal.signal(signal.SIGTERM, signal.SIG_IGN); p=Path(\\'{pidfile}\\'); "
+        f"p.with_suffix(\\'.tmp\\').write_text(str(os.getpid())); p.with_suffix(\\'.tmp\\').replace(p); time.sleep(60)']); "
         f"signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)\""
     )
     session = registry.spawn_local(command, task_id="descendant-test")
     try:
+        # Atomic publication makes existence a complete PID readiness signal.
         assert _wait_until(lambda: os.path.exists(pidfile))
         child_pid = int(open(pidfile).read())
         assert registry.kill_all("descendant-test", deadline=time.monotonic() + 3.0) == 1
@@ -392,7 +394,8 @@ def test_kill_terminates_descendant_that_escaped_process_group(registry, mode):
         os.unlink(pidfile)
     command = (
         f"{sys.executable} -c \"import subprocess,sys,time; "
-        f"subprocess.Popen([sys.executable,'-c','import os,time; open(\\'{pidfile}\\',\\'w\\').write(str(os.getpid())); time.sleep(60)'], start_new_session=True); "
+        f"subprocess.Popen([sys.executable,'-c','import os,time; from pathlib import Path; p=Path(\\'{pidfile}\\'); "
+        f"p.with_suffix(\\'.tmp\\').write_text(str(os.getpid())); p.with_suffix(\\'.tmp\\').replace(p); time.sleep(60)'], start_new_session=True); "
         f"time.sleep(60)\""
     )
     session = registry.spawn_local(command, task_id=f"escaped-descendant-{mode}")
