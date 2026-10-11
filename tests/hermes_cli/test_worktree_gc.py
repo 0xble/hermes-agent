@@ -319,6 +319,79 @@ class TestReclaim:
             assert os.readlink(path) == target
         assert (archived / "nested" / "note").read_text() == "scratch"
 
+    def test_regenerable_directories_go_with_the_tree_while_other_scratch_is_archived(
+        self, repo, tmp_path, monkeypatch,
+    ):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        (repo / ".gitignore").write_text(".ci/\nbuild/\n.env\nscratch/\n", encoding="utf-8")
+        # A tracked source folder that happens to be named like build output.
+        (repo / "scripts" / "build").mkdir(parents=True)
+        (repo / "scripts" / "build" / "tool.py").write_text("print()\n", encoding="utf-8")
+        _git(["add", ".gitignore"], repo)
+        _git(["add", "-f", "scripts/build/tool.py"], repo)
+        _git(["commit", "-m", "ignore local state"], repo)
+        _git(["push", "origin", "main"], repo)
+        tree, _ = _add_worktree(repo, "hermes-regenerable")
+        regenerable = (".venv/lib/site.py", "node_modules/pkg/index.js", "pkg/__pycache__/m.pyc",
+                       ".ci/cache/blob", "build/out.bin")
+        kept = {
+            ".env": "TOKEN=local\n",
+            "dist/notes.md": "hand-made, not ignored\n",
+            "scripts/build/.env": "ignored for another reason inside tracked source\n",
+            # An ignored parent is listed whole, so a cache inside it is archived with it.
+            "scratch/notes.md": "scratch\n",
+            "scratch/.venv/marker": "inside an ignored parent\n",
+        }
+        for rel, text in [*((rel, "regenerable") for rel in regenerable), *kept.items()]:
+            (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tree / rel).write_text(text, encoding="utf-8")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        record = _verdict(records, "hermes-regenerable")
+        assert record.verdict == "reap-archive"
+        assert sorted(record.untracked) == [".env", "dist/notes.md", "scratch/", "scripts/build/.env"]
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+
+        assert not tree.exists()
+        (archive,) = (archive_home / "archive" / "worktree-prune").glob("hermes-regenerable-*")
+        archived = {str(path.relative_to(archive)): path.read_text(encoding="utf-8-sig")
+                    for path in archive.rglob("*") if path.is_file()}
+        assert archived == kept
+
+    def test_tree_with_only_regenerable_dirt_reaps_without_an_archive(self, repo, tmp_path, monkeypatch):
+        archive_home = tmp_path / "archive-home"
+        monkeypatch.setenv("HERMES_HOME", str(archive_home))
+        tree, _ = _add_worktree(repo, "hermes-caches")
+        (tree / ".venv" / "lib").mkdir(parents=True)
+        (tree / ".venv" / "lib" / "site.py").write_text("x", encoding="utf-8")
+
+        records = worktree_gc.audit_worktrees(str(repo), with_sizes=False)
+        assert _verdict(records, "hermes-caches").verdict == "reap"
+        worktree_gc.reclaim_worktrees(str(repo), records=records)
+        assert not tree.exists()
+        assert not (archive_home / "archive").exists()
+
+    def test_dry_run_reports_archive_size_without_sizing_whole_trees(
+        self, repo, tmp_path, monkeypatch, capsys,
+    ):
+        import json
+
+        from hermes_cli.worktree_cmd import cmd_worktree
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "archive-home"))
+        monkeypatch.setattr(worktree_gc, "_tree_size_mb", lambda *a, **k: pytest.fail("sized a whole tree"))
+        tree, _ = _add_worktree(repo, "hermes-sized")
+        (tree / "scratch.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+        (tree / ".venv").mkdir()
+        (tree / ".venv" / "big.bin").write_bytes(b"x" * (3 * 1024 * 1024))
+
+        args = TestCmdWorktreeJson._ns(None, repo, "prune", dry_run=True, trees_only=True)
+        assert cmd_worktree(args) == 0
+        (action,) = [a for a in json.loads(capsys.readouterr().out)["actions"] if "hermes-sized" in a]
+        assert action.endswith(": archives ~2M")
+        assert tree.exists()
+
     def test_top_level_untracked_links_are_archived_as_links(self, repo, tmp_path, monkeypatch):
         archive_home = tmp_path / "archive-home"
         monkeypatch.setenv("HERMES_HOME", str(archive_home))
