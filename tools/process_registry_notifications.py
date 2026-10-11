@@ -204,7 +204,7 @@ def _outcome_only_stop_detail(detail):
         return detail
     reason = detail.strip().casefold()
     if reason in {"shutdown", "gateway_shutdown", "gateway shutdown", "gateway restart",
-                  "gateway shutting down", "gateway restarting"} or (
+                  "gateway shutting down", "gateway restarting", "cli shutdown"} or (
             reason.startswith("gateway shutdown (") and reason.endswith(")")):
         return "stopped before finishing"
     return detail
@@ -244,6 +244,8 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
+    if evt.get("status") == "interrupted" or any(r.get("status") == "interrupted" for r in results):
+        lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
@@ -326,6 +328,7 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         if status == "interrupted":
             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
+            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))
@@ -438,7 +441,7 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
 
 
 def _routine_process_stop(evt: dict) -> bool:
-    return evt.get("completion_reason") == "killed" and evt.get("termination_source") == "gateway_shutdown"
+    return evt.get("completion_reason") == "killed" and evt.get("termination_source") in {"gateway_shutdown", "kill_all"}
 
 
 def _completion_status(evt: dict) -> str:

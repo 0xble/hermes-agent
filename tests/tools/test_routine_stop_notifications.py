@@ -35,10 +35,11 @@ def test_goal_explicit_user_kill_keeps_its_attribution(monkeypatch):
 
 
 @pytest.mark.parametrize("exit_code", [-15, 143, -9])
-def test_routine_process_stop_is_outcome_only(exit_code):
+@pytest.mark.parametrize("source", ["gateway_shutdown", "kill_all"])
+def test_routine_process_stop_is_outcome_only(exit_code, source):
     text = format_process_notification({
         "session_id": "proc_test", "command": "verify", "output": "partial proof",
-        "completion_reason": "killed", "termination_source": "gateway_shutdown",
+        "completion_reason": "killed", "termination_source": source,
         "exit_code": exit_code,
     })
     assert text is not None
@@ -52,7 +53,6 @@ def test_routine_process_stop_is_outcome_only(exit_code):
 
 @pytest.mark.parametrize("reason,source,status", [
     ("killed", "process.kill", "terminated by process.kill"),
-    ("killed", "kill_all", "terminated by kill_all"),
     ("lost", "backend_lost", "marked lost because the process backend disappeared"),
     ("failed_start", "failed_start", "failed to start"),
 ])
@@ -70,7 +70,7 @@ def test_other_process_outcomes_keep_their_wording(reason, source, status):
 @pytest.mark.parametrize("batch", [False, True])
 @pytest.mark.parametrize("reason", [
     "gateway shutdown (final-cleanup)", "Gateway restarting", "Gateway shutting down",
-    "gateway shutdown", "gateway_shutdown", "shutdown",
+    "gateway shutdown", "gateway_shutdown", "shutdown", "CLI shutdown",
 ])
 def test_delegation_stop_notice_is_outcome_only(batch, reason):
     entry = {"status": "interrupted", "error": reason, "interrupt_reason": reason}
@@ -82,6 +82,7 @@ def test_delegation_stop_notice_is_outcome_only(batch, reason):
     for cause in ("shutdown", "restart", "gateway"):
         assert cause not in text.lower()
     assert "stopped before finishing" in text
+    assert "reconcile any non-idempotent effect first" in text
     assert entry["interrupt_reason"] == reason
     assert entry["error"] == reason
 

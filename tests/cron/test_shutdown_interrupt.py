@@ -591,14 +591,19 @@ class TestRunOneJobHonoursInterruptedFlag:
              ) as mock_summarize, \
              patch("cron.scheduler._is_cron_silence_response", return_value=False), \
              patch("cron.scheduler._deliver_result", return_value=None) as mock_deliver, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.finish_execution") as mock_finish:
             result = sched.run_one_job(job)
 
         assert result is True
         mock_summarize.assert_called_once()
         # The summarizer's error argument must mention the interruption,
         # not be silently None / the agent's own (possibly absent) error.
-        assert "interrupt" in mock_summarize.call_args.args[1].lower()
+        errors = [mock_summarize.call_args.args[1], mock_finish.call_args.kwargs["error"]]
+        for error in errors:
+            assert "stopped before finishing" in error
+            for cause in ("restart", "shutdown", "killed"):
+                assert cause not in error.lower()
         delivered_content = mock_deliver.call_args.args[1]
         assert delivered_content == "This run was interrupted."
         assert "plausible final response" not in delivered_content
