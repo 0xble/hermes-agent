@@ -56,7 +56,14 @@ def escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
+def _preview_normalized_window_sql(start: int, length: int) -> str:
+    # CR/LF -> space preserves character length, so slice before normalizing.
+    # CAST keeps legacy BLOB content on the same character (not byte) boundaries
+    # that REPLACE's implicit text conversion used before this optimization.
+    window = f"SUBSTR(CAST(m.content AS TEXT), {start}, {length})"
+    return f"REPLACE(REPLACE({window}, X'0A', ' '), X'0D', ' ')"
+
+
 # User-invoked and gateway auto-load scaffolds both get the head+tail excerpt window:
 # the typed request sits at the tail (auto-load) or behind the instruction marker.
 # No LIKE wildcards in either prefix, so no ESCAPE clause is needed.
@@ -138,10 +145,10 @@ _PREVIEW_RAW_SELECT = (
     f"CASE WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
     f" WHEN {_PREVIEW_MERGED_SUMMARY_SQL} THEN {_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
-    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW}) || '{SKILL_EXCERPT_JOINT}'"
-    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, -{_PREVIEW_SCAFFOLD_WINDOW})"
-    f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW * 2})"
-    f" ELSE SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_HEAD_CHARS}) END")
+    f" THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
+    f" || {_preview_normalized_window_sql(-_PREVIEW_SCAFFOLD_WINDOW, _PREVIEW_SCAFFOLD_WINDOW)}"
+    f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
+    f" ELSE {_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS)} END")
 
 
 def _shape_preview(raw: Any) -> str:

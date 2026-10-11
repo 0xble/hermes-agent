@@ -157,6 +157,7 @@ def _session_db_content_sig(db_path: Path):
     conn = None
     try:
         import hashlib
+        import marshal
         from hermes_state import _connect_tracked_db
         from hermes_state_holders import read_only_db_uri
 
@@ -174,7 +175,11 @@ def _session_db_content_sig(db_path: Path):
             rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}")
             digest = hashlib.blake2b(digest_size=16)
             for row in rows:
-                digest.update(repr(tuple(row)).encode("utf-8", "backslashreplace"))
+                # SQLite rows contain only primitive scalar values. Version 2 has no
+                # object-reference memoization, so equal rows hash identically across
+                # connections; binary doubles avoid float-to-decimal work every tick.
+                # This is an in-process signature only; never unmarshal stored input.
+                digest.update(marshal.dumps(tuple(row), 2))
                 digest.update(b"\0")
             signature = (fields, digest.digest())
     except Exception:  # noqa: BLE001 - preserve the old wake-up signal if the read probe cannot run
