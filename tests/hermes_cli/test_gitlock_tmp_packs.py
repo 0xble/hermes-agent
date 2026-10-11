@@ -34,7 +34,7 @@ def _age(path: Path, seconds: float) -> None:
 
 def test_removes_old_tmp_pack_debris(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
 
     debris = []
@@ -52,7 +52,7 @@ def test_removes_old_tmp_pack_debris(tmp_path, monkeypatch):
 
 def test_spares_fresh_debris_and_real_packs(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
 
     fresh = pack / "tmp_pack_fresh"           # a fetch may be writing this NOW
@@ -71,7 +71,7 @@ def test_spares_fresh_debris_and_real_packs(tmp_path, monkeypatch):
 
 def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: True)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: True)
     pack = repo / ".git" / "objects" / "pack"
     p = pack / "tmp_pack_old"
     p.write_bytes(b"x")
@@ -84,7 +84,7 @@ def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch):
 def test_bare_repo_pack_dir_is_swept(tmp_path, monkeypatch):
     """A bare repo (e.g. the checkpoint store) has no .git/ layer — objects/pack hangs directly
     off the repo root, where a gc killed mid-repack strands the same debris (#115410)."""
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = tmp_path / "objects" / "pack"
     pack.mkdir(parents=True)
     debris = pack / "tmp_pack_killedGc"
@@ -125,7 +125,7 @@ def test_unlink_failure_is_surfaced_at_warning(tmp_path, monkeypatch, caplog):
     """The skip used to be logged at debug, which hid the months-long Windows no-op sweep;
     a cleaner that fails silently is worse than none, so every skip must be visible (#116384)."""
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
     stuck = pack / "tmp_pack_stuck"
     stuck.write_bytes(b"x")

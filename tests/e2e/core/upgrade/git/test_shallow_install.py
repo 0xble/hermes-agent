@@ -31,13 +31,48 @@ pytestmark = G.PYTESTMARK
 ORPHAN = "orphan divergence"
 
 
+def _has_prefetch_heal(source: str) -> bool:
+    return "_heal_stale_shallow_checkout(_m().PROJECT_ROOT, branch)" in source
+
+
+def _first_n1_update(run: dict) -> None:
+    """Record the pre-swap implementation and actual fetch, not just its exit."""
+    w = run["w"]
+    run["base"] = w.head()
+    source = (w.checkout / "hermes_cli" / "update_cmd.py").read_text(encoding="utf-8")
+    run["has_prefetch_heal"] = _has_prefetch_heal(source)
+    run["mark1"] = w.srv.mark()
+    run["cp1"], run["head1"] = w.update(), w.head()
+    run["shape1"] = w.shape()
+    run["fetches1"] = [r for r in w.srv.since(run["mark1"]) if r.command == "fetch"]
+
+
+def _assert_first_n1_update(run: dict) -> None:
+    w, cp = run["w"], run["cp1"]
+    out = G.output(cp)
+    fetches = run["fetches1"]
+    # #123254 already gates the byte overfetch below. On slower runners the
+    # SAME old pre-swap transfer hits its 300s cap before reaching that assertion.
+    # Gate only a proved historical, unfiltered overfetch with no checkout move;
+    # current-code, transport, authentication and unmeasured timeouts stay red.
+    if (not run["has_prefetch_heal"] and cp.returncode == 1
+            and run["head1"] == run["base"]
+            and run["shape1"] == {"shallow": "true", "promisor": "-", "filter": "-"}
+            and "Failed to fetch updates from origin" in out
+            and "git fetch timed out after 300s" in out
+            and G.TRACEBACK not in out and G.SUCCESS not in out
+            and fetches and all(r.status == 200 and not r.fault for r in fetches)
+            and sum(r.body_bytes for r in fetches) > 2 * w.install_bytes):
+        pytest.xfail("#123254: historical pre-swap plain fetch exceeded the byte bound and hit its 300s cap; "
+                     "retire when N-1 carries pre-fetch healing")
+    assert cp.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp)}"
+
+
 def _depth1(root) -> dict:
     cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag())
     run = {"cm": cm, "w": w, "shape0": w.install_shape}
     w.set_main(I.head_sha())
-    run["mark1"] = w.srv.mark()
-    run["cp1"], run["head1"] = w.update(), w.head()
-    run["fetches1"] = [r for r in w.srv.since(run["mark1"]) if r.command == "fetch"]
+    _first_n1_update(run)
     run["target2"] = w.publish("release: e2e shallow next", {"e2e-shallow-next.txt": "release\n"})
     run["mark2"] = w.srv.mark()
     run["cp2"], run["head2"] = w.update(), w.head()
@@ -55,7 +90,7 @@ def _checked(root) -> dict:
     shallow = w.checkout / ".git" / "shallow"
     run["grafts"] = len(shallow.read_text(encoding="utf-8").split()) if shallow.is_file() else 0
     w.set_main(I.head_sha())
-    run["cp1"], run["head1"] = w.update(), w.head()
+    _first_n1_update(run)
     return run
 
 
@@ -96,7 +131,7 @@ def test_stale_depth1_install_updates_without_fetching_the_whole_history(runs):
     w: G.World = run["w"]
     cp1 = run["cp1"]
     assert run["shape0"]["shallow"] == "true", f"N-1's installer did not make a shallow clone: {run['shape0']}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
+    _assert_first_n1_update(run)
     main_fetch = run["fetches1"][0].body_bytes if run["fetches1"] else 0
     bound = 2 * w.install_bytes
     with known_failure(r"downloaded .* the depth-1 install itself",
@@ -112,7 +147,7 @@ def test_second_update_after_the_unshallowing_update_succeeds(runs):
     run = _run(runs, "depth1")
     w: G.World = run["w"]
     cp1, cp2 = run["cp1"], run["cp2"]
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
+    _assert_first_n1_update(run)
     assert cp2.returncode == 0 and run["head2"] == run["target2"], (
         f"the update after the unshallowing update failed (rc={cp2.returncode}):\n"
         f"{G.output(cp2)[-1500:]}\n{w.diag(cp2, run['mark2'])}")
@@ -126,7 +161,7 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
     cp1 = run["cp1"]
     for cp in run["checks"]:
         assert cp.returncode == 0 and G.TRACEBACK not in G.output(cp), f"`hermes update --check` failed:\n{w.diag(cp)}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
+    _assert_first_n1_update(run)
     with known_failure(r"claims orphan divergence",
                        "#124645: each depth-1 `--check` appends a graft the fetch reflog pins, and N-1's "
                        "update resets as orphan divergence. HEAD's prune expires those reflogs and HEAD "
