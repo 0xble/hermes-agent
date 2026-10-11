@@ -239,6 +239,7 @@ def test_iter_holders_rechecks_descriptor_after_close_or_reuse(tmp_path, monkeyp
     real_stat, real_readlink = os.stat, os.readlink
     changed = False
     owned_fd = fd
+    readlink_count = 0
 
     def change_descriptor():
         nonlocal changed, owned_fd
@@ -253,14 +254,17 @@ def test_iter_holders_rechecks_descriptor_after_close_or_reuse(tmp_path, monkeyp
         changed = True
 
     def stat_after_close(target, *args, **kwargs):
-        if os.fspath(target) == str(wal) and not changed:
+        if os.path.realpath(os.fspath(target)) == os.path.realpath(wal) and not changed:
             change_descriptor()
         return real_stat(target, *args, **kwargs)
 
     def readlink_before_reuse(target, *args, **kwargs):
+        nonlocal readlink_count
         result = real_readlink(target, *args, **kwargs)
-        if os.fspath(target) == fd_path and not changed:
-            change_descriptor()
+        if os.fspath(target) == fd_path:
+            readlink_count += 1
+            if readlink_count == 2 and not changed:
+                change_descriptor()
         return result
 
     if change == "close_during_path_stat":
@@ -273,6 +277,41 @@ def test_iter_holders_rechecks_descriptor_after_close_or_reuse(tmp_path, monkeyp
     finally:
         if owned_fd is not None:
             os.close(owned_fd)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("close_during_settle", [True, False])
+def test_open_guard_settles_closing_holder_but_refuses_persistent_holder(
+    tmp_path, monkeypatch, close_during_settle
+):
+    path = tmp_path / "state.db"
+    wal = Path(str(path) + "-wal")
+    wal.write_bytes(b"checkpointed sidecar")
+    fd = os.open(wal, os.O_RDONLY)
+    wal.unlink()
+    closed = False
+    waits = []
+
+    def settle(delay):
+        nonlocal closed
+        waits.append(delay)
+        if close_during_settle and not closed:
+            os.close(fd)
+            closed = True
+
+    monkeypatch.setattr(hermes_state_dbfile.time, "sleep", settle)
+    try:
+        if close_during_settle:
+            refuse_deleted_wal_generation(path)
+            assert waits == [0.01]
+        else:
+            with pytest.raises(DeletedWalGenerationError):
+                refuse_deleted_wal_generation(path)
+            assert waits == [0.01, 0.02, 0.04]
+        assert not wal.exists(), "the preconnect guard must not mint a replacement WAL"
+    finally:
+        if not closed:
+            os.close(fd)
 
 
 @pytest.mark.platforms("linux")  # deleted-WAL write halt uses Linux unlink semantics

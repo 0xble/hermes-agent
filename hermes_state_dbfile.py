@@ -499,6 +499,14 @@ def refuse_deleted_wal_generation(db_path) -> None:
     from hermes_state_errors import _DELETED_WAL_GENERATION_MSG
     if not _deleted_sidecar_holders_for_open(db_path):
         return
+    if sys.platform.startswith("linux"):
+        # SQLite's normal close unlinks checkpointed sidecars before closing
+        # their descriptors. Let that short-lived holder settle before refusing
+        # a new opener, without permitting a persistent retired generation.
+        for delay in (0.01, 0.02, 0.04):
+            time.sleep(delay)
+            if not iter_deleted_sqlite_sidecar_holders(db_path):
+                return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
 
