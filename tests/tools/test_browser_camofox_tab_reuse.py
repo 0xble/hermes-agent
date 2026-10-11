@@ -29,6 +29,7 @@ class _Camofox:
         self.calls: list[tuple[str, str, dict]] = []
         self.created = 0
         self.gone: set[str] = set()
+        self.open_tab_ids: list[str] = []
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -67,9 +68,12 @@ class _Camofox:
                     return self._send({"tabId": tab["tabId"], "url": tab["url"]})
                 if parsed.path.startswith("/browser/identities/") and parsed.path.endswith("/open"):
                     user_id = parsed.path.split("/")[3]
-                    tab = {"tabId": "visible-tab", "url": "https://login.example.test/", "listItemId": SHARED}
+                    tab_id = stub.open_tab_ids.pop(0) if stub.open_tab_ids else "visible-tab"
+                    tab = {"tabId": tab_id, "url": "https://login.example.test/", "listItemId": SHARED}
                     stub.tabs.setdefault(user_id, []).append(tab)
                     return self._send({"ok": True, "focused": True, "restarted": True, **tab})
+                if parsed.path.startswith("/browser/identities/") and parsed.path.endswith("/release"):
+                    return self._send({"ok": True, "released": True})
                 tab_id = parsed.path.split("/")[2] if parsed.path.startswith("/tabs/") else ""
                 if tab_id in stub.gone:
                     return self._send({"code": "tab_not_found"}, 404)
@@ -184,6 +188,73 @@ def test_handoff_tab_persists_across_turns(camofox):
     assert result["success"] and result["account"] == "brianle"
     assert camofox.server.tab_posts() == []
     assert camofox.server.acted_on() == ["visible-tab"]
+
+
+def test_handoff_sends_prior_binding_and_keeps_server_returned_own_tab(camofox):
+    cf = camofox.cf
+    session = cf._get_session("chat", "brianle")
+    session["tab_id"] = "own-tab"
+    camofox.server.open_tab_ids.append("own-tab")
+
+    result = _dispatch("browser_handoff", {"account": "brianle"}, "chat")
+
+    assert result["success"] and result["tabId"] == "own-tab"
+    assert "replacedTab" not in result
+    assert session["tab_id"] == "own-tab"
+    open_calls = [payload for method, path, payload in camofox.server.calls
+                  if method == "POST" and path.endswith("/open")]
+    assert open_calls == [{"tabId": "own-tab"}]
+
+
+def test_handoff_without_prior_binding_sends_no_tab_id(camofox):
+    result = _dispatch("browser_handoff", {"account": "brianle"}, "new-task")
+
+    assert result["success"] and result["tabId"] == "visible-tab"
+    assert camofox.cf._sessions["new-task"]["tab_id"] == "visible-tab"
+    open_calls = [payload for method, path, payload in camofox.server.calls
+                  if method == "POST" and path.endswith("/open")]
+    assert open_calls == [{}]
+
+
+def test_handoff_never_steals_another_live_tasks_tab(camofox):
+    cf = camofox.cf
+    owner = cf._get_session("owner", "brianle")
+    owner["tab_id"] = "foreign-tab"
+    caller = cf._get_session("caller", "brianle")
+    caller["tab_id"] = "caller-tab"
+    camofox.server.open_tab_ids.append("foreign-tab")
+
+    result = _dispatch("browser_handoff", {"account": "brianle"}, "caller")
+
+    assert result["success"] and result["modelDetached"] is True
+    assert "replacedTab" not in result
+    assert "another task's tab" in result["note"]
+    assert caller["tab_id"] == "caller-tab"
+    assert owner["tab_id"] == "foreign-tab"
+
+
+def test_handoff_restarted_flag_does_not_rebind_or_detach_tasks(camofox):
+    cf = camofox.cf
+    owner = cf._get_session("owner", "brianle")
+    owner["tab_id"] = "own-tab"
+    camofox.server.open_tab_ids.append("own-tab")
+
+    result = _dispatch("browser_handoff", {"account": "brianle"}, "owner")
+
+    assert result["success"] and result["restarted"] is True
+    assert "replacedTab" not in result
+    assert owner["tab_id"] == "own-tab"
+
+
+def test_release_keeps_task_tab_binding(camofox):
+    cf = camofox.cf
+    session = cf._get_session("release", "brianle")
+    session["tab_id"] = "own-tab"
+
+    result = _dispatch("browser_handoff", {"account": "brianle", "release": True}, "release")
+
+    assert result == {"success": True, "account": "brianle", "released": True}
+    assert session["tab_id"] == "own-tab"
 
 
 def test_new_task_adopts_same_origin_tab_before_creating(camofox):
@@ -414,14 +485,15 @@ def test_handoff_reserves_the_shared_tab_from_concurrent_adoption(camofox):
     assert cf._sessions["racer"]["tab_id"] != "visible-tab"
 
 
-def test_handoff_detaches_another_task_bound_to_the_visible_tab(camofox):
+def test_handoff_keeps_another_task_bound_to_the_visible_tab(camofox):
     cf = camofox.cf
     assert _dispatch("browser_handoff", {"account": "brianle"}, "first")["success"]
     _end_turn("first")
-    assert _dispatch("browser_handoff", {"account": "brianle"}, "second")["success"]
-    assert cf._sessions["second"]["tab_id"] == "visible-tab"
-    assert cf._sessions["first"]["tab_id"] is None
-    assert not _dispatch("browser_snapshot", {}, "first")["success"]  # rebinds only by navigating
+    second = _dispatch("browser_handoff", {"account": "brianle"}, "second")
+    assert second["success"] and second["modelDetached"] is True
+    assert cf._sessions["second"]["tab_id"] is None
+    assert cf._sessions["first"]["tab_id"] == "visible-tab"
+    assert not _dispatch("browser_snapshot", {}, "second")["success"]  # no prior binding to continue
 
 
 def test_a_protected_binding_does_not_move_to_a_continuation(camofox):
