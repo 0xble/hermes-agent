@@ -331,7 +331,16 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
     if supervisor is None:
         return None
     focused = supervisor.focus_page(origin, accept=_TAB_PROBES.get(kind))
-    return (origin or focused.get("url")) if focused.get("ok") else None
+    if not focused.get("ok"):
+        return None
+    # Adopted from upstream PR 128194: the requested origin is only a filter,
+    # never evidence about the attached page. Prefer its live post-focus URL.
+    from agent.vault_store import normalize_origin
+    try:
+        attached_origin = normalize_origin(str(focused.get("url") or ""))
+    except Exception:
+        attached_origin = None
+    return _current_page_origin(task_id) or attached_origin
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +517,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     their surface for the code their phone/email/app shows. The code goes into the page over the supervisor
     socket and never enters the conversation."""
     from agent.redact import register_vault_redaction_value
-    from agent.vault_backends import backend_for_handle
+    from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.base import MissingCredential
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
@@ -518,10 +527,56 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal
     browser_key = _browser_key(effective_task_id)
-    _focus_bound_origin(browser_key, "", "otp")
+    raw_meta = None
+    allowed = None
+    saved_origins = ()
+    if handle:
+        try:
+            raw_meta = backend.get_meta(handle) if backend is not None else None
+        except MissingCredential as exc:
+            return json.dumps({"success": False, "error_type": "credential_missing", "error": str(exc)[:200]})
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked; call browser_vault_unlock."})
+        if raw_meta is None or raw_meta.kind != "login":
+            return json.dumps({"success": False, "error_type": "credential_missing",
+                               "error": f"No login with handle {handle!r}. Use browser_vault_list."})
+        saved_origins = tuple(raw_meta.allowed_origins) or ((str(raw_meta.origin),) if raw_meta.origin else ())
+        from agent.vault_origin_aliases import apply_origin_aliases
+        meta = apply_origin_aliases([raw_meta])[0]
+        allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+        if not allowed:
+            return json.dumps({"success": False, "error_type": "no_origin",
+                               "error": "The saved login has no bound origin; refusing to enter a code."})
+        for candidate in allowed:
+            if _focus_bound_origin(browser_key, candidate, "otp"):
+                break
+    else:
+        _focus_bound_origin(browser_key, "", "otp")
+    # Never trust the requested candidate or a stale focus result as authorization.
     origin = _current_page_origin(browser_key)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
+    if allowed is not None and origin not in allowed:
+        return json.dumps({"success": False, "error_type": "origin_mismatch",
+                           "error": (f"Refused: current page origin ({origin}) does not match "
+                                     f"the vault item's bound origin(s) ({', '.join(allowed)}).")})
+    if allowed is not None and origin not in saved_origins:
+        alias_key = _alias_fill_key(effective_task_id, handle, origin)
+        decision = _alias_fill_decision(alias_key)
+        if decision == "refused":
+            return json.dumps({"success": False, "error_type": "origin_alias_retry_refused",
+                               "error": "Alias-origin confirmation was declined or unanswered. Do not retry."})
+        if decision is None:
+            decision = _confirm_alias_fill(raw_meta.label, origin, saved_origins)
+            if decision != "accept":
+                _record_alias_fill_decision(alias_key, "refused")
+                return json.dumps({"success": False,
+                                   "error_type": "origin_alias_declined" if decision == "decline" else "origin_alias_prompt_unanswered",
+                                   "error": "Alias-origin confirmation was declined or unanswered. Nothing was written."})
+            if refusal := _alias_fill_revalidation_refusal(raw_meta, origin):
+                return refusal
+            _record_alias_fill_decision(alias_key, "accept")
     site = origin.split("://", 1)[-1]
 
     nonce = secrets.token_hex(8)
@@ -535,6 +590,13 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                            "error": ("No one-time-code field on the current page. If the site wants a passkey, hardware key or "
                                      "an approval tap in an app, tell the user to complete it on their device and wait for the page to move on.")})
 
+    # Inspection and alias consent can race navigation. Refuse before minting
+    # a code, and retain the checked origin in the atomic in-page write guard.
+    if _current_page_origin(browser_key) != origin:
+        return json.dumps({"success": False, "error_type": "origin_changed",
+                           "error": "The page navigated before the code could be resolved. Nothing was written."})
+    if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
+        return refusal
     code: Optional[str] = None
     source = "user"
     if backend is not None:
@@ -558,6 +620,8 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
                                "error": "The user did not enter a code. Do not ask again this turn."})
 
     register_vault_redaction_value(code)
+    if raw_meta is not None and (refusal := _alias_fill_revalidation_refusal(raw_meta, origin)):
+        return refusal  # a manual-code prompt can outlive alias authorization too
     if backend is not None and (refusal := _browser_account_refusal(backend, effective_task_id)):
         return refusal  # re-checked at the write: the browser selection may have changed meanwhile
     fills = build_otp_fills(otp_controls, code)
