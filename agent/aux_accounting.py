@@ -51,7 +51,7 @@ def record_aux_usage(
     Strictly best-effort (accounting must never break an aux call). No-ops outside an
     agent turn, for main-loop-accounted tasks (``_EXCLUDED_TASKS``), or without usage.
     The model is read from ``response.model`` (accurate after aux provider fallback);
-    *provider*/*base_url* reflect the originally-resolved route.
+    *provider*/*base_url* reflect the successful destination, including fallback.
     """
     try:
         if not task or task in _EXCLUDED_TASKS:
@@ -75,6 +75,7 @@ def record_aux_usage(
             return
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
+        cost = None
         try:
             cost = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
             if cost.amount_usd is not None:
@@ -86,6 +87,8 @@ def record_aux_usage(
             input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens, cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens, estimated_cost_usd=estimated_cost,
+            cost_status=cost.status if cost else None, cost_source=cost.source if cost else None,
+            billing_mode="subscription_included" if cost and cost.status == "included" else None,
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

@@ -50,7 +50,7 @@ def _fold_moa_usage(agent, canonical_usage):
     returned, so advisor spend would be invisible) and flush the full-turn trace when
     ``moa.save_traces`` is on. Returns ``(client, canonical_usage, advisor_cost)``."""
     _moa_ref_cost = None
-    _moa_client = getattr(agent, "client", None)
+    _moa_client = getattr(agent, "client", None) if agent.provider == "moa" else None
     if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
         try:
             _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
@@ -218,7 +218,8 @@ def record_response_usage(
     # dropping aggregator spend. Price at the REAL model/provider from the aggregator slot.
     _billing_provider = billing_provider_identity(agent.provider, getattr(agent, "requested_provider", None))
     _agg_cost_model, _agg_cost_provider, _agg_cost_base_url = agent.model, _billing_provider, agent.base_url
-    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
+    _agg_slot = (getattr(_moa_client, "last_aggregator_billing_route", None)
+                 or getattr(_moa_client, "last_aggregator_slot", None)) if _moa_client is not None else None
     if _agg_slot and _agg_slot.get("model"):
         _agg_cost_model = _agg_slot["model"]
         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
@@ -271,11 +272,11 @@ def record_response_usage(
                 estimated_cost_usd=_cost_delta,
                 cost_status=_persist_status,
                 cost_source=cost_result.source,
-                billing_provider=_billing_provider,
-                billing_base_url=agent.base_url,
+                billing_provider=_agg_cost_provider,
+                billing_base_url=_agg_cost_base_url,
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
-                model=agent.model,
+                model=_agg_cost_model,
                 api_call_count=1,
                 task=getattr(agent, "_turn_route_task", "") or "",
             )

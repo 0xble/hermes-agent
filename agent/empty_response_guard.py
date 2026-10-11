@@ -144,10 +144,15 @@ def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
         return None
     try:
         from agent.usage_pricing import billing_provider_identity, estimate_usage_cost
+        route = {}
+        if getattr(agent, "provider", None) == "moa":
+            route = getattr(getattr(agent, "client", None), "last_aggregator_billing_route", None) or {}
         result = estimate_usage_cost(
-            getattr(agent, "model", "") or "", canonical,
-            provider=billing_provider_identity(getattr(agent, "provider", None), getattr(agent, "requested_provider", None)),
-            base_url=getattr(agent, "base_url", None), api_key=getattr(agent, "api_key", None),
+            route.get("model") or getattr(agent, "model", "") or "", canonical,
+            provider=route.get("provider") or billing_provider_identity(
+                getattr(agent, "provider", None), getattr(agent, "requested_provider", None)),
+            base_url=route.get("base_url") or getattr(agent, "base_url", None),
+            api_key=getattr(agent, "api_key", None),
         )
     except Exception:  # noqa: BLE001 — pricing must never break the loop
         logger.debug("empty-guard: cost estimation failed", exc_info=True)

@@ -399,7 +399,7 @@ def billing_provider_identity(provider: Optional[str], requested_provider: Optio
     """
     transport = (provider or "").strip().lower()
     selected = (requested_provider or "").strip().lower()
-    if (transport in {"custom", "local"} or transport.startswith("custom:")) and selected.startswith("custom:"):
+    if (transport in {"custom", "local"} or transport == selected) and selected.startswith("custom:"):
         return requested_provider
     return provider
 

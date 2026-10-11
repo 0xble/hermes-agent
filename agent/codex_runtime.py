@@ -152,12 +152,14 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     ``messages`` (the transcript mirror) lets real usage anchor the next preflight: this runtime bypasses
     the main loop's capture, and the mirror is never compacted natively, so without an anchor the rough
     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
+    from agent.usage_pricing import CanonicalUsage, billing_provider_identity, estimate_usage_cost, resolve_billing_route
+    billing_provider = billing_provider_identity(agent.provider, getattr(agent, "requested_provider", None))
     agent.session_api_calls += 1
     usage = getattr(turn, "token_usage_last", None)
     compressor = getattr(agent, "context_compressor", None)
 
     def billing(**extra):
-        return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
+        return dict(model=agent.model, billing_provider=billing_provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
     if not isinstance(usage, dict) or not usage:
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
@@ -165,9 +167,9 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
         if compressor is not None and callable(getattr(compressor, "note_usage_less_response", None)):
             compressor.note_usage_less_response()
         _queue_token_counts(agent, "Codex app-server api-call persistence failed (session=%s): %s",
-                            counts=lambda: billing(billing_mode="subscription_included"))
+                            counts=lambda: billing(billing_mode=resolve_billing_route(
+                                agent.model, provider=billing_provider, base_url=agent.base_url).billing_mode))
         return {}
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
     # ``inputTokens`` is INCLUSIVE of ``cachedInputTokens`` (same contract as the Responses API, see
     # normalize_usage's codex_responses branch); CanonicalUsage.prompt_tokens re-adds cache_read on top of
     # input_tokens, so the canonical input bucket must be the UNCACHED remainder or cached tokens count twice.
@@ -201,7 +203,7 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     for key, value in usage_dict.items():
         setattr(agent, f"session_{key}", getattr(agent, f"session_{key}") + value)
     cost_result = estimate_usage_cost(
-        agent.model, canonical_usage, provider=agent.provider, base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
+        agent.model, canonical_usage, provider=billing_provider, base_url=agent.base_url, api_key=getattr(agent, "api_key", ""),
     )
     cost_usd = float(cost_result.amount_usd) if cost_result.amount_usd is not None else None
     if cost_usd is not None:

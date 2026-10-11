@@ -148,9 +148,94 @@ def test_runtime_selected_route_persists_named_billing_identity(tmp_path, monkey
         reset_hermes_home_override(token)
 
 
+@pytest.mark.parametrize("requested", ["custom:included", "custom:metered"])
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_moa_main_turn_uses_resolved_aggregator_billing_route(tmp_path, monkeypatch, requested, prepared, stream):
+    from agent import turn_usage
+    from run_agent import AIAgent
+
+    home = tmp_path / "moa-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(json.dumps({
+        "providers": {
+            "included": {"base_url": URL, "api_key": "fixture-placeholder",
+                         "billing_mode": "subscription_included"},
+            "metered": {"base_url": URL, "api_key": "fixture-placeholder"},
+        },
+        "moa": {"default_preset": "billing", "presets": {"billing": {
+            "enabled": False, "reference_models": [],
+            "aggregator": {"provider": requested, "model": MODEL},
+        }}},
+    }), encoding="utf-8")
+    token = set_hermes_home_override(home)
+    db = SessionDB(db_path=home / "state.db")
+    agent = None
+    calls = []
+    try:
+        # Only the physical send is replaced: real preset normalization, runtime resolution,
+        # auxiliary routing, MoA facade, turn accounting and SQLite persistence all run.
+        def physical_call(resource, **kwargs):
+            calls.append((str(resource._client.base_url).rstrip("/"), kwargs["model"]))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="done", tool_calls=[]),
+                                         finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=1000, completion_tokens=50, cost=0.25),
+                model=MODEL, id=None)
+        monkeypatch.setattr("openai.resources.chat.completions.Completions.create", physical_call)
+        agent = AIAgent(
+            provider="moa", model="billing", session_id="moa-billing", session_db=db,
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            save_trajectories=False, enabled_toolsets=["file"])
+        messages = [{"role": "user", "content": "hi"}]
+        create_kw = {"messages": messages, "stream": stream}
+        if prepared:
+            create_kw["_moa_prepared_request"] = agent.client.chat.completions.prepare(messages)
+        response = agent.client.chat.completions.create(**create_kw)
+        if stream:
+            from agent.auxiliary_client import _aggregate_chat_stream
+            response = _aggregate_chat_stream(response, model=MODEL)
+        assert calls == [(URL, MODEL)]
+        turn_usage.record_response_usage(
+            agent, response, messages=messages, api_call_count=1, api_duration=0.1,
+            compression_attempts=0, max_compression_attempts=3)
+        db.flush_token_counts()
+        included = requested == "custom:included"
+        for table, clause in (("sessions", "id = 'moa-billing'"),
+                              ("session_model_usage", "session_id = 'moa-billing' AND task = ''")):
+            row = dict(db._conn.execute(
+                f"SELECT model, billing_provider, billing_base_url, billing_mode, "
+                f"estimated_cost_usd, actual_cost_usd, cost_status, cost_source FROM {table} WHERE {clause}"
+            ).fetchone())
+            row["billing_mode"] = row["billing_mode"] or None
+            if table == "sessions":
+                assert row.pop("actual_cost_usd") is None  # Existing session display uses estimated bucket.
+            elif included:
+                assert row.pop("actual_cost_usd") == 0
+            else:
+                assert row.pop("actual_cost_usd") == 0.25
+            assert row == {
+                "model": MODEL, "billing_provider": requested, "billing_base_url": URL,
+                "billing_mode": "subscription_included" if included else None,
+                "estimated_cost_usd": 0 if included else 0.25,
+                "cost_status": "included" if included else "actual",
+                "cost_source": "none" if included else "provider_cost_api",
+            }
+        assert (agent.provider, agent.model, agent.base_url) == ("moa", "billing", "moa://local")
+        from decimal import Decimal
+        from agent.empty_response_guard import _estimate_attempt_cost
+        assert _estimate_attempt_cost(agent, response) == (Decimal("0") if included else Decimal("0.25"))
+    finally:
+        if agent is not None:
+            agent.close()
+        db.close()
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("provider, requested, expected", [
     ("custom", "custom:included", "custom:included"),
     ("custom", "custom:metered", "custom:metered"),
+    ("custom:metered", "custom:included", "custom:metered"),
     ("custom", "CUSTOM:Included", "CUSTOM:Included"),
     ("custom", "custom", "custom"),
     ("custom", "auto", "custom"),
