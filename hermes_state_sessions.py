@@ -1411,6 +1411,9 @@ class SessionSessionsMixin:
             outer_where, id_params = self._chain_search_where(
                 where_sql, (id_query or "").strip().lower(), (search_query or "").strip().lower(),
             )
+            # Fence the ordered page before projecting previews/system prompts.
+            # Otherwise SQLite evaluates those correlated transcript expressions for
+            # discarded sort candidates too, making each idle refresh scan megabytes.
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -1431,15 +1434,21 @@ class SessionSessionsMixin:
                         MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
+                ),
+                session_page AS MATERIALIZED (
+                    SELECT s.id,
+                        COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
+                    FROM sessions s
+                    LEFT JOIN chain_max cm ON cm.root_id = s.id
+                    {outer_where}
+                    ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT ? OFFSET ?
                 )
                 {select_head}{_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, {_sql_in_window("s.started_at")}) AS _effective_last_active
-                FROM sessions s
-                LEFT JOIN chain_max cm ON cm.root_id = s.id
-                {prompt_join}
-                {outer_where}
-                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
-                LIMIT ? OFFSET ?
+                    page._effective_last_active
+                {from_sessions}
+                JOIN session_page page ON page.id = s.id
+                ORDER BY page._effective_last_active DESC, s.started_at DESC, s.id DESC
             """
             params = params + params + id_params + [limit, offset]  # WHERE binds twice (seed + outer)
         else:
