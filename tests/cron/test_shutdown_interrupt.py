@@ -375,19 +375,19 @@ class TestExecutionScopedInterruption:
 
 class TestCombinedCancelEvent:
     def test_or_semantics(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         assert combined.is_set() is False
         b.set()
         assert combined.is_set() is True
 
     def test_set_propagates_to_all(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         combined.set()
         assert a.is_set() and b.is_set()
 

@@ -29,7 +29,8 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Optional, Union
+from cron.scheduler_cancel import _CancelEventLike, _CombinedCancelEvent
 
 # Freeze the physical code root at module import. Resolving `__file__` during a
 # later dispatch would follow a moved `current` symlink into the next release.
@@ -677,29 +678,6 @@ _INFLIGHT_MIN_ALLOWANCE_MINUTES = 30.0
 # false "ok" (#60432). Token keying keeps an interruption scoped to that exact execution: a later run of the
 # same job ID (recurring jobs reuse the ID every fire) must not inherit the stale flag.
 _interrupted_job_ids: set = set()
-
-
-class _CancelEventLike(Protocol):
-    """Structural type for cancellation sources (``threading.Event``, ``_CombinedCancelEvent``)."""
-
-    def is_set(self) -> bool: ...
-    def set(self) -> None: ...
-
-
-class _CombinedCancelEvent:
-    """Duck-typed ``threading.Event`` ORing several cancellation sources (fire-claim heartbeat
-    ``lost_ownership`` + per-transport events). Workers only call is_set()/set(), so no pump thread.
-    """
-
-    def __init__(self, *events: Optional["_CancelEventLike"]) -> None:
-        self._events = [event for event in events if event is not None]
-
-    def is_set(self) -> bool:
-        return any(event.is_set() for event in self._events)
-
-    def set(self) -> None:
-        for event in self._events:
-            event.set()
 
 
 def get_running_job_ids() -> "frozenset[str]":
