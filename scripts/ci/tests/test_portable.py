@@ -208,6 +208,59 @@ class PortableGateTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
+    def test_windows_system_locations_survive_the_isolated_environment(self):
+        # Exercise env construction as data on every host, including POSIX's
+        # case-sensitive mapping. Native Windows itself normalizes env names.
+        import ntpath
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            for casing in ('mixed', 'upper'):
+                locations = {
+                    'SystemDrive': 'D:', 'SystemRoot': r'D:\Windows',
+                    'ProgramData': r'D:\ProgramData', 'ALLUSERSPROFILE': r'D:\ProgramData',
+                }
+                if casing == 'upper':
+                    locations = {key.upper(): value for key, value in locations.items()}
+                with self.subTest(casing=casing), patch.dict(os.environ, dict(locations, PATH=os.defpath, OPENAI_API_KEY='never-forward'), clear=True), patch.object(ci, 'STATE', state):
+                    env = ci.environment(state / casing)
+                    for key, value in locations.items():
+                        self.assertEqual(env.get(key.upper()), value)
+                    self.assertNotIn('OPENAI_API_KEY', env)
+                    with patch.dict(os.environ, env, clear=True):
+                        self.assertEqual(ntpath.expandvars(r'%SYSTEMDRIVE%\ProgramData'), r'D:\ProgramData')
+
+    def test_windows_system_locations_survive_the_shell_test_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_file = root / 'test_windows_locations.py'
+            locations = {
+                'SystemDrive': 'D:', 'SYSTEMDRIVE': 'D:',
+                'SystemRoot': r'D:\Windows', 'SYSTEMROOT': r'D:\Windows',
+                'ProgramData': r'D:\ProgramData', 'PROGRAMDATA': r'D:\ProgramData',
+                'ALLUSERSPROFILE': r'D:\ProgramData',
+                'PSModuleAnalysisCachePath': str(root / 'module-cache'),
+                'PSMODULEANALYSISCACHEPATH': str(root / 'module-cache'),
+            }
+            # Do not replace the real native Windows system paths when this
+            # portable contract itself runs there. POSIX uses fixture values.
+            locations = {key: os.environ.get(key) or os.environ.get(key.upper()) or value
+                         for key, value in locations.items()}
+            test_file.write_text(
+                'import os\n'
+                'def test_locations():\n'
+                f'    for key, value in {locations!r}.items():\n'
+                '        assert os.environ.get(key) == value, key\n', encoding='utf-8',
+            )
+            env = dict(os.environ, **locations, HERMES_PYTHON=sys.executable,
+                       HERMES_TEST_SCRATCH_ROOT=str(root / 'scratch'))
+            result = subprocess.run(
+                ['bash', 'scripts/run_tests.sh', '-j', '1', '--file-retries', '0', str(test_file)],
+                cwd=ci.ROOT, env=env, capture_output=True, text=True,
+                encoding='utf-8', errors='replace',
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_windows_appdata_stays_inside_isolated_home(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / 'isolated'
