@@ -1804,6 +1804,10 @@ def _deliver_via_live_adapter(
     return delivered
 
 
+class _StandaloneTimeout(str):
+    """Ambiguous standalone outcome: the Bot API request may still be in flight."""
+
+
 def _standalone_send(
     t: _TargetDelivery, content: str, media_files: list, *, copy_block: bool = False) -> tuple[Any, Optional[str]]:
     """Run the standalone sender for one target: ``(result, None)`` or ``(None, error)`` (already
@@ -1830,6 +1834,14 @@ def _standalone_send(
         logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
         return None, msg
 
+    def _timed_out(seconds: int) -> tuple[None, str]:
+        msg = _StandaloneTimeout(
+            f"standalone send to {t.where} timed out after {seconds}s "
+            "(the send may still be in flight)"
+        )
+        logger.error("Job '%s': %s", job["id"], msg)
+        return None, msg
+
     # Interpreter finalizing (SIGTERM/restart/OOM): asyncio.run and a fresh ThreadPoolExecutor both
     # raise "cannot schedule new futures after interpreter shutdown" — warn, not ERROR traceback.
     if _sched._interpreter_shutting_down():
@@ -1844,10 +1856,7 @@ def _standalone_send(
     except TimeoutError:
         # The send may still complete on the gateway loop (the dispatch shield keeps an in-flight
         # send un-cancelled); the run is released instead of waiting on it unbounded (#115469).
-        msg = (f"standalone send to {t.where} timed out after {send_timeout}s "
-               "(the send may still be in flight)")
-        logger.error("Job '%s': %s", job["id"], msg)
-        return None, msg
+        return _timed_out(send_timeout)
     except RuntimeError as run_err:
         # asyncio.run() refuses inside a running loop; close the unstarted coro, retry in a thread.
         coro.close()
@@ -1863,6 +1872,8 @@ def _standalone_send(
                     timeout=30), None
             finally:
                 pool.shutdown(wait=False)
+        except TimeoutError:
+            return _timed_out(30)
         except Exception as e:
             if _sched._interpreter_shutting_down(e):
                 return _warned(shutdown_msg)
@@ -1980,6 +1991,15 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
+        # A standalone timeout is ambiguous: the worker may have been released while
+        # the Bot API request remained in flight. Replaying it from the earlier
+        # reconnect-only live error can therefore deliver the same message twice.
+        if isinstance(err, _StandaloneTimeout):
+            logger.warning(
+                "Job '%s': not queueing ambiguous standalone timeout for %s",
+                job["id"], t.where,
+            )
+            return
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
         _queue_for_live_reconnect(
