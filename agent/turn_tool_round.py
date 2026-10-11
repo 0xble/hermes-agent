@@ -41,6 +41,7 @@ class ToolRoundVerdict:
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
     result: Optional[Dict[str, Any]] = None
+    interrupted: bool = False
 
 
 def run_tool_round(
@@ -56,13 +57,15 @@ def run_tool_round(
     process-only state."""
     from agent.conversation_loop import _invalid_tool_name_error_content
 
+    interrupted = False
+
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ToolRoundVerdict:
         return ToolRoundVerdict(
             action=action, messages=messages, conversation_history=conversation_history,
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
-            current_turn_user_idx=current_turn_user_idx, result=result,
+            current_turn_user_idx=current_turn_user_idx, result=result, interrupted=interrupted,
         )
 
     if not agent.quiet_mode:
@@ -175,10 +178,22 @@ def run_tool_round(
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
-        _turn_exit_reason = "guardrail_halt"
-        final_response = agent._toolguard_controlled_halt_response(decision)
-        agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
-        append_message(messages, {"role": "assistant", "content": final_response})
+        if decision.code in {"loop_web_search_cap", "loop_subagent_cap"}:
+            # All refused calls already have results. Reuse the bounded final-answer path:
+            # any tool calls it emits are discarded, never dispatched into another round.
+            _turn_exit_reason = "tool_cap_answer"
+            try:
+                final_response = agent._handle_max_iterations(messages, api_call_count, tool_cap=decision)
+            except InterruptedError:
+                from agent.interrupt_control import interrupted_during_api_call_reason
+                interrupted = True
+                _turn_exit_reason = interrupted_during_api_call_reason(agent)
+                final_response = ""
+        else:
+            _turn_exit_reason = "guardrail_halt"
+            final_response = agent._toolguard_controlled_halt_response(decision)
+            agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+            append_message(messages, {"role": "assistant", "content": final_response})
         # Emit the halt so it isn't mistaken for a crash; the stream callback is still
         # alive, so SSE/TUI clients see the explanation.
         if final_response:
