@@ -116,7 +116,8 @@ def _interrupt_background_review(
         try:
             from agent.interrupt_compat import request_hard_interrupt
 
-            request_hard_interrupt(review_agent, message, tool_reason=tool_reason)
+            request_hard_interrupt(review_agent, message, tool_reason=tool_reason,
+                delegation_reason="superseded")
         except Exception:
             logger.debug("Failed to cancel in-flight background review (%s)", message, exc_info=True)
 

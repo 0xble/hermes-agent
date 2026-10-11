@@ -24,6 +24,7 @@ def request_hard_interrupt(
     message: str | None = None,
     *,
     tool_reason: str | None = None,
+    delegation_reason: str | None = None,
 ) -> bool:
     """Request an explicit stop, falling back to the legacy interrupt ABI.
 
@@ -31,7 +32,9 @@ def request_hard_interrupt(
     doubles may only expose ``interrupt(message=None)`` and must not receive keyword
     arguments they do not know. ``tool_reason`` is a trusted, fixed category that may be
     exposed in model-visible tool cancellation output, forwarded only when the callable
-    explicitly supports it. Returns ``False`` only when neither callable is available.
+    explicitly supports it. ``delegation_reason`` is trusted producer metadata stored on
+    the agent for durable delegation classification; when omitted, an explicit direct
+    stop defaults to ``cancel``. Returns ``False`` only when neither callable is available.
     """
     # Static lookup first: a dynamic ``__getattr__`` proxy (unspecced MagicMock, RPC
     # facade) must not be treated as genuinely implementing the new ABI.
@@ -45,6 +48,15 @@ def request_hard_interrupt(
         interrupt = getattr(agent, "interrupt", None)
     if not callable(interrupt):
         return False
+    # Every explicit producer leaves a trusted stop category for delegation results.
+    # _signal_child_stop supplies system causes first; do not turn shutdown into a user cancel.
+    try:
+        reason = delegation_reason or getattr(agent, "_delegation_interrupt_reason", None)
+        if not isinstance(reason, str) or not reason:
+            reason = "cancel"
+        agent._delegation_interrupt_reason = reason
+    except Exception:
+        pass  # metadata must not break legacy/immutable interrupt facades
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
