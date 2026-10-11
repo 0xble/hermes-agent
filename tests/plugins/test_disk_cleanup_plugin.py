@@ -18,11 +18,127 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+def test_tracking_preserves_every_concurrent_process_update(_isolate_env):
+    """Separate plugin processes update the real JSON store, not a mocked writer."""
+    home = _isolate_env
+    for worker in range(8):
+        for i in range(40):
+            (home / f"worker-{worker}-{i}.txt").write_text("scratch")
+    lib_path = _load_lib().__file__
+    program = """
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('cleanup_worker', sys.argv[1])
+dg = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dg)
+home = Path(os.environ['HERMES_HOME'])
+for i in range(40):
+    assert dg.track(str(home / f'worker-{sys.argv[2]}-{i}.txt'), 'temp', silent=True)
+"""
+    workers = [subprocess.Popen([sys.executable, "-c", program, lib_path, str(i)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for i in range(8)]
+    for worker in workers:
+        out, err = worker.communicate(timeout=60)
+        assert worker.returncode == 0, out + err
+    tracked = _load_lib().load_tracked()
+    assert {Path(item["path"]).name for item in tracked} == {
+        f"worker-{worker}-{i}.txt" for worker in range(8) for i in range(40)}
+
+
+def test_pre_hook_ignores_out_of_scope_path_without_filesystem_probe(monkeypatch):
+    plugin = _load_plugin_init()
+    original_exists = Path.exists
+    visited = []
+
+    def checked_exists(path):
+        if str(path) == "/external-storage/test_probe.py":
+            visited.append(path)
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", checked_exists)
+    plugin._on_pre_tool_call(tool_name="write_file", args={"path": "/external-storage/test_probe.py"},
+                             tool_call_id="external")
+    assert plugin._pre_call[("default", "external")][1] == frozenset()
+    assert visited == []
+
+
+def test_tracking_survives_slow_cleanup(_isolate_env, monkeypatch):
+    dg = _load_lib()
+    old = _isolate_env / "test_old.py"
+    new = _isolate_env / "new.txt"
+    old.write_text("old"); new.write_text("new")
+    assert dg.track(str(old), "test", silent=True)
+    entered, release = threading.Event(), threading.Event()
+    original_delete = dg._delete_item
+
+    def slow_delete(item):
+        entered.set()
+        assert release.wait(10)
+        return original_delete(item)
+
+    monkeypatch.setattr(dg, "_delete_item", slow_delete)
+    failures = []
+
+    def clean():
+        try:
+            dg.quick()
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=clean)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert dg.track(str(new), "temp", silent=True)
+    finally:
+        release.set()
+        worker.join(10)
+    assert not worker.is_alive() and not failures
+    assert [item["path"] for item in dg.load_tracked()] == [str(new)]
+
+
+def test_post_hook_reports_tracking_timeout(_isolate_env, monkeypatch, caplog):
+    plugin = _load_plugin_init()
+    path = _isolate_env / "test_timeout.py"
+    args = {"path": str(path)}
+    plugin._on_pre_tool_call(tool_name="write_file", args=args, tool_call_id="timeout")
+    path.write_text("new")
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("disk-cleanup tracking lock unavailable")
+
+    monkeypatch.setattr(plugin.dg, "track", unavailable)
+    plugin._on_post_tool_call(tool_name="write_file", args=args, tool_call_id="timeout")
+    assert "disk-cleanup could not track" in caplog.text
+
+
+def test_cleanup_keeps_tracking_for_a_recreated_file(_isolate_env, monkeypatch):
+    dg = _load_lib()
+    path = _isolate_env / "test_recreated.py"
+    path.write_text("old")
+    assert dg.track(str(path), "test", silent=True)
+    original_delete = dg._delete_item
+
+    def recreate(item):
+        result = original_delete(item)
+        path.write_text("new")
+        assert dg.track(str(path), "test", silent=True) is False
+        return result
+
+    monkeypatch.setattr(dg, "_delete_item", recreate)
+    dg.quick()
+    assert path.read_text() == "new"
+    assert [item["path"] for item in dg.load_tracked()] == [str(path)]
 
 
 @pytest.fixture(autouse=True)

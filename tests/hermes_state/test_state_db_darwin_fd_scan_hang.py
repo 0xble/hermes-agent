@@ -21,6 +21,8 @@ import struct
 import threading
 import time
 
+import pytest
+
 import hermes_state_dbfile as dbfile
 from hermes_state_dbfile import (
     _DARWIN_FD_INO_OFFSET,
@@ -40,14 +42,23 @@ HANG_GUARD = 30.0
 class _HungLibproc:
     """One pid, one fd, whose vnode lookup never returns (state-U process)."""
 
+    def __init__(self):
+        self.release = threading.Event()
+
     def proc_pidinfo(self, pid, flavor, arg, buf, size):
         payload = struct.pack("<iI", 7, 1)
         ctypes.memmove(buf, payload, len(payload))
         return len(payload)
 
     def proc_pidfdinfo(self, pid, fd, flavor, record, size):
-        threading.Event().wait()
-        return 0  # unreachable
+        self.release.wait(HANG_GUARD)
+        return 0
+
+
+@pytest.fixture(autouse=True)
+def isolated_shared_scan(monkeypatch):
+    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_WORKER", None)
+    monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_RETRY_AT", 0.0)
 
 
 class _HealthyLibproc:
@@ -83,14 +94,19 @@ def _run_guarded(func, *args):
 
 
 def test_hung_vnode_scan_fails_open_within_budget(monkeypatch, tmp_path, caplog):
-    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: _HungLibproc())
+    lib = _HungLibproc()
+    monkeypatch.setattr(dbfile, "_darwin_libproc", lambda: lib)
     monkeypatch.setattr(dbfile, "_darwin_all_pids", lambda _lib: [4242])
     if hasattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS"):
         monkeypatch.setattr(dbfile, "_DARWIN_FD_SCAN_TIMEOUT_SECONDS", BUDGET)
-    with caplog.at_level(logging.WARNING, logger="hermes_state"):
-        worker, elapsed, outcome = _run_guarded(
-            _iter_darwin_sidecar_holders, tmp_path / "state.db"
-        )
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            worker, elapsed, outcome = _run_guarded(
+                _iter_darwin_sidecar_holders, tmp_path / "state.db"
+            )
+    finally:
+        lib.release.set()
+        dbfile._DARWIN_FD_SCAN_WORKER.join(HANG_GUARD)
     assert not worker.is_alive(), "scan blocked past the hang guard: no deadline"
     assert elapsed < HANG_GUARD
     assert outcome == [[]], "a timed-out scan must fail open (no holders, no refusal)"

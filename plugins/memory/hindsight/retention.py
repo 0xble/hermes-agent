@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from agent.synthetic_prompt import human_prompt_text, text_after_generated_prefix
+
+
+@dataclass
+class PendingRetainOperation:
+    bank_id: str
+    expires_at: float
+    wait_for_visibility: bool = True
 
 _MEMORY_CONTEXT_BLOCK_RE = re.compile(
     r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",

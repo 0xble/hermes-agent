@@ -5,9 +5,11 @@ and tool deregistration. Origin state and patchable helpers are read through ``_
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
+from tools.interpreter_shutdown import interpreter_shutting_down
 from tools.mcp_tool_common import _core, _get_lifecycle_seconds, _jittered, _resolve_tool_timeout
 from tools import mcp_tool_errors as _errors
 from tools import mcp_tool_registration as _registration
@@ -183,7 +185,7 @@ class MCPServerRunMixin:
             logger.debug(msg, *args)
         else:
             self._last_park_line = line
-            logger.warning(msg, *args)
+            logger.warning("%s [pid=%d]", line, os.getpid())
 
     async def _park(self, revival_reason: str) -> bool:
         """Drop this server's tools and wait for a reconnect request; True when shutdown came instead.
@@ -442,6 +444,12 @@ class MCPServerRunMixin:
         """Transport raised: classify, then run the initial-connect or reconnect ladder. False = exit."""
         # Unwrap anyio TaskGroup wrappers: the group's str() hides the root cause.
         root = _errors._unwrap_exception_group(exc)
+        # The same short executor error also occurs in a live process. Check
+        # process state without passing the exception to the broad matcher.
+        if interpreter_shutting_down():
+            logger.debug("MCP server '%s' transport ended during process shutdown [pid=%d]; stopping retries",
+                         self.name, os.getpid())
+            return False
         failure_class = _errors._classify_mcp_failure(root)
         if self._is_recycled_stdio():
             logger.warning("MCP server '%s': lazy reconnect after stdio recycle failed, marking unavailable "
