@@ -19,7 +19,7 @@ TELEGRAM_TOPIC_SCHEMA = {
     "name": "telegram_topic",
     "description": (
         "Create or edit a topic in the user's Telegram DM with Hermes. Each topic is its own Hermes "
-        "session. action=create opens a topic with a name, an optional native icon, model, provider "
+        "session. action=create opens a topic with a name, a required native icon when available, model, provider "
         "and reasoning effort, and an optional opening brief that the new session receives as its "
         "first message and starts working on. It returns the topic's thread_id, session_id and relay "
         "address. action=edit changes an existing topic's name or icon and its session's model or "
@@ -34,7 +34,7 @@ TELEGRAM_TOPIC_SCHEMA = {
             "name": {"type": "string",
                      "description": "Topic name, also stored as the session title. Required for create."},
             "icon": {"type": "string",
-                     "description": "One emoji from Telegram's topic icon set. Omit on create to let Hermes pick one."},
+                     "description": "Required on create: one emoji from Telegram's topic icon set that fits the subject. Optional on edit."},
             "model": {"type": "string", "description": "Model for the topic's session, as accepted by /model."},
             "provider": {"type": "string", "description": "Provider for that model, as accepted by /model --provider."},
             "reasoning": {"type": "string",
