@@ -435,3 +435,42 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
         await asyncio.gather(resolution, return_exceptions=True)
         if runner._executor is not None:
             await asyncio.to_thread(runner._executor.shutdown)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/subgoal cite the failing test", "/heartbeat every 10m check CI",
+                                     "/loop 5m poll CI"])
+async def test_goal_family_commands_keep_loop_live(command, monkeypatch, tmp_path):
+    """Manager writes behind /subgoal, /heartbeat and /loop take the writer lock: off the loop."""
+    from hermes_cli import goals
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1", chat_type="dm")
+    event = MessageEvent(text=command, message_type=MessageType.COMMAND, source=source)
+    entry = SimpleNamespace(session_id="session-a", session_key="agent:main:telegram:dm:123")
+    db = SessionDB(tmp_path / "probe.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    monkeypatch.setattr(runner, "_session_entry_for_manager", AsyncMock(return_value=entry))
+    monkeypatch.setattr(runner.async_session_store, "get_or_create_session", AsyncMock(return_value=entry))
+    monkeypatch.setattr(runner, "_register_heartbeat_watch", lambda *args: None)
+    goals.save_goal("session-a", goals.GoalState(goal="probe", status="active"))
+    original_write = db.set_meta
+
+    def install(block):
+        # Block the command's own write: manager construction is already off the loop.
+        def write(*args, **kwargs):
+            block()
+            return original_write(*args, **kwargs)
+
+        monkeypatch.setattr(db, "set_meta", write)
+
+    handler = {"/subgoal": runner._handle_subgoal_command, "/heartbeat": runner._handle_heartbeat_command,
+               "/loop": runner._handle_loop_command}[command.split()[0]]
+    try:
+        reply = await _assert_loop_live(lambda: handler(event), install)
+        assert reply
+    finally:
+        db.close()
+        executor = getattr(runner, "_executor", None)
+        if executor is not None:
+            await asyncio.to_thread(executor.shutdown)

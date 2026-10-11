@@ -14,11 +14,13 @@ import inspect
 import logging
 import os
 import signal
+import threading
 import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from pathlib import Path
 from agent.i18n import t
+from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
 from gateway.platforms.base import BasePlatformAdapter
@@ -1271,6 +1273,8 @@ class GatewayStartupMixin:
         except RuntimeError:
             self._gateway_loop = None
         if self._gateway_loop is not None:
+            # From here until shutdown disarms it, a state.db wait on this thread is reported.
+            set_loop_thread(threading.get_ident())
             self._start_loop_liveness_guards(self._gateway_loop)
             # Loop live: the loop-liveness watchdog takes over from the startup watchdog. Disarm even
             # when loop guards are config-disabled; only inside this branch (no live loop = stay armed).

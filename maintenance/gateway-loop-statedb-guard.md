@@ -9,6 +9,19 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   turn worker holds across its state.db write. [Seamless restart](seamless-restart.md) (PR 475)
   owns the per-turn, notification and topic-recovery hops. This unit adds the busy-path
   reaped-session probe (`_hm_reaped_session_id`, run through `asyncio.to_thread`).
+- `hermes_loop_guard` keeps new loop-thread sites from slipping in. The gateway registers its
+  loop thread when it binds the loop at startup and clears it when `stop()` disarms the
+  liveness guards. The SessionDB writer lock and the session-store lock are `LoopGuardedLock`s
+  and `SessionDB.__init__` checks too: a blocking use on the registered thread raises
+  `LoopThreadBlockingError` under pytest and logs one WARNING per call site in production
+  (never raises there). `/subgoal`, `/heartbeat` and `/loop` run their manager loads and writes
+  through `_run_in_executor_with_context`.
+- The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
+  fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
+  clean verdict for 10 s while both sidecars keep their identity, never while one is missing,
+  and runs once per path at a time; a timed-out scan is never cached.
+- The cron-tick worktree prune (git classification plus `du` of `.worktrees/`) waits 30
+  minutes after process start.
 - A restart admits resumed turns `_STARTUP_RESUME_CONCURRENCY` (4) at a time. Each slot is held
   until the turn ends or `_STARTUP_RESUME_OPENING_S` (15 s) passes, so a long turn never holds
   later sessions. `cron.max_parallel_jobs` defaults to 4 (`0` = unbounded), which bounds the
@@ -38,6 +51,12 @@ tolerance), `hermes_state_health.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`.
+
+Further proof surface: `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`,
+`test_goal_family_commands_keep_loop_live` in `tests/gateway/test_turn_state_db_off_loop.py`, and the
+boot-delay case in `tests/hermes_cli/test_worktree_pushed_tier.py`. Known remaining loop sites (logged
+by the guard in production): startup/reconnect sync helpers (`_normalize_source_for_session_key`) and
+first-access `_session_db` opens for an unwarmed profile scope.
 
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
 upstream bounds restart replay and cron catch-up itself.
