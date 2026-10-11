@@ -1,0 +1,43 @@
+# Gateway loop state.db guard
+
+Load this unit when gateway async code reads or writes `state.db` or the session store, or when
+changing what a gateway restart starts at once (restart auto-resume, cron catch-up).
+
+## Required behavior
+
+- The gateway event-loop thread never waits on `state.db` or on the session-store lock, which a
+  turn worker holds across its state.db write. [Seamless restart](seamless-restart.md) (PR 475)
+  owns the per-turn, notification and topic-recovery hops. This unit adds the busy-path
+  reaped-session probe (`_hm_reaped_session_id`, run through `asyncio.to_thread`).
+- A restart admits resumed turns `_STARTUP_RESUME_CONCURRENCY` (4) at a time. Each slot is held
+  until the turn ends or `_STARTUP_RESUME_OPENING_S` (15 s) passes, so a long turn never holds
+  later sessions. `cron.max_parallel_jobs` defaults to 4 (`0` = unbounded), which bounds the
+  first tick's catch-up as well.
+- The storage-health latch skips path resolution while nothing is latched, so every write no
+  longer resolves the state.db path under a process-wide lock.
+- A turn whose lease refresh stays blocked on a locked state.db past the row's expiry keeps
+  running while a read shows the row still names it. It stops only on a real takeover. See
+  [busy state.db turn survival](state-db-lock-turn-survival.md).
+
+## 2026-10-10 and 2026-10-11 incidents
+
+The gateway exited with code 75 four times on 2026-10-10 (19:07, 19:31, 19:33 and 19:44 PDT)
+and again on 2026-10-11 at 09:22 PDT. Each time the liveness watchdog killed it while the loop
+thread waited on SessionDB or session-store locks. The 09:22 stack was `_handle_message` →
+`_hm_evict_reaped_agent` → `SessionStore.peek_session_id`. Every boot re-created the herd:
+about 25 auto-resumes, goal continuations and about 20 cron catch-ups, all on a saturated
+disk. Upstream has no matching issue or PR (searched 2026-10-10).
+
+## Patch
+
+**Patch identity:** `gateway-loop-statedb-guard`. Source surfaces: `gateway/run_inbound.py`
+(reaped-session probe), `gateway/run_startup.py` (resume admission), `agent/turn_facade_lease.py` (post-expiry lock
+tolerance), `hermes_state_health.py`,
+`cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound). Proof surface:
+`tests/gateway/test_startup_resume_admission.py`,
+`test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
+`test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
+the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`.
+
+**Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
+upstream bounds restart replay and cron catch-up itself.

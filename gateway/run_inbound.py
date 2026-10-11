@@ -594,7 +594,21 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             )
             self._hm_evict_running_agent(_quick_key, "stale_running_agent_eviction")
 
-    def _hm_evict_reaped_agent(self, _quick_key: str) -> None:
+    def _hm_reaped_session_id(self, _quick_key: str) -> Optional[str]:
+        """The session id behind *_quick_key* when its durable row is ended, else None. Takes the
+        session-store lock and reads state.db, so callers run it off the event loop."""
+        _reap_store = getattr(self, "session_store", None)
+        # Public, lock-held accessors: peek_session_id returns a non-str on stubbed stores in
+        # bare test runners — the isinstance() / ``is True`` gates keep this inert unless a
+        # real SessionStore answers.
+        _reap_peek = getattr(_reap_store, "peek_session_id", None)
+        _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
+        _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
+        if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+            return _reap_sid
+        return None
+
+    async def _hm_evict_reaped_agent(self, _quick_key: str) -> None:
         """Evict the in-memory turn slot of a session whose durable row was ended while the gateway
         lived (``ws_orphan_reap`` / ``agent_close``): otherwise the fast-path queues every next
         message into the dead runtime. The cold path re-attaches via ``get_or_create_session``."""
@@ -603,14 +617,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # detached/ 405 suppressions in production. Evict the stale slot so the next message falls
             # through to the cold path and re-attaches or creates a fresh session; /status then correctly
             # shows 代理运行中: 否 before the heal and a live turn after.
-            _reap_store = getattr(self, "session_store", None)
-            # Public, lock-held accessors: peek_session_id returns a non-str on stubbed stores in
-            # bare test runners — the isinstance() / ``is True`` gates keep this inert unless a
-            # real SessionStore answers.
-            _reap_peek = getattr(_reap_store, "peek_session_id", None)
-            _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
-            _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
-            if isinstance(_reap_sid, str) and _reap_sid and callable(_is_ended) and _is_ended(_reap_sid) is True:
+            # The probe waits on the session-store lock, which a turn worker holds across its
+            # state.db write: on the loop thread that wait tripped the liveness watchdog.
+            _state = self._peek_session_state(_quick_key)
+            _probed_agent = _state.turn.agent if _state else None
+            _reap_sid = await asyncio.to_thread(self._hm_reaped_session_id, _quick_key)
+            # Only the run the probe judged: a fresh turn that replaced it during the await is live.
+            _state = self._peek_session_state(_quick_key)
+            if _reap_sid and _state is not None and _state.turn.agent is _probed_agent is not None:
                 logger.warning(
                     "Evicting stale _running_agents entry for %s — "
                     "durable session %s is ended (reaped) in state.db; "
@@ -1455,7 +1469,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
         if self._is_session_running(_quick_key):
-            self._hm_evict_reaped_agent(_quick_key)
+            await self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
