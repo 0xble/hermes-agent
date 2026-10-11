@@ -187,6 +187,18 @@ regression mocks now accept the validator's billing-coordinate keyword arguments
 Ruff, `git diff --check`, and `scripts/check_fork_patches.py` pass. No live
 configuration, runtime installation, or activation changed.
 
+### Auxiliary transport and auto-vision review repair
+
+The follow-up review of #478 found that choosing the billing declaration before
+text-client resolution replaced a normalized custom runtime's live endpoint and
+credential with its configured alias endpoint. Resolve the main transport first,
+then retain the selected custom alias only in the successful route's billing
+identity. Auto-vision follows the same order and carries that identity only when
+its main-runtime candidate succeeds; fallback destinations retain their own
+billing identity. The route regressions cover a live/declaration endpoint
+mismatch and sync/async auto-vision included-cost persistence versus a different
+fallback destination.
+
 ## Update and retirement
 
 Preserve explicit opt-in, disabled-entry filtering, exact route identity, and

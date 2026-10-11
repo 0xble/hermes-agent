@@ -4580,9 +4580,9 @@ def _warn_stale_openai_base_url(runtime_provider: str) -> None:
 def _main_route_target(runtime: Dict[str, Any], task: Optional[str]) -> Tuple[str, str, str, Any, str]:
     """Step-1 target: (provider, model, base_url, api_key, api_mode) of the main runtime, after the
     fast-model opt-in and the MoA aggregator substitution."""
-    from agent.usage_pricing import billing_provider_identity
-    main_provider = billing_provider_identity(
-        str(runtime.get("provider", "") or _read_main_provider() or ""), runtime.get("requested_provider")) or ""
+    # Keep the live transport provider here; the selected custom alias is attached to the
+    # resolved route below for billing only, after its endpoint and credential are chosen.
+    main_provider = str(runtime.get("provider", "") or _read_main_provider() or "")
     main_model = str(runtime.get("model") or _read_main_model() or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
@@ -4707,7 +4707,10 @@ def _resolve_auto_route(
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
-        return routed
+        from agent.usage_pricing import billing_provider_identity
+        client, resolved_model, transport_provider = routed
+        selected = billing_provider_identity(transport_provider, runtime.get("requested_provider"))
+        return client, resolved_model, selected or transport_provider
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -5691,7 +5694,9 @@ def _vision_auto_route(
     if main_provider and main_provider not in {"auto", "", "moa"}:
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
+            from agent.usage_pricing import billing_provider_identity
+            selected = billing_provider_identity(main_provider, runtime.get("requested_provider"))
+            return _finalize_vision_client(selected or main_provider, client, default_model, resolved_model, async_mode)
     # Aggregators use their dedicated vision model, not the user's main model.
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:

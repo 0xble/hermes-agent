@@ -200,3 +200,81 @@ def test_custom_responses_usage_uses_selected_declaration(billing_fixture):
     assert row["billing_provider"] == "custom:included"
     assert row["billing_mode"] == "subscription_included"
     assert row["cost_status"] == "included"
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+def test_auto_main_custom_alias_preserves_live_transport_and_billing(billing_fixture, monkeypatch, async_call):
+    """The live runtime endpoint wins transport; its selected custom alias remains billing identity."""
+    aux, db, _ = billing_fixture
+    live_url = "https://live.invalid/v1"
+    calls = []
+
+    def physical(client, kwargs, *a, **kw):
+        calls.append((str(client.base_url).rstrip("/"), client.api_key))
+        return response()
+
+    async def aphysical(*a, **kw):
+        return physical(*a, **kw)
+
+    monkeypatch.setattr(aux, "_create_with_progress", physical)
+    monkeypatch.setattr(aux, "_acreate_with_progress", aphysical)
+    runtime = dict(
+        provider="custom", requested_provider="custom:included", model=MODEL,
+        base_url=live_url, api_key="live-key", api_mode="chat_completions",
+    )
+    out = (asyncio.run(aux.async_call_llm(task="title_generation", main_runtime=runtime,
+                                          messages=[{"role": "user", "content": "title"}]))
+           if async_call else aux.call_llm(task="title_generation", main_runtime=runtime,
+                                           messages=[{"role": "user", "content": "title"}]))
+    assert calls == [(live_url, "live-key")]
+    assert out._hermes_billing_route["provider"] == "custom:included"
+    assert out._hermes_billing_route["base_url"].rstrip("/") == live_url
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_auto_vision_records_selected_destination_billing(billing_fixture, monkeypatch, async_call, fallback):
+    """Included main billing survives auto vision, but never follows a different destination."""
+    aux, db, _ = billing_fixture
+    fallback_url = "https://fallback.invalid/v1"
+    if fallback:
+        # Keep the real auto-vision chain: declared support rejects the main model and the strict
+        # backend boundary supplies the fallback transport. The physical send is mocked below.
+        monkeypatch.setattr(aux, "_vision_supports_declared", lambda *_a: False)
+        monkeypatch.setattr(aux, "_resolve_strict_vision_backend", lambda provider, model=None:
+            (SimpleNamespace(base_url=fallback_url, api_key="fallback-key"), MODEL)
+            if provider == "openrouter" else (None, None))
+        monkeypatch.setattr(aux, "_to_async_client", lambda client, model, **kw: (client, model))
+    calls = []
+
+    def physical(client, kwargs, *a, **kw):
+        calls.append((str(client.base_url).rstrip("/"), client.api_key))
+        return response()
+
+    async def aphysical(*a, **kw):
+        return physical(*a, **kw)
+
+    monkeypatch.setattr(aux, "_create_with_progress", physical)
+    monkeypatch.setattr(aux, "_acreate_with_progress", aphysical)
+    runtime = dict(provider="custom", requested_provider="custom:included", model=MODEL,
+                   base_url=URL, api_key="live-key", api_mode="chat_completions")
+    kwargs = dict(task="vision", main_runtime=runtime,
+                  messages=[{"role": "user", "content": [{"type": "text", "text": "describe"}]}])
+    out = asyncio.run(aux.async_call_llm(**kwargs)) if async_call else aux.call_llm(**kwargs)
+    expected_provider = "openrouter" if fallback else "custom:included"
+    expected_url = fallback_url if fallback else URL
+    assert calls == [(expected_url, "fallback-key" if fallback else "live-key")]
+    assert out._hermes_billing_route["provider"] == expected_provider
+    assert out._hermes_billing_route["base_url"].rstrip("/") == expected_url
+    row = dict(db._conn.execute(
+        "SELECT * FROM session_model_usage WHERE session_id = 'audit' AND task = 'vision'"
+    ).fetchone())
+    assert row["billing_provider"] == expected_provider
+    assert row["billing_base_url"].rstrip("/") == expected_url
+    if fallback:
+        assert row["billing_mode"] != "subscription_included"
+        assert row["cost_status"] != "included"
+    else:
+        assert row["billing_mode"] == "subscription_included"
+        assert row["estimated_cost_usd"] == 0
+        assert row["cost_status"] == "included"
