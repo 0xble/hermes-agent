@@ -93,6 +93,7 @@ def _runner(home, adapter, *, auto_icons=False):
 @pytest.mark.asyncio
 async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home):
     adapter = FakeTelegram()
+    adapter.get_forum_topic_icon_options = AsyncMock(return_value=list(ICONS))
     runner = _runner(home, adapter)
 
     result = await create_topic_session(runner, _source(thread_id="297206"), TopicSpec(
@@ -105,6 +106,9 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     key = runner._session_key_for_source(dest)
     sid = result["session_id"]
     assert result["thread_id"] == "4242" and result["relay"] == f"hermes:default/{sid}"
+    assert result["icon"] == "💡"
+    assert result["warnings"] == []
+    adapter.get_forum_topic_icon_options.assert_awaited_once()
     # Bound session, user-authority title, icon recorded as manual so auto-renames keep it.
     binding = home.db.get_telegram_topic_binding(chat_id=CHAT, thread_id="4242")
     assert binding["session_id"] == sid and binding["session_key"] == key
@@ -112,6 +116,7 @@ async def test_create_binds_a_new_session_with_every_setting_and_starts_it(home)
     assert home.db.get_session_title_source(sid) == "user"
     assert home.db.get_telegram_topic_icon_state(CHAT, "4242")["owner"] == "manual"
     # The brief is shown in the topic and admitted as the session's first turn, never as a command.
+    assert adapter.sent[0]["content"] == "/title is not a command here: read the plan"
     assert adapter.sent[0]["metadata"] == {"thread_id": "4242"}
     turn = adapter.admitted[0]
     assert turn.internal and not turn.allow_gateway_control and not turn.is_command()
@@ -132,29 +137,50 @@ async def test_create_validates_everything_before_touching_telegram(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
 
-    with pytest.raises(TopicRequestError, match="Unsupported topic icon"):
+    with pytest.raises(TopicRequestError, match="Unsupported topic icon.*Available icons:") as error:
         await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="🚀"))
+    assert str(error.value).endswith("Available icons: " + " ".join(item["emoji"] for item in ICONS))
     with pytest.raises(TopicRequestError, match="reasoning"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", reasoning="extreme"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", reasoning="extreme"))
     runner._perform_model_switch = AsyncMock(return_value=(None, "Unknown model nope"))
     with pytest.raises(TopicRequestError, match="Unknown model"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", model="nope"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", model="nope"))
     with pytest.raises(ValueError):
         await create_topic_session(runner, _source(), TopicSpec(name="x" * 200))
     assert adapter.created == []  # an invalid request never leaves an orphan topic
 
 
 @pytest.mark.asyncio
-async def test_create_without_icon_uses_the_automatic_pick(home):
+@pytest.mark.parametrize("auto_icons", [False, True])
+async def test_create_requires_an_icon_before_creating_a_topic(home, auto_icons):
     adapter = FakeTelegram()
+    runner = _runner(home, adapter, auto_icons=auto_icons)
+
+    with pytest.raises(TopicRequestError, match="icon is required.*Available icons:") as error:
+        await create_topic_session(runner, _source(), TopicSpec(name="Toolkit"))
+
+    assert str(error.value).endswith("Available icons: " + " ".join(item["emoji"] for item in ICONS))
+    assert adapter.created == []
+    assert home.db.list_telegram_topic_bindings_for_chat(chat_id=CHAT) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", ["empty", "failure"])
+@pytest.mark.parametrize("requested_icon", ["", "💡"])
+async def test_create_without_an_available_icon_set_warns_and_reports_no_icon(home, unavailable, requested_icon):
+    adapter = FakeTelegram()
+    adapter.get_forum_topic_icon_options = AsyncMock(
+        return_value=[], side_effect=RuntimeError("network down") if unavailable == "failure" else None)
     runner = _runner(home, adapter, auto_icons=True)
-    runner._select_telegram_topic_icon = AsyncMock(
-        return_value=("icon-thread", ("icon-thread", "🧵", "default"), ("🧵", "icon-thread", "default"), "auto"))
 
-    await create_topic_session(runner, _source(), TopicSpec(name="Thread Work"))
+    result = await create_topic_session(runner, _source(), TopicSpec(name="Toolkit", icon=requested_icon))
 
-    assert adapter.created[0]["icon"] == "icon-thread"
-    assert home.db.get_telegram_topic_icon_state(CHAT, "4242")["owner"] == "auto"
+    assert adapter.created == [{"chat_id": int(CHAT), "name": "Toolkit", "icon": None}]
+    assert result["icon"] is None
+    assert any("icon" in warning.lower() and "unavailable" in warning.lower() for warning in result["warnings"])
+    assert home.db.get_telegram_topic_icon_state(CHAT, "4242") is None
+    assert home.db.get_telegram_topic_binding(chat_id=CHAT, thread_id="4242")["session_id"] == result["session_id"]
+    adapter.get_forum_topic_icon_options.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -164,7 +190,7 @@ async def test_create_reports_the_created_topic_when_setup_fails(home):
     runner.session_store.get_or_create_session = MagicMock(side_effect=RuntimeError("db locked"))
 
     with pytest.raises(TopicRequestError, match="Topic 4242 was created.*thread_id=4242"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
 
 
 @pytest.mark.asyncio
@@ -187,7 +213,7 @@ async def test_create_refuses_a_model_that_needs_the_users_confirmation(home, mo
     monkeypatch.setattr(guards, "combined_selection_warning", _warn)
 
     with pytest.raises(TopicRequestError, match=r"Expensive Model Warning: gpt-test needs the user's confirmation"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", model="gpt-test"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", model="gpt-test"))
     assert seen == [("gpt-test", "openai-codex")]
     assert adapter.created == []
     runner._perform_model_switch.assert_awaited_once()
@@ -201,7 +227,7 @@ async def test_create_reports_an_undelivered_brief_and_never_admits_it(home):
 
     with pytest.raises(TopicRequestError, match=r"opening brief was not delivered: Forbidden: topic closed\. "
                                                 r"Send it with relay to hermes:default/"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", message="start here"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", message="start here"))
     # The topic and its session exist and are bound; only the brief is missing, and the session never
     # starts working from a brief the user was not shown.
     assert home.db.get_telegram_topic_binding(chat_id=CHAT, thread_id="4242")["session_id"]
@@ -209,7 +235,7 @@ async def test_create_reports_an_undelivered_brief_and_never_admits_it(home):
 
     adapter.send = AsyncMock(side_effect=RuntimeError("network down"))
     with pytest.raises(TopicRequestError, match="not delivered: network down"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room 2", message="start here"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room 2", icon="💡", message="start here"))
     assert adapter.admitted == []
 
 
@@ -259,8 +285,8 @@ async def test_a_create_that_failed_after_telegram_is_finished_by_the_suggested_
     bind = runner._record_telegram_topic_binding
     runner._record_telegram_topic_binding = MagicMock(side_effect=RuntimeError("db locked"))
 
-    with pytest.raises(TopicRequestError, match="action=edit thread_id=4242 name='Room' reasoning='high'") as err:
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", reasoning="high"))
+    with pytest.raises(TopicRequestError, match="action=edit thread_id=4242 name='Room' icon='💡' reasoning='high'") as err:
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", reasoning="high"))
     assert home.db.get_telegram_topic_binding(chat_id=CHAT, thread_id="4242") is None
     assert "action=edit" in str(err.value)
 
@@ -285,7 +311,7 @@ async def test_a_model_edit_after_restart_resolves_against_the_topics_own_route(
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    await create_topic_session(runner, _source(), TopicSpec(name="Room", model="gpt-test", provider="openai-codex"))
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", model="gpt-test", provider="openai-codex"))
 
     restarted = _runner(home, adapter)
     restarted._is_session_running = lambda key: False
@@ -302,7 +328,7 @@ async def test_edit_follows_a_restored_binding_instead_of_repointing_the_topic(h
     would, not rebind the topic to whatever the stale route points at."""
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    created = await create_topic_session(runner, _source(), TopicSpec(name="Room"))
+    created = await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
     older = home.db.create_session(session_id="older-session", source="telegram")
     home.db.bind_telegram_topic(chat_id=CHAT, thread_id="4242", user_id=CHAT,
                                 session_key=runner._session_key_for_source(_source(thread_id="4242")),
@@ -326,7 +352,7 @@ async def test_a_model_edit_on_a_restored_topic_resolves_and_lands_on_the_topics
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
     created = await create_topic_session(runner, _source(), TopicSpec(
-        name="Room", model="gpt-test", provider="openai-codex", reasoning="high"))
+        name="Room", icon="💡", model="gpt-test", provider="openai-codex", reasoning="high"))
     key = runner._session_key_for_source(_source(thread_id="4242"))
     home.db.create_session(session_id="older-session", source="telegram")
     home.db.bind_telegram_topic(chat_id=CHAT, thread_id="4242", user_id=CHAT, session_key=key,
@@ -370,7 +396,7 @@ async def test_a_model_commit_rechecks_that_the_session_is_still_idle(home):
     swapped. The commit re-checks under the /model lock."""
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    await create_topic_session(runner, _source(), TopicSpec(name="Room"))
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
     checks = iter([False, True])  # idle when the edit starts, running by commit time
     runner._is_session_running = lambda key: next(checks)
 
@@ -389,7 +415,7 @@ async def test_a_paused_hermes_starts_no_brief(home, monkeypatch):
     runner = _runner(home, adapter)
 
     with pytest.raises(TopicRequestError, match="opening brief was not delivered: Hermes is paused"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room", message="start"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", message="start"))
     assert adapter.sent == [] and adapter.admitted == []
 
 
@@ -397,7 +423,7 @@ async def test_a_paused_hermes_starts_no_brief(home, monkeypatch):
 async def test_a_new_topic_gets_no_model_switch_note_and_an_edit_does(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    await create_topic_session(runner, _source(), TopicSpec(name="Room", model="gpt-test"))
+    await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡", model="gpt-test"))
     key = runner._session_key_for_source(_source(thread_id="4242"))
     assert key not in runner._pending_model_notes
 
@@ -422,7 +448,7 @@ def test_relay_address_names_the_gateways_own_profile_when_the_source_has_none()
 async def test_edit_renames_topic_and_session_and_changes_settings(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    created = await create_topic_session(runner, _source(), TopicSpec(name="Old Name"))
+    created = await create_topic_session(runner, _source(), TopicSpec(name="Old Name", icon="💡"))
 
     result = await edit_topic_session(runner, _source(thread_id="297206"), "4242", TopicSpec(
         name="New Name", icon="🧵", model="gpt-test", reasoning="low"))
@@ -430,6 +456,7 @@ async def test_edit_renames_topic_and_session_and_changes_settings(home):
     assert adapter.renamed[-1] == {"chat_id": CHAT, "thread_id": "4242", "name": "New Name",
                                    "icon_custom_emoji_id": "icon-thread"}
     assert result["title"] == "New Name" and home.db.get_session_title(created["session_id"]) == "New Name"
+    assert result["icon"] == "🧵"
     key = runner._session_key_for_source(_source(thread_id="4242"))
     assert runner._session_model_override(key)["model"] == "gpt-test"
     assert runner._resolve_session_reasoning_config(session_key=key) == {"enabled": True, "effort": "low"}
@@ -439,7 +466,7 @@ async def test_edit_renames_topic_and_session_and_changes_settings(home):
 async def test_edit_icon_only_keeps_the_visible_name(home):
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
-    await create_topic_session(runner, _source(), TopicSpec(name="Keep Me"))
+    await create_topic_session(runner, _source(), TopicSpec(name="Keep Me", icon="💡"))
 
     await edit_topic_session(runner, _source(), "4242", TopicSpec(icon="🧵"))
 
@@ -488,8 +515,27 @@ async def test_a_call_fails_closed_when_the_profile_has_no_telegram_adapter(home
     runner._delivery_adapter_for = lambda source: None  # disconnected, or a secondary that failed
 
     with pytest.raises(TopicRequestError, match="unavailable right now"):
-        await create_topic_session(runner, _source(), TopicSpec(name="Room"))
+        await create_topic_session(runner, _source(), TopicSpec(name="Room", icon="💡"))
     assert adapter.created == []
+
+
+@pytest.mark.asyncio
+async def test_tool_returns_icon_choices_then_accepts_a_corrected_create(home, monkeypatch):
+    from tools import telegram_topic_tool as tool
+
+    adapter = FakeTelegram()
+    runner = _runner(home, adapter)
+    monkeypatch.setattr(tool, "_live_runner", lambda: runner)
+    monkeypatch.setattr(tool, "_calling_source", lambda _runner: _source())
+
+    error = json.loads(await tool.telegram_topic_tool({"action": "create", "name": "Toolkit"}))
+    assert "icon is required" in error["error"]
+    assert error["error"].endswith("Available icons: " + " ".join(item["emoji"] for item in ICONS))
+    assert adapter.created == []
+
+    result = json.loads(await tool.telegram_topic_tool({"action": "create", "name": "Toolkit", "icon": "💡"}))
+    assert result["icon"] == "💡"
+    assert adapter.created == [{"chat_id": int(CHAT), "name": "Toolkit", "icon": "icon-idea"}]
 
 
 def test_tool_reaches_only_telegram_sessions():
@@ -500,6 +546,8 @@ def test_tool_reaches_only_telegram_sessions():
     assert "telegram_topic" not in resolve_toolset("hermes-cli")
     assert "telegram_topic" not in resolve_toolset("hermes-discord")
     assert TELEGRAM_TOPIC_SCHEMA["parameters"]["additionalProperties"] is False
+    assert TELEGRAM_TOPIC_SCHEMA["parameters"]["required"] == ["action"]
+    assert "Required on create" in TELEGRAM_TOPIC_SCHEMA["parameters"]["properties"]["icon"]["description"]
 
 
 def test_saved_telegram_tool_list_gains_the_tool_without_a_config_edit():

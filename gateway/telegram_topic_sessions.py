@@ -18,8 +18,6 @@ from gateway.session_identity import replace_source
 
 logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
-BRIEF_HEADER = "Opening brief"
-
 
 class TopicRequestError(ValueError):
     """A request the caller can correct: bad name, icon, model, reasoning or target."""
@@ -53,14 +51,38 @@ def _clean_name(runner, name: str) -> str:
     return runner._sanitize_telegram_topic_title(clean)
 
 
-async def topic_icon_id(adapter, emoji: str) -> str:
-    """Native custom-emoji id for ``emoji`` from Telegram's topic icon set."""
-    options = await adapter.get_forum_topic_icon_options()
+def _icon_choices(options) -> str:
+    return " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
+
+
+def _match_icon(options, emoji: str) -> str:
     match = next((item for item in options if item.get("emoji") == emoji), None)
     if match is None or not match.get("custom_emoji_id"):
-        choices = " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
-        raise TopicRequestError(f"Unsupported topic icon {emoji!r}. Available icons: {choices or 'none'}")
+        raise TopicRequestError(
+            f"Unsupported topic icon {emoji!r}. Available icons: {_icon_choices(options) or 'none'}")
     return str(match["custom_emoji_id"])
+
+
+async def topic_icon_id(adapter, emoji: str) -> str:
+    """Native custom-emoji id for ``emoji`` from Telegram's topic icon set."""
+    return _match_icon(await adapter.get_forum_topic_icon_options(), emoji)
+
+
+async def _create_icon(adapter, emoji: str) -> tuple[Optional[str], list[str]]:
+    """The icon id a create applies. An icon is required whenever Telegram offers a native set.
+    When the set is empty or cannot be fetched, the topic is created without one and warns."""
+    try:
+        options = list(await adapter.get_forum_topic_icon_options() or [])
+    except Exception:
+        logger.warning("Telegram topic icon set could not be fetched", exc_info=True)
+        options = []
+    if not options:
+        return None, ["Telegram's topic icon set is unavailable, so the topic was created without an icon."]
+    if not emoji:
+        raise TopicRequestError(
+            "An icon is required: pick one emoji that fits the subject. "
+            f"Available icons: {_icon_choices(options)}")
+    return _match_icon(options, emoji), []
 
 
 def _parse_reasoning(effort: str) -> Optional[dict]:
@@ -146,7 +168,7 @@ async def _deliver_brief(adapter, dest: SessionSource, brief: str) -> None:
     paused = paused_reply()
     if paused is not None:
         raise RuntimeError(paused)
-    sent = await adapter.send(str(dest.chat_id), f"{BRIEF_HEADER}\n\n{brief}",
+    sent = await adapter.send(str(dest.chat_id), brief,
                               metadata={"thread_id": str(dest.thread_id)})
     if not getattr(sent, "success", False):
         raise RuntimeError(getattr(sent, "error", None) or "Telegram did not accept the message")
@@ -198,14 +220,7 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     adapter = _adapter(runner, source, "_create_dm_topic")
     root = replace_source(source, thread_id=None, message_id=None)
     name = _clean_name(runner, spec.name)
-    icon_id, icon_records = None, None
-    if spec.icon:
-        icon_id = await topic_icon_id(adapter, spec.icon)
-    else:
-        # Same pick an automatic rename would make; None when auto_topic_icons is off.
-        icon_id, state_record, history_record, owner = await runner._select_telegram_topic_icon(
-            root, adapter, name, preserve_manual=False)
-        icon_records = (state_record, history_record, owner) if icon_id else None
+    icon_id, warnings = await _create_icon(adapter, spec.icon)
     effort = _parse_reasoning(spec.reasoning)
     model = await _resolve_model(runner, root, spec)
 
@@ -219,11 +234,9 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
         if runner._session_db is not None:
             title = await runner._session_db.set_session_title_in_lineage(entry.session_id, name)
         await asyncio.to_thread(runner._record_telegram_topic_binding, dest, entry)
-        if spec.icon:
+        if icon_id:
             await _record_manual_icon(runner, dest, str(thread_id), spec.icon, icon_id)
-        elif icon_records:
-            await runner._persist_telegram_topic_icon_records(dest, *icon_records)
-        warnings = await _apply_session_settings(runner, dest, entry, model, effort, announce=False)
+        warnings.extend(await _apply_session_settings(runner, dest, entry, model, effort, announce=False))
     except Exception as exc:
         retry = " ".join(f"{field}={value!r}" for field, value in (
             ("name", name), ("icon", spec.icon), ("model", spec.model), ("provider", spec.provider),
@@ -244,7 +257,7 @@ async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -
     return {
         "action": "create", "thread_id": str(thread_id), "session_id": entry.session_id,
         "relay": relay, "title": title,
-        "icon": spec.icon or None, "model": getattr(model[1], "new_model", None) if model else None,
+        "icon": spec.icon if icon_id else None, "model": getattr(model[1], "new_model", None) if model else None,
         "provider": getattr(model[1], "target_provider", None) if model else None,
         "reasoning": effort, "brief_delivered": bool(brief), "warnings": warnings,
     }
@@ -294,7 +307,7 @@ async def edit_topic_session(runner, source: SessionSource, thread_id: str, spec
     return {
         "action": "edit", "thread_id": thread_id, "session_id": entry.session_id,
         "relay": relay_address(runner, source, entry.session_id), "name": name, "title": title,
-        "icon": spec.icon or None,
+        "icon": spec.icon if icon_id else None,
         "model": getattr(model[1], "new_model", None) if model else None,
         "provider": getattr(model[1], "target_provider", None) if model else None,
         "reasoning": effort, "warnings": warnings,
