@@ -606,8 +606,25 @@ class GatewayBusySessionMixin:
             )
         return False
 
+    def _human_preempts_autonomous_turn(self, event: MessageEvent, state: Any) -> bool:
+        """Whether a typed message should cut into the running turn instead of queueing behind it.
+
+        ``busy_input_mode: queue`` exists so the user's follow-ups wait for the user's own work.
+        Goal continuations, boot auto-resume, completion follow-ups, heartbeats and agent relays
+        run as turns in the same session too, sometimes for an hour, and the user waiting behind
+        one of those just sees an unresponsive chat. Once the user has steered or redirected the
+        turn it is theirs again.
+        """
+        opener = getattr(getattr(state, "turn", None), "event", None)
+        if opener is None or not self._is_user_turn_event(event) or is_agent_origin_text(event.text):
+            return False
+        if getattr(state.turn.agent, "_turn_user_intervened", False) is True:
+            return False
+        return not self._is_user_turn_event(opener) or is_agent_origin_text(getattr(opener, "text", ""))
+
     async def _resolve_busy_steer_or_redirect(
-        self, event: MessageEvent, session_key: str, effective_mode: str, running_agent: Any
+        self, event: MessageEvent, session_key: str, effective_mode: str, running_agent: Any,
+        *, preempt: bool = False,
     ) -> "GatewayRunner._BusySteerOutcome":
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
@@ -639,13 +656,25 @@ class GatewayBusySessionMixin:
             _steer_all_voice = bool(_steer_media_urls) and (
                 len(self._pending_event_audio_paths(event)) == len(_steer_media_urls)
             )
-            if steer_text and (plain_text or _steer_all_voice) and agent_live and hasattr(running_agent, "steer"):
+            if (
+                preempt and plain_text and agent_live and hasattr(running_agent, "redirect")
+                and getattr(running_agent, "_supports_active_turn_redirect", False) is True
+            ):
+                # Redirect reaches the model now: it re-issues an in-flight request with the
+                # message, or yields a foreground command to the background; it never kills.
+                redirected = self._redirect_active_turn(
+                    running_agent, (event.text or "").strip(), session_key, event
+                )
+            if (
+                not redirected and steer_text and (plain_text or _steer_all_voice) and agent_live
+                and hasattr(running_agent, "steer")
+            ):
                 steered = self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )
             if steered:
                 self._fold_into_running_turn(running_agent, session_key, event)
-            else:
+            elif not redirected:
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt" and plain_text and agent_live
@@ -890,6 +919,11 @@ class GatewayBusySessionMixin:
         if getattr(event, "internal", False):
             self._queue_or_replace_pending_event(session_key, event)
             return True
+        _busy_state = self._peek_session_state(session_key)
+        preempt = effective_mode == "queue" and self._human_preempts_autonomous_turn(event, _busy_state)
+        if preempt:
+            logger.info("Typed message preempts autonomous turn for session %s", session_key)
+            effective_mode = "steer"
         if (
             event.message_type == MessageType.TEXT
             and self._effective_busy_text_mode(event.source) == "queue"
@@ -897,9 +931,10 @@ class GatewayBusySessionMixin:
         ):
             return False
 
-        _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
-        _steer = await self._resolve_busy_steer_or_redirect(event, session_key, effective_mode, running_agent)
+        _steer = await self._resolve_busy_steer_or_redirect(
+            event, session_key, effective_mode, running_agent, preempt=preempt
+        )
         effective_mode, redirected = _steer.effective_mode, _steer.redirected
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
@@ -915,8 +950,8 @@ class GatewayBusySessionMixin:
         # arrived as one mashed-together turn (#43066 sub-bug 2). The FIFO path gives each text its own turn
         # in arrival order while still preserving photo-burst / album merge semantics for media.
         is_queue_mode = effective_mode == "queue"
-        is_steer_mode = effective_mode == "steer"
-        is_redirect_mode = effective_mode == "interrupt" and redirected
+        is_steer_mode = effective_mode == "steer" and not redirected
+        is_redirect_mode = redirected
         if (
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
