@@ -12,8 +12,14 @@ reducing the grace for children that still own their spawn incarnation.
 
 ## Invariants and update rule
 
-- Cache psutil PID/create-time handles while stdio children are being tracked.
-  Retain descendant witnesses through release. Both release and reaping may
+- Cache psutil PID/create-time handles at stdio spawn. Refresh descendant
+  witnesses in `_run_stdio`'s inner `finally`, while still inside `stdio_client`,
+  **before** SDK teardown closes stdin and waits for the wrapper to exit. This
+  capture runs on normal shutdown, session/handshake errors and cancellation.
+  Refresh extends only existing live, create-time-verified handles, revalidated
+  after descendant enumeration; it never recaptures a numeric wrapper PID or
+  replaces earlier descendant evidence when a wrapper has already exited.
+  Retain these witnesses through post-SDK release. Both release and reaping may
   discover new group members only through a previously recorded, live,
   create-time-verified witness in that group, revalidated after enumeration.
 - Numeric PID/PGID/SID equality never authorizes adoption or a signal. This
@@ -41,8 +47,14 @@ or without an exited group leader, and rejection of reused groups both with an
 unrelated session and with matching numeric SID/PGID after the replacement leader
 exits. The empty-witness active-ledger regression exercises final shutdown.
 Synchronization uses child readiness pipes; fake signal tests never touch
-live host processes. Existing stability and parent-death supervisor tests now seed
-incarnation evidence, not numeric PID-only signal authority.
+live host processes. `test_grandchild_reaped_via_pgroup` executes the real
+`_run_stdio` capture/release path with a pipe-controlled wrapper and late helper:
+track → helper spawn → pre-SDK witness capture → stdin EOF → wrapper exit →
+release → reaper. It fails on `55da6807` because the helper survives, and covers
+normal shutdown, errors and cancellation. Refresh regressions reject empty,
+dead, recycled and unreadable witnesses, including one that exits during a scan.
+Existing stability and parent-death supervisor tests seed incarnation evidence,
+not numeric PID-only signal authority.
 
 Run the MCP lifecycle/shutdown and gateway shutdown files through
 `scripts/run_tests.sh`, lint touched source/tests, and require

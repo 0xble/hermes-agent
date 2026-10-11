@@ -26,6 +26,38 @@ def isolated_ledger(monkeypatch):
     monkeypatch.setattr("tools.mcp_tool._update_death_supervisor", lambda *args: None)
 
 
+@pytest.mark.parametrize("ledger", ["empty", "dead", "reused", "unverifiable", "exits_during_scan"])
+def test_pre_teardown_refresh_cannot_recapture_an_unverified_wrapper(monkeypatch, ledger):
+    """Refresh must extend the original incarnation, never recapture its numeric PID."""
+    pid = 787878
+    original = Mock(pid=pid)
+    original.create_time.return_value = 100.0
+    original.status.return_value = psutil.STATUS_RUNNING
+    if ledger == "unverifiable":
+        original.is_running.side_effect = psutil.AccessDenied(pid)
+    elif ledger == "exits_during_scan":
+        original.is_running.side_effect = [True, False]
+    else:
+        original.is_running.return_value = False
+    child = Mock(pid=787879)
+    child.create_time.return_value = 200.0
+    original.children.return_value = [child]
+    lifecycle._stdio_processes[pid] = {} if ledger == "empty" else {pid: original}
+    process = Mock(side_effect=AssertionError("refresh recaptured a possibly reused PID"))
+    monkeypatch.setattr(psutil, "Process", process)
+    monkeypatch.setattr(lifecycle.os, "kill", Mock())
+    monkeypatch.setattr(lifecycle.os, "killpg", Mock(), raising=False)
+
+    lifecycle._remember_mcp_processes({pid}, refresh=True)
+
+    assert child.pid not in lifecycle._stdio_processes[pid]
+    process.assert_not_called()
+    original.send_signal.assert_not_called()
+    child.send_signal.assert_not_called()
+    lifecycle.os.kill.assert_not_called()
+    lifecycle.os.killpg.assert_not_called()
+
+
 @pytest.mark.parametrize("ledger", ["empty", "dead", "reused", "unverifiable"])
 def test_reaper_skips_wait_and_signals_without_a_live_owned_incarnation(monkeypatch, ledger):
     pid = 999999999

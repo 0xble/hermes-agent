@@ -421,11 +421,19 @@ class MCPServerTransportMixin:
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
-                async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
-                    # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
-                    # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
-                    connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
-                    return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                try:
+                    async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
+                        # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
+                        # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
+                        connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
+                        return await self._serve_session(session, connect_timeout, mark_lifecycle=True)
+                finally:
+                    # Capture late npx/mcp-remote helpers BEFORE stdio_client's
+                    # __aexit__ closes stdin and waits for the wrapper to exit.
+                    # Release runs afterward, when that ancestry is already gone.
+                    # Synchronous capture also runs under task cancellation.
+                    if new_pids:
+                        _lifecycle._remember_mcp_processes(new_pids, refresh=True)
         except Exception as exc:
             # The SDK only sees "Connection closed"; the child's stderr says why (#124264).
             abi_error = node_abi_error(self.name, await asyncio.to_thread(stderr.close))

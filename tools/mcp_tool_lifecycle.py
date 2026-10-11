@@ -54,22 +54,44 @@ def _mcp_process_in_group(proc, pgid: int) -> bool:
         return False
 
 
-def _remember_mcp_processes(pids: set) -> None:
-    """Capture incarnation handles while the newly spawned children are ours."""
+def _remember_mcp_processes(pids: set, *, refresh: bool = False) -> None:
+    """Capture at spawn; refresh only through the original verified incarnations.
+
+    Pre-teardown refresh must never construct a new handle for a recorded PID:
+    a wrapper may already have exited and that numeric PID may have been reused.
+    Retain earlier descendant witnesses even if their wrapper is now gone.
+    """
     import psutil
     for pid in pids:
-        try:
-            proc = psutil.Process(pid)
-            proc.create_time()  # require a readable birth identity, not a PID-only handle
+        if refresh:
+            with _core._lock:
+                members = dict(_stdio_processes.get(pid, {}))
+            witnesses = list(members.values())
+        else:
+            try:
+                proc = psutil.Process(pid)
+                proc.create_time()  # readable birth identity, not a PID-only handle
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
             members = {proc.pid: proc}
-            for child in proc.children(recursive=True):
-                try:
-                    child.create_time()
-                    members[child.pid] = child
-                except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                    continue
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            continue
+            witnesses = [proc]
+        for proc in witnesses:
+            if not _mcp_process_alive(proc):
+                continue
+            try:
+                descendants = {}
+                for child in proc.children(recursive=True):
+                    try:
+                        child.create_time()
+                        descendants[child.pid] = child
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        continue
+                # Enumeration is not authority if the witness died/recycled
+                # during it; this is the same fail-closed rule as group adoption.
+                if _mcp_process_alive(proc):
+                    members.update(descendants)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
         with _core._lock:
             _stdio_processes[pid] = members
 
