@@ -1538,6 +1538,38 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
 
 
 @pytest.fixture
+def isolated_machine_home(tmp_path_factory, monkeypatch):
+    """Machine-changing tests opt into disposable account and child paths."""
+    # Separate from tmp_path: tests that inspect their fixture directory must not see
+    # the harness's home. Shell/native children inherit the same destination.
+    home = tmp_path_factory.mktemp("installer-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    if os.name == "nt":
+        for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
+            target = home / "AppData" / directory
+            target.mkdir(parents=True)
+            monkeypatch.setenv(name, str(target))
+    else:
+        # launchd deliberately consults pwd before HOME so profile pinning cannot move
+        # a real user's service. Keep that production resolver intact inside the fixture.
+        import pwd
+
+        getpwuid = pwd.getpwuid
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only branch
+
+        def isolated_account(account_uid):
+            record = getpwuid(account_uid)
+            if account_uid == uid:
+                record = pwd.struct_passwd((*record[:5], str(home), record[6]))
+            return record
+
+        monkeypatch.setattr(pwd, "getpwuid", isolated_account)
+    return home
+
+
+@pytest.fixture
 def real_bash() -> str:
     """A bash that runs shell scripts: on the Windows runners PATH resolves ``bash`` to
     System32's WSL launcher, which prints a UTF-16 "no installed distributions" notice and
