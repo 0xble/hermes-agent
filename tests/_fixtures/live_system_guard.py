@@ -265,6 +265,50 @@ def _live_system_guard(request, monkeypatch):
 
     from tests.git_safety import blocked_git_mutation
 
+    def _base_is_hermes_update(cmd) -> bool:
+        # Keep the pre-PR predicate unchanged: new checks may add protection,
+        # never replace protection provided by this conservative baseline.
+        cmd_str = _cmd_to_string(cmd)
+        low = cmd_str.lower()
+        return "update" in low and (
+            # hermes update / hermes update --gateway / setsid bash -c ... hermes update
+            ("hermes" in low and "update" in low.split())
+            or
+            # python -m hermes_cli.main update --gateway
+            ("hermes_cli" in low and "update" in low.split())
+            or
+            # venv/bin/hermes update  (absolute path variant used in tests)
+            (".venv/bin/hermes" in low and "update" in low)
+        )
+
+    def _is_npm_refresh_fixture(cmd, kwargs) -> bool:
+        # Only PM's direct temporary fixture command is a known false positive:
+        # its parent path can contain "hermes-ci-home", but it updates a throwaway
+        # package-lock.json. Shell payloads, extra args and executable overrides
+        # are deliberately not exempt. No real Hermes entrypoint has this shape.
+        if not isinstance(cmd, (list, tuple)) or len(cmd) != 2 or cmd[1] != "update":
+            return False
+        if not kwargs or kwargs.get("shell") or kwargs.get("executable") is not None:
+            return False
+        import tempfile
+        binary = Path(_argv_token(cmd[0]))
+        if not binary.is_absolute():
+            return False
+        suffix = ("store", "npm-fixture", "npm.cmd") if _os.name == "nt" else (
+            "store", "npm-fixture", "bin", "npm"
+        )
+        if binary.parts[-len(suffix):] != suffix:
+            return False
+        root = binary.parents[len(suffix) - 1]
+        cwd = kwargs.get("cwd")
+        return (
+            root.name.startswith("pm-deps-")
+            and root.parent.resolve() == Path(tempfile.gettempdir()).resolve()
+            and binary.is_file()
+            and cwd is not None
+            and Path(cwd).resolve() == (root / "repo").resolve()
+        )
+
     def _argv_token(token) -> str:
         if isinstance(token, (bytes, bytearray)):
             return bytes(token).decode(errors="replace")
@@ -378,9 +422,8 @@ def _live_system_guard(request, monkeypatch):
         # inotify/SHA watchdogs.  Any test that legitimately needs to exercise
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
-        # Match executable/module tokens, not arbitrary path components such
-        # as the fixture home ``hermes-ci-home\\npm-fixture\\npm.cmd update``.
-        if _is_hermes_update(cmd):
+        block_update = _base_is_hermes_update(cmd) or _is_hermes_update(cmd)
+        if block_update and not _is_npm_refresh_fixture(cmd, kwargs):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "
