@@ -6,6 +6,16 @@ Fork patch identity: `quick-snapshot-recovery`.
 
 Automatic pre-update snapshots and manually labeled snapshots retain independent windows. A failed or oversized capture must not halt pruning indefinitely or replace the last verified copy of a missing database. A manifest-listed payload counts as recovery only when it is present, its size agrees with the manifest, and SQLite integrity passes for databases. The just-published generation is never deleted by its own prune. A usable previously captured oversized non-database file remains protected too.
 
+Ordinary copy failures are omissions too, not merely warnings. Persist each path
+in `failed_files`, print and log the failed capture, and include that list in
+recovery-anchor selection and completeness classification. An older manifest
+without this optional field retains its existing meaning; a later standalone prune
+must still retain the last verified copy of an omitted config/auth/cron file.
+The real unreadable-file regression in `test_quick_snapshot_retention.py` combines
+`chmod 0` with an oversized database so the complete-generation guard cannot mask
+the path omission, proves repeated failures stay bounded, and releases the anchor
+only after a successful recapture.
+
 ## Provenance and adoption
 
 - Archived HERMES-131, `0xble/hermes-agent-archived` source proposal; the narrow current implementation follows [upstream PR #106101](https://github.com/NousResearch/hermes-agent/pull/106101) at `bf9c28bc2ea0c31175d4c049d8d706f53b8174dd`, following issue #106087. Source PR #97768 remains an upstream predecessor for the broader retention model.
