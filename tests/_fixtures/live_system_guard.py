@@ -301,10 +301,27 @@ def _live_system_guard(request, monkeypatch):
         # inotify/SHA watchdogs.  Any test that legitimately needs to exercise
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
-        try:
-            command_tokens = _shlex.split(cmd_str)
-        except ValueError:
-            command_tokens = cmd_str.split()
+        if isinstance(cmd, (list, tuple)):
+            def argv_token(token) -> str:
+                if isinstance(token, (bytes, bytearray)):
+                    return bytes(token).decode(errors="replace")
+                try:
+                    token = _os.fspath(token)
+                except TypeError:
+                    token = str(token)
+                return token.decode(errors="replace") if isinstance(token, bytes) else str(token)
+
+            # Preserve argv element boundaries. POSIX shlex treats the
+            # backslashes in a native Windows executable path as escapes when
+            # a list is flattened into one string, turning
+            # ``C:\\repo\\Scripts\\hermes.exe`` into
+            # ``C:repoScriptshermes.exe`` before basename matching.
+            command_tokens = [argv_token(token) for token in cmd]
+        else:
+            try:
+                command_tokens = _shlex.split(cmd_str)
+            except ValueError:
+                command_tokens = cmd_str.split()
         # Match executable/ module tokens, not arbitrary path components.  The
         # CI home is deliberately named ``hermes-ci-home``; substring matching
         # therefore misclassified an unrelated fixture command such as

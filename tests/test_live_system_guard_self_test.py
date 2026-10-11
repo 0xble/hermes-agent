@@ -125,6 +125,25 @@ def test_subprocess_run_systemctl_restart_blocked():
         subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"])
 
 
+@pytest.mark.parametrize(
+    "executable",
+    [
+        r"C:\repo\.venv\Scripts\hermes.exe",
+        r"C:\repo\.venv\Scripts\HERMES.EXE",
+        r"C:\repo\hermes.exe",
+        r"C:\repo\HERMES.EXE",
+        r"C:\repo\.venv\Scripts\hermes",
+        r"C:\repo\.venv\Scripts\HERMES",
+        r"C:\repo\hermes",
+        r"C:\repo\HERMES",
+    ],
+)
+def test_subprocess_run_windows_native_hermes_update_blocked(executable):
+    """Native Windows argv preserves backslashes and must still block updates."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([executable, "update"])
+
+
 def test_subprocess_run_full_path_systemctl_blocked():
     """``/usr/bin/systemctl`` (full path) must be blocked too."""
     with pytest.raises(RuntimeError, match="live-system guard"):
