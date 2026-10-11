@@ -7642,7 +7642,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
-        self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
+        await self._prepare_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -7659,7 +7659,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._prepare_text_event(event)
             return
         await self.handle_message(event)
 
@@ -7728,7 +7728,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         logger.info("[%s] Received Rich Message as Markdown (%d chars, %d blocks)",
                     self.name, len(event.text or ""), projection.block_count)
-        self._enqueue_text_event(self._apply_telegram_group_observe_attribution(event))
+        await self._prepare_text_event(self._apply_telegram_group_observe_attribution(event))
 
     @staticmethod
     def _unmatched_message_fields(message: Any) -> List[str]:
@@ -7775,10 +7775,20 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     # -- Text message aggregation (handles Telegram client-side splits) --
 
-    def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped batching key; topic recovery first so DM-topic batches coalesce on the recovered lane."""
-        self._apply_topic_recovery(event)
-        return super()._text_batch_key(event)
+    async def _prepare_text_event(self, event: MessageEvent) -> None:
+        """Recover the lane off-loop before synchronously keying/enqueuing a chunk."""
+        if self._drop_unresolved(event):
+            return
+        if self._should_drop_delayed_delivery():
+            self._hold_inbound_event(event, where="text-enqueue")
+            return
+        expected_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
+        if (not expected_key and getattr(self, "_topic_recovery_fn", None) is not None
+                and event.source.platform == Platform.TELEGRAM and event.source.chat_type == "dm"):
+            await asyncio.to_thread(self._apply_topic_recovery, event)
+        # Batch dictionaries, task creation and acceptance belong to the loop.
+        # The enqueue guard rechecks teardown after the storage await.
+        self._enqueue_text_event(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""

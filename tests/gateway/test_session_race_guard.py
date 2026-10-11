@@ -408,6 +408,7 @@ async def test_reset_like_commands_invalidate_deferred_queue(command_text):
     runner.adapters[Platform.TELEGRAM] = adapter
     runner._peek_session_state = lambda _key: None
     runner._interrupt_running_turn = lambda *_args, **_kwargs: 1
+    runner._is_session_run_current = lambda *_args: True
     runner._thread_metadata_for_source = lambda _source: {}
     runner._drop_turn_slot = lambda *_args, **_kwargs: None
     runner._overflow_queue = lambda _key: []
