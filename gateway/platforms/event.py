@@ -15,6 +15,15 @@ from gateway.session import SessionSource
 GOAL_CONTINUATION_METADATA_KEY = "goal_continuation"
 
 
+def is_goal_continuation_event(event_or_text: Any) -> bool:
+    """Recognize stamped continuations and legacy text (which must fail the identity fence)."""
+    metadata = getattr(event_or_text, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get(GOAL_CONTINUATION_METADATA_KEY):
+        return True
+    from hermes_cli.goals import is_goal_continuation_text
+    return is_goal_continuation_text(str(getattr(event_or_text, "text", event_or_text) or ""))
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -102,6 +111,8 @@ class MessageEvent:
     _owned_local_pending: Optional[int] = field(default=None, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Run-owned identity of a queued chain's terminal turn, for the chain's single post-turn judge.
+    _post_turn_goal_identity: Optional[dict] = field(default=None, init=False, repr=False, compare=False)
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other*: addressed human input wins over autonomous unknown input."""

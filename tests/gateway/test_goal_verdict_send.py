@@ -289,7 +289,11 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     elif case == "internal":
         event.internal = True
     elif case == "continuation":
-        event.text = "[Continuing toward your standing goal]\nGoal: repair"
+        event = runner._synthetic_prompt_event(
+            event.source, "[Continuing toward your standing goal]\nGoal: repair",
+            reply_expected=False, goal_continuation=True,
+            goal_session_id=entry.session_id, goal_state=GoalManager(entry.session_id).state,
+        )
     elif case == "heartbeat":
         event = runner._synthetic_prompt_event(event.source, "[Heartbeat — periodic check]")
         event._heartbeat_session_id = entry.session_id
@@ -314,7 +318,8 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     runner._run_agent = run_agent
     with patch("hermes_cli.goals.judge_goal") as judge:
         await runner._handle_message(event)
-    if case in {"unauthorized", "rejected-preparation", "lease-timeout"}:
+    if case in {"continuation", "unauthorized", "rejected-preparation", "lease-timeout"}:
+        # A paused goal's continuation is rejected at ingress, not merely barred from revival.
         assert not observed
     else:
         assert len(observed) == 1

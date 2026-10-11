@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext, suppress
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 
@@ -151,7 +151,8 @@ class GatewayGoalsMixin:
     @staticmethod
     def _synthetic_prompt_event(
         source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
-        goal_continuation: bool = False,
+        goal_continuation: bool = False, goal_session_id: str = "",
+        goal_state: Any = None, goal_fingerprint: Optional[str] = None, goal_instance: Optional[float] = None,
     ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
@@ -163,11 +164,27 @@ class GatewayGoalsMixin:
         continuation on a no-change tick). A typed message absorbed into the same turn still
         restores the human contract through ``MessageEvent.absorb_reply_expected``.
         """
+        metadata = {}
+        if goal_continuation:
+            from hermes_cli.session_controls import _definition_fingerprint
+            # Instance fences replacement; definition edits refresh when the queue is consumed.
+            fingerprint = goal_fingerprint if goal_fingerprint is not None else _definition_fingerprint(
+                "goal", goal_state.to_json() if goal_state is not None else None,
+            )
+            metadata = {
+                GOAL_CONTINUATION_METADATA_KEY: True,
+                "goal_continuation_session_id": goal_session_id,
+                "goal_continuation_fingerprint": fingerprint,
+                "goal_continuation_instance": (
+                    goal_instance if goal_instance is not None else getattr(goal_state, "created_at", None)
+                ),
+                "goal_continuation_created_at": time.time(),
+            }
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
-            metadata={GOAL_CONTINUATION_METADATA_KEY: True} if goal_continuation else {},
+            metadata=metadata,
         )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -469,6 +486,16 @@ class GatewayGoalsMixin:
                 logger.debug("goal stop: notice failed: %s", exc)
             return True
 
+    def _post_turn_goal_identity(self, event) -> Dict[str, Any]:
+        """Plain-data identity of the turn whose response the post-turn goal judge evaluates."""
+        if event is None:
+            return {"user_turn": False, "goal_instance": None}
+        metadata = getattr(event, "metadata", None) or {}
+        instance = metadata.get("goal_continuation_instance") if metadata.get(
+            GOAL_CONTINUATION_METADATA_KEY) else None
+        return {"user_turn": self._is_user_turn_event(event),
+                "goal_instance": instance if type(instance) in (int, float) else None}
+
     def _is_user_turn_event(self, event) -> bool:
         """An admitted turn the user sent, not a wake, continuation, heartbeat or relayed message."""
         return not (getattr(event, "internal", False)
@@ -501,6 +528,7 @@ class GatewayGoalsMixin:
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
         user_initiated: bool = False, external_event: bool = False,
+        goal_instance: Optional[float] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -517,6 +545,12 @@ class GatewayGoalsMixin:
         if mgr is None:
             return
         if not mgr.is_active():
+            return
+        # A continuation turn answers the goal instance it was stamped for. If that goal was
+        # replaced or cleared and re-set while the turn ran, its response is not evidence for the
+        # new goal: judging it would spend the new goal's turns and verdicts on old work.
+        if goal_instance is not None and getattr(mgr.state, "created_at", None) != goal_instance:
+            logger.info("goal continuation: turn answered a superseded goal instance; not judged")
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -551,7 +585,10 @@ class GatewayGoalsMixin:
             if adapter and _quick_key:
                 # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True), adapter,
+                    _quick_key, self._synthetic_prompt_event(
+                        source, prompt, reply_expected=False, goal_continuation=True,
+                        goal_session_id=mgr.session_id, goal_state=mgr.state,
+                    ), adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -583,11 +620,18 @@ class GatewayGoalsMixin:
             # metadata, never derived from message text.
             metadata = getattr(event, "metadata", None) or {}
             external_event = metadata.get("notification_origin") == "process_registry_synthetic"
-            turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
-            hooks.insert(0, (
-                "goal continuation", self._post_turn_goal_continuation,
-                {"user_initiated": turn_is_user, "external_event": external_event},
-            ))
+            # A queued chain is judged once, on its terminal turn's response: take that turn's
+            # origin and goal identity rather than the chain head's.
+            identity = getattr(event, "_post_turn_goal_identity", None)
+            if not isinstance(identity, dict):
+                identity = (self._post_turn_goal_identity(event) if event is not None
+                            else {"user_turn": not is_internal, "goal_instance": None})
+            goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
+            # A stamped continuation turn is judged only against the goal instance it served.
+            instance = identity.get("goal_instance")
+            if type(instance) in (int, float):
+                goal_kwargs["goal_instance"] = instance
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
@@ -791,7 +835,10 @@ class GatewayGoalsMixin:
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
+        event = self._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+            goal_session_id=sid, goal_state=mgr.state,
+        )
         event.metadata["gateway_session_key"] = key
         if resume_marker is not None:
             cleared = await self.async_session_store.clear_resume_pending(

@@ -3077,6 +3077,17 @@ class BasePlatformAdapter(ABC):
                    "end": end, "total": total, "page_info": page_info}
         return options[start:end], meta
 
+    async def send_control_request(
+        self, chat_id: str, text: str, request_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a session-control approval request; non-button adapters use text fallback."""
+        return await self.send(
+            chat_id=chat_id,
+            content=f"{text}\n\nRequest: {request_id} (buttons unavailable on this platform.)",
+            metadata=metadata,
+        )
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:

@@ -780,7 +780,9 @@ class GoalState:
         for i, rev in enumerate(self.revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
-            if quote:
+            if rev.get("authority") == "button":
+                authority = "approved by the user in Telegram" + (f" ({source})" if source else "")
+            elif quote:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
             else:
                 authority = "agent, no user authority"
@@ -788,8 +790,13 @@ class GoalState:
             changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
             lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
                          f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}")
+            # A user-authorized replacement supersedes the old objective; label it so it is not read as binding.
+            superseded = rev.get("kind") == "replace" and rev.get("actor") == "user"
             for key in changed:
-                if key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
+                if superseded and key == "goal":
+                    lines.append(f"    superseded goal (replaced with user authority, no longer binding): "
+                                 f"{str(before.get(key) or '(empty)')}")
+                elif key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
                     lines.append(f"    earlier {key}: {str(before.get(key) or '(empty)')}")
                 elif key == "subgoals":
                     dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
@@ -950,7 +957,7 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
+def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
     """Load the goal for a session, or None if none exists."""
     if not session_id:
         return None
@@ -958,8 +965,14 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     if db is None:
         return None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        if cursor is not None:
+            row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+            raw = row[0] if row else None
+        else:
+            raw = db.get_meta(_meta_key(session_id))
     except Exception as exc:
+        if cursor is not None:
+            raise
         logger.debug("GoalManager: get_meta failed: %s", exc)
         return None
     if not raw:
@@ -971,18 +984,25 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
-def save_goal(session_id: str, state: GoalState) -> None:
+def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
         return
     db = _get_session_db()
     if db is None:
+        if cursor is not None:
+            raise RuntimeError("session-control store unavailable")
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
         state.mutation_id = uuid.uuid4().hex
-        db.set_meta(_meta_key(session_id), state.to_json())
+        if cursor is None:
+            db.set_meta(_meta_key(session_id), state.to_json())
+        else:
+            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
     except Exception as exc:
+        if cursor is not None:
+            raise
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
@@ -2070,14 +2090,28 @@ def _is_user_typed(row: Dict[str, Any]) -> bool:
         return False
     if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
         return False
+    # Relay and other gateway-authored text is persisted as an ordinary user row.  The
+    # response-origin marker is the authoritative second provenance check; fail closed if
+    # the filter cannot be imported so synthetic text can never authorize a revision.
+    try:
+        from gateway.response_filters import is_agent_origin_text
+        if is_agent_origin_text(content):
+            return False
+    except Exception:
+        return False
     try:
         from agent.context_compressor import ContextCompressor
         if ContextCompressor._is_context_summary_content(content):
             return False
-    except Exception:  # pragma: no cover - compressor is part of the runtime
-        pass
+    except Exception:
+        # Same fail-closed rule: if a context summary cannot be ruled out, the row cannot
+        # authorize a revision or session control.
+        return False
     return True
-_REPLY_QUOTE_RE = re.compile(r'^\[Replying to: ".*?"\]\n\s*', re.DOTALL)
+# Gateway reply pointer (gateway/run_inbound.py ``_prepend_inbound_reply_context``), with or without
+# " your previous message". Greedy to the last ``"]`` line end: the quoted text is the assistant's
+# words and may itself contain ``"]``, so stripping too much fails closed for quote authority.
+_REPLY_QUOTE_RE = re.compile(r'^\[Replying to(?: your previous message)?: ".*"\]\n\s*', re.DOTALL)
 
 
 _REVISION_QUOTE_MIN_CHARS = 12
@@ -2121,7 +2155,7 @@ class GoalManager:
     """
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
-                 min_continuation_gap_seconds: Optional[float] = None):
+                 min_continuation_gap_seconds: Optional[float] = None, cursor=None):
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         if min_continuation_gap_seconds is None:
@@ -2131,7 +2165,11 @@ class GoalManager:
             # turns synchronously without a wall-clock scheduler.
             min_continuation_gap_seconds = 0
         self.min_continuation_gap_seconds = normalize_goal_continuation_gap(min_continuation_gap_seconds)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        # Session controls lend their write transaction; ordinary drivers keep independent writes.
+        self._cursor = cursor
+        self._state: Optional[GoalState] = (
+            load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
+        )
 
     # --- introspection ------------------------------------------------
 
@@ -2183,7 +2221,10 @@ class GoalManager:
             db, expected = snapshot
             assert_goal_snapshot(self.session_id, expected, db)
             return self._state
-        save_goal(self.session_id, self._state)
+        if self._cursor is None:
+            save_goal(self.session_id, self._state)
+        else:
+            save_goal(self.session_id, self._state, cursor=self._cursor)
         return self._state
 
     def _require_goal(self) -> GoalState:
@@ -2206,12 +2247,29 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
+    def _next_instance_time(self) -> float:
+        """A new goal instance's created_at, strictly after the one it supersedes.
+
+        created_at is the continuation instance fence, so a coarse or frozen clock must not let a
+        replacement or re-set reuse the previous instance's value.
+        """
+        prior = self._state.created_at if self._state is not None else getattr(self, "_cleared_instance", 0.0)
+        # Another manager may have set a newer instance since this one loaded: include the stored
+        # row (cleared rows stay stored) so two instances never share a created_at.
+        try:
+            stored = load_goal(self.session_id) if self._cursor is None else load_goal(
+                self.session_id, cursor=self._cursor)
+        except Exception:
+            stored = None
+        prior = max(float(prior or 0.0), float(getattr(stored, "created_at", 0.0) or 0.0))
+        return max(time.time(), prior + 1e-6)
+
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
         self._state = GoalState(
-            goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
         )
@@ -2270,6 +2328,7 @@ class GoalManager:
             return
         self._state.status = "cleared"
         self._save()
+        self._cleared_instance = self._state.created_at
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -2351,6 +2410,77 @@ class GoalManager:
         state.last_dispute_evidence = ""
         self._save()
         return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
+
+    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                contract: Optional[Any] = None, user_quote: str = "",
+                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace the goal with explicit quote authority and preserve revision history."""
+        old = self._state
+        if old is None or old.status not in {"active", "paused"}:
+            return {"ok": False, "error_code": "no_goal", "error": "there is no active or paused goal to replace", "state": old, "revision": None}
+        reason = (reason or "").strip()
+        goal = (goal or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason", "state": old, "revision": None}
+        if not goal:
+            return {"ok": False, "error_code": "no_change", "error": "replacement goal is empty", "state": old, "revision": None}
+        authority = None
+        try:
+            from hermes_cli.session_controls import _CURRENT_AUTHORITY
+            authority = _CURRENT_AUTHORITY.get()
+        except Exception:
+            authority = None
+        quote = " ".join((user_quote or "").split())
+        source = ""
+        if not (authority and authority.get("via") in {"quote", "button"}):
+            if not quote:
+                return {"ok": False, "error_code": "user_authority_required", "error": "goal replacement needs user_quote", "state": old, "revision": None}
+            try:
+                from hermes_cli.session_controls import check_user_quote, quote_matches_control
+                checked = check_user_quote(self.session_id, quote)
+                if isinstance(checked, str):
+                    return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
+                if not quote_matches_control("goal", "replace", self.session_id, self.session_id,
+                                             checked[0], {"goal": goal}):
+                    return {"ok": False, "error_code": "user_quote_mismatch",
+                            "error": "the quote must be the user asking to replace or change the goal",
+                            "state": old, "revision": None}
+                quote, source = checked
+                # A quote validated here is the same user authority apply_control records.
+                authority = {"via": "quote", "quote": quote, "message": source}
+            except ValueError as exc:
+                code = str(exc)
+                return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}
+        elif authority.get("via") == "button":
+            # Button approval is the user's authority: record who approved what so the judge and
+            # continuation treat the old goal as superseded rather than as an agent-only change.
+            quote = ""
+            source = f'Approved in Telegram: replace goal with "{goal}"'
+        else:
+            source = str(authority.get("message") or "")
+        if user_messages is not None and source == "" and user_messages:
+            source = " ".join(str(user_messages[-1]).split())
+        old_contract = old.contract.to_dict()
+        new_contract = contract.to_dict() if hasattr(contract, "to_dict") else dict(contract or {})
+        new_contract = {k: str(new_contract.get(k) or "").strip() for k in _CONTRACT_FIELDS}
+        before = {"goal": old.goal, "max_turns": old.max_turns, "contract": old_contract,
+                  "status": old.status, "subgoals": list(old.subgoals)}
+        after = {"goal": goal, "max_turns": old.max_turns if max_turns is None else normalize_goal_max_turns(max_turns, self.default_max_turns),
+                 "contract": new_contract, "status": "active", "subgoals": []}
+        revision = {"kind": "replace", "before": before, "after": after, "user_quote": quote,
+                    "user_message": source, "reason": reason, "at": time.time(), "actor": "agent"}
+        if authority and authority.get("via") in {"quote", "button"}:
+            revision["actor"] = "user"
+            revision["authority"] = authority["via"]
+            if authority["via"] == "button":
+                revision["approved_by"] = str(authority.get("user_id") or "")
+        revisions = list(old.revisions) + [revision]
+        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(),
+                                max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),
+                                revisions=revisions)
+        self._save()
+        return {"ok": True, "error_code": "", "error": "", "state": self._state,
+                "revision": revision}
 
     # --- /subgoal user controls ---------------------------------------
 

@@ -127,6 +127,30 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
 
 
 @pytest.mark.asyncio
+async def test_post_turn_completion_does_not_stop_a_loop_revised_during_the_turn(loop_env):
+    """The gateway completes with a fresh manager: a stop verdict on prompt A must not end B."""
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt A"))
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    loops.save_loop("sid-gateway-loop", mgr.state)
+    assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
+    revised = loops.LoopManager(session_id="sid-gateway-loop").revise(
+        reason="new target", prompt="poll prompt B",
+        user_quote="switch the loop to polling prompt B",
+        user_messages=["Please switch the loop to polling prompt B now"])
+    assert revised["ok"] is True, revised
+
+    await GatewayRunner._post_turn_loop_completion(
+        runner, session_entry=_FakeSessionEntry(), source=None,
+        final_response="Prompt A is done.\nLOOP_COMPLETE",
+    )
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.status == "active" and reloaded.prompt == "poll prompt B"
+    assert reloaded.awaiting_response is False
+
+
+@pytest.mark.asyncio
 async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))

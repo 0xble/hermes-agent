@@ -4,6 +4,7 @@ Bound onto ``GatewayRunner`` through ``GatewaySlashCommandsMixin``."""
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
@@ -56,7 +57,10 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(event, result.prompt, label="command enqueue", kickoff=result.kickoff)
+            self._enqueue_goal_turn(
+                event, result.prompt, label="command enqueue", kickoff=result.kickoff,
+                goal_session_id=mgr.session_id, goal_state=mgr.state,
+            )
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -68,7 +72,8 @@ class GatewayGoalCommandsMixin:
             logger.debug("goal %s: pending continuation cleanup failed: %s", verb, exc)
 
     def _enqueue_goal_turn(
-        self, event: MessageEvent, text: str, *, label: str, kickoff: bool
+        self, event: MessageEvent, text: str, *, label: str, kickoff: bool,
+        goal_session_id: str = "", goal_state: Any = None,
     ) -> None:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
@@ -92,6 +97,7 @@ class GatewayGoalCommandsMixin:
                 else:
                     turn = self._synthetic_prompt_event(
                         event.source, text, reply_expected=False, goal_continuation=True,
+                        goal_session_id=goal_session_id, goal_state=goal_state,
                     )
                 self._enqueue_fifo(quick_key, turn, adapter)
         except Exception as exc:
