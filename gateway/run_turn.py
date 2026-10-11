@@ -3705,7 +3705,8 @@ class GatewayTurnMixin:
             _cur_tool or "none",
         )
         if _timed_out_agent:
-            request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
+            request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT,
+                                   tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT, delegation_reason="timeout")
         _timeout_mins = int(worker.agent_timeout // 60) or 1
         _iter_progress = format_iteration_progress(_iter_n, _iter_max)
         _diag_lines = [t("gateway.progress.timeout_header", minutes=_timeout_mins)]

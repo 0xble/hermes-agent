@@ -314,7 +314,8 @@ class SubagentLifecycleService:
         if agent is not None:
             with contextlib.suppress(Exception):
                 accepted = request_hard_interrupt(
-                    agent, f"Lifecycle cancellation requested: {reason[:500]}", tool_reason="subagent cancellation requested",
+                    agent, f"Lifecycle cancellation requested: {reason[:500]}",
+                    tool_reason="subagent cancellation requested", delegation_reason=reason,
                 )
         return SubagentCancelResult(bool(accepted), unsupported=not accepted, state=SubagentState.CANCEL_REQUESTED)
 

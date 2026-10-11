@@ -2770,7 +2770,8 @@ def _abandon_timed_out_gateway_turn(
     agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
-            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
+            request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT,
+                                   delegation_reason="timeout")
         except Exception:
             logger.debug("Timed-out agent interrupt failed", exc_info=True)
         from hermes_cli.observability.shared_metrics_process import record_watchdog_turn_abort
