@@ -763,14 +763,23 @@ def _action_list(a: Dict[str, Any]) -> str:
 
 def _action_remove(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     job_id = job["id"]
-    if not remove_job(job_id):
+    run_result = {}
+    if not remove_job(job_id, run_result=run_result):
         return tool_error(f"Failed to remove job '{job_id}'", success=False)
     _notify_provider_jobs_changed_safe()
     return _dumps({
         "success": True,
         "message": f"Cron job '{job['name']}' removed.",
         "removed_job": {"id": job_id, "name": job["name"], "schedule": job.get("schedule_display")},
+        **run_result,
     })
+
+
+def _action_pause(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+    run_result = {}
+    updated = pause_job(job["id"], reason=a["reason"], run_result=run_result)
+    _notify_provider_jobs_changed_safe()
+    return _dumps({"success": updated is not None, "job": _format_job(updated or job), **run_result})
 
 
 def _job_state_result(updated: Dict[str, Any]) -> str:
@@ -997,7 +1006,7 @@ _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
+    "pause": _action_pause,
     "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
 }
 

@@ -136,6 +136,7 @@ class _SelfRemovalDelivery:
     def __init__(self, job_id: str):
         self.job_id = job_id
         self.removed = False
+        self.paused_at: Optional[str] = None
 
 
 _self_removal_delivery: ContextVar[Optional[_SelfRemovalDelivery]] = ContextVar(
@@ -160,6 +161,13 @@ def self_removal_delivery_allowed(job_id: str) -> bool:
     if marker is None or marker.job_id != job_id or not marker.removed:
         return False
     return all(item.get("id") != job_id for item in load_jobs())
+
+
+def _self_pause_delivery_allowed(job: dict) -> bool:
+    """Only the run's exact internal auto-pause may finish its blocked-run alert."""
+    marker = _self_removal_delivery.get()
+    return bool(marker and marker.job_id == job.get("id") and marker.paused_at
+                and marker.paused_at == job.get("paused_at") and job.get("state") == "paused")
 
 # Import-time snapshot so deliberate re-pointing of CRON_DIR/JOBS_FILE/OUTPUT_DIR (the documented
 # escape hatch for tests/embedders) is distinguishable from the constants merely being stale.
@@ -2056,6 +2064,20 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
+def job_running_state(job: Dict[str, Any]) -> dict:
+    """Best-effort visibility without booting the scheduler in listing/tool processes."""
+    if sys.modules.get("cron.scheduler") is not None:
+        try:
+            from cron.scheduler_control import running_job_state
+            return running_job_state(job)
+        except Exception:
+            logger.debug("Cron running-state lookup unavailable", exc_info=True)
+    claim = job.get("fire_claim") or {}
+    live = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+    return {"was_running": live,
+            "run_started_at": claim.get("started_at", claim.get("at")) if live else None}
+
+
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
@@ -2069,6 +2091,9 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
         latest = {}
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
+        running = job_running_state(job)
+        job["running"] = running["was_running"]
+        job["running_since"] = running["run_started_at"]
     return jobs
 
 
@@ -2231,20 +2256,42 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         save_jobs(jobs)
         return _normalize_job_record(updated)
 
-    return _with_job(job_id, apply)
+    updated = _with_job(job_id, apply)
+    # pause_job owns its self-pause/auto-pause exceptions. A plain disable is also
+    # an operator stop, after releasing the store lock; detached runs lose renewal.
+    if (updated is not None and updates.get("enabled") is False
+            and updated.get("state") != "paused" and sys.modules.get("cron.scheduler") is not None):
+        from cron.scheduler_control import interrupt_job_run
+        interrupt_job_run(updated)
+    return updated
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def pause_job(
+    job_id: str, reason: Optional[str] = None, *, run_result: Optional[dict] = None,
+    interrupt_running: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(job["id"], {
+    updated = update_job(job["id"], {
         "enabled": False,
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
     })
+    if updated is not None:
+        marker = _self_removal_delivery.get()
+        if marker is not None and marker.job_id == job["id"]:
+            # A run pausing its own job is still allowed to deliver this result, just like
+            # self-removal. Keep the marker alive so the scheduler records the paused timestamp.
+            marker.paused_at = updated["paused_at"]
+        elif interrupt_running:
+            from cron.scheduler_control import interrupt_job_run
+            receipt = interrupt_job_run(job)
+            if run_result is not None:
+                run_result.update(receipt)
+    return updated
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -2366,7 +2413,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
     return _with_job(job_ref["id"], apply)
 
 
-def remove_job(job_id: str) -> bool:
+def remove_job(job_id: str, *, run_result: Optional[dict] = None) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
@@ -2384,18 +2431,24 @@ def remove_job(job_id: str) -> bool:
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == canonical_id:
             marker.removed = True
-        if job_output_dir.exists():
-            shutil.rmtree(job_output_dir)
-        try:
-            from cron.notepad import clear_notepad
-            clear_notepad(canonical_id)
-        except Exception:
-            logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
-        # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
-        _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
-        with _fire_fence_locks_guard:
-            _fire_fence_locks.pop(_fence_key, None)
-        return True
+
+    # Interrupt after releasing the jobs lock: cancellation may inspect or update the same store.
+    from cron.scheduler_control import interrupt_job_run
+    receipt = interrupt_job_run(job)
+    if run_result is not None:
+        run_result.update(receipt)
+    if job_output_dir.exists():
+        shutil.rmtree(job_output_dir)
+    try:
+        from cron.notepad import clear_notepad
+        clear_notepad(canonical_id)
+    except Exception:
+        logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+    # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
+    _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
+    with _fire_fence_locks_guard:
+        _fire_fence_locks.pop(_fence_key, None)
+    return True
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
@@ -2893,7 +2946,8 @@ def claim_job_for_fire(
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        job["fire_claim"] = {"at": now.isoformat(), "started_at": now.isoformat(),
+                             "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
@@ -2913,7 +2967,8 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
     report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
     def apply(jobs, _i, job):
-        return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
+        return (is_job_runnable(job) or _self_pause_delivery_allowed(job)) and _refresh_claim(
+            jobs, job.get("fire_claim"), expected_owner)
 
     return _with_job(job_id, apply, False)
 

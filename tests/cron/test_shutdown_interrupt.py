@@ -375,19 +375,19 @@ class TestExecutionScopedInterruption:
 
 class TestCombinedCancelEvent:
     def test_or_semantics(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         assert combined.is_set() is False
         b.set()
         assert combined.is_set() is True
 
     def test_set_propagates_to_all(self):
-        import cron.scheduler as sched
+        from cron.scheduler_cancel import _CombinedCancelEvent
 
         a, b = threading.Event(), threading.Event()
-        combined = sched._CombinedCancelEvent(a, b)
+        combined = _CombinedCancelEvent(a, b)
         combined.set()
         assert a.is_set() and b.is_set()
 
@@ -405,7 +405,11 @@ class TestCombinedCancelEvent:
             assert sched.run_one_job(job, cancel_event=external) is True
 
         kwargs = body.call_args.kwargs
-        assert kwargs["transport_cancel"] is external
+        combined = kwargs["transport_cancel"]
+        assert not combined.is_set()
+        external.set()
+        assert combined.is_set()
+        external.clear()
         # What run_job receives: the ownership handle built from the two forwarded sources.
         combined = sched._FireOwnership(job, kwargs["claim_lost"], kwargs["transport_cancel"]).cancel_event
         assert combined.is_set() is False
