@@ -166,9 +166,9 @@ async def test_completion_scope_uses_stamped_profile_for_raw_api_event(monkeypat
     entered = []
 
     class _Scope:
-        def __enter__(self):
+        async def __aenter__(self):
             entered.append("enter")
-        def __exit__(self, *_args):
+        async def __aexit__(self, *_args):
             entered.append("exit")
 
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name == "secondary")
@@ -176,7 +176,7 @@ async def test_completion_scope_uses_stamped_profile_for_raw_api_event(monkeypat
     monkeypatch.setattr("gateway.run._async_profile_runtime_scope", lambda home: _Scope())
     monkeypatch.setattr("hermes_constants.get_hermes_home_override", lambda: "/profiles/default")
 
-    with runner._completion_event_scope({"profile": "secondary", "platform": "api_server"}):
+    async with runner._completion_event_scope({"profile": "secondary", "platform": "api_server"}):
         pass
     assert entered == ["enter", "exit"]
 

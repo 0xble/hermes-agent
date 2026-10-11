@@ -539,7 +539,7 @@ class GatewaySessionCommandsMixin:
         # Platform + stable gateway session key bind this agent (for external context engines) to
         # the original conversation, not a default "cli" host.
         platform_key = _platform_config_key(source.platform) if source.platform else None
-        model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, session_key=session_key)
+        model, runtime_kwargs = await self._resolve_session_agent_runtime_async(source=source, session_key=session_key)
         if str(runtime_kwargs.get("api_mode") or "").lower() == "codex_app_server":
             # Context lives in the server-side thread of the LIVE cached agent; a temporary agent
             # has none (and finally-eviction would destroy the real context).
@@ -556,7 +556,7 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["gateway_session_key"] = session_key
         # Same reasoning setting as a live turn (session ``/reasoning`` > per-model > global): without it
         # the transport applies its default effort — a 400 on non-reasoning models.
-        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
+        runtime_kwargs["reasoning_config"] = await asyncio.to_thread(self._resolve_session_reasoning_config, source=source, model=model)
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:
@@ -850,7 +850,7 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         if not sanitized:
             return t("gateway.title.empty_after_clean")
-        topic_lane = self._is_telegram_topic_lane(source)
+        topic_lane = await asyncio.to_thread(self._is_telegram_topic_lane, source)
         try:
             if topic_lane and hasattr(self._session_db, "set_session_title_in_lineage"):
                 stored_title = await self._session_db.set_session_title_in_lineage(session_id, sanitized)

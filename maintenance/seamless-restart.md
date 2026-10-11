@@ -73,6 +73,32 @@ A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a sta
 
 Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not retry interrupted work.
 
+## Blocking state.db work stays off the event loop
+
+Patch identity: `seamless-restart; keep gateway startup and loop off blocking state.db I/O`
+(the #345 lineage). This is core-owned: gateway admission, manager construction,
+profile scoping and platform batching cannot be repaired by a presentation plugin.
+
+The watchdog's main-thread-first dumps from 2026-10-10 showed per-turn goal
+metadata reads, completion route loading, Telegram topic-recovery lazy database
+opens and persisted model-override reads waiting behind SessionDB/SessionStore
+locks on the asyncio thread. Warming a database handle does not make subsequent
+reads nonblocking. Keep the entire sync operation (including handle acquisition,
+manager construction and metadata reads/writes) in a context-preserving worker.
+Keep profile scope entry, admission fences and adapter queue/timer mutation on
+asyncio; Telegram topic recovery must finish before batching derives its key.
+
+Proof surface: `tests/gateway/test_turn_state_db_off_loop.py` uses an independent
+storage-controller thread and an asyncio heartbeat to pin goal/loop construction,
+user-turn revival, completion scope, model rehydration and Telegram ingress.
+A broken implementation is released after a two-second heartbeat bound, rather
+than hanging its own asyncio timeout. Retain semantic regression coverage in
+`test_goal_continuation_drain.py`, `test_goal_resume_restart.py`,
+`test_goal_parked_idle_wake.py`, `test_telegram_topic_mode.py`,
+`test_active_session_text_merge.py` and `tests/plugins/test_telegram_update_admission.py`.
+Do not weaken the liveness watchdog, bypass SQLite/FTS locks, or change typed-turn
+progress, cleanup, live status or ten-second bubble-edit behavior.
+
 ## Bounded terminal shutdown
 
 Patch identity: `seamless-restart; bounded restart shutdown` (the same lineage as

@@ -497,7 +497,7 @@ class GatewayAgentCacheMixin:
             try:
                 # Capture before the first await. The immutable marker includes the
                 # session identity, so a delayed stop cannot clear a newer recovery.
-                stop_marker = self.session_store.get_resume_pending_marker(session_key)
+                stop_marker = await self.async_session_store.get_resume_pending_marker(session_key)
             except Exception:
                 logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
         state = self._peek_session_state(session_key)

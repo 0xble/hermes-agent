@@ -306,6 +306,10 @@ class GatewayTurnMixin:
 
         return model, runtime_kwargs
 
+    async def _resolve_session_agent_runtime_async(self, **kwargs):
+        """Resolve persisted overrides and credentials without blocking the gateway loop."""
+        return await asyncio.to_thread(self._resolve_session_agent_runtime, **kwargs)
+
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
@@ -696,7 +700,7 @@ class GatewayTurnMixin:
             configured_model, configured_provider, configured_base_url = hs.model, hs.provider, hs.base_url
 
             with suppress(Exception):
-                hs.model, _hyg_runtime = self._resolve_session_agent_runtime(
+                hs.model, _hyg_runtime = await self._resolve_session_agent_runtime_async(
                     source=source, session_key=session_key,
                     user_config=hs.data if isinstance(hs.data, dict) else None,
                 )
@@ -762,10 +766,12 @@ class GatewayTurnMixin:
         with image_cost_context(learned_image_token_cost(hs.model, hs.base_url)):
             if session_entry.last_prompt_tokens <= 0:
                 from agent.usage_anchor import persisted_anchor_tokens
-                _session_db = getattr(self, "_session_db", None)
-                _anchored = persisted_anchor_tokens(
-                    getattr(_session_db, "_db", _session_db), session_entry.session_id, history,
-                )
+                def _read_anchor():
+                    session_db = getattr(self, "_session_db", None)
+                    return persisted_anchor_tokens(
+                        getattr(session_db, "_db", session_db), session_entry.session_id, history,
+                    )
+                _anchored = await asyncio.to_thread(_read_anchor)
             if session_entry.last_prompt_tokens > 0:
                 _approx_tokens, _token_source = session_entry.last_prompt_tokens, "actual"
             elif _anchored is not None:
@@ -782,19 +788,21 @@ class GatewayTurnMixin:
             # failing compression is not re-triggered on every restart.
             # The in-memory dict was reset on every restart, re-triggering the same failing compression and
             # wedging session storage (#74136).
-            _session_db = getattr(self, "_session_db", None)
-            _getter = getattr(getattr(_session_db, "_db", _session_db), "get_compression_failure_cooldown", None)
-            if _getter is not None:
-                _cooldown_state = None
-                with suppress(Exception):
-                    _cooldown_state = _getter(session_entry.session_id)
-                if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
-                    logger.info(
-                        "Session hygiene: skipping compression for %s; "
-                        "previous failure cooldown active for %.1fs",
-                        session_entry.session_id, _cooldown_state["remaining_seconds"],
-                    )
-                    _needs_compress = False
+            def _read_cooldown():
+                session_db = getattr(self, "_session_db", None)
+                getter = getattr(getattr(session_db, "_db", session_db), "get_compression_failure_cooldown", None)
+                return getter(session_entry.session_id) if getter is not None else None
+
+            _cooldown_state = None
+            with suppress(Exception):
+                _cooldown_state = await asyncio.to_thread(_read_cooldown)
+            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
+                logger.info(
+                    "Session hygiene: skipping compression for %s; "
+                    "previous failure cooldown active for %.1fs",
+                    session_entry.session_id, _cooldown_state["remaining_seconds"],
+                )
+                _needs_compress = False
 
         if _needs_compress and await self._session_has_compression_in_flight(session_key):
             # A prior compression still holds the durable lock (e.g. a shielded worker left by /stop):
@@ -1369,7 +1377,7 @@ class GatewayTurnMixin:
 
         attempt = self._HygieneAttempt(agent=None, meta=self._event_thread_metadata(event, source), history=history)
         try:
-            _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
+            _hyg_model, _hyg_runtime = await self._resolve_session_agent_runtime_async(
                 source=source, session_key=session_key,
                 user_config=hs.data if isinstance(hs.data, dict) else None,
             )
@@ -2206,7 +2214,7 @@ class GatewayTurnMixin:
 
         # Resolve once after preparation so expiry behaves like /fast off and its notice rides this turn.
         if session_key:
-            transition = self._resolve_session_service_tier(
+            transition = await asyncio.to_thread(self._resolve_session_service_tier, 
                 session_key=session_key, report_transition=True,
             )
             expiry_notice = transition[1] if isinstance(transition, tuple) else None
@@ -2586,7 +2594,7 @@ class GatewayTurnMixin:
 
         try:
             user_config = _load_gateway_config()
-            model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
+            model, runtime_kwargs = await self._resolve_session_agent_runtime_async(source=source, user_config=user_config)
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(source.chat_id, t("gateway.background.no_credentials"), metadata=_thread_metadata)
                 return
@@ -2595,9 +2603,9 @@ class GatewayTurnMixin:
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
+            reasoning_config = await asyncio.to_thread(self._resolve_session_reasoning_config, source=source, model=model)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
+            self._service_tier = await asyncio.to_thread(self._resolve_session_service_tier, source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions (same as the main flow).

@@ -919,7 +919,7 @@ class GatewaySlashCommandsMixin(
         if not history:
             return t("gateway.btw.no_history")
         try:
-            model, rt = self._resolve_session_agent_runtime(source=source)
+            model, rt = await self._resolve_session_agent_runtime_async(source=source)
         except Exception:
             model, rt = None, {}
         if not rt.get("api_key"):

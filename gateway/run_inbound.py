@@ -293,7 +293,8 @@ class GatewayInboundMixin:
         # the routing identity of an already admitted event.
         reconnect_key = None
         if reconnect_keys and not is_internal:
-            reconnect_key = self._session_key_for_source(self._normalize_source_for_session_key(source))
+            normalized = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+            reconnect_key = self._session_key_for_source(normalized)
         if (
             (getattr(self, "_startup_restore_in_progress", False)
              or (reconnect_keys and reconnect_keys.get(reconnect_key, 0)))
@@ -1659,7 +1660,7 @@ class GatewayInboundMixin:
         # runtime explicitly rather than consulting process-global compatibility mirrors.
         vision_runtime = None
         try:
-            turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+            turn_model, runtime_kwargs = await self._resolve_session_agent_runtime_async(
                 source=source, session_key=session_key,
             )
             vision_runtime = {**(runtime_kwargs or {}), "model": turn_model}
@@ -1823,7 +1824,7 @@ class GatewayInboundMixin:
             except Exception:
                 _msg_custom_providers = _msg_cfg.get("custom_providers") or []
         # GatewayRunner has no self._model/self._base_url; resolve the session's actual runtime.
-        _msg_model, _msg_runtime = self._resolve_session_agent_runtime(
+        _msg_model, _msg_runtime = await self._resolve_session_agent_runtime_async(
             source=source, session_key=session_key, user_config=_msg_cfg,
         )
         _msg_base_url = _msg_runtime.get("base_url") or ""

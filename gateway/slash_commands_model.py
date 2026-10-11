@@ -819,7 +819,7 @@ class GatewayModelCommandsMixin:
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
-        self._reasoning_config = self._resolve_session_reasoning_config(
+        self._reasoning_config = await asyncio.to_thread(self._resolve_session_reasoning_config, 
             source=event.source, session_key=session_key, model=_session_model,
         )
         platform_key = _platform_config_key(event.source.platform)
@@ -945,7 +945,7 @@ class GatewayModelCommandsMixin:
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
-        transition = self._resolve_session_service_tier(
+        transition = await asyncio.to_thread(self._resolve_session_service_tier, 
             session_key=session_key, report_transition=True,
         )
         if isinstance(transition, tuple):
