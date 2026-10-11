@@ -218,19 +218,59 @@ def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkey
     assert row_expiry() > admitted_expiry, "the delayed renewal must have renewed the row"
     assert lease._authority_deadline <= row_expiry()
 
-    # Near expiry with the lock held throughout: the renewal must give up and interrupt while the
-    # row is still unexpired, so no successor can reclaim it under a running turn.
-    clock.set(lease._authority_deadline - 3.0)
+    # Near and past expiry with the lock held throughout: a busy database is not a successor, so
+    # the turn keeps running while the row still names this holder.
+    monkeypatch.setattr(turn_facade_lease, "_REFRESH_WRITE_PATIENCE_S", 0.5)
+    for at in (lease._authority_deadline - 3.0, lease._authority_deadline + 30.0):
+        clock.set(at)
+        blocker = write_lock()
+        try:
+            assert lease.refresh_tick() is None
+        finally:
+            blocker.rollback()
+            blocker.close()
+    assert events == []
+
+    # A real takeover past expiry stops the turn: a successor claims the expired row, and the
+    # next locked tick's ownership read sees it.
+    assert db.try_acquire_session_turn_lease("s1", "successor")
     blocker = write_lock()
     try:
         assert lease.refresh_tick() is False
     finally:
         blocker.rollback()
         blocker.close()
-    assert [msg for _, msg in events] == [
-        "Session turn lease could not be refreshed; stopping to protect the transcript."
-    ]
-    assert events[0][0] < row_expiry()
+    assert [msg for _, msg in events] == ["Session turn lease lost; stopping to protect the transcript."]
+    db.close()
+
+
+def test_delayed_renewal_after_expiry_keeps_an_unclaimed_row_and_fences_a_claimed_one(tmp_path, monkeypatch):
+    """The renewal that finally lands past expiry is holder-qualified: it extends a row nobody
+    claimed, and a row a successor claimed in the meantime fails it and stops the turn."""
+    import hermes_state
+    import hermes_state_compression
+    from agent import turn_facade_lease
+
+    clock = _MovingClock(1000.0)
+    fake_time = SimpleNamespace(time=clock.time, monotonic=time.monotonic, sleep=time.sleep)
+    monkeypatch.setattr(turn_facade_lease, "time", fake_time)
+    monkeypatch.setattr(hermes_state_compression, "time", fake_time)
+    db = hermes_state.SessionDB(tmp_path / "state.db")
+    db.create_session("s1", source="test")
+    assert db.try_acquire_session_turn_lease("s1", "h")
+    events = []
+    agent = SimpleNamespace(session_id="s1", interrupt=lambda msg, **kw: events.append(msg))
+    lease = DurableTurnLease(agent, db, "s1", "h", expires_at=db.session_turn_lease_expires_at("s1", "h"))
+    lease.turn_active = True
+
+    clock.set(lease._authority_deadline + 30.0)
+    assert lease.refresh_tick() is None and events == []
+    assert db.session_turn_lease_expires_at("s1", "h") > clock.time()
+
+    clock.set(lease._authority_deadline + 30.0)
+    assert db.try_acquire_session_turn_lease("s1", "successor")
+    assert lease.refresh_tick() is False
+    assert events == ["Session turn lease lost; stopping to protect the transcript."]
     db.close()
 
 

@@ -42,6 +42,11 @@ from typing import Any, Dict, Optional, Tuple
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
+# A restart resumes every interrupted session at once. Their turn openings (history load, prompt
+# build, first writes) all hit the shared state.db writer, so admit a few at a time: each slot is
+# held until its turn ends or the opening window passes, so long turns never hold later sessions.
+_STARTUP_RESUME_CONCURRENCY = 4
+_STARTUP_RESUME_OPENING_S = 15.0
 
 
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> None:
@@ -92,12 +97,20 @@ class GatewayStartupMixin:
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
     ) -> None:
         """Dispatch one synthetic startup resume and wait for its agent turn (inbound stays queued
-        until it finishes, else a user message can race it)."""
+        until it finishes, else a user message can race it). Admission takes one of
+        ``_STARTUP_RESUME_CONCURRENCY`` slots for the turn's opening window."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        slots = getattr(self, "_startup_resume_slots", None)
+        if slots is None:
+            slots = self._startup_resume_slots = asyncio.Semaphore(_STARTUP_RESUME_CONCURRENCY)
+        task = None
         try:
-            await adapter.handle_message(event)
-            session_tasks = getattr(adapter, "_session_tasks", {})
-            task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+            async with slots:
+                await adapter.handle_message(event)
+                session_tasks = getattr(adapter, "_session_tasks", {})
+                task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+                if task is not None:
+                    await asyncio.wait({task}, timeout=_STARTUP_RESUME_OPENING_S)
             if task is not None:
                 await asyncio.shield(task)
         finally:
