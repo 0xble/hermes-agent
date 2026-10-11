@@ -7,7 +7,6 @@ import pytest
 
 from gateway.platforms.base import SendResult
 from gateway.copy_blocks import (
-    protect_inline_copy_bodies,
     CopyMarkerStreamFilter,
     extract_copy_blocks,
     map_outside_copy_blocks,
@@ -34,9 +33,9 @@ def test_extract_copy_blocks_fences_outside_are_literal_but_inside_are_body() ->
 
 
 def test_extract_copy_blocks_malformed_empty_and_stray_close() -> None:
-    assert extract_copy_blocks("x\n[[/copy]]\ny")[0] == "x\ny"
+    assert extract_copy_blocks("x\n[[/copy]]\ny") == ("x\ny", [])
     assert extract_copy_blocks("[[copy]]\n  \n[[/copy]]") == ("", [])
-    assert extract_copy_blocks("prefix\n[[copy]]\nbody") == ("prefix\n", ["body"])
+    assert extract_copy_blocks("prefix\n[[copy]]\nbody") == ("prefix\nbody", [])
 
 
 def test_extract_copy_blocks_empty_and_none_inputs() -> None:
@@ -156,24 +155,12 @@ def test_map_outside_copy_blocks_never_rewrites_bodies() -> None:
     assert map_outside_copy_blocks("plain MEDIA:/a.png", resolve) == "plain data:image/png"
 
 
-def test_open_marker_inside_a_block_closes_it_on_every_renderer() -> None:
-    # A mistyped close: the second [[copy]] ends the block, and nothing leaks or is swallowed.
-    text = "Reply.\n\n[[copy]]\nHi\n[[copy]]\n\n[^1]: x\n"
-    assert extract_copy_blocks(text) == ("Reply.\n\n\n[^1]: x\n", ["Hi"])
-    assert render_copy_blocks_inline(text) == "Reply.\n\nHi\n\n[^1]: x\n"
+def test_nested_open_keeps_all_bodies_inline_on_every_renderer() -> None:
+    text = "a\n[[copy]]\nx\n[[copy]]\ny\n[[/copy]]\nb\n"
+    assert extract_copy_blocks(text) == ("a\nx\ny\nb\n", [])
+    assert render_copy_blocks_inline(text) == "a\nx\ny\nb\n"
     stream = CopyMarkerStreamFilter(drop_bodies=True)
-    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "Reply.\n\n\n[^1]: x\n"
-    protected, bodies = protect_inline_copy_bodies(text)
-    assert "[[copy]]" not in protected and list(bodies.values()) == ["Hi\n"]
-    assert "[[copy]]" not in map_outside_copy_blocks(text, lambda part: part)
-    # Toggling pairs work too, and a stray close after them stays control syntax.
-    assert extract_copy_blocks("[[copy]]\nA\n[[copy]]\nmid\n[[copy]]\nB\n[[copy]]\n[[/copy]]\n") == (
-        "mid\n", ["A", "B"])
-
-
-def test_fenced_open_marker_inside_a_block_is_still_body_text() -> None:
-    text = "[[copy]]\n```\n[[copy]]\n```\n[[/copy]]\n"
-    assert extract_copy_blocks(text) == ("", ["```\n[[copy]]\n```"])
+    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "a\nb\n"
 
 
 def test_extracted_response_keeps_legacy_constructor() -> None:
@@ -515,7 +502,7 @@ async def test_api_commentary_renders_copy_blocks_inline() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_turn_keeps_partial_block_inline_and_literal() -> None:
+async def test_interrupted_turn_keeps_invalid_partial_block_in_ordinary_reply() -> None:
     runner = object.__new__(GatewayTurnMixin)
     adapter = object.__new__(_FakeAdapter)
     adapter.platform = "telegram"
@@ -528,8 +515,9 @@ async def test_interrupted_turn_keeps_partial_block_inline_and_literal() -> None
         event, event.source, None, "session", None, {"interrupted": True}, [], text, None, False,
     )
     extracted = await adapter._extract_response_content(returned, event, "", is_ephemeral_response=True)
-    assert extracted.copy_blocks == [] and extracted.images == []
-    assert extracted.text_content == "![paste this](https://example.com/literal.png)"
+    assert extracted.copy_blocks == []
+    # Invalid markup has no protected body: ordinary directive processing applies.
+    assert extracted.images == [("https://example.com/literal.png", "paste this")]
 
 
 def test_streaming_tts_never_speaks_copy_bodies() -> None:
@@ -546,11 +534,11 @@ def test_streaming_tts_never_speaks_copy_bodies() -> None:
 
 
 @pytest.mark.parametrize("body", ["```python\nprint(1)", "~~~\nopen [[/copy]]\n", "``` \nx\n```\ny\n```"])
-def test_ledger_wrapping_round_trips_bodies_ending_in_an_open_fence(body) -> None:
+def test_ledger_wrapping_open_fence_falls_back_inline(body) -> None:
     from gateway.copy_blocks import wrap_copy_block
-    _, blocks = extract_copy_blocks("[[copy]]\n" + body)
-    for extracted in blocks:
-        assert extract_copy_blocks(wrap_copy_block(extracted)) == ("", [extracted])
+    assert extract_copy_blocks("[[copy]]\n" + body) == (body, [])
+    assert wrap_copy_block(body) == body
+    assert extract_copy_blocks(wrap_copy_block(body)) == (body, [])
 
 
 @pytest.mark.asyncio

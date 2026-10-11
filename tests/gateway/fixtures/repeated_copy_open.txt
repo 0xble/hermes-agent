@@ -1,0 +1,20 @@
+**Lugg is like Uber for moving.** You book a pickup truck with two movers in the app or on their site, they collect from any store, and they carry the item into whatever room you pick. In Portland it averages about $75–115, and you see the price up front before you book.[^1] Their site says you can cancel free any time before the movers arrive.[^2]
+
+**To bother Zahra as little as possible, she'd get one text, sent only after it's booked.** Instead of asking her questions, I'd assume the following:
+- **Day:** tomorrow at 2, since she proposed it. If she'd rather wait until next Sunday, I'll move or cancel the booking for free.
+- **Drop-off:** her house on NW Laidlaw Rd, with the movers carrying it inside.
+- **Plan:** I'll book Lugg, then send her the text below.
+
+**She has to forward one thing.** CB2 only releases an order to someone holding the "Ready for pickup" email, or to a person she named at checkout.[^3] She's the only one with that email. A forward is about the least she can do.
+
+After that, I'll forward the email to the movers, check tomorrow at 1:30 that a crew is assigned, and confirm with her once it's inside. If Lugg has no crew, I'll switch to Taskrabbit without involving her.
+
+Should I go ahead? You don't have a Lugg account, so I'll set one up with your email. When I pay, you'll get a prompt to approve the card and the exact price.
+
+[[copy]]
+Hi Ami! I booked movers to pick up the CB2 table tomorrow at 2 and bring it inside for you. Can you forward me the CB2 pickup email so they can get it?
+[[copy]]
+
+[^1]: [Lugg: Furniture delivery in Portland, OR](https://lugg.com/portland-or-furniture-delivery)
+[^2]: [Lugg vs Dolly](https://lugg.com/compare/lugg-vs-dolly)
+[^3]: [CB2 FAQ: store pickup](https://uat-www.cb2.ca/customer-service/faq-shop)

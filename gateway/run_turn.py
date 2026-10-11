@@ -1992,13 +1992,18 @@ class GatewayTurnMixin:
                 copy_delivered = any(getattr(result, "success", False) for result in copy_results)
                 copy_failed = any(not getattr(result, "success", False) for result in copy_results)
             if adapter and agent_result.get("interrupted") and response:
-                from gateway.copy_blocks import adapter_sends_copy_blocks, extract_copy_blocks
-                _, _partial_bodies = extract_copy_blocks(response)
-                if _partial_bodies and adapter_sends_copy_blocks(adapter):
+                from gateway.copy_blocks import adapter_sends_copy_blocks, CopyMarkerStreamFilter
+                # This is deliberately a streaming replay, not extraction of a complete
+                # response: an interrupted block is invalid but its hidden bytes must survive.
+                _partial_filter = CopyMarkerStreamFilter(drop_bodies=True, capture_hidden=True)
+                _partial_filter.feed(response)
+                _partial_filter.flush()
+                _partial_body = _partial_filter.hidden_text
+                if _partial_body and adapter_sends_copy_blocks(adapter):
                     # The stream hid these bodies for separate sending, but an interrupted block
                     # may be partial: show them as ordinary reply text instead of dropping them.
                     try:
-                        await adapter.send(source.chat_id, "\n".join(_partial_bodies),
+                        await adapter.send(source.chat_id, _partial_body,
                                            metadata=self._event_thread_metadata(event, source))
                     except Exception as _e:
                         logger.warning("interrupted copy text send failed: %s", _e)
