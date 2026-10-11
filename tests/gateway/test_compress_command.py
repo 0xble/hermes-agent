@@ -495,8 +495,8 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
     with (
         patch.object(
             runner,
-            "_resolve_session_agent_runtime",
-            return_value=("test-model", {"api_key": "***"}),
+            "_resolve_session_agent_runtime_async",
+            new=AsyncMock(return_value=("test-model", {"api_key": "***"})),
         ),
         patch.object(
             runner,
