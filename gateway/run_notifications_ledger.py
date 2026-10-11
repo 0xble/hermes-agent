@@ -75,13 +75,19 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
     abandoned = False
     handed_over: list[_T] = []
 
+    def _release_abandoned(result: _T) -> None:
+        try:
+            release_ctx.run(release, result)
+        except Exception:
+            logger.warning("Could not refund abandoned durable claim", exc_info=True)
+
     def _claim_and_handoff() -> _T:
         result = claim()  # A failed claim has nothing to release.
         with lock:
             if not abandoned:
                 handed_over.append(result)
                 return result
-        release(result)  # No loop callback or executor submission during teardown.
+        _release_abandoned(result)  # No loop callback or executor submission during teardown.
         return result
 
     future = loop.run_in_executor(None, claim_ctx.run, _claim_and_handoff)
@@ -93,7 +99,7 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
         if handed_over:
             # The worker finished before cancellation, but its result was never consumed.
             threading.Thread(
-                target=release_ctx.run, args=(release, handed_over[0]), daemon=False,
+                target=_release_abandoned, args=(handed_over[0],), daemon=False,
             ).start()
         raise
 

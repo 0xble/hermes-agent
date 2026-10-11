@@ -284,11 +284,12 @@ def test_handoff_reports_replaced_prior_tab_and_preserves_restart_flag(tmp_path,
     session["tab_id"] = "old-tab"
     with patch("tools.browser_camofox.requests.post", return_value=_response({
         "ok": True, "focused": True, "tabId": "new-tab", "restarted": False,
-    })):
+    })) as post:
         result = json.loads(camofox.camofox_handoff("brianle", "replace"))
     assert result["replacedTab"] is True
     assert result["restarted"] is False
     assert session["tab_id"] == "new-tab"
+    assert post.call_args.kwargs["json"] == {"tabId": "old-tab"}
 
 
 def test_handoff_busy_identity_leaves_tab_unchanged(tmp_path, monkeypatch):
@@ -305,8 +306,9 @@ def test_handoff_busy_identity_leaves_tab_unchanged(tmp_path, monkeypatch):
     with patch("tools.browser_camofox.requests.post", return_value=response):
         result = json.loads(camofox.camofox_handoff("brianle", "busy"))
     assert result["success"] is False
-    assert "another operation is using this account's browser" in result["error"].lower()
-    assert "wait for it to finish" in result["error"].lower()
+    assert "currently busy" in result["error"].lower()
+    assert "no task tab binding was changed" in result["error"].lower()
+    assert "wait for it to finish" not in result["error"].lower()
     assert session["tab_id"] == "existing-tab"
 
 
@@ -349,7 +351,7 @@ def test_release_clears_stale_tab_and_preserves_account_binding(tmp_path, monkey
     assert post.call_args.args[0].endswith(f"/browser/identities/{user_id}/release")
     assert post.call_args.kwargs["json"] == {}
     assert post.call_args.kwargs["timeout"] == 120
-    assert session["tab_id"] is None
+    assert session["tab_id"] == "visible-tab"
     assert camofox._get_session("release", "brianle") is session
 
 
@@ -370,7 +372,9 @@ def test_release_busy_leaves_tab_unchanged_and_requests_retry(tmp_path, monkeypa
         raw = registry.dispatch("browser_handoff", {"account": "brianle", "release": True}, task_id="busy-release")
     result = json.loads(raw) if isinstance(raw, str) else raw
     assert result["success"] is False
-    assert "wait for it to finish" in result["error"].lower()
+    assert "currently busy" in result["error"].lower()
+    assert "no task tab binding was changed" in result["error"].lower()
+    assert "wait for it to finish" not in result["error"].lower()
     assert "retry the release" in result["error"].lower()
     assert session["user_id"] not in json.dumps(result)
     assert session["tab_id"] == "visible-tab"
