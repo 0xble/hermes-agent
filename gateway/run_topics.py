@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -19,6 +20,7 @@ from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 from hermes_state_telegram import TELEGRAM_TOPIC_ICON_HISTORY_LIMIT
+from gateway.session_identity import replace_source
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -302,6 +304,45 @@ class GatewayTopicThreadsMixin:
             and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
+    def _recover_discord_auto_thread_source(self, source: SessionSource, session_key: str) -> SessionSource:
+        """*source* with the auto-thread markers of the session's opening event, when that event
+        created this same native Discord thread.
+
+        Native Discord stamps the markers only on the opening event, so a later title retry on a
+        rebuilt agent arrives unmarked. The routing entry's ``origin`` is that opening source and
+        survives restarts. ``replace_source`` keeps the live transport owner and message id."""
+        if (
+            source.platform != Platform.DISCORD or source.chat_type != "thread" or not source.thread_id
+            or source.delivered_via_upstream_relay or self._is_discord_auto_thread_lane(source)
+        ):
+            return source
+        entry = self.session_store.lookup_by_session_key(session_key)
+        if entry is None:
+            return source
+
+        def opens_this_thread(origin: Optional[SessionSource]) -> bool:
+            return (
+                origin is not None and str(origin.thread_id) == str(source.thread_id)
+                and self._is_discord_auto_thread_lane(origin)
+            )
+
+        origin = entry.origin
+        if not opens_this_thread(origin):
+            # An entry rebuilt after a lost routing index holds an unmarked event, while the session
+            # row keeps the opening origin until that entry's first peer refresh overwrites it.
+            db = self.session_store._db_for_key(session_key)
+            row = db.get_session(entry.session_id) if db is not None else None
+            raw = (row or {}).get("origin_json")
+            origin = None
+            if raw:
+                with suppress(ValueError, KeyError, TypeError):  # malformed/legacy row: no recovery
+                    origin = SessionSource.from_dict(json.loads(raw))
+            if not opens_this_thread(origin):
+                return source
+        return replace_source(
+            source, auto_thread_created=True, auto_thread_initial_name=origin.auto_thread_initial_name,
+        )
+
     def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
         """Shape-only check: a relay-delivered Discord CHANNEL event whose reply the connector MAY
         auto-thread (title-turn registration gate). Deliberately does NOT consult the send-result
@@ -544,12 +585,10 @@ class GatewayTopicThreadsMixin:
             from agent.topic_icons import resolve_override
             if resolve_override(topic_name, extra.get("topic_icon_overrides"), options):
                 return options, None
-            sync_db = self._sync_session_db()
-
             def _pick() -> Optional[str]:
                 from agent.aux_accounting import set_accounting_context
                 from agent.title_generator import pick_topic_icon
-                set_accounting_context(sync_db, session_id)
+                set_accounting_context(self._sync_session_db(), session_id)
                 return pick_topic_icon(topic_name, options, instructions=str(extra.get("topic_icon_instructions") or ""),
                                        timeout=_EXPLICIT_TITLE_ICON_TIMEOUT_S)
             # call_llm's timeout bounds each provider attempt, not retries or fallbacks; cap the whole pick.
@@ -661,11 +700,10 @@ class GatewayTopicThreadsMixin:
         icon_state_to_record = None
         icon_history_to_record = None
         icon_state_owner = "auto"
-        session_db = getattr(self, "_session_db", None)
-        sync_session_db = self._sync_session_db() if session_db is not None else None
         extra = self._telegram_platform_extra(source)
         if not is_truthy_value(extra.get("auto_topic_icons")):
             return None, None, None, icon_state_owner
+        sync_session_db = await asyncio.to_thread(self._sync_session_db)
         try:
             if options is None:
                 options = await adapter.get_forum_topic_icon_options()
@@ -734,7 +772,7 @@ class GatewayTopicThreadsMixin:
     async def _persist_telegram_topic_icon_records(
         self, source: SessionSource, state_record, history_record, owner: str,
     ) -> None:
-        sync_session_db = self._sync_session_db()
+        sync_session_db = await asyncio.to_thread(self._sync_session_db)
         if not (state_record and sync_session_db):
             return
         custom_id, emoji, profile_name = state_record
@@ -803,7 +841,7 @@ class GatewayTopicThreadsMixin:
                 operator_topic = None
             if isinstance(operator_topic, dict):
                 return
-        session_db = getattr(self, "_session_db", None)
+        session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
         if session_db is not None:
             try:
                 binding = await session_db.get_telegram_topic_binding(

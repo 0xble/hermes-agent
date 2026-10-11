@@ -23,7 +23,6 @@ async def test_stop_preserves_successor_marker(tmp_path, route, outcome, monkeyp
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner._running_agents = {key: MagicMock()}
     runner._pending_messages = {}
-    runner._invalidate_session_run_generation = lambda *a, **kw: None
     runner._release_running_agent_state = lambda *a, **kw: None
     runner._is_user_authorized_for_source = lambda *a, **kw: True
     runner.session_store = SessionStore(tmp_path / "sessions", runner.config)

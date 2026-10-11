@@ -19,8 +19,8 @@ from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
-    _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, interruptible_backoff_sleep,
-    log_api_error_attempt,
+    _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
+    interruptible_backoff_sleep, log_api_error_attempt,
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
     recover_before_classification, route_classified_error, settle_delivered_partial,
 )
@@ -228,8 +228,8 @@ def exceeds_retry_wait_cap(agent: Any, api_error: Any) -> bool:
     cap = getattr(agent, "_max_retry_wait_s", None)
     if cap is None:
         return False
-    from agent.turn_recovery_autorecover import _retry_after_seconds
-    retry_after = _retry_after_seconds(api_error)
+    from agent.retry_utils import provider_retry_after_seconds
+    retry_after = provider_retry_after_seconds(api_error)
     return retry_after is not None and retry_after > cap
 
 
@@ -372,6 +372,15 @@ def settle_unrecovered_error(
         # transport rebuild and the auto-recovery ladder below would each restart or park the
         # attempt, so both are skipped too.
         max_retries = retry_count
+
+    # An attended session on the free model does not sit through a long cooldown: end the attempt
+    # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
+    attempts_made = min(retry_count, max_retries)
+    if is_rate_limited and retry_count < max_retries and free_tier_cooldown_ends_turn(agent, api_error, _base):
+        logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
+                    agent.log_prefix, retry_count)
+        retry_count = max_retries
+
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
         # transient transport errors (stale pool, TCP reset).
@@ -408,7 +417,7 @@ def settle_unrecovered_error(
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(
-            agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
+            agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
             messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,

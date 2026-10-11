@@ -28,6 +28,18 @@ _stdio_sessions: Dict[int, int] = {}
 # psutil handles cache (PID, create-time) at spawn; retain descendant witnesses
 # after the direct child exits. A numeric PID/PGID alone is never signal authority.
 _stdio_processes: dict[int, dict] = {}
+# Upstream #43044/#117505: drift-tolerant leader fingerprints supplement the
+# incarnation ledger; missing/unreadable fingerprints never authorize a signal.
+_stdio_starttimes: Dict[int, int] = {}
+
+
+def _leader_start_time(pid: int) -> Optional[int]:
+    """Leader fingerprint across platforms; unavailable after it has been reaped."""
+    from gateway.status import get_process_start_time
+    try:
+        return get_process_start_time(pid)
+    except Exception:  # noqa: BLE001 — the guard must never break signalling
+        return None
 
 
 def _mcp_process_state(proc):
@@ -370,8 +382,8 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
         _close_mcp_stderr_logs(scope=scope)
 
 
-def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[dict, dict, dict, dict]:
-    """Atomically pop selected owners, groups, session IDs and spawn witnesses."""
+def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[dict, dict, dict, dict, dict]:
+    """Atomically pop owners, groups, session IDs, witnesses and leader fingerprints."""
     def _owned(entries: Dict[int, str]) -> Dict[int, str]:
         return {pid: owner for pid, owner in entries.items() if server_name is None or owner == server_name}
 
@@ -388,13 +400,27 @@ def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tup
         pgids = {pid: _stdio_pgids.pop(pid) for pid in pids if pid in _stdio_pgids}
         sessions = {pid: _stdio_sessions.pop(pid) for pid in pids if pid in _stdio_sessions}
         processes = {pid: _stdio_processes.pop(pid, {}) for pid in pids}
-    return pids, pgids, sessions, processes
+        starts = {pid: _stdio_starttimes.pop(pid) for pid in pids if pid in _stdio_starttimes}
+    return pids, pgids, sessions, processes, starts
 
 
-def _signal_mcp_processes(members: dict, sig: int, pgid: Optional[int], my_pgid: Optional[int]) -> None:
-    """Signal a group only through a live incarnation witness; PID fallback uses psutil's reuse guard."""
+def _signal_mcp_processes(members: dict, sig: int, pgid: Optional[int], my_pgid: Optional[int],
+                          *, leader_pid: int, expected_start: Optional[int] = None) -> None:
+    """Signal only live incarnation witnesses, also rejecting a recycled leader fingerprint."""
     import psutil
     alive = {pid: proc for pid, proc in members.items() if _mcp_process_alive(proc)}
+    if not alive:
+        return
+    if expected_start is not None:
+        current = _leader_start_time(leader_pid)
+        if current is not None:
+            try:
+                from gateway.status import start_time_fingerprints_match
+                if not start_time_fingerprints_match(expected_start, current):
+                    logger.debug("Skip signalling MCP pid %d: leader start-time mismatch", leader_pid)
+                    return
+            except (TypeError, ValueError):
+                pass  # fingerprint unavailable; the incarnation witnesses are still required
     killpg = getattr(os, "killpg", None)
     if pgid is not None and pgid != my_pgid and killpg is not None:
         for proc in alive.values():
@@ -452,7 +478,7 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
     server (stdio reconnects cleaning up their old transport)."""
     import signal as _signal
     import psutil
-    pids, pgids, sessions, processes = _take_reapable_pids(include_active, server_name)
+    pids, pgids, sessions, processes, starts = _take_reapable_pids(include_active, server_name)
     if not pids:
         return
 
@@ -473,7 +499,8 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         if not survivors:  # empty, dead, reused or unverified ledgers pay no grace
             return
         for pid, members in owned.items():
-            _signal_mcp_processes(members, _signal.SIGTERM, pgids.get(pid), my_pgid)
+            _signal_mcp_processes(members, _signal.SIGTERM, pgids.get(pid), my_pgid,
+                                  leader_pid=pid, expected_start=starts.get(pid))
         # One shared grace, not one per child. psutil waits on cached incarnation
         # handles and returns as soon as all owned processes exit.
         deadline = time.monotonic() + 2.0
@@ -482,7 +509,10 @@ def _kill_orphaned_mcp_children(include_active: bool = False, server_name: Optio
         for pid, members in owned.items():
             alive = {member_pid: proc for member_pid, proc in members.items() if _mcp_process_alive(proc)}
             if alive:
-                _signal_mcp_processes(alive, sigkill, pgids.get(pid), my_pgid)
+                # A dead leader does not suppress escalation for its verified
+                # SIGTERM-ignoring descendants (upstream #23799).
+                _signal_mcp_processes(alive, sigkill, pgids.get(pid), my_pgid,
+                                      leader_pid=pid, expected_start=starts.get(pid))
                 logger.warning("Force-killed MCP process group for %d (%s) after SIGTERM timeout", pid, pids[pid])
     finally:
         # Release groups whose current membership is verified empty or positively

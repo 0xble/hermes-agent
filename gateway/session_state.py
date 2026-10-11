@@ -86,6 +86,7 @@ class PersistentState:
     run_generation_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
     # Monotonic across conversation resets; rejects delayed durable latch writes (no ABA).
     stop_latch_revision: int = 0
+    model_override_epoch: int = 0  # monotonic across overrides AND conversation boundaries
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.
@@ -164,6 +165,8 @@ class SessionFieldView(_RunnerView):
         return getattr(getattr(state, self._spec.scope), self._spec.name)
 
     def _set(self, state: SessionState, value: Any) -> None:
+        if self._spec.scope == "conversation" and self._spec.name == "model_override":
+            state.persistent.model_override_epoch += 1
         setattr(getattr(state, self._spec.scope), self._spec.name, value)
 
     def _present(self, key: Any) -> Optional[SessionState]:

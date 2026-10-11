@@ -78,7 +78,8 @@ def _attach_child(parent_agent: Any, child: Any) -> None:
     hard = getattr(parent_agent, "_hard_interrupt_requested", None)
     if hard is None or hard.is_set():
         _signal_child_stop(child, message or "parent agent interrupted",
-                           tool_reason=getattr(parent_agent, "_tool_interrupt_reason", None) or "parent agent interrupted")
+                           tool_reason=getattr(parent_agent, "_tool_interrupt_reason", None) or "parent agent interrupted",
+                           delegation_reason=getattr(parent_agent, "_delegation_interrupt_reason", None))
     else:
         with _quiet("Failed to propagate interrupt to late child: %s"):
             child.interrupt(message)
@@ -92,15 +93,22 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
     except (ValueError, UnboundLocalError) as e:
         logger.debug("Could not remove child from active_children: %s", e)
 
-def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "parent delegation ended") -> None:
+def _signal_child_stop(
+    child: Any, *reason: str, tool_reason: str = "parent delegation ended", delegation_reason: Optional[str] = None,
+) -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly. ``tool_reason`` is the
-    fixed cause the child's tools see (a pending approval wait reports it instead of a user deny)."""
+    fixed cause the child's tools see (a pending approval wait reports it instead of a user deny).
+    ``delegation_reason`` carries the trusted parent stop category into the durable result."""
     with _quiet(None):
         if child is None:
             return
-        if reason:
-            child._delegation_interrupt_reason = str(reason[0])
-        if not request_hard_interrupt(child, *reason, tool_reason=tool_reason) and hasattr(child, "_interrupt_requested"):
+        result_reason = delegation_reason or (str(reason[0]) if reason else tool_reason)
+        try:
+            child._delegation_interrupt_reason = result_reason
+        except (AttributeError, TypeError):
+            pass
+        if not request_hard_interrupt(child, *reason, tool_reason=tool_reason,
+                                      delegation_reason=result_reason) and hasattr(child, "_interrupt_requested"):
             child._interrupt_requested = True
 
 # ── 0-API-call timeout diagnostic ────────────────────────────────────────────
@@ -845,7 +853,9 @@ class _ChildRun:
         via a Future done-callback (``close_deferred=True``) — closing here would race its still-unwinding finally
         path.
         """
-        from tools.delegate_tool import (_get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb)
+        from tools.delegate_tool import (
+            _STALE_RESULT_GRACE_SECONDS, _get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb,
+        )
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
@@ -879,7 +889,31 @@ class _ChildRun:
             self.wait_liveness_aware(settled, future, child_timeout)
             if not future.done():
                 stale_after = getattr(self.heartbeat, "stale_threshold_seconds", None)
-                raise FuturesTimeoutError()
+                if stale_after is None:
+                    # A configured inactivity cap elapsing keeps its teeth: the user armed a
+                    # budget, the fingerprint never moved, abandon now (#116001 contract).
+                    raise FuturesTimeoutError()
+                # Grace collection (#113222): the heartbeat's stale verdict ended the wait
+                # while the worker was still pending — a child that already wrote its final
+                # answer often lands its result moments later, and that real result must be
+                # collected instead of a synthesized timeout that strands a finished batch
+                # as `running`. Signal the cooperative stop (a stoppable worker can then
+                # unwind inside the window), poll the future for the grace period, and only
+                # fall through to the timeout path if nothing lands. Steering stays OPEN
+                # here on purpose: the success path's `_merge_late_steer` (or the failure
+                # path below) is the linearization boundary, so a concurrent steer is never
+                # lost either way.
+                _signal_child_stop(child)
+                grace = _STALE_RESULT_GRACE_SECONDS
+                grace_done = threading.Event()
+                future.add_done_callback(lambda _f: grace_done.set())
+                if not grace_done.wait(timeout=grace) or not future.done():
+                    raise FuturesTimeoutError()
+                logger.info(
+                    "Subagent %d settled inside the %.1fs stale-result grace window — collecting its real result",
+                    task_index, grace,
+                )
+                return future.result(), None, False
             return future.result(), None, False
         except Exception as wait_exc:
             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block

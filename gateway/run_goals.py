@@ -128,7 +128,7 @@ class GatewayGoalsMixin:
         session_entry = await self._session_entry_for_manager(event, f"{kind} manager")
         if session_entry is None:
             return None, None
-        return factory(session_entry.session_id), session_entry
+        return await self._run_in_executor_with_context(factory, session_entry.session_id), session_entry
 
     async def _get_goal_manager_for_event(self, event: "MessageEvent"):
         """Return ``(GoalManager, session_entry)`` for this event, or ``(None, None)``."""
@@ -209,6 +209,10 @@ class GatewayGoalsMixin:
             or self._queue_depth(quick_key, adapter=adapter) > 0
         ):
             return  # keep missed intervals due until user work has drained
+        from agent.estop import check_paused
+
+        if check_paused("heartbeat", logger):
+            return  # `hermes pause`: leave the tick unclaimed so it fires after `hermes resume`
         from hermes_cli.heartbeat import HeartbeatManager
 
         mgr = HeartbeatManager(session_id=session_id)
@@ -405,7 +409,7 @@ class GatewayGoalsMixin:
     async def _post_turn_manager(self, session_entry: Any, label: str, module: str, load):
         """Shared head of the post-turn hooks: ``load()`` imports the manager module and returns a
         ``session_id -> manager`` factory; None when unavailable / no session id. Warms the
-        SessionDB cache first — a cold cache at the turn boundary drops the read/write."""
+        SessionDB cache first, then constructs/loads the manager off-loop too."""
         try:
             factory = load()
         except Exception as exc:
@@ -415,7 +419,7 @@ class GatewayGoalsMixin:
         if not sid:
             return None
         await self._warm_goals_session_db(label)
-        return factory(sid)
+        return await self._run_in_executor_with_context(factory, sid)
 
     async def _pause_goal_for_stop(
         self, session_key: str, source: Any, *, expected_session_id: Optional[str] = None,
@@ -490,12 +494,14 @@ class GatewayGoalsMixin:
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal stop")
+            if not _is_current():
+                return False
             try:
                 goal = await self._run_in_executor_with_context(_pause)
             except Exception as exc:
                 logger.warning("goal stop: pause failed for session %s: %s", session_id, exc)
                 return False
-            if not goal:
+            if not goal or not _is_current():
                 return False
             logger.info("goal stop: paused standing goal for session %s", session_id)
             try:
@@ -522,12 +528,17 @@ class GatewayGoalsMixin:
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal recovery")
-            mgr = GoalManager(
-                session_entry.session_id,
-                default_max_turns=self._goal_max_turns_from_config(),
-                min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
-            )
-            if not mgr.resume_for_user_input():
+            # A warm handle still takes the writer lock for metadata reads/writes.
+            max_turns = self._goal_max_turns_from_config()
+            min_gap = self._goal_min_continuation_gap_from_config()
+
+            def _revive():
+                mgr = GoalManager(session_entry.session_id, default_max_turns=max_turns,
+                                  min_continuation_gap_seconds=min_gap)
+                return mgr if mgr.resume_for_user_input() else None
+
+            mgr = await self._run_in_executor_with_context(_revive)
+            if mgr is None:
                 return
             try:
                 await self._send_goal_status_notice(
@@ -704,7 +715,7 @@ class GatewayGoalsMixin:
                 )
             return
 
-        source = self._build_process_event_source({
+        source = await asyncio.to_thread(self._build_process_event_source, {
             "session_key": "",
             "platform": platform_name,
             "chat_id": chat_id,
@@ -719,11 +730,20 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and session_key in self._running_agents:
             return  # busy — stays due, next scan retries
-        if goal_blocks_loop_tick(sid):
-            return
+        def _due_manager():
+            if goal_blocks_loop_tick(sid):
+                return None
+            mgr = LoopManager(session_id=sid)
+            return mgr if mgr.is_due(now) else None
 
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_due(now):
+        mgr = await self._run_in_executor_with_context(_due_manager)
+        if mgr is None:
+            return
+        from agent.estop import check_paused
+
+        # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
+        # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
+        if check_paused("loop", logger):
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
@@ -767,7 +787,7 @@ class GatewayGoalsMixin:
         from hermes_cli.goals import GoalManager
 
         store = getattr(self, "session_store", None)
-        entry = store.lookup_by_session_id(sid) if store is not None else None
+        entry = await self.async_session_store.lookup_by_session_id(sid) if store is not None else None
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
         assert store is not None
@@ -792,7 +812,7 @@ class GatewayGoalsMixin:
                 _resume_pending_marker_timestamp,
             )
 
-            resume_marker = store.get_resume_pending_marker(key)
+            resume_marker = await self.async_session_store.get_resume_pending_marker(key)
             if resume_marker is None:
                 return  # marker disappeared or the session was replaced; retry on the next scan
             marked_at = _resume_pending_marker_timestamp(entry, resume_marker)

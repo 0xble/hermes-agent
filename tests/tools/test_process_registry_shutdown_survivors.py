@@ -99,14 +99,20 @@ def test_unreadable_detached_identity_is_a_survivor(registry, monkeypatch):
 
 
 @pytest.mark.platforms("posix")
-def test_pending_scope_stop_cannot_starve_active_term(registry, monkeypatch):
-    """Main's gone-scope cleanup is the pre-TERM retry path (no finished retry flag)."""
+@pytest.mark.parametrize("finished_scope", [False, True])
+def test_pending_scope_stop_cannot_starve_active_term(registry, monkeypatch, finished_scope):
+    """Gone detached scopes and upstream's finished-scope retries run after active TERM."""
     with worker() as (process, _messages, _child_ready), \
          worker() as (gone, _gone_messages, _gone_child_ready):
         pending = tracked(registry, gone, detached=True, sid="proc_pending_scope")
         pending.systemd_unit = "hermes-worker-test-pending.scope"
         gone.terminate()
         gone.wait(timeout=5)
+        if finished_scope:
+            pending.exited = True
+            pending._scope_stop_pending = True
+            registry._running.pop(pending.id)
+            registry._finished[pending.id] = pending
         tracked(registry, process)
         term_sent = threading.Event()
         stop_entered = threading.Event()

@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -86,7 +87,9 @@ class GatewayAgentCacheMixin:
             instance = cls._MEMORY_IDENTITY_PROVIDER_MEMO.get(name)
             if instance is None:
                 from plugins.memory import load_memory_provider
-                instance = load_memory_provider(name, register_skills=False)
+                from plugins.plugin_loader import bounded_load_wait
+                with bounded_load_wait():  # runs every turn: never stall on another thread's hung import
+                    instance = load_memory_provider(name, register_skills=False)
                 if instance is None:
                     return {}
                 cls._MEMORY_IDENTITY_PROVIDER_MEMO[name] = instance
@@ -106,9 +109,8 @@ class GatewayAgentCacheMixin:
         freezes them at init; omitting them in shared-thread keys would cross-attribute messages.
 
         ``user_id`` and ``user_id_alt`` are the runtime user identities carried by the current message's
-        gateway source. They participate in the cache key because the Honcho memory provider freezes them
-        into ``HonchoSessionManager`` at first-message init (see
-        ``plugins/memory/honcho/__init__.py::_do_session_init``). Without them in the signature, a
+        gateway source. They participate in the cache key because memory providers freeze them at
+        first-message init (the Honcho plugin resolves its user peer from them once). Without them in the signature, a
         shared-thread session_key (one in which ``build_session_key`` intentionally omits the participant
         ID, e.g. ``thread_sessions_per_user=False``) would reuse the cached AIAgent across distinct users,
         causing the second user's messages to be attributed to the first user's resolved Honcho peer. This
@@ -144,14 +146,89 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 
+    def _session_model_override_epoch(self, session_key: str) -> int:
+        return self._session_state(session_key).persistent.model_override_epoch
+
+    def _bump_session_model_override_epoch(self, session_key: str) -> None:
+        self._session_state(session_key).persistent.model_override_epoch += 1
+
+    def _session_model_override_lock(self, session_key: str) -> asyncio.Lock:
+        """Loop-owned, per-route serialization of hydration and durable override edits."""
+        locks = getattr(self, "_session_model_override_locks", None)
+        if not isinstance(locks, dict):
+            locks = self._session_model_override_locks = {}
+        return locks.setdefault(session_key, asyncio.Lock())
+
+    async def _persist_session_model_override(self, session_key: str, override: Optional[dict]) -> None:
+        async with self._session_model_override_lock(session_key):
+            await self._persist_session_model_override_locked(session_key, override)
+
+    async def _persist_session_model_override_locked(self, session_key: str, override: Optional[dict]) -> None:
+        """Caller holds the route lock; publish memory only after successful persistence."""
+        self._bump_session_model_override_epoch(session_key)
+        epoch = self._session_model_override_epoch(session_key)
+        write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        cancelled = None
+        try:
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError as exc:
+                    # Cancellation does not stop a storage worker. Keep the lock
+                    # until it finishes, even when the caller is cancelled again.
+                    cancelled = exc
+            await write
+        finally:
+            if (not write.cancelled() and write.done() and write.exception() is None
+                    and self._session_model_override_epoch(session_key) == epoch):
+                if override is None:
+                    self._session_model_overrides.pop(session_key, None)
+                else:
+                    self._session_model_overrides[session_key] = dict(override)
+            self._bump_session_model_override_epoch(session_key)
+        if cancelled is not None:
+            raise cancelled
+
+    def _commit_session_model_override(self, session_key: str, override: Optional[dict], epoch: int) -> None:
+        """On-loop CAS: an override edit or boundary invalidates the worker's snapshot."""
+        if (override is None or self._session_model_override_epoch(session_key) != epoch
+                or self._session_model_override(session_key) is not None):
+            return
+        self._session_model_overrides[session_key] = override
+        logger.info(
+            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
+            session_key, override.get("model"), override.get("provider") or "",
+        )
+
+    def _session_model_override_edit_pending(self, session_key: str) -> bool:
+        """True while a durable override edit holds the route lock. Read-only, safe off-loop:
+        it never creates a lock, so a synchronous caller cannot bind one to the wrong loop."""
+        locks = getattr(self, "_session_model_override_locks", None)
+        lock = locks.get(session_key) if isinstance(locks, dict) else None
+        return bool(lock is not None and lock.locked())
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
-        """Lazily restore a persisted /model override after a gateway restart: non-secret parts
-        (model/provider/base_url) are written through on /model and read back on first use; api_key
-        is never persisted and is re-resolved. No-op when an in-memory override or nothing exists."""
+        """Synchronous callers retain lazy restoration, using the same fenced commit.
+
+        They cannot await the route lock, so they skip hydration while an edit is pending:
+        memory is already cleared and storage may still hold the value being replaced. The
+        edit itself publishes the outcome, and the next resolution hydrates normally."""
+        if self._session_model_override(session_key) is not None:
+            return
+        if self._session_model_override_edit_pending(session_key):
+            return
+        epoch = self._session_model_override_epoch(session_key)
+        loaded = self._load_session_model_override(session_key)
+        if self._session_model_override_edit_pending(session_key):
+            return
+        self._commit_session_model_override(session_key, loaded, epoch)
+
+    def _load_session_model_override(self, session_key: str) -> Optional[dict]:
+        """Load non-secret persisted fields and resolve credentials; never mutate runner state."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
-        if self._session_model_override(session_key) is not None or store is None:
-            return
+        if store is None:
+            return None
         try:
             persisted = store.get_model_override(session_key)
         except Exception:
@@ -188,17 +265,17 @@ class GatewayAgentCacheMixin:
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
-        self._session_state(session_key).conversation.model_override = override
-        logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
-        )
+        return override
 
     def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped
         so partial overrides don't clobber defaults), returning (model, runtime_kwargs)."""
+        return self._apply_model_override(self._session_model_override(session_key), model, runtime_kwargs)
+
+    @staticmethod
+    def _apply_model_override(override: Optional[dict], model: str, runtime_kwargs: dict) -> tuple:
+        """Layer a detached override snapshot, without consulting live session state."""
         from gateway.run import _credential_pool_for_provider
-        override = self._session_model_override(session_key)
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
@@ -240,9 +317,10 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         if snapshot.get("had_override"):
-            self._session_state(session_key).conversation.model_override = dict(snapshot.get("override") or {})
-        elif (state := self._peek_session_state(session_key)) is not None:
-            state.conversation.model_override = None
+            self._session_model_overrides[session_key] = dict(snapshot.get("override") or {})
+        else:
+            self._bump_session_model_override_epoch(session_key)
+            self._session_model_overrides.pop(session_key, None)
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:
@@ -255,6 +333,38 @@ class GatewayAgentCacheMixin:
         # Exactly the recorded move (alias -> backing): a later fallback onto some other model is
         # ordinary drift and still evicts.
         return getattr(agent, "_nous_model_switch", None) == (config_model, agent.model)
+
+    def _fallback_baseline_model(self, session_key: str, source: Optional[SessionSource], agent: Any) -> str:
+        """The model *agent* was built to run, for the post-turn fallback check: what
+        ``_resolve_session_agent_runtime`` chose (session /model, then channel_overrides on the chat,
+        thread or parent, then the global model), canonicalized as ``AIAgent.__init__`` did on the
+        agent's PRIMARY route. The route a fallback moved it to would make that fallback look primary."""
+        from gateway.run import _resolve_gateway_model
+        primary = getattr(agent, "_primary_runtime", None) or {}
+        provider = primary.get("provider", getattr(agent, "provider", "")) or ""
+        # An override whose provider was unavailable this turn ran on the default route instead.
+        override = self._session_model_override(session_key) or {}
+        if override.get("model") and override.get("provider") in (None, "", provider):
+            model = override["model"]
+        elif source is not None:
+            model = self._resolve_model_for_channel(
+                source.platform, str(source.chat_id) if source.chat_id else "",
+                thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+            )
+        else:
+            model = _resolve_gateway_model()
+        # Vendor prefix stripped on native providers, else the cached agent is evicted every turn,
+        # destroying prompt caching.
+        with suppress(Exception):
+            from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS, normalize_model_for_provider
+            if provider and provider not in _AGGREGATOR_PROVIDERS:
+                model = normalize_model_for_provider(model, provider)
+        # The Nous welcome host runs its one model whatever the chat configured (pin_model_for_route).
+        with suppress(Exception):
+            from hermes_cli.anon_auth import pin_model_for_route
+            model = pin_model_for_route(provider, primary.get("base_url", getattr(agent, "base_url", None)), model)
+        return model
 
     def _release_running_agent_state(
         self, session_key: str, *, run_generation: Optional[int] = None
@@ -365,6 +475,7 @@ class GatewayAgentCacheMixin:
         from gateway.run import _CONVERSATION_SCOPED_STATE
         if not session_key:
             return
+        self._bump_session_model_override_epoch(session_key)
         state = self._peek_session_state(session_key)
         if state is not None:
             state.conversation.clear()
@@ -400,6 +511,14 @@ class GatewayAgentCacheMixin:
                 clear(session_key)
             except Exception as e:
                 logger.debug("Failed to clear %s state for session boundary %s: %s", what, session_key, e)
+        # The persisted /yolo copy dies with the in-memory one, or the next turn's restore revives it.
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            try:
+                store.set_session_yolo(session_key, False)
+            except Exception:
+                # Never fails the boundary itself, but a surviving ON would come back after a restart.
+                logger.warning("Failed to clear persisted yolo for session boundary %s", session_key, exc_info=True)
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh, monotonically increasing run generation token (NEVER reset): a late result
@@ -461,7 +580,8 @@ class GatewayAgentCacheMixin:
             # bump and release below are the cleanup that matters.
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
-                request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+                request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason,
+                                       delegation_reason=invalidation_reason)
             _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:
@@ -546,6 +666,16 @@ class GatewayAgentCacheMixin:
         if interrupt_reason == _INTERRUPT_REASON_STOP:
             await self._persist_user_stop_latch(
                 session_key, session_id=stop_session_id, revision=stop_latch_revision)
+            try:
+                # Validate the pre-interrupt snapshot off-loop. A newer marker is never
+                # adopted by this stop, even when it still belongs to the same route.
+                current_marker = await self.async_session_store.get_resume_pending_marker(session_key)
+                if current_marker != stop_marker:
+                    stop_marker = None
+            except Exception:
+                logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
+        if not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return
         adapter = self._delivery_adapter_for(source)
         # /stop, /new, and /reset invalidate the adapter-side deferred-command queue too. The
         # runner's turn generation protects agent state, but queued slash events live on adapters
@@ -560,6 +690,8 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        if not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
@@ -590,7 +722,8 @@ class GatewayAgentCacheMixin:
                 await self.async_session_store.clear_resume_pending(session_key, expected_marker=stop_marker)
             except Exception:
                 logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
-        if interrupt_reason == _INTERRUPT_REASON_STOP:
+        if (interrupt_reason == _INTERRUPT_REASON_STOP
+                and self._is_session_run_current(session_key, _generation_at_interrupt)):
             await self._pause_goal_for_stop(
                 session_key, source, expected_session_id=stop_session_id,
                 expected_generation=_generation_at_interrupt, expected_session_entry=stop_session_entry)
@@ -856,11 +989,9 @@ class GatewayAgentCacheMixin:
         if src.platform == Platform.DISCORD:
             from gateway.session import _discord_tools_loaded
             discord_tools = "1" if _discord_tools_loaded() else "0"
-            # message_id: only PRESENCE is rendered (the id itself arrives per-turn in the user
-            # message) — keying on the value would re-render every message for zero byte change.
+            # message_id is not rendered (value nor presence): it arrives per-turn in the user message.
             discord_ids = (
                 _s(src.guild_id), _s(src.parent_chat_id), _s(src.thread_id), _s(src.chat_id),
-                "1" if src.message_id else "0",
             )
         # Slack's capability-aware platform note is gated on _slack_tools_loaded() — the gate state must
         # be in the key (same parity contract as the Discord gate above) so a config / MCP-registration

@@ -9,18 +9,18 @@
  */
 
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
-import { SLASH_COMMAND_RE } from '@hermes/shared'
 import { useCallback, useMemo, useRef } from 'react'
 
 import type { ClientSessionState } from '@/app/types'
 import type { WorkspaceMode } from '@/contrib/types'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
+import { isSlashCommandText } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
@@ -45,13 +45,14 @@ import type { SessionInfo } from '@/types/hermes'
 
 import type { GatewayRequester } from '../contrib/types'
 import { uploadComposerAttachment } from '../session/hooks/use-prompt-actions'
+import { isStaleTargetError } from '../session/hooks/use-prompt-actions'
 import {
   appendMidTurnUserMessage,
   applyBranchVisibility,
   applyReloadOptimistic,
   applyRewindOptimistic,
   durableRowIdsForRebind,
-  finalizeUserInterruptedMessages,
+  finalizeStoppedMessages,
   planEdit,
   planReload,
   planRestore,
@@ -326,7 +327,17 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
       listTileSession(visibleText)
 
-      if (!tokenPayload && !attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+      if (!tokenPayload && isSlashCommandText(visibleText)) {
+        if (attachments.length) {
+          notify({
+            kind: 'warning',
+            title: copy.slashCommandIgnoredTitle,
+            message: copy.slashCommandIgnoredBody
+          })
+
+          return false
+        }
+
         triggerHaptic('selection')
         await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
 
@@ -346,7 +357,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
 
     update(state => ({
       ...state,
-      messages: finalizeUserInterruptedMessages(state.messages, state.streamId),
+      messages: finalizeStoppedMessages(state.messages, state.streamId),
       busy: false,
       awaitingResponse: false,
       streamId: null,
@@ -615,6 +626,49 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
           )
         )
       } catch (err) {
+        // Same stale-target hazard as the primary chat's restore (#107593): a
+        // tile's cached durable row ids go stale after optimistic sends, resume
+        // drift, or session.branch remapping, and the gateway refuses with 4018.
+        // Mirror edit's recovery: refresh the transcript from the stored
+        // session, recompute the restore plan against fresh history, retry once.
+        if ((plan.truncateMessageId || plan.truncateRowId !== undefined) && isStaleTargetError(err)) {
+          try {
+            const refreshed = await sessionTileDelegate()!.resumeTile(storedIdRef.current, {
+              refreshTranscript: true
+            })
+
+            if (typeof refreshed === 'string' && refreshed && refreshed !== sessionId) {
+              runtimeIdRef.current = refreshed
+            }
+
+            const freshMessages = readMessages()
+
+            const retryPlan = planRestore(freshMessages, messageId, {
+              text: target?.text ?? plan.sourceText,
+              userOrdinal: target?.userOrdinal ?? plan.truncateOrdinal
+            })
+
+            if (retryPlan.truncateMessageId || retryPlan.truncateRowId !== undefined) {
+              applySurvivorRowIds(
+                await submitRewind(
+                  retryPlan.text,
+                  retryPlan.truncateOrdinal,
+                  interruptFirst,
+                  retryPlan.truncateMessageId,
+                  retryPlan.truncateRowId,
+                  retryPlan.sourceText,
+                  durableRowIdsForRebind(freshMessages)
+                )
+              )
+
+              return
+            }
+          } catch {
+            // Fall through to the rollback below: the optimistic truncation
+            // must never survive a failed retry.
+          }
+        }
+
         update(state => ({
           ...state,
           busy: false,
@@ -691,8 +745,16 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     [update]
   )
 
+  const branchInNewChat = useCallback(
+    (messageId: string) =>
+      sessionTileDelegate()?.branchSessionAtMessage(storedIdRef.current, runtimeIdRef.current, messageId) ??
+      Promise.resolve(false),
+    []
+  )
+
   return useMemo(
     () => ({
+      branchInNewChat,
       cancelRun,
       dismissError,
       editMessage,
@@ -704,6 +766,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       submitText
     }),
     [
+      branchInNewChat,
       cancelRun,
       dismissError,
       editMessage,
