@@ -79,7 +79,7 @@ checks. That check is no longer required; `qualification` replaced it.
 ## Provenance and disposition
 
 Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`,
-`native-test-coverage`.
+  `native-test-coverage`.
 
 `native-test-coverage` keeps strict native assertions aligned with the upstream
 subprocess contract, including closed stdin for the Windows WhatsApp tree kill.
