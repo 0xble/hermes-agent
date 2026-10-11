@@ -38,9 +38,10 @@ def test_list_still_matches_container_key():
     assert [e["session_id"] for e in reg.list_sessions(task_id="default")] == ["proc_c1"]
 
 
-def test_has_active_processes_matches_raw_owner():
+def test_has_active_processes_matches_container_key_and_raw_owner():
     reg = ProcessRegistry()
     reg._running["proc_own1"] = _owned_session()
+    assert reg.has_active_processes("default") is True
     assert reg.has_active_processes("sa-1-abc123") is True
     assert reg.has_active_processes("sa-9-unrelated") is False
 

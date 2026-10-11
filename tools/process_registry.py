@@ -2541,12 +2541,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             return any(not s.exited and predicate(s) for s in self._running.values())
 
     def has_active_processes(self, task_id: str) -> bool:
-        """Whether any process for ``task_id`` is still running. Ownership is
-        ``owner_task_id`` (the raw spawning id) like the other task-scoped queries:
-        ``task_id`` on a session is the collapsed container key, shared across
-        turns and delegate children, so a container-key match alone would miss a
-        delegate child's own background work (#120546)."""
-        return self._any_running(lambda s: s.owner_task_id == task_id)
+        """Whether any process for ``task_id`` is still running.
+
+        Match both the collapsed container key (``task_id`` on a session) and
+        the raw spawning owner (``owner_task_id``), because callers use both:
+        the idle environment reaper is keyed by container while delegate
+        children need to see their own background work (#120546).
+        """
+        return self._any_running(lambda s: s.task_id == task_id or s.owner_task_id == task_id)
 
     def running_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
         """Running processes whose RAW spawning owner is ``owner_task_id``."""

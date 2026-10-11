@@ -814,3 +814,18 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   real profile databases and rejects unserved/traversal profile names.
 - Retire with `update-lifecycle` only when a released upstream provides equivalent
   owner-routed, profile-scoped agent handoff and reason-bearing update notifications.
+
+## Container-Key Active Process Reaping
+
+- Fork patch identity: `active-processes-container-key`.
+- Upstream's `has_active_processes` regression matched only the raw spawning
+  owner, but the terminal idle-environment reaper queries by collapsed container
+  key. A delegate-owned background process therefore failed the liveness check,
+  and its still-needed environment could be torn down. The query now matches
+  either the container key or raw owner, preserving both callers' semantics.
+- Guard: `tests/tools/test_process_registry_owner_chain.py`
+  (`test_has_active_processes_matches_container_key_and_raw_owner`) and
+  `tests/tools/test_terminal_tool_lifecycle.py`
+  (`test_cleanup_inactive_env_keeps_container_with_owner_spawned_process`).
+- Retire when upstream's process liveness query matches both the container key
+  and raw spawning owner, with equivalent idle-reaper coverage.
