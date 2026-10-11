@@ -17,7 +17,8 @@ the same stale-root bridge before importing that graph. The historical
 v2026.9.14 graph-swap test, plus a fresh-process backup-first regression,
 qualifies this seam independently of import order in the unit suite.
 
-Source surfaces: `pm/store.py`, `hermes_cli/backup.py`.
+Source surfaces: `pm/store.py`, `hermes_cli/backup.py`,
+`hermes_cli/gitlock.py`, `hermes_cli/_git_process_scope.py`.
 Guard surfaces: `tests/pm/test_legacy_tar_bootstrap.py`,
 `tests/pm/test_archive_safety.py`,
 `tests/hermes_cli/test_stale_root_module_bridge.py`, and
@@ -31,3 +32,29 @@ raised historical upgrade floor makes its guard redundant. Read
 [install and scratch GC](install-and-scratch-gc.md) when changing takeover PM
 runtime lock/owner identity; the PM dependency project is not the checkout
 whose dependency state recovery and collection fence.
+
+## Linux Git recovery and historical qualification
+
+The failed index-lock update and intermittent dead temp-pack retention in the
+branch qualifier share a recovery veto: a host-wide `pgrep -x git` also sees
+unrelated E2E installs and smart-HTTP transfers. The PM checkout identity does
+not own this Git sweep. Linux recovery now binds observed process ownership to
+repository metadata (including shared worktree metadata); inaccessible or
+redirected ownership still vetoes deletion. Non-Linux probes are unchanged.
+The live-writer veto, age floors and exact debris prefixes must survive any
+adoption or refactor. Guard surfaces are
+`tests/hermes_cli/test_gitlock_process_scope.py`, `test_gitlock.py`,
+`test_gitlock_tmp_packs.py`, and the foreign-state/truthful-outcome Linux cells.
+Retire the Linux bridge when equivalent repository-scoped safety is adopted.
+
+N-1's unfiltered pre-swap fetch is immutable from the target branch. The existing
+#123254 byte-overfetch expected failure also has a slow-runner manifestation:
+it hits the old 300-second cap before the byte-bound assertion. The shallow
+qualifier gates that manifestation only with absent pre-fetch healing, an
+unchanged historical checkout, shallow non-promisor shape, fault-free HTTP-200
+transfers and a measured overfetch. Transport/authentication failures and
+current-code timeouts remain hard failures. This is qualification of an existing
+historical gap, not a claim that the old release now updates successfully.
+`tests/hermes_cli/test_upgrade_shallow_qualifier.py` guards the classification.
+Remove both expected-failure forms once N-1 carries the pre-fetch repair; do
+not extend them to HEAD behavior or raise fetch deadlines to hide overfetch.
