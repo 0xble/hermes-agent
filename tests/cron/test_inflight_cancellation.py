@@ -87,6 +87,15 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
         future.result(timeout=5)
     assert side_effects == []
     delivered.assert_not_called()
+    if action == "pause":
+        paused = jobs.get_job(job["id"])
+        assert paused["state"] == "paused"
+        assert not paused.get("fire_claim")
+        shown = next(j for j in dispatch("list", include_disabled=True)["jobs"]
+                     if j["job_id"] == job["id"])
+        assert not shown["running"] and shown["running_since"] is None
+        assert jobs.resume_job(job["id"])
+        assert jobs.claim_job_for_fire(job["id"])
 
 
 @pytest.mark.parametrize("action", ["remove", "pause"])
@@ -132,3 +141,13 @@ def test_cancel_scope_latches_before_agent_registration(isolated_store):
     finally:
         scheduler.release_running_job(job["id"])
     assert key not in scheduler._running_cancel_events
+
+
+def test_cancelled_completion_never_clears_replacement_claim(isolated_store):
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    owner = claimed["fire_claim"]["by"]
+    jobs.update_job(job["id"], {"fire_claim": {"by": "replacement",
+                                             "at": jobs._hermes_now().isoformat()}})
+    scheduler._record_fire_ownership_lost(job["id"], owner, "missing-execution")
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] == "replacement"

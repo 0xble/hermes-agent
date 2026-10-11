@@ -2862,8 +2862,11 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
     terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
-    if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
-        mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
+    # Renewal rejects paused jobs, but terminal bookkeeping must still clear the
+    # cancelled owner's claim. mark_job_run atomically compares the owner token.
+    if fire_owner is not None and mark_job_run(
+        job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
+    ):
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
     else:
         finish_execution(
