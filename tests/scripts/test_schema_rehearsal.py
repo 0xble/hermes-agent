@@ -126,6 +126,7 @@ def test_candidate_open_refuses_nonfresh_scratch_home(rehearsal, tmp_path, monke
     copy.write_bytes(b"disposable copy")
     home = tmp_path / "scratch"
     home.mkdir()
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
     target = home / "state.db"
     if existing == "state":
         target.write_bytes(b"live profile database")
@@ -141,6 +142,15 @@ def test_candidate_open_refuses_nonfresh_scratch_home(rehearsal, tmp_path, monke
     elif existing == "symlink":
         assert target.is_symlink()
     assert copy.read_bytes() == b"disposable copy"
+
+
+def test_candidate_open_uses_fresh_home_and_real_candidate(rehearsal, v2_copy, tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
+    home = tmp_path / "fresh-scratch"
+    result = rehearsal.open_with_candidate(v2_copy, home, sys.executable)
+    assert result["opened"] and result["exit"] == 0, result
+    assert (home / "state.db").resolve() == v2_copy.resolve()
 
 
 def test_rehearsal_refuses_active_custom_profile(rehearsal, tmp_path, monkeypatch):

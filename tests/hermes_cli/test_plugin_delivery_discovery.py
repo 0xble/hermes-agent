@@ -23,6 +23,38 @@ def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     assert joined == [True]
 
 
+def test_delivery_refuses_partial_hooks_after_discovery_timeout(monkeypatch):
+    import threading
+    import pytest
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    entered, release = threading.Event(), threading.Event()
+    dispatched = []
+    def load():
+        manager._hooks.setdefault("pre_tool_call", []).append(lambda **kw: dispatched.append(True))
+        entered.set()
+        assert release.wait(5)
+    monkeypatch.setattr(manager, "_discover_and_load_inner", load)
+    monkeypatch.setattr(manager, "_refresh_secret_sources_after_discovery", lambda: None)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    join = plugins._join_background_discovery
+    monkeypatch.setattr(plugins, "_join_background_discovery", lambda: join(timeout=0))
+    worker = threading.Thread(target=manager.discover_and_load, daemon=True)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", worker)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="discovery"):
+            plugins.invoke_hook("pre_tool_call")
+        assert dispatched == []
+    finally:
+        release.set()
+        worker.join(5)
+    plugins.invoke_hook("pre_tool_call")
+    assert dispatched == [True]
+
+
 def _inflight_discovery(monkeypatch):
     """A real worker thread that registers `pre_llm_call` late while `_discovered` is already True
     (discover_and_load() publishes the flag before loading)."""
@@ -43,6 +75,7 @@ def _inflight_discovery(monkeypatch):
         started.set()
         time.sleep(0.3)
         manager._hooks.setdefault("pre_llm_call", []).append(callback)
+        manager._discovery_complete = True
 
     worker = threading.Thread(target=late_registration, name="plugin-discovery", daemon=True)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)

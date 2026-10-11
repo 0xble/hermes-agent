@@ -1167,6 +1167,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
+        self._discovery_complete: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
         # the installed scope may then hold plugin-supplied names, and a later discovery that finds NO
         # enabled plugin source (plugin removed / disabled) must still reconcile once to drop them.
@@ -1297,11 +1298,12 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             # ``on_plugin_loaded`` reports the plugins this sweep loads that the process did not have before
             # (boot: everything; a mid-run install/enable: just the newcomer), keyed on the pre-sweep set.
             loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            self._discovery_complete = False
             if force:
                 self.unload()  # the ledger owns teardown of process-global registries
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-                self._discovered = True
+                self._discovered = self._discovery_complete = True
                 return
             # Flag set up front as a re-entrancy guard (register() can trigger discovery again) but
             # reset on failure so a failed scan is NOT cached as "discovered with an empty registry"
@@ -1309,11 +1311,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             self._discovered = True
             try:
                 self._discover_and_load_inner()
-                # Persistent registrations survived the unload-all; now that plugins re-registered,
-                # dispose the ones whose plugin did not come back.
-                # Now that plugins have had their chance to re-register, dispose the ones whose plugin did
-                # not come back (disabled, removed, or omitted from this discovery pass) so e.g. a disabled
-                # auth plugin's provider does not stay live process-wide until restart. See #91701.
+                # Evict registrations from disabled/removed plugins after re-registration (#91701).
                 self._evict_stale_persistent_registrations()
                 # load_hermes_dotenv() ran at import, before plugin secret sources existed: re-pull.
                 # Plugin secret sources register during discover; the initial load_hermes_dotenv() already
@@ -1325,6 +1323,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # Re-register so force-reload is symmetric (#60036; tracking #64178 — salvaged from PR
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
+                self._discovery_complete = True
             except BaseException:
                 self._discovered = False
                 raise
@@ -1800,6 +1799,8 @@ def _join_background_discovery(timeout: float = 30.0) -> None:
     if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
         return
     t.join(timeout=timeout)
+    if t.is_alive():
+        raise RuntimeError("Plugin discovery incomplete after timeout; refusing partial registry delivery")
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1860,13 +1861,12 @@ def _delivery_manager() -> PluginManager:
     on those surfaces (#50776, #67597, #67890, #50937; tracking #64178 — salvaged from PR #64188).
     """
     manager = get_plugin_manager()
-    # ``PluginManager.discover_and_load`` sets ``_discovered`` before loading any
-    # plugin so recursive discovery cannot re-enter the sweep.  A startup caller
-    # can therefore observe ``_discovered`` while the background worker is still
-    # populating hooks; join the worker before reading the registry.
+    # The recursion guard is not readiness: delivery requires the entire hook sweep.
     _join_background_discovery()
     if not getattr(manager, "_discovered", True):
         manager.discover_and_load()
+    if not getattr(manager, "_discovery_complete", True):
+        raise RuntimeError("Plugin discovery incomplete; defer hook delivery until loading finishes")
     return manager
 
 

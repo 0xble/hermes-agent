@@ -16,7 +16,8 @@ MAX_DUMP_BYTES = 1024 * 1024
 
 @pytest.mark.parametrize("secret_leaf", ["DB_PASSWORD=abcdef12", "PASS=174"])
 def test_dump_redacts_structurally_and_preserves_json(tmp_path, secret_leaf):
-    request = {"model": "debug-model", "messages": [{"role": "user", "content": secret_leaf}]}
+    request = {"model": "debug-model", "messages": [{"role": "user", "content": secret_leaf,
+                                                       "password": "hunter2"}]}
     original = copy.deepcopy(request)
     path = dump_api_request_debug(_agent(tmp_path), request, reason="preflight")
     assert path is not None
@@ -24,6 +25,7 @@ def test_dump_redacts_structurally_and_preserves_json(tmp_path, secret_leaf):
     payload = json.loads(serialized)
     assert payload["request"]["body"]["messages"][0]["content"].startswith(secret_leaf.split("=")[0])
     assert secret_leaf.split("=")[1] not in serialized
+    assert "hunter2" not in serialized
     assert request == original
 
 
