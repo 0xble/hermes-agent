@@ -1171,11 +1171,23 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         return not bool(getattr(self, "_fatal_error_retryable", True))
 
     def _replacement_telegram_adapter(self) -> Optional["TelegramAdapter"]:
-        """Live adapter if the reconnect watcher replaced us in ``runner.adapters`` (an in-flight
-        ``send()`` still holds the old instance whose ``_bot`` stays None)."""
+        """Live replacement for this adapter's owning profile after a reconnect.
+
+        ``runner.adapters`` belongs only to the primary profile. A secondary adapter
+        must resolve from its own map; otherwise an in-flight delivery can use the
+        wrong bot identity.
+        """
         runner = getattr(self, "gateway_runner", None)
-        adapters = getattr(runner, "adapters", None) or {}
-        live = adapters.get(self.platform)
+        if runner is None:
+            return None
+        owner = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None)
+        resolve = getattr(runner, "_authorization_adapter", None)
+        if callable(resolve):
+            live = resolve(self.platform, owner)
+        elif owner and owner != "default" and owner != getattr(runner, "_primary_profile_name", None):
+            live = ((getattr(runner, "_profile_adapters", None) or {}).get(owner) or {}).get(self.platform)
+        else:
+            live = (getattr(runner, "adapters", None) or {}).get(self.platform)
         if live is not None and live is not self and getattr(live, "_bot", None):
             return live
         return None
