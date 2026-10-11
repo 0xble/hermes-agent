@@ -2,6 +2,8 @@
 
 
 
+
+
 [project]
 name = "hermes-agent"
 version = "0.0.0"
@@ -198,6 +200,9 @@ dependencies = [
   # already works there and managed-mode perms depend on its exact lifecycle.
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
+  # The Camofox lease backend imports portalocker directly on Windows; keep it
+  # explicit instead of relying on concurrent-log-handler's transitive dependency.
+  "portalocker>=2.10.1,<4; sys_platform == 'win32' and python_version >= '3.14'",
   "concurrent-log-handler==0.9.29; sys_platform == 'win32' and python_version >= '3.14'",
   # First-party lifecycle and shared-metrics runtime. Relay 0.9 is the supported
   # native runtime and provider-codec baseline. Managed calls pass request and

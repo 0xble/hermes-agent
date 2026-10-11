@@ -95,6 +95,8 @@ class _Camofox:
                     tab_id = parsed.path.split("/")[2]
                     stub.tabs[query.get("userId")] = [
                         t for t in stub.tabs.get(query.get("userId"), []) if t["tabId"] != tab_id]
+                elif parsed.path.startswith("/sessions/"):
+                    stub.tabs.pop(parsed.path.split("/")[2], None)
                 return self._send({"ok": True})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -126,6 +128,8 @@ def camofox(tmp_path, monkeypatch):
         "browser:\n  cloud_provider: camofox\n  camofox:\n    managed_persistence: true\n",
         encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    from tools import browser_camofox_leases as leases
+    monkeypatch.setattr(leases, "_lease_root", lambda: home / "test-tab-leases")
     server = _Camofox()
     server.thread.start()
     monkeypatch.setenv("CAMOFOX_URL", server.url)
@@ -134,9 +138,13 @@ def camofox(tmp_path, monkeypatch):
     monkeypatch.setattr(bt, "_url_policy_error", lambda url, auto_local=False: None)
 
     def reset():
+        for server_url, user_id, tab_id in list(leases._handles):
+            leases.release(server_url, user_id, tab_id)
         with cf._sessions_lock:
             cf._sessions.clear()
             getattr(cf, "_stale_tab_ids", {}).clear()
+            getattr(cf, "_owned_tabs", {}).clear()
+            cf._closing_tabs.clear()
         cf._protected_tab_ids.clear()
         cf._protected_tab_owners.clear()
 
@@ -153,10 +161,10 @@ def _dispatch(name, args, task_id):
     return json.loads(raw) if isinstance(raw, str) else raw
 
 
-def _end_turn(task_id):
+def _end_turn(task_id, *, headed=False):
     """The real per-turn cleanup every agent turn runs (headless mode)."""
     from agent.chat_completion_helpers import cleanup_task_resources
-    with patch("tools.browser_tool_cloud._is_headed_mode", return_value=False), \
+    with patch("tools.browser_tool_cloud._is_headed_mode", return_value=headed), \
          patch("agent.chat_completion_helpers.is_persistent_env", return_value=False), \
          patch("run_agent.cleanup_vm"):
         cleanup_task_resources(SimpleNamespace(verbose_logging=False), task_id)
@@ -166,17 +174,18 @@ def _user_id(cf, task_id):
     return cf._sessions[task_id]["user_id"]
 
 
-def test_tab_binding_survives_end_of_turn_cleanup(camofox):
+@pytest.mark.parametrize("headed", [False, True])
+def test_owned_tab_closes_at_end_of_turn(camofox, headed):
     assert _dispatch("browser_navigate", {"url": "https://shop.example.test/a"}, "chat")["success"]
     first_tab = camofox.cf._sessions["chat"]["tab_id"]
-    _end_turn("chat")
+    _end_turn("chat", headed=headed)
 
-    # Next turn: page actions keep working without a new navigate, on the same tab.
-    assert _dispatch("browser_snapshot", {}, "chat")["success"]
-    assert _dispatch("browser_navigate", {"url": "https://shop.example.test/b"}, "chat")["success"]
+    # Disposable owned tabs do not survive the owning turn.
+    assert not _dispatch("browser_snapshot", {}, "chat")["success"]
     assert camofox.server.tab_posts() == ["/tabs"]
-    assert set(camofox.server.acted_on()) == {first_tab}
-
+    assert all(tab["tabId"] != first_tab for tabs in camofox.server.tabs.values() for tab in tabs)
+    assert _dispatch("browser_navigate", {"url": "https://shop.example.test/b"}, "chat")["success"]
+    assert camofox.server.tab_posts() == ["/tabs", "/tabs"]
 
 def test_handoff_tab_persists_across_turns(camofox):
     handoff = _dispatch("browser_handoff", {"account": "brianle"}, "chat")
@@ -325,10 +334,22 @@ def test_ephemeral_sessions_still_close_at_end_of_turn(camofox):
     with patch("tools.browser_camofox.requests.delete",
                side_effect=lambda url, **kw: deleted.append(url) or original(url, **kw)):
         assert _dispatch("browser_navigate", {"url": "https://shop.example.test/"}, "eph")["success"]
+        user_id = _user_id(camofox.cf, "eph")
         _end_turn("eph")
     assert "eph" not in camofox.cf._sessions
-    assert len(deleted) == 1 and "/sessions/hermes_" in deleted[0]
-    assert not any(path == "/tabs" and method == "GET" for method, path, _ in camofox.server.calls)
+    assert deleted == [f"{camofox.server.url}/tabs/created-1", f"{camofox.server.url}/sessions/{user_id}"]
+    assert user_id not in camofox.server.tabs
+
+
+def test_managed_sessions_do_not_delete_the_server_session(camofox):
+    deleted = []
+    original = requests.delete
+    with patch("tools.browser_camofox.requests.delete",
+               side_effect=lambda url, **kw: deleted.append(url) or original(url, **kw)):
+        assert _dispatch("browser_navigate", {"url": "https://shop.example.test/"}, "managed")["success"]
+        assert json.loads(camofox.cf.camofox_close("managed"))["closed"]
+    assert len(deleted) == 1 and "/tabs/created-1" in deleted[0]
+    assert not any("/sessions/" in path for path in deleted)
 
 
 def test_stale_carried_tab_recovers_through_navigation_only(camofox):
@@ -419,19 +440,42 @@ def test_agent_close_releases_unused_continuations_only(camofox):
     assert "s3" in cf._sessions  # in use by another agent: kept
 
 
-def test_agent_close_deletes_an_ephemeral_session_left_open(camofox):
-    """A turn cut before its cleanup leaves an ephemeral session; agent close must still delete it."""
+def test_agent_close_deletes_an_ephemeral_owned_tab_left_open(camofox):
+    """A cut turn must close its exact tab, not a whole identity that could hold user tabs."""
     from agent.client_lifecycle import ClientLifecycleMixin
 
     (camofox.home / "config.yaml").write_text("browser:\n  cloud_provider: camofox\n", encoding="utf-8")
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "cut-turn")["success"]
-    user_id = _user_id(camofox.cf, "cut-turn")
+    tab = camofox.cf._sessions["cut-turn"]["tab_id"]
     deleted = []
     with patch("tools.browser_camofox._delete", side_effect=lambda path, *a, **k: deleted.append(path) or {}), \
          patch("run_agent.cleanup_vm"), patch("run_agent.cleanup_browser"):
         ClientLifecycleMixin._close_task_resources(SimpleNamespace(_process_owner_task_ids={"cut-turn"}), "other")
     assert "cut-turn" not in camofox.cf._sessions
-    assert deleted == [f"/sessions/{user_id}"]
+    assert deleted == [f"/tabs/{tab}"]
+
+
+@pytest.mark.parametrize("status,code", [(410, "page_crashed"), (404, "browser_restarted")])
+def test_stale_error_keeps_durable_quarantine_across_restart(camofox, status, code):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    session = cf._sessions["chat"]
+    tab = session["tab_id"]
+    cf.quarantine_current_protected_tab("chat")
+    response = requests.Response()
+    response.status_code = status
+    response._content = json.dumps({"code": code}).encode()
+    assert cf._clear_stale_tab(session, requests.HTTPError("stale", response=response))
+    assert tab in cf._protected_tabs_on_disk()
+
+    # Model a fresh process: only disk quarantine survives, while the server still lists it.
+    cf._sessions.clear()
+    cf._stale_tab_ids.clear()
+    cf._protected_tab_ids.clear()
+    cf._protected_tab_owners.clear()
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "fresh")["success"]
+    assert cf._sessions["fresh"]["tab_id"] != tab
+    assert tab in cf._protected_tabs_on_disk()
 
 
 def test_stale_tab_record_is_pruned_once_the_server_forgets_the_tab(camofox):
@@ -439,12 +483,16 @@ def test_stale_tab_record_is_pruned_once_the_server_forgets_the_tab(camofox):
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     tab = cf._sessions["chat"]["tab_id"]
     user_id = _user_id(cf, "chat")
+    cf.quarantine_current_protected_tab("chat")
     camofox.server.gone.add(tab)
     assert not _dispatch("browser_snapshot", {}, "chat")["success"]
     assert cf._stale_tab_ids[user_id] == {tab}
+    assert tab in cf._protected_tabs_on_disk()
     camofox.server.tabs[user_id] = [t for t in camofox.server.tabs[user_id] if t["tabId"] != tab]
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     assert user_id not in cf._stale_tab_ids
+    assert tab not in cf._protected_tabs_on_disk()
+    assert tab not in cf._protected_tab_ids
 
 
 def test_turns_without_a_task_id_keep_the_tab(camofox):
@@ -551,16 +599,15 @@ def test_one_shot_run_closes_the_tab_it_created(camofox, monkeypatch):
     assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
 
 
-def test_top_level_session_close_keeps_its_tab(camofox, monkeypatch):
+def test_top_level_session_close_has_already_reaped_its_disposable_tab(camofox, monkeypatch):
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     tab, user_id = camofox.cf._sessions["chat"]["tab_id"], _user_id(camofox.cf, "chat")
     _end_turn("chat")
     _close_agent({"chat"}, platform="telegram", _delegate_depth=0)
     assert "chat" not in camofox.cf._sessions
-    assert _tab_deletes(camofox.server) == []
-    assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])  # left for adoption
-
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+    assert not any(t["tabId"] == tab for t in camofox.server.tabs[user_id])
 
 def test_subagent_release_refuses_adoption_before_tab_delete(camofox):
     cf = camofox.cf
@@ -593,13 +640,14 @@ def test_subagent_close_never_deletes_an_adopted_tab(camofox):
 
 
 def test_subagent_close_never_deletes_a_handed_off_shared_tab(camofox):
-    # The task first opens its own tab, then a handoff rebinds it to the shared visible tab.
+    # The task first opens its own disposable tab, then a handoff rebinds it to the shared visible tab.
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "child")["success"]
+    owned = camofox.cf._sessions["child"]["tab_id"]
     assert _dispatch("browser_handoff", {"account": "brianle"}, "child")["success"]
     assert camofox.cf._sessions["child"]["tab_id"] == "visible-tab"
     _close_agent({"child"}, _delegate_depth=1)
-    assert _tab_deletes(camofox.server) == []
-
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{owned}"]
+    assert any(t["tabId"] == "visible-tab" for tabs in camofox.server.tabs.values() for t in tabs)
 
 def test_subagent_close_never_deletes_a_tab_another_task_is_bound_to(camofox):
     cf = camofox.cf
@@ -612,7 +660,7 @@ def test_subagent_close_never_deletes_a_tab_another_task_is_bound_to(camofox):
     assert _tab_deletes(camofox.server) == []
 
 
-def test_subagent_close_never_deletes_a_protected_tab(camofox):
+def test_subagent_close_deletes_its_protected_owned_tab(camofox):
     from agent.redact import clear_vault_date_components, register_vault_date_component
     cf = camofox.cf
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "child")["success"]
@@ -623,8 +671,117 @@ def test_subagent_close_never_deletes_a_protected_tab(camofox):
         _close_agent({"child"}, _delegate_depth=1)
     finally:
         clear_vault_date_components("child")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+    assert tab not in cf._protected_tab_ids
+    assert tab not in cf._protected_tabs_on_disk()
+    assert not any(key[3] == tab for key in cf._owned_tabs)
+
+
+def test_ephemeral_close_deletes_protected_owned_tab_and_releases_lease(camofox, monkeypatch):
+    from agent.redact import register_vault_date_component
+    from tools import browser_camofox_leases as leases
+    cf = camofox.cf
+    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "ephemeral")["success"]
+    session = cf._sessions["ephemeral"]
+    assert session["managed"] is False
+    tab, user_id = session["tab_id"], session["user_id"]
+    key = (camofox.server.url, user_id, tab)
+    cf.quarantine_current_protected_tab("ephemeral")
+    register_vault_date_component("bday-year", "1990", tab="ephemeral", origin="https://a.example.test")
+    assert key in leases._handles
+
+    assert json.loads(cf.camofox_close("ephemeral"))["closed"]
+
+    assert _tab_deletes(camofox.server) == [
+        (f"/tabs/{tab}", {"userId": user_id}),
+        (f"/sessions/{user_id}", {}),
+    ]
+    assert user_id not in camofox.server.tabs
+    assert "ephemeral" not in cf._sessions
+    assert tab not in cf._protected_tab_ids and tab not in cf._protected_tabs_on_disk()
+    assert tab not in cf._protected_tab_owners
+    assert not any(owned[3] == tab for owned in cf._owned_tabs)
+    assert key not in leases._handles and key not in leases._local_claims
+    assert not leases._lease_path(key).exists()
+
+
+@pytest.mark.parametrize("exclusion", ["live-protection", "handoff", "shared-tab", "unreadable", "tab-delete-failure"])
+def test_ephemeral_close_does_not_bypass_tab_retention(camofox, monkeypatch, exclusion):
+    cf = camofox.cf
+    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "ephemeral")["success"]
+    session = cf._sessions["ephemeral"]
+    tab, user_id = session["tab_id"], session["user_id"]
+    if exclusion == "live-protection":
+        cf.quarantine_current_protected_tab("ephemeral")
+        cf._sessions["holder"] = {**session, "task_id": "holder"}
+        cf._protected_tab_owners[tab] = "holder"
+    elif exclusion == "handoff":
+        cf._handoffs_in_flight[user_id] = 1
+        monkeypatch.setattr(cf, "_handoffs_in_flight", cf._handoffs_in_flight.copy())
+    elif exclusion == "shared-tab":
+        cf._owned_tabs[cf._owned_tab_key("ephemeral", tab)]["session_key"] = SHARED
+    elif exclusion == "unreadable":
+        monkeypatch.setattr(cf, "_protected_tabs_on_disk", lambda: None)
+    else:
+        original_delete = cf._delete
+
+        def fail_tab_delete(path, **kwargs):
+            if path.startswith("/tabs/"):
+                raise requests.ConnectionError("fake tab close failure")
+            return original_delete(path, **kwargs)
+
+        monkeypatch.setattr(cf, "_delete", fail_tab_delete)
+    try:
+        assert json.loads(cf.camofox_close("ephemeral"))["closed"]
+        assert _tab_deletes(camofox.server) == []
+        assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])
+    finally:
+        cf._handoffs_in_flight.pop(user_id, None)
+
+
+def test_agent_close_does_not_delete_protected_adopted_tab(camofox):
+    cf = camofox.cf
+    user_id = cf._get_session("owner")["user_id"]
+    camofox.server.seed(user_id, {"tabId": "user-tab", "url": "https://a.example.test/", "listItemId": SHARED})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "owner")["success"]
+    assert cf._sessions["owner"]["tab_id"] == "user-tab"
+    cf.quarantine_current_protected_tab("owner")
+    cf.release_task_bindings({"owner"}, close_created_tabs=True)
     assert _tab_deletes(camofox.server) == []
-    assert tab in cf._protected_tab_ids  # quarantined, not closed
+    assert "user-tab" in cf._protected_tabs_on_disk()
+
+
+@pytest.mark.parametrize("protected", [False, True])
+def test_agent_abandons_failed_delete_records_and_leases(camofox, protected):
+    from tools import browser_camofox_leases as leases
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "owner")["success"]
+    tab, user_id = cf._sessions["owner"]["tab_id"], _user_id(cf, "owner")
+    if protected:
+        cf.quarantine_current_protected_tab("owner")
+    with patch.object(cf, "_delete", side_effect=requests.ConnectionError("fake server down")):
+        cf.release_task_bindings({"owner"}, close_created_tabs=True)
+    assert not any(key[3] == tab for key in cf._owned_tabs)
+    assert (camofox.server.url, user_id, tab) not in leases._handles
+    assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])
+    if protected:
+        assert tab in cf._protected_tabs_on_disk()  # abandonment must not permit reads
+
+
+def test_stale_owned_tab_releases_record_and_lease_but_retains_quarantine(camofox):
+    from tools import browser_camofox_leases as leases
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "owner")["success"]
+    tab, user_id = cf._sessions["owner"]["tab_id"], _user_id(cf, "owner")
+    cf.quarantine_current_protected_tab("owner")
+    camofox.server.gone.add(tab)
+    assert not _dispatch("browser_snapshot", {}, "owner")["success"]
+    assert not any(key[3] == tab for key in cf._owned_tabs)
+    assert tab in cf._protected_tabs_on_disk()
+    assert tab not in cf._protected_tab_owners
+    assert (camofox.server.url, user_id, tab) not in leases._handles
 
 
 def test_subagent_tab_close_failure_is_swallowed(camofox):
@@ -635,3 +792,352 @@ def test_subagent_tab_close_failure_is_swallowed(camofox):
         cf.release_task_bindings({"child"}, close_created_tabs=True)  # must not raise
     assert delete.call_args.args == (f"/tabs/{tab}",)
     assert "child" not in cf._sessions
+
+
+@pytest.mark.parametrize("replacement", ["none", "stale", "identity", "handoff", "compression", "move"])
+def test_owning_turn_closes_every_created_disposable_tab(camofox, replacement):
+    """Creation, not the current binding or identity, determines cleanup ownership."""
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "owner")["success"]
+    first = cf._sessions["owner"]["tab_id"]
+    user_id = _user_id(cf, "owner")
+    expected = [(f"/tabs/{first}", {"userId": user_id})]
+    ending = "owner"
+    if replacement == "stale":
+        cf._sessions["owner"]["tab_id"] = None
+        cf._stale_tab_ids.setdefault(user_id, set()).add(first)
+        assert _dispatch("browser_navigate", {"url": "https://b.example.test/"}, "owner")["success"]
+        expected.append((f"/tabs/{cf._sessions['owner']['tab_id']}", {"userId": user_id}))
+    elif replacement == "identity":
+        cf._sessions["owner"]["carried"] = True
+        assert _dispatch("browser_navigate", {"url": "https://b.example.test/", "account": "lpg"}, "owner")["success"]
+        expected.append((f"/tabs/{cf._sessions['owner']['tab_id']}", {"userId": _user_id(cf, "owner")}))
+    elif replacement == "handoff":
+        assert _dispatch("browser_handoff", {"account": "brianle"}, "owner")["success"]
+    elif replacement in {"compression", "move"}:
+        cf.carry_task_binding("owner", "continuation", move=replacement == "move")
+        if replacement == "move":
+            ending = "continuation"
+    _end_turn(ending)
+    if replacement == "compression":
+        assert _tab_deletes(camofox.server) == []
+        _end_turn("continuation")
+    assert sorted(_tab_deletes(camofox.server)) == sorted(expected)
+    assert all(tab["tabId"] != first for tabs in camofox.server.tabs.values() for tab in tabs)
+    if replacement == "handoff":
+        assert _dispatch("browser_snapshot", {}, "owner")["success"]
+    else:
+        assert not _dispatch("browser_snapshot", {}, "continuation" if replacement in {"compression", "move"} else "owner")["success"]
+
+
+@pytest.mark.parametrize("exclusion", ["adopted", "keep", "other-task", "protected", "unreadable", "failure"])
+def test_turn_cleanup_preserves_non_disposable_tabs_and_retry_ownership(camofox, exclusion):
+    cf = camofox.cf
+    if exclusion == "adopted":
+        user_id = cf._get_session("owner", "brianle")["user_id"]
+        camofox.server.seed(user_id, {"tabId": "user-tab", "url": "https://a.example.test/", "listItemId": SHARED})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "owner")["success"]
+    tab = cf._sessions["owner"]["tab_id"]
+    user_id = _user_id(cf, "owner")
+    if exclusion == "keep":
+        assert cf.keep_task_tabs("owner") == 1
+    elif exclusion == "other-task":
+        cf._sessions["sibling"] = {**cf._sessions["owner"], "task_id": "sibling"}
+    elif exclusion == "protected":
+        cf.quarantine_current_protected_tab("owner")
+    if exclusion == "unreadable":
+        with patch.object(cf, "_protected_tabs_on_disk", return_value=None):
+            _end_turn("owner")
+    elif exclusion == "failure":
+        with patch.object(cf, "_delete", side_effect=requests.ConnectionError("fake server down")):
+            _end_turn("owner")
+        assert cf._sessions["owner"]["tab_id"] == tab
+    else:
+        _end_turn("owner")
+    assert _tab_deletes(camofox.server) == []
+    assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])
+    if exclusion == "keep":
+        assert cf.keep_task_tabs("owner", keep=False) == 1
+    elif exclusion == "other-task":
+        cf._drop_session("sibling")
+    if exclusion in {"keep", "other-task", "unreadable", "failure"}:
+        _end_turn("owner")
+        assert _tab_deletes(camofox.server) == [(f"/tabs/{tab}", {"userId": user_id})]
+
+
+def test_top_level_agent_close_cleans_a_cut_turn(camofox):
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    tab = camofox.cf._sessions["chat"]["tab_id"]
+    _close_agent({"chat"}, _delegate_depth=0, platform="telegram")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_agent_close_cleans_unused_compression_continuation(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    tab = cf._sessions["chat"]["tab_id"]
+    cf.carry_task_binding("chat", "continuation")
+    _close_agent({"chat"}, _delegate_depth=0, platform="telegram")
+    assert "continuation" not in cf._sessions
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_handoff_in_flight_preserves_owned_tab(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    user_id = _user_id(cf, "chat")
+    cf._handoffs_in_flight[user_id] = 1
+    try:
+        _end_turn("chat")
+        assert _tab_deletes(camofox.server) == []
+    finally:
+        cf._handoffs_in_flight.pop(user_id)
+    _end_turn("chat")
+    assert len(_tab_deletes(camofox.server)) == 1
+
+
+def test_server_configuration_change_never_deletes_on_the_wrong_server(camofox, monkeypatch):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    monkeypatch.setenv("CAMOFOX_URL", "http://other.invalid")
+    _end_turn("chat")
+    assert _tab_deletes(camofox.server) == []
+    assert len(cf._owned_tabs) == 1
+    monkeypatch.setenv("CAMOFOX_URL", camofox.server.url)
+    _end_turn("chat")
+    assert len(_tab_deletes(camofox.server)) == 1
+
+
+@pytest.mark.parametrize("exclusion", ["keep", "user-tab"])
+def test_ephemeral_cleanup_preserves_kept_and_user_tabs(camofox, exclusion):
+    (camofox.home / "config.yaml").write_text("browser:\n  cloud_provider: camofox\n", encoding="utf-8")
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    user_id = _user_id(cf, "chat")
+    if exclusion == "keep":
+        cf.keep_task_tabs("chat")
+    else:
+        camofox.server.seed(user_id, {"tabId": "user-created", "url": "https://b.example.test/", "listItemId": SHARED})
+    _end_turn("chat")
+    if exclusion == "keep":
+        assert _tab_deletes(camofox.server) == []
+    else:
+        assert [t["tabId"] for t in camofox.server.tabs[user_id]] == ["user-created"]
+    assert not any("/sessions/" in path for _method, path, _payload in camofox.server.calls)
+
+
+def test_explicit_handoff_keeps_an_owned_tab_atomically(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "chat")["success"]
+    tab = cf._sessions["chat"]["tab_id"]
+    real_post = cf._post
+    def open_owned(path, body, **kwargs):
+        if path.endswith("/open"):
+            return {"ok": True, "tabId": tab}
+        return real_post(path, body, **kwargs)
+    with patch.object(cf, "_post", side_effect=open_owned):
+        assert _dispatch("browser_handoff", {"account": "brianle"}, "chat")["success"]
+    _end_turn("chat")
+    _close_agent({"chat"}, _delegate_depth=0, platform="telegram")
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_other_live_process_blocks_adoption_and_owned_cleanup(camofox):
+    import subprocess
+    import sys
+    from tools import browser_camofox_leases as leases
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "owner")["success"]
+    tab = cf._sessions["owner"]["tab_id"]
+    user_id = _user_id(cf, "owner")
+    leases.release(camofox.server.url, user_id, tab)
+    code = "from pathlib import Path; import sys; from tools import browser_camofox_leases as l; l._lease_root=lambda:Path(sys.argv[1]); print(l.claim(*sys.argv[2:]), flush=True); sys.stdin.readline()"
+    child = subprocess.Popen([sys.executable, "-u", "-c", code, str(leases._lease_root()), camofox.server.url, user_id, tab],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "True"
+        _end_turn("owner")
+        assert _tab_deletes(camofox.server) == []
+        cf._drop_session("owner")
+        assert _dispatch("browser_navigate", {"url": "https://a.example.test/next"}, "sibling")["success"]
+        assert cf._sessions["sibling"]["tab_id"] != tab
+    finally:
+        child.communicate("release\n", timeout=15)
+    cf.release_task_bindings({"owner"}, close_created_tabs=True)
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_confirmed_release_removes_keep_but_preserves_binding_until_cleanup(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "chat")["success"]
+    tab = cf._sessions["chat"]["tab_id"]
+    cf.keep_task_tabs("chat")
+    assert _dispatch("browser_handoff", {"account": "brianle", "release": True}, "chat")["success"]
+    assert cf._sessions["chat"]["tab_id"] == tab
+    _end_turn("chat")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_handoff_cannot_rebind_when_cross_process_ownership_is_uncertain(camofox):
+    cf = camofox.cf
+    session = cf._get_session("chat", "brianle")
+    session["tab_id"] = "own-bound-tab"
+    with patch("tools.browser_camofox_leases.claim", return_value=False):
+        result = _dispatch("browser_handoff", {"account": "brianle"}, "chat")
+    assert result["success"] and result["modelDetached"]
+    assert "ownership could not be confirmed" in result["note"]
+    assert "replacedTab" not in result
+    assert session["tab_id"] == "own-bound-tab"
+
+
+def test_handoff_retains_an_owned_tab_without_stealing_its_live_binding(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "owner")["success"]
+    tab = cf._sessions["owner"]["tab_id"]
+    camofox.server.open_tab_ids.append(tab)
+    result = _dispatch("browser_handoff", {"account": "brianle"}, "caller")
+    assert result["success"] and result["modelDetached"]
+    assert cf._sessions["owner"]["tab_id"] == tab
+    assert cf._sessions["caller"]["tab_id"] is None
+    _end_turn("owner")
+    _close_agent({"owner"}, _delegate_depth=0)
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_temporary_agent_close_does_not_clean_another_agents_live_browser(camofox):
+    from agent.client_lifecycle import ClientLifecycleMixin
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "live-owner")["success"]
+    tab = cf._sessions["live-owner"]["tab_id"]
+    # Do not mock cleanup_browser: generic close-time cleanup shares the session ID too.
+    temporary = ClientLifecycleMixin()
+    setattr(temporary, "_process_owner_task_ids", set())
+    with patch("run_agent.cleanup_vm"):
+        temporary._close_task_resources("live-owner")
+    assert cf._sessions["live-owner"]["tab_id"] == tab
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
+    from agent.client_lifecycle import ClientLifecycleMixin
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "tool-owner")["success"]
+    tab = cf._sessions["tool-owner"]["tab_id"]
+    owner = ClientLifecycleMixin()
+    setattr(owner, "_process_owner_task_ids", {"tool-owner"})
+    with patch("run_agent.cleanup_vm"):
+        owner._close_task_resources("different-session-id")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):
+    cf = camofox.cf
+    session = cf._get_session("slow-owner")
+    session["tab_id"] = "slow-tab"
+    cf._record_owned_tab(session, "slow-tab")
+    started = threading.Event()
+    finish = threading.Event()
+    tool_done = threading.Event()
+    results = []
+
+    def slow_delete(*_args, **_kwargs):
+        started.set()
+        assert finish.wait(5)
+        return {}
+
+    def sibling_tool():
+        results.append(_dispatch("browser_navigate", {"url": "https://sibling.example.test/"}, "sibling"))
+        tool_done.set()
+
+    with patch.object(cf, "_delete", side_effect=slow_delete):
+        # Exercise release_task_bindings too: it must not retain its outer RLock
+        # while invoking the owned-tab DELETE helper.
+        closer = threading.Thread(target=cf.release_task_bindings,
+                                  args=({"slow-owner"},), kwargs={"close_created_tabs": True})
+        closer.start()
+        assert started.wait(1)
+        sibling = threading.Thread(target=sibling_tool)
+        sibling.start()
+        try:
+            assert tool_done.wait(1), "sibling browser tool blocked on slow DELETE"
+            assert results[0]["success"]
+        finally:
+            finish.set()
+            closer.join(5)
+            sibling.join(5)
+    assert not closer.is_alive() and not sibling.is_alive()
+
+
+def test_agent_close_releases_kept_tab_ownership_without_deleting(camofox):
+    cf = camofox.cf
+    from tools import browser_camofox_leases as leases
+
+    session = cf._get_session("kept-owner")
+    session["tab_id"] = "kept-tab"
+    cf._record_owned_tab(session, "kept-tab")
+    cf.keep_task_tabs("kept-owner")
+    key = (cf.hermes_home_key(), "kept-owner", camofox.server.url, "kept-tab")
+    lease_key = (camofox.server.url, session["user_id"], "kept-tab")
+    assert leases.claim(*lease_key)
+    assert key in cf._owned_tabs and lease_key in leases._handles
+
+    with patch.object(cf, "_delete") as delete:
+        cf.release_task_bindings({"kept-owner"}, close_created_tabs=True)
+
+    assert key not in cf._owned_tabs
+    assert lease_key not in leases._handles
+    delete.assert_not_called()
+
+
+def test_kept_owner_close_retains_live_sibling_lease(camofox):
+    cf = camofox.cf
+    from tools import browser_camofox_leases as leases
+
+    session = cf._get_session("owner")
+    session["tab_id"] = "shared-kept-tab"
+    cf._record_owned_tab(session, session["tab_id"])
+    cf.keep_task_tabs("owner")
+    lease_key = (camofox.server.url, session["user_id"], session["tab_id"])
+    assert leases.claim(*lease_key)
+    with cf._sessions_lock:
+        cf._sessions["sibling"] = {**session, "task_id": "sibling"}
+    cf.release_task_bindings({"owner"}, close_created_tabs=True)
+    assert not cf._owned_tabs
+    assert lease_key in leases._handles
+    cf._drop_session("sibling")
+    assert lease_key not in leases._handles
+
+
+def test_closing_fence_survives_listing_disappearance_and_handoff(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "owner")["success"]
+    tab = cf._sessions["owner"]["tab_id"]
+    user_id = cf._sessions["owner"]["user_id"]
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_delete(*_args, **_kwargs):
+        started.set()
+        assert finish.wait(5)
+        return {}
+
+    with patch.object(cf, "_delete", side_effect=slow_delete):
+        closer = threading.Thread(target=cf._delete_owned_tabs, args=("owner",))
+        closer.start()
+        assert started.wait(1)
+        try:
+            # GET can temporarily omit a closing tab, clearing the ordinary stale cache.
+            camofox.server.tabs[user_id] = []
+            assert cf._adopt_existing_tab(cf._get_session("sibling", "brianle")).get("tab_id") is None
+            assert tab not in cf._stale_tab_ids.get(user_id, set())
+            camofox.server.seed(user_id, {"tabId": tab, "url": "https://a.example.test/", "listItemId": SHARED})
+            assert cf._adopt_existing_tab(cf._get_session("sibling", "brianle")).get("tab_id") is None
+            camofox.server.open_tab_ids.append(tab)
+            handoff = _dispatch("browser_handoff", {"account": "brianle"}, "sibling")
+            assert handoff["success"] and handoff["modelDetached"]
+            assert cf._sessions["sibling"]["tab_id"] is None
+        finally:
+            finish.set()
+            closer.join(5)
+    assert (camofox.server.url, user_id, tab) not in cf._closing_tabs

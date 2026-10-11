@@ -2449,11 +2449,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 def cleanup_task_resources(agent, task_id: str) -> None:
     """Per-turn VM + browser cleanup for a task. Skips ``cleanup_vm`` for persistent
     terminal envs (``_cleanup_inactive_envs`` reaps them after ``terminal.lifetime_seconds``)
-    and ``cleanup_browser`` in headed mode (the inactivity reaper handles idle sessions)."""
+    and local ``cleanup_browser`` in headed mode. Camofox always runs native owned-tab
+    cleanup; visibility alone is not an explicit keep or user handoff."""
     def _headed() -> bool:
         try:
+            from tools import browser_tool
             from tools.browser_tool_cloud import _is_headed_mode
-            return _is_headed_mode()
+            return _is_headed_mode() and not browser_tool._is_camofox_mode()
         except Exception:
             return bool(os.environ.get("AGENT_BROWSER_HEADED"))
 
