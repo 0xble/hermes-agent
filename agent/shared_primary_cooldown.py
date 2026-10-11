@@ -117,14 +117,14 @@ def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
             unlock = lambda: (lock_file.seek(0), msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1))
         try:
             try:
-                raw = json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
-            except (OSError, ValueError, TypeError):
-                logger.warning("Ignoring unreadable primary cooldown state at %s", state_path)
-                raw = {}
-            state = raw if isinstance(raw, dict) else {}
-            routes = state.get("routes")
-            if not isinstance(routes, dict):
-                routes = {}
+                raw = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            except FileNotFoundError:
+                raw = {"routes": {}}
+            except (ValueError, TypeError) as exc:
+                raise OSError(f"Malformed primary cooldown state at {state_path}") from exc
+            if not isinstance(raw, dict) or not isinstance(raw.get("routes"), dict):
+                raise OSError(f"Malformed primary cooldown state at {state_path}")
+            routes = raw["routes"]
             state = {"version": _STATE_VERSION, "routes": routes}
             yield state_path, state
         finally:
