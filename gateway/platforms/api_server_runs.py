@@ -1281,7 +1281,7 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
     self._stopping_run_ids.add(run_id)
     if agent is not None:
         with suppress(Exception):
-            _api_server.request_hard_interrupt(agent, "Stop requested via API")
+            _api_server.request_hard_interrupt(agent, "Stop requested via API", delegation_reason="stop_command")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")

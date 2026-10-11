@@ -226,7 +226,9 @@ class InterruptControlMixin:
         for child in children_copy:
             try:
                 if hard_cancel:
-                    request_hard_interrupt(child, message, tool_reason=tool_interrupt_reason)
+                    request_hard_interrupt(
+                        child, message, tool_reason=tool_interrupt_reason,
+                        delegation_reason=getattr(self, "_delegation_interrupt_reason", None))
                 else:
                     child.interrupt(message)
             except Exception as e:
