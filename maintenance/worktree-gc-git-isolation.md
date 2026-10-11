@@ -32,6 +32,10 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   archived.
   Archiving these caches had copied out 1.6 GB of a 3.8 GB tree, so a prune
   moved bytes instead of freeing them.
+- Reclaim gives `git worktree remove` `WORKTREE_REMOVE_TIMEOUT` (600s), in
+  both `hermes worktree prune` and the startup/cron pruner. A 15-30s timeout
+  killed removals mid-delete on a saturated volume and left registered,
+  half-deleted trees that every later prune keeps as dirty.
 - `hermes worktree prune --dry-run` reports, per tree and in total, how much
   would be copied to the archive. It sizes only those paths, never whole trees;
   the rest of each tree is freed.
@@ -48,7 +52,7 @@ reclaim verdicts, or the Git invocation in `hermes_cli/worktree_gc.py`.
   parsing; review reproduced silent loss of a quoted filename followed by a
   full reclaim, and a later review found ignored-directory symlinks archived as
   regular files. Neither revision was adopted here.
-- Surfaces: `hermes_cli/worktree_gc.py`, `tests/hermes_cli/test_worktree_gc.py`.
+- Surfaces: `hermes_cli/worktree_gc.py`, `hermes_cli/worktree_ops.py` (remove timeout), `tests/hermes_cli/test_worktree_gc.py`.
 
 ## Verification
 

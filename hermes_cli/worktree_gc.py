@@ -380,6 +380,7 @@ def reclaim_worktrees(
 ) -> List[str]:
     """Remove every reap-verdict tree from a frozen audit list — never re-globs inside the
     destructive loop, so trees created by concurrent sessions after the audit are out of scope."""
+    from hermes_cli import worktree_ops as _ops
     if records is None:
         records = audit_worktrees(repo_root, with_sizes=False)
     actions: List[str] = []
@@ -402,7 +403,8 @@ def reclaim_worktrees(
         with contextlib.suppress(Exception):
             _git(["worktree", "unlock", record.path], cwd=repo_root, timeout=10)
         try:
-            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root, timeout=30)
+            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root,
+                                 timeout=_ops.WORKTREE_REMOVE_TIMEOUT)
             if remove_result.returncode != 0:
                 actions.append(f"failed to remove {record.name}: {remove_result.stderr.strip()}")
                 continue
