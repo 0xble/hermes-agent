@@ -21,6 +21,13 @@ from agent.agent_runtime_helpers import looks_like_degenerate_final
 from agent.conversation_loop import _DEGENERATE_FINAL_NUDGE
 
 
+GATEWAY_SILENCE_REPROMPT = (
+    "[System: The user typed this message and expects a visible reply. Silence markers are only "
+    "for gateway-generated turns. Reply now with a short status of what you did or started, "
+    "without a silence marker.]"
+)
+
+
 @pytest.fixture()
 def loop_agent():
     """AIAgent with a mocked OpenAI client (mirrors test_dropped_tool_call_recovery)."""
@@ -75,6 +82,60 @@ def _final(text):
 def _user_rows_sent(agent, call_index):
     kwargs = agent.client.chat.completions.create.call_args_list[call_index].kwargs
     return [m["content"] for m in kwargs["messages"] if m.get("role") == "user"]
+
+
+class TestGatewaySilenceRecovery:
+    @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+    def test_user_typed_gateway_silence_marker_reprompts_once(self, loop_agent, marker):
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        result = _run_gateway(loop_agent, [_final(marker), _final("Started the requested work.")])
+
+        assert result["final_response"] == "Started the requested work."
+        assert loop_agent.client.chat.completions.create.call_count == 2
+        assert _user_rows_sent(loop_agent, 1)[-1] == GATEWAY_SILENCE_REPROMPT
+        contents = [m.get("content") for m in result["messages"]]
+        assert marker not in contents
+        assert GATEWAY_SILENCE_REPROMPT not in contents
+
+    def test_machinery_gateway_silence_does_not_reprompt(self, loop_agent):
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        result = _run_gateway(
+            loop_agent, [_final("NO_REPLY")], persist_user_display_kind="internal_notification",
+        )
+
+        assert result["final_response"] == "NO_REPLY"
+        assert loop_agent.client.chat.completions.create.call_count == 1
+
+    def test_unaddressed_gateway_silence_does_not_reprompt(self, loop_agent):
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        result = _run_gateway(
+            loop_agent, [_final("[SILENT]")], persist_user_display_metadata={"reply_expected": False},
+        )
+
+        assert result["final_response"] == "[SILENT]"
+        assert loop_agent.client.chat.completions.create.call_count == 1
+
+    def test_user_typed_gateway_silence_retry_is_bounded(self, loop_agent):
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        result = _run_gateway(loop_agent, [_final("NO_REPLY"), _final("[SILENT]")])
+
+        assert result["final_response"] == "[SILENT]"
+        assert loop_agent.client.chat.completions.create.call_count == 2
+
+
+def _run_gateway(agent, stages, *, persist_user_display_kind=None, persist_user_display_metadata=None):
+    agent.client.chat.completions.create.side_effect = stages
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("model_tools.handle_function_call", return_value="ok"),
+    ):
+        return agent.run_conversation(
+            "build the workbook",
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata or {},
+        )
 
 
 class TestFragmentAfterToolWork:
