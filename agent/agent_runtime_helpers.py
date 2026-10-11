@@ -1673,11 +1673,11 @@ def dump_api_request_debug(
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
         # Redact secrets first: this fires unconditionally on API errors and captures the full
         # request body, so context-embedded secrets would otherwise land in cleartext on disk.
-        from agent.redact import redact_sensitive_text
-        _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
+        from agent.redact import redact_sensitive_json
+        _plain = json.loads(json.dumps(dump_payload, ensure_ascii=False, default=str))
         from agent.request_debug import bounded_request_dump, prune_request_dumps
-        _redacted_payload = bounded_request_dump(json.loads(redact_sensitive_text(_serialized, force=True)))
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        _redacted_payload = bounded_request_dump(redact_sensitive_json(_plain, force=True))
+        atomic_json_write(dump_file, _redacted_payload, mode=0o600, default=str)
         prune_request_dumps(dump_file)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
