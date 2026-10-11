@@ -60,6 +60,11 @@ unreachable otherwise).
 
 ## Development Environment
 
+Provider HTTP diagnostics MUST use `.venv/bin/python scripts/probe_provider.py`.
+Never use `curl` with inline keys, put credentials in argv, or echo config secrets.
+Unsupported providers fail closed; extend the helper rather than making an inline
+credentialed request. See `maintenance/io-safe-provider-probe.md` for its scope.
+
 ```bash
 source ./activate   # provisions/syncs PM tools + dependencies, then activates
 ```
