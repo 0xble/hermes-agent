@@ -167,3 +167,95 @@ async def test_failure_persisted_after_recovery_sweep_is_redelivered_once():
         Platform.TELEGRAM, profile="default"
     )
     assert primary.send.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "secondary"])
+@pytest.mark.parametrize("cancel_count", [1, 2])
+@pytest.mark.parametrize("phase", ["claim", "clear", "note", "send", "delivered_write", "refund_before", "refund_after"])
+async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
+    monkeypatch, profile, cancel_count, phase,
+):
+    import threading
+
+    primary, secondary = _adapter("default"), _adapter("secondary")
+    runner = _runner(primary, secondary)
+    adapter, sibling = (primary, secondary) if profile == "default" else (secondary, primary)
+    _failed_row("first", profile)
+    _failed_row("second", profile)
+    _failed_row("sibling", "secondary" if profile == "default" else "default")
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), asyncio.Event()
+    thread_release = threading.Event()
+    writes = []
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return SendResult(success=True, message_id="sent") if phase == "send" else None
+
+    if phase == "claim":
+        real_sweep = ledger.sweep_failed_for_runtime
+        def delayed_sweep(*args, **kwargs):
+            rows = real_sweep(*args, **kwargs)
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(10)
+            return rows
+        monkeypatch.setattr(ledger, "sweep_failed_for_runtime", delayed_sweep)
+    elif phase in {"delivered_write", "refund_before", "refund_after"}:
+        name = "mark_delivered" if phase == "delivered_write" else "release_runtime_claim"
+        real_write = getattr(ledger, name)
+        def delayed_write(*args, **kwargs):
+            writes.append(args[0])
+            if len(writes) != 1:
+                return real_write(*args, **kwargs)
+            result = real_write(*args, **kwargs) if phase == "refund_after" else None
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(10)
+            return result if phase == "refund_after" else real_write(*args, **kwargs)
+        monkeypatch.setattr(ledger, name, delayed_write)
+        if phase.startswith("refund"):
+            runner._async_session_store.clear_resume_pending.side_effect = RuntimeError("store unavailable")
+    elif phase == "clear":
+        runner._async_session_store.clear_resume_pending.side_effect = blocked
+    elif phase == "note":
+        runner._redelivery_restart_note_event = blocked
+    else:
+        adapter.send.side_effect = blocked
+
+    task = asyncio.create_task(
+        runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile=profile)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        assert _state("first")[0] == ("failed" if phase == "refund_after" else "attempting")
+        for _ in range(cancel_count):
+            task.cancel()
+            await asyncio.sleep(0)
+        if phase == "refund_after":
+            # A replacement can claim the row before the older refund await returns.
+            # Repeated cancellation must not restart that refund against this claim.
+            successor = ledger.sweep_failed_for_runtime("telegram", profile=profile)
+            assert [row["obligation_id"] for row in successor] == ["first"]
+        thread_release.set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        if phase in {"send", "delivered_write"}:
+            assert _state("first") == ("delivered", 1)
+            assert adapter.send.await_count == 1
+        elif phase == "refund_after":
+            assert _state("first") == ("attempting", 1)
+            assert writes.count("first") == 1
+            adapter.send.assert_not_awaited()
+        else:
+            assert _state("first") == ("failed", 0)
+            adapter.send.assert_not_awaited()
+        assert _state("second") == _state("sibling") == ("failed", 0)
+        sibling.send.assert_not_awaited()
+    finally:
+        thread_release.set()
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
