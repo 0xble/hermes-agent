@@ -454,3 +454,80 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+@pytest.mark.parametrize("tool_name,cap_field,code", [
+    ("web_search", "max_web_searches", "loop_web_search_cap"),
+    ("delegate_task", "max_subagents", "loop_subagent_cap"),
+])
+@pytest.mark.parametrize("max_iterations", [1, 10])
+def test_loop_cap_batch_gets_final_answer_from_collected_results(
+    tool_name, cap_field, code, max_iterations,
+):
+    agent = _make_agent(tool_name, max_iterations=max_iterations, config={
+        "tool_loop_guardrails": {"loop_caps": {cap_field: 1}},
+    })
+    field = "query" if tool_name == "web_search" else "goal"
+    calls = [_mock_tool_call(tool_name, json.dumps({field: f"distinct {i}"}), f"cap-{i}")
+             for i in range(3)]
+    answer = "Based on the collected evidence, here is the answer."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", "tool_calls", calls), _mock_response(answer),
+    ]
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    agent._disable_streaming = True
+    with (
+        patch("model_tools.handle_function_call", return_value='{"evidence":"collected"}') as dispatch,
+        patch.object(agent, "_dispatch_delegate_task", return_value='{"evidence":"collected"}') as delegate,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Research and answer.")
+    assert (dispatch if tool_name == "web_search" else delegate).call_count == 1
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["final_response"] == answer
+    assert result["turn_exit_reason"] == "tool_cap_answer"
+    assert answer in deltas
+    assert [m["content"] for m in result["messages"] if m.get("role") == "user"] == ["Research and answer."]
+    tool_results = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert {m["tool_call_id"] for m in tool_results} == {tc.id for tc in calls}
+    # Concurrent searches may acquire the cap in any order; all results retain their IDs.
+    assert sum("collected" in m["content"] for m in tool_results) == 1
+    assert sum(code in m["content"] for m in tool_results) == 2
+    final_request = agent.client.chat.completions.create.call_args.kwargs
+    assert any("collected" in str(m.get("content")) for m in final_request["messages"])
+    assert final_request["messages"][0]["content"] == agent._cached_system_prompt
+
+
+@pytest.mark.parametrize("tool_name,cap_field", [
+    ("web_search", "max_web_searches"), ("delegate_task", "max_subagents"),
+])
+def test_loop_cap_repeated_calls_in_final_completion_never_execute_or_loop(tool_name, cap_field):
+    agent = _make_agent(tool_name, config={
+        "tool_loop_guardrails": {"loop_caps": {cap_field: 1}},
+    })
+    field = "query" if tool_name == "web_search" else "goal"
+    def batch(prefix):
+        return [_mock_tool_call(tool_name, json.dumps({field: f"{prefix} {i}"}), f"{prefix}-{i}")
+                for i in range(3)]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", "tool_calls", batch("first")),
+        _mock_response("", "tool_calls", batch("again")),
+    ]
+    with (
+        patch("model_tools.handle_function_call", return_value='{"evidence":"collected"}') as dispatch,
+        patch.object(agent, "_dispatch_delegate_task", return_value='{"evidence":"collected"}') as delegate,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Research and answer.")
+    assert (dispatch if tool_name == "web_search" else delegate).call_count == 1
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["turn_exit_reason"] == "tool_cap_answer"
+    assert "per-turn limit" in result["final_response"]
+    assert "without making progress" not in result["final_response"]
+    assert all(not str(m.get("tool_call_id", "")).startswith("again-")
+               for m in result["messages"])
