@@ -1051,20 +1051,25 @@ class SessionDB(
         ioerr_begin_retried = False
         while True:
             self._raise_if_db_corrupt(storage=True)
-            # NOTE: the replaced/generation live probe runs INSIDE the lock below,
-            # not here. close() mutates _conn and _db_sidecar_identity under that
-            # same lock, ending the WAL generation (SQLite unlinks the -wal/-shm
-            # sidecars on a clean close). A lock-free probe that races close() can
-            # observe the mid-teardown state — sidecars already unlinked while
-            # _db_sidecar_identity is not yet cleared — and misclassify this
-            # process's OWN clean close as an externally deleted generation,
-            # raising a sticky DeletedWalGenerationError that permanently refuses
-            # later writes (#105567). Inside the lock the probe only ever sees the
-            # stable post-close state (identity cleared → adopt / reopen path).
+            # NOTE: the AUTHORITATIVE replaced/generation probe runs INSIDE the lock below.
+            # close() mutates _conn and _db_sidecar_identity under that same lock, ending the
+            # WAL generation (SQLite unlinks the -wal/-shm sidecars on a clean close). A
+            # lock-free probe that races close() can observe the mid-teardown state — sidecars
+            # already unlinked while _db_sidecar_identity is not yet cleared — and misclassify
+            # this process's OWN clean close as an externally deleted generation, raising a
+            # sticky DeletedWalGenerationError that permanently refuses later writes (#105567).
+            # The lock-free pre-probe below can therefore only CLEAR the healthy path: any doubt
+            # (a mismatch, nothing recorded, an error) defers to the in-lock probe, which only
+            # ever sees the stable post-close state. Its stat()/pread syscalls stall in the
+            # kernel on a saturated disk, and under the lock that stalled every queued writer.
+            generation_clean = self._db_generation_probe_clean()
             fn_started = False
             try:
                 with self._lock:
-                    self._raise_if_db_replaced()
+                    if generation_clean:
+                        self._raise_if_db_generation_flagged()
+                    else:
+                        self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -1346,11 +1351,39 @@ class SessionDB(
 
     def _raise_if_db_replaced(self) -> None:
         """Sticky-flag fast path (no log spam on every write), then the live probe."""
+        self._raise_if_db_generation_flagged()
+        self._halt_if_db_generation_changed()
+
+    def _raise_if_db_generation_flagged(self) -> None:
+        """The sticky replaced / lost-generation flags only (no filesystem syscalls)."""
         if self._db_replaced:
             raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
         if self._db_wal_generation_lost:
             raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
-        self._halt_if_db_generation_changed()
+
+    def _db_generation_probe_clean(self) -> bool:
+        """Lock-free healthy-path probe for writes: True only when the main file and every
+        recorded sidecar still carry the identities recorded under ``self._lock`` and the
+        header's application_id still matches. Pure (never adopts, never flags): any doubt
+        returns False so the authoritative probe runs under the lock (see _execute_write_marked)."""
+        if self._db_replaced or self._db_wal_generation_lost:
+            return False
+        try:
+            recorded_main, recorded_sidecars = self._db_file_identity, self._db_sidecar_identity
+            if recorded_main is None or (self._wal_active and not recorded_sidecars):
+                return False
+            if _stat_db_file_identity(self.db_path) != recorded_main:
+                return False
+            recorded_app = int(self._db_file_application_id or 0)
+            if recorded_app:
+                disk_app = _read_sqlite_application_id(self.db_path)
+                if disk_app and disk_app != recorded_app:
+                    return False
+            base = os.fspath(self.db_path)
+            return all(_stat_db_file_identity(Path(base + suffix)) == ident
+                       for suffix, ident in (recorded_sidecars or {}).items())
+        except Exception:
+            return False
 
     @classmethod
     def _is_structural_corruption_error(cls, exc: BaseException) -> bool:
