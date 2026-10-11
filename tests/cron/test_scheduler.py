@@ -1770,6 +1770,22 @@ class TestParallelTick:
         start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
 
+    @pytest.mark.parametrize("configured, expected", [
+        (None, "default"), ({"max_parallel_jobs": None}, "default"),
+        ({"max_parallel_jobs": 2}, 2), ({"max_parallel_jobs": 0}, None),
+    ])
+    def test_max_parallel_is_bounded_unless_explicitly_unbounded(self, monkeypatch, configured, expected):
+        """A restart makes every missed job due on one tick: the pool must be bounded by default."""
+        from cron import scheduler
+        from hermes_cli.config_defaults import DEFAULT_CRON_MAX_PARALLEL_JOBS
+
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+        monkeypatch.setattr(scheduler, "load_config", lambda: {} if configured is None else {"cron": configured})
+        resolved = scheduler._resolve_max_parallel_workers()
+        assert resolved == (DEFAULT_CRON_MAX_PARALLEL_JOBS if expected == "default" else expected)
+        assert DEFAULT_CRON_MAX_PARALLEL_JOBS >= 1
+
+
 class TestDeliverResultTimeoutCancelsFuture:
     """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
     send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
