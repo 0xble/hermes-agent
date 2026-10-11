@@ -30,6 +30,29 @@ _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
 # lane, not merged scratch; checking it is expensive and it stays preserved.
 _MAX_CHERRY_AHEAD = 50
 
+# Directories a tool regenerates from tracked sources. They are removed with the tree instead of
+# archived: copying them out (often over half a tree) moved bytes instead of freeing them. Exact
+# names only, matched against directory components, so a file or an unlisted directory is still
+# archived.
+_REGENERABLE_DIRS = frozenset({
+    ".venv", "node_modules", "__pycache__", ".pytest_cache", ".pytest-cache", ".ruff_cache",
+    ".mypy_cache", ".direnv",
+})
+# Generic build-output names, trusted only when an ignore rule matches the directory itself
+# (git then reports it as one ``!! dir/`` entry): an untracked ``build/`` could be hand-made, and
+# a tracked source folder such as ``scripts/build/`` can hold an ignored ``.env``. ``.ci`` is the
+# local CI state and caches.
+_IGNORED_BUILD_DIRS = frozenset({".ci", "build", "dist", "target", ".next", ".turbo"})
+
+
+def _regenerable(path: str, ignored: bool) -> bool:
+    """True when porcelain *path* lies inside (or is) a regenerable directory."""
+    is_dir = path.endswith("/")
+    parts = path.rstrip("/").split("/")
+    if any(part in _REGENERABLE_DIRS for part in (parts if is_dir else parts[:-1])):
+        return True
+    return ignored and is_dir and parts[-1] in _IGNORED_BUILD_DIRS
+
 
 @dataclass
 class TreeRecord:
@@ -41,6 +64,7 @@ class TreeRecord:
     verdict: str          # reap | reap-archive | keep
     reason: str
     untracked: List[str] = field(default_factory=list)
+    archive_mb: Optional[int] = None  # size of ``untracked`` (copied out, not freed); with sizes only
 
 
 @dataclass
@@ -103,11 +127,33 @@ def _tree_size_mb(path: Path, timeout: int = 30) -> Optional[int]:
         return None
 
 
+def _raise(error: OSError) -> None:
+    raise error
+
+
+def _paths_size_mb(tree: Path, rels: List[str]) -> Optional[int]:
+    """Bytes (MiB, rounded up) the archive would copy for *rels*; None when unreadable."""
+    total = 0
+    try:
+        for rel in rels:
+            src = tree / rel
+            if src.is_symlink() or not src.is_dir():
+                total += src.lstat().st_size
+                continue
+            for root, _dirs, files in os.walk(src, onerror=_raise):
+                total += sum(os.lstat(os.path.join(root, name)).st_size for name in files)
+    except OSError:
+        return None
+    return -(-total // (1024 * 1024))
+
+
 def _dirty_split(path: str) -> tuple[bool, List[str]]:
     """(has_tracked_modifications, untracked_paths) — tracked = real work, untracked = archivable.
 
     Ignored-but-present files are included intentionally: cleanup cannot safely
-    delete a worktree merely because repository or host policy hides a file.
+    delete a worktree merely because repository or host policy hides a file
+    (local env files, notes, scratch output). Regenerable directories
+    (:func:`_regenerable`) are the exception: they are left out and go with the tree.
     """
     try:
         result = _git([
@@ -123,7 +169,9 @@ def _dirty_split(path: str) -> tuple[bool, List[str]]:
                 return True, []
             status = field[:2]
             if status in (b"??", b"!!"):
-                untracked.append(os.fsdecode(field[3:]))
+                rel = os.fsdecode(field[3:])
+                if not _regenerable(rel, ignored=status == b"!!"):
+                    untracked.append(rel)
             else:
                 tracked = True
                 # Porcelain v1 -z adds an extra NUL-delimited *source* for renames/copies.
@@ -308,7 +356,8 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
         records.append(TreeRecord(
             name=entry.name, path=str(entry), branch=branch,
             age_days=age_days, size_mb=_tree_size_mb(entry) if with_sizes else None,
-            verdict=verdict, reason=reason, untracked=untracked))
+            verdict=verdict, reason=reason, untracked=untracked,
+            archive_mb=_paths_size_mb(entry, untracked) if with_sizes else None))
 
     if len(merge_cache) != cache_size_before:
         _ops._save_worktree_merge_cache(merge_cache)
@@ -318,11 +367,20 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
 _REAP_VERDICTS = {"reap", "reap-archive", "reap-keep-branch"}
 
 
+def _size_note(record: TreeRecord) -> str:
+    if record.archive_mb is None:
+        return ""
+    if record.size_mb is None:
+        return f": archives ~{record.archive_mb}M"
+    return f": frees ~{max(record.size_mb - record.archive_mb, 0)}M, archives ~{record.archive_mb}M"
+
+
 def reclaim_worktrees(
     repo_root: str, *, dry_run: bool = False, records: Optional[List[TreeRecord]] = None
 ) -> List[str]:
     """Remove every reap-verdict tree from a frozen audit list — never re-globs inside the
     destructive loop, so trees created by concurrent sessions after the audit are out of scope."""
+    from hermes_cli import worktree_ops as _ops
     if records is None:
         records = audit_worktrees(repo_root, with_sizes=False)
     actions: List[str] = []
@@ -330,7 +388,7 @@ def reclaim_worktrees(
         if record.verdict not in _REAP_VERDICTS:
             continue
         if dry_run:
-            actions.append(f"would remove {record.name} ({record.reason})")
+            actions.append(f"would remove {record.name} ({record.reason}){_size_note(record)}")
             continue
 
         entry = Path(record.path)
@@ -345,7 +403,8 @@ def reclaim_worktrees(
         with contextlib.suppress(Exception):
             _git(["worktree", "unlock", record.path], cwd=repo_root, timeout=10)
         try:
-            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root, timeout=30)
+            remove_result = _git(["worktree", "remove", record.path, "--force"], cwd=repo_root,
+                                 timeout=_ops.WORKTREE_REMOVE_TIMEOUT)
             if remove_result.returncode != 0:
                 actions.append(f"failed to remove {record.name}: {remove_result.stderr.strip()}")
                 continue
