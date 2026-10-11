@@ -2055,10 +2055,13 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
         latest = latest_executions([job.get("id", "") for job in jobs])
     except Exception:
         latest = {}
-    from cron.scheduler_control import running_job_state
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
-        running = running_job_state(job)
+        try:
+            from cron.scheduler_control import running_job_state
+            running = running_job_state(job)
+        except Exception:
+            running = {"was_running": False, "run_started_at": None}
         job["running"] = running["was_running"]
         job["running_since"] = running["run_started_at"]
     return jobs

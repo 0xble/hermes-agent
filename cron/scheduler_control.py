@@ -10,7 +10,8 @@ from agent.interrupt_scope import InterruptScope
 class RunControl(threading.Event):
     def __init__(self) -> None:
         super().__init__()
-        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.started_at = None
+        self.delivery_completed = False
         self.scope = InterruptScope()
         self.local = True
 
@@ -56,6 +57,69 @@ def owns_terminal_claim(job_id: str, owner: str) -> bool:
                 and (job.get("fire_claim") or {}).get("by") == owner)
 
 
+def rearm_unstarted_control(job: dict, control: RunControl, key: tuple) -> RunControl:
+    """A pause/resume while queued must not cancel the resumed occurrence."""
+    from cron import jobs, scheduler as sched
+
+    current = jobs.get_job(job["id"])
+    if control.started_at is None and current is not None and jobs.is_job_runnable(current):
+        with sched._running_lock:
+            if sched._running_cancel_events.get(key) is control:
+                return register_control(key)
+    return control
+
+
+def start_control(job_id: str) -> None:
+    from cron import scheduler as sched
+
+    with sched._running_lock:
+        control = sched._running_cancel_events.get(sched._inflight_key(job_id))
+        if control is not None:
+            control.started_at = datetime.now(timezone.utc).isoformat()
+
+
+def note_completed_delivery(job_id: str) -> None:
+    from cron import scheduler as sched
+
+    with sched._running_lock:
+        control = sched._running_cancel_events.get(sched._inflight_key(job_id))
+        if control is not None:
+            control.delivery_completed = True
+
+
+def schedule_cancelled(job_id: str, owner: str | None) -> bool:
+    from cron import scheduler as sched
+    from cron.jobs import get_job, is_job_runnable
+
+    with sched._running_lock:
+        control = sched._running_cancel_events.get(sched._inflight_key(job_id))
+        if control is not None and control.is_set():
+            return True
+    current = get_job(job_id)
+    return current is None or (not is_job_runnable(current)
+                              and (current.get("fire_claim") or {}).get("by") == owner)
+
+
+def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
+    """Keep the audit outcome without treating an operator action as a job failure/fire."""
+    from cron import jobs
+
+    def apply(records, _index, current):
+        if (current.get("fire_claim") or {}).get("by") != owner:
+            return False
+        streak = current.get("failure_streak", 0)
+        jobs._record_run_outcome(current, False, error, None, None, jobs._hermes_now().isoformat())
+        current["failure_streak"] = streak
+        repeat = current.get("repeat") or {}
+        if current.get("schedule", {}).get("kind") == "once" and (repeat.get("times") or 0) > 0:
+            # claim_dispatch prepaid this one-shot; owner CAS makes the refund single-use.
+            repeat["completed"] = max(0, repeat.get("completed", 0) - 1)
+        jobs.save_jobs(records)
+        return True
+
+    return jobs._under_fire_fence(job_id, lambda: jobs._with_job(job_id, apply, False))
+
+
 def running_job_state(job: dict) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
@@ -63,17 +127,17 @@ def running_job_state(job: dict) -> dict:
     key = sched._inflight_key(str(job.get("id") or "unknown"))
     with sched._running_lock:
         local = key in sched._running_job_ids or key in sched._running_fire_owners
-        started = sched._running_since.get(key)
         control = sched._running_cancel_events.get(key)
+        started = control.started_at if control is not None else None
     claim = job.get("fire_claim") or {}
     live_claim = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+    queued = local and control is not None and control.local and started is None
     return {
-        "was_running": local or live_claim,
+        "was_running": not queued and (bool(started) or live_claim),
         "run_started_at": (
-            datetime.fromtimestamp(started, timezone.utc).isoformat() if started is not None
-            else claim.get("started_at", claim.get("at")) if live_claim
-            else control.started_at if local and control is not None else None),
+            None if queued else started or (claim.get("started_at", claim.get("at")) if live_claim else None)),
         "interrupted": False,
+        "delivery_completed": bool(control and control.delivery_completed),
     }
 
 
@@ -87,8 +151,12 @@ def interrupt_job_run(job: dict) -> dict:
         control = sched._running_cancel_events.get(sched._inflight_key(job["id"]))
     if control is not None and control.local and not self_removal_delivery_allowed(job["id"]):
         control.set()
-        result["was_running"] = result["interrupted"] = True
-    if result["was_running"]:
+        result["interrupted"] = result["was_running"] and not result["delivery_completed"]
+    if result["delivery_completed"]:
+        result["warning"] = (
+            "Delivery completed before the schedule was cancelled; it was not interrupted. "
+            "Side effects cannot be undone; read back the target before retrying.")
+    elif result["was_running"]:
         result["warning"] = (
             "A run was in progress. Interruption is requested, not proof of rollback or tool "
             "completion. Side effects already performed cannot be undone; read back the target "

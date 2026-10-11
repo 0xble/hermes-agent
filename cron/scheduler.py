@@ -2769,6 +2769,9 @@ def run_one_job(
     with _running_lock:
         control = _running_cancel_events.get(control_key)
     if control is not None and control.is_set():
+        from cron.scheduler_control import rearm_unstarted_control
+        control = rearm_unstarted_control(job, control, control_key)
+    if control is not None and control.is_set():
         from cron.scheduler_control import release_unstarted_claim
         release_unstarted_claim(job)
         finish_execution(execution_id, success=False, error="Cron job removed or paused before start.")
@@ -2873,12 +2876,13 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
     terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
     # Renewal rejects paused jobs, but terminal bookkeeping must still clear the
     # cancelled owner's claim. mark_job_run atomically compares the owner token.
-    from cron.scheduler_control import owns_terminal_claim
-    with _running_lock:
-        control = _running_cancel_events.get(_inflight_key(job_id))
-    interrupted_error = (
-        _CANCELLED_INTERRUPTED if control is not None and control.is_set()
-        else _OWNERSHIP_LOST_INTERRUPTED)
+    from cron.scheduler_control import owns_terminal_claim, record_cancelled_run, schedule_cancelled
+    if schedule_cancelled(job_id, fire_owner):
+        if fire_owner is not None:
+            record_cancelled_run(job_id, fire_owner, _CANCELLED_INTERRUPTED)
+        finish_execution(execution_id, success=False, error=_CANCELLED_INTERRUPTED)
+        return
+    interrupted_error = _OWNERSHIP_LOST_INTERRUPTED
     if fire_owner is not None and owns_terminal_claim(job_id, fire_owner) and mark_job_run(
         job_id, False, interrupted_error, expected_fire_owner=fire_owner,
     ):
@@ -3039,6 +3043,21 @@ class _RunDelivery:
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
     result_committed: bool = False
+    completion_note: Optional[str] = None
+
+
+def _run_delivery_outcome(d: _RunDelivery) -> str:
+    job = d.job
+    return _classify_delivery_outcome(
+        delivery_error=d.delivery_error,
+        delivery_queued=job.get("last_delivery_queued"),
+        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
+        should_deliver=d.should_deliver,
+        unresolved_origin=d.unresolved_origin,
+        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
+        incident_acked=d.incident_acked,
+        success=d.success,
+    )
 
 
 def _save_compose_deliver(
@@ -3128,6 +3147,9 @@ def _save_compose_deliver(
                 # on the failure path) honor the job's failure_deliver override (NS-788).
                 for_failure=not d.success,
             )
+            if _run_delivery_outcome(d) == "delivered":
+                from cron.scheduler_control import note_completed_delivery
+                note_completed_delivery(job["id"])
     except Exception as de:
         if isinstance(de, (_FireClaimLostDuringSideEffect, _ExecutionCommitLost)):
             raise
@@ -3195,30 +3217,21 @@ def _finish_completed_run(
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
         job["id"], d.success, d.error, **mark_kwargs)
-    if fire_owner is not None and not marked:
+    if fire_owner is not None and not marked and not (d.delivery_attempted and _run_delivery_outcome(d) == "delivered"):
         finish_execution(
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
-    delivery_outcome = _classify_delivery_outcome(
-        delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued"),
-        notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
-        should_deliver=d.should_deliver,
-        unresolved_origin=d.unresolved_origin,
-        # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
-        incident_acked=d.incident_acked,
-        success=d.success,
-    )
+    delivery_outcome = _run_delivery_outcome(d)
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     if result_committed:
         _record_committed_delivery_outcome(execution_id, delivery_outcome)
     else:
+        finish_kwargs: dict = {"output": d.completion_note} if d.completion_note else {}
         finish_execution(
-            execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+            execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome, **finish_kwargs)
     return True
 
 
@@ -3344,6 +3357,9 @@ def _run_one_job_body(
             logger.warning("Cron job %s lost execution ownership before start; skipping", job["id"])
             return True
 
+        from cron.scheduler_control import start_control
+        start_control(job["id"])
+
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
         _fire_scope_tokens = _install_fire_secret_scope()
@@ -3463,12 +3479,13 @@ def _run_one_job_body(
             d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if _fire_claim_ownership_lost():
-            # #105861: the claim check is one sample; a miss AFTER a completed delivery must not
-            # overwrite the delivered run's terminal status — ok, or a failure whose notice already
-            # left with its real error — so fall through to _finish_completed_run, whose owner-fenced
-            # mark_job_run is authoritative either way. An explicit transport cancel stays fail-closed.
+            # Cancellation cannot undo an acknowledged send. Preserve that result even when
+            # the operator removed the record; the owner fence still protects any replacement.
             transport_cancelled = fence.transport_cancelled()
-            if d.delivery_attempted and not d.delivery_error and not transport_cancelled:
+            if d.delivery_attempted and not d.delivery_error:
+                from cron.scheduler_control import schedule_cancelled
+                if schedule_cancelled(job["id"], fire_owner):
+                    d.completion_note = "Cron schedule cancelled after completed delivery."
                 logger.warning(
                     "Job '%s': fire claim ownership lost after completed delivery; "
                     "recording the delivered run's terminal status",
@@ -3501,6 +3518,15 @@ def _run_one_job_body(
         # and no error. Owner fencing still applies: a stale worker must not record over a replacement claim
         # owner.
         _err_text = str(e) or type(e).__name__
+        from cron.scheduler_control import schedule_cancelled
+        if not committed and (
+            _err_text == _CANCELLED_INTERRUPTED
+            or (_fire_claim_ownership_lost() and schedule_cancelled(job["id"], fire_owner))
+        ):
+            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
+            if not isinstance(e, Exception):
+                raise
+            return True
         if committed:
             logger.error("Cron post-commit side effect failed for job %s: %s", job["id"], _err_text)
             return False

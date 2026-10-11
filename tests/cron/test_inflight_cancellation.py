@@ -2,6 +2,7 @@
 import contextvars
 import json
 import threading
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
@@ -60,7 +61,8 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
         return True, "output", result.get("final_response", ""), None
 
     monkeypatch.setattr(scheduler, "run_job", run_job)
-    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local", repeat=3)
+    jobs.update_job(job["id"], {"failure_streak": 2})
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert claimed
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -93,6 +95,7 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
         assert paused["state"] == "paused"
         assert paused["last_error"] == scheduler._CANCELLED_INTERRUPTED
         assert not paused.get("fire_claim")
+        assert paused["failure_streak"] == 2 and paused["repeat"]["completed"] == 0
         shown = next(j for j in dispatch("list", include_disabled=True)["jobs"]
                      if j["job_id"] == job["id"])
         assert not shown["running"] and shown["running_since"] is None
@@ -135,7 +138,8 @@ def test_cancel_scope_latches_before_agent_registration(isolated_store):
     control = scheduler._running_cancel_events[key]
     try:
         receipt = dispatch("remove", job_id=job["id"])
-        assert receipt["was_running"] and receipt["interrupted"]
+        assert not receipt["was_running"] and not receipt["interrupted"]
+        assert "warning" not in receipt
         agent = Mock(spec=["interrupt"])
         with bind_interrupt_scope(control.scope), track_in_interrupt_scope(agent):
             agent.interrupt.assert_called_once()
@@ -145,23 +149,33 @@ def test_cancel_scope_latches_before_agent_registration(isolated_store):
     assert key not in scheduler._running_cancel_events
 
 
-@pytest.mark.parametrize("registered", [True, False])
-def test_pause_before_start_releases_only_its_own_claim(isolated_store, monkeypatch, registered):
+@pytest.mark.parametrize("registered,resumed", [(True, False), (False, False), (True, True)])
+def test_pause_before_start_releases_only_its_own_claim(isolated_store, monkeypatch, registered, resumed):
     job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
     assert isinstance(claimed, dict)
-    runner = Mock()
+    runner = Mock(return_value=(True, "output", "[SILENT]", None))
     monkeypatch.setattr(scheduler, "run_job", runner)
     if registered:
         assert scheduler.try_register_running_job(job["id"])
     try:
         receipt = dispatch("pause", job_id=job["id"])
-        assert receipt["was_running"]
-        assert receipt["interrupted"] is registered
+        assert receipt["was_running"] is (not registered)
+        assert not receipt["interrupted"]
+        if registered:
+            shown = jobs.list_jobs(include_disabled=True)[0]
+            assert not shown["running"] and shown["running_since"] is None
+            assert "warning" not in receipt
+        if resumed:
+            assert jobs.resume_job(job["id"])
         assert scheduler.run_one_job(claimed)
     finally:
         if registered:
             scheduler.release_running_job(job["id"])
+    if resumed:
+        runner.assert_called_once()
+        assert jobs.get_job(job["id"])["last_status"] == "ok"
+        return
     runner.assert_not_called()
     paused = jobs.get_job(job["id"])
     assert paused and not paused.get("fire_claim")
@@ -183,3 +197,92 @@ def test_cancelled_completion_never_clears_replacement_claim(isolated_store):
     from cron.scheduler_control import release_unstarted_claim
     release_unstarted_claim(claimed)
     assert jobs.get_job(job["id"])["fire_claim"]["by"] == "replacement"
+
+
+@pytest.mark.parametrize("action", ["pause", "remove"])
+def test_cancel_after_delivery_keeps_completed_outcome(isolated_store, monkeypatch, action):
+    receipt = {}
+    operator_context = contextvars.copy_context()
+    agent = Mock()
+    delivered = Mock(return_value=None)
+    monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+
+    def run_job(job, *, defer_agent_teardown, **kwargs):
+        defer_agent_teardown.append(agent)
+        return True, "output", "sent", None
+
+    def teardown(*args, **kwargs):
+        receipt.update(operator_context.run(dispatch, action, job_id=job["id"]))
+
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    monkeypatch.setattr(scheduler, "_teardown_cron_agent", teardown)
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="telegram:123")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert scheduler.run_one_job(claimed)
+    delivered.assert_called_once()
+    execution = scheduler.get_execution(claimed["execution_id"])
+    assert execution["status"] == "completed"
+    assert execution["delivery_outcome"] == "delivered"
+    assert "after completed delivery" in execution["output"]
+    assert execution["error"] is None
+    assert receipt["delivery_completed"] and not receipt["interrupted"]
+    if action == "pause":
+        current = jobs.get_job(job["id"])
+        assert current["state"] == "paused" and current["last_status"] == "ok"
+        assert current["last_error"] is None and not current["fire_claim"]
+
+
+@pytest.mark.parametrize("action,oneshot", [("pause", False), ("pause", True), ("remove", False)])
+def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypatch, action, oneshot):
+    started, rejected = threading.Event(), threading.Event()
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_MISS_CONFIRM_SECONDS", 0.01)
+    heartbeat = jobs.heartbeat_fire_claim
+
+    def renew(*args, **kwargs):
+        accepted = heartbeat(*args, **kwargs)
+        if not accepted:
+            rejected.set()
+        return accepted
+
+    def run_job(job, **kwargs):
+        started.set()
+        assert rejected.wait(5)
+        return False, "output", "", "fire claim lost"
+
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", renew)
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    delivery = Mock()
+    monkeypatch.setattr(scheduler, "_deliver_result", delivery)
+    schedule = (jobs._hermes_now() + timedelta(minutes=5)).isoformat() if oneshot else "every 5m"
+    job = jobs.create_job(prompt="work", schedule=schedule, repeat=3, deliver="local")
+    jobs.update_job(job["id"], {"failure_streak": 2})
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(contextvars.copy_context().run, scheduler.run_one_job, claimed)
+        assert started.wait(5)
+        # A detached worker has no control in the operator's process.
+        control = scheduler._running_cancel_events[scheduler._inflight_key(job["id"])]
+        control.local = False
+        receipt = dispatch(action, job_id=job["id"])
+        assert receipt["was_running"] and not receipt["interrupted"]
+        assert not control.is_set()
+        assert future.result(timeout=5)
+    execution = scheduler.get_execution(claimed["execution_id"])
+    assert execution["error"] == scheduler._CANCELLED_INTERRUPTED
+    delivery.assert_not_called()
+    if action == "pause":
+        current = jobs.get_job(job["id"])
+        assert current["last_error"] == scheduler._CANCELLED_INTERRUPTED
+        assert current["state"] == "paused" and not current["fire_claim"]
+        assert current["failure_streak"] == 2
+        assert current["repeat"]["completed"] == 0
+
+
+def test_list_jobs_survives_scheduler_import_failure(isolated_store, monkeypatch):
+    import sys
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    monkeypatch.setitem(sys.modules, "cron.scheduler_control", None)
+    listed = jobs.list_jobs()
+    assert listed[0]["id"] == job["id"]
+    assert listed[0]["running"] is False and listed[0]["running_since"] is None
