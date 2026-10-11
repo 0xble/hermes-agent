@@ -307,6 +307,37 @@ class TestConnectionLifecycle:
             for sql in executed
         )
 
+    def test_warm_writable_open_skips_generation_checkpoint(self, tmp_path, monkeypatch):
+        """A settled generation stamp must not checkpoint a large state.db on every open."""
+        db_path = tmp_path / "state.db"
+        statements = []
+        real_connect = hermes_state._connect_tracked_db
+
+        def tracing_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        monkeypatch.setattr(hermes_state, "_connect_tracked_db", tracing_connect)
+
+        first = SessionDB(db_path=db_path)
+        first.close()
+        first_count = len(statements)
+        assert any(
+            "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
+            for sql in statements[:first_count]
+        )
+
+        warm = SessionDB(db_path=db_path)
+        warm_statements = statements[first_count:]
+        try:
+            assert not any(
+                "pragma wal_checkpoint(passive)" == " ".join(sql.lower().split())
+                for sql in warm_statements
+            )
+        finally:
+            warm.close()
+
     def test_read_only_connection_keeps_fts_search_available(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
