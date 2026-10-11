@@ -30,6 +30,24 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_camofox_leases(tmp_path, monkeypatch):
+    """Keep Camofox lease files inside the per-test directory, never the host state dir."""
+    from tools import browser_camofox_leases as leases
+
+    monkeypatch.setattr(leases, "_lease_root", lambda: tmp_path / "camofox-tab-leases")
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+    yield
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
