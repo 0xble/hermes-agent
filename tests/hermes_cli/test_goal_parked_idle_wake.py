@@ -46,9 +46,8 @@ def _write_receipt(home: Path, proc: str, **fields) -> None:
     (directory / f"{proc}.json").write_text(json.dumps({"id": proc, **fields}), encoding="utf-8")
 
 
-def test_restart_killed_process_lifts_barrier_with_a_factual_note(hermes_home):
-    """The live case: parked on a process a restart's kill_all killed. The previous gateway's
-    registry is gone, so only the durable receipt knows what happened."""
+def test_kill_all_process_lifts_barrier_with_an_outcome_only_note(hermes_home):
+    """A legacy kill_all receipt proves an incomplete result, not who stopped it."""
     proc = "proc_d2196a6c1051"
     _write_receipt(hermes_home, proc, exit_code=-15, completion_reason="killed", termination_source="kill_all")
     mgr = _park_on_session("s-killed", proc)
@@ -56,7 +55,9 @@ def test_restart_killed_process_lifts_barrier_with_a_factual_note(hermes_home):
     prompt = mgr.lifted_barrier_prompt()
 
     assert prompt is not None and "ship the nightly check" in prompt
-    assert f"{proc} was killed by a gateway restart or shutdown" in prompt
+    assert f"{proc} stopped before it finished (exit -15)" in prompt
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in prompt.lower()
     assert "verify the real state" in prompt
     # Pure: the barrier stays until the caller's continuation was admitted.
     assert goals.load_goal("s-killed").waiting_on_session == proc
@@ -67,6 +68,9 @@ def test_untracked_process_reports_unknown_outcome(hermes_home):
     prompt = mgr.lifted_barrier_prompt()
     assert prompt is not None
     assert "no longer tracked" in prompt and "do not assume it succeeded" in prompt
+    assert "output or artifacts" in prompt and "before rerunning" in prompt
+    for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
+        assert cause not in prompt.lower()
 
 
 def test_barrier_that_still_holds_yields_no_prompt(hermes_home, monkeypatch):

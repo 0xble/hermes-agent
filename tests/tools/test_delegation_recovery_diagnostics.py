@@ -93,6 +93,8 @@ print(json.dumps([{"event": event, "message": format_process_notification(event)
         assert event["last_known_status"] == "running"
         assert "running" in item["message"]
         assert not event.get("summary")
+        for cause in ("gateway", "shutdown", "restart", "owner exited", "owner exit"):
+            assert cause not in item["message"].lower()
         paths = event['task_transcripts']
         assert len(paths) <= 1
         for index, path in paths.items():

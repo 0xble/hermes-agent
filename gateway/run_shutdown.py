@@ -930,10 +930,10 @@ class GatewayShutdownMixin:
         return _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
 
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
-        """Mark every non-pending running session resume_pending; returns the keys marked."""
+        """Bulk-mark running turns durably; return all interruption candidates for notes."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
-        marked: list[str] = []
+        markers = []
         # Pre-mark sessions as resume_pending BEFORE the drain wait. If the process is killed by the service
         # manager during the drain, the durable marker is already written so the next gateway boot can
         # recover in-flight sessions (#27856).
@@ -946,11 +946,16 @@ class GatewayShutdownMixin:
                 _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
                 _entry = getattr(self.session_store, "_entries", {}).get(_sk)
                 _turn_id = getattr(_entry, "active_turn_token", None)
-                await self.async_session_store.mark_resume_pending(
-                    _sk, reason, turn_id=_turn_id, human=_human,
-                )
-                marked.append(_sk)
-        return marked
+                markers.append((_sk, _turn_id, _human))
+        # One awaited durable write still finishes before the drain (or interruption).
+        # The timeout pass returns existing markers for notes without re-saving them.
+        if markers:
+            with _log_suppressed(logging.DEBUG, "%s batch failed: %s", log_prefix):
+                await self.async_session_store.mark_resume_pending_many(markers, reason)
+                # As with the single-entry path, a cut turn is still a note candidate
+                # when its route was removed/suspended and no resume flag was written.
+                return [key for key, _turn_id, _human in markers]
+        return []
 
     def _restart_notification_allowed(self, platform: Platform) -> bool:
         """False when the platform config sets ``gateway_restart_notification=false``."""

@@ -688,8 +688,7 @@ def recover_abandoned_delegations() -> int:
                     recovered += 1
                     continue
             if last_state in ("queued", "admitted") and not cron_execution_id:
-                error = (f"Delegation owner exited while this work was {last_state}; "
-                         "it was never started.")
+                error = f"Work was {last_state}; it was never started."
                 event = {
                     "type": "async_delegation", "delegation_id": delegation_id,
                     "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -712,11 +711,11 @@ def recover_abandoned_delegations() -> int:
                 continue
             error = ("Cron execution record missing; outcome unknown."
                      if cron_execution_id else
-                     "Delegation owner exited before recording a terminal result; outcome unknown.")
+                     "No terminal result was recorded; outcome unknown.")
             recovered_results = _recovered_results(task, result_json, error)
             if recovered_results:
                 done = sum(1 for r in recovered_results if r.get("status") != "unknown")
-                error = (f"Delegation owner exited before the unit finished; {done}/{len(recovered_results)} child "
+                error = (f"The unit did not finish; {done}/{len(recovered_results)} child "
                          "results were recorded and are included below, the rest are unknown.")
             diagnostics = {"last_known_status": last_state, "task_transcripts": task.get("task_transcripts") or {}}
             # Verbatim transcript tails + a git snapshot of the owner's cwd, so the parent can

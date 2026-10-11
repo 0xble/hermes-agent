@@ -154,6 +154,20 @@ had relabelled the task as a background trigger (2026-10-08 to 10-10, ~170 failu
 Telegram adapter now runs post-delivery callbacks under the trigger of the turn that registered
 them. Regression: `tests/gateway/test_telegram_daily_quota.py`.
 
+**User voice echoes** (`telegram-chat-budget`). The shared gateway STT echo path
+classifies a response to a non-internal voice event as `OUTBOUND_FINAL` for budget
+priority, regardless of the queued task's inherited trigger or outbound class.
+The `_interim_send` marker remains intact for stream-is-the-message adapters;
+quota priority does not seal the running stream. Internal producers retain their
+existing classification. Failed `SendResult`s (including `daily_budget_shed`) and
+exceptions are WARNING-logged without adding transcript text to the log.
+Regression: the same daily-quota suite drives busy FIFO prefetch, overflow drain,
+and idle enrichment through the real Telegram send with goal/untagged pressure,
+checks topic routing and interim metadata, and verifies background traffic still
+sheds. Roll back by reverting the gateway echo/event binding and these tests;
+retire when an accepted upstream release protects originating-user echoes under
+an equivalent quota contract. No configuration or persistent-state changes.
+
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
 classification by id, widening on the real error path plus its scope and expiry, the

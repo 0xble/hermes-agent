@@ -916,39 +916,50 @@ class GatewayAdapterLifecycleMixin:
         except Exception:
             logger.warning("Pending follow-up recovery after %s reconnect failed", platform.value,
                            exc_info=True)
-        try:
-            # A platform that was offline at boot could not receive its S2 note. Before reconnect
-            # resumes any durable interruption marker, claim and send that marker's note through the
-            # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
-            reconnect_note_keys = []
-            for entry in candidates or ():
+        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
+        reconnect_note_keys = []
+        for entry in candidates or ():
+            try:
                 if (platform is not None and getattr(entry.origin, "platform", None) != platform):
                     continue
                 if not getattr(entry, "resume_turn_id", None):
                     continue
                 if self._auto_resume_ready(entry) is not None:
                     reconnect_note_keys.append(entry.session_key)
-            if reconnect_note_keys:
-                await self._send_interrupted_turn_notes(
-                    reconnect_note_keys, cancel_on_timeout=True,
-                    timeout=_startup_restore_drain_timeout_secs(),
-                )
-            # Recovery scans all served homes, but only the newly available platform resumes.
-            self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
-                                                   restore_tasks=tasks, restore_keys=keys)
-        except Exception:
-            logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
-                           exc_info=True)
-        keys.update(self._session_key_for_source(self._normalize_source_for_session_key(event.source))
-                    for event in getattr(self, "_startup_restore_queue", [])[queued_before:])
-        if not keys and not tasks:
-            return
+            except Exception:
+                # A bad note candidate must not strand follow-ups already claimed above.
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+        keys.update(reconnect_note_keys)
         counts = getattr(self, "_reconnect_restore_keys", None)
         if counts is None:
             counts = self._reconnect_restore_keys = {}
         for key in keys:
             counts[key] = counts.get(key, 0) + 1
+        counted_keys = set(keys)
         try:
+            try:
+                # A platform that was offline at boot could not receive its S2 note. Before reconnect
+                # resumes any durable interruption marker, claim and send that marker's note through the
+                # append-only sender; it is a no-op when restart_notes already has a visible/in-flight note.
+                if reconnect_note_keys:
+                    await self._send_interrupted_turn_notes(
+                        reconnect_note_keys, cancel_on_timeout=True,
+                        timeout=_startup_restore_drain_timeout_secs(),
+                    )
+                # Recovery scans all served homes, but only the newly available platform resumes.
+                self._schedule_resume_pending_sessions(platform=platform, candidates=candidates,
+                                                       restore_tasks=tasks, restore_keys=keys)
+            except Exception:
+                logger.warning("Pending auto-resume after %s reconnect failed", platform.value,
+                               exc_info=True)
+            for key in keys:
+                if key not in counted_keys:
+                    counts[key] = counts.get(key, 0) + 1
+                    counted_keys.add(key)
+            if not keys and not tasks:
+                return
             if tasks:
                 await self._wait_bounded_or_release(
                     set(tasks), _startup_restore_drain_timeout_secs(),
@@ -961,7 +972,7 @@ class GatewayAdapterLifecycleMixin:
         finally:
             # The timeout deliberately fails open after a bounded wait; unfinished resume turns
             # retain their pre-claimed running slots, so fresh inbound cannot start a duplicate turn.
-            for key in keys:
+            for key in counted_keys:
                 counts[key] -= 1
                 if not counts[key]:
                     del counts[key]
