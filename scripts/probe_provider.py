@@ -16,30 +16,54 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def _endpoint():
-    from agent.secret_scope import get_secret_str, load_env_file
+    from agent.credential_pool import custom_provider_pool_key_candidates
+    from agent.secret_scope import load_env_file
+    from hermes_cli.auth import has_usable_secret, read_credential_pool
     from hermes_cli.config import load_config_readonly
     from hermes_cli.config_providers import _canonical_api_mode, get_compatible_custom_providers
-    from hermes_cli.providers import custom_provider_aliases
+    from hermes_cli.runtime_provider import _get_named_custom_provider, _raise_if_provider_disabled
+    from hermes_cli.runtime_provider_custom import _key_env_secret
     from hermes_constants import get_hermes_home
 
+    # Match CLI startup's process-env-over-dotenv boundary before the runtime
+    # lookup resolves key_env (including when an inline key is also present).
+    for name, value in load_env_file(get_hermes_home() / ".env").items():
+        os.environ.setdefault(name, value)
     config = load_config_readonly()
     model = config.get("model") or {}
     requested = str(model.get("provider") or "").strip().lower()
-    if requested == "custom":
+    _raise_if_provider_disabled(requested)
+    entry = _get_named_custom_provider(requested) or {}
+    if not entry and requested == "custom":
         entry = model
+        safety_entry = model
     else:
-        entry = next((e for e in get_compatible_custom_providers(config)
-                      if requested in custom_provider_aliases(e["name"], e.get("provider_key", ""))), {})
-    mode = _canonical_api_mode(str(entry.get("api_mode") or entry.get("transport") or ""))
-    if (not entry or entry.get("key_cmd") or entry.get("extra_headers")
+        # This is the agent's actual read-only endpoint/credential lookup, not
+        # the legacy-first picker view. It preserves providers-first routing
+        # and key_env-over-inline precedence for keyed providers.
+        # Runtime lookup intentionally omits legacy key_cmd and invalid modes;
+        # recover safety metadata only, never endpoint/credential selection.
+        safety_entry = next((candidate for candidate in get_compatible_custom_providers(config)
+                             if (entry.get("provider_key") and candidate.get("provider_key") == entry["provider_key"])
+                             or (not entry.get("provider_key") and not candidate.get("provider_key")
+                                 and candidate.get("name") == entry.get("name")
+                                 and candidate.get("base_url") == entry.get("base_url"))), {})
+    mode = _canonical_api_mode(str(safety_entry.get("api_mode") or safety_entry.get("transport") or ""))
+    if (not entry or not safety_entry or safety_entry.get("key_cmd") or safety_entry.get("extra_headers")
             or mode not in {"", "chat_completions", "codex_responses"}):
         raise ValueError
 
-    key = str(entry.get("api_key") or "").strip()
-    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
-    if not key and key_env:
-        key = get_secret_str(key_env) or load_env_file(get_hermes_home() / ".env").get(key_env, "")
     base = str(entry.get("base_url") or "").strip().rstrip("/")
+    # Do not call the full runtime builder: load_pool seeds/persists auth.json
+    # (agent/credential_pool.py:3087-3119), and select can refresh credentials
+    # (:1992-1998). Persisted pools are outside this static diagnostic boundary.
+    if any(read_credential_pool(name) for name in custom_provider_pool_key_candidates(base, requested)):
+        raise ValueError
+    # Mirror only the no-pool named-runtime tail's configured-key candidates
+    # (hermes_cli/runtime_provider_custom.py:560-566), using its own key-env
+    # reader. Host-derived/fallback credentials remain unsupported/fail-closed.
+    inline_key = str(entry.get("api_key") or "").strip()
+    key = inline_key if has_usable_secret(inline_key) else _key_env_secret(entry, requested)
     parsed = urlsplit(base)
     if (not key or "\r" in key or "\n" in key or not parsed.hostname
             or parsed.username is not None or parsed.password is not None

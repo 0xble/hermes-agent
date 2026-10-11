@@ -1,7 +1,6 @@
 """Configured provider probes keep credentials out of argv, output and logs."""
 
 import json
-import logging
 import os
 from pathlib import Path
 import subprocess
@@ -117,6 +116,98 @@ def test_probe_refuses_unsafe_or_unsupported_configuration(tmp_path, entry):
         "providers": {"fixture": {"api_key": key, **entry}},
     })
     (tmp_path / "config.yaml").write_text(config_text)
+    result = _run(tmp_path, key, "config")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "configuration" in result.stdout
+
+
+@pytest.mark.parametrize("conflict", ["endpoint", "credential"])
+def test_probe_matches_runtime_custom_resolution(tmp_path, conflict):
+    """The diagnostic and the real runtime must use the same selected route."""
+    key = "fresh-fixture-credential"
+    stale_key = "stale-fixture-credential"
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}/runtime"
+    entry = {"base_url": base_url, "api_key": key}
+    config = {"model": {"provider": "fixture"}, "providers": {"fixture": entry}}
+    if conflict == "endpoint":
+        config["custom_providers"] = [{"name": "fixture", "base_url": base_url + "/legacy", "api_key": key}]
+    else:
+        entry.update(api_key=stale_key, key_env="PROBE_TEST_KEY")
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    try:
+        result = _run(tmp_path, key, "env")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    # Resolve AFTER the probe: the runtime may seed/persist its pool, whereas
+    # the status-only diagnostic must not create credential state.
+    assert not (tmp_path / "auth.json").exists()
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(tmp_path), PROBE_TEST_KEY=key,
+               PROBE_TEST_BASE_URL=base_url)
+    runtime = subprocess.run([sys.executable, "-c", """
+import os
+from unittest.mock import patch
+from hermes_cli.runtime_provider import resolve_runtime_provider
+# The probe's supported boundary is static config, not pool rotation/seeding.
+# Keep all real provider/credential lookup in the runtime, disabling only that
+# unsupported stateful rung in this reference resolution.
+with patch('hermes_cli.runtime_provider._try_resolve_from_custom_pool', return_value=None):
+    runtime = resolve_runtime_provider(requested='fixture')
+assert runtime['base_url'] == os.environ['PROBE_TEST_BASE_URL']
+assert runtime['api_key'] == os.environ['PROBE_TEST_KEY']
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    assert runtime.returncode == 0, "runtime fixture did not resolve the expected route"
+    assert stale_key not in result.stdout + result.stderr + (tmp_path / "probe.log").read_text()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert requests == [("/runtime/models", f"Bearer {key}")]
+
+
+def test_probe_refuses_persisted_credential_pools_without_mutating_them(tmp_path):
+    key = "configured-fixture-credential"
+    config = {"model": {"provider": "fixture"}, "providers": {"fixture": {
+        "base_url": "http://127.0.0.1:1/v1", "api_key": key,
+    }}}
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    auth_path = tmp_path / "auth.json"
+    auth_text = json.dumps({"credential_pool": {"fixture": [{
+        "id": "fixture-pool", "access_token": "unsupported-pool-credential",
+    }]}})
+    auth_path.write_text(auth_text)
+    result = _run(tmp_path, key, "config")
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "configuration" in result.stdout
+    assert auth_path.read_text() == auth_text
+
+
+@pytest.mark.parametrize("shape", ["providers", "custom_providers"])
+@pytest.mark.parametrize("unsupported", [
+    {"key_cmd": "echo unsafe"},
+    {"extra_headers": {"X-Fixture-Key": "unsupported-header-credential"}},
+    {"api_mode": "unknown_transport"},
+])
+def test_runtime_lookup_does_not_bypass_probe_safety_guards(tmp_path, shape, unsupported):
+    key = "configured-fixture-credential"
+    entry = {"base_url": "http://127.0.0.1:1/v1", "api_key": key, **unsupported}
+    config: dict = {"model": {"provider": "fixture"}}
+    config[shape] = {"fixture": entry} if shape == "providers" else [{"name": "fixture", **entry}]
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
     result = _run(tmp_path, key, "config")
     assert result.returncode == 2, result.stdout + result.stderr
     assert "configuration" in result.stdout
