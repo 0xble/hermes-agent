@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
-from cron.jobs import effective_job_state
+from cron.jobs import effective_job_state, job_running_state
 
 import hermes_time
 
@@ -425,8 +425,7 @@ _FORMAT_JOB_OPTIONAL_KEYS = (
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     from agent.redact import redact_sensitive_text
 
-    from cron.scheduler_control import running_job_state
-    run_state = running_job_state(job)
+    run_state = job_running_state(job)
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
     job_id = str(job.get("id") or "unknown")

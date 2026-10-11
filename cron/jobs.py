@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -2044,6 +2045,20 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     return _normalize_job_record(name_matches[0])
 
 
+def job_running_state(job: Dict[str, Any]) -> dict:
+    """Best-effort visibility without booting the scheduler in listing/tool processes."""
+    if sys.modules.get("cron.scheduler") is not None:
+        try:
+            from cron.scheduler_control import running_job_state
+            return running_job_state(job)
+        except Exception:
+            logger.debug("Cron running-state lookup unavailable", exc_info=True)
+    claim = job.get("fire_claim") or {}
+    live = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+    return {"was_running": live,
+            "run_started_at": claim.get("started_at", claim.get("at")) if live else None}
+
+
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
     jobs = [_normalize_job_record(j) for j in load_jobs()]
@@ -2057,11 +2072,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
         latest = {}
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
-        try:
-            from cron.scheduler_control import running_job_state
-            running = running_job_state(job)
-        except Exception:
-            running = {"was_running": False, "run_started_at": None}
+        running = job_running_state(job)
         job["running"] = running["was_running"]
         job["running_since"] = running["run_started_at"]
     return jobs
@@ -2226,7 +2237,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         save_jobs(jobs)
         return _normalize_job_record(updated)
 
-    return _with_job(job_id, apply)
+    updated = _with_job(job_id, apply)
+    # pause_job owns its self-pause/auto-pause exceptions. A plain disable is also
+    # an operator stop, after releasing the store lock; detached runs lose renewal.
+    if (updated is not None and updates.get("enabled") is False
+            and updated.get("state") != "paused" and sys.modules.get("cron.scheduler") is not None):
+        from cron.scheduler_control import interrupt_job_run
+        interrupt_job_run(updated)
+    return updated
 
 
 def pause_job(

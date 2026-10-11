@@ -46,14 +46,14 @@ def release_unstarted_claim(job: dict) -> None:
 
 
 def owns_terminal_claim(job_id: str, owner: str) -> bool:
-    """Rejected/missing claims cannot write a run; a paused own claim still needs release."""
+    """Rejected/missing claims cannot write a run; a stopped own claim still needs release."""
     from cron import scheduler as sched
-    from cron.jobs import get_job
+    from cron.jobs import get_job, is_job_runnable
 
     if sched.heartbeat_fire_claim(job_id, expected_owner=owner):
         return True
     job = get_job(job_id)
-    return bool(job and job.get("state") == "paused"
+    return bool(job and not is_job_runnable(job)
                 and (job.get("fire_claim") or {}).get("by") == owner)
 
 
@@ -101,7 +101,7 @@ def schedule_cancelled(job_id: str, owner: str | None) -> bool:
 
 
 def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
-    """Keep the audit outcome without treating an operator action as a job failure/fire."""
+    """Keep the audit outcome and failure streak; started one-shots retain their dispatch."""
     from cron import jobs
 
     def apply(records, _index, current):
@@ -110,10 +110,6 @@ def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
         streak = current.get("failure_streak", 0)
         jobs._record_run_outcome(current, False, error, None, None, jobs._hermes_now().isoformat())
         current["failure_streak"] = streak
-        repeat = current.get("repeat") or {}
-        if current.get("schedule", {}).get("kind") == "once" and (repeat.get("times") or 0) > 0:
-            # claim_dispatch prepaid this one-shot; owner CAS makes the refund single-use.
-            repeat["completed"] = max(0, repeat.get("completed", 0) - 1)
         jobs.save_jobs(records)
         return True
 

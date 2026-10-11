@@ -3479,12 +3479,14 @@ def _run_one_job_body(
             d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if _fire_claim_ownership_lost():
-            # Cancellation cannot undo an acknowledged send. Preserve that result even when
-            # the operator removed the record; the owner fence still protects any replacement.
+            # A schedule stop cannot undo an acknowledged send. Transport drain remains
+            # fail-closed (#105861); a sampled claim miss still uses the terminal owner CAS.
+            from cron.scheduler_control import schedule_cancelled
             transport_cancelled = fence.transport_cancelled()
-            if d.delivery_attempted and not d.delivery_error:
-                from cron.scheduler_control import schedule_cancelled
-                if schedule_cancelled(job["id"], fire_owner):
+            schedule_stopped = schedule_cancelled(job["id"], fire_owner)
+            if (d.delivery_attempted and not d.delivery_error
+                    and (not transport_cancelled or schedule_stopped)):
+                if schedule_stopped:
                     d.completion_note = "Cron schedule cancelled after completed delivery."
                 logger.warning(
                     "Job '%s': fire claim ownership lost after completed delivery; "

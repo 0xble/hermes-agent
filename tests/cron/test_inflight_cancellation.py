@@ -29,7 +29,7 @@ def isolated_store(tmp_path, monkeypatch):
         yield tmp_path
 
 
-@pytest.mark.parametrize("action", ["remove", "pause"])
+@pytest.mark.parametrize("action", ["remove", "pause", "disable"])
 def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, monkeypatch, action):
     started, proceed, stopped = threading.Event(), threading.Event(), threading.Event()
     side_effects = []
@@ -75,13 +75,17 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
             raw = next(j for j in jobs.list_jobs() if j["id"] == job["id"])
             assert raw["running"] and raw["running_since"]
             assert shown["last_run_at"] is None  # Never-run is NOT idle.
-            receipt = dispatch(action, job_id=job["id"])
-            assert receipt["success"] is True
-            assert receipt["was_running"] is True
-            assert receipt["interrupted"] is True
-            assert receipt["run_started_at"]
-            assert "cannot be undone" in receipt["warning"]
-            assert "read back" in receipt["warning"]
+            if action == "disable":
+                updated = jobs.update_job(job["id"], {"enabled": False})
+                assert updated is not None and updated["enabled"] is False
+            else:
+                receipt = dispatch(action, job_id=job["id"])
+                assert receipt["success"] is True
+                assert receipt["was_running"] is True
+                assert receipt["interrupted"] is True
+                assert receipt["run_started_at"]
+                assert "cannot be undone" in receipt["warning"]
+                assert "read back" in receipt["warning"]
             # This is synchronous, before releasing the agent and WITHOUT a heartbeat.
             assert stopped.is_set()
         finally:
@@ -89,10 +93,12 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
         future.result(timeout=5)
     assert side_effects == []
     delivered.assert_not_called()
-    if action == "pause":
+    if action in {"pause", "disable"}:
         paused = jobs.get_job(job["id"])
         assert paused is not None
-        assert paused["state"] == "paused"
+        assert not paused["enabled"]
+        if action == "pause":
+            assert paused["state"] == "paused"
         assert paused["last_error"] == scheduler._CANCELLED_INTERRUPTED
         assert not paused.get("fire_claim")
         assert paused["failure_streak"] == 2 and paused["repeat"]["completed"] == 0
@@ -218,9 +224,11 @@ def test_cancel_after_delivery_keeps_completed_outcome(isolated_store, monkeypat
     monkeypatch.setattr(scheduler, "_teardown_cron_agent", teardown)
     job = jobs.create_job(prompt="work", schedule="every 5m", deliver="telegram:123")
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
     assert scheduler.run_one_job(claimed)
     delivered.assert_called_once()
     execution = scheduler.get_execution(claimed["execution_id"])
+    assert execution is not None
     assert execution["status"] == "completed"
     assert execution["delivery_outcome"] == "delivered"
     assert "after completed delivery" in execution["output"]
@@ -232,7 +240,8 @@ def test_cancel_after_delivery_keeps_completed_outcome(isolated_store, monkeypat
         assert current["last_error"] is None and not current["fire_claim"]
 
 
-@pytest.mark.parametrize("action,oneshot", [("pause", False), ("pause", True), ("remove", False)])
+@pytest.mark.parametrize("action,oneshot", [
+    ("pause", False), ("pause", True), ("remove", False), ("disable", False), ("disable", True)])
 def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypatch, action, oneshot):
     started, rejected = threading.Event(), threading.Event()
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
@@ -264,25 +273,119 @@ def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypa
         # A detached worker has no control in the operator's process.
         control = scheduler._running_cancel_events[scheduler._inflight_key(job["id"])]
         control.local = False
-        receipt = dispatch(action, job_id=job["id"])
-        assert receipt["was_running"] and not receipt["interrupted"]
+        if action == "disable":
+            updated = jobs.update_job(job["id"], {"enabled": False})
+            assert updated is not None and updated["enabled"] is False
+        else:
+            receipt = dispatch(action, job_id=job["id"])
+            assert receipt["was_running"] and not receipt["interrupted"]
         assert not control.is_set()
         assert future.result(timeout=5)
     execution = scheduler.get_execution(claimed["execution_id"])
     assert execution["error"] == scheduler._CANCELLED_INTERRUPTED
     delivery.assert_not_called()
-    if action == "pause":
+    if action in {"pause", "disable"}:
         current = jobs.get_job(job["id"])
+        assert current is not None
         assert current["last_error"] == scheduler._CANCELLED_INTERRUPTED
-        assert current["state"] == "paused" and not current["fire_claim"]
+        assert not current["enabled"] and not current["fire_claim"]
         assert current["failure_streak"] == 2
-        assert current["repeat"]["completed"] == 0
+        assert current["repeat"]["completed"] == int(oneshot)
 
 
-def test_list_jobs_survives_scheduler_import_failure(isolated_store, monkeypatch):
+@pytest.mark.parametrize("failure", ["import", "lookup"])
+def test_listing_and_formatting_survive_scheduler_failure(isolated_store, monkeypatch, failure):
     import sys
     job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
-    monkeypatch.setitem(sys.modules, "cron.scheduler_control", None)
+    if failure == "import":
+        monkeypatch.setitem(sys.modules, "cron.scheduler_control", None)
+    else:
+        monkeypatch.setattr("cron.scheduler_control.running_job_state",
+                            Mock(side_effect=RuntimeError("running lock unavailable")))
     listed = jobs.list_jobs()
     assert listed[0]["id"] == job["id"]
     assert listed[0]["running"] is False and listed[0]["running_since"] is None
+    from tools.cronjob_job_args import _format_job
+    assert _format_job(listed[0])["state"] == "scheduled"
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_listing_without_scheduler_never_imports_it(isolated_store, monkeypatch, claimed):
+    import builtins
+    import sys
+    from tools.cronjob_job_args import _format_job
+
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    if claimed:
+        assert jobs.claim_job_for_fire(job["id"])
+    monkeypatch.delitem(sys.modules, "cron.scheduler", raising=False)
+    original_import = builtins.__import__
+
+    def forbid_scheduler(name, *args, **kwargs):
+        if name in {"cron.scheduler", "cron.scheduler_control"}:
+            pytest.fail("listing must not boot the scheduler")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", forbid_scheduler)
+    listed = jobs.list_jobs()
+    assert listed[0]["running"] is claimed
+    assert bool(listed[0]["running_since"]) is claimed
+    formatted = _format_job(listed[0])
+    assert formatted["running"] is claimed
+    assert bool(formatted["running_since"]) is claimed
+    assert "cron.scheduler" not in sys.modules
+
+
+def test_cancelled_started_oneshot_keeps_consumed_dispatch(isolated_store, monkeypatch):
+    schedule = (jobs._hermes_now() + timedelta(minutes=5)).isoformat()
+    job = jobs.create_job(prompt="one-shot", schedule=schedule, deliver="local", repeat=1)
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    operator_context = contextvars.copy_context()
+
+    def run_job(*args, **kwargs):
+        current = jobs.get_job(job["id"])
+        assert current is not None and current["repeat"]["completed"] == 1
+        operator_context.run(jobs.pause_job, job["id"])
+        return False, "", "", "paused"
+
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    assert scheduler.run_one_job(claimed)
+    persisted = jobs.get_job(job["id"])
+    assert persisted is not None
+    assert persisted["last_status"] == "error"
+    assert persisted["last_run_at"] is not None
+    assert persisted["repeat"]["completed"] == 1
+    assert persisted["failure_streak"] == 0
+    assert not persisted["fire_claim"]
+    assert not jobs.claim_dispatch(job["id"]), "a started one-shot needs explicit re-arm, not a refund"
+
+
+def test_disable_after_delivery_keeps_completed_outcome(isolated_store, monkeypatch):
+    delivered = Mock(return_value=None)
+    operator_context = contextvars.copy_context()
+    agent = Mock()
+    monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+
+    def run_job(job, *, defer_agent_teardown, **kwargs):
+        defer_agent_teardown.append(agent)
+        return True, "output", "sent", None
+
+    def teardown(*args, **kwargs):
+        operator_context.run(jobs.update_job, job["id"], {"enabled": False})
+
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    monkeypatch.setattr(scheduler, "_teardown_cron_agent", teardown)
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="telegram:123")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    assert scheduler.run_one_job(claimed)
+    delivered.assert_called_once()
+    execution = scheduler.get_execution(claimed["execution_id"])
+    assert execution is not None
+    assert execution["status"] == "completed"
+    assert execution["delivery_outcome"] == "delivered"
+    current = jobs.get_job(job["id"])
+    assert current is not None
+    assert not current["enabled"] and current["last_status"] == "ok"
+    assert current["last_error"] is None and not current["fire_claim"]
