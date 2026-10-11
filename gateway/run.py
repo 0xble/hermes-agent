@@ -4761,6 +4761,35 @@ def _housekeeping_checkpoint_prune() -> None:
     auto_prune_from_config()
 
 
+# Hourly cap on orphan installs removed (each is tens of thousands of files): 240 a day, about twice
+# the peak rate agents delete worktrees, small enough that one pass cannot saturate a nearly full volume.
+_INSTALL_ORPHAN_BATCH = 10
+_install_orphan_thread: Optional[threading.Thread] = None
+
+
+def _housekeeping_install_orphans() -> None:
+    """Remove dependency installs (``<root>/installs/<key>``) whose checkout is gone. Each agent
+    worktree that runs Hermes builds a full environment there, and before this only a release
+    publish collected them. On its own thread so a slow delete never stalls the heartbeat; a pass
+    still running when the next is due is left to finish."""
+    global _install_orphan_thread
+    if _install_orphan_thread is not None and _install_orphan_thread.is_alive():
+        return
+
+    def _collect() -> None:
+        from pm.install_gc import collect_install_orphans
+        try:
+            removed = collect_install_orphans(limit=_INSTALL_ORPHAN_BATCH)
+        except Exception as exc:
+            logger.debug("Install orphan collection error: %s", exc)
+            return
+        if removed:
+            logger.info("Install orphan collection: removed %d install(s) of deleted checkouts", len(removed))
+
+    _install_orphan_thread = threading.Thread(target=_collect, name="install-orphan-gc", daemon=True)
+    _install_orphan_thread.start()
+
+
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
     profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
@@ -4834,6 +4863,8 @@ def _start_gateway_housekeeping(
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry, False),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim, False),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner), False),
+        # First tick too (after the watch window): a gateway restarted more often than hourly still collects.
+        (60, "Install orphan collection", _housekeeping_install_orphans, True),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
         (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune, False)]
 
