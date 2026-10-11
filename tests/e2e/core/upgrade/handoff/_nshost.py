@@ -5,6 +5,9 @@ tmpfs over ``/run/user/<uid>``, real ``~/.hermes`` read-only, only ``root`` writ
 agent, then runs and spawns every process of a cell inside it. Closing it kills the sandbox's init,
 which takes every process of the namespace with it, detached or not, so nothing a cell starts can
 outlive it; the dashboard lane's ``_reaper`` is armed around it as the leak check.
+When bubblewrap is unavailable on CI, enumeration and signals use the same exact
+fixture HOME ownership boundary as ``_reaper``, and close explicitly kills its
+captured process incarnations, including detached descendants.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ class NamespaceHost:
     def __init__(self, root: Path, env: dict[str, str]):
         self.root = root
         self.env = env
+        self._isolated = H.BWRAP_OK
         self.transcript: list[str] = []
         self._ids = itertools.count(1)
         self._pending: dict[int, Future] = {}
@@ -104,7 +108,7 @@ class NamespaceHost:
         return int(msg["pid"])
 
     def procs(self) -> list[dict]:
-        """Every process in the namespace (pids as the sandbox sees them)."""
+        """Fixture-owned processes, with PIDs as the sandbox sees them."""
         return self.call({"op": "procs"}, timeout=60)["procs"]
 
     def kill(self, pid: int, sig: int = signal.SIGTERM) -> bool:
@@ -118,7 +122,14 @@ class NamespaceHost:
         return "   PID   PPID S CMD\n" + "\n".join(sorted(rows, key=lambda r: int(r.split()[0])))
 
     def close(self) -> list[str]:
-        """Kill the sandbox (its init takes every namespace process with it); returns leaked host pids."""
+        """Kill the sandbox's processes, with explicit ownership when there is no PID namespace."""
+        owned = _reaper.with_home(Path(self.env["HOME"]))
+        snapshot = owned() if not self._isolated else {}
+        if not self._isolated:
+            # The CI fallback has no namespace init to reap detached descendants.
+            # Match the existing fixture HOME boundary and kernel incarnation,
+            # never all /proc PIDs or merely a process-group ancestry snapshot.
+            _reaper.kill_identified(snapshot)
         try:
             os.killpg(self._proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -128,6 +139,6 @@ class NamespaceHost:
         except subprocess.TimeoutExpired:
             pass
         try:
-            return _reaper.reap(_reaper.with_home(Path(self.env["HOME"])), timeout=15)
+            return _reaper.reap(owned, lambda: snapshot, timeout=15)
         finally:
             _reaper.release_orphans()
