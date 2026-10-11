@@ -540,8 +540,9 @@ def _spawn_deferred_launchd_reload(
     *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
 ) -> bool:
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
-    helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then retries bootstrap
-    until ``launchctl list`` shows a positive PID or the drain budget elapses."""
+    helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then probes label
+    unload and retries every bootstrap failure with growing backoff until the separate reload
+    deadline. A successful bootstrap waits for a positive PID without registering again."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -555,7 +556,7 @@ def _spawn_deferred_launchd_reload(
     stamp = "$(date '+%Y-%m-%d %H:%M:%S %z')"
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
-    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [0-9]+;'"
+    listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [1-9][0-9]*;'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
     reload_script = (
@@ -566,14 +567,29 @@ def _spawn_deferred_launchd_reload(
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
         f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
         f"    break;   fi;   sleep 1; done; "
-        # Let launchd finish unregistering the label after the process exits.
-        f"sleep 1; _deadline=$(($(date +%s) + {_reload_budget})); while :; do "
-        f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-        f"  if {listed}; then break; fi; "
-        f"  echo \"[{stamp}] bootstrap not yet registered for {q_target} — retrying\" >> {q_log}; "
-        f"  if [ $(date +%s) -ge $_deadline ]; then break; fi;   sleep 2; done; "
-        f"if ! {listed}; then "
-        f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — service NOT registered after {_reload_budget}s of retries\" >> {q_log}; "
+        # Probe unregister completion, rather than delaying every already-unloaded job.
+        # The probe is best-effort: it fails on macOS-26 per-user domains and degrades to this retry path.
+        # The shared reload deadline bounds every bootstrap failure. Backoff is in tenths so Bash needs no float math.
+        f"_deadline=$(($(date +%s) + {_reload_budget})); _unloaded=1; _supervised=0; "
+        f"_rc=not-attempted; _reason='label never unloaded'; "
+        f"while launchctl print {q_target} >/dev/null 2>&1; do "
+        f"  if [ $(date +%s) -ge $_deadline ]; then _unloaded=0; break; fi; sleep 0.2; done; "
+        f"if [ $_unloaded -eq 1 ]; then _backoff=2; "
+        f"  _reason='bootstrap failures exhausted reload budget'; "
+        f"  while :; do "
+        f"    launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; _rc=$?; "
+        f"    if [ $_rc -eq 0 ]; then _supervised=1; _reason='bootstrapped with no positive PID'; "
+        # Successful registration may not yet have a PID. Wait for supervision, not another bootstrap.
+        f"      while :; do if {listed}; then break; fi; "
+        f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; break; fi; "
+        f"    _remaining=$((_deadline - $(date +%s))); if [ $_remaining -le 0 ]; then break; fi; "
+        f"    echo \"[{stamp}] bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
+        # Clip the growing delay to the remaining budget, then make one final attempt after that sleep.
+        f"    _delay=$_backoff; if [ $_delay -gt $((_remaining * 10)) ]; then _delay=$((_remaining * 10)); fi; "
+        f"    sleep $(printf '%d.%d' $((_delay / 10)) $((_delay % 10))); "
+        f"    _backoff=$((_backoff * 2)); if [ $_backoff -gt 20 ]; then _backoff=20; fi; done; fi; "
+        f"if [ $_supervised -eq 0 ]; then "
+        f"  echo \"[{stamp}] FAILED launchd reload for {q_target} — $_reason (bootstrap rc=$_rc; reload budget {_reload_budget}s)\" >> {q_log}; "
         f"fi; "
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
