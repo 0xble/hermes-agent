@@ -87,6 +87,12 @@ def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: s
             if session.get("tab_id") == tab_id:
                 _stale_tab_ids.setdefault(session["user_id"], set()).add(tab_id)
                 session["tab_id"] = None
+                # A confirmed destroyed tab no longer needs retry ownership or quarantine.
+                for key, record in list(_owned_tabs.items()):
+                    if (key[0] == hermes_home_key() and key[2:] == (get_camofox_url(), tab_id)
+                            and record["user_id"] == session["user_id"]):
+                        _owned_tabs.pop(key, None)
+                _clear_tab_protection(tab_id)
                 _release_unused_tab_lease(tab_id, session["user_id"])
     from agent.redact import clear_vault_date_components
     clear_vault_date_components(session.get("task_id", "default"))
@@ -358,6 +364,17 @@ def _quarantine_protected_tab(tab_id: str) -> None:
         Path(temp).unlink(missing_ok=True)
 
 
+def _clear_tab_protection(tab_id: str) -> None:
+    """Forget quarantine only after the server confirms this tab was destroyed."""
+    import hashlib
+    _protected_tab_ids.discard(tab_id)
+    _protected_tab_owners.pop(tab_id, None)
+    try:
+        (_protected_tabs_path() / hashlib.sha256(tab_id.encode("utf-8")).hexdigest()).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Camofox destroyed-tab quarantine cleanup failed: %s", exc)
+
+
 def quarantine_current_protected_tab(task_id: str) -> None:
     """Durably mark the tab before a protected fill can write into it, and detach every
     other task bound to it: their protection state is empty, so they must not read it."""
@@ -524,14 +541,20 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
     from tools import browser_camofox_leases as leases
     task = task_id or "default"
     candidates = []
+    from agent.redact import has_vault_date_components
     with _sessions_lock:
         protected = _protected_tabs_on_disk()
         if protected is None:
             return
-        from agent.redact import has_vault_date_components
-        live = _sessions.get(task, {})
-        if live.get("tab_id") and has_vault_date_components(task):
-            protected = protected | {live["tab_id"]}
+        # Quarantine forbids adoption, not destruction by the exact creator. Only a live
+        # task's protection keeps an owned tab open; after close/drop no reader needs it.
+        live_protected = {
+            session["tab_id"] for owner, session in _sessions.items()
+            if session.get("tab_id") and (has_vault_date_components(owner)
+                                         or _protected_tab_owners.get(session["tab_id"]) == owner)
+        }
+        live_protected |= {tab_id for tab_id, owner in _protected_tab_owners.items()
+                           if owner in _sessions}
         live_other_tabs = {
             session.get("tab_id") for owner, session in _sessions.items()
             if owner != task and session.get("tab_id")
@@ -541,7 +564,7 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
             if (profile != hermes_home_key() or owner != task or server != get_camofox_url()
                     or record.get("kept") or record.get("session_key") == SHARED_IDENTITY_GROUP
                     or record["user_id"] in _handoffs_in_flight
-                    or tab_id in live_other_tabs or tab_id in (_protected_tab_ids | protected)
+                    or tab_id in live_other_tabs or tab_id in live_protected
                     or not leases.claim(server, record["user_id"], tab_id)):
                 continue
             stale = _stale_tab_ids.setdefault(record["user_id"], set())
@@ -585,6 +608,7 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
                 session.pop("closing_tab_id", None)
                 if session.get("tab_id") is None:
                     session["carried"] = True
+            _clear_tab_protection(tab_id)
             leases.release(server, record["user_id"], tab_id)
 
 
@@ -748,13 +772,17 @@ def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False
 
 
 def _release_retained_tab_ownership(task_ids: set[str]) -> None:
-    """Drop kept/handoff ownership when an agent process closes without deleting the tab."""
+    """Abandon retained or failed-delete ownership after its agent has ended.
+
+    Quarantine stays until destruction is confirmed, but dead agents must not pin OS leases.
+    Live sibling bindings/ownership still hold their lease.
+    """
     from tools import browser_camofox_leases as leases
     released = []
     with _sessions_lock:
         for key, record in list(_owned_tabs.items()):
             profile, owner, server, tab_id = key
-            if profile == hermes_home_key() and owner in task_ids and record.get("kept"):
+            if profile == hermes_home_key() and owner in task_ids and owner not in _sessions:
                 _owned_tabs.pop(key, None)
                 still_bound = any(session.get("tab_id") == tab_id and
                                   session.get("user_id") == record["user_id"]
@@ -772,7 +800,8 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
     """Release this agent's bindings, including unused compression continuations.
 
     ``close_created_tabs`` closes exact POST-created ownership, including replaced bindings and
-    retryable turn-cleanup failures. Kept, user/adopted, protected and live sibling tabs survive.
+    retryable turn-cleanup failures. Kept, user/adopted and live sibling tabs survive;
+    protected owned tabs close once their protection-holding session ends.
     Every agent close enables it; temporary agents with no task ownership cannot close siblings.
     """
     keys = {key or "default" for key in task_ids}
@@ -788,8 +817,8 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
     if close_created_tabs:
         for key in keys:
             _delete_owned_tabs(key)
-    # Kept/handoff tabs survive agent shutdown, but their process-local ownership must not
-    # prevent a later Hermes process from adopting them.
+    # Surviving tabs (including failed DELETEs) no longer have an agent to retry cleanup.
+    # Abandon ownership/leases without removing their protected-data quarantine.
     _release_retained_tab_ownership(keys)
 
 

@@ -18,10 +18,16 @@ _handles: dict[tuple[str, str, str], Any] = {}
 _paths: dict[tuple[str, str, str], Path] = {}
 _local_claims: set[tuple[str, str, str]] = set()
 _fallback_warned = False
+_pruned = False
 logger = logging.getLogger(__name__)
 
 
 def _lease_root() -> Path:
+    if os.environ.get("HERMES_HOME", "").strip():
+        # Process-level state follows the same convention as gateway lifecycle state;
+        # task-local profile overrides must not move a process's lease coordinator.
+        from hermes_constants import get_process_hermes_home
+        return get_process_hermes_home() / "state" / "camofox-tab-leases"
     return Path.home() / ".local" / "state" / "hermes" / "camofox-tab-leases"
 
 
@@ -44,6 +50,39 @@ def _try_lock(handle: Any) -> bool:
         except portalocker.LockException:
             return False
     return True
+
+
+def _unlink_locked_path(handle: Any, path: Path) -> None:
+    """Unlink only the authoritative inode while still holding its exclusive lock."""
+    current = path.stat(follow_symlinks=False)
+    opened = os.fstat(handle.fileno())
+    if (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino):
+        path.unlink()
+
+
+def _prune_idle_files(root: Path) -> None:
+    """Best-effort crash residue cleanup once on this process's first claim.
+
+    Age/PIDs never grant cleanup authority: only a nonblocking exclusive lock does.
+    Claimants validate their inode after locking, so preopened unlinked files are safe.
+    """
+    global _pruned
+    if _pruned:
+        return
+    _pruned = True
+    try:
+        for path in root.iterdir():
+            if len(path.name) != 64 or any(c not in "0123456789abcdef" for c in path.name):
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "r+b") as handle:
+                    if _try_lock(handle):
+                        _unlink_locked_path(handle, path)
+            except (OSError, ImportError):
+                continue
+    except OSError:
+        pass
 
 
 def _warn_process_local_fallback(exc: BaseException) -> None:
@@ -69,6 +108,7 @@ def claim(server: str, user_id: str, tab_id: str) -> bool:
         try:
             path = _lease_path(key)
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _prune_idle_files(path.parent)
             while True:
                 fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
                 handle = os.fdopen(fd, "r+b")
@@ -117,7 +157,7 @@ def release(server: str, user_id: str, tab_id: str) -> None:
             # replacing an inode that another process may have locked between close/unlink.
             if path is not None:
                 try:
-                    path.unlink()
+                    _unlink_locked_path(handle, path)
                 except OSError:
                     pass
             handle.close()

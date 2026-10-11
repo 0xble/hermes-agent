@@ -455,7 +455,7 @@ or unsaved form contents) is lost unless the tab is explicitly handed off or kep
 
 With a named account or `managed_persistence: true`, a conversation does not
 automatically keep its tab across turns under Camofox. A tab explicitly handed off
-with `browser_handoff` or marked to be kept can remain available, but ordinary
+with `browser_handoff` can remain available until the handoff is released, but ordinary
 per-turn cleanup may close it. When a task has no tab yet (a new conversation or a
 gateway restart), Hermes reuses an existing tab of the same identity before opening
 one: a tab on the requested site first, otherwise the newest eligible handoff tab.
@@ -913,7 +913,8 @@ Or via environment variable: `AGENT_BROWSER_HEADED=1`.
 
 Headed mode launches Chromium with a visible window (passes `--headed` to
 agent-browser in local mode), so you can watch the agent work and intervene
-manually for sign-in challenges or CAPTCHAs.
+manually for sign-in challenges or CAPTCHAs. Local agent-browser headed sessions skip
+per-turn cleanup, so their window can remain open between turns.
 
 The visible window does not change Camofox's lifecycle rules: Hermes still performs per-turn cleanup and does not guarantee that a tab remains open between turns. Cookies and other profile-backed state can survive; page state not stored in cookies is lost unless the tab is explicitly handed off or kept.
 
