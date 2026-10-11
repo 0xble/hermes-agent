@@ -18,6 +18,10 @@ DRIVER = Path(__file__).resolve().parents[2] / "install/e2e-assets/drive-dmg-ins
     ("checkout", False),
     ("launcher", False),
     ("app", False),
+    ("app-info", False),
+    ("app-executable", False),
+    ("app-directory", False),
+    ("app-non-executable", False),
     ("completion", False),
     ("historical", True),
     ("marker-only", False),
@@ -37,7 +41,16 @@ def test_dmg_driver_requires_complete_pm_source_install(tmp_path, missing, expec
         launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         launcher.chmod(0o755)
     if missing != "app":
-        (root / "apps/desktop/release/mac-arm64/Hermes.app").mkdir(parents=True)
+        app = root / "apps/desktop/release/mac-arm64/Hermes.app"
+        (app / "Contents/MacOS").mkdir(parents=True)
+        if missing != "app-info":
+            (app / "Contents/Info.plist").write_text("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>\n", encoding="utf-8")
+        executable = app / "Contents/MacOS/Hermes"
+        if missing == "app-directory":
+            executable.mkdir()
+        elif missing != "app-executable":
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o644 if missing == "app-non-executable" else 0o755)
     if missing not in {"completion", "historical", "wrong-root-log"}:
         (root / ".hermes-bootstrap-complete").write_text("completed", encoding="utf-8")
     # The legacy file must not mask a missing PM publication.
