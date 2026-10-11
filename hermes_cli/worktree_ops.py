@@ -917,6 +917,11 @@ def _classify_prune_candidates(repo_root: str, candidates: list) -> list:
     return verdicts
 
 
+# `git worktree remove` deletes the tree before it drops the registration. Killed by a timeout
+# mid-delete, it leaves a registered tree with thousands of tracked files gone, which every later
+# prune keeps as "uncommitted changes". On a saturated volume one removal can take minutes.
+WORKTREE_REMOVE_TIMEOUT = 600
+
 # Preserving verdicts -> reason reported for trees past the stale-work cutoff.
 _PRESERVE_REASONS = {"dirty": "uncommitted changes", "unpushed": "unpushed commits"}
 
@@ -945,7 +950,8 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
 
         try:
             branch = _git(["branch", "--show-current"], str(entry), timeout=5).stdout.strip()
-            remove_result = _git(["worktree", "remove", str(entry), "--force"], repo_root, timeout=15)
+            remove_result = _git(["worktree", "remove", str(entry), "--force"], repo_root,
+                                 timeout=WORKTREE_REMOVE_TIMEOUT)
             if remove_result.returncode != 0:
                 logger.debug("Failed to remove worktree %s: %s", entry.name, remove_result.stderr.strip())
                 continue
