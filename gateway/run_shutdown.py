@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from agent.i18n import t
+from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -3258,6 +3259,8 @@ class GatewayShutdownMixin:
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        # Shutdown drains synchronously on the loop by design, with the liveness watchdog disarmed.
+        set_loop_thread(None)
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart

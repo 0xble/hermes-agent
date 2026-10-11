@@ -382,12 +382,67 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     return holders
 
 
+# The holder scan walks every descriptor of every process on the host (libproc on macOS). Run per
+# open, a boot's burst of opens repeated it back to back, and one vnode stuck in the kernel wedged
+# every opener in uninterruptible sleep. A clean verdict is reused while the sidecars at the path
+# keep their identity (a retired generation can only appear by unlinking or replacing one of them),
+# for a short TTL; one scan runs per path at a time, and an opener waits for it only so long.
+_HOLDER_SCAN_CLEAN_TTL_S = 10.0
+_HOLDER_SCAN_WAIT_S = 2.0
+_holder_scan_lock = threading.Lock()
+_holder_scan_clean: Dict[str, Tuple[float, Dict[str, tuple]]] = {}
+_holder_scan_inflight: Dict[str, "_HolderScan"] = {}
+
+
+class _HolderScan:
+    """One holder scan on a daemon thread: a scan wedged in the kernel must not block exit."""
+
+    def __init__(self, db_path, sidecars: Dict[str, tuple]) -> None:
+        self.sidecars = sidecars  # the identities this verdict describes
+        self.done = threading.Event()
+        self.finished_at = 0.0
+        self.holders: List[Tuple[int, str]] = []
+        threading.Thread(target=self._run, args=(db_path,), name="state-db-holder-scan", daemon=True).start()
+
+    def _run(self, db_path) -> None:
+        try:
+            self.holders = iter_deleted_sqlite_sidecar_holders(db_path)
+        finally:
+            self.finished_at = time.monotonic()
+            self.done.set()
+
+
+def _deleted_sidecar_holders_for_open(db_path) -> List[Tuple[int, str]]:
+    """:func:`iter_deleted_sqlite_sidecar_holders`, reusing a recent clean verdict and failing open
+    (like the scan itself on any error) when the scan does not finish in ``_HOLDER_SCAN_WAIT_S``."""
+    key = os.path.abspath(os.fspath(db_path))
+    sidecars = _stat_sqlite_sidecar_identity(Path(key))
+    with _holder_scan_lock:
+        clean = _holder_scan_clean.get(key)
+        if clean is not None and clean[0] > time.monotonic() and clean[1] == sidecars:
+            return []
+        scan = _holder_scan_inflight.get(key)
+        # A scan an earlier opener gave up on may have finished long ago: its verdict is stale.
+        if scan is None or (scan.done.is_set() and time.monotonic() - scan.finished_at > _HOLDER_SCAN_CLEAN_TTL_S):
+            scan = _holder_scan_inflight[key] = _HolderScan(db_path, sidecars)
+    if not scan.done.wait(_HOLDER_SCAN_WAIT_S):
+        logger.warning("deleted-WAL holder scan for %s is still running after %.0fs; opening without it",
+                       db_path, _HOLDER_SCAN_WAIT_S)
+        return []
+    with _holder_scan_lock:
+        if _holder_scan_inflight.get(key) is scan:
+            del _holder_scan_inflight[key]
+            if not scan.holders:
+                _holder_scan_clean[key] = (time.monotonic() + _HOLDER_SCAN_CLEAN_TTL_S, scan.sidecars)
+    return scan.holders
+
+
 def refuse_deleted_wal_generation(db_path) -> None:
     """Raise if any process holds a deleted WAL/SHM generation for *db_path*; called
     *before* ``sqlite3.connect`` so a second opener cannot mint a replacement WAL inode."""
     from hermes_state import DeletedWalGenerationError
     from hermes_state_errors import _DELETED_WAL_GENERATION_MSG
-    if not iter_deleted_sqlite_sidecar_holders(db_path):
+    if not _deleted_sidecar_holders_for_open(db_path):
         return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)

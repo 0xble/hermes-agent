@@ -4249,7 +4249,11 @@ _last_dead_owner_reap_at: Dict[str, float] = {}
 
 # Worktree prune throttle: the cron tick is the only reliably periodic process on gateway boxes.
 _WORKTREE_MAINTENANCE_INTERVAL_SECONDS = 6 * 3600.0
-_last_worktree_maintenance_at: Optional[float] = None
+# The first pass waits this long after the process starts: git classification of every tree plus a
+# ``du`` of .worktrees/ is heavy metadata I/O, and a boot already saturates the disk and state.db.
+_WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS = 1800.0
+_last_worktree_maintenance_at: Optional[float] = (
+    time.monotonic() - _WORKTREE_MAINTENANCE_INTERVAL_SECONDS + _WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS)
 _worktree_maintenance_lock = threading.Lock()
 
 
@@ -4416,19 +4420,22 @@ def _sweep_stale_inflight_for_tick(due_jobs: list) -> None:
 
 
 def _resolve_max_parallel_workers() -> Optional[int]:
-    """Max workers: env > config.yaml > unbounded (HERMES_CRON_MAX_PARALLEL=1 restores serial)."""
+    """Max workers: env > config.yaml > ``DEFAULT_CRON_MAX_PARALLEL_JOBS``; 0 = unbounded,
+    1 = serial (HERMES_CRON_MAX_PARALLEL=1 restores serial)."""
+    from hermes_cli.config_defaults import DEFAULT_CRON_MAX_PARALLEL_JOBS
     try:
         _env_par = cron_env_setting("HERMES_CRON_MAX_PARALLEL").strip()
         if _env_par:
             return int(_env_par) or None
     except (ValueError, TypeError):
-        logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
+        logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; using the default of %d",
+                       DEFAULT_CRON_MAX_PARALLEL_JOBS)
     with contextlib.suppress(Exception):
         _ucfg = load_config() or {}
         _cfg_par = (_ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}).get("max_parallel_jobs")
         if _cfg_par is not None:
             return int(_cfg_par) or None
-    return None
+    return DEFAULT_CRON_MAX_PARALLEL_JOBS
 
 
 def _sweep_mcp_orphans() -> None:

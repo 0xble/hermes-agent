@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Any
 
+from hermes_loop_guard import LoopGuardedLock
+
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
 from gateway.session_identity import transport_profile_of
@@ -857,7 +859,9 @@ class SessionStore(
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[Dict[str, Any]] = None
-        self._lock = threading.Lock()  # guards _entries / _loaded only
+        # Guards _entries / _loaded, and is held across the state.db write of a turn marker or
+        # routing save, so the event loop must never wait on it (see hermes_loop_guard).
+        self._lock = LoopGuardedLock("session-store lock")
         self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
