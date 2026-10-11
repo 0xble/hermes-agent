@@ -7,6 +7,7 @@ can be shared across profiles. The directory contains only hashed resource keys.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 import threading
@@ -14,10 +15,19 @@ from typing import Any
 
 _lock = threading.RLock()
 _handles: dict[tuple[str, str, str], Any] = {}
+_paths: dict[tuple[str, str, str], Path] = {}
+_local_claims: set[tuple[str, str, str]] = set()
+_fallback_warned = False
+logger = logging.getLogger(__name__)
 
 
 def _lease_root() -> Path:
     return Path.home() / ".local" / "state" / "hermes" / "camofox-tab-leases"
+
+
+def _lease_path(key: tuple[str, str, str]) -> Path:
+    digest = hashlib.sha256(repr(key).encode()).hexdigest()
+    return _lease_root() / digest
 
 
 def _try_lock(handle: Any) -> bool:
@@ -36,25 +46,44 @@ def _try_lock(handle: Any) -> bool:
     return True
 
 
+def _warn_process_local_fallback(exc: BaseException) -> None:
+    global _fallback_warned
+    if not _fallback_warned:
+        logger.warning("Camofox tab leases unavailable; using process-local ownership: %s", exc)
+        _fallback_warned = True
+
+
 def claim(server: str, user_id: str, tab_id: str) -> bool:
-    """Claim a tab or confirm our existing lease; uncertainty refuses the claim."""
+    """Claim a tab or confirm our existing lease.
+
+    A real non-blocking lock collision refuses the claim. State-directory failures and an
+    unavailable optional Windows lock provider degrade to process-local ownership instead of
+    making every newly-created tab unusable.
+    """
     key = (server, user_id, tab_id)
     with _lock:
-        if key in _handles:
+        if key in _handles or key in _local_claims:
             return True
         handle = None
+        path: Path | None = None
         try:
-            root = _lease_root()
-            root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            digest = hashlib.sha256(repr(key).encode()).hexdigest()
-            # Never unlink lock files: replacing an inode permits two simultaneous locks.
-            fd = os.open(root / digest, os.O_CREAT | os.O_RDWR, 0o600)
+            path = _lease_path(key)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
             handle = os.fdopen(fd, "r+b")
             if _try_lock(handle):
                 _handles[key] = handle
+                _paths[key] = path
                 return True
-        except (OSError, ImportError):
-            return False
+        except (OSError, ImportError) as exc:
+            _local_claims.add(key)
+            if handle is not None and path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            _warn_process_local_fallback(exc)
+            return True
         finally:
             if handle is not None and key not in _handles:
                 handle.close()
@@ -62,7 +91,17 @@ def claim(server: str, user_id: str, tab_id: str) -> bool:
 
 
 def release(server: str, user_id: str, tab_id: str) -> None:
+    key = (server, user_id, tab_id)
     with _lock:
-        handle = _handles.pop((server, user_id, tab_id), None)
+        _local_claims.discard(key)
+        handle = _handles.pop(key, None)
+        path = _paths.pop(key, None)
         if handle is not None:
+            # Remove the pathname while the exclusive lock is still held. This avoids
+            # replacing an inode that another process may have locked between close/unlink.
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
             handle.close()

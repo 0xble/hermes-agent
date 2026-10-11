@@ -878,3 +878,49 @@ def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
     with patch("run_agent.cleanup_vm"):
         owner._close_task_resources("different-session-id")
     assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]
+
+
+def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):
+    cf = camofox.cf
+    session = cf._get_session("slow-owner")
+    session["tab_id"] = "slow-tab"
+    cf._record_owned_tab(session, "slow-tab")
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_delete(*_args, **_kwargs):
+        started.set()
+        assert finish.wait(2)
+        return {}
+
+    with patch.object(cf, "_delete", side_effect=slow_delete):
+        closer = threading.Thread(target=cf._delete_owned_tabs, args=("slow-owner",))
+        closer.start()
+        assert started.wait(1)
+        with cf._sessions_lock:
+            cf._sessions["sibling"] = {"task_id": "sibling", "user_id": "sibling-user",
+                                        "tab_id": None}
+        finish.set()
+        closer.join(2)
+    assert not closer.is_alive()
+
+
+def test_agent_close_releases_kept_tab_ownership_without_deleting(camofox):
+    cf = camofox.cf
+    from tools import browser_camofox_leases as leases
+
+    session = cf._get_session("kept-owner")
+    session["tab_id"] = "kept-tab"
+    cf._record_owned_tab(session, "kept-tab")
+    cf.keep_task_tabs("kept-owner")
+    key = (cf.hermes_home_key(), "kept-owner", camofox.server.url, "kept-tab")
+    lease_key = (camofox.server.url, session["user_id"], "kept-tab")
+    assert leases.claim(*lease_key)
+    assert key in cf._owned_tabs and lease_key in leases._handles
+
+    with patch.object(cf, "_delete") as delete:
+        cf.release_task_bindings({"kept-owner"}, close_created_tabs=True)
+
+    assert key not in cf._owned_tabs
+    assert lease_key not in leases._handles
+    delete.assert_not_called()

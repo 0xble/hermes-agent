@@ -449,15 +449,18 @@ another alias. The `personal` alias is not accepted. Each alias maps to a separa
 stable, profile-scoped Camofox identity; the underlying `userId` is never exposed
 to the model. Ending a named-account task drops Hermes' local handle and does not
 delete the Camofox profile, so its cookies remain available to a later task using
-the same alias.
+the same alias. The tab itself is not guaranteed to survive turn cleanup: page state
+that is not stored in cookies (such as the DOM, in-memory app state, scroll position,
+or unsaved form contents) is lost unless the tab is explicitly handed off or kept.
 
-With a named account or `managed_persistence: true`, a conversation keeps its tab
-across turns, including the tab shown by `browser_handoff`, so the agent continues
-where the user logged in. When a task has no tab yet (a new conversation or a
-gateway restart), Hermes reuses an existing tab of the same identity before
-opening one: a tab on the requested site first, otherwise the newest handoff tab.
-It never takes a tab another live task holds, a tab with protected vault data, or
-a tab the server reported closed.
+With a named account or `managed_persistence: true`, a conversation does not
+automatically keep its tab across turns under Camofox. A tab explicitly handed off
+with `browser_handoff` or marked to be kept can remain available, but ordinary
+per-turn cleanup may close it. When a task has no tab yet (a new conversation or a
+gateway restart), Hermes reuses an existing tab of the same identity before opening
+one: a tab on the requested site first, otherwise the newest eligible handoff tab.
+It never takes a tab another live task holds, a tab with protected vault data, or a
+tab the server reported closed.
 
 Account selection is advertised only when Camofox is the active browser backend.
 The aliases are intentionally separate from vault credentials. A vault item can
@@ -911,7 +914,9 @@ Or via environment variable: `AGENT_BROWSER_HEADED=1`.
 Headed mode does two things:
 
 1. **Launches Chromium with a visible window** (passes `--headed` to agent-browser in local mode).
-2. **Keeps the window open between turns.** Normally the browser session is cleaned up after every agent reply; in headed mode the per-turn cleanup is skipped so you can watch the agent work, intervene manually (sign-in challenges, CAPTCHAs), and keep login state warm across the conversation.
+2. **Shows a visible window when supported.** Local Chromium passes `--headed` (Camofox may also expose its visible window).
+
+The visible window does not change Camofox's lifecycle rules: Hermes still performs per-turn cleanup and does not guarantee that a tab remains open between turns. Cookies and other profile-backed state can survive; page state not stored in cookies is lost unless the tab is explicitly handed off or kept.
 
 Idle sessions are still reaped after `browser.inactivity_timeout` (default 120s of no browser activity), and all sessions are closed on shutdown. Headed mode only affects the local browser — cloud sessions (Browserbase) are unaffected.
 

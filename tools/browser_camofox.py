@@ -78,10 +78,16 @@ def classify_camofox_http_error(exc: BaseException, *, endpoint: str = "mandator
 def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: str = "mandatory") -> bool:
     if classify_camofox_http_error(exc, endpoint=endpoint) != "stale":
         return False
-    if session.get("tab_id"):  # the server's tab list may still show it
+    tab_id = session.get("tab_id")
+    if tab_id:  # the server's tab list may still show it
         with _sessions_lock:
-            _stale_tab_ids.setdefault(session["user_id"], set()).add(session["tab_id"])
-    session["tab_id"] = None
+            # Keep the stale fence until the server listing proves the tab is gone.  An
+            # adopted tab has no _owned_tabs record, so dropping this binding must also
+            # release the process-local OS lease (the same rule as _drop_session_locked).
+            if session.get("tab_id") == tab_id:
+                _stale_tab_ids.setdefault(session["user_id"], set()).add(tab_id)
+                session["tab_id"] = None
+                _release_unused_tab_lease(tab_id, session["user_id"])
     from agent.redact import clear_vault_date_components
     clear_vault_date_components(session.get("task_id", "default"))
     return True
@@ -505,11 +511,15 @@ def keep_task_tabs(task_id: Optional[str], keep: bool = True) -> int:
 
 
 def _delete_owned_tabs(task_id: Optional[str]) -> None:
-    """Close disposable owned tabs, retaining ownership when safety or I/O is uncertain."""
+    """Close disposable owned tabs without holding the binding lock over HTTP I/O.
+
+    Candidates are fenced under ``_sessions_lock`` before DELETE: ownership is removed and
+    the tab is marked stale so another task cannot adopt it while the server call is in flight.
+    A failed DELETE restores the ownership record and binding for the next cleanup attempt.
+    """
     from tools import browser_camofox_leases as leases
     task = task_id or "default"
-    # Keep the binding lock through DELETE. A sibling must not bind or keep the tab
-    # between the ownership check and destruction. The OS lease excludes other processes.
+    candidates = []
     with _sessions_lock:
         protected = _protected_tabs_on_disk()
         if protected is None:
@@ -530,23 +540,42 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
                     or tab_id in live_other_tabs or tab_id in (_protected_tab_ids | protected)
                     or not leases.claim(server, record["user_id"], tab_id)):
                 continue
-            # Also fence re-entrant adoption and stale server listings after a successful close.
             stale = _stale_tab_ids.setdefault(record["user_id"], set())
             was_stale = tab_id in stale
             stale.add(tab_id)
-            try:
-                _delete(f"/tabs/{tab_id}", params={"userId": record["user_id"]}, timeout=10)
-            except Exception as exc:
-                if not was_stale:
-                    stale.discard(tab_id)
-                logger.warning("Camofox owned tab close failed for %s; retaining ownership: %s", tab_id, exc)
-                continue
             _owned_tabs.pop(key, None)
-            leases.release(server, record["user_id"], tab_id)
             session = _sessions.get(task)
             if session and session.get("tab_id") == tab_id:
+                # A concurrent tool call may create a replacement tab, but it must not
+                # continue using the tab that is fenced for deletion.
                 session["tab_id"] = None
+                session["closing_tab_id"] = tab_id
+            candidates.append((key, dict(record), was_stale))
+
+    for key, record, was_stale in candidates:
+        _profile, owner, server, tab_id = key
+        try:
+            _delete(f"/tabs/{tab_id}", params={"userId": record["user_id"]}, timeout=10)
+        except Exception as exc:
+            with _sessions_lock:
+                _owned_tabs.setdefault(key, record)
+                stale = _stale_tab_ids.setdefault(record["user_id"], set())
+                if not was_stale:
+                    stale.discard(tab_id)
+                session = _sessions.get(owner)
+                if session and session.get("closing_tab_id") == tab_id:
+                    if session.get("tab_id") is None:
+                        session["tab_id"] = tab_id
+                    session.pop("closing_tab_id", None)
+            logger.warning("Camofox owned tab close failed for %s; retaining ownership: %s", tab_id, exc)
+            continue
+
+        with _sessions_lock:
+            session = _sessions.get(owner)
+            if session and session.get("closing_tab_id") == tab_id:
+                session.pop("closing_tab_id", None)
                 session["carried"] = True
+        leases.release(server, record["user_id"], tab_id)
 
 
 def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[str, Any]:
@@ -707,6 +736,20 @@ def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False
             _drop_session_locked(old_task_id)
 
 
+def _release_retained_tab_ownership(task_ids: set[str]) -> None:
+    """Drop kept/handoff ownership when an agent process closes without deleting the tab."""
+    from tools import browser_camofox_leases as leases
+    released = []
+    with _sessions_lock:
+        for key, record in list(_owned_tabs.items()):
+            profile, owner, server, tab_id = key
+            if profile == hermes_home_key() and owner in task_ids and record.get("kept"):
+                _owned_tabs.pop(key, None)
+                released.append((server, record["user_id"], tab_id))
+    for server, user_id, tab_id in released:
+        leases.release(server, user_id, tab_id)
+
+
 def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool = False) -> None:
     """Release this agent's bindings, including unused compression continuations.
 
@@ -723,9 +766,13 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
             keys |= carried
         for key in keys:
             _drop_session_locked(key)  # quarantine before destroying tabs
-        if close_created_tabs:
-            for key in keys:
-                _delete_owned_tabs(key)
+    # The DELETE calls must not run while the process-wide session lock is held.
+    if close_created_tabs:
+        for key in keys:
+            _delete_owned_tabs(key)
+    # Kept/handoff tabs survive agent shutdown, but their process-local ownership must not
+    # prevent a later Hermes process from adopting them.
+    _release_retained_tab_ownership(keys)
 
 
 # ---- HTTP helpers ----
