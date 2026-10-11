@@ -1247,6 +1247,34 @@ def pytest_runtest_call(item):
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
             wait()
+        _drain_gateway_metrics()
+
+
+def _drain_gateway_metrics() -> None:
+    """Finish queued gateway/cron metric recordings before pytest's next log-capture phase.
+
+    The metrics worker records fire-and-forget on its own thread and imports its
+    recorder modules lazily, so a job left queued by one test can create loggers
+    while pytest's ``catching_logs.__enter__`` iterates ``loggerDict`` for the next
+    phase: "RuntimeError: dictionary changed size during iteration" (hosted run
+    37604253497, tests/cron/test_scheduler_provider.py).
+    """
+    gateway_metrics = sys.modules.get("hermes_cli.observability.shared_metrics_gateway")
+    if gateway_metrics is None or getattr(gateway_metrics, "_executor", None) is None:
+        return
+    try:
+        gateway_metrics.drain(timeout=10.0)
+    except Exception:  # a wedged recorder must not fail an unrelated test
+        pass
+
+
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Drain metric jobs queued by fixture teardown (cron tickers, adapters) too."""
+    try:
+        return (yield)
+    finally:
+        _drain_gateway_metrics()
 
 
 def pytest_runtest_setup(item):
