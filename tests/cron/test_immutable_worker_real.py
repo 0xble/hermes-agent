@@ -12,13 +12,54 @@ import pytest
 from hermes_cli.immutable_releases import promote, stage_release
 from tests.hermes_cli.immutable_test_helpers import _build_test_venv
 
+# scripts/run_tests_parallel.py kills a file after 300s with no attribution. Fail
+# inside the test first, naming the phase that ran out of budget, while leaving
+# room for interpreter startup, collection and teardown.
+AGGREGATE_BUDGET_SECONDS = 240.0
+# Per-wait cap: one stuck handshake must not spend the whole budget silently.
+PHASE_TIMEOUT_SECONDS = 60.0
+
+
+class _Budget:
+    """One aggregate deadline shared by every wait, with per-phase timings."""
+
+    def __init__(self, total: float):
+        self.total = total
+        self.start = time.monotonic()
+        self.deadline = self.start + total
+        self.phases: list[tuple[str, float]] = []
+        self._mark = self.start
+
+    def lap(self, phase: str) -> None:
+        now = time.monotonic()
+        self.phases.append((phase, now - self._mark))
+        self._mark = now
+        self.check(phase)
+
+    def check(self, phase: str) -> None:
+        if time.monotonic() >= self.deadline:
+            raise AssertionError(self._exhausted(phase))
+
+    def timeout(self, phase: str, cap: float = PHASE_TIMEOUT_SECONDS) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(self._exhausted(phase))
+        return min(cap, remaining)
+
+    def _exhausted(self, phase: str) -> str:
+        return (f"aggregate budget of {self.total:g}s exhausted during {phase!r} "
+                f"(elapsed {time.monotonic() - self.start:.1f}s); phases: {self.report()}")
+
+    def report(self) -> str:
+        return ", ".join(f"{name}={seconds:.1f}s" for name, seconds in self.phases)
+
 
 @pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
 def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path, monkeypatch):
-    from cron import executions
     from cron.jobs import create_job, use_cron_store
 
+    budget = _Budget(AGGREGATE_BUDGET_SECONDS)
     uv = shutil.which("uv")
     if uv is None:
         pytest.skip("uv is required for real release staging")
@@ -37,6 +78,7 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
                         "commit", "-qm", f"test release {name}"], check=True)
         revisions.append(subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"],
                                                text=True).strip())
+    budget.lap("clone and commit revisions")
     from hermes_cli import immutable_releases as releases
     # This test verifies immutable Python/cron worker identity, not the optional web bundle.
     # Building npm assets for each disposable revision dominated the native-file budget on
@@ -47,7 +89,9 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
     monkeypatch.setattr(releases, "_build_venv", _build_test_venv)
     monkeypatch.setattr(releases, "restore_active_distributions", lambda *args, **kwargs: None)
     a, _ = stage_release(source, home, sha=revisions[0], uv=uv)
+    budget.lap("stage release A")
     b, _ = stage_release(source, home, sha=revisions[1], uv=uv)
+    budget.lap("stage release B")
     for name, release in (("A", a), ("B", b)):
         # Exercise the candidate's scheduler and its job/deadline dependencies
         # together; copying only the facade mixes it with the cloned base API.
@@ -85,25 +129,28 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
             encoding="utf-8",
         )
     promote(home, a)
+    budget.lap("overlay candidate and promote A")
     parents = []
     worker_pids = []
 
-    def await_file(path, timeout=60):
-        deadline = time.monotonic() + timeout
+    def await_file(path):
+        deadline = time.monotonic() + budget.timeout(f"wait for {path.name}")
         while time.monotonic() < deadline:
             if path.exists():
                 return path
             time.sleep(.05)
-        raise AssertionError(f"missing {path}")
+        budget.check(f"wait for {path.name}")
+        raise AssertionError(f"missing {path} after {PHASE_TIMEOUT_SECONDS:g}s; phases: {budget.report()}")
 
-    def await_json(path, timeout=60):
-        deadline = time.monotonic() + timeout
+    def await_json(path):
+        deadline = time.monotonic() + budget.timeout(f"wait for {path.name}")
         while time.monotonic() < deadline:
             try:
                 return json.loads(path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
                 time.sleep(.05)
-        raise AssertionError(f"missing or incomplete JSON: {path}")
+        budget.check(f"wait for {path.name}")
+        raise AssertionError(f"missing or incomplete JSON: {path}; phases: {budget.report()}")
 
     def dispatch(name, release, profile):
         profile_home = home if profile == "default" else home / "profiles" / "p"
@@ -151,19 +198,24 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
     try:
         initial = [dispatch("A-default", a, "default"), dispatch("A-profile", a, "p")]
         delayed = dispatch("A-delayed", a, "default")
+        budget.lap("spawn A dispatchers")
         for profile_home, _ in initial:
             name = "A-default" if profile_home == home else "A-profile"
             (profile_home / f"dispatch-{name}").touch()
             await_file(profile_home / f"started-{name}")
+        budget.lap("start A workers")
         promote(home, b)
         later = [delayed, dispatch("B-default", b, "default"), dispatch("B-profile", b, "p")]
+        budget.lap("promote B and spawn B dispatchers")
         for (profile_home, parent), name in zip(initial + later,
                                                  ("A-default", "A-profile", "A-delayed", "B-default", "B-profile")):
             if name.startswith("B-") or name == "A-delayed":
                 (profile_home / f"dispatch-{name}").touch()
                 await_file(profile_home / f"started-{name}")
+                budget.lap(f"start {name} worker")
             (profile_home / f"probe-{name}").touch()
             result = await_json(profile_home / f"observed-{name}.json")
+            budget.lap(f"probe {name}")
             worker_pids.append(result["pid"])
             print(f"{name}: {json.dumps(result, sort_keys=True)}")
             release = a if name.startswith("A-") else b
@@ -177,8 +229,14 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
             assert Path(result["module"]).is_relative_to(release), (name, result)
             assert Path(result["cwd"]) == release, (name, result)
             (profile_home / f"finish-{name}").touch()
-            parent.wait(timeout=60)
+            try:
+                parent.wait(timeout=budget.timeout(f"finish {name}"))
+            except subprocess.TimeoutExpired:
+                budget.check(f"finish {name}")
+                raise AssertionError(f"{name} dispatcher did not exit; phases: {budget.report()}")
             assert parent.returncode == 0, (name, parent.returncode)
+            budget.lap(f"finish {name}")
+        print(f"phase timings: {budget.report()}")
     finally:
         for parent in parents:
             if parent.poll() is None:
