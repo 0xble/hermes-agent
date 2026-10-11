@@ -911,10 +911,9 @@ browser:
 
 Or via environment variable: `AGENT_BROWSER_HEADED=1`.
 
-Headed mode does two things:
-
-1. **Launches Chromium with a visible window** (passes `--headed` to agent-browser in local mode).
-2. **Shows a visible window when supported.** Local Chromium passes `--headed` (Camofox may also expose its visible window).
+Headed mode launches Chromium with a visible window (passes `--headed` to
+agent-browser in local mode), so you can watch the agent work and intervene
+manually for sign-in challenges or CAPTCHAs.
 
 The visible window does not change Camofox's lifecycle rules: Hermes still performs per-turn cleanup and does not guarantee that a tab remains open between turns. Cookies and other profile-backed state can survive; page state not stored in cookies is lost unless the tab is explicitly handed off or kept.
 

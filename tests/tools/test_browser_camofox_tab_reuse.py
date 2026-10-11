@@ -142,6 +142,7 @@ def camofox(tmp_path, monkeypatch):
             cf._sessions.clear()
             getattr(cf, "_stale_tab_ids", {}).clear()
             getattr(cf, "_owned_tabs", {}).clear()
+            cf._closing_tabs.clear()
         cf._protected_tab_ids.clear()
         cf._protected_tab_owners.clear()
 
@@ -887,22 +888,35 @@ def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):
     cf._record_owned_tab(session, "slow-tab")
     started = threading.Event()
     finish = threading.Event()
+    tool_done = threading.Event()
+    results = []
 
     def slow_delete(*_args, **_kwargs):
         started.set()
-        assert finish.wait(2)
+        assert finish.wait(5)
         return {}
 
+    def sibling_tool():
+        results.append(_dispatch("browser_navigate", {"url": "https://sibling.example.test/"}, "sibling"))
+        tool_done.set()
+
     with patch.object(cf, "_delete", side_effect=slow_delete):
-        closer = threading.Thread(target=cf._delete_owned_tabs, args=("slow-owner",))
+        # Exercise release_task_bindings too: it must not retain its outer RLock
+        # while invoking the owned-tab DELETE helper.
+        closer = threading.Thread(target=cf.release_task_bindings,
+                                  args=({"slow-owner"},), kwargs={"close_created_tabs": True})
         closer.start()
         assert started.wait(1)
-        with cf._sessions_lock:
-            cf._sessions["sibling"] = {"task_id": "sibling", "user_id": "sibling-user",
-                                        "tab_id": None}
-        finish.set()
-        closer.join(2)
-    assert not closer.is_alive()
+        sibling = threading.Thread(target=sibling_tool)
+        sibling.start()
+        try:
+            assert tool_done.wait(1), "sibling browser tool blocked on slow DELETE"
+            assert results[0]["success"]
+        finally:
+            finish.set()
+            closer.join(5)
+            sibling.join(5)
+    assert not closer.is_alive() and not sibling.is_alive()
 
 
 def test_agent_close_releases_kept_tab_ownership_without_deleting(camofox):
@@ -924,3 +938,56 @@ def test_agent_close_releases_kept_tab_ownership_without_deleting(camofox):
     assert key not in cf._owned_tabs
     assert lease_key not in leases._handles
     delete.assert_not_called()
+
+
+def test_kept_owner_close_retains_live_sibling_lease(camofox):
+    cf = camofox.cf
+    from tools import browser_camofox_leases as leases
+
+    session = cf._get_session("owner")
+    session["tab_id"] = "shared-kept-tab"
+    cf._record_owned_tab(session, session["tab_id"])
+    cf.keep_task_tabs("owner")
+    lease_key = (camofox.server.url, session["user_id"], session["tab_id"])
+    assert leases.claim(*lease_key)
+    with cf._sessions_lock:
+        cf._sessions["sibling"] = {**session, "task_id": "sibling"}
+    cf.release_task_bindings({"owner"}, close_created_tabs=True)
+    assert not cf._owned_tabs
+    assert lease_key in leases._handles
+    cf._drop_session("sibling")
+    assert lease_key not in leases._handles
+
+
+def test_closing_fence_survives_listing_disappearance_and_handoff(camofox):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/", "account": "brianle"}, "owner")["success"]
+    tab = cf._sessions["owner"]["tab_id"]
+    user_id = cf._sessions["owner"]["user_id"]
+    started = threading.Event()
+    finish = threading.Event()
+
+    def slow_delete(*_args, **_kwargs):
+        started.set()
+        assert finish.wait(5)
+        return {}
+
+    with patch.object(cf, "_delete", side_effect=slow_delete):
+        closer = threading.Thread(target=cf._delete_owned_tabs, args=("owner",))
+        closer.start()
+        assert started.wait(1)
+        try:
+            # GET can temporarily omit a closing tab, clearing the ordinary stale cache.
+            camofox.server.tabs[user_id] = []
+            assert cf._adopt_existing_tab(cf._get_session("sibling", "brianle")).get("tab_id") is None
+            assert tab not in cf._stale_tab_ids.get(user_id, set())
+            camofox.server.seed(user_id, {"tabId": tab, "url": "https://a.example.test/", "listItemId": SHARED})
+            assert cf._adopt_existing_tab(cf._get_session("sibling", "brianle")).get("tab_id") is None
+            camofox.server.open_tab_ids.append(tab)
+            handoff = _dispatch("browser_handoff", {"account": "brianle"}, "sibling")
+            assert handoff["success"] and handoff["modelDetached"]
+            assert cf._sessions["sibling"]["tab_id"] is None
+        finally:
+            finish.set()
+            closer.join(5)
+    assert (camofox.server.url, user_id, tab) not in cf._closing_tabs

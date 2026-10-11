@@ -69,9 +69,25 @@ def claim(server: str, user_id: str, tab_id: str) -> bool:
         try:
             path = _lease_path(key)
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-            handle = os.fdopen(fd, "r+b")
-            if _try_lock(handle):
+            while True:
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+                handle = os.fdopen(fd, "r+b")
+                if not _try_lock(handle):
+                    return False
+                # Release unlinks while locked. A claimant can have opened that old inode
+                # just before unlink, then acquire it after close. Never publish that orphan
+                # lease: only the inode still addressed by the resource path is authoritative.
+                try:
+                    current = path.stat()
+                except FileNotFoundError:
+                    handle.close()
+                    handle = None
+                    continue
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                    handle.close()
+                    handle = None
+                    continue
                 _handles[key] = handle
                 _paths[key] = path
                 return True

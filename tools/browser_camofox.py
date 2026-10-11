@@ -306,6 +306,8 @@ _sessions_lock = threading.RLock()
 # Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
 # keep the exact identity and profile separately until close is confirmed.
 _owned_tabs: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
+# Independent of the server listing: an in-flight DELETE must never become adoptable.
+_closing_tabs: set[tuple[str, str, str]] = set()
 # A managed tab containing a filled date must never be adopted under another task.
 _protected_tab_ids: set[str] = set()
 # tab_id -> the task whose live protection covers it; only that task may keep the binding.
@@ -435,6 +437,8 @@ def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = Non
         refused |= {key[3] for key, record in _owned_tabs.items()
                     if key[1] != task_id and key[2] == get_camofox_url()
                     and record["user_id"] == session["user_id"] and not record.get("kept")}
+        refused |= {tab_id for server, user_id, tab_id in _closing_tabs
+                    if server == get_camofox_url() and user_id == session["user_id"]}
         handoff_pending = _handoffs_in_flight.get(session["user_id"], 0) > 0
         ranked = []
         for index, tab in enumerate(tabs):
@@ -543,6 +547,7 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
             stale = _stale_tab_ids.setdefault(record["user_id"], set())
             was_stale = tab_id in stale
             stale.add(tab_id)
+            _closing_tabs.add((server, record["user_id"], tab_id))
             _owned_tabs.pop(key, None)
             session = _sessions.get(task)
             if session and session.get("tab_id") == tab_id:
@@ -559,6 +564,7 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
         except Exception as exc:
             with _sessions_lock:
                 _owned_tabs.setdefault(key, record)
+                _closing_tabs.discard((server, record["user_id"], tab_id))
                 stale = _stale_tab_ids.setdefault(record["user_id"], set())
                 if not was_stale:
                     stale.discard(tab_id)
@@ -571,11 +577,15 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
             continue
 
         with _sessions_lock:
+            _closing_tabs.discard((server, record["user_id"], tab_id))
+            # Keep the post-delete stale fence even if a concurrent GET pruned it.
+            _stale_tab_ids.setdefault(record["user_id"], set()).add(tab_id)
             session = _sessions.get(owner)
             if session and session.get("closing_tab_id") == tab_id:
                 session.pop("closing_tab_id", None)
-                session["carried"] = True
-        leases.release(server, record["user_id"], tab_id)
+                if session.get("tab_id") is None:
+                    session["carried"] = True
+            leases.release(server, record["user_id"], tab_id)
 
 
 def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[str, Any]:
@@ -659,7 +669,8 @@ def _release_unused_tab_lease(tab_id: Optional[str], user_id: str) -> None:
     server = get_camofox_url()
     owned = any(k[2:] == (server, tab_id) and r["user_id"] == user_id for k, r in _owned_tabs.items())
     bound = any(s.get("tab_id") == tab_id and s.get("user_id") == user_id for s in _sessions.values())
-    if not owned and not bound:
+    closing = (server, user_id, tab_id) in _closing_tabs
+    if not owned and not bound and not closing:
         from tools import browser_camofox_leases as leases
         leases.release(server, user_id, tab_id)
 
@@ -745,9 +756,16 @@ def _release_retained_tab_ownership(task_ids: set[str]) -> None:
             profile, owner, server, tab_id = key
             if profile == hermes_home_key() and owner in task_ids and record.get("kept"):
                 _owned_tabs.pop(key, None)
-                released.append((server, record["user_id"], tab_id))
-    for server, user_id, tab_id in released:
-        leases.release(server, user_id, tab_id)
+                still_bound = any(session.get("tab_id") == tab_id and
+                                  session.get("user_id") == record["user_id"]
+                                  for session in _sessions.values())
+                still_owned = any(other[2:] == (server, tab_id) and
+                                  value["user_id"] == record["user_id"]
+                                  for other, value in _owned_tabs.items())
+                if not still_bound and not still_owned:
+                    released.append((server, record["user_id"], tab_id))
+        for server, user_id, tab_id in released:
+            leases.release(server, user_id, tab_id)
 
 
 def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool = False) -> None:
@@ -919,7 +937,8 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
                 elif is_protected and not owns_protection:
                     protected_detached = True
                     session["tab_id"] = None
-                elif not leases.claim(get_camofox_url(), user_id, tab_id):
+                elif ((get_camofox_url(), user_id, tab_id) in _closing_tabs or
+                      not leases.claim(get_camofox_url(), user_id, tab_id)):
                     ownership_detached = True
                 else:
                     session["tab_id"] = tab_id
