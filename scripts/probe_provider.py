@@ -20,7 +20,10 @@ def _endpoint():
     from agent.secret_scope import load_env_file
     from hermes_cli.auth import has_usable_secret, read_credential_pool
     from hermes_cli.config import load_config_readonly
-    from hermes_cli.config_providers import _canonical_api_mode, get_compatible_custom_providers
+    from hermes_cli.config_read_errors import FailedConfigRead
+    from hermes_cli.config_providers import (
+        _canonical_api_mode, _normalize_custom_provider_entry, get_compatible_custom_providers,
+    )
     from hermes_cli.runtime_provider import _get_named_custom_provider, _raise_if_provider_disabled
     from hermes_cli.runtime_provider_custom import _key_env_secret
     from hermes_constants import get_hermes_home
@@ -30,6 +33,9 @@ def _endpoint():
     for name, value in load_env_file(get_hermes_home() / ".env").items():
         os.environ.setdefault(name, value)
     config = load_config_readonly()
+    # Last-known-good fallback is useful to the agent, not a current-route probe.
+    if isinstance(config, FailedConfigRead):
+        raise ValueError
     model = config.get("model") or {}
     requested = str(model.get("provider") or "").strip().lower()
     _raise_if_provider_disabled(requested)
@@ -43,11 +49,17 @@ def _endpoint():
         # and key_env-over-inline precedence for keyed providers.
         # Runtime lookup intentionally omits legacy key_cmd and invalid modes;
         # recover safety metadata only, never endpoint/credential selection.
-        safety_entry = next((candidate for candidate in get_compatible_custom_providers(config)
-                             if (entry.get("provider_key") and candidate.get("provider_key") == entry["provider_key"])
-                             or (not entry.get("provider_key") and not candidate.get("provider_key")
+        if entry.get("provider_key"):
+            # The picker view can deduplicate this block against a legacy entry.
+            provider_key = entry["provider_key"]
+            safety_entry = _normalize_custom_provider_entry(
+                (config.get("providers") or {}).get(provider_key), provider_key=provider_key,
+            ) or {}
+        else:
+            safety_entry = next((candidate for candidate in get_compatible_custom_providers(config)
+                                 if not candidate.get("provider_key")
                                  and candidate.get("name") == entry.get("name")
-                                 and candidate.get("base_url") == entry.get("base_url"))), {})
+                                 and candidate.get("base_url") == entry.get("base_url")), {})
     mode = _canonical_api_mode(str(safety_entry.get("api_mode") or safety_entry.get("transport") or ""))
     if (not entry or not safety_entry or safety_entry.get("key_cmd") or safety_entry.get("extra_headers")
             or mode not in {"", "chat_completions", "codex_responses"}):

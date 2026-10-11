@@ -121,7 +121,50 @@ def test_probe_refuses_unsafe_or_unsupported_configuration(tmp_path, entry):
     assert "configuration" in result.stdout
 
 
-@pytest.mark.parametrize("conflict", ["endpoint", "credential"])
+def test_probe_refuses_last_known_good_backup_without_contacting_provider(tmp_path):
+    key = "backup-fixture-credential"
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, format, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(json.dumps({
+        "model": {"provider": "fixture"}, "providers": {"fixture": {
+            "base_url": f"http://127.0.0.1:{server.server_port}/backup", "api_key": key,
+        }},
+    }))
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    try:
+        # A successful real load leaves the good backup used by a fresh process.
+        seed = subprocess.run([sys.executable, "-c", """
+from hermes_cli.config import load_config_readonly
+assert load_config_readonly()['model']['provider'] == 'fixture'
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+        assert seed.returncode == 0, "valid config did not load"
+        assert list((tmp_path / "backups" / "config").glob("config.yaml.good.*"))
+        config_path.write_text(f"model: [{key}\n")
+        result = _run(tmp_path, key, "config")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert requests == [], "probe contacted the stale backup endpoint"
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "configuration" in result.stdout
+
+
+@pytest.mark.parametrize("conflict", ["endpoint", "credential", "duplicate"])
 def test_probe_matches_runtime_custom_resolution(tmp_path, conflict):
     """The diagnostic and the real runtime must use the same selected route."""
     key = "fresh-fixture-credential"
@@ -145,6 +188,8 @@ def test_probe_matches_runtime_custom_resolution(tmp_path, conflict):
     config = {"model": {"provider": "fixture"}, "providers": {"fixture": entry}}
     if conflict == "endpoint":
         config["custom_providers"] = [{"name": "fixture", "base_url": base_url + "/legacy", "api_key": key}]
+    elif conflict == "duplicate":
+        config["custom_providers"] = [{"name": "fixture", "base_url": base_url, "api_key": stale_key}]
     else:
         entry.update(api_key=stale_key, key_env="PROBE_TEST_KEY")
     (tmp_path / "config.yaml").write_text(json.dumps(config))
