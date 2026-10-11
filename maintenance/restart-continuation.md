@@ -55,8 +55,8 @@ reconcile-before-retry hint. CLI cleanup passes a neutral delegation stop reason
 historical `CLI shutdown` reasons are sanitized only when presenting notices.
 Cron persisted errors and direct owner notices likewise state the unfinished
 outcome, without promising a retry for jobs no longer scheduled. The new
-`gateway.shutdown.cron_stopped` key falls back to English until translated; old
-cause-based locale strings are no longer used by this path.
+`gateway.shutdown.cron_stopped` key carries English text in every locale until
+translated, and the retired cause-based keys were removed.
 
 ## Provenance and patches
 
@@ -81,7 +81,8 @@ For routine-stop wording, also run `tests/tools/test_routine_stop_notifications.
 `tests/hermes_cli/test_cli_delegation_stop_notice.py`,
 `tests/cron/test_shutdown_interrupt.py`,
 `tests/gateway/test_cron_interrupt_notification.py`, and
-`tests/gateway/test_cron_active_work_drain.py`.
+`tests/gateway/test_cron_active_work_drain.py`, plus `tests/agent/test_i18n.py`
+for locale key parity.
 Also run `tests/gateway/test_stop_resume_marker_generation.py` for busy and idle
 stop, unrelated interrupts, repeated marks, and durable routing readback.
 The policy file must prove: platform override > global > adapter default,
