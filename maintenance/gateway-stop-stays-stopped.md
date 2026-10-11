@@ -20,7 +20,10 @@ async-delegation or process-completion injection, or goal pause/revival.
   older releases ignore). Both the memory and durable paths validate the owning route.
   Stop captures the routing entry before yielding: compression changes its id in place,
   while reset/resume replaces it. This preserves a hold across compression but never
-  grants a replaced route's hold to a successor. After a gateway restart, held
+  grants a replaced route's hold to a successor. Startup recovery also preserves the
+  hold when SQLite has committed a verified compression child but the routing entry
+  still names its ended parent; recovery to an unrelated session never inherits it.
+  After a gateway restart, held
   completions stay held until the user sends a turn. Completions
   pinned to compression ancestors resolve their current conversation owner via
   `GatewayNotificationsMixin._resolve_compression_lineage_target`, the same
@@ -77,8 +80,10 @@ Upstream comparison on 2026-10-02:
 
 Run `scripts/run_tests.sh tests/gateway/test_stop_pauses_goal_and_holds_wakes.py
 tests/gateway/test_stop_loop_responsiveness.py`. The regressions exercise durable
-parent-id delegations after compression/stop/restart; reset rejection BEFORE and
-after restart; ownership changes at warm-up/executor admission; and suspended
+parent-id delegations after compression/stop/restart; `/stop` before a committed
+compression child with a restart before routing advancement (and unrelated-session
+recovery rejection); reset rejection BEFORE and after restart; ownership changes
+at warm-up/executor admission; and suspended
 goal/store writes. A real loop-thread generation claim must leave a 50 ms heartbeat
 under 200 ms even while stop persistence is held on a threading event. Newer goal
 writes serialize at SQLite instead of blocking generation claims. Same-generation

@@ -172,6 +172,61 @@ async def test_stop_latch_survives_gateway_restart(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("compression_continuation", [True, False])
+async def test_stop_hold_survives_startup_compression_recovery_only(
+    monkeypatch, compression_continuation,
+):
+    import json
+    from gateway.session import SessionStore
+    from hermes_state import SessionDB
+
+    runner, _adapter, source, key, parent_id = await _runner(monkeypatch)
+    await runner._handle_stop_command(MessageEvent(text="/stop", source=source))
+    store = runner.session_store
+    assert store.is_stop_latched(key, session_id=parent_id)
+    assert store.get_prompt_pin(key) is None  # hold recovery must not depend on a prompt pin
+
+    def commit_successor():
+        db = store._db_for_key(key)
+        assert isinstance(db, SessionDB)
+        if compression_continuation:
+            assert db.try_acquire_compression_lock(parent_id, "startup-recovery-test")
+            db.publish_compression_child(
+                parent_session_id=parent_id, child_session_id="startup-child",
+                source="telegram", messages=[{"role": "user", "content": "summary"}],
+                compression_lock_holder="startup-recovery-test",
+            )
+        else:
+            # A newer session for the same peer is not a compression continuation.
+            db.end_session(parent_id, "compression")
+            db.create_session(
+                session_id="startup-child", source="telegram", session_key=key,
+                chat_id=source.chat_id, chat_type=source.chat_type, user_id=source.user_id,
+            )
+        persisted = json.loads(db.load_gateway_routing_entries(scope=store._routing_scope())[key])
+        assert persisted["session_id"] == parent_id
+        assert persisted["stop_latched"] is True
+
+    await asyncio.to_thread(commit_successor)
+    # Crash before advance_compression_session: reload SQLite's stale parent route,
+    # without admitting a user turn that would legitimately clear the hold.
+    restarted = SessionStore(sessions_dir=store.sessions_dir, config=store.config)
+
+    def verify_recovery():
+        assert restarted.is_stop_latched(key, session_id="startup-child") is compression_continuation
+        recovered = restarted.get_or_create_session(source)
+        assert recovered.session_id == "startup-child"
+        assert not restarted.is_stop_latched(key, session_id=parent_id)
+        db = restarted._db_for_key(key)
+        assert isinstance(db, SessionDB)
+        persisted = json.loads(db.load_gateway_routing_entries(scope=restarted._routing_scope())[key])
+        assert persisted["session_id"] == "startup-child"
+        assert persisted["stop_latched"] is compression_continuation
+
+    await asyncio.to_thread(verify_recovery)
+
+
+@pytest.mark.asyncio
 async def test_compression_ancestor_completion_stays_held_after_restart(monkeypatch):
     from hermes_cli.goals import _get_session_db
 
