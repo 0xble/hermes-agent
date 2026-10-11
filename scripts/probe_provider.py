@@ -1,147 +1,101 @@
 #!/usr/bin/env python3
-"""One status-only GET to the configured custom OpenAI-compatible provider.
+"""One status-only GET for an explicit, unambiguous providers.<key> entry.
 
-Run with the checkout's Python and no arguments. Credentials are read here,
-never accepted on argv. This is a dedicated process, not an in-process API.
+Run with the checkout's Python and exactly one config key, never a credential.
+This is a dedicated process, not an in-process API or general runtime resolver.
 """
 
 from contextlib import redirect_stderr, redirect_stdout
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def _endpoint():
+def _endpoint(requested):
+    from agent.bedrock_adapter import is_bedrock_openai_base_url
     from agent.credential_pool import custom_provider_pool_key_candidates
+    from agent.gemini_native_adapter import is_native_gemini_base_url
     from agent.secret_scope import load_env_file
     from hermes_cli.auth import has_usable_secret, read_credential_pool
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import is_provider_enabled, load_config_readonly
     from hermes_cli.config_read_errors import FailedConfigRead
-    from hermes_cli.config_providers import (
-        _canonical_api_mode, _normalize_custom_provider_entry, get_compatible_custom_providers,
-    )
-    from hermes_cli.runtime_provider import (
-        _VERTEX_NAMES, _get_named_custom_provider, _raise_if_provider_disabled,
-    )
-    from hermes_cli.runtime_provider_custom import _key_env_secret
+    from hermes_cli.config_providers import _canonical_api_mode
+    from hermes_cli.providers import custom_provider_aliases, is_actual_route
+    from hermes_cli.runtime_provider import _VERTEX_NAMES, _detect_api_mode_for_url, _host_gated_env_key_candidates
+    from hermes_cli.runtime_provider_custom import _match_new_style_provider, _opencode_family_for_custom, _shadowed_by_builtin
     from hermes_constants import get_hermes_home
 
-    # Match CLI startup's process-env-over-dotenv boundary before the runtime
-    # lookup resolves key_env (including when an inline key is also present).
+    # CLI startup's process-env-over-dotenv boundary. No general env routing.
     for name, value in load_env_file(get_hermes_home() / ".env").items():
         os.environ.setdefault(name, value)
     config = load_config_readonly()
-    # Last-known-good fallback is useful to the agent, not a current-route probe.
     if isinstance(config, FailedConfigRead):
         raise ValueError
+    providers = config.get("providers") or {}
+    entry = providers.get(requested)
+    if (not isinstance(entry, dict) or not is_provider_enabled(entry)
+            or requested in {"custom", "auto", "moa", *_VERTEX_NAMES}
+            or _shadowed_by_builtin(requested)):
+        raise ValueError
+    aliases = custom_provider_aliases(entry.get("name") or requested, requested)
+    # Refuse all overlapping declarations, even identical duplicates. This is
+    # admission, not a second implementation of runtime precedence/deduplication.
+    declarations = [(key, item) for key, item in providers.items() if key != requested]
+    legacy = config.get("custom_providers") or []
+    if not isinstance(legacy, list):
+        raise ValueError
+    declarations += [(item.get("provider_key", ""), item) for item in legacy]
+    if any(aliases & custom_provider_aliases(item.get("name") or key, key)
+           for key, item in declarations):
+        raise ValueError
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if any(value and (name.endswith("_BASE_URL") or name in {
+            "HERMES_INFERENCE_PROVIDER", "CUSTOM_API_KEY", "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY", "OLLAMA_API_KEY",
+            } or (name.endswith("_API_KEY") and name != key_env))
+           for name, value in os.environ.items()):
+        raise ValueError
+    mode = _canonical_api_mode(entry.get("api_mode") or entry.get("transport") or "")
     model = config.get("model") or {}
-    requested = str(model.get("provider") or "").strip().lower()
-    _raise_if_provider_disabled(requested)
-    # Runtime ladder rung 2 claims these names before any custom entry
-    # (hermes_cli/runtime_provider.py:_resolve_requested_shortcuts).
-    if requested in {"moa", "azure-foundry", *_VERTEX_NAMES}:
+    if (entry.get("key_cmd") or entry.get("extra_headers")
+            or mode not in {"", "chat_completions", "codex_responses"}
+            or model.get("openai_runtime") == "codex_app_server"):
         raise ValueError
-    entry = _get_named_custom_provider(requested) or {}
-    if not entry and requested == "custom":
-        entry = model
-        safety_entry = model
-    else:
-        # This is the agent's actual read-only endpoint/credential lookup, not
-        # the legacy-first picker view. It preserves providers-first routing
-        # and key_env-over-inline precedence for keyed providers.
-        # Runtime lookup intentionally omits legacy key_cmd and invalid modes;
-        # recover safety metadata only, never endpoint/credential selection.
-        if entry.get("provider_key"):
-            # The picker view can deduplicate this block against a legacy entry.
-            provider_key = entry["provider_key"]
-            safety_entry = _normalize_custom_provider_entry(
-                (config.get("providers") or {}).get(provider_key), provider_key=provider_key,
-            ) or {}
-        else:
-            safety_entry = next((candidate for candidate in get_compatible_custom_providers(config)
-                                 if not candidate.get("provider_key")
-                                 and candidate.get("name") == entry.get("name")
-                                 and candidate.get("base_url") == entry.get("base_url")), {})
-    mode = _canonical_api_mode(str(safety_entry.get("api_mode") or safety_entry.get("transport") or ""))
-    if (not entry or not safety_entry or safety_entry.get("key_cmd") or safety_entry.get("extra_headers")
-            or mode not in {"", "chat_completions", "codex_responses"}):
+    # Reuse the runtime's keyed-entry lookup for URL/key_env/inline precedence.
+    # Never call load_pool, select, or the full runtime builder (they can write,
+    # refresh credentials, execute key_cmd, and auto-detect local models).
+    resolved = _match_new_style_provider(requested, {requested: entry}) or {}
+    base = str(resolved.get("base_url") or "").strip().rstrip("/")
+    key = resolved.get("api_key") or ""
+    if ((resolved.get("api_mode") or _detect_api_mode_for_url(base) or "chat_completions")
+            not in {"chat_completions", "codex_responses"}
+            or is_native_gemini_base_url(base) or is_bedrock_openai_base_url(base)
+            or is_actual_route("custom", base) or _opencode_family_for_custom(requested, base)
+            or any(_host_gated_env_key_candidates(base, ollama=True))):
         raise ValueError
-
-    base = str(entry.get("base_url") or "").strip().rstrip("/")
-    # The wire is what the runtime would pick, not just what config declares.
-    base, effective_mode = _runtime_transport(requested, entry, model, base)
-    if effective_mode not in {"chat_completions", "codex_responses"}:
+    # Runtime pool lookup tries the durable provider_key, legacy display slug,
+    # then URL matches. Also guard every current/legacy identity and bare custom.
+    identities = {*aliases, "custom"}
+    pool_keys = set(identities)
+    for identity in identities:
+        pool_keys.update(custom_provider_pool_key_candidates(base, identity))
+    pools = read_credential_pool()
+    if any(pools.get(name) for name in pool_keys):
         raise ValueError
-    # Do not call the full runtime builder: load_pool seeds/persists auth.json
-    # (agent/credential_pool.py:3087-3119), and select can refresh credentials
-    # (:1992-1998). Persisted pools are outside this static diagnostic boundary.
-    if any(read_credential_pool(name) for name in custom_provider_pool_key_candidates(base, requested)):
-        raise ValueError
-    # Mirror only the no-pool named-runtime tail's configured-key candidates
-    # (hermes_cli/runtime_provider_custom.py:560-566), using its own key-env
-    # reader. Host-derived/fallback credentials remain unsupported/fail-closed.
-    inline_key = str(entry.get("api_key") or "").strip()
-    key = inline_key if has_usable_secret(inline_key) else _key_env_secret(entry, requested)
     parsed = urlsplit(base)
-    if (not key or "\r" in key or "\n" in key or not parsed.hostname
+    if (not has_usable_secret(key) or "\r" in key or "\n" in key or not parsed.hostname
             or parsed.username is not None or parsed.password is not None
             or parsed.query or parsed.fragment or key in unquote(base)
             or (parsed.scheme != "https" and not (
                 parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}))):
         raise ValueError
-    # Validate the port before giving a malformed URL to the transport.
     parsed.port
     return base + "/models", key
-
-
-def _runtime_transport(requested, entry, model, base):
-    """(base_url, api_mode) the no-pool runtime would use for this route.
-
-    Composes the runtime's own read-only mode helpers in its order
-    (hermes_cli/runtime_provider_custom.py:_resolve_named_custom_runtime and
-    runtime_provider_backends.py:_resolve_openrouter_runtime, then the
-    resolve_runtime_provider overlay), skipping only its stateful pool rung and
-    the local model auto-detect GET. URL-routed client wires that keep
-    ``chat_completions`` (native Gemini, Bedrock Mantle SigV4) map to their own
-    pseudo-modes so the caller refuses them too.
-    """
-    from agent.bedrock_adapter import is_bedrock_openai_base_url
-    from agent.gemini_native_adapter import is_native_gemini_base_url
-    from hermes_cli.auth import normalize_actual_base_url
-    from hermes_cli.config import split_model_config_default
-    from hermes_cli.models import normalize_opencode_base_url, opencode_model_api_mode
-    from hermes_cli.providers import is_actual_route
-    from hermes_cli.runtime_provider import (
-        _detect_api_mode_for_url, _maybe_apply_codex_app_server_runtime, _resolve_plain_custom_api_mode,
-    )
-    from hermes_cli.runtime_provider_custom import _opencode_family_for_custom
-
-    if entry is model:
-        mode = _resolve_plain_custom_api_mode(model, base)
-    else:
-        mode = entry.get("api_mode") or _detect_api_mode_for_url(base) or "chat_completions"
-    # Each rung's _runtime() pins Actual before the codex app-server overlay.
-    if is_actual_route("custom", base):
-        mode, base = "chat_completions", normalize_actual_base_url(base)
-    if entry is not model:
-        family = _opencode_family_for_custom(requested, base)
-        if family is not None and not entry.get("api_mode"):
-            effective_model = str(entry.get("model") or "").strip() or split_model_config_default(
-                model.get("default") or model.get("model"))[0]
-            if effective_model:
-                mode = opencode_model_api_mode(family, effective_model)
-            base = normalize_opencode_base_url(family, mode, base)
-    mode = _maybe_apply_codex_app_server_runtime(provider="custom", api_mode=mode, model_cfg=model,
-                                                 requested_provider=requested)
-    if is_native_gemini_base_url(base):
-        mode = "gemini_native"
-    elif is_bedrock_openai_base_url(base):
-        mode = "bedrock_mantle"
-    return base, mode
 
 
 def _emit(message):
@@ -157,15 +111,15 @@ def main():
     # HTTP DEBUG logs include headers and reflected reason phrases. This standalone
     # process needs only a status, not logs or config-loader parse-warning excerpts.
     logging.disable(logging.CRITICAL)
-    if sys.argv[1:]:
-        _emit("Provider probe refused (arguments unsupported; use configuration).")
+    if len(sys.argv) != 2 or not re.fullmatch(r"[a-z][a-z0-9_-]*", sys.argv[1]):
+        _emit("Provider probe refused (use exactly one providers.<key> config key; never a credential).")
         return 2
     with open(os.devnull, "w", encoding="utf-8") as sink, redirect_stdout(sink), redirect_stderr(sink):
         try:
-            url, key = _endpoint()
+            url, key = _endpoint(sys.argv[1])
             import httpx
         except Exception:
-            code, message = 2, "Provider probe refused (configuration unsupported or incomplete)."
+            code, message = 2, "Provider probe refused (configuration ambiguous or unsupported; use an unambiguous keyed providers entry)."
         else:
             try:
                 with httpx.Client(timeout=5.0, follow_redirects=False, trust_env=False) as client:

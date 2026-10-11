@@ -21,32 +21,62 @@ import logging, os, runpy, socket, sys
 _resolve = socket.getaddrinfo
 socket.getaddrinfo = lambda _host, port, *args, **kwargs: _resolve("127.0.0.1", port, *args, **kwargs)
 logging.basicConfig(filename=os.environ['PROBE_TEST_LOG'], level=logging.DEBUG)
-sys.argv = ['provider-probe']
+sys.argv = ['provider-probe', *sys.argv[1:]]
 runpy.run_path('scripts/probe_provider.py', run_name='__main__')
 """
 
 
-def _run(home, key, source):
+def _write_config(home, port, key, source):
+    entry = {"base_url": f"http://127.0.0.1:{port}/v1", "api_key": key}
+    if source != "config":
+        entry.update(api_key="stale-fixture-credential", key_env="PROBE_TEST_KEY")
+    (home / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "fixture"}, "providers": {"fixture": entry},
+    }))
+
+
+def _run(home, key, source, *, overrides=None, provider="fixture"):
     env = os.environ.copy()
     env.update(HERMES_HOME=str(home), PROBE_TEST_LOG=str(home / "probe.log"),
                HERMES_REDACT_SECRETS="false")
     env.pop("PROBE_TEST_KEY", None)
     if source == "env":
         env["PROBE_TEST_KEY"] = key
-    command = [sys.executable, "-c", BOOTSTRAP]
+    env.update(overrides or {})
+    command = [sys.executable, "-c", BOOTSTRAP, *([provider] if provider is not None else [])]
     result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
                             text=True, timeout=30)
     assert key not in " ".join(command)
     output = result.stdout + result.stderr + (home / "probe.log").read_text()
     assert key not in output
     assert "sk-reflected-only-1234567890" not in output
+    if result.returncode in {0, 1}:
+        config = json.loads((home / "config.yaml").read_text())
+        entry = config["providers"][provider]
+        env.update(PROBE_EXPECTED_BASE=entry.get("api") or entry.get("url") or entry["base_url"],
+                   PROBE_EXPECTED_KEY=key, PROBE_REQUESTED=provider)
+        # Reference AFTER the probe; disable only the stateful pool rung.
+        reference = subprocess.run([sys.executable, "-c", """
+import os
+from unittest.mock import patch
+from hermes_cli.runtime_provider import resolve_runtime_provider
+from agent.secret_scope import load_env_file
+from hermes_constants import get_hermes_home
+for name, value in load_env_file(get_hermes_home() / '.env').items():
+    os.environ.setdefault(name, value)
+with patch('hermes_cli.runtime_provider._try_resolve_from_custom_pool', return_value=None):
+    runtime = resolve_runtime_provider(requested=os.environ['PROBE_REQUESTED'])
+assert runtime['base_url'] == os.environ['PROBE_EXPECTED_BASE'].strip().rstrip('/')
+assert runtime['api_key'] == os.environ['PROBE_EXPECTED_KEY']
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+        assert reference.returncode == 0, "accepted probe route diverged from the runtime"
     return result
 
 
 @pytest.mark.parametrize("status,source,shape", [
-    (200, "env", "providers"), (401, "config", "custom_providers"),
-    (500, "dotenv", "model"), (302, "env", "providers"),
-    (0, "config", "model"),
+    (200, "env", "providers"), (401, "config", "providers"),
+    (500, "dotenv", "providers"), (302, "env", "providers"),
+    (0, "config", "providers"),
 ])
 def test_probe_uses_configured_endpoint_without_disclosing_credentials(tmp_path, status, source, shape):
     key = "opaque/probe+credential=" if source != "dotenv" else "sk-probe-fixture-1234567890"
@@ -80,12 +110,7 @@ def test_probe_uses_configured_endpoint_without_disclosing_credentials(tmp_path,
     }
     entry.update({"api_key": key} if source == "config" else {"key_env": "PROBE_TEST_KEY"})
     config = {"model": {"provider": "fixture"}, "security": {"redact_secrets": False}}
-    if shape == "model":
-        config["model"].update(entry, provider="custom")
-    elif shape == "providers":
-        config["providers"] = {"fixture": entry}
-    else:
-        config["custom_providers"] = [{"name": "fixture", **entry}]
+    config["providers"] = {"fixture": entry}
     (tmp_path / "config.yaml").write_text(json.dumps(config))
     if source == "dotenv":
         (tmp_path / ".env").write_text(f"PROBE_TEST_KEY={key}\n")
@@ -170,7 +195,7 @@ assert load_config_readonly()['model']['provider'] == 'fixture'
     assert "configuration" in result.stdout
 
 
-@pytest.mark.parametrize("conflict", ["endpoint", "credential", "duplicate"])
+@pytest.mark.parametrize("conflict", ["endpoint", "credential", "duplicate", "inline", "env-unset", "api-key-env"])
 def test_probe_matches_runtime_custom_resolution(tmp_path, conflict):
     """The diagnostic and the real runtime must use the same selected route."""
     key = "fresh-fixture-credential"
@@ -196,8 +221,10 @@ def test_probe_matches_runtime_custom_resolution(tmp_path, conflict):
         config["custom_providers"] = [{"name": "fixture", "base_url": base_url + "/legacy", "api_key": key}]
     elif conflict == "duplicate":
         config["custom_providers"] = [{"name": "fixture", "base_url": base_url, "api_key": stale_key}]
-    else:
-        entry.update(api_key=stale_key, key_env="PROBE_TEST_KEY")
+    elif conflict in {"credential", "api-key-env"}:
+        entry.update(api_key=stale_key, **{"api_key_env" if conflict == "api-key-env" else "key_env": "PROBE_TEST_KEY"})
+    elif conflict == "env-unset":
+        entry["key_env"] = "PROBE_UNSET_KEY"
     (tmp_path / "config.yaml").write_text(json.dumps(config))
     try:
         result = _run(tmp_path, key, "env")
@@ -226,22 +253,32 @@ assert runtime['api_key'] == os.environ['PROBE_TEST_KEY']
 """], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert runtime.returncode == 0, "runtime fixture did not resolve the expected route"
     assert stale_key not in result.stdout + result.stderr + (tmp_path / "probe.log").read_text()
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert requests == [("/runtime/models", f"Bearer {key}")]
+    if conflict in {"endpoint", "duplicate"}:
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert requests == []
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert requests == [("/runtime/models", f"Bearer {key}")]
 
 
-def test_probe_refuses_persisted_credential_pools_without_mutating_them(tmp_path):
+@pytest.mark.parametrize("pool_identity", ["fixture", "display", "custom:display", "custom:fixture", "custom"], ids=str)
+def test_probe_refuses_persisted_credential_pools_without_mutating_them(tmp_path, pool_identity):
     key = "configured-fixture-credential"
-    config = {"model": {"provider": "fixture"}, "providers": {"fixture": {
-        "base_url": "http://127.0.0.1:1/v1", "api_key": key,
+    server, thread, connections = _connection_counter()
+    config = {"model": {"provider": "Display"}, "providers": {"fixture": {
+        "name": "Display", "base_url": f"http://127.0.0.1:{server.server_address[1]}/v1", "api_key": key,
     }}}
     (tmp_path / "config.yaml").write_text(json.dumps(config))
     auth_path = tmp_path / "auth.json"
-    auth_text = json.dumps({"credential_pool": {"fixture": [{
+    auth_text = json.dumps({"credential_pool": {pool_identity: [{
         "id": "fixture-pool", "access_token": "unsupported-pool-credential",
     }]}})
     auth_path.write_text(auth_text)
-    result = _run(tmp_path, key, "config")
+    try:
+        result = _run(tmp_path, key, "config")
+    finally:
+        _stop(server, thread)
+    assert connections == []
     assert result.returncode == 2, result.stdout + result.stderr
     assert "configuration" in result.stdout
     assert auth_path.read_text() == auth_text
@@ -262,6 +299,134 @@ def test_runtime_lookup_does_not_bypass_probe_safety_guards(tmp_path, shape, uns
     result = _run(tmp_path, key, "config")
     assert result.returncode == 2, result.stdout + result.stderr
     assert "configuration" in result.stdout
+
+
+@pytest.mark.parametrize("ambiguous", ["bare-custom-env", "display-name-pool", "legacy-only",
+                                        "env-route", "env-key", "alias-url", "alias-key"])
+def test_probe_refuses_ambiguous_routes_without_connection(tmp_path, ambiguous):
+    key = "ambiguous-fixture-credential"
+    server, thread, connections = _connection_counter()
+    base = f"http://127.0.0.1:{server.server_address[1]}/v1"
+    entry = {"base_url": base, "api_key": key}
+    config = {"model": {"provider": "fixture"}, "providers": {"fixture": entry}}
+    overrides = {}
+    auth_text = None
+    if ambiguous == "bare-custom-env":
+        config = {"model": {"provider": "custom", **entry}}
+        overrides["CUSTOM_BASE_URL"] = base + "/override"
+    elif ambiguous == "display-name-pool":
+        entry["name"] = "Display"
+        config["model"]["provider"] = "Display"
+        config["custom_providers"] = [{"name": "Display", "base_url": base + "/legacy", "api_key": key}]
+        auth_text = json.dumps({"credential_pool": {"fixture": [{
+            "id": "fixture-pool", "access_token": "unsupported-pool-credential",
+        }]}})
+        (tmp_path / "auth.json").write_text(auth_text)
+    elif ambiguous == "legacy-only":
+        config = {"model": {"provider": "fixture"}, "custom_providers": [{"name": "fixture", **entry}]}
+    elif ambiguous.startswith("env-"):
+        overrides["CUSTOM_BASE_URL" if ambiguous == "env-route" else "OPENAI_API_KEY"] = base
+    else:
+        config["custom_providers"] = [{"name": "custom:fixture", **entry}]
+        config["custom_providers"][0].update(
+            {"base_url": base + "/other"} if ambiguous == "alias-url" else {"api_key": "other-credential"})
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    try:
+        result = _run(tmp_path, key, "config", overrides=overrides,
+                      provider="custom" if ambiguous == "bare-custom-env" else "fixture")
+    finally:
+        _stop(server, thread)
+    assert connections == [], "ambiguous provider route opened a connection"
+    assert result.returncode == 2, result.stdout + result.stderr
+    if auth_text is not None:
+        assert (tmp_path / "auth.json").read_text() == auth_text
+
+
+@pytest.mark.parametrize("variable", [
+    "CUSTOM_BASE_URL", "OPENAI_BASE_URL", "OPENROUTER_BASE_URL", "HERMES_CODEX_BASE_URL",
+    "CUSTOM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_API_KEY",
+    "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY", "ZAI_API_KEY", "ZAI_CN_API_KEY",
+    "KIMI_API_KEY", "DEEPSEEK_API_KEY", "MISTRAL_API_KEY", "SYNTHETIC_API_KEY",
+    "KILOCODE_API_KEY", "AI_GATEWAY_API_KEY", "HERMES_INFERENCE_PROVIDER",
+])
+def test_probe_refuses_routing_env_overrides_before_connecting(tmp_path, variable):
+    key = "declared-fixture-credential"
+    server, thread, connections = _connection_counter()
+    _write_config(tmp_path, server.server_address[1], key, "config")
+    # Cover shell and dotenv overrides, not only CUSTOM_BASE_URL.
+    (tmp_path / ".env").write_text(f"{variable}=override-value\n")
+    try:
+        result = _run(tmp_path, key, "config")
+    finally:
+        _stop(server, thread)
+    assert result.returncode == 2
+    assert connections == []
+
+
+@pytest.mark.parametrize("provider", [None, "custom", "custom:fixture", "display", "missing"])
+def test_probe_requires_explicit_key_not_model_or_display_alias(tmp_path, provider):
+    key = "selected-fixture-credential"
+    server, thread, connections = _connection_counter()
+    _write_config(tmp_path, server.server_address[1], key, "config")
+    config = json.loads((tmp_path / "config.yaml").read_text())
+    config["providers"]["fixture"]["name"] = "Display"
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    try:
+        result = _run(tmp_path, key, "config", provider=provider)
+    finally:
+        _stop(server, thread)
+    assert result.returncode == 2
+    assert connections == []
+
+
+@pytest.mark.parametrize("declaration", ["providers", "custom_providers"])
+@pytest.mark.parametrize("alias", ["fixture", "Display", "custom:fixture", "custom:Display"])
+def test_probe_refuses_any_overlapping_declaration(tmp_path, declaration, alias):
+    key = "selected-fixture-credential"
+    server, thread, connections = _connection_counter()
+    _write_config(tmp_path, server.server_address[1], key, "config")
+    config = json.loads((tmp_path / "config.yaml").read_text())
+    config["providers"]["fixture"]["name"] = "Display"
+    other = {"name": alias, "base_url": "https://other.invalid/v1", "api_key": "other-credential"}
+    if declaration == "providers":
+        config["providers"]["other"] = other
+    else:
+        config["custom_providers"] = [other]
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    try:
+        result = _run(tmp_path, key, "config")
+    finally:
+        _stop(server, thread)
+    assert result.returncode == 2
+    assert connections == []
+
+
+@pytest.mark.parametrize("shape", ["name", "model-ignored", "env-suffix", "url-alias", "api-alias"])
+def test_probe_accepted_keyed_entry_matches_runtime(tmp_path, shape):
+    key = "runtime-parity-fixture-credential"
+    server, thread, connections = _connection_counter()
+    _write_config(tmp_path, server.server_address[1], key, "config")
+    config = json.loads((tmp_path / "config.yaml").read_text())
+    entry = config["providers"]["fixture"]
+    overrides = {}
+    if shape == "name":
+        entry["name"] = "Display"
+        config["model"]["provider"] = "Display"
+    elif shape == "model-ignored":
+        config["model"] = {"provider": "custom", "base_url": "https://unselected.invalid/v1"}
+    elif shape == "env-suffix":
+        entry.update(key_env="FIXTURE_API_KEY", api_key="stale-fixture-key")
+        overrides["FIXTURE_API_KEY"] = key
+    else:
+        entry["api" if shape == "api-alias" else "url"] = entry.pop("base_url")
+    (tmp_path / "config.yaml").write_text(json.dumps(config))
+    try:
+        result = _run(tmp_path, key, "config", overrides=overrides)
+    finally:
+        _stop(server, thread)
+    # Counter stub responds 500: acceptance still must make exactly one connection.
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(connections) == 1
 
 
 # Every non-OpenAI wire the runtime can select for a configured custom route.
@@ -378,7 +543,7 @@ def test_probe_refuses_every_runtime_selected_non_openai_transport(tmp_path, rou
         # The fixture really is a route the runtime sends over a non-OpenAI wire.
         assert json.loads(reference.stdout.strip().splitlines()[-1]) == expected
         assert connections == [], "runtime reference contacted the endpoint"
-        result = _run(tmp_path, key, "config")
+        result = _run(tmp_path, key, "config", provider=entry.get("name", "fixture"))
     finally:
         _stop(server, thread)
     assert connections == [], "probe contacted a non-OpenAI-compatible endpoint"
