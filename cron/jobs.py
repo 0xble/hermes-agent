@@ -2047,8 +2047,12 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
         latest = latest_executions([job.get("id", "") for job in jobs])
     except Exception:
         latest = {}
+    from cron.scheduler_control import running_job_state
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
+        running = running_job_state(job)
+        job["running"] = running["was_running"]
+        job["running_since"] = running["run_started_at"]
     return jobs
 
 
@@ -2214,17 +2218,25 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return _with_job(job_id, apply)
 
 
-def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def pause_job(
+    job_id: str, reason: Optional[str] = None, *, run_result: Optional[dict] = None,
+) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
         return None
-    return update_job(job["id"], {
+    updated = update_job(job["id"], {
         "enabled": False,
         "state": "paused",
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
     })
+    if updated is not None:
+        from cron.scheduler_control import interrupt_job_run
+        receipt = interrupt_job_run(job)
+        if run_result is not None:
+            run_result.update(receipt)
+    return updated
 
 
 def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -2363,7 +2375,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
     return _with_job(job_ref["id"], apply)
 
 
-def remove_job(job_id: str) -> bool:
+def remove_job(job_id: str, *, run_result: Optional[dict] = None) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
     if not job:
@@ -2381,6 +2393,10 @@ def remove_job(job_id: str) -> bool:
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == canonical_id:
             marker.removed = True
+        from cron.scheduler_control import interrupt_job_run
+        receipt = interrupt_job_run(job)
+        if run_result is not None:
+            run_result.update(receipt)
         if job_output_dir.exists():
             shutil.rmtree(job_output_dir)
         try:
@@ -2874,7 +2890,8 @@ def claim_job_for_fire(
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        job["fire_claim"] = {"at": now.isoformat(), "started_at": now.isoformat(),
+                             "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
@@ -2894,7 +2911,7 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
     report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
     def apply(jobs, _i, job):
-        return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
+        return is_job_runnable(job) and _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
     return _with_job(job_id, apply, False)
 

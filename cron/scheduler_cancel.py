@@ -22,5 +22,3 @@ class _CombinedCancelEvent:
     def set(self) -> None:
         for event in self._events:
             event.set()
-
-

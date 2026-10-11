@@ -425,6 +425,8 @@ _FORMAT_JOB_OPTIONAL_KEYS = (
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     from agent.redact import redact_sensitive_text
 
+    from cron.scheduler_control import running_job_state
+    run_state = running_job_state(job)
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
     job_id = str(job.get("id") or "unknown")
@@ -455,6 +457,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": job.get("enabled", True),
         # Derive from enabled so half-paused records never render as paused.
         "state": effective_job_state(job),
+        "running": run_state["was_running"],
+        "running_since": run_state["run_started_at"],
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }

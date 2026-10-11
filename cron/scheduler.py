@@ -653,6 +653,7 @@ _running_since: dict = {}
 # in-flight key -> stale-inflight allowance (s), resolved once per run by get_wedged_job_ids.
 _running_allowance_s: dict = {}
 _running_futures: dict = {}
+_running_cancel_events: dict = {}
 
 # Installed in ``_running_futures`` at claim time so a sweep landing before ``pool.submit`` returns
 # never sees ``missing`` and releases a claim about to get its future.
@@ -799,6 +800,8 @@ def try_register_running_job(job_id: str) -> bool:
         # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
         _running_since[key] = time.time()
         _running_futures[key] = _FUTURE_PENDING
+        from cron.scheduler_control import register_control
+        register_control(key)
         return True
 
 
@@ -816,6 +819,7 @@ def release_running_job(job_id: str, home: Optional[Union[Path, str]] = None) ->
         _running_since.pop(key, None)
         _running_allowance_s.pop(key, None)
         _running_futures.pop(key, None)
+        _running_cancel_events.pop(key, None)
         _running_worker_pids.pop(key, None)
         _external_worker_modes.pop(key, None)
 
@@ -1058,6 +1062,7 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             _running_since.pop(key, None)
             _running_allowance_s.pop(key, None)
             _running_futures.pop(key, None)
+            _running_cancel_events.pop(key, None)
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 
@@ -1942,7 +1947,8 @@ def _run_agent_with_watchdog(
         if cancel_event is None or not cancel_event.is_set():
             return
         if agent is not None and hasattr(agent, "interrupt"):
-            agent.interrupt("Cron fire claim ownership was lost")
+            request_hard_interrupt(
+                agent, "Cron run cancelled or fire claim ownership lost", tool_reason="cron run cancelled")
         raise RuntimeError(f"Cron job '{job_name}' lost its durable fire claim ownership")
 
     def _heartbeat_run_claim_if_due():
@@ -2752,7 +2758,16 @@ def run_one_job(
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
+    from cron.scheduler_control import register_control
+    control_key = _inflight_key(job["id"])
+    with _running_lock:
+        control = _running_cancel_events.get(control_key)
+    if control is not None and control.is_set():
+        finish_execution(execution_id, success=False, error="Cron job removed or paused before start.")
+        return True
     if not external_owner:
+        if control is not None:
+            control.local = False  # A gateway waiter cannot interrupt a detached worker.
         try:
             handed_off = _launch_external_cron_worker(job)
         except Exception as handoff_error:
@@ -2804,6 +2819,10 @@ def run_one_job(
             extra_prompt = str(_stamped)
     claim = job.get("fire_claim")
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    with _running_lock:
+        control = _running_cancel_events.get(control_key) or register_control(control_key)
+        control.local = True
+    cancel_event = _CombinedCancelEvent(control, cancel_event)
     execution_token = object()
     profile_home = _get_hermes_home().resolve()
     _fire_key = _inflight_key(job["id"])
@@ -2811,7 +2830,8 @@ def run_one_job(
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        with self_removal_delivery_scope(job["id"]):
+        from agent.interrupt_scope import bind_interrupt_scope
+        with self_removal_delivery_scope(job["id"]), bind_interrupt_scope(control.scope):
             return _run_with_fire_claim_heartbeat(
                 job,
                 lambda lost_ownership: _run_one_job_body(
@@ -2831,6 +2851,8 @@ def run_one_job(
                 executions.pop(execution_token, None)
                 if not executions:
                     _running_fire_owners.pop(_fire_key, None)
+            if _fire_key not in _running_job_ids and _running_cancel_events.get(_fire_key) is control:
+                _running_cancel_events.pop(_fire_key, None)
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
