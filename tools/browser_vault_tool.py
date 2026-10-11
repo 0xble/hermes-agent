@@ -915,6 +915,13 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     )
     protected_tab = browser_key if meta.kind in ("payment", "protected_field") else effective_task_id
     if meta.kind == "payment":
+        # A manager can store a formatted PAN; register its canonical digits
+        # too, so the redactor handles whatever separator the page adds/removes.
+        number = secret.get("card_number", "")
+        canonical_number = "".join(ch for ch in number if ch.isascii() and ch.isdigit())
+        if (13 <= len(canonical_number) <= 19
+                and all((ch.isascii() and ch.isdigit()) or ch.isspace() or ch == "-" for ch in number)):
+            register_vault_redaction_value(canonical_number)
         for field in ("card_number", "cvc"):
             register_vault_redaction_value(secret.get(field, ""))
         for field in ("cardholder_name", "exp_month", "exp_year", "billing_postal_code"):

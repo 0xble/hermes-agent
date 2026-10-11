@@ -171,6 +171,11 @@ def redact_registered_vault_values(text: str, *,
         values = sorted(bucket, key=len, reverse=True) if bucket else ()
     parts = _date_parts(tab, origin)
     for value in values:
+        if value.isascii() and value.isdigit() and 13 <= len(value) <= 19:
+            # Checkout masks commonly insert spaces, NBSPs or dashes into a
+            # registered PAN. Match only this known number, not arbitrary PANs.
+            pattern = r"(?<!\d)" + r"[\s-]*".join(value) + r"(?!\d)"
+            text = re.sub(pattern, "«redacted-vault-secret»", text)
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
     for _, value in parts:
