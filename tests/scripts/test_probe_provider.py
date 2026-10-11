@@ -285,6 +285,70 @@ def test_probe_refuses_persisted_credential_pools_without_mutating_them(tmp_path
     assert auth_path.read_text() == auth_text
 
 
+@pytest.mark.parametrize("recovery_exists", [False, True])
+@pytest.mark.parametrize("location", ["profile", "global"])
+@pytest.mark.parametrize("payload", [
+    b'{"credential_pool":{"fixture":[{"id":"fixture-pool"}]},',
+    b'\xff{"credential_pool":{"fixture":[{"id":"fixture-pool"}]}}',
+    b'[]',
+    b'{"credential_pool":[]}',
+    b'{"credential_pool":{"fixture":{}}}',
+    b'{"credential_pool":{"fixture":[null]}}',
+], ids=["truncated", "invalid-utf8", "non-object", "pool-non-object", "rows-non-list", "row-non-object"])
+def test_probe_refuses_malformed_auth_stores_without_connection_or_writes(
+        tmp_path, location, payload, recovery_exists):
+    key = "configured-fixture-credential"
+    home = tmp_path / "profiles" / "fixture"
+    home.mkdir(parents=True)
+    (home / "auth.json").write_text('{"providers":{}}')
+    (tmp_path / "auth.json").write_text('{"providers":{}}')
+    auth_path = (home if location == "profile" else tmp_path) / "auth.json"
+    auth_path.write_bytes(payload)
+    # Include existing recovery/lock files: the probe must not create OR overwrite them.
+    if recovery_exists:
+        auth_path.with_suffix(".json.corrupt").write_bytes(b"existing recovery fixture")
+        auth_path.with_suffix(".lock").write_bytes(b"existing lock fixture")
+
+    def auth_files():
+        return {str(path.relative_to(tmp_path)): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in tmp_path.rglob("auth*") if path.is_file()}
+
+    before = auth_files()
+    server, thread, connections = _connection_counter()
+    _write_config(home, server.server_address[1], key, "config")
+    try:
+        result = _run(home, key, "config")
+    finally:
+        _stop(server, thread)
+    assert auth_files() == before, "probe changed auth state"
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert connections == [], "malformed auth store allowed a connection"
+
+
+@pytest.mark.parametrize("location", ["profile", "global"])
+@pytest.mark.parametrize("pool", [{"fixture": []}, {"other": [{"id": "unrelated"}]},
+                                  {"fixture": [{"id": "fixture-pool"}]}],
+                         ids=["empty", "unrelated", "matching"])
+def test_probe_profile_and_global_pool_admission_is_read_only(tmp_path, location, pool):
+    key = "configured-fixture-credential"
+    home = tmp_path / "profiles" / "fixture"
+    home.mkdir(parents=True)
+    auth_path = (home if location == "profile" else tmp_path) / "auth.json"
+    auth_text = json.dumps({"credential_pool": pool})
+    auth_path.write_text(auth_text)
+    server, thread, connections = _connection_counter()
+    _write_config(home, server.server_address[1], key, "config")
+    try:
+        result = _run(home, key, "config")
+    finally:
+        _stop(server, thread)
+    matching = bool(pool.get("fixture"))
+    assert result.returncode == (2 if matching else 1), result.stdout + result.stderr
+    assert len(connections) == (0 if matching else 1)
+    assert list(tmp_path.rglob("auth*")) == [auth_path]
+    assert auth_path.read_text() == auth_text
+
+
 @pytest.mark.parametrize("shape", ["providers", "custom_providers"])
 @pytest.mark.parametrize("unsupported", [
     {"key_cmd": "echo unsafe"},

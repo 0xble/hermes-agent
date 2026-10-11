@@ -6,6 +6,7 @@ This is a dedicated process, not an in-process API or general runtime resolver.
 """
 
 from contextlib import redirect_stderr, redirect_stdout
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,12 +17,37 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+def _has_persisted_pool(pool_keys):
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    # Auth's recovering loader can copy corruption and return an empty store.
+    # Admission must read both stores without recovery, locking, or migrations;
+    # only absence is safe to treat as empty. Any other read/parse failure refuses.
+    for home in {get_hermes_home(), get_default_hermes_root()}:
+        try:
+            store = json.loads((home / "auth.json").read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            continue
+        if not isinstance(store, dict):
+            raise ValueError
+        pool = store.get("credential_pool", {})
+        if (not isinstance(pool, dict) or any(
+                not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+                for rows in pool.values())):
+            raise ValueError
+        # No merged credential selection is needed: either store's matching pool
+        # makes this route unsupported, regardless of profile shadowing.
+        if any(pool.get(name) for name in pool_keys):
+            return True
+    return False
+
+
 def _endpoint(requested):
     from agent.bedrock_adapter import is_bedrock_openai_base_url
     from agent.credential_pool import custom_provider_pool_key_candidates
     from agent.gemini_native_adapter import is_native_gemini_base_url
     from agent.secret_scope import load_env_file
-    from hermes_cli.auth import has_usable_secret, read_credential_pool
+    from hermes_cli.auth import has_usable_secret
     from hermes_cli.config import is_provider_enabled, load_config_readonly
     from hermes_cli.config_read_errors import FailedConfigRead
     from hermes_cli.config_providers import _canonical_api_mode
@@ -84,8 +110,7 @@ def _endpoint(requested):
     pool_keys = set(identities)
     for identity in identities:
         pool_keys.update(custom_provider_pool_key_candidates(base, identity))
-    pools = read_credential_pool()
-    if any(pools.get(name) for name in pool_keys):
+    if _has_persisted_pool(pool_keys):
         raise ValueError
     parsed = urlsplit(base)
     if (not has_usable_secret(key) or "\r" in key or "\n" in key or not parsed.hostname

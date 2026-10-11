@@ -37,8 +37,10 @@ for overrides, including one that coincides with the declared variable.
   the runtime's precedence or deduplicated picker view.
 - Persisted pools for the provider key, display name, `custom:<key>`,
   `custom:<name>`, or bare `custom` are refused. Also guard the runtime's pool
-  candidate helper for each identity, including URL-matched candidates. Use the
-  read-only merged profile/global pool view; never load/select a credential pool.
+  candidate helper for each identity, including URL-matched candidates. Inspect
+  both profile/global auth files directly without recovery, locks, or migrations;
+  malformed/unreadable stores are refused, never treated as empty or backed up.
+  Never load/select a credential pool.
 - `key_cmd`, extra authentication headers, invalid/unsupported transports,
   codex app-server overlays, native Gemini/Vertex, Bedrock Mantle, Actual URL
   rewriting, and model-dependent OpenCode routing are refused. Undeclared modes
