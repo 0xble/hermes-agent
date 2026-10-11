@@ -7,6 +7,7 @@ import pytest
 
 from gateway.platforms.base import SendResult
 from gateway.copy_blocks import (
+    protect_inline_copy_bodies,
     CopyMarkerStreamFilter,
     extract_copy_blocks,
     map_outside_copy_blocks,
@@ -155,12 +156,24 @@ def test_map_outside_copy_blocks_never_rewrites_bodies() -> None:
     assert map_outside_copy_blocks("plain MEDIA:/a.png", resolve) == "plain data:image/png"
 
 
-def test_literal_open_marker_inside_body_is_body_on_every_renderer() -> None:
-    text = "a\n[[copy]]\nx\n[[copy]]\ny\n[[/copy]]\nb\n"
-    assert extract_copy_blocks(text) == ("a\nb\n", ["x\n[[copy]]\ny"])
-    assert render_copy_blocks_inline(text) == "a\nx\n[[copy]]\ny\nb\n"
+def test_open_marker_inside_a_block_closes_it_on_every_renderer() -> None:
+    # A mistyped close: the second [[copy]] ends the block, and nothing leaks or is swallowed.
+    text = "Reply.\n\n[[copy]]\nHi\n[[copy]]\n\n[^1]: x\n"
+    assert extract_copy_blocks(text) == ("Reply.\n\n\n[^1]: x\n", ["Hi"])
+    assert render_copy_blocks_inline(text) == "Reply.\n\nHi\n\n[^1]: x\n"
     stream = CopyMarkerStreamFilter(drop_bodies=True)
-    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "a\nb\n"
+    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "Reply.\n\n\n[^1]: x\n"
+    protected, bodies = protect_inline_copy_bodies(text)
+    assert "[[copy]]" not in protected and list(bodies.values()) == ["Hi\n"]
+    assert "[[copy]]" not in map_outside_copy_blocks(text, lambda part: part)
+    # Toggling pairs work too, and a stray close after them stays control syntax.
+    assert extract_copy_blocks("[[copy]]\nA\n[[copy]]\nmid\n[[copy]]\nB\n[[copy]]\n[[/copy]]\n") == (
+        "mid\n", ["A", "B"])
+
+
+def test_fenced_open_marker_inside_a_block_is_still_body_text() -> None:
+    text = "[[copy]]\n```\n[[copy]]\n```\n[[/copy]]\n"
+    assert extract_copy_blocks(text) == ("", ["```\n[[copy]]\n```"])
 
 
 def test_extracted_response_keeps_legacy_constructor() -> None:
