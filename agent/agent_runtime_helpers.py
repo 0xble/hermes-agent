@@ -1560,8 +1560,10 @@ def dump_api_request_debug(
         # request body, so context-embedded secrets would otherwise land in cleartext on disk.
         from agent.redact import redact_sensitive_text
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
-        _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
+        from agent.request_debug import bounded_request_dump, prune_request_dumps
+        _redacted_payload = bounded_request_dump(json.loads(redact_sensitive_text(_serialized, force=True)))
         atomic_json_write(dump_file, _redacted_payload, default=str)
+        prune_request_dumps(dump_file)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
             print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))

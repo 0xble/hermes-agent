@@ -19,6 +19,7 @@ the hygiene-compression block already uses) and must actually reach
 import logging
 import threading
 from contextlib import contextmanager
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -162,15 +163,15 @@ async def test_at_reference_ignores_global_context_for_runtime_route_override(mo
     )
     monkeypatch.setattr(
         runner,
-        "_resolve_session_agent_runtime",
-        lambda **_kwargs: (
+        "_resolve_session_agent_runtime_async",
+        AsyncMock(return_value=(
             "shared-model",
             {
                 "provider": "custom",
                 "api_key": "test",
                 "base_url": "https://small.example/v1",
             },
-        ),
+        )),
     )
 
     import agent.context_references as ctx_mod

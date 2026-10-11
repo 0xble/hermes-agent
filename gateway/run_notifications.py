@@ -1985,7 +1985,7 @@ class GatewayNotificationsMixin:
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
         rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim)."""
         from gateway.run import _USER_BOUNDARY_END_REASONS
-        session_db = getattr(self, "_session_db", None)
+        session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
         if session_db is None:
             return "retry"
         try:
@@ -2130,7 +2130,15 @@ class GatewayNotificationsMixin:
             claim.proceed, claim.early_result = False, False
         return claim
 
-    def _completion_event_scope(self, evt: dict):
+    @contextlib.asynccontextmanager
+    async def _completion_event_scope(self, evt: dict):
+        # Scope setup reads the routing store too; entering the context itself must
+        # stay on-loop so the target profile's contextvars cover the awaited body.
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        async with self._completion_event_context(evt, source):
+            yield
+
+    def _completion_event_context(self, evt: dict, source):
         """Profile runtime scope of the session a completion event targets (a no-op context when the
         event is the default profile's or the scope is already installed).
 
@@ -2141,7 +2149,6 @@ class GatewayNotificationsMixin:
         state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
-        source = self._build_process_event_source(evt)
         profile_name = getattr(source, "profile", None) if source is not None else None
         profile_name = str(profile_name or evt.get("profile") or "").strip() or None
         if source is None and profile_name and profile_name != "default":
