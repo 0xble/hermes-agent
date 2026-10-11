@@ -11,12 +11,21 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import hermes_cli.local_runtime.load_progress as lp
 
 
-def setup_function(_fn):
-    with lp._lock:
-        lp._snapshot.clear()
+@pytest.fixture(autouse=True)
+def _isolated_load_progress(monkeypatch):
+    # These tests inject events directly; the real SSE watcher can clear the
+    # snapshot concurrently when no managed endpoint is available. Do not start
+    # a process-lifetime thread, give each test its own event state, and make a
+    # watcher already started by another test in this process unable to clear it.
+    monkeypatch.setattr(lp, "_ensure_watcher", lambda: None)
+    monkeypatch.setattr(lp, "_clear_snapshot", lambda: None)
+    monkeypatch.setattr(lp, "_snapshot", {})
+    yield
 
 
 # ── composite percent ────────────────────────────────────────
