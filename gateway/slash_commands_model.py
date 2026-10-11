@@ -207,6 +207,14 @@ class GatewayModelCommandsMixin:
         Returns the warning for a ``--global`` switch whose ``config.yaml`` write or stale-override
         cleanup failed (the switch then stays a session override), else ``None``.
         """
+        async with self._session_model_override_lock(ctx.session_key):
+            return await self._record_model_switch_locked(
+                result, ctx, source=source, one_turn=one_turn, picker=picker,
+            )
+
+    async def _record_model_switch_locked(
+        self, result, ctx: _ModelSwitchContext, *, source, one_turn: bool, picker: bool
+    ) -> Optional[str]:
         from hermes_cli.model_switch import format_model_for_display
 
         # Persist the new model to the session DB so the dashboard shows the updated model (#34850).
@@ -236,6 +244,7 @@ class GatewayModelCommandsMixin:
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
+        self._bump_session_model_override_epoch(ctx.session_key)
         self._session_model_overrides[ctx.session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
@@ -263,7 +272,7 @@ class GatewayModelCommandsMixin:
         # model/provider the session override must stay, or the next turn runs the channel model.
         if ctx.persist_global and global_error is None and self._channel_override_for(source) is None:
             try:
-                await self._persist_session_model_override(ctx.session_key, None)
+                await self._persist_session_model_override_locked(ctx.session_key, None)
             except Exception as e:
                 # Store still holds the stale copy: keep memory in agreement and report it (#100314).
                 logger.warning("Failed to clear persisted session model override: %s", e)
@@ -281,7 +290,7 @@ class GatewayModelCommandsMixin:
         # so a crash before the restore rehydrated the once-model permanently.)
         elif not one_turn:
             try:
-                await self._persist_session_model_override(
+                await self._persist_session_model_override_locked(
                     ctx.session_key, self._session_model_overrides[ctx.session_key]
                 )
             except Exception:
@@ -819,7 +828,7 @@ class GatewayModelCommandsMixin:
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
-        self._reasoning_config = await asyncio.to_thread(self._resolve_session_reasoning_config, 
+        self._reasoning_config = self._resolve_session_reasoning_config(
             source=event.source, session_key=session_key, model=_session_model,
         )
         platform_key = _platform_config_key(event.source.platform)
@@ -945,7 +954,7 @@ class GatewayModelCommandsMixin:
         # The /reasoning parser strips --global (any position) and normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(event.get_command_args().strip().lower())
         session_key = self._session_key_for_source(event.source)
-        transition = await asyncio.to_thread(self._resolve_session_service_tier, 
+        transition = self._resolve_session_service_tier(
             session_key=session_key, report_transition=True,
         )
         if isinstance(transition, tuple):

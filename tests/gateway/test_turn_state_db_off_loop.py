@@ -404,7 +404,18 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
             )
             ctx = _ModelSwitchContext(key, source, tmp_path / "config.yaml", False,
                                       current_model="old-model")
-            await runner._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
+            switch_started = asyncio.Event()
+
+            async def switch_model():
+                switch_started.set()
+                await runner._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
+
+            switch = asyncio.create_task(switch_model())
+            await asyncio.wait_for(switch_started.wait(), 5)
+            # The switch now queues behind hydration instead of racing its read.
+            # Release the read before awaiting the lock-owning switch.
+            gate.release.set()
+            await asyncio.wait_for(switch, 5)
             assert runner._session_model_override(key)["model"] == "new-model"
         else:
             runner._clear_conversation_scope(key, reason="session_reset")

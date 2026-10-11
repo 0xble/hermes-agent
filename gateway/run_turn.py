@@ -320,10 +320,12 @@ class GatewayTurnMixin:
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
-        if skey and self._session_model_override(skey) is None:
-            epoch = self._session_model_override_epoch(skey)
-            hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
-            self._commit_session_model_override(skey, hydrated, epoch)
+        if skey:
+            async with self._session_model_override_lock(skey):
+                if self._session_model_override(skey) is None:
+                    epoch = self._session_model_override_epoch(skey)
+                    hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
+                    self._commit_session_model_override(skey, hydrated, epoch)
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
             resolved = await asyncio.to_thread(
@@ -1815,10 +1817,11 @@ class GatewayTurnMixin:
             )
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
             logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-            new_entry = await self.async_session_store.reset_session(session_key)
-            self._evict_cached_agent(session_key)
-            # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-            self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
+            async with self._session_model_override_lock(session_key):
+                new_entry = await self.async_session_store.reset_session(session_key)
+                self._evict_cached_agent(session_key)
+                # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
+                self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
             if new_entry is not None:
                 # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
                 # switches the next message back onto the bloated child and re-triggers exhaustion
@@ -2239,7 +2242,7 @@ class GatewayTurnMixin:
 
         # Resolve once after preparation so expiry behaves like /fast off and its notice rides this turn.
         if session_key:
-            transition = await asyncio.to_thread(self._resolve_session_service_tier, 
+            transition = self._resolve_session_service_tier(
                 session_key=session_key, report_transition=True,
             )
             expiry_notice = transition[1] if isinstance(transition, tuple) else None
@@ -2628,9 +2631,9 @@ class GatewayTurnMixin:
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = await asyncio.to_thread(self._resolve_session_reasoning_config, source=source, model=model)
+            reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
-            self._service_tier = await asyncio.to_thread(self._resolve_session_service_tier, source=source)
+            self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
             # Enrich the prompt with image descriptions (same as the main flow).

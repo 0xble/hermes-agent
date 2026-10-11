@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -150,14 +151,42 @@ class GatewayAgentCacheMixin:
     def _bump_session_model_override_epoch(self, session_key: str) -> None:
         self._session_state(session_key).persistent.model_override_epoch += 1
 
+    def _session_model_override_lock(self, session_key: str) -> asyncio.Lock:
+        """Loop-owned, per-route serialization of hydration and durable override edits."""
+        locks = getattr(self, "_session_model_override_locks", None)
+        if not isinstance(locks, dict):
+            locks = self._session_model_override_locks = {}
+        return locks.setdefault(session_key, asyncio.Lock())
+
     async def _persist_session_model_override(self, session_key: str, override: Optional[dict]) -> None:
-        # Fence hydrations started before OR during the storage write, including clears
-        # with no live override. The epoch survives ConversationState.clear().
+        async with self._session_model_override_lock(session_key):
+            await self._persist_session_model_override_locked(session_key, override)
+
+    async def _persist_session_model_override_locked(self, session_key: str, override: Optional[dict]) -> None:
+        """Caller holds the route lock; publish memory only after successful persistence."""
         self._bump_session_model_override_epoch(session_key)
+        epoch = self._session_model_override_epoch(session_key)
+        write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        cancelled = None
         try:
-            await self.async_session_store.set_model_override(session_key, override)
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError as exc:
+                    # Cancellation does not stop a storage worker. Keep the lock
+                    # until it finishes, even when the caller is cancelled again.
+                    cancelled = exc
+            await write
         finally:
+            if (not write.cancelled() and write.done() and write.exception() is None
+                    and self._session_model_override_epoch(session_key) == epoch):
+                if override is None:
+                    self._session_model_overrides.pop(session_key, None)
+                else:
+                    self._session_model_overrides[session_key] = dict(override)
             self._bump_session_model_override_epoch(session_key)
+        if cancelled is not None:
+            raise cancelled
 
     def _commit_session_model_override(self, session_key: str, override: Optional[dict], epoch: int) -> None:
         """On-loop CAS: an override edit or boundary invalidates the worker's snapshot."""

@@ -89,6 +89,11 @@ Keep profile scope entry, admission fences and adapter queue/timer mutation on
 asyncio; Telegram topic recovery must finish before batching derives its key.
 Model-override hydration and runtime-resolution commits stay on-loop, with a
 monotonic override-epoch compare-and-set so /model and conversation boundaries win.
+A loop-owned per-session async lock spans hydration's check/read/commit and every
+async model-override memory edit plus durable write (including /resume, /new and
+login clears); retain the epoch for synchronous boundaries and one-turn restores.
+Reasoning and service-tier resolvers stay synchronous on-loop: no watchdog dump
+implicated them, and offloading their live-session mutations races newer pickers.
 /stop captures and interrupts its target before the storage await; the captured
 run generation fences the delayed marker handling and cleanup from successors.
 

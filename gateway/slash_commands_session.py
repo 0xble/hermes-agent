@@ -171,16 +171,17 @@ class GatewaySessionCommandsMixin:
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one
         # funnel call (see _CONVERSATION_SCOPED_STATE in gateway/run.py).
-        self._clear_conversation_scope(session_key, reason="session_reset")
-        # In-flight async delegations end WITH the conversation: once the id rotates their
-        # completions have no live owner. Expire by durable id, routing key as legacy fallback.
-        with contextlib.suppress(Exception):
-            from tools.async_delegation import interrupt_for_session
-            interrupt_for_session(session_key=session_key, reason="session_reset",
-                                  parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
-        _reset_process_scoped_tool_state()
+        async with self._session_model_override_lock(session_key):
+            self._clear_conversation_scope(session_key, reason="session_reset")
+            # In-flight async delegations end WITH the conversation: once the id rotates their
+            # completions have no live owner. Expire by durable id, routing key as legacy fallback.
+            with contextlib.suppress(Exception):
+                from tools.async_delegation import interrupt_for_session
+                interrupt_for_session(session_key=session_key, reason="session_reset",
+                                      parent_session_id=str(getattr(old_entry, "session_id", "") or ""))
+            _reset_process_scoped_tool_state()
 
-        new_entry = await self.async_session_store.reset_session(session_key)
+            new_entry = await self.async_session_store.reset_session(session_key)
         _old_sid = old_entry.session_id if old_entry else None
         await self._fire_session_reset_hooks(source, session_key, _old_sid,
                                              new_entry.session_id if new_entry else None)
@@ -556,7 +557,7 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["gateway_session_key"] = session_key
         # Same reasoning setting as a live turn (session ``/reasoning`` > per-model > global): without it
         # the transport applies its default effort — a 400 on non-reasoning models.
-        runtime_kwargs["reasoning_config"] = await asyncio.to_thread(self._resolve_session_reasoning_config, source=source, model=model)
+        runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:
@@ -966,20 +967,21 @@ class GatewaySessionCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
         self._release_running_agent_state(session_key)
-        new_entry = await self.async_session_store.switch_session(
-            session_key, target_id, preserve_prompt_pin=False,
-        )
-        if not new_entry:
-            return t("gateway.resume.switch_failed")
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self._persist_session_model_override(session_key, None)
+        async with self._session_model_override_lock(session_key):
+            new_entry = await self.async_session_store.switch_session(
+                session_key, target_id, preserve_prompt_pin=False,
+            )
+            if not new_entry:
+                return t("gateway.resume.switch_failed")
+            # Conversation boundary: all conversation-scoped state + security state in one funnel call.
+            # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
+            # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
+            # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
+            self._clear_conversation_scope(session_key, reason="resume")
+            # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
+            # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
+            # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
+            await self._persist_session_model_override_locked(session_key, None)
         await self.async_session_store.set_reasoning_override(session_key, None)
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
