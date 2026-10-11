@@ -199,12 +199,28 @@ class GatewayAgentCacheMixin:
             session_key, override.get("model"), override.get("provider") or "",
         )
 
+    def _session_model_override_edit_pending(self, session_key: str) -> bool:
+        """True while a durable override edit holds the route lock. Read-only, safe off-loop:
+        it never creates a lock, so a synchronous caller cannot bind one to the wrong loop."""
+        locks = getattr(self, "_session_model_override_locks", None)
+        lock = locks.get(session_key) if isinstance(locks, dict) else None
+        return bool(lock is not None and lock.locked())
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
-        """Synchronous callers retain lazy restoration, using the same fenced commit."""
+        """Synchronous callers retain lazy restoration, using the same fenced commit.
+
+        They cannot await the route lock, so they skip hydration while an edit is pending:
+        memory is already cleared and storage may still hold the value being replaced. The
+        edit itself publishes the outcome, and the next resolution hydrates normally."""
         if self._session_model_override(session_key) is not None:
             return
+        if self._session_model_override_edit_pending(session_key):
+            return
         epoch = self._session_model_override_epoch(session_key)
-        self._commit_session_model_override(session_key, self._load_session_model_override(session_key), epoch)
+        loaded = self._load_session_model_override(session_key)
+        if self._session_model_override_edit_pending(session_key):
+            return
+        self._commit_session_model_override(session_key, loaded, epoch)
 
     def _load_session_model_override(self, session_key: str) -> Optional[dict]:
         """Load non-secret persisted fields and resolve credentials; never mutate runner state."""

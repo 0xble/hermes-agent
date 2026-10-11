@@ -82,6 +82,50 @@ async def test_model_hydration_waits_for_pending_resume_clear(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_sync_hydration_during_pending_clear_cannot_resurrect_override(monkeypatch, tmp_path):
+    """Synchronous resolvers (TurnRunner.run_sync, /fast's route note) cannot await the route
+    lock. While a durable clear is pending they must not hydrate the old stored value."""
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+    runner.session_store.set_model_override(key, {"model": "stale-model"})
+    runner._session_model_overrides[key] = {"model": "stale-model"}
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda _: "default-model")
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs",
+                        lambda: {"api_key": "default-key", "provider": "probe"})
+    loop = asyncio.get_running_loop()
+    write_started = asyncio.Event()
+    release_write = threading.Event()
+    original_write = runner.session_store.set_model_override
+
+    def pending_write(session_key, override):
+        loop.call_soon_threadsafe(write_started.set)
+        assert release_write.wait(10), "clear was not released"
+        original_write(session_key, override)
+
+    monkeypatch.setattr(runner.session_store, "set_model_override", pending_write)
+    runner._session_model_overrides.pop(key, None)  # the clear's in-memory half, as /resume does first
+    clear = asyncio.create_task(runner._persist_session_model_override(key, None))
+    try:
+        await asyncio.wait_for(write_started.wait(), 10)
+        model, _runtime = runner._resolve_session_agent_runtime(session_key=key)
+        assert model == "default-model", f"sync hydration resurrected {model!r} during a pending clear"
+        release_write.set()
+        await asyncio.wait_for(clear, 10)
+        live = runner._session_model_override(key)
+        persisted = runner.session_store.get_model_override(key)
+        assert live is None and persisted is None, (
+            f"pending clear resurrected override: persisted={persisted!r}, live={live!r}"
+        )
+    finally:
+        release_write.set()
+        await asyncio.gather(clear, return_exceptions=True)
+        if runner._executor is not None:
+            await asyncio.to_thread(runner._executor.shutdown)
+
+
+@pytest.mark.asyncio
 async def test_reasoning_hydration_cannot_overwrite_newer_picker(monkeypatch, tmp_path):
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
