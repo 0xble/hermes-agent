@@ -240,6 +240,37 @@ checkout, and fails on the previous probe order. Upstream main (after
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
 
+## Hosted load-progress fixture isolation
+
+The `fork-ci-reliability` identity covers `tests/hermes_cli/test_load_progress.py`.
+The tests inject events directly, but `get_loading_progress()` started the real
+process-lifetime SSE watcher. With no managed endpoint, its first iteration
+cleared the injected snapshot between event application and assertion. Hosted
+run 38038101921, job 114172687324, failed with `assert 'm1' in {}`. A per-test
+snapshot, disabled watcher startup, and a no-op `_clear_snapshot` (so a watcher
+already started by another test in the same process cannot clear it) isolate
+this unit boundary; the endpoint ownership and event-consumer assertions remain
+unchanged. A forcing probe that
+waits for the watcher's first clear failed 200/200 before and passed 200/200
+after. Retire this adaptation when upstream isolates these direct-event tests.
+
+## Hosted OpenRouter browser observation
+
+The `fork-ci-reliability` identity also covers the nonce-path HTTP test in
+`tests/hermes_cli/test_auth_commands.py`. Hosted run 38039556937, job
+114176942229, raised `KeyError: 'genuine_status'`: returning the authorization
+code means the callback server has accepted it, not that the browser worker has
+published its response status. Join the real client thread with a bounded,
+explicit failure before asserting its result, and surface client exceptions in
+the test thread. If the loopback call fails, bounded cleanup attaches unfinished
+worker and redirect-error diagnostics as notes to that same exception, preserving
+its traceback instead of replacing it with an assertion. Both forged-path
+rejection and genuine-path success assertions are retained. Delaying the client
+after it receives the genuine response caused
+188 failures in 200 iterations before and none in 200 afterward. No callback
+port, server behavior, timeout policy, retry, or assertion was relaxed. Retire
+this adaptation when upstream synchronizes the browser test's result owner.
+
 ## Verification and retirement
 
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
