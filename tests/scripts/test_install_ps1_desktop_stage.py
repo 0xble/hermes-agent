@@ -92,6 +92,8 @@ function New-StubShortcut {
 function New-StubShell {
     $shell = [pscustomobject]@{}
     $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
+        param([string]$LinkPath)
+        Add-Content -Path $env:WSH_LOG -Value "CREATE:$LinkPath"
         return New-StubShortcut
     }
     return $shell
@@ -244,6 +246,20 @@ def test_desktop_stage_uses_pm_sync_and_product_cli(tmp_path: Path) -> None:
     runtime_dir.mkdir(parents=True)
     shutil.copyfile(REPO_ROOT / "scripts/desktop-update/runtime.ps1", runtime_dir / "runtime.ps1")
 
+    # New-DesktopShortcuts resolves its targets through
+    # [Environment]::GetFolderPath('Programs'/'Desktop'), which honors the
+    # process USERPROFILE/APPDATA and returns "" when the folder is missing.
+    # The CI harness isolates USERPROFILE to a fresh home with neither folder,
+    # so the stage's best-effort catch skipped shortcut creation and the icon
+    # cache bust entirely. Give the stage a temp profile that owns both known
+    # folders: the real resolution path runs and every link lands under it.
+    profile = tmp_path / "profile"
+    roaming = profile / "AppData" / "Roaming"
+    programs = roaming / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    desktop = profile / "Desktop"
+    programs.mkdir(parents=True)
+    desktop.mkdir()
+
     wrapper = tmp_path / "boundary-wrapper.ps1"
     wrapper.write_text(_WRAPPER, encoding="utf-8-sig")
     env = {
@@ -255,6 +271,8 @@ def test_desktop_stage_uses_pm_sync_and_product_cli(tmp_path: Path) -> None:
         "FAKE_INSTALL_DIR": str(install_dir),
         "WSH_LOG": str(wsh_log),
         "ICACLS_LOG": str(icacls_log),
+        "USERPROFILE": str(profile),
+        "APPDATA": str(roaming),
     }
     run = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -279,21 +297,27 @@ def test_desktop_stage_uses_pm_sync_and_product_cli(tmp_path: Path) -> None:
     # 3. the stage probed the artifact the fake build produced.
     exe = install_dir / "apps" / "desktop" / "release" / "win-unpacked" / "Hermes.exe"
     assert exe.is_file(), calls
+    output = f"STDOUT:\n{run.stdout}\nSTDERR:\n{run.stderr}"
     # 4. ACL grant hit the intercepted icacls with the produced exe's dir.
     icacls_lines = icacls_log.read_text().splitlines()
     assert any(
         line.startswith("icacls ") and str(exe.parent) in line
         and "*S-1-15-2-2:(OI)(CI)(RX)" in line
         for line in icacls_lines
-    ), icacls_lines
+    ), (icacls_lines, output)
     # 5. icon-cache bust hit the intercepted ie4uinit.exe stub.
-    assert any(line.startswith("ie4uinit.exe") for line in icacls_lines), icacls_lines
+    assert any(line.startswith("ie4uinit.exe") for line in icacls_lines), (icacls_lines, output)
     # 6. shortcut creation went through the intercepted WScript.Shell stub:
-    #    logged, pointing at the produced exe, and NOT written to any real
-    #    known folder.
-    shortcuts = wsh_log.read_text().splitlines()
-    assert len(shortcuts) == 2, shortcuts
-    for line in shortcuts:
-        assert line.startswith("SAVED:"), shortcuts
-        target = line.split("|")[0][len("SAVED:"):]
-        assert target == str(exe), shortcuts
+    #    one Start-menu and one desktop link, each saved pointing at the
+    #    produced exe, and both inside the temp profile -- no real known folder.
+    assert wsh_log.is_file(), output
+    lines = wsh_log.read_text().splitlines()
+    created = [line[len("CREATE:"):] for line in lines if line.startswith("CREATE:")]
+    saved = [line[len("SAVED:"):] for line in lines if line.startswith("SAVED:")]
+    assert [os.path.normcase(p) for p in created] == [
+        os.path.normcase(str(programs / "Hermes.lnk")),
+        os.path.normcase(str(desktop / "Hermes.lnk")),
+    ], (lines, output)
+    assert len(saved) == 2, (lines, output)
+    for line in saved:
+        assert line.split("|")[0] == str(exe), (lines, output)

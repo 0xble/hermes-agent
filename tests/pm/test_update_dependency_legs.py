@@ -129,7 +129,10 @@ def test_uv_refresh_uses_real_installed_tool_and_only_the_owned_project(tmp_path
 @pytest.mark.platforms('windows', 'posix')
 def test_npm_refresh_uses_its_installed_entry_and_owned_project(monkeypatch, capsys):
     # Keep the real tool's argv clear of the harness's hermes-update guard.
-    temp_root = Path(os.environ['LOCALAPPDATA']) / 'Temp' if os.name == 'nt' else Path('/tmp')
+    # The CI harness relocates LOCALAPPDATA inside its guarded home.  Use the
+    # already-created process temp root instead of reconstructing a native
+    # Windows profile path under that relocated value.
+    temp_root = Path(tempfile.gettempdir())
     with tempfile.TemporaryDirectory(prefix='pm-deps-', dir=temp_root) as temporary, monkeypatch.context() as scoped:
         monkeypatch = scoped
         root = Path(temporary)
