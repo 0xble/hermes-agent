@@ -759,14 +759,16 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
             data = _post(f"/browser/identities/{session['user_id']}/release", {}, timeout=lifecycle_timeout)
             if data.get("ok") is not True or not isinstance(data.get("released"), bool):
                 return tool_error("Camofox did not confirm account release; the task's tab was not changed", success=False)
-            session["tab_id"] = None
             return json.dumps({"success": True, "account": session["account"], "released": data["released"]})
         prior_tab_id = session.get("tab_id")
         user_id = session["user_id"]
+        open_body = {"tabId": prior_tab_id} if prior_tab_id else {}
+        detached_from_other_task = False
+        protected_detached = False
         with _sessions_lock:
             _handoffs_in_flight[user_id] = _handoffs_in_flight.get(user_id, 0) + 1
         try:
-            data = _post(f"/browser/identities/{user_id}/open", {}, timeout=lifecycle_timeout)
+            data = _post(f"/browser/identities/{user_id}/open", open_body, timeout=lifecycle_timeout)
             tab_id = data.get("tabId")
             if data.get("ok") is not True or not isinstance(tab_id, str) or not tab_id:
                 return tool_error("Camofox did not return a shared tab; the task's tab was not changed", success=False)
@@ -780,15 +782,18 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
                 is_protected = quarantined is None or tab_id in (_protected_tab_ids | quarantined)
                 owns_protection = (_protected_tab_owners.get(tab_id) == (task_id or "default")
                                    and has_vault_date_components(task_id or "default"))
-                session["tab_id"] = tab_id if not is_protected or owns_protection else None
-                if session["tab_id"]:
+                bound_to_other = any(other is not session and other.get("tab_id") == tab_id
+                                     for other in _sessions.values())
+                if bound_to_other:
+                    # The visible window may still be showing another live task's tab. Never
+                    # steal its binding or make that task's next page action hit a replacement.
+                    detached_from_other_task = True
+                elif is_protected and not owns_protection:
+                    protected_detached = True
+                    session["tab_id"] = None
+                else:
+                    session["tab_id"] = tab_id
                     session.pop("fresh", None)
-                    # The visible tab now belongs to this task. Another task bound to it loses the
-                    # binding and rebinds only by navigating.
-                    for key, other in _sessions.items():
-                        if other is not session and other.get("tab_id") == tab_id:
-                            other["tab_id"] = None
-                            other.pop("fresh", None)
         finally:
             with _sessions_lock:
                 remaining = _handoffs_in_flight.get(user_id, 1) - 1
@@ -798,11 +803,15 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
                     _handoffs_in_flight.pop(user_id, None)
         result = {"success": True, "account": session["account"], "focused": bool(data.get("focused")),
                   "tabId": tab_id}
-        if session["tab_id"] is None:
+        if detached_from_other_task:
+            result["modelDetached"] = True
+            result["note"] = ("The visible window is showing another task's tab. Keep working in your "
+                              "own bound tab; do not use the visible window for this task.")
+        elif protected_detached or session["tab_id"] is None:
             result["modelDetached"] = True
             result["note"] = ("Shown to the user only: this tab holds protected data from an earlier "
                               "session. Navigate to open a fresh tab for further browser work.")
-        if prior_tab_id and prior_tab_id != tab_id:
+        if prior_tab_id and prior_tab_id != tab_id and not detached_from_other_task:
             result["replacedTab"] = True
         if isinstance(data.get("restarted"), bool):
             result["restarted"] = data["restarted"]
@@ -816,7 +825,7 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
             return tool_error("This account is not configured as a shared visible identity on the Camofox server. Configure it there before handoff or release.", success=False)
         if status == 409:
             action = "release" if release else "handoff"
-            return tool_error(f"Another operation is using this account's browser. Wait for it to finish, then retry the {action}; do not interrupt it.", success=False)
+            return tool_error(f"Camofox account {action} is currently busy; no task tab binding was changed. Retry the {action} later.", success=False)
         return tool_error("Camofox account handoff/release failed; check the server and its authentication", success=False)
     except requests.RequestException:
         return tool_error("Camofox account handoff/release failed; check the server connection", success=False)

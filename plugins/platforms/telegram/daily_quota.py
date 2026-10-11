@@ -14,10 +14,13 @@ and logs the counts at the refusal so the next incident can be compared against 
 
 Shedding follows the message count against ``soft_ceiling`` (``PlatformConfig.extra``
 ``daily_message_soft_ceiling``):
-- At ``COSMETIC_FRACTION`` of the ceiling, typing, interim edits, drafts, progress bubbles and
-  their cleanup deletes are shed.
+- At ``COSMETIC_FRACTION`` of the ceiling, typing, interim edits, drafts and progress bubbles are
+  shed.
 - At the ceiling, non-final notices are also shed.
 - Final replies are never shed.
+
+Cleanup deletes are never shed: they create no message, so shedding them saves nothing against the
+daily cap and only strands the bubbles they would remove. The per-minute budget still meters them.
 """
 
 from __future__ import annotations
@@ -159,7 +162,7 @@ class DailyQuota:
         pressure = self.pressure(chat_key)
         if kind == OUTBOUND_NOTICE:
             return pressure >= PRESSURE_NOTICES
-        return pressure >= PRESSURE_COSMETIC  # progress, typing, interim edits, drafts, cleanup
+        return pressure >= PRESSURE_COSMETIC  # progress, typing, interim edits, drafts
 
     def note_retry_after(self, chat_key: str, wait: float) -> None:
         """A long server penalty ends at the window reset: anchor there and record the evidence."""

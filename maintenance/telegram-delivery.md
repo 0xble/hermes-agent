@@ -145,6 +145,29 @@ requests or sleep for hours inside a ban. Reads (`get*`) and chat-less calls suc
 indicators refresh chat-wide at most every 4s, so not every topic shows "typing" continuously,
 and progress bubbles update at most every 10s.
 
+**Daily volume shedding** (`daily_quota.py`, 2026-10-07). Per-chat message-creating calls are
+counted per Telegram day against `daily_message_soft_ceiling` (default 1500). Turns not typed by
+the user shed typing, interim edits, drafts and progress at 70% of it, and non-final notices at
+100%. Finals are never shed. Cleanup deletes are never shed either: they create no message, and
+shedding them stranded progress bubbles whenever a typed turn's cleanup ran after an in-band drain
+had relabelled the task as a background trigger (2026-10-08 to 10-10, ~170 failures/day). The
+Telegram adapter now runs post-delivery callbacks under the trigger of the turn that registered
+them. Regression: `tests/gateway/test_telegram_daily_quota.py`.
+
+**User voice echoes** (`telegram-chat-budget`). The shared gateway STT echo path
+classifies a response to a non-internal voice event as `OUTBOUND_FINAL` for budget
+priority, regardless of the queued task's inherited trigger or outbound class.
+The `_interim_send` marker remains intact for stream-is-the-message adapters;
+quota priority does not seal the running stream. Internal producers retain their
+existing classification. Failed `SendResult`s (including `daily_budget_shed`) and
+exceptions are WARNING-logged without adding transcript text to the log.
+Regression: the same daily-quota suite drives busy FIFO prefetch, overflow drain,
+and idle enrichment through the real Telegram send with goal/untagged pressure,
+checks topic routing and interim metadata, and verifies background traffic still
+sheds. Roll back by reverting the gateway echo/event binding and these tests;
+retire when an accepted upstream release protects originating-user echoes under
+an equivalent quota contract. No configuration or persistent-state changes.
+
 **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_chat_outbound_budget.py`
 pins the summed per-chat rate against each class ceiling with every path saturated at once,
 classification by id, widening on the real error path plus its scope and expiry, the
@@ -185,7 +208,9 @@ released upstream mechanism.
   changes. Separate local flood-coherence and ledger deltas remain. Flood coherence
   is tracked in [issue #107612](https://github.com/NousResearch/hermes-agent/issues/107612).
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
-  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
+  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. On 2026-10-10 it was
+  converted back to draft to free an open-PR slot for PR 133834 (the slot was still
+  refused). Mark it ready again once the author's open ready PR count is under the limit.
 
 ## Reconnect Teardown During Text Sends
 

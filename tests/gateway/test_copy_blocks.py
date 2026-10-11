@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.platforms.base import SendResult
 from gateway.copy_blocks import (
+    protect_inline_copy_bodies,
     CopyMarkerStreamFilter,
     extract_copy_blocks,
     map_outside_copy_blocks,
@@ -154,12 +156,24 @@ def test_map_outside_copy_blocks_never_rewrites_bodies() -> None:
     assert map_outside_copy_blocks("plain MEDIA:/a.png", resolve) == "plain data:image/png"
 
 
-def test_literal_open_marker_inside_body_is_body_on_every_renderer() -> None:
-    text = "a\n[[copy]]\nx\n[[copy]]\ny\n[[/copy]]\nb\n"
-    assert extract_copy_blocks(text) == ("a\nb\n", ["x\n[[copy]]\ny"])
-    assert render_copy_blocks_inline(text) == "a\nx\n[[copy]]\ny\nb\n"
+def test_open_marker_inside_a_block_closes_it_on_every_renderer() -> None:
+    # A mistyped close: the second [[copy]] ends the block, and nothing leaks or is swallowed.
+    text = "Reply.\n\n[[copy]]\nHi\n[[copy]]\n\n[^1]: x\n"
+    assert extract_copy_blocks(text) == ("Reply.\n\n\n[^1]: x\n", ["Hi"])
+    assert render_copy_blocks_inline(text) == "Reply.\n\nHi\n\n[^1]: x\n"
     stream = CopyMarkerStreamFilter(drop_bodies=True)
-    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "a\nb\n"
+    assert "".join(stream.feed(ch) for ch in text) + stream.flush() == "Reply.\n\n\n[^1]: x\n"
+    protected, bodies = protect_inline_copy_bodies(text)
+    assert "[[copy]]" not in protected and list(bodies.values()) == ["Hi\n"]
+    assert "[[copy]]" not in map_outside_copy_blocks(text, lambda part: part)
+    # Toggling pairs work too, and a stray close after them stays control syntax.
+    assert extract_copy_blocks("[[copy]]\nA\n[[copy]]\nmid\n[[copy]]\nB\n[[copy]]\n[[/copy]]\n") == (
+        "mid\n", ["A", "B"])
+
+
+def test_fenced_open_marker_inside_a_block_is_still_body_text() -> None:
+    text = "[[copy]]\n```\n[[copy]]\n```\n[[/copy]]\n"
+    assert extract_copy_blocks(text) == ("", ["```\n[[copy]]\n```"])
 
 
 def test_extracted_response_keeps_legacy_constructor() -> None:
@@ -683,3 +697,44 @@ def test_partial_marker_still_carries_across_a_message_boundary() -> None:
     f.message_boundary()
     out += f.feed("py]]\nbody\n[[/copy]]\nafter\n") + f.flush()
     assert out == "intro\nbody\nafter\n"
+
+
+@pytest.mark.asyncio
+async def test_refused_copy_block_is_never_resent_with_a_fallback_banner() -> None:
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = "telegram"
+    sends = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append(content)
+        return SendResult(success=False, error="Bad Request: message rejected", retryable=False)
+
+    adapter.send = send
+    result = await adapter._send_with_retry(
+        chat_id="chat", content="exact body", reply_to=None,
+        metadata={"copy_block": True, "copy_block_index": 0, "plain": True})
+    assert result.success is False
+    assert sends == ["exact body"]
+
+
+@pytest.mark.asyncio
+async def test_copy_block_recovered_from_a_deleted_topic_stays_exact() -> None:
+    from gateway.config import Platform
+    adapter = object.__new__(_FakeAdapter)
+    adapter.platform = Platform.TELEGRAM
+    sends = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append((content, dict(metadata or {})))
+        if (metadata or {}).get("thread_id"):
+            return SendResult(success=False, error="Bad Request: message thread not found", retryable=False)
+        return SendResult(success=True, message_id="9")
+
+    adapter.send = send
+    result = await adapter._send_with_retry(
+        chat_id="chat", content="exact body", reply_to=None,
+        metadata={"copy_block": True, "plain": True, "notify": True, "thread_id": "77",
+                  "telegram_dm_topic_reply_fallback": True})
+    assert result.success is True
+    assert sends[-1][0] == "exact body"
+    assert "thread_id" not in sends[-1][1] and sends[-1][1]["copy_block"] is True

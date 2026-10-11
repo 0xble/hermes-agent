@@ -30,7 +30,7 @@ from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.daily_quota import DEFAULT_SOFT_CEILING, DailyQuota
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
-    current_trigger, reset_trigger)
+    current_trigger, keep_trigger, reset_trigger)
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
@@ -3628,6 +3628,14 @@ class TelegramAdapter(BasePlatformAdapter):
             bind_trigger(event)
         return event
 
+    def register_post_delivery_callback(
+        self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
+        # Bubble cleanup fires after the in-band drain above has relabelled the task for the
+        # follow-up; keep it under the trigger of the turn that registered it.
+        if callable(callback):
+            callback = keep_trigger(callback)
+        super().register_post_delivery_callback(session_key, callback, generation=generation)
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
@@ -4966,10 +4974,9 @@ class TelegramAdapter(BasePlatformAdapter):
         Used by the stream consumer's fresh-final cleanup path (ported from openclaw/openclaw#72038) to
         remove long-lived preview messages after sending the completed reply as a fresh message. Telegram's
         Bot API ``deleteMessage`` works for bot-posted messages in the last 48 hours. Failures are non-fatal
-        — the caller leaves the preview in place and logs at debug level.
+        — the caller leaves the preview in place and logs at debug level. Never shed by the daily volume
+        budget (a delete creates no message); the per-minute budget and flood guard still meter it.
         """
-        if self._daily_sheds(chat_id, OUTBOUND_PROGRESS):
-            return False  # the bubble stays; cleanup is cosmetic
         if not self._bot:
             live = self._replacement_telegram_adapter()
             return await live.delete_message(chat_id, message_id) if live is not None else False
@@ -4989,7 +4996,7 @@ class TelegramAdapter(BasePlatformAdapter):
         any other batch failure falls back to single deletes, which report per id."""
         ids = [str(mid) for mid in dict.fromkeys(message_ids)]
         results: Dict[str, bool] = {mid: False for mid in ids}
-        if not ids or self._daily_sheds(chat_id, OUTBOUND_PROGRESS):
+        if not ids:
             return results
         if not self._bot:
             live = self._replacement_telegram_adapter()
