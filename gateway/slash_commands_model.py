@@ -263,7 +263,7 @@ class GatewayModelCommandsMixin:
         # model/provider the session override must stay, or the next turn runs the channel model.
         if ctx.persist_global and global_error is None and self._channel_override_for(source) is None:
             try:
-                await self.async_session_store.set_model_override(ctx.session_key, None)
+                await self._persist_session_model_override(ctx.session_key, None)
             except Exception as e:
                 # Store still holds the stale copy: keep memory in agreement and report it (#100314).
                 logger.warning("Failed to clear persisted session model override: %s", e)
@@ -281,7 +281,7 @@ class GatewayModelCommandsMixin:
         # so a crash before the restore rehydrated the once-model permanently.)
         elif not one_turn:
             try:
-                await self.async_session_store.set_model_override(
+                await self._persist_session_model_override(
                     ctx.session_key, self._session_model_overrides[ctx.session_key]
                 )
             except Exception:

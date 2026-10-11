@@ -144,14 +144,45 @@ class GatewayAgentCacheMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.model_override if state else None
 
+    def _session_model_override_epoch(self, session_key: str) -> int:
+        return self._session_state(session_key).persistent.model_override_epoch
+
+    def _bump_session_model_override_epoch(self, session_key: str) -> None:
+        self._session_state(session_key).persistent.model_override_epoch += 1
+
+    async def _persist_session_model_override(self, session_key: str, override: Optional[dict]) -> None:
+        # Fence hydrations started before OR during the storage write, including clears
+        # with no live override. The epoch survives ConversationState.clear().
+        self._bump_session_model_override_epoch(session_key)
+        try:
+            await self.async_session_store.set_model_override(session_key, override)
+        finally:
+            self._bump_session_model_override_epoch(session_key)
+
+    def _commit_session_model_override(self, session_key: str, override: Optional[dict], epoch: int) -> None:
+        """On-loop CAS: an override edit or boundary invalidates the worker's snapshot."""
+        if (override is None or self._session_model_override_epoch(session_key) != epoch
+                or self._session_model_override(session_key) is not None):
+            return
+        self._session_model_overrides[session_key] = override
+        logger.info(
+            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
+            session_key, override.get("model"), override.get("provider") or "",
+        )
+
     def _rehydrate_session_model_override(self, session_key: str) -> None:
-        """Lazily restore a persisted /model override after a gateway restart: non-secret parts
-        (model/provider/base_url) are written through on /model and read back on first use; api_key
-        is never persisted and is re-resolved. No-op when an in-memory override or nothing exists."""
+        """Synchronous callers retain lazy restoration, using the same fenced commit."""
+        if self._session_model_override(session_key) is not None:
+            return
+        epoch = self._session_model_override_epoch(session_key)
+        self._commit_session_model_override(session_key, self._load_session_model_override(session_key), epoch)
+
+    def _load_session_model_override(self, session_key: str) -> Optional[dict]:
+        """Load non-secret persisted fields and resolve credentials; never mutate runner state."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
-        if self._session_model_override(session_key) is not None or store is None:
-            return
+        if store is None:
+            return None
         try:
             persisted = store.get_model_override(session_key)
         except Exception:
@@ -188,17 +219,17 @@ class GatewayAgentCacheMixin:
                     "Credential re-resolution failed for persisted override "
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
-        self._session_state(session_key).conversation.model_override = override
-        logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
-        )
+        return override
 
     def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped
         so partial overrides don't clobber defaults), returning (model, runtime_kwargs)."""
+        return self._apply_model_override(self._session_model_override(session_key), model, runtime_kwargs)
+
+    @staticmethod
+    def _apply_model_override(override: Optional[dict], model: str, runtime_kwargs: dict) -> tuple:
+        """Layer a detached override snapshot, without consulting live session state."""
         from gateway.run import _credential_pool_for_provider
-        override = self._session_model_override(session_key)
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
@@ -240,9 +271,10 @@ class GatewayAgentCacheMixin:
         if not session_key:
             return
         if snapshot.get("had_override"):
-            self._session_state(session_key).conversation.model_override = dict(snapshot.get("override") or {})
-        elif (state := self._peek_session_state(session_key)) is not None:
-            state.conversation.model_override = None
+            self._session_model_overrides[session_key] = dict(snapshot.get("override") or {})
+        else:
+            self._bump_session_model_override_epoch(session_key)
+            self._session_model_overrides.pop(session_key, None)
         self._evict_cached_agent(session_key)
 
     def _is_intentional_model_switch(self, session_key: str, agent: Any, config_model: str) -> bool:
@@ -365,6 +397,7 @@ class GatewayAgentCacheMixin:
         from gateway.run import _CONVERSATION_SCOPED_STATE
         if not session_key:
             return
+        self._bump_session_model_override_epoch(session_key)
         state = self._peek_session_state(session_key)
         if state is not None:
             state.conversation.clear()
@@ -494,12 +527,8 @@ class GatewayAgentCacheMixin:
             # Latch before interrupting: the interrupted background delegations below report back
             # within a second and must not start the turn the user just stopped.
             self._latch_user_stop(session_key)
-            try:
-                # Capture before the first await. The immutable marker includes the
-                # session identity, so a delayed stop cannot clear a newer recovery.
-                stop_marker = await self.async_session_store.get_resume_pending_marker(session_key)
-            except Exception:
-                logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
+        # Capture and interrupt the original target synchronously: storage contention
+        # must neither delay /stop nor let it interrupt a successor after the await.
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
@@ -530,6 +559,15 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
+        if interrupt_reason == _INTERRUPT_REASON_STOP:
+            try:
+                # The immutable marker includes session identity; combined with the
+                # captured generation, a delayed stop cannot clear a newer recovery.
+                stop_marker = await self.async_session_store.get_resume_pending_marker(session_key)
+            except Exception:
+                logger.warning("Could not read restart marker before /stop for %s", session_key, exc_info=True)
+        if not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return
         adapter = self._delivery_adapter_for(source)
         # /stop, /new, and /reset invalidate the adapter-side deferred-command queue too. The
         # runner's turn generation protects agent state, but queued slash events live on adapters
@@ -544,6 +582,8 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        if not self._is_session_run_current(session_key, _generation_at_interrupt):
+            return
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
@@ -574,8 +614,9 @@ class GatewayAgentCacheMixin:
                 await self.async_session_store.clear_resume_pending(session_key, expected_marker=stop_marker)
             except Exception:
                 logger.warning("Could not persist restart marker clear after /stop for %s", session_key, exc_info=True)
-        if interrupt_reason == _INTERRUPT_REASON_STOP:
-            await self._pause_goal_for_stop(session_key, source)
+        if (interrupt_reason == _INTERRUPT_REASON_STOP
+                and self._is_session_run_current(session_key, _generation_at_interrupt)):
+            await self._pause_goal_for_stop(session_key, source, run_generation=_generation_at_interrupt)
 
     def _latch_user_stop(self, session_key: str) -> None:
         """Hold background wakes for ``session_key`` until the next non-internal turn."""

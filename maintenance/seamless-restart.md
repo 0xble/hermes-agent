@@ -87,6 +87,10 @@ reads nonblocking. Keep the entire sync operation (including handle acquisition,
 manager construction and metadata reads/writes) in a context-preserving worker.
 Keep profile scope entry, admission fences and adapter queue/timer mutation on
 asyncio; Telegram topic recovery must finish before batching derives its key.
+Model-override hydration and runtime-resolution commits stay on-loop, with a
+monotonic override-epoch compare-and-set so /model and conversation boundaries win.
+/stop captures and interrupts its target before the storage await; the captured
+run generation fences the delayed marker handling and cleanup from successors.
 
 Proof surface: `tests/gateway/test_turn_state_db_off_loop.py` uses an independent
 storage-controller thread and an asyncio heartbeat to pin goal/loop construction,

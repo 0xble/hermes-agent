@@ -193,7 +193,7 @@ class GatewayLoginCommandsMixin:
             if str(override.get("model") or "") == anon_auth.GUEST_MODEL:
                 for attempt in range(2):
                     try:
-                        await self.async_session_store.set_model_override(key, None)
+                        await self._persist_session_model_override(key, None)
                         break
                     except Exception:
                         if attempt == 1:

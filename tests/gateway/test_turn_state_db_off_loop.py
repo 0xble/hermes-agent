@@ -266,3 +266,161 @@ async def test_telegram_recovers_before_batching_without_blocking_loop(
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _BlockedRead:
+    """Freeze a store result until the loop has performed the competing operation."""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = threading.Event()
+        self.loop = asyncio.get_running_loop()
+
+    def block(self):
+        self.loop.call_soon_threadsafe(self.started.set)
+        assert self.release.wait(10), "competing operation did not release the read"
+
+
+@pytest.mark.asyncio
+async def test_stop_interrupts_original_before_blocked_marker_read(monkeypatch, tmp_path):
+    from gateway.session import build_session_key
+    from unittest.mock import MagicMock
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    key = build_session_key(source)
+    runner.session_store.get_or_create_session(source)
+    runner.session_store.mark_resume_pending(key, "original-recovery")
+    original, successor = MagicMock(), MagicMock()
+    original.session_id = "original-turn"
+    successor.session_id = "successor-turn"
+    original_generation = runner._begin_session_run_generation(key)
+    runner._running_agents[key] = original
+    runner._agent_cache[key] = (original, "original-signature")
+    monkeypatch.setattr(runner, "_persist_active_agents", lambda: None)
+    monkeypatch.setattr(runner, "_pause_goal_for_stop", AsyncMock())
+    adapter = SimpleNamespace(_invalidate_deferred_commands=MagicMock())
+    monkeypatch.setattr(runner, "_delivery_adapter_for", lambda _: adapter)
+    gate = _BlockedRead()
+    read = runner.session_store.get_resume_pending_marker
+
+    def blocked_read(session_key):
+        gate.block()
+        # Deliberately read AFTER replacement: the generation fence must also
+        # protect a recovery whose immutable marker was not available at /stop.
+        return read(session_key)
+
+    monkeypatch.setattr(runner.session_store, "get_resume_pending_marker", blocked_read)
+    stop = asyncio.create_task(runner._interrupt_and_clear_session(
+        key, source, interrupt_reason="Stop requested", invalidation_reason="stop_command"
+    ))
+    try:
+        await asyncio.wait_for(gate.started.wait(), 10)
+        interrupted_before_read = original.interrupt.call_count
+        generation_before_read = runner._current_session_run_generation(key)
+        successor_generation = runner._begin_session_run_generation(key)
+        runner._running_agents[key] = successor
+        runner._agent_cache[key] = (successor, "successor-signature")
+        runner._pending_messages[key] = "successor-command"
+        runner.session_store.mark_resume_pending(key, "successor-recovery")
+        successor_marker = read(key)
+        gate.release.set()
+        await asyncio.wait_for(stop, 10)
+        assert interrupted_before_read == 1, "original turn was not interrupted before storage await"
+        assert generation_before_read == original_generation + 1
+        successor.interrupt.assert_not_called()
+        assert runner._current_session_run_generation(key) == successor_generation
+        assert runner._running_agents[key] is successor
+        assert runner._agent_cache[key][0] is successor
+        assert runner._pending_messages[key] == "successor-command"
+        adapter._invalidate_deferred_commands.assert_not_called()
+        runner._pause_goal_for_stop.assert_not_awaited()
+        assert successor_marker is not None and read(key) == successor_marker
+    finally:
+        gate.release.set()
+        await asyncio.gather(stop, return_exceptions=True)
+        if runner._executor is not None:
+            await asyncio.to_thread(runner._executor.shutdown)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["model", "boundary"])
+@pytest.mark.parametrize("phase", ["store", "runtime"])
+async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, monkeypatch, tmp_path):
+    from gateway.session import build_session_key
+    from gateway.slash_commands_model import _ModelSwitchContext
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    key = build_session_key(source)
+    runner.session_store.get_or_create_session(source)
+    runner.session_store.set_model_override(key, {"model": "old-model", "provider": "probe"})
+    runner._session_db = None
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda _: "default-model")
+    gate = _BlockedRead()
+    credential_calls = 0
+
+    def resolve_credentials(*args, **kwargs):
+        nonlocal credential_calls
+        credential_calls += 1
+        if phase == "runtime":
+            if credential_calls == 1:
+                return {"provider": "probe"}  # hydration is credential-less; resolve again
+            if credential_calls == 2:
+                gate.block()
+        return {"api_key": "test-key", "provider": "probe"}
+
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs_for_provider", resolve_credentials)
+    monkeypatch.setattr("gateway.run._resolve_runtime_agent_kwargs",
+                        lambda: {"api_key": "default-key", "provider": "probe"})
+    read = runner.session_store.get_model_override
+
+    def blocked_read(session_key):
+        snapshot = read(session_key)
+        if phase == "store":
+            gate.block()
+        return snapshot
+
+    monkeypatch.setattr(runner.session_store, "get_model_override", blocked_read)
+    owner_thread = threading.get_ident()
+    state_access_threads = []
+    session_state = runner._session_state
+
+    def observed_state(session_key):
+        state_access_threads.append(threading.get_ident())
+        return session_state(session_key)
+
+    monkeypatch.setattr(runner, "_session_state", observed_state)
+    resolution = asyncio.create_task(runner._resolve_session_agent_runtime_async(
+        source=source, session_key=key
+    ))
+    try:
+        await asyncio.wait_for(gate.started.wait(), 10)
+        if change == "model":
+            result = SimpleNamespace(
+                new_model="new-model", target_provider="probe", api_key="new-key",
+                base_url="https://probe.invalid/v1", api_mode="chat_completions",
+                request_overrides={}, runtime_capabilities={}, provider_label="probe",
+            )
+            ctx = _ModelSwitchContext(key, source, tmp_path / "config.yaml", False,
+                                      current_model="old-model")
+            await runner._record_model_switch(result, ctx, source=source, one_turn=False, picker=False)
+            assert runner._session_model_override(key)["model"] == "new-model"
+        else:
+            runner._clear_conversation_scope(key, reason="session_reset")
+            await runner.async_session_store.set_model_override(key, None)
+            assert runner._session_model_override(key) is None
+        gate.release.set()
+        model, _ = await asyncio.wait_for(resolution, 10)
+        override = runner._session_model_override(key)
+        assert (override or {}).get("model") == ("new-model" if change == "model" else None), (
+            "stale rehydrate replaced the concurrent model choice or conversation boundary"
+        )
+        assert model == ("new-model" if change == "model" else "default-model")
+        assert state_access_threads and set(state_access_threads) == {owner_thread}
+        assert (read(key) or {}).get("model") == ("new-model" if change == "model" else None)
+    finally:
+        gate.release.set()
+        await asyncio.gather(resolution, return_exceptions=True)
+        if runner._executor is not None:
+            await asyncio.to_thread(runner._executor.shutdown)

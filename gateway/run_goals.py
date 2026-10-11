@@ -417,7 +417,9 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return await self._run_in_executor_with_context(factory, sid)
 
-    async def _pause_goal_for_stop(self, session_key: str, source: Any) -> bool:
+    async def _pause_goal_for_stop(
+        self, session_key: str, source: Any, *, run_generation: Optional[int] = None,
+    ) -> bool:
         """``/stop`` pauses the standing goal and drops its queued continuations (CLI Ctrl+C parity).
 
         A judge BLOCKED pause is overwritten too: an explicit stop must not be revived by the next
@@ -430,6 +432,11 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal stop: session lookup failed for %s: %s", session_key, exc)
             session_id = None
+        def is_current():
+            return run_generation is None or self._is_session_run_current(session_key, run_generation)
+
+        if not is_current():
+            return False
         adapter = self._delivery_adapter_for(source)
         with suppress(Exception):
             self._clear_goal_pending_continuations(session_key, adapter)
@@ -447,17 +454,21 @@ class GatewayGoalsMixin:
                 return None
             if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
                 return None
+            if not is_current():
+                return None
             mgr.pause(reason=_GOAL_STOP_PAUSE_REASON)
             return mgr.state.goal
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal stop")
+            if not is_current():
+                return False
             try:
                 goal = await self._run_in_executor_with_context(_pause)
             except Exception as exc:
                 logger.warning("goal stop: pause failed for session %s: %s", session_id, exc)
                 return False
-            if not goal:
+            if not goal or not is_current():
                 return False
             logger.info("goal stop: paused standing goal for session %s", session_id)
             try:
