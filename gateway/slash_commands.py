@@ -462,6 +462,11 @@ class GatewaySlashCommandsMixin(
         all cases.  The session is preserved so the user can continue."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
         source = event.source
+        # A cold translation loads profile config and parses locale YAML. Keep that I/O/CPU
+        # work off the ingress loop too, including the otherwise-idle /stop reply.
+        async def _reply(key: str) -> str:
+            return await asyncio.to_thread(t, key)
+
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
@@ -493,10 +498,10 @@ class GatewaySlashCommandsMixin(
         if agent is _AGENT_PENDING_SENTINEL:  # force-clean the sentinel so the session is unlocked
             await _stop(session_key, "stop_command_pending")
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key)
-            return EphemeralReply(t("gateway.stop.stopped_pending"))
+            return EphemeralReply(await _reply("gateway.stop.stopped_pending"))
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
             await _stop(session_key, "stop_command_handler")
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return EphemeralReply(await _reply("gateway.stop.stopped"))
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
         # shaped key. One scan feeds both tiers; the chat tier is a superset of the thread-sibling
@@ -519,7 +524,7 @@ class GatewaySlashCommandsMixin(
                 await _stop(fallback_key, reason)
             logger.info("STOP (%s) by %s — interrupted %d run(s): %s",
                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return EphemeralReply(await _reply("gateway.stop.stopped"))
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
         # earlier turn still count as "active": stop them; each returns as an interrupted completion.
@@ -540,7 +545,7 @@ class GatewaySlashCommandsMixin(
             session_key, source, expected_session_id=stop_session_id,
             expected_generation=stop_generation, expected_session_entry=stop_session_entry)
         if interrupted or goal_paused:
-            return EphemeralReply(t("gateway.stop.stopped"))
+            return EphemeralReply(await _reply("gateway.stop.stopped"))
         # A platform status indicator can still be stuck —
         # e.g. Slack's persistent assistant.threads.setStatus survives a gateway restart or a turn
         # that died without a final send.
@@ -551,7 +556,7 @@ class GatewaySlashCommandsMixin(
                 await adapter._stop_typing_with_metadata(source.chat_id, self._reply_metadata(event))
         except Exception:
             logger.debug("Failed to clear typing on /stop with no active agent", exc_info=True)
-        return t("gateway.stop.no_active")
+        return await _reply("gateway.stop.no_active")
 
     async def _handle_platform_command(self, event: MessageEvent) -> str:
         """Handle ``/platform list|pause|resume [name]`` — inspect and manually control failed/paused

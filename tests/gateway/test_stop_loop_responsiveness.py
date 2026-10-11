@@ -141,6 +141,71 @@ async def test_stop_latch_store_io_is_off_loop(monkeypatch, action):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["idle", "goal", "pending", "running"])
+async def test_cold_stop_reply_catalog_load_is_off_loop(monkeypatch, state):
+    from types import SimpleNamespace
+
+    from agent import i18n, i18n_layers
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from hermes_constants import get_hermes_home
+
+    runner, _, source, key, session_id = await _runner(monkeypatch)
+    if state == "goal":
+        _active_goal(session_id)
+    elif state == "pending":
+        runner._running_agents[key] = _AGENT_PENDING_SENTINEL
+    elif state == "running":
+        runner._running_agents[key] = SimpleNamespace(interrupt=lambda *args, **kwargs: None)
+
+    i18n.reset_language_cache()
+    original_parse = i18n_layers.parse_locale_file
+    loop_thread, home = threading.get_ident(), get_hermes_home()
+    writing, release, progressed = (threading.Event() for _ in range(3))
+    ready, done = asyncio.Event(), asyncio.Event()
+    parse_threads, parse_homes = [], []
+
+    def suspended_parse(path):
+        parse_threads.append(threading.get_ident())
+        parse_homes.append(get_hermes_home())
+        writing.set()
+        assert release.wait(timeout=5), "cold reply catalog was not released"
+        return original_parse(path)
+
+    async def heartbeat():
+        ready.set()
+        while not done.is_set():
+            await asyncio.sleep(0.05)
+            if writing.is_set() and not release.is_set():
+                progressed.set()
+
+    def release_after_pulse():
+        if writing.wait(timeout=3):
+            progressed.wait(timeout=2)  # releases an on-loop regression without hanging pytest
+        release.set()
+
+    monkeypatch.setattr(i18n_layers, "parse_locale_file", suspended_parse)
+    pulse_task = asyncio.create_task(heartbeat())
+    await asyncio.wait_for(ready.wait(), timeout=2)
+    releaser = threading.Thread(target=release_after_pulse)
+    releaser.start()
+    try:
+        reply = await asyncio.wait_for(
+            runner._handle_stop_command(MessageEvent(text="/stop", source=source)), timeout=5)
+    finally:
+        release.set()
+        done.set()
+        await asyncio.wait_for(pulse_task, timeout=2)
+        await asyncio.to_thread(releaser.join, 2)
+        assert not releaser.is_alive()
+    assert writing.is_set() and parse_threads, "the stop reply never loaded its cold catalog"
+    assert loop_thread not in parse_threads, "cold stop reply catalog ran on the asyncio thread"
+    assert progressed.is_set(), "the loop did not progress while the cold catalog was blocked"
+    assert all(parsed_home == home for parsed_home in parse_homes)
+    assert ("No active task" if state == "idle" else "Stopped") in str(reply)
+
+
+@pytest.mark.asyncio
 async def test_delayed_stop_latch_write_cannot_rehold_after_user_admission(monkeypatch):
     runner, _, _, key, session_id = await _runner(monkeypatch)
     writing, release = threading.Event(), threading.Event()
