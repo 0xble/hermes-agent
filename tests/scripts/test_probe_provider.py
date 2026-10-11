@@ -68,6 +68,7 @@ with patch('hermes_cli.runtime_provider._try_resolve_from_custom_pool', return_v
     runtime = resolve_runtime_provider(requested=os.environ['PROBE_REQUESTED'])
 assert runtime['base_url'] == os.environ['PROBE_EXPECTED_BASE'].strip().rstrip('/')
 assert runtime['api_key'] == os.environ['PROBE_EXPECTED_KEY']
+assert runtime.get('api_mode') in {'chat_completions', 'codex_responses'}, runtime.get('api_mode')
 """], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
         assert reference.returncode == 0, "accepted probe route diverged from the runtime"
     return result
@@ -444,6 +445,8 @@ _NON_OPENAI_ROUTES = {
                             "codex_app_server"),
     "openai-runtime-overlay": ({"base_url": "http://127.0.0.1:{port}/v1"}, {"openai_runtime": "codex_app_server"},
                                "codex_app_server"),
+    "openai-runtime-overlay-unnormalized": ({"base_url": "http://127.0.0.1:{port}/v1"},
+                                            {"openai_runtime": " CODEX_APP_SERVER "}, "codex_app_server"),
     "opencode-family-name": ({"name": "opencode-go-bridge", "base_url": "http://127.0.0.1:{port}/zen/go/v1",
                               "default_model": "minimax-m2.5"}, {}, "anthropic_messages"),
     "opencode-host": ({"name": "zen", "base_url": "https://opencode.ai:{port}/zen/v1",

@@ -64,7 +64,7 @@ def _endpoint(requested):
     model = config.get("model") or {}
     if (entry.get("key_cmd") or entry.get("extra_headers")
             or mode not in {"", "chat_completions", "codex_responses"}
-            or model.get("openai_runtime") == "codex_app_server"):
+            or str(model.get("openai_runtime") or "").strip().lower() == "codex_app_server"):
         raise ValueError
     # Reuse the runtime's keyed-entry lookup for URL/key_env/inline precedence.
     # Never call load_pool, select, or the full runtime builder (they can write,
