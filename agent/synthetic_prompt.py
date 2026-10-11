@@ -274,6 +274,54 @@ def human_prompt_text(
     return text or None
 
 
+# GatewayInboundMixin._enrich_message_with_vision and the CLI vision enrichment emit this
+# *pair* of notes. Use the second note as the boundary: descriptions can contain paragraphs,
+# quoted brackets and even unbalanced brackets. Splitting on the first `]` loses human text.
+_IMAGE_RECALL_PREFIX = re.compile(
+    r"\[The user (?:sent an image~ Here's what I can see:|"
+    r"attached an image\. Here's what it contains:)\n(?P<description>.*?)\]\n"
+    r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
+    re.DOTALL,
+)
+# Only known, single-line attachment metadata emitted by gateway/CLI producers, never arbitrary
+# bracketed human prose. Speech-to-text's quoted transcript is intentionally NOT a metadata note.
+_ATTACHMENT_RECALL_NOTE = re.compile(
+    r"\[(?:User sent (?:an image|audio|a video|a file): "
+    r"|The user sent (?:a (?:text )?document: '|an audio file attachment: '|a video attachment: '"
+    r"|a voice message: |a voice message but it came through empty or inaudible "
+    r"|an image but I couldn't quite see it this time "
+    r"|an image but something went wrong when I tried to look at it)"
+    r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \())"
+    r"[^\n]*\](?=\n|$)"
+)
+
+
+def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
+    """Prefer the request over prepended attachment context, with an image-only fallback.
+
+    This affects recall only, not human_prompt_text (retention) or the model's original prompt.
+    Recheck generated prefixes after peeling attachment notes: either prefix can wrap the other.
+    A generated/trivial suffix is not an image-only turn and must not fall back to its description.
+    """
+    descriptions = []
+    while text:
+        if not include_synthetic:
+            human = human_prompt_text(text)
+            if not human:
+                return None
+            text = human
+        image = _IMAGE_RECALL_PREFIX.match(text)
+        note = None if image else _ATTACHMENT_RECALL_NOTE.match(text)
+        if image:
+            descriptions.append(image.group("description").strip())
+        prefix = image or note
+        if not prefix:
+            return text
+        text = text[prefix.end():].strip()
+    fallback = "\n\n".join(description for description in descriptions if description)
+    return fallback if include_synthetic else human_prompt_text(fallback)
+
+
 def auto_recall_query(
     content: Optional[str], *, display_kind: Optional[str] = None, platform: Optional[str] = None,
     include_synthetic: bool = False,
@@ -282,8 +330,12 @@ def auto_recall_query(
 
     Synthetic turns recall nothing by default (``memory.recall_synthetic_turns``): their generated
     text is a poor semantic query and repeats verbatim across turns. A human suffix merged into one
-    still recalls, keyed on that suffix alone. Explicit memory tools are unaffected.
+    still recalls, keyed on that suffix alone. Attachment descriptions/path advice do not precede
+    the human request in the query; meaningful image-only descriptions remain a fallback. Explicit
+    memory tools, retained content and the model's prompt are unaffected.
     """
     text = (content or "").strip()
     query = text if include_synthetic else human_prompt_text(text, display_kind=display_kind, platform=platform)
+    if query:
+        query = _attachment_recall_text(query, include_synthetic=include_synthetic)
     return "" if not query or is_trivial_prompt(query) else query
