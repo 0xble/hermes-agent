@@ -2684,6 +2684,8 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         return True
 
     if owns_fire_claim is False:
+        from cron.scheduler_control import release_unstarted_claim
+        release_unstarted_claim(job)
         logger.warning("Job '%s': fire claim ownership was already lost before execution", job_id)
         _finish_unstarted("Fire claim ownership lost before execution started.")
         return True
@@ -2763,6 +2765,8 @@ def run_one_job(
     with _running_lock:
         control = _running_cancel_events.get(control_key)
     if control is not None and control.is_set():
+        from cron.scheduler_control import release_unstarted_claim
+        release_unstarted_claim(job)
         finish_execution(execution_id, success=False, error="Cron job removed or paused before start.")
         return True
     if not external_owner:

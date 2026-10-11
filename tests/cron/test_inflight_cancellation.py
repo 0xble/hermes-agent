@@ -143,6 +143,33 @@ def test_cancel_scope_latches_before_agent_registration(isolated_store):
     assert key not in scheduler._running_cancel_events
 
 
+@pytest.mark.parametrize("registered", [True, False])
+def test_pause_before_start_releases_only_its_own_claim(isolated_store, monkeypatch, registered):
+    job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    runner = Mock()
+    monkeypatch.setattr(scheduler, "run_job", runner)
+    if registered:
+        assert scheduler.try_register_running_job(job["id"])
+    try:
+        receipt = dispatch("pause", job_id=job["id"])
+        assert receipt["was_running"]
+        assert receipt["interrupted"] is registered
+        assert scheduler.run_one_job(claimed)
+    finally:
+        if registered:
+            scheduler.release_running_job(job["id"])
+    runner.assert_not_called()
+    paused = jobs.get_job(job["id"])
+    assert paused and not paused.get("fire_claim")
+    assert paused["last_run_at"] is None
+    assert paused["repeat"]["completed"] == 0
+    assert not jobs.list_jobs(include_disabled=True)[0]["running"]
+    assert jobs.resume_job(job["id"])
+    assert jobs.claim_job_for_fire(job["id"])
+
+
 def test_cancelled_completion_never_clears_replacement_claim(isolated_store):
     job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
     claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
@@ -150,4 +177,7 @@ def test_cancelled_completion_never_clears_replacement_claim(isolated_store):
     jobs.update_job(job["id"], {"fire_claim": {"by": "replacement",
                                              "at": jobs._hermes_now().isoformat()}})
     scheduler._record_fire_ownership_lost(job["id"], owner, "missing-execution")
+    assert jobs.get_job(job["id"])["fire_claim"]["by"] == "replacement"
+    from cron.scheduler_control import release_unstarted_claim
+    release_unstarted_claim(claimed)
     assert jobs.get_job(job["id"])["fire_claim"]["by"] == "replacement"

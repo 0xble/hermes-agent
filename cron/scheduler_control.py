@@ -28,6 +28,22 @@ def register_control(key: tuple) -> RunControl:
     return control
 
 
+def release_unstarted_claim(job: dict) -> None:
+    """Release only this cancelled attempt, without consuming repeat or outcome fields."""
+    from cron import jobs
+
+    owner = (job.get("fire_claim") or {}).get("by")
+    if owner is None:
+        return
+
+    def apply(records, _index, current):
+        if (current.get("fire_claim") or {}).get("by") == owner:
+            current["fire_claim"] = None
+            jobs.save_jobs(records)
+
+    jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
+
+
 def running_job_state(job: dict) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
