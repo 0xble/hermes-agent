@@ -4249,7 +4249,11 @@ _last_dead_owner_reap_at: Dict[str, float] = {}
 
 # Worktree prune throttle: the cron tick is the only reliably periodic process on gateway boxes.
 _WORKTREE_MAINTENANCE_INTERVAL_SECONDS = 6 * 3600.0
-_last_worktree_maintenance_at: Optional[float] = None
+# The first pass waits this long after the process starts: git classification of every tree plus a
+# ``du`` of .worktrees/ is heavy metadata I/O, and a boot already saturates the disk and state.db.
+_WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS = 1800.0
+_last_worktree_maintenance_at: Optional[float] = (
+    time.monotonic() - _WORKTREE_MAINTENANCE_INTERVAL_SECONDS + _WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS)
 _worktree_maintenance_lock = threading.Lock()
 
 
