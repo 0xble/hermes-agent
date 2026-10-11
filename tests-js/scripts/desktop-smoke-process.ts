@@ -147,6 +147,31 @@ function linuxListeningPid(port: number, candidates: NativeProcess[]): number[] 
   }).map((candidate: NativeProcess): number => candidate.pid)
 }
 
+/** Avoid inspecting unrelated host descriptors before the ownership filter. */
+export function macosListeningPids(port: number, candidatePids: number[], query = nativeText): number[] {
+  if (candidatePids.length === 0) {
+    return []
+  }
+
+  let output: string
+
+  try {
+    output = query('/usr/sbin/lsof', ['-nP', '-a', '-p', candidatePids.join(','), `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp'])
+  } catch (error) {
+    // lsof reports an empty intersection with exit 1, without a diagnostic.
+    if (error instanceof Error && 'status' in error && error.status === 1
+      && 'stdout' in error && String(error.stdout).trim() === ''
+      && 'stderr' in error && String(error.stderr).trim() === '') {
+      return []
+    }
+
+    throw error
+  }
+
+  return output.split('\n').filter((line: string): boolean => /^p\d+$/.test(line))
+    .map((line: string): number => Number(line.slice(1)))
+}
+
 /** Epoch seconds a live process started (psutil's `create_time` basis), or null when unreadable. */
 function processStartTime(pid: number): number | null {
   try {
@@ -225,8 +250,7 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
     pids = z.array(z.number()).parse(JSON.parse(nativeText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
       `ConvertTo-Json -Compress -InputObject @((Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction Stop).OwningProcess | Sort-Object -Unique)`])))
   } else if (process.platform === 'darwin') {
-    pids = nativeText('/usr/sbin/lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp']).split('\n')
-      .filter((line: string): boolean => /^p\d+$/.test(line)).map((line: string): number => Number(line.slice(1)))
+    pids = macosListeningPids(port, candidates.map(candidate => candidate.pid))
   } else {
     pids = linuxListeningPid(port, candidates)
   }

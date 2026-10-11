@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { type ChildProcess, exec as execCallback, type ExecOptionsWithStringEncoding, spawn } from 'node:child_process'
+import { type ChildProcess, exec as execCallback, execFile as execFileCallback, type ExecOptionsWithStringEncoding, spawn } from 'node:child_process'
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -111,7 +111,9 @@ async function spawnFixture(launcher: 'setsid' | 'nohup', owned: boolean): Promi
     startedAt: new Date().toISOString()
   }
 
-  await mkdir(bin)
+  // A bare link to a copied venv interpreter loses its standard-library prefix.
+  // Keep native venv metadata alongside the restricted bin, as installed launchers do.
+  await promisify(execFileCallback)('python3', ['-m', 'venv', '--without-pip', root])
   await mkdir(hermesHome)
   await mkdir(path.join(root, 'reports'))
 
@@ -119,7 +121,6 @@ async function spawnFixture(launcher: 'setsid' | 'nohup', owned: boolean): Promi
   // real nohup with no setsid executable anywhere on the child's PATH.
   for (const tool of [
     'sh',
-    'python3',
     'mkdir',
     'dirname',
     'rm',

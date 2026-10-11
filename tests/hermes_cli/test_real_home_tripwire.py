@@ -106,6 +106,45 @@ def test_installed_desktop_app_can_be_read_but_never_changed(tmp_path, monkeypat
     assert plist.read_text(encoding="utf-8") == "unchanged"
 
 
+def test_host_install_directories_are_readable_but_cannot_be_changed(protected_home, tmp_path, monkeypatch):
+    from tests import conftest
+
+    directories = [tmp_path / ".local" / "bin", tmp_path / "Library" / "LaunchAgents"]
+    for directory in directories:
+        directory.mkdir(parents=True)
+        (directory / "existing").write_text("unchanged", encoding="utf-8")
+    source = tmp_path / "replacement"
+    source.write_text("replacement", encoding="utf-8")
+    monkeypatch.setattr(conftest, "_REAL_HOST_INSTALL_DIRS", directories, raising=False)
+    for directory in directories:
+        existing, new = directory / "existing", directory / "new"
+        assert existing.read_text(encoding="utf-8") == "unchanged"
+        assert list(directory.iterdir()) == [existing]
+        changes = [
+            lambda: existing.write_text("changed", encoding="utf-8"), existing.unlink,
+            lambda: source.replace(existing), lambda: new.mkdir(),
+            lambda: os.makedirs(new / "child"), lambda: shutil.rmtree(directory),
+            lambda: os.symlink(source, new), lambda: os.link(source, new),
+        ]
+        for change in changes:
+            with pytest.raises(pytest.fail.Exception, match="REAL host installation directory"):
+                change()
+        alias = tmp_path / f"{directory.name}-alias"
+        with pytest.raises(pytest.fail.Exception, match="REAL host installation directory"):
+            os.link(existing, alias)
+        assert existing.read_text(encoding="utf-8") == "unchanged"
+        assert not new.exists()
+        assert not alias.exists()
+    alias = tmp_path / "hermes-state-alias"
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        os.link(protected_home / "file.txt", alias)
+    assert not alias.exists()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [])
+        assert (protected_home / "file.txt").read_text(encoding="utf-8") == "unchanged"
+    assert source.read_text(encoding="utf-8") == "replacement"
+
+
 def test_unprotected_paths_and_open_descriptors_still_work(protected_home, tmp_path):
     target = tmp_path / "allowed" / "file.txt"
     target.parent.mkdir()
