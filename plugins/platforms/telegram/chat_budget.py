@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import inspect
 import json
 import logging
 import sqlite3
@@ -39,7 +40,7 @@ from contextlib import closing
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from plugins.platforms.telegram.daily_quota import OUTBOUND_PROGRESS, DailyQuota
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
@@ -429,6 +430,26 @@ def reset_trigger(token) -> None:
 
 def current_trigger() -> str:
     return _TRIGGER.get()
+
+
+def keep_trigger(callback: Callable[[], Any]) -> Callable[[], Awaitable[None]]:
+    """Run a deferred callback under the trigger current now, not the one current when it fires.
+
+    An in-band drain relabels the task for the follow-up turn before the previous turn's
+    post-delivery callbacks run, so without this they would be counted (and judged) as the follow-up.
+    """
+    trigger = _TRIGGER.get()
+
+    async def run() -> None:
+        token = _TRIGGER.set(trigger)
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        finally:
+            _TRIGGER.reset(token)
+
+    return run
 
 
 class DailyCallCounter:

@@ -2,6 +2,8 @@
 
 import json
 import re
+import zipfile
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,73 @@ def profiles(monkeypatch, tmp_path):
         raising=False,
     )
     return {"default": default_home, "work": work, "sparks": sparks}
+
+
+@pytest.mark.parametrize("kind", ["manual", "pre_update", "pre_migration"])
+@pytest.mark.parametrize("critical", [
+    "config.yaml", ".env", "auth.json", "cron/jobs.json", "platforms/pairing/token.json",
+])
+def test_vanished_named_profile_state_retains_last_complete_archive(
+        tmp_path, monkeypatch, capsys, kind, critical):
+    home = _mk_profile(tmp_path / ".hermes")
+    coder = _mk_profile(home / "profiles" / "coder")
+    target = coder / critical
+    target.parent.mkdir(parents=True, exist_ok=True)
+    original = b"named-profile critical state\n"
+    target.write_bytes(original)
+    rel = target.relative_to(home).as_posix()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    create = getattr(backup, f"create_{kind}_backup", None)
+    success = None
+    out_dir = tmp_path / "archives"
+    if kind == "manual":
+        out_dir.mkdir()
+        prefix = backup._RUN_BACKUP_PREFIX
+        prior = out_dir / f"{prefix}20000101-000000.zip"
+        assert backup.run_backup(Namespace(output=str(prior), keep=1)) is True
+    else:
+        assert create is not None
+        good = create(hermes_home=home, keep=1)
+        assert good
+        # A second run in the same second must not overwrite the prior fixture;
+        # retention orders archive names, so move it to an older real timestamp.
+        prefix = backup._PRE_UPDATE_PREFIX if kind == "pre_update" else backup._PRE_MIGRATION_PREFIX
+        prior = good.with_name(f"{prefix}2000-01-01-000000.zip")
+        good.rename(prior)
+    with zipfile.ZipFile(prior) as archive:
+        assert archive.read(rel) == original
+
+    real_iter = backup._iter_backup_files
+
+    def scan_then_remove(*args, **kwargs):
+        selected = list(real_iter(*args, **kwargs))
+        target.unlink()
+        return iter(selected)
+
+    monkeypatch.setattr(backup, "_iter_backup_files", scan_then_remove)
+    capsys.readouterr()
+    outcome = {}
+    if kind == "manual":
+        current = out_dir / f"{prefix}20990101-000000.zip"
+        success = backup.run_backup(Namespace(output=str(current), keep=1))
+    else:
+        assert create is not None
+        current = create(hermes_home=home, keep=1, outcome=outcome)
+    assert current and current.exists()
+    assert prior.exists(), "vanished profile state rotated away the last complete archive"
+    with zipfile.ZipFile(prior) as archive:
+        assert archive.read(rel) == original
+    with zipfile.ZipFile(current) as archive:
+        assert rel not in archive.namelist()
+    if kind == "manual":
+        assert success is False
+        assert "Backup incomplete" in capsys.readouterr().out
+    else:
+        assert outcome["errors"] == 1
+        assert outcome["vanished"] == 0
+        assert outcome["incomplete"] is True
+        assert backup._archive_is_incomplete(current)
 
 
 class TestSiblingEnumeration:

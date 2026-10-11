@@ -4040,10 +4040,14 @@ class BasePlatformAdapter(ABC):
             }}
             root_meta["telegram_stale_topic_recovery"] = True
             partial = self._is_partial_delivery(result)
-            root_content = (
-                "A response was partially delivered before its Telegram topic was deleted. "
-                "The complete response remains in Hermes session history."
-                if partial else "Recovered response from a deleted Telegram topic:\n\n" + content)
+            if partial:
+                root_content = ("A response was partially delivered before its Telegram topic was deleted. "
+                                "The complete response remains in Hermes session history.")
+            elif topic_meta.get("copy_block"):
+                # A copy block moves to the root unchanged: a banner would break the exact text.
+                root_content = content
+            else:
+                root_content = "Recovered response from a deleted Telegram topic:\n\n" + content
             logger.warning("[%s] Recovering completed reply from deleted Telegram topic chat=%s thread=%s",
                            self.name, chat_id, thread_id)
             return await self.send(chat_id=chat_id, content=root_content, reply_to=None, metadata=root_meta)
@@ -4054,6 +4058,12 @@ class BasePlatformAdapter(ABC):
         if self._is_partial_delivery(result):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
+            return result
+        if isinstance(metadata, dict) and metadata.get("copy_block"):
+            # A copy block already went out as plain text, so formatting is not the cause, and a
+            # banner-prefixed resend would no longer be the exact text to copy. The failure stands
+            # and the delivery ledger owns the retry.
+            logger.warning("[%s] Copy block send failed: %s — not re-sending with a fallback banner", self.name, error_str)
             return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
@@ -4408,6 +4418,12 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
+        # Busy admission bypasses the normal inbound path, so apply the same relay-origin contract
+        # before any branch can queue, debounce, or merge the event. Once each complete event carries
+        # ``reply_expected=False``, MessageEvent.absorb_reply_expected preserves it only when every
+        # merged event is likewise unaddressed; a typed human event restores the visible fallback.
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(event)
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
         # calling the message handler directly and sending the response.  Do NOT use

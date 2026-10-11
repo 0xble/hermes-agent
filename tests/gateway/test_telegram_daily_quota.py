@@ -212,6 +212,122 @@ def test_ceiling_comes_from_platform_extra(tmp_path):
     assert _adapter(tmp_path, ceiling=1234)._daily_quota().soft_ceiling == 1234
 
 
+def _voice_runner_and_event(adapter):
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(stt_enabled=True)
+    runner._queued_events = {}
+    runner._draining = False
+    runner._session_run_generation = {}
+    runner._should_echo_stt_transcripts = lambda: True
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._reply_anchor_for_event = lambda event: None
+    runner._thread_metadata_for_source = lambda source, anchor: {"thread_id": source.thread_id}
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT, thread_id="42", chat_type="group")
+    event = MessageEvent(
+        text="", message_type=MessageType.VOICE, source=source,
+        media_urls=["/voice.ogg"], media_types=["audio/ogg"],
+    )
+    runner._enrich_message_with_transcription = AsyncMock(return_value=('"queued words"', ["queued words"]))
+    return runner, event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["prefetch", "overflow-drain", "idle"])
+@pytest.mark.parametrize("trigger", ["goal", "untagged"])
+async def test_busy_voice_echo_survives_background_daily_pressure(tmp_path, path, trigger):
+    """Use the real gateway queue/drain and Telegram send, faking only STT and the Bot API."""
+    from plugins.platforms.telegram.chat_budget import bind_trigger, current_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 11)  # already above the soft ceiling
+    runner, event = _voice_runner_and_event(adapter)
+    session_key = "telegram:group:voice-topic"
+    token = (
+        bind_trigger(SimpleNamespace(text="[Continuing toward your standing goal]", internal=True))
+        if trigger == "goal" else None
+    )
+    try:
+        assert current_trigger() == trigger
+        with outbound_class(OUTBOUND_NOTICE):  # inherit the busy background turn's outbound context too
+            if path == "prefetch":
+                adapter.send = AsyncMock(wraps=adapter.send)
+                runner._enqueue_fifo(session_key, event, adapter)
+                await event._gateway_pending_stt_prefetch
+                assert adapter._pending_messages[session_key] is event
+                assert adapter.send.await_args.kwargs["metadata"]["_interim_send"] is True
+            elif path == "idle":
+                assert await runner._enrich_inbound_voice(
+                    event, event.source, "", event.media_urls,
+                ) == '"queued words"'
+            else:
+                # Overflow promotion bypasses Telegram.get_pending_message's trigger rebinding.
+                runner._session_state(session_key).conversation.queued_events.append(event)
+                drained, text = await runner._run_agent_drain_pending(
+                    {"final_response": "done"}, adapter, event.source, session_key,
+                )
+                assert drained is event and text == '"queued words"'
+        adapter._bot.send_message.assert_awaited_once()
+        sent = adapter._bot.send_message.await_args.kwargs
+        assert "🎙️" in sent["text"] and "queued words" in sent["text"]
+        assert sent["message_thread_id"] == 42
+        runner._enrich_message_with_transcription.assert_awaited_once()
+        assert current_trigger() == trigger  # no echo exemption leaks into background sends
+        with outbound_class(OUTBOUND_NOTICE):
+            assert (await adapter.send(CHAT, "goal notice")).error == "daily_budget_shed"
+        with outbound_class(OUTBOUND_PROGRESS):
+            assert (await adapter.send(CHAT, "background progress")).error == "daily_budget_shed"
+        adapter._bot.send_message.assert_awaited_once()
+    finally:
+        if token is not None:
+            reset_trigger(token)
+
+
+@pytest.mark.asyncio
+async def test_internal_voice_echo_does_not_gain_user_priority(tmp_path, caplog):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 11)
+    runner, event = _voice_runner_and_event(adapter)
+    event.internal = True
+    token = bind_trigger(SimpleNamespace(text="[Continuing toward your standing goal]", internal=True))
+    try:
+        with outbound_class(OUTBOUND_NOTICE):
+            await runner._echo_pending_stt_transcripts_once(
+                event, adapter, event.source, ["internal words"], metadata={"_interim_send": True},
+            )
+    finally:
+        reset_trigger(token)
+    adapter._bot.send_message.assert_not_awaited()
+    assert any("daily_budget_shed" in r.getMessage() and r.levelno >= logging.INFO for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["daily_budget_shed", "raised"])
+async def test_failed_voice_echo_is_visible_without_debug_logging(tmp_path, caplog, failure):
+    adapter = _adapter(tmp_path)
+    runner, event = _voice_runner_and_event(adapter)
+    adapter.send = AsyncMock(
+        side_effect=RuntimeError("echo transport failed") if failure == "raised" else None,
+        return_value=SendResult(success=False, error="daily_budget_shed"),
+    )
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    await runner._echo_pending_stt_transcripts_once(
+        event, adapter, event.source, ["private transcript"], log_context="Voice-queue",
+    )
+    assert any(
+        r.levelno >= logging.INFO and "Voice-queue echo failed" in r.getMessage()
+        and ("daily_budget_shed" if failure == "daily_budget_shed" else "echo transport failed") in r.getMessage()
+        for r in caplog.records
+    )
+    assert all("private transcript" not in r.getMessage() for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_installed_request_limiter_shares_the_adapter_quota(tmp_path):
     """The PTB limiter built for the live bot must meter and shed with the adapter's own ledger."""
@@ -233,7 +349,7 @@ async def test_installed_request_limiter_shares_the_adapter_quota(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup(tmp_path):
+async def test_cosmetic_pressure_sheds_typing_interim_edits_and_progress(tmp_path):
     adapter = _adapter(tmp_path)
     _spend(adapter, 7)
     await adapter.send_typing(CHAT)
@@ -241,9 +357,6 @@ async def test_cosmetic_pressure_sheds_typing_interim_edits_progress_and_cleanup
     skipped = await adapter.edit_message(CHAT, "5", "interim", finalize=False)
     assert skipped.raw_response == {"skipped": True}
     adapter._bot.edit_message_text.assert_not_awaited()
-    assert await adapter.delete_messages(CHAT, ["1", "2"]) == {"1": False, "2": False}
-    assert await adapter.delete_message(CHAT, "3") is False
-    adapter._bot.delete_messages.assert_not_awaited()
     with outbound_class(OUTBOUND_PROGRESS):
         shed = await adapter.send(CHAT, "⚙️ progress")
     assert shed.error == "daily_budget_shed"
@@ -304,3 +417,49 @@ async def test_a_shed_notice_is_final_no_retry_fallback_or_failure_notice(tmp_pa
     assert result.error == "daily_budget_shed"
     assert calls == ["status line"]  # no retry, plain-text copy, or "delivery failed" notice
     adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_background_pressure_never_sheds_cleanup_deletes(tmp_path):
+    """Deletes create no messages, so shedding them saves none of the daily cap and strands bubbles.
+
+    Regression: a typed turn's end-of-turn cleanup ran labelled with a drained background follow-up's
+    trigger, was shed, and left every progress bubble behind (``returned_false``).
+    """
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    _spend(adapter, 7)  # past the cosmetic threshold
+    token = bind_trigger(SimpleNamespace(text="[IMPORTANT: Background process 42 finished]", internal=True))
+    try:
+        assert adapter._daily_sheds(CHAT, OUTBOUND_PROGRESS)  # background progress is still shed
+        assert await adapter.delete_messages(CHAT, ["1", "2"]) == {"1": True, "2": True}
+        assert await adapter.delete_message(CHAT, "3") is True
+    finally:
+        reset_trigger(token)
+    adapter._bot.delete_messages.assert_awaited_once()
+    adapter._bot.delete_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_path):
+    """Draining a queued background event relabels the task; the prior turn's cleanup must not inherit it."""
+    from plugins.platforms.telegram.chat_budget import bind_trigger, current_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    seen = []
+    token = bind_trigger(SimpleNamespace(text="please check the build"))
+    try:
+        adapter.register_post_delivery_callback("sk", lambda: seen.append(current_trigger()), generation=1)
+        adapter._pending_messages["sk"] = SimpleNamespace(
+            text="[IMPORTANT: Background process 42 finished]", internal=True)
+        adapter.get_pending_message("sk")  # the runner's in-band drain
+        assert current_trigger() == "process"
+        callback = adapter.pop_post_delivery_callback("sk", generation=1)
+        result = callback()
+        if asyncio.iscoroutine(result):
+            await result
+        assert seen == ["typed"]
+        assert current_trigger() == "process"  # the follow-up turn keeps its own label afterwards
+    finally:
+        reset_trigger(token)

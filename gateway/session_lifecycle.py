@@ -231,22 +231,60 @@ class SessionLifecycleMixin:
         self, session_key: str, reason: str = "restart_timeout", *,
         turn_id: Optional[str] = None, human: bool = True,
     ) -> bool:
-        """Mark a session resumable after a restart interruption (keeps the session_id/transcript,
-        unlike ``suspend_session``). A repeated shutdown pass for the same durable turn preserves
-        its marker token and note id so it cannot post a duplicate note."""
-        def _apply(entry: SessionEntry):
-            if entry.suspended:  # never override an explicit ``suspended`` (hard forced-wipe)
-                return False
-            same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.resume_human = bool(human)
-            if not same_turn:
-                entry.resume_marker_token = uuid.uuid4().hex
-                entry.resume_turn_id = turn_id
-                # A successor owns a new note record; predecessor records remain durable and visible.
-                entry.last_resume_marked_at = _now()
-        return self._update_entry(session_key, _apply)
+        """Mark a session resumable after an interruption; True for an eligible entry,
+        even when its exact same-turn marker was already durable."""
+        return bool(self.mark_resume_pending_many([(session_key, turn_id, human)], reason))
+
+    def mark_resume_pending_many(
+        self, markers: list[tuple[str, Optional[str], bool]], reason: str = "restart_timeout",
+    ) -> list[str]:
+        """Durably mark ``(key, turn_id, human)`` requests with one locked full save.
+
+        Return every eligible key, including unchanged same-turn markers: interruption
+        notes are owed independently of whether this pass needed to write. Tokenless
+        legacy marks still get a fresh marker, preserving their conditional-clear CAS.
+        The existing full-save path captures one generation and preserves routing-home
+        ownership, stale-writer ordering, and the state.db + sessions.json contract.
+        """
+        if not markers:
+            return []
+        marked = []
+        previous = []
+        with self._lock:
+            self._ensure_loaded_locked()
+            for session_key, turn_id, human in markers:
+                entry = self._entries.get(session_key)
+                if entry is None or entry.suspended:
+                    continue  # never override an explicit suspension (hard forced-wipe)
+                marked.append(session_key)
+                human = bool(human)
+                same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
+                if same_turn and entry.resume_reason == reason and entry.resume_human == human:
+                    continue
+                previous.append((entry, (
+                    entry.resume_pending, entry.resume_reason, entry.resume_human,
+                    entry.resume_marker_token, entry.resume_turn_id, entry.last_resume_marked_at,
+                )))
+                entry.resume_pending = True
+                entry.resume_reason = reason
+                entry.resume_human = human
+                if not same_turn:
+                    entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_turn_id = turn_id
+                    # A successor owns a new note; predecessor records stay durable and visible.
+                    entry.last_resume_marked_at = _now()
+            if previous:
+                try:
+                    self._save()
+                except Exception:
+                    # A failed durable write must not make the next attempt look like a no-op.
+                    for entry, state in reversed(previous):
+                        (
+                            entry.resume_pending, entry.resume_reason, entry.resume_human,
+                            entry.resume_marker_token, entry.resume_turn_id, entry.last_resume_marked_at,
+                        ) = state
+                    raise
+        return marked
 
     def get_resume_pending_marker(self, session_key: str) -> Optional[tuple]:
         """Snapshot the current marker before an interrupt can yield to a successor."""
