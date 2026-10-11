@@ -394,7 +394,7 @@ Registered on the `hermes-telegram` platform toolset (gateway only). Topic creat
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `telegram_topic` | `create` opens a topic in the user's Telegram DM as its own Hermes session, with a name, an optional native icon, model, provider and reasoning effort, and an optional opening brief the session receives as its first message. Returns the `thread_id`, `session_id` and relay address. `edit` changes a topic's name or icon and its session's model or reasoning. Settings persist across gateway restarts. | Telegram adapter |
+| `telegram_topic` | `create` opens a topic in the user's Telegram DM as its own Hermes session, with a name, a required native icon when Telegram provides its icon set, model, provider and reasoning effort, and an optional opening brief the session receives as its first message. A missing or unsupported icon is rejected with the available choices before creation. If the icon set is unavailable, creation proceeds without an icon and returns a warning. Returns the `thread_id`, `session_id`, relay address and icon actually applied. `edit` changes a topic's name or icon and its session's model or reasoning. Settings persist across gateway restarts. | Telegram adapter |
 
 ## `spotify` toolset
 

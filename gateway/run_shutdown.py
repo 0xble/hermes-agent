@@ -1272,7 +1272,6 @@ class GatewayShutdownMixin:
         except Exception as e:
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
-        action = t("gateway.shutdown.action_restarting" if self._restart_requested else "gateway.shutdown.action_shutting_down")
         notified: set = set()
         for job_id in job_ids:
             try:
@@ -1287,7 +1286,7 @@ class GatewayShutdownMixin:
                 logger.debug("Cron interrupt targets unresolved for %s: %s", job_id, e)
                 continue
             job_name = job.get("name") or job_id
-            msg = t("gateway.shutdown.cron_interrupted", job=job_name, action=action)
+            msg = t("gateway.shutdown.cron_stopped", job=job_name, job_id=job_id)
             for target in targets or ():
                 try:
                     platform = Platform(str(target.get("platform", "")).lower())
@@ -2255,7 +2254,7 @@ class GatewayShutdownMixin:
             logger.warning(
                 "Restart deferred wait: %d work unit(s) remain outside configured wait budgets "
                 "(%d wedged, %d restart-safe external cron); "
-                "proceeding to stop()/drain which will interrupt them",
+                "proceeding to stop()/drain with restart-safe external cron excluded",
                 self._active_work_count(), self._wedged_agent_count(),
                 self._restart_safe_cron_count(),
             )
@@ -2380,7 +2379,7 @@ class GatewayShutdownMixin:
             # still emit a plausible response from truncated output — mark it interrupted, never success.
             from cron.scheduler import mark_running_jobs_interrupted
             _interrupted = mark_running_jobs_interrupted(
-                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished."
+                "Run stopped before finishing; no result this run."
             )
             if _interrupted:
                 logger.warning(
@@ -2624,7 +2623,7 @@ class GatewayShutdownMixin:
             GatewayRunner._quiet_step,
             "mark_running_jobs_interrupted (post-interrupt) error",
             lambda: mark_running_jobs_interrupted(
-                "Gateway shutdown (post-interrupt) interrupted the job before tool cleanup completed."
+                "Run stopped before finishing; no result this run."
             ),
             level=logging.WARNING,
         ))

@@ -2923,7 +2923,7 @@ def run_one_job(
                     _running_fire_owners.pop(_fire_key, None)
 
 
-_OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_OWNERSHIP_LOST_INTERRUPTED = "Run stopped before finishing; no terminal result was recorded."
 
 
 def _record_fire_ownership_lost(
@@ -3121,10 +3121,7 @@ def _save_compose_deliver(
     # output; force the honest "interrupted" failure path. Peek-only (consumed later).
     if d.success and _is_interrupted(job["id"], execution_token):
         d.success = False
-        d.error = (
-            "Interrupted by gateway shutdown before the run finished "
-            "(tool subprocess was killed mid-flight)."
-        )
+        d.error = "Run stopped before finishing; no result this run."
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
@@ -3214,7 +3211,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
     finish_execution(
         execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+        error="Run stopped before finishing; no terminal result was recorded.")
 
 
 def _record_committed_delivery_outcome(execution_id: str, outcome: str) -> None:
@@ -3498,7 +3495,7 @@ def _run_one_job_body(
                 return False
             if success and _is_interrupted(job["id"], execution_token):
                 success = False
-                error = "Interrupted by gateway shutdown before the run finished."
+                error = "Run stopped before finishing; no result this run."
             if success and not final_response.strip():
                 success = False
                 error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"

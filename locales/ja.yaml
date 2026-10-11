@@ -837,9 +837,7 @@ gateway:
     code_reply: "こんにちは！まだあなたを認識できていないため、このボットの運用者が承認するまで返信できません。\n\nあなたのペアリングコード: `{code}` (有効期間 {validity})\n\nこのボットを運用している方は、ターミナルで次を実行してください: `{approve_cmd}`。そうでない場合は、このコマンドをボットの所有者に送ってください。承認後、メッセージをもう一度送信してください。"
     rate_limited: "現在ペアリングリクエストが多すぎます。数分待ってから、メッセージをもう一度送信してください。"
   shutdown:
-    action_shutting_down: "シャットダウン中"
-    action_restarting: "再起動中"
-    cron_interrupted: "⚠️ Hermes が{action}のため、スケジュールジョブ '{job}' は途中で打ち切られました。今回の実行結果はありません。次回のスケジュールで再実行されます。Hermes の復帰後に `hermes cron run {job}` で今すぐ実行することもできます。"
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes はシャットダウン中です — 現在のタスクは中断されます。オンラインに戻ったら何かメッセージを送ってください。中断したところから再開を試みます。"
     notice_restart: "⚠️ Hermes は再起動中です — 現在のタスクは中断されます。再起動後に何かメッセージを送ってください。中断したところから再開を試みます。"
     interrupted_turn: "↻ Hermes が停止したため中断されました。戻り次第、ここで自動的に続行します。"

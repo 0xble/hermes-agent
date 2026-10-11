@@ -707,6 +707,7 @@ def test_scoped_teardown_of_one_owner_keeps_the_other_owner_supervised(monkeypat
     a = subprocess.Popen(_VICTIM, start_new_session=True)
     b = subprocess.Popen(_VICTIM, start_new_session=True)
     try:
+        _mcp_lifecycle._remember_mcp_processes({a.pid, b.pid})
         pg_a, pg_b = os.getpgid(a.pid), os.getpgid(b.pid)
         with mcp_tool._lock:
             _mcp_lifecycle._stdio_pids[a.pid] = "profile-a"

@@ -837,9 +837,7 @@ gateway:
     code_reply: "Hallo! Ich kenne Sie noch nicht und kann daher erst antworten, wenn die Person, die diesen Bot betreibt, Sie freigegeben hat.\n\nIhr Kopplungscode: `{code}` (gültig für {validity})\n\nWenn Sie diesen Bot betreiben, öffnen Sie ein Terminal und führen Sie aus: `{approve_cmd}`. Andernfalls senden Sie diesen Befehl an den Bot-Besitzer. Senden Sie Ihre Nachricht nach der Freigabe erneut."
     rate_limited: "Zu viele Kopplungsanfragen gerade. Warten Sie ein paar Minuten und senden Sie Ihre Nachricht dann erneut."
   shutdown:
-    action_shutting_down: "herunterfährt"
-    action_restarting: "neu startet"
-    cron_interrupted: "⚠️ Der geplante Job '{job}' wurde abgebrochen, weil Hermes gerade {action}; kein Ergebnis in diesem Lauf. Er läuft wieder nach Zeitplan, oder Sie starten ihn mit `hermes cron run {job}`, sobald Hermes zurück ist."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes wird heruntergefahren — Ihre aktuelle Aufgabe wird unterbrochen. Sobald Hermes wieder online ist, senden Sie eine beliebige Nachricht und ich versuche, dort weiterzumachen, wo wir aufgehört haben."
     notice_restart: "⚠️ Hermes wird neu gestartet — Ihre aktuelle Aufgabe wird unterbrochen. Senden Sie nach dem Neustart eine beliebige Nachricht und ich versuche, dort weiterzumachen, wo Sie aufgehört haben."
     interrupted_turn: "↻ Unterbrochen, weil Hermes angehalten wurde. Ich fahre hier automatisch fort, sobald Hermes wieder da ist."

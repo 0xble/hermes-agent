@@ -3,19 +3,21 @@
 The #43044 PID-reuse guards introduced by #131910 compared the spawn-time start-time
 baseline with a later reading using exact ``==``/``!=``:
 ``tools.environments.local._leader_is_ours`` (terminal group teardown) and
-``tools.mcp_tool_lifecycle._signal_mcp_process`` (stdio MCP orphan reaper).  Same-host
+``tools.mcp_tool_lifecycle._signal_mcp_processes`` (stdio MCP orphan reaper).  Same-host
 readings drift ~1 s on macOS (``kern.boottime`` adjustment, #117505) and
 ``gateway.status`` ships ``start_time_fingerprints_match`` (tolerance 200 ticks ≈ 2 s)
 for exactly that; a drifted reading therefore made the guard refuse to kill a live,
 legitimately-owned process group — timed-out terminal commands survived their kill path
 and live MCP stdio servers leaked past the reaper.  Both comparisons now route through
 the shared tolerant comparator, and an unreadable current value for a still-live leader
-keeps the legacy best-effort kill instead of refusing.
+does not veto a verified incarnation. MCP signals additionally require the fork's
+live spawn-time witness; numeric PGID/start-time matches alone are never authority.
 """
 
 import os
 import signal
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -96,7 +98,8 @@ def test_local_guard_unreadable_start_time_live_leader_is_best_effort(monkeypatc
 
 def _reset_mcp_ledgers():
     from tools.mcp_tool_lifecycle import (
-        _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids, _stdio_starttimes)
+        _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids,
+        _stdio_starttimes, _stdio_processes, _stdio_sessions)
     from tools.mcp_tool import _lock
     with _lock:
         _stdio_pids.clear()
@@ -104,16 +107,28 @@ def _reset_mcp_ledgers():
         _orphan_stdio_pid_servers.clear()
         _stdio_pgids.clear()
         _stdio_starttimes.clear()
+        _stdio_processes.clear()
+        _stdio_sessions.clear()
 
 
-def _stage_orphan(fake_pid: int):
-    from tools.mcp_tool_lifecycle import _orphan_stdio_pids, _stdio_pgids, _stdio_starttimes
+def _stage_orphan(fake_pid: int, monkeypatch, *, witness=True):
+    from tools.mcp_tool_lifecycle import (
+        _orphan_stdio_pids, _stdio_pgids, _stdio_starttimes, _stdio_processes)
     from tools.mcp_tool import _lock
     _reset_mcp_ledgers()
     with _lock:
         _orphan_stdio_pids.add(fake_pid)
         _stdio_pgids[fake_pid] = fake_pid
         _stdio_starttimes[fake_pid] = RECORDED
+        if witness:
+            proc = Mock(pid=fake_pid)
+            proc.is_running.return_value = True
+            proc.status.return_value = "running"
+            proc.children.return_value = []
+            _stdio_processes[fake_pid] = {fake_pid: proc}
+    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
+    monkeypatch.setattr(os, "getpgid", lambda pid: fake_pid)
 
 
 def test_mcp_orphan_reaper_survives_start_time_drift(monkeypatch):
@@ -123,7 +138,7 @@ def test_mcp_orphan_reaper_survives_start_time_drift(monkeypatch):
     from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
 
     fake_pid = 484848
-    _stage_orphan(fake_pid)
+    _stage_orphan(fake_pid, monkeypatch)
     killpg_calls = []
     monkeypatch.setattr("tools.mcp_tool_lifecycle._leader_start_time",
                         lambda pid: RECORDED + 100)
@@ -137,13 +152,13 @@ def test_mcp_orphan_reaper_survives_start_time_drift(monkeypatch):
     assert (fake_pid, signal.SIGTERM) in killpg_calls
 
 
-def test_mcp_orphan_reaper_unreadable_live_leader_is_best_effort(monkeypatch):
-    """An unreadable leader start time on a still-live orphan keeps the legacy
-    best-effort signalling rather than skipping the kill."""
+@pytest.mark.parametrize("witness", [False, True])
+def test_mcp_orphan_reaper_unreadable_live_leader_requires_witness(monkeypatch, witness):
+    """An unreadable fingerprint is not a veto, but cannot authorize adoption."""
     from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
 
     fake_pid = 494949
-    _stage_orphan(fake_pid)
+    _stage_orphan(fake_pid, monkeypatch, witness=witness)
     killpg_calls = []
     monkeypatch.setattr("tools.mcp_tool_lifecycle._leader_start_time", lambda pid: None)
     monkeypatch.setattr("tools.mcp_tool_lifecycle.os.killpg",
@@ -153,7 +168,10 @@ def test_mcp_orphan_reaper_unreadable_live_leader_is_best_effort(monkeypatch):
 
     _kill_orphaned_mcp_children()
 
-    assert (fake_pid, signal.SIGTERM) in killpg_calls
+    if witness:
+        assert (fake_pid, signal.SIGTERM) in killpg_calls
+    else:
+        assert killpg_calls == []
 
 
 def test_mcp_orphan_reaper_still_refuses_recycled_pid(monkeypatch):
@@ -161,7 +179,7 @@ def test_mcp_orphan_reaper_still_refuses_recycled_pid(monkeypatch):
     from tools.mcp_tool_lifecycle import _kill_orphaned_mcp_children
 
     fake_pid = 505050
-    _stage_orphan(fake_pid)
+    _stage_orphan(fake_pid, monkeypatch)
     killpg_calls = []
     monkeypatch.setattr("tools.mcp_tool_lifecycle._leader_start_time",
                         lambda pid: RECORDED + 500000)

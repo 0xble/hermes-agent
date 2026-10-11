@@ -124,6 +124,10 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
+        for reason, _result in marked_calls:
+            assert "stopped before finishing" in reason
+            for cause in ("restart", "shutdown", "killed"):
+                assert cause not in reason.lower()
 
 
 

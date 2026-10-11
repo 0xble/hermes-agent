@@ -837,9 +837,7 @@ gateway:
     code_reply: "¡Hola! Todavía no te reconozco, así que no puedo responderte hasta que la persona que administra este bot te apruebe.\n\nTu código de vinculación: `{code}` (válido durante {validity})\n\nSi este bot es tuyo, abre una terminal y ejecuta: `{approve_cmd}`. Si no, envía ese comando a quien lo administra. Cuando te aprueben, vuelve a enviar tu mensaje."
     rate_limited: "Demasiadas solicitudes de vinculación en este momento. Espera unos minutos y vuelve a enviar tu mensaje."
   shutdown:
-    action_shutting_down: "apagándose"
-    action_restarting: "reiniciándose"
-    cron_interrupted: "⚠️ La tarea programada '{job}' se interrumpió porque Hermes se está {action}; esta vez no hay resultado. Volverá a ejecutarse según lo programado, o puedes lanzarla ahora con `hermes cron run {job}` cuando Hermes vuelva a estar disponible."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes se está apagando — tu tarea actual se interrumpirá. Cuando vuelva a estar en línea, envía cualquier mensaje e intentaré continuar donde lo dejamos."
     notice_restart: "⚠️ Hermes se está reiniciando — tu tarea actual se interrumpirá. Envía cualquier mensaje después del reinicio e intentaré retomar donde lo dejaste."
     interrupted_turn: "↻ Interrumpido porque Hermes se detuvo. Continuaré aquí automáticamente cuando vuelva."

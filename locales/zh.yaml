@@ -837,9 +837,7 @@ gateway:
     code_reply: "你好！我还不认识你，需要运行此机器人的人批准后才能回复。\n\n你的配对码：`{code}`（有效期 {validity}）\n\n如果这个机器人是你运行的，请打开终端执行：`{approve_cmd}`。否则请把该命令发给机器人所有者。获批后，请重新发送你的消息。"
     rate_limited: "当前配对请求过多。请等待几分钟后重新发送消息。"
   shutdown:
-    action_shutting_down: "正在关闭"
-    action_restarting: "正在重启"
-    cron_interrupted: "⚠️ 定时任务 '{job}' 因 Hermes {action}而被中断；本次运行没有结果。它会按计划再次运行，或在 Hermes 恢复后用 `hermes cron run {job}` 立即运行。"
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes 正在关闭——你当前的任务将被中断。恢复上线后，发送任意消息，我会尝试从中断处继续。"
     notice_restart: "⚠️ Hermes 正在重启——你当前的任务将被中断。重启后发送任意消息，我会尝试从你离开的地方继续。"
     interrupted_turn: "↻ 因 Hermes 停止而中断。Hermes 恢复后，我会在这里自动继续。"

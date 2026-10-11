@@ -837,9 +837,7 @@ gateway:
     code_reply: "مرحبًا! لا أعرفك بعد، لذا لا يمكنني الرد حتى يوافق عليك الشخص الذي يشغّل هذا البوت.\n\nرمز الاقتران الخاص بك: `{code}` (صالح لمدة {validity})\n\nإن كنت أنت من يشغّل هذا البوت، افتح طرفية وشغّل: `{approve_cmd}`. وإلا فأرسل هذا الأمر إلى مالك البوت. بعد الموافقة، أعد إرسال رسالتك."
     rate_limited: "طلبات اقتران كثيرة جدًا في الوقت الحالي. انتظر بضع دقائق ثم أعد إرسال رسالتك."
   shutdown:
-    action_shutting_down: "قيد إيقاف التشغيل"
-    action_restarting: "قيد إعادة التشغيل"
-    cron_interrupted: "⚠️ قُطعت المهمة المجدولة '{job}' لأن Hermes {action}؛ لا نتيجة لهذا التشغيل. ستعمل مجددًا في موعدها، أو شغّلها الآن بـ `hermes cron run {job}` بعد عودة Hermes."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ Hermes قيد إيقاف التشغيل — ستُقطع مهمتك الحالية. عند عودته إلى الاتصال، أرسل أي رسالة وسأحاول المتابعة من حيث توقفنا."
     notice_restart: "⚠️ Hermes قيد إعادة التشغيل — ستُقطع مهمتك الحالية. أرسل أي رسالة بعد إعادة التشغيل وسأحاول الاستئناف من حيث توقفت."
     interrupted_turn: "↻ تمت المقاطعة لأن Hermes توقّف. سأتابع هنا تلقائيًا بمجرد عودته."

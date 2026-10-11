@@ -49,7 +49,14 @@ outcome, preserve exit codes and partial results, and require reconciliation of
 non-idempotent effects before retrying; diagnostic cause metadata remains intact.
 Untracked processes report unknown outcomes without guessing a cause.
 Explicit user-kill attribution, backend-loss wording, and failed-start wording
-remain unchanged.
+remain unchanged. Generic `kill_all` is a routine stop, matching the `/goal` barrier
+surface. Single and batch interrupted delegation notices carry the same
+reconcile-before-retry hint. CLI cleanup passes a neutral delegation stop reason;
+historical `CLI shutdown` reasons are sanitized only when presenting notices.
+Cron persisted errors and direct owner notices likewise state the unfinished
+outcome, without promising a retry for jobs no longer scheduled. The new
+`gateway.shutdown.cron_stopped` key carries English text in every locale until
+translated, and the retired cause-based keys were removed.
 
 ## Provenance and patches
 
@@ -70,6 +77,12 @@ remain unchanged.
 `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py
 tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py
 tests/gateway/test_multiplex_pending_recovery.py tests/gateway/test_shutdown_flush.py`.
+For routine-stop wording, also run `tests/tools/test_routine_stop_notifications.py`,
+`tests/hermes_cli/test_cli_delegation_stop_notice.py`,
+`tests/cron/test_shutdown_interrupt.py`,
+`tests/gateway/test_cron_interrupt_notification.py`, and
+`tests/gateway/test_cron_active_work_drain.py`, plus `tests/agent/test_i18n.py`
+for locale key parity.
 Also run `tests/gateway/test_stop_resume_marker_generation.py` for busy and idle
 stop, unrelated interrupts, repeated marks, and durable routing readback.
 The policy file must prove: platform override > global > adapter default,

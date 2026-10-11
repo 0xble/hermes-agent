@@ -837,9 +837,7 @@ gateway:
     code_reply: "Olá! Ainda não reconheço você, então não posso responder até que a pessoa responsável por este bot aprove seu acesso.\n\nSeu código de pareamento: `{code}` (válido por {validity})\n\nSe você administra este bot, abra um terminal e execute: `{approve_cmd}`. Caso contrário, envie esse comando ao dono do bot. Após a aprovação, envie sua mensagem novamente."
     rate_limited: "Muitas solicitações de pareamento no momento. Aguarde alguns minutos e envie sua mensagem novamente."
   shutdown:
-    action_shutting_down: "sendo encerrado"
-    action_restarting: "sendo reiniciado"
-    cron_interrupted: "⚠️ A tarefa agendada '{job}' foi interrompida porque o Hermes está {action}; sem resultado nesta execução. Ela rodará de novo conforme o agendamento, ou execute agora com `hermes cron run {job}` quando o Hermes voltar."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ O Hermes está sendo encerrado — sua tarefa atual será interrompida. Quando ele voltar a ficar online, envie qualquer mensagem e tentarei continuar de onde paramos."
     notice_restart: "⚠️ O Hermes está sendo reiniciado — sua tarefa atual será interrompida. Envie qualquer mensagem após o reinício e tentarei retomar de onde você parou."
     interrupted_turn: "↻ Interrompido porque o Hermes parou. Vou continuar aqui automaticamente assim que ele voltar."

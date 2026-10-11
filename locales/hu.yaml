@@ -849,9 +849,7 @@ gateway:
     code_reply: "Szia! Még nem ismerlek, így nem válaszolhatok, amíg a bot üzemeltetője jóvá nem hagy.\n\nA párosító kódod: `{code}` (érvényes: {validity})\n\nHa te üzemelteted a botot, nyiss egy terminált, és futtasd: `{approve_cmd}`. Ha nem, küldd el ezt a parancsot a bot tulajdonosának. A jóváhagyás után küldd el újra az üzenetedet."
     rate_limited: "Túl sok párosítási kérés érkezett. Várj néhány percet, majd küldd el újra az üzenetedet."
   shutdown:
-    action_shutting_down: "leáll"
-    action_restarting: "újraindul"
-    cron_interrupted: "⚠️ A(z) '{job}' ütemezett feladat megszakadt, mert a Hermes {action}; ebben a futásban nincs eredmény. Ütemezés szerint újra lefut, vagy futtasd most a `hermes cron run {job}` paranccsal, amint a Hermes visszatért."
+    cron_stopped: "⚠️ Scheduled job '{job}' stopped before finishing; no result this run. If it is still scheduled, it will run again on schedule. To retry now, use `hermes cron run {job_id}`; reconcile any non-idempotent effects first."
     notice_shutdown: "⚠️ A Hermes leáll — a jelenlegi feladatod megszakad. Amikor újra elérhető, küldj egy tetszőleges üzenetet, és megpróbálom onnan folytatni, ahol abbahagytuk."
     notice_restart: "⚠️ A Hermes újraindul — a jelenlegi feladatod megszakad. Az újraindítás után küldj egy tetszőleges üzenetet, és megpróbálom onnan folytatni, ahol abbahagytad."
     interrupted_turn: "↻ Megszakadt, mert a Hermes leállt. Automatikusan folytatom itt, amint visszatér."
