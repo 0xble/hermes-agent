@@ -1328,6 +1328,9 @@ def _ephemeral_session_delete_allowed(session: Dict[str, Any]) -> bool:
                 or any(key[2] == get_camofox_url() and record["user_id"] == user_id
                        for key, record in _owned_tabs.items())):
             return False
+    # The GET /tabs → DELETE /sessions gap is acceptable: the userId is a random,
+    # task-private identity, adoption is off for ephemeral identities, and this session
+    # is already dropped from _sessions.
     try:
         tabs = _get("/tabs", params={"userId": user_id}, timeout=5).get("tabs")
     except Exception:

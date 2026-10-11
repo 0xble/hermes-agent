@@ -9,8 +9,8 @@ def test_lease_root_is_host_wide_across_process_and_profile_homes(tmp_path, monk
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from tools import browser_camofox_leases as leases
     import runpy
-    # The tools autouse fixture replaces _lease_root for ordinary tests. Load the
-    # resolver without that patch; all its paths still point into this sandbox.
+    # The fixture in tests/conftest.py replaces _lease_root for ordinary tests. Load
+    # the resolver without that patch; all its paths still point into this sandbox.
     lease_root = runpy.run_path(leases.__file__)["_lease_root"]
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(leases.Path, "home", lambda: tmp_path)
