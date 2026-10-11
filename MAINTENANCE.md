@@ -152,7 +152,18 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Release defects | Narrow, guarded fixes for defects found while syncing to `v2026.9.24`, each with a patch identity and guard test | Before changing a file a section names, when a sync review finds a defect, or when checking whether upstream now fixes one | [Release defects](maintenance/release-defects.md) |
 | Direct web extraction and local docs | Bounded, safe direct fetches and checkout-backed docs avoid paid provider calls | Web extraction routing, URL safety, docs mapping, or extract config changes | [Direct web extraction](maintenance/web-extract-direct.md) |
 | Proactive tool-result prune default | Enable the existing deterministic no-LLM tool-result prune at 48000 tokens while protecting the recent tail | `compression.proactive_prune_tokens`, its config/docs, and proactive-prune regressions | [Proactive tool-result prune default](maintenance/proactive-tool-result-prune.md) |
-| Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+| Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+| Malformed copy markup | Invalid nested, stray-close, and unclosed `[[copy]]` markup produces no copy blocks; marker lines are removed and bodies remain inline | `gateway/copy_blocks.py`, streaming final reconciliation, or copy-block regressions | [Malformed copy markup](maintenance/malformed-copy-markup.md) |
+
+## Active patch record: malformed copy markup
+
+- **Patch identity:** `malformed-copy-markup`.
+- **Behavior:** Treat nested opens, stray closes, and unclosed `[[copy]]` markup as invalid; remove marker lines outside fences and keep all bodies inline with one warning.
+- **Source surfaces:** `gateway/copy_blocks.py`, streaming final reconciliation, and copy-block regressions.
+- **Upstream status:** No equivalent upstream behavior was available in the fork baseline.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_copy_markup_invalid.py tests/gateway/test_copy_blocks.py tests/gateway/test_empty_sentinel_rewrite_copy.py tests/gateway/test_stream_final_contract.py tests/tui_gateway/test_turn_payload_interim_final.py tests/gateway/test_delivery_ledger.py tests/hermes_cli/test_stream_delta_think_tag.py`.
+- **Retirement:** Remove when upstream provides equivalent invalid-markup fallback and the focused regression passes without the patch.
+- **Rollback:** Revert the malformed-copy-markup fix commit.
 
 ## Active patch record: relay silence (S1)
 
