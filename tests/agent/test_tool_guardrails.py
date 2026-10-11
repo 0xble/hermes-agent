@@ -280,8 +280,13 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
-
+    # Excess calls are refused without advancing the executed-call count.
+    for i in range(10):
+        refused = controller.before_call("web_search", {"query": f"excess {i}"})
+        assert not refused.allows_execution
+        assert refused.count == 3
+    controller.reset_for_turn()
+    assert controller.before_call("web_search", {"query": "new turn"}).allows_execution
 
 
 
