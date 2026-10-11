@@ -852,3 +852,29 @@ def test_handoff_retains_an_owned_tab_without_stealing_its_live_binding(camofox)
     _end_turn("owner")
     _close_agent({"owner"}, _delegate_depth=0)
     assert _tab_deletes(camofox.server) == []
+
+
+def test_temporary_agent_close_does_not_clean_another_agents_live_browser(camofox):
+    from agent.client_lifecycle import ClientLifecycleMixin
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "live-owner")["success"]
+    tab = cf._sessions["live-owner"]["tab_id"]
+    # Do not mock cleanup_browser: generic close-time cleanup shares the session ID too.
+    temporary = ClientLifecycleMixin()
+    setattr(temporary, "_process_owner_task_ids", set())
+    with patch("run_agent.cleanup_vm"):
+        temporary._close_task_resources("live-owner")
+    assert cf._sessions["live-owner"]["tab_id"] == tab
+    assert _tab_deletes(camofox.server) == []
+
+
+def test_agent_close_cleans_actual_tool_task_not_shared_session_id(camofox):
+    from agent.client_lifecycle import ClientLifecycleMixin
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "tool-owner")["success"]
+    tab = cf._sessions["tool-owner"]["tab_id"]
+    owner = ClientLifecycleMixin()
+    setattr(owner, "_process_owner_task_ids", {"tool-owner"})
+    with patch("run_agent.cleanup_vm"):
+        owner._close_task_resources("different-session-id")
+    assert [path for path, _ in _tab_deletes(camofox.server)] == [f"/tabs/{tab}"]

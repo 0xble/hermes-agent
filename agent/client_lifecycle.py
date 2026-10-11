@@ -143,7 +143,14 @@ class ClientLifecycleMixin:
                 camofox.release_task_bindings(getattr(self, "_process_owner_task_ids", ()),
                                               close_created_tabs=True)
 
-        for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
+        def release_browser() -> None:
+            from tools.browser_tool import _is_camofox_mode
+            # Generic Camofox cleanup accepts a session ID; temporary hygiene agents
+            # share that ID with their live parent. Use only actual tool-owner IDs below.
+            if not _is_camofox_mode():
+                cleanup_browser(task_id)
+
+        for step in (kill_processes, lambda: cleanup_vm(task_id), release_browser,
                      release_camofox_tabs, release_computer_use, forget_file_state):
             _quietly(step)
 
