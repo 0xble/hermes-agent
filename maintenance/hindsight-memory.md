@@ -1,5 +1,24 @@
 # Hindsight memory provider
 
+**Patch identity:** `hindsight-retain-visibility`.
+
+Accepted asynchronous retain operations remain tracked after the first prefetch
+visibility wait expires. Later prefetches do not repeat that wait. The existing
+writer also ages out initial waits while idle, covering tools-only, synchronous
+recall, disabled prefetch waits, and the final turn before idle. It polls late
+operations with a two-second pass budget and
+five-second cadence. A single operation map keeps each operation's bank, expiry
+and whether its initial wait is still due. Tracking is limited to 256 operations
+and one hour, with visible warnings on eviction, expiry and terminal failure.
+Idle polling cannot release an active prefetch barrier or a configured unlimited
+visibility wait. Capacity eviction uses expiry order independently of poll rotation.
+Completed and failed operations are removed. Slow status requests rotate to the
+back so they cannot starve later operations. Proof:
+`scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py`.
+Retire when the selected upstream integration preserves late visibility without
+repeating per-turn waits. Revert the `hindsight-retain-visibility` commit to
+restore deadline eviction. No accepted server operation is cancelled on rollback.
+
 Load this unit when changing `plugins/memory/hindsight/`, the provider's lifecycle
 contract with `agent/memory_manager.py` and `agent/agent_init.py`, or the retain
 strategy and cron-exclusion behavior.

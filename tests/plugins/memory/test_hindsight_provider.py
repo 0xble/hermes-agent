@@ -786,7 +786,7 @@ class TestPrefetchServerRetainVisibility:
         )
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()
-        assert {"op-a", "op-b"} <= provider._pending_retain_ops
+        assert {"op-a", "op-b"} <= set(provider._pending_retain_ops)
 
     def test_sync_retain_tracks_no_ops(self, provider_with_config):
         p = provider_with_config(retain_async=False)
@@ -797,7 +797,7 @@ class TestPrefetchServerRetainVisibility:
         p.sync_turn("hello", "world")
         p._retain_queue.join()
         # retain_async=False → no server-side op to wait on.
-        assert p._pending_retain_ops == set()
+        assert not p._pending_retain_ops
 
     def test_prefetch_waits_for_server_completion_before_recall(self, provider):
         """Recall must not run until the tracked async op reports completed."""
@@ -822,7 +822,7 @@ class TestPrefetchServerRetainVisibility:
         # was cleared (so a later prefetch won't re-poll it).
         assert order == ["recall"]
         assert provider._client.operations.get_operation_status.await_count >= 3
-        assert provider._pending_retain_ops == set()
+        assert not provider._pending_retain_ops
 
     def test_prefetch_proceeds_after_server_wait_timeout(self, provider_with_config):
         """A wedged/never-completing async op must not hang prefetch forever;
@@ -866,40 +866,72 @@ class TestPrefetchServerRetainVisibility:
 
         assert provider._wait_for_server_retain_ops(lambda: False, 5.0) is True
         assert sorted(polled) == [("new-op", "new-bank"), ("old-op", "old-bank")]
-        assert provider._pending_retain_ops == set()
+        assert not provider._pending_retain_ops
 
-    def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
-        """Ops unresolved at deadline must be EVICTED so a permanently failing
-        status endpoint can't make every later prefetch re-burn the full
-        timeout on a growing pending set (unbounded session-wide degradation
-        + reply-path join penalty)."""
+    def test_timed_out_ops_remain_observable_without_repeated_prefetch_waits(self, provider_with_config):
         p = provider_with_config(prefetch_retain_drain_timeout=0.3)
         p._client = self._client_with_ops(["pending"])  # never completes
-        p._client.arecall = AsyncMock(
-            return_value=SimpleNamespace(results=[SimpleNamespace(text="m")])
-        )
-
-        p.sync_turn("hello", "world")
-        p._retain_queue.join()
-        assert p._pending_retain_ops, "op should be tracked before the wait"
-
-        # First prefetch burns the budget and must DROP the wedged op.
-        p.queue_prefetch("q1")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-        assert p._pending_retain_ops == set(), (
-            "unresolved ops must be evicted at deadline, not retained"
-        )
-
-        # A later prefetch must not poll the dropped op again (counted, not timed).
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "original-bank")
+        assert p._wait_for_retains_drained(0.3) is False
+        assert "op-1" in p._pending_retain_ops
         polls = p._client.operations.get_operation_status.await_count
-        p.queue_prefetch("q2")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-            assert not p._prefetch_thread.is_alive()
-        assert p._client.operations.get_operation_status.await_count == polls, (
-            "second prefetch re-polled dropped ops — eviction regressed"
-        )
+        assert p._wait_for_retains_drained(0.3) is True
+        assert p._client.operations.get_operation_status.await_count == polls
+        p._client.operations.get_operation_status = AsyncMock(return_value=SimpleNamespace(status="completed"))
+        p._poll_late_retain_ops()
+        assert not p._pending_retain_ops
+        p._client.operations.get_operation_status.assert_awaited_once_with(
+            bank_id="original-bank", operation_id="op-1")
+
+    def test_visibility_tracking_is_bounded_by_capacity_and_expiry(self, provider, monkeypatch, caplog):
+        monkeypatch.setattr("plugins.memory.hindsight._RETAIN_OP_TRACKING_MAX", 2)
+        provider._track_retain_ops(SimpleNamespace(operation_id=None, operation_ids=["a", "b", "c"]), "bank")
+        assert set(provider._pending_retain_ops) == {"b", "c"}
+        provider._pending_retain_ops["b"].expires_at = 0.0
+        provider._poll_late_retain_ops()
+        assert set(provider._pending_retain_ops) == {"c"}
+        assert "tracking full" in caplog.text and "visibility expired" in caplog.text
+
+    @pytest.mark.parametrize("cfg", [
+        {"prefetch_waits_for_retain": False}, {"recall_sync": True},
+        {"memory_mode": "tools"}, {"auto_recall": False}, {},
+    ])
+    def test_idle_ops_are_polled_without_a_prefetch_wait(self, provider_with_config, cfg):
+        p = provider_with_config(**cfg)
+        p._client = self._client_with_ops(["failed"])
+        p._track_retain_ops(SimpleNamespace(operation_id="idle-op", operation_ids=None), "original-bank")
+        from plugins.memory.hindsight import _RETAIN_OP_TRACKING_TTL_S
+        p._pending_retain_ops["idle-op"].expires_at = (
+            time.monotonic() + _RETAIN_OP_TRACKING_TTL_S - p._prefetch_retain_drain_timeout - 1)
+        p._poll_late_retain_ops()
+        assert not p._pending_retain_ops
+        p._client.operations.get_operation_status.assert_awaited_once_with(
+            bank_id="original-bank", operation_id="idle-op")
+
+    @pytest.mark.parametrize("timeout", [0, -1])
+    def test_idle_poll_preserves_configured_unbounded_visibility_wait(self, provider_with_config, timeout):
+        p = provider_with_config(prefetch_retain_drain_timeout=timeout)
+        p._client = self._client_with_ops(["pending"])
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "bank")
+        p._poll_late_retain_ops()
+        assert p._pending_retain_ops["op-1"].wait_for_visibility
+        p._client.operations.get_operation_status.assert_not_awaited()
+
+    def test_idle_poll_does_not_release_an_active_visibility_wait(self, provider_with_config, monkeypatch):
+        p = provider_with_config(prefetch_retain_drain_timeout=0.1)
+        p._client = self._client_with_ops(["pending"])
+        p._track_retain_ops(SimpleNamespace(operation_id="op-1", operation_ids=None), "bank")
+        from plugins.memory.hindsight import _RETAIN_OP_TRACKING_TTL_S
+        p._pending_retain_ops["op-1"].expires_at = time.monotonic() + _RETAIN_OP_TRACKING_TTL_S - 1
+
+        def while_waiting(_expired, timeout, _remaining):
+            p._poll_late_retain_ops()
+            assert p._pending_retain_ops["op-1"].wait_for_visibility
+            return False
+
+        monkeypatch.setattr(p, "_poll_server_retain_ops", while_waiting)
+        assert not p._wait_for_server_retain_ops(lambda: False, 1)
+        assert p._retain_visibility_waiters == 0
 
     def test_drain_budget_bounds_the_status_request_itself(self, provider_with_config):
         """The drain deadline must bound each status request, not only the loop checks: a hung
@@ -917,7 +949,7 @@ class TestPrefetchServerRetainVisibility:
         start = time.monotonic()
         assert p._wait_for_retains_drained(0.3) is False
         assert time.monotonic() - start < 2.5
-        assert p._pending_retain_ops == set()
+        assert "op-1" in p._pending_retain_ops
 
     def test_embedded_reconnect_retry_gets_only_the_remaining_budget(self, provider):
         """The local_embedded reconnect retry must spend what the first attempt left of the

@@ -451,6 +451,15 @@ class TestGeneratedSystemdUnits:
         assert "<key>NumberOfFiles</key>" in plist
         assert "<integer>65536</integer>" in plist
 
+    def test_launchd_plist_runs_gateway_as_interactive(self):
+        """launchd's default for an agent with no ProcessType is UTILITY QoS,
+        which starves the gateway behind ordinary terminal workloads."""
+        import plistlib
+
+        body = plistlib.loads(gateway_cli.generate_launchd_plist().encode())
+
+        assert body["ProcessType"] == "Interactive"
+
     def test_launchd_plist_omits_nofile_block_when_disabled(self, monkeypatch):
         """runtime.nofile_soft_limit: 0/false/null disables the adjustment; the
         plist must then not contain a SoftResourceLimits block at all."""

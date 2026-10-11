@@ -12,6 +12,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,9 +26,42 @@ logger = logging.getLogger(__name__)
 _LARGE_FILE_BYTES = 500 * 1024 * 1024
 
 
+@contextlib.contextmanager
+def _tracking_lock():
+    """Serialize tracking transactions without holding the lock during cleanup I/O."""
+    from hermes_cli.active_sessions import _FileLock
+    lock = _FileLock(_state_file("tracked.lock"), timeout=2.0)
+    try:
+        lock.__enter__()
+    except RuntimeError as exc:
+        raise RuntimeError("disk-cleanup tracking lock unavailable") from exc
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
 def _state_file(name: str) -> Path:
     """``$HERMES_HOME/disk-cleanup/<name>`` — deliberately outside ``$HERMES_HOME/logs/``."""
     return get_hermes_home() / "disk-cleanup" / name
+
+
+def in_cleanup_scope(path: Path) -> bool:
+    """Reject unrelated argument paths before probing their filesystem."""
+    absolute = Path(os.path.abspath(path))
+    try:
+        absolute.relative_to(get_hermes_home())
+        return True
+    except ValueError:
+        pass
+    for root in (Path("/tmp"), Path("/private/tmp")):  # no-tmp: ok — lexical aliases only
+        try:
+            relative = absolute.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0].startswith("hermes-"):
+            return True
+    return False
 
 
 def is_safe_path(path: Path) -> bool:
@@ -35,6 +69,8 @@ def is_safe_path(path: Path) -> bool:
 
     Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
     """
+    if not in_cleanup_scope(path):
+        return False
     hermes_home = get_hermes_home()
     try:
         resolved = path.resolve()
@@ -173,7 +209,10 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         category = "other"
 
     try:
-        path = Path(path_str).resolve()
+        path = Path(path_str).expanduser()
+        if not in_cleanup_scope(path):
+            return False
+        path = path.resolve()
     except (OSError, RuntimeError):
         _log(f"REJECT: {path_str} (could not resolve path)")
         return False
@@ -185,12 +224,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         _log(f"REJECT: {path} (outside HERMES_HOME)")
         return False
     size = path.stat().st_size if path.is_file() else 0
-    tracked = load_tracked()
-    if any(item["path"] == str(path) for item in tracked):
-        return False
-    tracked.append({"path": str(path), "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "category": category, "size": size})
-    save_tracked(tracked)
+    with _tracking_lock():
+        tracked = load_tracked()
+        if any(item["path"] == str(path) for item in tracked):
+            return False
+        tracked.append({"path": str(path), "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "category": category, "size": size})
+        save_tracked(tracked)
     _log(f"TRACKED: {path} ({category}, {fmt_size(size)})")
     if not silent:
         print(f"Tracked: {path} ({category}, {fmt_size(size)})")
@@ -200,12 +240,13 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
 def forget(path_str: str) -> int:
     """Remove a path from tracking without deleting the file."""
     p = Path(path_str).resolve()
-    tracked = load_tracked()
-    kept = [i for i in tracked if Path(i["path"]).resolve() != p]
-    removed = len(tracked) - len(kept)
-    if removed:
-        save_tracked(kept)
-        _log(f"FORGOT: {p} ({removed} entries)")
+    with _tracking_lock():
+        tracked = load_tracked()
+        kept = [i for i in tracked if Path(i["path"]).resolve() != p]
+        removed = len(tracked) - len(kept)
+        if removed:
+            save_tracked(kept)
+            _log(f"FORGOT: {p} ({removed} entries)")
     return removed
 
 
@@ -272,8 +313,11 @@ def quick() -> Dict[str, Any]:
     """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``."""
     deleted = freed = 0
     new_tracked: List[Dict] = []
+    deleted_items: List[Dict] = []
     errors: List[str] = []
-    for item, p, age in _live_items(load_tracked(), datetime.now(timezone.utc), log_stale=True):
+    with _tracking_lock():
+        snapshot = load_tracked()
+    for item, p, age in _live_items(snapshot, datetime.now(timezone.utc), log_stale=True):
         cat = item["category"]
         if cat in _STALE_SKIP_NOTE and (re_cat := guess_category(p)) != cat:
             # Misclassified stale entry — drop it rather than delete the file.
@@ -293,11 +337,17 @@ def quick() -> Dict[str, Any]:
         if err is None:
             freed += item["size"]
             deleted += 1
+            deleted_items.append(item)
         else:
             errors.append(err)
             new_tracked.append(item)
+    # Merge only removals from this snapshot. Slow classification/deletion must
+    # not block track(), and concurrent additions or replacements must survive.
+    recreated = [item for item in deleted_items if Path(item["path"]).exists()]
+    removed = [item for item in snapshot if item not in new_tracked and item not in recreated]
+    with _tracking_lock():
+        save_tracked([item for item in load_tracked() if item not in removed])
     empty_removed = _sweep_empty_dirs(get_hermes_home())
-    save_tracked(new_tracked)
     _log(f"QUICK_SUMMARY: {deleted} files, {empty_removed} dirs, {fmt_size(freed)}")
     return {"deleted": deleted, "empty_dirs": empty_removed, "freed": freed, "errors": errors}
 

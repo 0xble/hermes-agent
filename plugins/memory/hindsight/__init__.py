@@ -48,7 +48,7 @@ from .settings import (
     _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
     _resolve_bank_id_template,
 )
-from .retention import filter_retain_messages
+from .retention import PendingRetainOperation, filter_retain_messages
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,8 @@ _RETAIN_MAX_ATTEMPTS = 5
 _RETAIN_BACKLOG_MAX = 50
 _RETAIN_RETRY_BASE_S = 5.0
 _RETAIN_RETRY_MAX_S = 300.0
+_RETAIN_OP_TRACKING_MAX = 256
+_RETAIN_OP_TRACKING_TTL_S = 3600.0
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
@@ -337,6 +339,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # Each server-side op status poll is a round trip — coarser than the 0.05s queue poll.
     _RETAIN_OP_POLL_INTERVAL_S = 0.5
+    _RETAIN_LATE_POLL_INTERVAL_S = 5.0
 
     def backup_paths(self) -> List[str]:
         """Legacy shared config + embedded-mode profile env files live under ~/.hindsight."""
@@ -386,11 +389,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # Server-side async retain ops still in flight: aretain_batch returns on
         # *acceptance*, not durability, so the prefetch gates on these via
         # get_operation_status (a drained local queue is not a read-after-write signal).
-        self._pending_retain_ops: set[str] = set()
-        # Bank each pending op was retained to: a session-scoped bank_id_template can leave
-        # old-session ops pending after a switch, and their status lives only in their own bank.
-        self._pending_retain_op_banks: dict[str, str] = {}
+        self._pending_retain_ops: dict[str, PendingRetainOperation] = {}
         self._pending_retain_ops_lock = threading.Lock()
+        self._retain_visibility_waiters = 0
+        self._retain_status_next_at = 0.0
         self._apply_retain_policy({})
 
         # Recall: pending prefetch block + count, and the indicator state (recall_status()).
@@ -600,6 +602,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     return
                 if self._retain_backlog and time.monotonic() >= self._retain_backlog_next_at:
                     self._drain_retain_backlog()
+                self._poll_late_retain_ops()
                 continue
             try:
                 if job is _WRITER_SENTINEL:
@@ -656,8 +659,59 @@ class HindsightMemoryProvider(MemoryProvider):
         raw_ids = [getattr(retain_response, "operation_id", None), *(getattr(retain_response, "operation_ids", None) or [])]
         if ids := [str(op) for op in raw_ids if op]:
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.update(ids)
-                self._pending_retain_op_banks.update(dict.fromkeys(ids, bank_id))
+                self._expire_retain_ops_locked()
+                for op_id in ids:
+                    self._pending_retain_ops.setdefault(op_id, PendingRetainOperation(
+                        bank_id, time.monotonic() + _RETAIN_OP_TRACKING_TTL_S))
+                dropped = max(0, len(self._pending_retain_ops) - _RETAIN_OP_TRACKING_MAX)
+                for _ in range(dropped):
+                    oldest = min(self._pending_retain_ops, key=lambda key: self._pending_retain_ops[key].expires_at)
+                    self._pending_retain_ops.pop(oldest)
+                if dropped:
+                    logger.warning("Hindsight retain visibility tracking full; expired %d oldest op(s)", dropped)
+
+    def _expire_retain_ops_locked(self) -> None:
+        expired = [op_id for op_id, op in self._pending_retain_ops.items()
+                   if op.expires_at <= time.monotonic()]
+        for op_id in expired:
+            self._pending_retain_ops.pop(op_id)
+        if expired:
+            logger.warning("Hindsight retain visibility expired for %d unresolved op(s)", len(expired))
+
+    def _poll_late_retain_ops(self) -> None:
+        """Bounded idle polling preserves accepted operations after their first wait."""
+        with self._pending_retain_ops_lock:
+            if time.monotonic() < self._retain_status_next_at:
+                return
+            self._retain_status_next_at = time.monotonic() + self._RETAIN_LATE_POLL_INTERVAL_S
+            self._expire_retain_ops_locked()
+            # Tools-only, synchronous recall, disabled prefetch waits, and the
+            # final turn before idle never reach the prefetch barrier.
+            timeout = self._prefetch_retain_drain_timeout
+            unbounded_wait = (timeout <= 0 and self._prefetch_waits_for_retain
+                              and not self._recall_sync and not self._recall_disabled())
+            if not self._retain_visibility_waiters and not unbounded_wait:
+                for op in self._pending_retain_ops.values():
+                    first_wait_deadline = op.expires_at - _RETAIN_OP_TRACKING_TTL_S + max(0.0, timeout)
+                    if time.monotonic() >= first_wait_deadline:
+                        op.wait_for_visibility = False
+            pending = [(op_id, op) for op_id, op in self._pending_retain_ops.items()
+                       if not op.wait_for_visibility]
+        deadline = time.monotonic() + 2.0
+        for op_id, op in pending:
+            left = deadline - time.monotonic()
+            if left <= 0 or self._shutting_down.is_set():
+                return
+            with self._pending_retain_ops_lock:
+                if self._pending_retain_ops.get(op_id) is not op:
+                    continue
+                # A slow status endpoint must not starve later operations.
+                self._pending_retain_ops.pop(op_id)
+                self._pending_retain_ops[op_id] = op
+            if self._is_retain_op_complete(op.bank_id, op_id, timeout=left):
+                with self._pending_retain_ops_lock:
+                    if self._pending_retain_ops.get(op_id) is op:
+                        self._pending_retain_ops.pop(op_id)
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str, timeout: float | None = None) -> bool:
         """True when a server-side retain op is done or gone (completed ops are evicted,
@@ -675,7 +729,10 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
-        return str(getattr(resp, "status", "") or "").lower() in {"completed", "failed"}
+        status = str(getattr(resp, "status", "") or "").lower()
+        if status == "failed":
+            logger.warning("Hindsight retain operation failed: op=%s bank=%s", op_id, bank_id)
+        return status in {"completed", "failed"}
 
     def _wait_for_retains_drained(self, timeout: float) -> bool:
         """Block up to *timeout* s for the last retain to become recall-visible
@@ -702,41 +759,48 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float,
                                     _remaining: Callable[[], float | None] = lambda: None) -> bool:
-        """Poll tracked async retain ops until complete or *_expired()* (deadline
-        predicate). Ops still pending at the deadline are DROPPED: keeping them
-        would let a permanently failing status endpoint burn the full timeout on
-        EVERY later prefetch (a per-turn latency penalty via prefetch()'s bounded
-        join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
+        with self._pending_retain_ops_lock:
+            self._retain_visibility_waiters += 1
+        try:
+            return self._poll_server_retain_ops(_expired, timeout, _remaining)
+        finally:
+            with self._pending_retain_ops_lock:
+                self._retain_visibility_waiters -= 1
+
+    def _poll_server_retain_ops(self, _expired: Callable[[], bool], timeout: float,
+                               _remaining: Callable[[], float | None]) -> bool:
+        """Wait once per accepted op, then leave late completion to idle polling."""
         while True:
             with self._pending_retain_ops_lock:
-                pending = [(op_id, self._pending_retain_op_banks.get(op_id) or self._bank_id)
-                           for op_id in self._pending_retain_ops]
+                self._expire_retain_ops_locked()
+                pending = [(op_id, op) for op_id, op in self._pending_retain_ops.items()
+                           if op.wait_for_visibility]
             if not pending:
                 return True
             if self._shutting_down.is_set():
                 return False
             done: set[str] = set()
-            for op_id, bank_id in pending:
+            for op_id, op in pending:
                 if self._shutting_down.is_set():
                     return False
                 if _expired():
                     break
-                if self._is_retain_op_complete(bank_id, op_id, timeout=_remaining()):
+                if self._is_retain_op_complete(op.bank_id, op_id, timeout=_remaining()):
                     done.add(op_id)
             with self._pending_retain_ops_lock:
-                self._pending_retain_ops.difference_update(done)
                 for op_id in done:
-                    self._pending_retain_op_banks.pop(op_id, None)
-                if not self._pending_retain_ops:
+                    self._pending_retain_ops.pop(op_id, None)
+                unresolved = [op_id for op_id, _ in pending if op_id in self._pending_retain_ops]
+                if not any(op.wait_for_visibility for op in self._pending_retain_ops.values()):
                     return True
-                dropped = len(self._pending_retain_ops) if _expired() else 0
-                if dropped:
-                    self._pending_retain_ops.clear()
-                    self._pending_retain_op_banks.clear()
-            if dropped:
+                late = len(unresolved) if _expired() else 0
+                if late:
+                    for op_id in unresolved:
+                        self._pending_retain_ops[op_id].wait_for_visibility = False
+            if late:
                 logger.warning("Prefetch: server retain visibility timed out after %.1fs; "
-                               "dropping %d unresolved op(s) so later prefetches stay "
-                               "bounded (recall may miss the just-completed turn)", timeout, dropped)
+                               "tracking %d unresolved op(s) in background "
+                               "(recall may miss the just-completed turn)", timeout, late)
                 return False
             left = _remaining()
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S if left is None else min(self._RETAIN_OP_POLL_INTERVAL_S, left))

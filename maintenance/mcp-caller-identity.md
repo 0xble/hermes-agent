@@ -6,6 +6,15 @@ per-server opt-in bookkeeping in `tools/mcp_tool_discovery.py`, the identity cap
 
 **Patch identity:** `mcp-caller-identity`.
 
+Authoritative top-level source/cron context resolves the topic without opening
+SessionDB, even before its session row is persisted. Delegated children inherit
+that context, so their delegated-process/source marker takes precedence and they
+still resolve their nearest non-subagent ancestor. Legacy contexts use the same
+database lineage lookup. Its complete connection/query/cleanup runs behind a
+two-second budget with one in-flight reader per process. A stuck reader cannot
+accumulate additional workers. The real stdio MCP regression covers a cron caller
+whose row has not been persisted, plus delegated ancestry and blocked SQLite I/O.
+
 ## Required behavior
 
 - `mcp_servers.<name>.caller_identity` defaults to `false` and is parsed like
