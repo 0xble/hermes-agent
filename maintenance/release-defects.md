@@ -208,6 +208,19 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_every_reusable_only_workflow_has_a_caller`,
   `test_every_local_action_reference_resolves`).
 
+## DMG install proof accepted an unrelated app
+
+- Fork patch identity: `dmg-install-proof-provenance`.
+- The macOS DMG driver treated any `/Applications/Hermes.app` as proof that
+  the selected checkout's bootstrap had installed its desktop app. The proof
+  now stays under `INSTALL_DIR` and requires the minimum app-bundle shape,
+  while the desktop E2E caller uses the same scoped admission.
+- Guard: `tests/scripts/install/test_dmg_install_driver.py` and `bash -n` on
+  both macOS install drivers.
+- Upstream status: the scoped test-driver fix is fork-local. Upstream has an
+  open macOS installer/product-app ownership issue tracked in #125245; that
+  runtime packaging change is separate from this proof-boundary repair.
+
 ## Media send checks flood cooldown after chat lock acquisition
 
 - Fork patch identity: `telegram-media-flood-under-lock`.
