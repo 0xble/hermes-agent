@@ -8,7 +8,6 @@ from pathlib import Path
 
 REQUEST_DUMP_MAX_BYTES = 1024 * 1024
 REQUEST_DUMP_MAX_FILES = 100
-REQUEST_DUMP_SCAN_LIMIT = 4096
 _TRUNCATED = "[request dump truncated]"
 _DUMP_NAME = re.compile(r"request_dump_.+_[0-9]{8}_[0-9]{6}_[0-9]{6}\.json")
 
@@ -22,10 +21,13 @@ def bounded_request_dump(payload: dict) -> dict:
     def size(value):
         text = json.dumps(value, ensure_ascii=False, indent=2)
         try:
-            return len(text.encode("utf-8"))
+            encoded = len(text.encode("utf-8"))
         except UnicodeEncodeError:
             # atomic_json_write escapes the entire payload on surrogate fallback.
-            return len(json.dumps(value, ensure_ascii=True, indent=2).encode("utf-8"))
+            text = json.dumps(value, ensure_ascii=True, indent=2)
+            encoded = len(text.encode("utf-8"))
+        # atomic_json_write writes in text mode, so each newline becomes os.linesep on disk.
+        return encoded + text.count("\n") * (len(os.linesep) - 1)
 
     original_bytes = size(payload)
     if original_bytes <= REQUEST_DUMP_MAX_BYTES:
@@ -70,15 +72,17 @@ def bounded_request_dump(payload: dict) -> dict:
 
 
 def prune_request_dumps(newest: Path) -> None:
-    """Best-effort profile-wide count retention with bounded scan/deletion work.
+    """Best-effort profile-wide count retention.
 
-    Only the writer's timestamped regular files qualify. Keep the just-written dump
-    even across clock skew; permission errors and concurrent writers defer pruning.
+    Every write scans the whole directory so pruning cannot starve behind unrelated
+    entries. The scan reads names only and stats just dump-shaped entries. Only the
+    writer's timestamped regular files qualify. Keep the just-written dump even across
+    clock skew; permission errors and concurrent writers defer pruning.
     """
     candidates = []
     try:
         with os.scandir(newest.parent) as entries:
-            for entry in islice(entries, REQUEST_DUMP_SCAN_LIMIT):
+            for entry in entries:
                 if entry.name == newest.name or not _DUMP_NAME.fullmatch(entry.name):
                     continue
                 try:

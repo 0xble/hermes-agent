@@ -10,10 +10,12 @@ without a bound. Keep valid diagnostic JSON, recognizable request/error context,
 and explicit omission markers; do not truncate the actual provider request.
 The limits are local defaults, not another configuration surface.
 
-Retention is write-triggered and best-effort. Limit each directory scan and only
-unlink regular files matching the writer's timestamped dump names. Preserve
-transcripts, unrelated JSON, temporary files, directories, and symlinks. A scan
-limit or filesystem race may defer complete pruning until later writes.
+Retention is write-triggered and best-effort. Scan the whole directory by name,
+stat only dump-shaped entries, and only unlink regular files matching the writer's
+timestamped dump names. A partial scan budget would let unrelated entries starve
+pruning forever. Preserve transcripts, unrelated JSON, temporary files,
+directories, and symlinks. A filesystem race may defer pruning until a later write.
+Size accounting includes text-mode newline expansion so Windows dumps keep the cap.
 
 ## Provenance and adoption
 
@@ -43,6 +45,6 @@ newest-file retention, and non-dump preservation. Existing endpoint and session
 cleanup tests protect surrounding behavior.
 
 Retire when released upstream satisfies the full size, valid-JSON, write-time
-retention, bounded-scan, and non-dump-preservation contract. Roll back by reverting
+retention, full-scan progress, and non-dump-preservation contract. Roll back by reverting
 the patch; previously pruned diagnostics cannot be recovered. No profile config
 or runtime activation belongs to this unit.

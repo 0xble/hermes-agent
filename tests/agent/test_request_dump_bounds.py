@@ -125,26 +125,38 @@ def test_retention_does_not_unlink_dump_shaped_symlinks(tmp_path):
     assert target.read_text(encoding="utf-8") == "keep me"
 
 
-def test_retention_scan_has_a_finite_entry_budget(tmp_path, monkeypatch):
-    visited = []
+def test_retention_makes_progress_when_unrelated_entries_exceed_any_scan_budget(tmp_path, monkeypatch):
+    """Unrelated session artifacts listed ahead of the dumps must not starve pruning."""
+    for index in range(4100):
+        (tmp_path / f"session_{index:05d}.json").write_text("{}", encoding="utf-8")
+    for index in range(120):
+        (tmp_path / f"request_dump_old_20250101_000000_{index:06d}.json").write_text("{}", encoding="utf-8")
+    real_scandir = os.scandir
 
     @contextmanager
-    def scandir(path):
-        assert path == tmp_path
+    def nondump_first(path):
+        with real_scandir(path) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name.startswith("request_dump_"))
+        yield iter(ordered)
 
-        def entries():
-            for index in range(4097):
-                visited.append(index)
-                assert len(visited) <= 4096, "request-dump retention exceeded its scan budget"
-                yield SimpleNamespace(name=f"session_{index}.json")
-
-        yield entries()
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    monkeypatch.setattr(os, "scandir", nondump_first)
     dump_file = dump_api_request_debug(_agent(tmp_path), {"model": "debug-model"}, reason="preflight")
 
     assert dump_file is not None and dump_file.exists()
-    assert 0 < len(visited) <= 4096
+    assert len(list(tmp_path.glob("request_dump_*.json"))) == 100
+    assert len(list(tmp_path.glob("session_*.json"))) == 4100
+
+
+def test_size_cap_accounts_for_platform_newline_expansion(monkeypatch):
+    from agent import request_debug
+
+    monkeypatch.setattr(request_debug.os, "linesep", "\r\n")
+    # Fits the cap with LF newlines (1,008,069 bytes) but not once each one becomes CRLF.
+    payload = {"request": {"body": {"messages": ["ab"] * 72000}}}
+    bounded = request_debug.bounded_request_dump(payload)
+    text = json.dumps(bounded, ensure_ascii=False, indent=2)
+    on_disk = len(text.encode("utf-8")) + text.count("\n")
+    assert on_disk <= MAX_DUMP_BYTES, f"CRLF output would be {on_disk} bytes"
 
 
 def test_retention_errors_do_not_discard_a_successful_dump(tmp_path, monkeypatch):
