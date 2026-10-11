@@ -14,6 +14,18 @@ def _line_marker(line: str, marker: str) -> bool:
     return line.strip() == marker
 
 
+def _is_copy_marker(line: str) -> bool:
+    """Any marker line. Inside a block a bare ``[[copy]]`` closes it, like ``[[/copy]]``:
+    a model that mistypes the close must never leak a marker or swallow the rest of the reply.
+    A body that needs a literal marker line keeps it inside a code fence."""
+    return _line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)
+
+
+def _after_marker(line: str, in_copy: bool) -> bool:
+    """Block state after a marker line: an open marker toggles, a close marker always closes."""
+    return _line_marker(line, _COPY_OPEN) and not in_copy
+
+
 def _next_fence(fence: str | None, line: str) -> str | None:
     """Return the open fence after *line*, following CommonMark fence rules.
 
@@ -67,7 +79,8 @@ def extract_copy_blocks(text: str) -> tuple[str, list[str]]:
     fence: str | None = None
 
     for line in lines:
-        if fence is None and _line_marker(line, _COPY_OPEN if not in_copy else _COPY_CLOSE):
+        if fence is None and _is_copy_marker(line):
+            # Marker lines are control syntax, never visible text; a stray close changes nothing.
             if in_copy:
                 body = "".join(copy_parts)
                 body = _strip_one_adjacent_newline(body, leading=True)
@@ -75,10 +88,7 @@ def extract_copy_blocks(text: str) -> tuple[str, list[str]]:
                 if body.strip():
                     blocks.append(body)
                 copy_parts = []
-            in_copy = not in_copy
-            continue
-        if fence is None and not in_copy and _line_marker(line, _COPY_CLOSE):
-            # A stray close marker is control syntax, never visible text.
+            in_copy = _after_marker(line, in_copy)
             continue
         # Fences are tracked inside copy bodies too, so a fenced marker line is
         # body text there, matching CopyMarkerStreamFilter.
@@ -123,17 +133,11 @@ class CopyMarkerStreamFilter:
         return False
 
     def _is_marker(self, line: str) -> bool:
-        # Inside a block an open marker is body text, as in extract_copy_blocks.
-        return self._fence is None and (
-            (_line_marker(line, _COPY_OPEN) and not self._in_copy) or _line_marker(line, _COPY_CLOSE)
-        )
+        return self._fence is None and _is_copy_marker(line)
 
     def _on_marker(self, line: str) -> None:
-        if _line_marker(line, _COPY_OPEN) and not self._in_copy:
-            self._in_copy = True
-        elif _line_marker(line, _COPY_CLOSE) and self._in_copy:
-            self._in_copy = False
-        # A nested open or stray close is control syntax and changes nothing.
+        # Same state machine as extract_copy_blocks.
+        self._in_copy = _after_marker(line, self._in_copy)
 
     def _emit(self) -> bool:
         return not (self._drop_bodies and self._in_copy)
@@ -278,14 +282,13 @@ def protect_inline_copy_bodies(text: str) -> tuple[str, dict[str, str]]:
     fence: str | None = None
     in_copy = False
     for line in text.splitlines(keepends=True):
-        if fence is None and (
-                (_line_marker(line, _COPY_OPEN) and not in_copy) or _line_marker(line, _COPY_CLOSE)):
+        if fence is None and _is_copy_marker(line):
             if in_copy and body:
                 token = _token()
                 bodies[token] = "".join(body)
                 out.append(token)
                 body = []
-            in_copy = _line_marker(line, _COPY_OPEN)
+            in_copy = _after_marker(line, in_copy)
             continue
         (body if in_copy else out).append(line)
         fence = _next_fence(fence, line)
@@ -328,10 +331,9 @@ def map_outside_copy_blocks(text: str, transform, *, keep_markers: bool = False)
             ordinary.clear()
 
     for line in text.splitlines(keepends=True):
-        if fence is None and (
-                (_line_marker(line, _COPY_OPEN) and not in_copy) or _line_marker(line, _COPY_CLOSE)):
+        if fence is None and _is_copy_marker(line):
             _flush_ordinary()
-            in_copy = _line_marker(line, _COPY_OPEN)
+            in_copy = _after_marker(line, in_copy)
             if keep_markers:
                 out.append(line)
             continue
