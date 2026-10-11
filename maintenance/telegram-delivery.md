@@ -208,7 +208,9 @@ released upstream mechanism.
   changes. Separate local flood-coherence and ledger deltas remain. Flood coherence
   is tracked in [issue #107612](https://github.com/NousResearch/hermes-agent/issues/107612).
 - Emphasis is an own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906),
-  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19.
+  open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. On 2026-10-10 it was
+  converted back to draft to free an open-PR slot for PR 133834 (the slot was still
+  refused). Mark it ready again once the author's open ready PR count is under the limit.
 
 ## Reconnect Teardown During Text Sends
 
