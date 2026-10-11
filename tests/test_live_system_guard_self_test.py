@@ -141,7 +141,68 @@ def test_subprocess_run_systemctl_restart_blocked():
 def test_subprocess_run_windows_native_hermes_update_blocked(executable):
     """Native Windows argv preserves backslashes and must still block updates."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run([executable, "update"])
+        _check_update_command_without_spawning([executable, "update"])
+
+
+def _check_update_command_without_spawning(command):
+    # Exercise the installed guard, never a real updater if the canary fails.
+    import inspect
+
+    check = inspect.getclosurevars(subprocess.run).nonlocals["_check_subprocess_cmd"]
+    check("Popen", command)
+
+
+@pytest.mark.parametrize(
+    "command, blocked",
+    [
+        pytest.param(["bash", "-c", "hermes update --gateway"], True, id="bash-c"),
+        pytest.param(["setsid", "bash", "-c", "python -m hermes_cli.main update --gateway"], True, id="setsid-bash-c"),
+        pytest.param(["sh", "-lc", "hermes update"], True, id="sh-lc"),
+        pytest.param(["bash", "-lc", "--", "hermes update"], True, id="shell-command-option-boundary"),
+        pytest.param(["zsh", "-ic", "hermes update"], True, id="zsh-ic"),
+        pytest.param(["dash", "-ilc", "hermes update"], True, id="dash-combined-c"),
+        pytest.param(["env", "MODE=test", "nohup", "timeout", "10", "sudo", "-u", "nobody", "/bin/bash", "-lc", "hermes update"], True, id="prefixed-bash-lc"),
+        pytest.param(["cmd", "/c", r"C:\repo\hermes.exe update"], True, id="cmd-c"),
+        pytest.param(["cmd.exe", "/c", r'"C:\Program Files\hermes.exe" update'], True, id="cmd-exe-c-quoted"),
+        pytest.param(["powershell", "-Command", r"C:\repo\hermes.exe update"], True, id="powershell-command"),
+        pytest.param(["pwsh", "-c", r"& 'C:\Program Files\hermes.exe' update"], True, id="pwsh-c-quoted"),
+        pytest.param(["bash", "-c", "sh -lc 'hermes update'"], True, id="nested-shells"),
+        pytest.param(["bash", "-c", "hermes update '"], True, id="malformed-shell-fail-closed"),
+        pytest.param(["bash", "-c", "hermes update; true"], True, id="shell-operator"),
+        pytest.param(["bash", "-c", "echo ok; sh -c 'hermes update'"], True, id="nested-after-command"),
+        pytest.param(["bash", "-c", "sh -c true; sh -c 'hermes update'"], True, id="second-shell-payload"),
+        pytest.param(["bash", "-c", "python -m hermes_cli.main update '"], True, id="malformed-module-fail-closed"),
+        pytest.param(["bash", "-c", "hermes status"], False, id="shell-read-only"),
+        pytest.param(["cmd", "/c", r"C:\hermes-ci-home\npm-fixture\npm.cmd update"], False, id="cmd-npm-update"),
+        pytest.param(["python", "-c", "print(\"hermes update\")"], False, id="non-shell-payload"),
+        pytest.param(["bash", "-c", r'printf %s "C:\Program Files\npm.cmd update"'], False, id="shell-data-argument"),
+    ],
+)
+def test_shell_wrapper_hermes_update_blocked_without_spawning(command, blocked):
+    if blocked:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(command)
+    else:
+        _check_update_command_without_spawning(command)
+
+
+@pytest.mark.parametrize(
+    "command, blocked",
+    [
+        pytest.param(r"C:\repo\.venv\Scripts\hermes.exe update", True, id="native-windows-string"),
+        pytest.param(r'"C:\Program Files\hermes.exe" update', True, id="quoted-windows-spaces"),
+        pytest.param(r"C:\Program Files\hermes.exe update", True, id="unquoted-windows-spaces"),
+        pytest.param(r'"C:\Program Files\hermes.exe update', True, id="malformed-windows-fail-closed"),
+        pytest.param(r"C:\hermes-ci-home\npm-fixture\npm.cmd update", False, id="native-npm-update"),
+        pytest.param(r'"C:\Program Files\hermes.exe" status', False, id="windows-read-only"),
+    ],
+)
+def test_windows_string_hermes_update_blocked_without_spawning(command, blocked):
+    if blocked:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(command)
+    else:
+        _check_update_command_without_spawning(command)
 
 
 def test_subprocess_run_full_path_systemctl_blocked():

@@ -265,6 +265,83 @@ def _live_system_guard(request, monkeypatch):
 
     from tests.git_safety import blocked_git_mutation
 
+    def _argv_token(token) -> str:
+        if isinstance(token, (bytes, bytearray)):
+            return bytes(token).decode(errors="replace")
+        try:
+            token = _os.fspath(token)
+        except TypeError:
+            token = str(token)
+        return token.decode(errors="replace") if isinstance(token, bytes) else str(token)
+
+    def _token_basename(token: str) -> str:
+        return token.strip('\"\'').replace('\\', '/').rsplit('/', 1)[-1].lower()
+
+    _UPDATE_SHELLS = {"sh", "bash", "zsh", "dash", "cmd", "powershell", "pwsh"}
+
+    def _is_hermes_update(cmd, *, posix=None) -> bool:
+        if isinstance(cmd, (list, tuple)):
+            # Native argv is already split. Never reinterpret path backslashes
+            # or spaces inside its elements as shell syntax.
+            tokens = [_argv_token(token) for token in cmd]
+        else:
+            text = _cmd_to_string(cmd)
+            if posix is None:
+                # This guard also inspects Windows commands on POSIX runners.
+                import re
+                posix = not ("\\" in text or re.search(r"[A-Za-z]:", text))
+            try:
+                lexer = _shlex.shlex(text, posix=posix, punctuation_chars=";&|()")
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                tokens = list(lexer)
+            except ValueError:
+                # Unbalanced quotes must not hide updater intent. Keep path
+                # separators intact and recover only lexical token boundaries.
+                import re
+                tokens = re.split(r"[\s\"';&|()]+", text)
+            tokens = [token.strip('\"\'') for token in tokens]
+
+        update_token = any(token.lower() == "update" for token in tokens)
+        invokes_hermes = any(
+            _token_basename(token) in {"hermes", "hermes.exe", "hermes.cmd"}
+            or token.lower() in {"hermes_cli.main", "hermes_cli.main.py"}
+            for token in tokens
+        )
+        if update_token and invokes_hermes:
+            return True
+        if not tokens:
+            return False
+        head = _token_basename(tokens[0]).removesuffix(".exe")
+        if (
+            isinstance(cmd, (list, tuple))
+            and head not in _UPDATE_SHELLS
+            and head not in _WRAPPER_COMMANDS
+        ):
+            return False
+        # Prefix launchers leave the shell and its command flag in argv. Only
+        # the shell payload is a command string; its remaining argv stays intact.
+        for index, token in enumerate(tokens):
+            shell = _token_basename(token).removesuffix(".exe")
+            if shell not in _UPDATE_SHELLS:
+                continue
+            for flag_index in range(index + 1, len(tokens) - 1):
+                flag = tokens[flag_index].lower()
+                command_flag = (
+                    flag in {"/c", "/k"} if shell == "cmd" else
+                    flag in {"-command", "-c"} if shell in {"powershell", "pwsh"} else
+                    flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]
+                )
+                payload_index = flag_index + 1
+                if shell in {"sh", "bash", "zsh", "dash"} and tokens[payload_index] == "--":
+                    payload_index += 1
+                if command_flag and payload_index < len(tokens) and _is_hermes_update(
+                    tokens[payload_index],
+                    posix=shell not in {"cmd", "powershell", "pwsh"},
+                ):
+                    return True
+        return False
+
     def _check_subprocess_cmd(name, cmd, kwargs=None):
         git_verb = blocked_git_mutation(cmd, kwargs, _LIVE_GUARD_PROTECTED_GIT_ROOTS)
         if git_verb is not None:
@@ -301,44 +378,9 @@ def _live_system_guard(request, monkeypatch):
         # inotify/SHA watchdogs.  Any test that legitimately needs to exercise
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
-        if isinstance(cmd, (list, tuple)):
-            def argv_token(token) -> str:
-                if isinstance(token, (bytes, bytearray)):
-                    return bytes(token).decode(errors="replace")
-                try:
-                    token = _os.fspath(token)
-                except TypeError:
-                    token = str(token)
-                return token.decode(errors="replace") if isinstance(token, bytes) else str(token)
-
-            # Preserve argv element boundaries. POSIX shlex treats the
-            # backslashes in a native Windows executable path as escapes when
-            # a list is flattened into one string, turning
-            # ``C:\\repo\\Scripts\\hermes.exe`` into
-            # ``C:repoScriptshermes.exe`` before basename matching.
-            command_tokens = [argv_token(token) for token in cmd]
-        else:
-            try:
-                command_tokens = _shlex.split(cmd_str)
-            except ValueError:
-                command_tokens = cmd_str.split()
-        # Match executable/ module tokens, not arbitrary path components.  The
-        # CI home is deliberately named ``hermes-ci-home``; substring matching
-        # therefore misclassified an unrelated fixture command such as
-        # ``...\npm-fixture\npm.cmd update`` as the real ``hermes update``.
-        def token_basename(token: str) -> str:
-            return token.strip('"\'').replace('\\', '/').rsplit('/', 1)[-1].lower()
-
-        update_token = any(token.strip('"\'').lower() == "update" for token in command_tokens)
-        invokes_hermes = any(
-            token_basename(token) in {"hermes", "hermes.exe", "hermes.cmd"}
-            for token in command_tokens
-        )
-        invokes_hermes_cli = any(
-            token.strip('"\'').lower() in {"hermes_cli.main", "hermes_cli.main.py"}
-            for token in command_tokens
-        )
-        if update_token and (invokes_hermes or invokes_hermes_cli):
+        # Match executable/module tokens, not arbitrary path components such
+        # as the fixture home ``hermes-ci-home\\npm-fixture\\npm.cmd update``.
+        if _is_hermes_update(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "
