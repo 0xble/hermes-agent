@@ -107,7 +107,7 @@ async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session
 
 async def _record_manual_icon(runner, source: SessionSource, thread_id: str, emoji: str, icon_id: str) -> None:
     """Record an explicitly chosen icon as manual so automatic renames keep it."""
-    db = runner._sync_session_db()
+    db = await asyncio.to_thread(runner._sync_session_db)
     if db is None:
         return
     profile = runner._telegram_topic_profile_name(source)

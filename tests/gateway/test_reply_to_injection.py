@@ -7,6 +7,8 @@ in the conversation history. History can contain the same or similar text
 multiple times, and without an explicit pointer the agent has to guess
 which prior message the user is referencing.
 """
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -98,7 +100,9 @@ async def test_quoted_reply_references_stay_literal_while_typed_ones_expand(tmp_
     runner = _make_runner()
     runner._session_model_overrides, runner._last_resolved_model = {}, {}
     runner._agent_cache, runner._agent_cache_lock = {}, threading.Lock()
-    runner._resolve_session_agent_runtime = lambda **kw: ("openai/gpt-4.1-mini", {"base_url": None, "api_key": ""})
+    runner._resolve_session_agent_runtime_async = AsyncMock(
+        return_value=("openai/gpt-4.1-mini", {"base_url": None, "api_key": ""})
+    )
     source = _source()
 
     quoted = ("x " * 300) + f"\nsee @file:{payload.name} for details"
@@ -106,11 +110,13 @@ async def test_quoted_reply_references_stay_literal_while_typed_ones_expand(tmp_
     result = await runner._prepare_inbound_message_text(event=quoted_ref, source=source, history=[])
     assert quoted in result
     assert "LOCAL-FILE-MARKER" not in result
+    runner._resolve_session_agent_runtime_async.assert_not_awaited()
 
     typed_ref = MessageEvent(text=f"read @file:{payload.name}", source=source, reply_to_message_id="7", reply_to_text="short")
     result = await runner._prepare_inbound_message_text(event=typed_ref, source=source, history=[])
     assert result.startswith('[Replying to: "short"]')
     assert "LOCAL-FILE-MARKER" in result
+    runner._resolve_session_agent_runtime_async.assert_awaited_once()
 
 
 @pytest.mark.asyncio

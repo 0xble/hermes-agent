@@ -342,7 +342,7 @@ class GatewayBusySessionMixin:
             return False
         except Exception:
             return _assume_active("session", session_key)
-        session_db = getattr(self, "_session_db", None)
+        session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
         if not session_id or session_db is None:
             return False
         raw_db = getattr(session_db, "_db", session_db)

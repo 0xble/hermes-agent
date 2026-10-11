@@ -544,12 +544,10 @@ class GatewayTopicThreadsMixin:
             from agent.topic_icons import resolve_override
             if resolve_override(topic_name, extra.get("topic_icon_overrides"), options):
                 return options, None
-            sync_db = self._sync_session_db()
-
             def _pick() -> Optional[str]:
                 from agent.aux_accounting import set_accounting_context
                 from agent.title_generator import pick_topic_icon
-                set_accounting_context(sync_db, session_id)
+                set_accounting_context(self._sync_session_db(), session_id)
                 return pick_topic_icon(topic_name, options, instructions=str(extra.get("topic_icon_instructions") or ""),
                                        timeout=_EXPLICIT_TITLE_ICON_TIMEOUT_S)
             # call_llm's timeout bounds each provider attempt, not retries or fallbacks; cap the whole pick.
@@ -661,11 +659,10 @@ class GatewayTopicThreadsMixin:
         icon_state_to_record = None
         icon_history_to_record = None
         icon_state_owner = "auto"
-        session_db = getattr(self, "_session_db", None)
-        sync_session_db = self._sync_session_db() if session_db is not None else None
         extra = self._telegram_platform_extra(source)
         if not is_truthy_value(extra.get("auto_topic_icons")):
             return None, None, None, icon_state_owner
+        sync_session_db = await asyncio.to_thread(self._sync_session_db)
         try:
             if options is None:
                 options = await adapter.get_forum_topic_icon_options()
@@ -734,7 +731,7 @@ class GatewayTopicThreadsMixin:
     async def _persist_telegram_topic_icon_records(
         self, source: SessionSource, state_record, history_record, owner: str,
     ) -> None:
-        sync_session_db = self._sync_session_db()
+        sync_session_db = await asyncio.to_thread(self._sync_session_db)
         if not (state_record and sync_session_db):
             return
         custom_id, emoji, profile_name = state_record
@@ -803,7 +800,7 @@ class GatewayTopicThreadsMixin:
                 operator_topic = None
             if isinstance(operator_topic, dict):
                 return
-        session_db = getattr(self, "_session_db", None)
+        session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
         if session_db is not None:
             try:
                 binding = await session_db.get_telegram_topic_binding(
