@@ -49,7 +49,13 @@ def _guarded(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
 
 
 def drain(timeout: float = 5.0) -> None:
-    """Wait for queued recordings (tests and live probes; the worker is FIFO)."""
+    """Wait for queued recordings (tests and live probes; the worker is FIFO).
+
+    With no worker yet nothing is queued, so this returns without starting one.
+    """
+    with _executor_lock:
+        if _executor is None:
+            return
     future = _submit(lambda: None)
     if future is not None:
         future.result(timeout=timeout)
