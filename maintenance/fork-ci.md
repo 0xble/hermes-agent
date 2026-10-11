@@ -290,6 +290,27 @@ worker in its suite, or when pytest copies `loggerDict` before iterating it.
 
 ## Verification and retirement
 
+The host-installation tripwire also protects the captured account's `.local/bin`
+and `Library/LaunchAgents` from Python writes, removals and link publication.
+Reads remain available for command and service discovery. Script/installer tests
+own a temporary machine home through `HOME`, `Path.home()` and the current-UID
+`pwd` lookup, and their ordinary subprocesses inherit that home. Ordinary tests
+retain stable HOME semantics from upstream commit `ea8adb5e222d`; this is not a
+sandbox for native children that discard the fixture environment.
+
+Two disposable regressions were red on `cc277b4e2ffe`: host-installation paths
+were mutable, and installer subprocess destinations used the operator's home.
+Run `scripts/run_tests.sh tests/hermes_cli/test_real_home_tripwire.py
+tests/scripts/test_installer_home_isolation.py` for the boundary, then the full
+`tests/scripts` subsystem. Related upstream [PR #111453](https://github.com/NousResearch/hermes-agent/pull/111453)
+isolates individual host-service leaks, and [PR #76464](https://github.com/NousResearch/hermes-agent/pull/76464)
+skips legacy Node link publication during recovery. Both are merged, but neither
+replaces this shared write boundary. No new upstream contribution is claimed.
+Retire this adaptation when the accepted upstream release protects those
+destinations and installer machine homes through equivalent executable coverage.
+Rollback removes the added host-directory registry, restores the guard's app-only
+write callback, and removes the installer-home fixture and its regression.
+
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
 adds real-process Kanban and tenancy fixtures. Their OS home is separate from
 their explicit Hermes home so native service discovery assigns a unique profile

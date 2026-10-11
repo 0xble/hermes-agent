@@ -1504,6 +1504,21 @@ _REAL_INSTALLED_GUI_APPS = sorted({
     os.path.normcase(form) for app in packaged_gui_app_paths() if os.path.lexists(app)
     for form in (os.path.abspath(app), os.path.realpath(app))})
 
+# Installer destinations are account-scoped, outside HERMES_HOME. Capture both HOME and
+# the native account home before fixtures replace either, including currently absent dirs.
+_HOST_ACCOUNT_HOMES = {Path.home()}
+try:
+    import pwd
+    _HOST_ACCOUNT_HOMES.add(Path(pwd.getpwuid(os.getuid()).pw_dir))  # windows-footgun: ok — optional POSIX lookup after import pwd
+except (ImportError, KeyError, OSError):
+    pass
+_REAL_HOST_INSTALL_DIRS = sorted({
+    os.path.normcase(form)
+    for home in _HOST_ACCOUNT_HOMES
+    for directory in (home / ".local" / "bin", home / "Library" / "LaunchAgents")
+    for form in (os.path.abspath(directory), os.path.realpath(directory))
+})
+
 
 @pytest.fixture(autouse=True)
 def _forbid_real_hermes_home_io(monkeypatch, request):
@@ -1516,7 +1531,10 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: {
+        "installed Hermes desktop app": _REAL_INSTALLED_GUI_APPS,
+        "host installation directory": _REAL_HOST_INSTALL_DIRS,
+    }).install(monkeypatch)
 
 
 @pytest.fixture
