@@ -441,17 +441,44 @@ def test_agent_close_deletes_an_ephemeral_owned_tab_left_open(camofox):
     assert deleted == [f"/tabs/{tab}"]
 
 
+@pytest.mark.parametrize("status,code", [(410, "page_crashed"), (404, "browser_restarted")])
+def test_stale_error_keeps_durable_quarantine_across_restart(camofox, status, code):
+    cf = camofox.cf
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
+    session = cf._sessions["chat"]
+    tab = session["tab_id"]
+    cf.quarantine_current_protected_tab("chat")
+    response = requests.Response()
+    response.status_code = status
+    response._content = json.dumps({"code": code}).encode()
+    assert cf._clear_stale_tab(session, requests.HTTPError("stale", response=response))
+    assert tab in cf._protected_tabs_on_disk()
+
+    # Model a fresh process: only disk quarantine survives, while the server still lists it.
+    cf._sessions.clear()
+    cf._stale_tab_ids.clear()
+    cf._protected_tab_ids.clear()
+    cf._protected_tab_owners.clear()
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "fresh")["success"]
+    assert cf._sessions["fresh"]["tab_id"] != tab
+    assert tab in cf._protected_tabs_on_disk()
+
+
 def test_stale_tab_record_is_pruned_once_the_server_forgets_the_tab(camofox):
     cf = camofox.cf
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     tab = cf._sessions["chat"]["tab_id"]
     user_id = _user_id(cf, "chat")
+    cf.quarantine_current_protected_tab("chat")
     camofox.server.gone.add(tab)
     assert not _dispatch("browser_snapshot", {}, "chat")["success"]
     assert cf._stale_tab_ids[user_id] == {tab}
+    assert tab in cf._protected_tabs_on_disk()
     camofox.server.tabs[user_id] = [t for t in camofox.server.tabs[user_id] if t["tabId"] != tab]
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "chat")["success"]
     assert user_id not in cf._stale_tab_ids
+    assert tab not in cf._protected_tabs_on_disk()
+    assert tab not in cf._protected_tab_ids
 
 
 def test_turns_without_a_task_id_keep_the_tab(camofox):
@@ -691,7 +718,7 @@ def test_agent_abandons_failed_delete_records_and_leases(camofox, protected):
         assert tab in cf._protected_tabs_on_disk()  # abandonment must not permit reads
 
 
-def test_confirmed_stale_owned_tab_releases_record_protection_and_lease(camofox):
+def test_stale_owned_tab_releases_record_and_lease_but_retains_quarantine(camofox):
     from tools import browser_camofox_leases as leases
     cf = camofox.cf
     assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "owner")["success"]
@@ -700,7 +727,8 @@ def test_confirmed_stale_owned_tab_releases_record_protection_and_lease(camofox)
     camofox.server.gone.add(tab)
     assert not _dispatch("browser_snapshot", {}, "owner")["success"]
     assert not any(key[3] == tab for key in cf._owned_tabs)
-    assert tab not in cf._protected_tabs_on_disk()
+    assert tab in cf._protected_tabs_on_disk()
+    assert tab not in cf._protected_tab_owners
     assert (camofox.server.url, user_id, tab) not in leases._handles
 
 

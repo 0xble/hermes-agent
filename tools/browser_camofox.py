@@ -87,12 +87,13 @@ def _clear_stale_tab(session: Dict[str, Any], exc: BaseException, *, endpoint: s
             if session.get("tab_id") == tab_id:
                 _stale_tab_ids.setdefault(session["user_id"], set()).add(tab_id)
                 session["tab_id"] = None
-                # A confirmed destroyed tab no longer needs retry ownership or quarantine.
+                # Stale errors detach ownership, but crashes/restarts can leave the tab
+                # listed. Keep durable quarantine until listing absence or successful DELETE.
                 for key, record in list(_owned_tabs.items()):
                     if (key[0] == hermes_home_key() and key[2:] == (get_camofox_url(), tab_id)
                             and record["user_id"] == session["user_id"]):
                         _owned_tabs.pop(key, None)
-                _clear_tab_protection(tab_id)
+                _protected_tab_owners.pop(tab_id, None)
                 _release_unused_tab_lease(tab_id, session["user_id"])
     from agent.redact import clear_vault_date_components
     clear_vault_date_components(session.get("task_id", "default"))
@@ -446,7 +447,10 @@ def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = Non
         if session.get("tab_id") or _sessions.get(task_id, session) is not session:
             return session  # bound meanwhile, or replaced (account switch / release)
         listed = {tab.get("tabId") for tab in tabs if isinstance(tab, dict)}
-        stale = _stale_tab_ids.pop(session["user_id"], set()) & listed
+        previous_stale = _stale_tab_ids.pop(session["user_id"], set())
+        for tab_id in previous_stale - listed:
+            _clear_tab_protection(tab_id)
+        stale = previous_stale & listed
         if stale:
             _stale_tab_ids[session["user_id"]] = stale
         refused = _protected_tab_ids | quarantined | stale | {

@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Any
 
 _lock = threading.RLock()
@@ -23,11 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 def _lease_root() -> Path:
-    if os.environ.get("HERMES_HOME", "").strip():
-        # Process-level state follows the same convention as gateway lifecycle state;
-        # task-local profile overrides must not move a process's lease coordinator.
-        from hermes_constants import get_process_hermes_home
-        return get_process_hermes_home() / "state" / "camofox-tab-leases"
+    # Gateways, CLIs and profiles can share one Camofox identity, so neither
+    # process HERMES_HOME nor task-local profile scope may move the coordinator.
     return Path.home() / ".local" / "state" / "hermes" / "camofox-tab-leases"
 
 
@@ -75,6 +73,10 @@ def _prune_idle_files(root: Path) -> None:
             if len(path.name) != 64 or any(c not in "0123456789abcdef" for c in path.name):
                 continue
             try:
+                # Avoid briefly stealing a fresh tab's lease from a nonblocking claimant.
+                # Age only defers pruning; the exclusive lock still authorizes removal.
+                if time.time() - path.stat(follow_symlinks=False).st_mtime < 600:
+                    continue
                 fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
                 with os.fdopen(fd, "r+b") as handle:
                     if _try_lock(handle):

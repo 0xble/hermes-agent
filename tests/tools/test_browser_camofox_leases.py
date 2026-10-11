@@ -5,7 +5,7 @@ import os
 import pytest
 
 
-def test_lease_root_follows_explicit_process_home_and_preserves_default(tmp_path, monkeypatch):
+def test_lease_root_is_host_wide_across_process_and_profile_homes(tmp_path, monkeypatch):
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from tools import browser_camofox_leases as leases
     import runpy
@@ -15,13 +15,29 @@ def test_lease_root_follows_explicit_process_home_and_preserves_default(tmp_path
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setattr(leases.Path, "home", lambda: tmp_path)
     assert lease_root() == tmp_path / ".local/state/hermes/camofox-tab-leases"
-    monkeypatch.setenv("LEASE_TEST_ROOT", str(tmp_path))
-    monkeypatch.setenv("HERMES_HOME", "$LEASE_TEST_ROOT/process")
-    token = set_hermes_home_override(tmp_path / "task-profile")
-    try:
-        assert lease_root() == tmp_path / "process/state/camofox-tab-leases"
-    finally:
-        reset_hermes_home_override(token)
+    for process_home in (tmp_path / "process", tmp_path / "process/profiles/other"):
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        assert lease_root() == tmp_path / ".local/state/hermes/camofox-tab-leases"
+        token = set_hermes_home_override(tmp_path / "task-profile")
+        try:
+            assert lease_root() == tmp_path / ".local/state/hermes/camofox-tab-leases"
+        finally:
+            reset_hermes_home_override(token)
+
+
+def test_pruning_does_not_lock_recent_lease_files(tmp_path, monkeypatch):
+    from tools import browser_camofox_leases as leases
+
+    path = tmp_path / ("a" * 64)
+    path.touch()
+    monkeypatch.setattr(leases, "_pruned", False)
+
+    def unexpected_lock(_handle):
+        pytest.fail("pruning must not briefly lock a recently created tab lease")
+
+    monkeypatch.setattr(leases, "_try_lock", unexpected_lock)
+    leases._prune_idle_files(tmp_path)
+    assert path.exists()
 
 
 def test_first_claim_prunes_only_unlocked_residue_once(tmp_path, monkeypatch):
@@ -33,7 +49,9 @@ def test_first_claim_prunes_only_unlocked_residue_once(tmp_path, monkeypatch):
     idle = leases._lease_path(("server", "user", "idle"))
     held = leases._lease_path(("server", "user", "held"))
     idle.touch()
+    os.utime(idle, (1, 1))
     with open(held, "w+b") as holder:
+        os.utime(held, (1, 1))
         assert leases._try_lock(holder)
         assert leases.claim("server", "user", "first")
         try:
@@ -56,6 +74,7 @@ def test_pruning_never_unlinks_a_replacement_inode(tmp_path, monkeypatch):
     monkeypatch.setattr(leases, "_pruned", False)
     path = leases._lease_path(("server", "user", "old"))
     path.touch()
+    os.utime(path, (1, 1))
     original_try_lock = leases._try_lock
     replacement = []
 
