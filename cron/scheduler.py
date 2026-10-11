@@ -4293,6 +4293,9 @@ def _maybe_run_worktree_maintenance() -> None:
     git. Same conservative pruner as ``hermes -w`` startup (dirty/unpushed/locked trees untouched).
     Errors never propagate: GC is hygiene, not scheduling."""
     global _last_worktree_maintenance_at
+    from hermes_cli.maintenance_window import deletion_window_open
+    if not deletion_window_open():
+        return  # outside maintenance.deletion_window: leave the throttle unspent for the window
     now = time.monotonic()
     with _worktree_maintenance_lock:
         if (

@@ -4761,8 +4761,9 @@ def _housekeeping_checkpoint_prune() -> None:
     auto_prune_from_config()
 
 
-# Hourly cap on orphan installs removed (each is tens of thousands of files): 240 a day, about twice
-# the peak rate agents delete worktrees, small enough that one pass cannot saturate a nearly full volume.
+# Cap per pass on orphan installs removed (each is tens of thousands of files). A pass every 5 minutes
+# of the 3-hour deletion window allows ~360 a night, above agents' peak of ~140 worktrees a day, while
+# one pass stays small enough not to saturate a nearly full volume.
 _INSTALL_ORPHAN_BATCH = 10
 _install_orphan_thread: Optional[threading.Thread] = None
 
@@ -4773,6 +4774,9 @@ def _housekeeping_install_orphans() -> None:
     publish collected them. On its own thread so a slow delete never stalls the heartbeat; a pass
     still running when the next is due is left to finish."""
     global _install_orphan_thread
+    from hermes_cli.maintenance_window import deletion_window_open
+    if not deletion_window_open():
+        return
     if _install_orphan_thread is not None and _install_orphan_thread.is_alive():
         return
 
@@ -4864,7 +4868,9 @@ def _start_gateway_housekeeping(
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim, False),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner), False),
         # First tick too (after the watch window): a gateway restarted more often than hourly still collects.
-        (60, "Install orphan collection", _housekeeping_install_orphans, True),
+        # Every 5 ticks so the nightly deletion window (maintenance.deletion_window) keeps up with
+        # agents' worktree churn; outside the window each tick is one cached config read.
+        (5, "Install orphan collection", _housekeeping_install_orphans, True),
         # Last: a real prune can hold this thread for a while; every other chore of the tick runs first.
         (1, "Checkpoint prune tick", _housekeeping_checkpoint_prune, False)]
 
