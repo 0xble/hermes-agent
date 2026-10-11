@@ -184,7 +184,7 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
         identity = (fd_stat.st_dev, fd_stat.st_ino)
         if not _identity_is_truly_unlinked(identity, watched_path):
             return False
-        # SQLite unlinks its checkpointed sidecars before closing their FDs.
+        # SQLite may unlink its checkpointed -shm sidecar before closing its FD.
         # A close or FD reuse during the path stat is no longer a live holder.
         target = os.readlink(fd_path)
         confirmed = os.stat(fd_path)
