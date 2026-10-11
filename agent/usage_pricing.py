@@ -414,6 +414,14 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=url, billing_mode="subscription_included")
+    if provider_name in {"custom", "local"} or provider_name.startswith("custom:"):
+        try:
+            from hermes_cli.config_providers import get_custom_provider_billing_mode
+            mode = get_custom_provider_billing_mode(url, provider_name)
+        except Exception:
+            mode = ""
+        if mode == "subscription_included":
+            return BillingRoute(provider=provider_name, model=model, base_url=url, billing_mode=mode)
     if provider_name == "openrouter" or host("openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=url, billing_mode="official_models_api")
     if provider_name == "nous" or host("inference-api.nousresearch.com"):
