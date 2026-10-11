@@ -1999,6 +1999,12 @@ def _deliver_standalone(
                 "Job '%s': not queueing ambiguous standalone timeout for %s",
                 job["id"], t.where,
             )
+            pending_copies = (copy_blocks or [])[delivered_copy_count + int(is_copy_block):]
+            pending_media = [] if payload_media else media_files
+            if pending_copies or pending_media:
+                _queue_for_live_reconnect(
+                    t, "", pending_media, delivery_errors, copy_blocks=pending_copies,
+                )
             return
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.

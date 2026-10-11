@@ -33,6 +33,10 @@ flood worker and profile/ledger schema remain in place.
 at the committed claim, resume clear, note admission, Bot API send, delivered
 write, and both sides of a refund commit; repeat cancellation and successor
 claims must not change settlement or cross profile ownership.
+`test_sweep_failure_preserves_pending_teardown_cancellation` covers a shielded
+sweep that raises after teardown cancellation: the original cancellation still
+propagates, while an uncancelled sweep failure retains its zero-result behavior.
+Both cases leave failed rows and sibling transports untouched.
 
 ## Rollback and retirement
 

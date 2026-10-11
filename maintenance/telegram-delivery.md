@@ -123,6 +123,10 @@ locally with `RetryAfter` for every path. The durable penalty is checked again a
 `budget.take()` returns: a flood recorded while a delivery waits for its slot must
 refuse it before the callback. Regression:
 `test_penalty_recorded_while_queued_is_rechecked_before_egress`.
+A post-slot penalty refusal conservatively retains its pacing reservation:
+`take()` has no reservation token/refund API, and rolling back shared `next_at`
+can erase later concurrent reservations. This may waste one slot, not a Bot API
+request; cancellation-safe slot refunds are outside this delivery-safety patch.
 Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
@@ -351,7 +355,11 @@ including the thread-fallback timeout, is ambiguous and must never be queued
 from an earlier reconnect-only live error: the Bot API call may still deliver.
 The typed local timeout verdict preserves the existing two-value result seam;
 `test_ambiguous_standalone_timeout_is_not_replayed` exercises both execution
-lanes. Contract borrowed from
+lanes. Only the ambiguous payload is excluded: later, never-attempted copy
+blocks retain failed ledger rows, and trailing media is passed through the
+existing attachment-loss reporting path. Attachments remain outside the text-only
+ledger. `test_timeout_preserves_only_unattempted_payloads` covers each payload
+position in a text/copy/copy/media delivery. Contract borrowed from
 [upstream PR #127188](https://github.com/NousResearch/hermes-agent/pull/127188),
 without its older scheduler or the unrelated retry-verdict changes.
 

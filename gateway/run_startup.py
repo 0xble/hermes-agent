@@ -781,6 +781,8 @@ class GatewayStartupMixin:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
             )
+            if settlement.cancelled:
+                raise asyncio.CancelledError()
             return 0
         sendable = []
         if claimed and not settlement.cancelled:

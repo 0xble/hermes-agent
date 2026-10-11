@@ -259,3 +259,46 @@ async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["default", "secondary"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_sweep_failure_preserves_pending_teardown_cancellation(monkeypatch, profile, cancelled):
+    import threading
+
+    primary, secondary = _adapter("default"), _adapter("secondary")
+    runner = _runner(primary, secondary)
+    _failed_row("waiting", profile)
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+
+    def failing_sweep(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise RuntimeError("ledger sweep unavailable")
+
+    monkeypatch.setattr(ledger, "sweep_failed_for_runtime", failing_sweep)
+    task = asyncio.create_task(
+        runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile=profile)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if cancelled:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+        release.set()
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        else:
+            assert await asyncio.wait_for(task, 10) == 0
+        assert _state("waiting") == ("failed", 0)
+        primary.send.assert_not_awaited()
+        secondary.send.assert_not_awaited()
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
