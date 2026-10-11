@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 if TYPE_CHECKING:
-    from cron.scheduler import _CancelEventLike
+    from cron.scheduler_cancel import _CancelEventLike
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
