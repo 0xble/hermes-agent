@@ -269,7 +269,6 @@ class Platform(Enum):
     SIGNAL = "signal"
     MATTERMOST = "mattermost"
     MATRIX = "matrix"
-    HOMEASSISTANT = "homeassistant"
     EMAIL = "email"
     SMS = "sms"
     DINGTALK = "dingtalk"

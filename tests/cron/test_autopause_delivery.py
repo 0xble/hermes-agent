@@ -137,7 +137,7 @@ def test_reclaimed_paused_owner_never_attempts_terminal_write(tmp_path, monkeypa
         claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
         assert isinstance(claimed, dict)
         jobs.pause_job(job["id"])
-        scheduler._record_fire_ownership_lost(job["id"], "stale-owner", "stale-execution")
+        scheduler._record_fire_ownership_lost(job, "stale-owner", "stale-execution")
         mark_run.assert_not_called()
         assert finish.call_args.kwargs["error"] == (
             "Fire claim ownership lost; stale result was discarded.")

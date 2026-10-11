@@ -60,6 +60,11 @@ runtime and request-override resolution in `tools/delegate_tool_config.py`.
 - `explicit_parent_reasoning` honors the marker only while it equals the live
   `reasoning_config`. A model switch or fallback that re-resolves from config
   therefore retires it, without every re-resolution path having to clear it.
+- A temporary `auxiliary.voice_chat` route restores `reasoning_config`,
+  `reasoning_override`, and `_pre_fallback_reasoning_override` as one session
+  state. A rejected voice route restores them immediately; a failed runtime
+  reinstatement still restores the picks while the existing fallback recovery
+  handles the route. Real fallback activation continues to retire a live marker.
 - Transports clamp the inherited level to what the child's route supports.
 - The live personal profile sets `inherit_service_tier: true` and
   `reasoning_effort: medium`. Children therefore run at medium unless the user
@@ -93,7 +98,8 @@ Run:
 scripts/run_tests.sh tests/tools/test_delegate_service_tier_inheritance.py \
   tests/tools/test_delegate_explicit_inheritance.py \
   tests/gateway/test_running_agent_session_toggles.py \
-  tests/hermes_cli/test_fast_mode_custom_provider_opt_in.py
+  tests/hermes_cli/test_fast_mode_custom_provider_opt_in.py \
+  tests/agent/test_voice_turn_route.py
 ```
 
 These cover:
@@ -106,7 +112,9 @@ These cover:
 - the reasoning precedence table, including stale markers and an explicit
   `none`,
 - surface marking and reset,
-- the custom-provider opt-in, its transport scope, and shared-URL closure.
+- the custom-provider opt-in, its transport scope, and shared-URL closure,
+- both reasoning markers across accepted, rejected, and failed-to-restore voice
+  routes, using production begin/end helpers and loopback providers.
 
 ## Retirement and rollback
 

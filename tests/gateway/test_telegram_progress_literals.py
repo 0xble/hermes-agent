@@ -164,6 +164,7 @@ def test_telegram_literal_uses_a_longer_backtick_run_than_its_content(text, expe
 def test_markdownv2_keeps_single_backtick_code_and_real_fences_unchanged():
     adapter = _telegram()
     assert adapter.format_message("run `a_b` now") == "run `a_b` now"
+    assert adapter.format_message(adapter.format_progress_literal("a `b` c")) == "`a \\`b\\` c`"
     fenced = "```\nx = ``y``\n```"
     assert adapter.format_message(fenced) == "```\nx = \\`\\`y\\`\\`\n```"
 

@@ -42,7 +42,12 @@ scheduler lookup failures must not break these read-only responses.
 Verification must include `tests/cron/test_fire_claim_lost_after_delivery.py` and
 `tests/cron/test_inflight_cancellation.py`; a passing exact-SHA gate alone does not
 prove these paths ran. The bounded integration check is
-`bash ./scripts/run_tests.sh tests/cron tests/tools/test_cronjob_tools.py -j1 -q -p no:xdist`.
+`bash ./scripts/run_tests.sh tests/cron tests/tools/test_cronjob_tools.py -j1 -q`.
+The v0.21.6 integration retains registration-owner fencing and late-future attachment,
+per-profile restart-wait accounting, unstarted execution settlement, and retry
+`ladder_rung` accounting. Cancellation controls register and release inside the same
+owner-fenced critical sections; cancellation does not spend another retry occurrence.
+`tests/cron/test_cancellation_registration_fencing.py` checks these combined boundaries.
 
 Terminal bookkeeping must first confirm ownership: stale and replacement owners
 never call `mark_job_run`, while a paused own claim is still released through its

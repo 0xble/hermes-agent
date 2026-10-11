@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 import hermes_cli.gateway as gateway
 import hermes_cli.update_cmd_fleet as fleet
 
@@ -133,3 +135,42 @@ def test_external_supervisor_probe_error_is_reported_and_fresh_pid_is_protected(
     output = capsys.readouterr().out
     assert "Could not determine external-supervisor ownership" in output
     assert str(supervised_pid) in output
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_resumed_gateway_is_excluded_from_manual_sweep(monkeypatch, tmp_path, mapped):
+    """A paused gateway already resumed on new code must not be stopped a second time."""
+    from hermes_cli import update_cmd_posix_pause
+
+    service_pid, resumed_pid, manual_pid, external_pid = 4101, 4102, 4103, 4104
+    candidates = [service_pid, resumed_pid, manual_pid, external_pid]
+    profile_processes = [SimpleNamespace(profile="external", path=tmp_path, pid=external_pid)]
+    if mapped:
+        profile_processes.append(SimpleNamespace(profile="default", path=tmp_path, pid=resumed_pid))
+    signals = _patch_sweep(
+        monkeypatch, candidates, profile_processes, external_pids={external_pid},
+    )
+    exclusions = []
+
+    def find_pids(*, exclude_pids, all_profiles):
+        assert all_profiles is True
+        exclusions.append(set(exclude_pids))
+        return [pid for pid in candidates if pid not in exclude_pids]
+
+    def find_profiles(*, exclude_pids):
+        exclusions.append(set(exclude_pids))
+        return [proc for proc in profile_processes if proc.pid not in exclude_pids]
+
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda all_profiles=False: {service_pid})
+    monkeypatch.setattr(gateway, "find_gateway_pids", find_pids)
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", find_profiles)
+    monkeypatch.setattr(update_cmd_posix_pause, "already_restarted", lambda: {"pids": {resumed_pid}})
+    outcome = _outcome([resumed_pid, manual_pid])
+
+    fleet._restart_manual_gateways(outcome, 45.0)
+
+    assert [pid for pid, _sig in signals] == [manual_pid]
+    assert outcome.killed_pids == {manual_pid}
+    assert outcome.stopped_unmapped_pids == {manual_pid}
+    assert outcome.externally_supervised_profiles == []
+    assert exclusions == [{service_pid, resumed_pid}] * 2

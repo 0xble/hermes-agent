@@ -14,8 +14,8 @@ from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
 from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
 from tools.mcp_tool_lifecycle import (
-    _filter_mcp_children, _orphan_stdio_pid_servers, _orphan_stdio_pids,
-    _stdio_pgids, _stdio_processes, _stdio_sessions, _stdio_pids,
+    _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids,
+    _stdio_pgids, _stdio_processes, _stdio_sessions, _stdio_pids, _stdio_starttimes,
 )
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
@@ -290,6 +290,7 @@ class MCPServerTransportMixin:
         captured while alive (getpgid fails after exit; the sweep needs them for reparented descendants)."""
         new_pgids: Dict[int, int] = {}
         new_sessions: Dict[int, int] = {}
+        new_starts: Dict[int, int] = {}
         _lifecycle._remember_mcp_processes(new_pids)
         for pid in new_pids:
             try:
@@ -304,10 +305,16 @@ class MCPServerTransportMixin:
                 new_pgids[pid] = pid
             except (AttributeError, OSError):  # Windows (os.getpgid is POSIX-only)
                 pass
+            # Record the leader's start time so a later sweep can detect PID/PGID
+            # recycling before signalling (see _stdio_starttimes, #43044).
+            start = _leader_start_time(pid)
+            if start is not None:
+                new_starts[pid] = start
         with _core._lock:
             _stdio_pids.update(dict.fromkeys(new_pids, self.name))
             _stdio_pgids.update(new_pgids)
             _stdio_sessions.update(new_sessions)
+            _stdio_starttimes.update(new_starts)
         # Machine spawn ledger (startup sweeps reap orphans after an unclean exit); best-effort.
         for _pid in new_pids:
             try:
@@ -358,6 +365,7 @@ class MCPServerTransportMixin:
                     _lifecycle._stdio_processes.pop(pid, None)
                     dropped = _stdio_pgids.pop(pid, None)
                     _stdio_sessions.pop(pid, None)
+                    _stdio_starttimes.pop(pid, None)
                     if dropped is not None:
                         released_pgids.append(dropped)
         # Do not unregister a recorded POSIX group merely because its current

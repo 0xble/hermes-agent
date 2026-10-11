@@ -198,7 +198,7 @@ def test_cancelled_completion_never_clears_replacement_claim(isolated_store):
     owner = claimed["fire_claim"]["by"]
     jobs.update_job(job["id"], {"fire_claim": {"by": "replacement",
                                              "at": jobs._hermes_now().isoformat()}})
-    scheduler._record_fire_ownership_lost(job["id"], owner, "missing-execution")
+    scheduler._record_fire_ownership_lost(job, owner, "missing-execution")
     assert jobs.get_job(job["id"])["fire_claim"]["by"] == "replacement"
     from cron.scheduler_control import release_unstarted_claim
     release_unstarted_claim(claimed)

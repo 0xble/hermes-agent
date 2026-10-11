@@ -2,8 +2,6 @@
 
 
 
-
-
 [project]
 name = "hermes-agent"
 version = "0.0.0"
@@ -343,7 +341,6 @@ wake = [
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
-honcho = ["honcho-ai==2.2.0"]
 # Platform sub-extras / alias extras — declared so pm.extras.ANCHORS names
 # only real extras (contract: tests/pm/test_extras.py). Each is
 # lazy-installed at first use via pm.ensure_import(name) and therefore
@@ -385,15 +382,8 @@ google-chat = [
 # can re-sync exactly the pin from core.
 doc-extract = ["firecrawl-anydoc==0.2.4"]
 trace-upload = ["huggingface-hub==1.24.0"]
-# Cloud memory providers are opt-in PM extras. They stay outside [all],
-# like honcho, so a quarantined release cannot break fresh installs.
-supermemory = ["supermemory==3.50.0"]
-# mem0ai pulls qdrant-client → grpcio, which has no win_arm64 wheel — same
-# win32-arm64 gate as google-chat. mem0 is lazy-installed, so on arm64 the
-# provider is simply unavailable.
-mem0 = [
-  "mem0ai==2.0.10; platform_machine != 'ARM64' or sys_platform != 'win32'",
-]
+# Cloud memory providers are opt-in PM extras. They stay outside [all]
+# so a quarantined release cannot break fresh installs.
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list above) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
@@ -428,7 +418,6 @@ mcp = [
 # Backwards-compatible no-op alias. Relay is a core dependency on supported
 # wheel targets and intentionally unavailable on other platforms.
 nemo-relay = []
-homeassistant = ["aiohttp==3.14.3"]
 sms = ["aiohttp==3.14.3"]
 teams = [
   "microsoft-teams-apps==2.0.13.4",
@@ -468,17 +457,15 @@ termux = [
   "python-telegram-bot[webhooks]==22.8",
   "hermes-agent[cron]",
   "hermes-agent[mcp]",
-  "hermes-agent[honcho]",
   "hermes-agent[acp]",
 ]
 termux-all = [
   # Best-effort "install all" profile for Termux. Same policy as [all]:
   # only includes extras that are not prepared on demand by PM.
-  # Backends like telegram/slack/dingtalk/feishu/honcho lazy-install at
+  # Backends like telegram/slack/dingtalk/feishu lazy-install at
   # first use, so they're no longer eager-installed here.
   "hermes-agent[termux]",
   "hermes-agent[google]",
-  "hermes-agent[homeassistant]",
   "hermes-agent[sms]",
   "hermes-agent[web]",
   "hermes-agent[pty]",
@@ -549,7 +536,6 @@ all = [
   "hermes-agent[pty]",
   "hermes-agent[mcp]",
   "hermes-agent[uvloop]",
-  "hermes-agent[homeassistant]",
   "hermes-agent[sms]",
   "hermes-agent[acp]",
   "hermes-agent[google]",
@@ -614,8 +600,6 @@ opt-in-extras = ["kittentts", "documents"]
 matrix = "sys_platform == 'linux'"
 # grpcio (via google-cloud-pubsub) has no win_arm64 wheel.
 google-chat = "platform_machine != 'ARM64' or sys_platform != 'win32'"
-# qdrant-client → grpcio (via mem0ai) has no win_arm64 wheel.
-mem0 = "platform_machine != 'ARM64' or sys_platform != 'win32'"
 # pymupdf has no win_arm64 or android wheel (sdist builds MuPDF from C). Termux
 # reports sys_platform 'linux' on a Bionic libc that no manylinux wheel fits,
 # so the Android kernel release guard used for nemo-relay applies too.
@@ -762,7 +746,6 @@ google-auth-httplib2 = false
 google-auth-oauthlib = false
 google-cloud-pubsub = false
 h2 = false
-honcho-ai = false
 httplib2 = false
 httpx = false
 httpx2 = false
@@ -776,7 +759,6 @@ matplotlib = false
 maturin = false
 mautrix = false
 mcp = false
-mem0ai = false
 microsoft-teams-apps = false
 mistralai = false
 modal = false
@@ -832,7 +814,6 @@ snowballstemmer = false
 sounddevice = false
 soundfile = "2026-06-06T08:58:48Z"
 starlette = false
-supermemory = false
 tenacity = false
 ty = false
 tzdata = false

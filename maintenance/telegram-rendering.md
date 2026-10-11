@@ -166,7 +166,10 @@ tappable, and Discord/Slack keep their own `format_tool_preview` overrides.
   `_progress_code_span` (CommonMark code span whose backtick run is longer than
   any run inside, space-padded when the text starts or ends with a backtick).
   `format_message` converts multi-backtick spans to MarkdownV2 single-backtick
-  code with `` ` `` and `\` escaped, and its bracket safety net skips escaped
+  code with `` ` `` and `\` escaped. The inline and fenced passes share
+  `_MDV2_FENCE_RE` (the v0.21.6 fence matcher), preserving every backtick inside
+  list-nested and lead-in-prose fences and closing only on an own-line fence.
+  Its bracket safety net skips escaped
   backticks inside a span. `_RICH_PROTECTED_REGION_RE` opens a fence only at
   line start with a backtick-free info string, so an inline triple-backtick
   span no longer swallows the lines up to a later terminal fence.
@@ -215,7 +218,7 @@ with other work, remove `format_progress_literal` and `_BARE_HTTP_URL_RE` from
 `get_tool_emoji` and raw `tool_name`/preview/args in `_progress_build_message`,
 delete `progress_tool_label`, and in the Telegram adapter delete
 `format_progress_literal`, `_progress_code_span`, `_MULTI_TICK_CODE_SPAN_RE`,
-`_LINE_START_FENCE_RE`, `_BACKTICK_RUN_RE`, the step-1a block in
+`_BACKTICK_RUN_RE`, the step-1a block in
 `format_message`, the bracket-split regex change, and the line-start fence
 anchor in `_RICH_PROTECTED_REGION_RE`. Delete the focused test file. No state,
 schema, or configuration migration.
