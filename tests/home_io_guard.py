@@ -48,12 +48,11 @@ def _contains(path: str, prefix: str) -> bool:
 
 
 class HomeIOGuard:
-    def __init__(self, roots, installed_apps=lambda: ()):
+    def __init__(self, roots, protected_writes=lambda: {}):
         self.roots = roots
-        # The machine's installed desktop app (``packaged_gui_app_paths()`` before any test ran):
-        # deleting, replacing or writing into it is refused. Reads stay allowed: several update
-        # paths only probe it.
-        self.installed_apps = installed_apps
+        # Captured host installation paths, grouped by their diagnostic description.
+        # Probes stay allowed, but tests may never publish or remove host tools/services.
+        self.protected_writes = protected_writes
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
@@ -90,7 +89,7 @@ class HomeIOGuard:
             # which is not I/O against the home.
             if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
                 return
-            resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
+            resolved = self._refuse_protected_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
             # Resolving the root itself (get_default_hermes_root's relative_to
             # probe) reads no state; only its contents are guarded.
@@ -129,20 +128,22 @@ class HomeIOGuard:
         finally:
             self.checking.active = False
 
-    def _refuse_installed_app_change(self, value, absolute):
-        """Fail on a change to an installed app (already normalized, literal and resolved);
+    def _refuse_protected_change(self, value, absolute):
+        """Fail on a change to a captured host installation path, literal or resolved;
         returns the resolved path so check() does not resolve it again, or None."""
-        apps = self.installed_apps()
-        if not apps:
+        groups = self.protected_writes()
+        if not groups:
             return None
         resolved = _normcase(os.path.realpath(absolute))
-        for app in apps:
-            if _within(absolute, app) or _within(resolved, app):
-                import pytest  # noqa: PLC0415
-                # pytest.fail, not AssertionError: removal helpers catch Exception and would log
-                # the refusal as a warning while the test passed.
-                pytest.fail(f"TEST BUG: changing the REAL installed Hermes desktop app: {value}\n"
-                            "Stub hermes_cli.gui_uninstall.packaged_gui_app_paths to a temporary path.")
+        for description, paths in groups.items():
+            for path in paths:
+                prefix = _normcase(os.fspath(path))
+                if _within(absolute, prefix) or _within(resolved, prefix):
+                    import pytest  # noqa: PLC0415
+                    # pytest.fail, not AssertionError: removal helpers catch Exception and would log
+                    # the refusal as a warning while the test passed.
+                    pytest.fail(f"TEST BUG: changing the REAL {description}: {value}\n"
+                                "Point the installer/service fixture at a temporary path.")
         return resolved
 
     @staticmethod
@@ -187,11 +188,29 @@ class HomeIOGuard:
         for module in (builtins, io):
             wrap(module, "open", (("file", None),), destructive=open_writes)
         for name in ("mkdir", "unlink", "remove", "rmdir", "chmod", "utime"):
-            wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir")
+            wrap(os, name, (("path", "dir_fd"),), destructive=True)
         for name in ("stat", "lstat", "readlink", "access"):
             wrap(os, name, (("path", "dir_fd"),), metadata=True)
         for name in ("makedirs", "listdir", "scandir"):
-            wrap(os, name, (("name" if name == "makedirs" else "path", None),))
+            wrap(os, name, (("name" if name == "makedirs" else "path", None),),
+                 destructive=name == "makedirs")
+        # A symlink's src is link text, not a path being accessed. Guard the destination,
+        # including links to interpreter binaries that otherwise receive the read exemption.
+        for name in ("symlink", "link"):
+            original = getattr(os, name)
+
+            def guarded_link(*args, _original=original, _hardlink=name == "link", **kwargs):
+                if _hardlink:
+                    # A hardlink aliases the source inode, allowing later temporary-path
+                    # writes to mutate it. Reading a host tool is allowed, aliasing it is not.
+                    source = args[0] if args else kwargs.get("src")
+                    self.check(source, dir_fd=kwargs.get("src_dir_fd"), destructive=True)
+                destination = args[1] if len(args) > 1 else kwargs.get("dst")
+                self.check(destination, dir_fd=kwargs.get("dst_dir_fd", kwargs.get("dir_fd")),
+                           destructive=True)
+                return _original(*args, **kwargs)
+
+            monkeypatch.setattr(os, name, guarded_link)
         for name in ("rename", "replace"):
             wrap(os, name, (("src", "src_dir_fd"), ("dst", "dst_dir_fd")), destructive=True)
         wrap(shutil, "rmtree", (("path", "dir_fd"),), destructive=True)
