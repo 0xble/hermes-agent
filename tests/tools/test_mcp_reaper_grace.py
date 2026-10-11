@@ -18,11 +18,11 @@ from tools import mcp_tool_transport as transport
 @pytest.fixture(autouse=True)
 def isolated_ledger(monkeypatch):
     for name, value in (("_stdio_pids", {}), ("_stdio_pgids", {}), ("_stdio_sessions", {}),
+                        ("_stdio_processes", {}),
                         ("_orphan_stdio_pids", set()), ("_orphan_stdio_pid_servers", {})):
         monkeypatch.setattr(lifecycle, name, value)
         if hasattr(transport, name):
             monkeypatch.setattr(transport, name, value)
-    monkeypatch.setattr(lifecycle, "_stdio_processes", {}, raising=False)
     monkeypatch.setattr("tools.mcp_tool._update_death_supervisor", lambda *args: None)
 
 
