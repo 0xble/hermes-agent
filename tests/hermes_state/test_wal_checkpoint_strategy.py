@@ -246,3 +246,38 @@ class TestCheckpointFrequency:
         assert call_count[0] == 1, (
             f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
         )
+
+
+class TestFtsMergeOffTheWriterLock:
+    def test_writers_proceed_while_a_slow_fts_merge_runs(self, db, monkeypatch):
+        """Each incremental FTS merge command commits on its own (synchronous=FULL). Under the
+        writer lock a pass stalled every writer for seconds (2026-10-11 11:39: 19 turns and 48
+        writers queued behind _merge_fts_incrementally)."""
+        import threading
+
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowMerge(TrackingConnection):
+            def execute(self, sql, *args, **kwargs):
+                if "'merge'" in sql and threading.current_thread().name == "slow-merge":
+                    entered.set()
+                    assert release.wait(10), "merge never released"
+                return super().execute(sql, *args, **kwargs)
+
+        open_conn = db._open_writer_conn
+        monkeypatch.setattr(db, "_open_writer_conn", lambda: SlowMerge(open_conn()))
+        monkeypatch.setattr(db, "_conn", SlowMerge(db._conn))  # wherever it runs, it is slow
+        db.create_session(session_id="s1", source="cli")
+        db.append_message(session_id="s1", role="user", content="merge me")
+        merger = threading.Thread(target=db._try_incremental_merge_fts, name="slow-merge")
+        merger.start()
+        try:
+            assert entered.wait(10), "merge never started"
+            writer = threading.Thread(target=db.set_meta, args=("probe", "1"))
+            writer.start()
+            writer.join(3)
+            assert not writer.is_alive(), "a write waited on the incremental FTS merge"
+        finally:
+            release.set()
+            merger.join(10)
+        assert db.get_meta("probe") == "1"

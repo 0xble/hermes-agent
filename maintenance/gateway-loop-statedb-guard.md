@@ -22,7 +22,10 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   (one at a time). With `checkpoint_fullfsync` on macOS it waits for the whole device's dirty
   data; under the writer lock that stalled every writer (2026-10-11 10:36: 20 turns and 41
   threads queued behind one checkpoint). The connection is closed under the WAL lock guard in
-  `close()`, before the writer, and pinned beside a retired writer.
+  `close()`, before the writer, and pinned beside a retired writer. The periodic incremental FTS
+  merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
+  maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
+  behind it); usermerge floor and bounded pages unchanged.
 - A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
   with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
@@ -49,7 +52,8 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
-`test_writers_proceed_while_a_slow_checkpoint_runs` in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
+`test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
+in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
 `tests/hermes_state/test_gateway_routing_replace_diff.py`, and
 `test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 

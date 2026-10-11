@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error
+from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error
 from hermes_state_common import (
     FTS_CJK_STALE_KEY, FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,
     FTS_TRIGRAM_EXCLUDED_SOURCES, FTS_TRIGRAM_SQL,
@@ -222,8 +222,9 @@ class SessionSearchMixin:
             # The canonical write is already committed before this cadence runs. No maintenance failure —
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
             # scrambling — may escape and make the caller replay an ambiguous, possibly-durable write
-            # (#90734, #85079).
-            logger.warning("FTS incremental merge failed after commit: %s", exc)
+            # (#90734, #85079). A busy database just defers the pass to the next cadence boundary.
+            (logger.debug if is_sqlite_lock_error(exc) else logger.warning)(
+                "FTS incremental merge failed after commit: %s", exc)
 
     # ── Deferred rebuild engine (base + CJK backfills) ─────────────────────
 
@@ -1259,11 +1260,12 @@ class SessionSearchMixin:
 
     # ── FTS maintenance commands ───────────────────────────────────────────
 
-    def _fts_table_exists(self, name: str) -> bool:
+    def _fts_table_exists(self, name: str, *, conn=None) -> bool:
         """True if an FTS5 virtual table is queryable ("no such table" and "vtable
-        constructor failed" — missing tokenizer / mid-teardown — both count as not)."""
+        constructor failed" — missing tokenizer / mid-teardown — both count as not).
+        *conn* defaults to the writer connection (caller holds ``self._lock``)."""
         try:
-            self._conn.execute(f"SELECT 1 FROM {name} LIMIT 0")
+            (self._conn if conn is None else conn).execute(f"SELECT 1 FROM {name} LIMIT 0")
             return True
         except sqlite3.DatabaseError:
             return False
@@ -1354,15 +1356,21 @@ class SessionSearchMixin:
             max_commands = self._FTS_MERGE_COMMANDS_PER_PASS
         _positive_int("max_commands", max_commands)
         executed = 0
-        with self._lock:
-            for tbl in self._present_fts_tables():
+        # On the maintenance connection, NOT under self._lock: each command commits on its own
+        # (synchronous=FULL), and holding the in-process writer lock across a whole pass stalled every
+        # writer for seconds on a busy disk (2026-10-11 11:39: 19 turns, 48 writers queued). SQLite's
+        # own write lock still serializes each command against every other writer.
+        with self._maintenance_conn() as conn:
+            if conn is None:
+                return 0
+            for tbl in [t for t in self._FTS_TABLES if self._fts_table_exists(t, conn=conn)]:
                 if not self._fts_usermerge_floor_applied:
-                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
+                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
                 for _ in range(max_commands):
-                    before = self._conn.total_changes
-                    self._conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
+                    before = conn.total_changes
+                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
                     executed += 1
-                    if self._conn.total_changes - before < 2:
+                    if conn.total_changes - before < 2:
                         break
             self._fts_usermerge_floor_applied = True
         return executed
