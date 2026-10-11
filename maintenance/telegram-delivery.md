@@ -119,7 +119,11 @@ media, controls, deletions, topic edits, reactions) wait FIFO and are never drop
 drafts are shed when no slot is free. Interim edits are skipped by the adapter inside the
 10.0s edit floor. The adapter pre-waits sends and final edits under the chat lock so pacing
 never eats a transport deadline. A request inside a durably recorded server penalty is refused
-locally with `RetryAfter` for every path. Any published `retry_after` widens that chat's gap
+locally with `RetryAfter` for every path. The durable penalty is checked again after
+`budget.take()` returns: a flood recorded while a delivery waits for its slot must
+refuse it before the callback. Regression:
+`test_penalty_recorded_while_queued_is_rechecked_before_egress`.
+Any published `retry_after` widens that chat's gap
 2x for 10 minutes from the next call, and is persisted and logged. The inline-wait cap is
 floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per request).
 `TelegramAdapter.PROGRESS_EDIT_INTERVAL` is 10.0s, the transport edit floor, and
@@ -315,9 +319,16 @@ rebuilds the adapter, a turn already in flight keeps the retired instance, whose
 `edit_message()`, `delete_message()` and `send_typing()` did not. Their refusal was
 not retryable, so the progress loop stopped editing and sent every later tool line
 as its own reply. Observed 2026-10-03 in the Booking Analytics topic after the
-12:33 PDT adapter rebuild. These three calls now forward to the live adapter. With
-no live adapter, an edit returns a retryable `Not connected` unless the failure is
-permanently fatal.
+12:33 PDT adapter rebuild. These three calls now forward to the live adapter. Replacement resolution uses
+the runner's profile-scoped adapter resolver (or an exact owner map for legacy
+runners), never the primary-only `runner.adapters` as a secondary fallback.
+`send`, `edit_message`, `delete_message`, `delete_messages` and `send_typing` are
+covered across default/named primary and secondary profiles, including missing
+replacements, by `test_retired_adapter_egress_is_profile_scoped_and_fail_closed`
+in `tests/gateway/test_telegram_multiplex_reconnect_isolation.py`. This adapts
+[upstream PR #117691](https://github.com/NousResearch/hermes-agent/pull/117691)
+to the current runner. With no live adapter, an edit returns a retryable
+`Not connected` unless the failure is permanently fatal.
 
 Source: `plugins/platforms/telegram/adapter.py`. Proof:
 `tests/gateway/test_telegram_replacement_adapter_egress.py`, red on the base. No new
@@ -335,7 +346,14 @@ window after `send_path_degraded` or a short flood refusal. Only after that wind
 it use the legacy standalone sender. If that fallback succeeds after a transient live
 failure, the job records `last_delivery_formatting_degraded` with the affected target
 and emits a WARNING; non-Telegram targets are unchanged. The existing delivery ledger
-remains the recovery path when fallback cannot send.
+remains the recovery path when fallback cannot send. A standalone timeout,
+including the thread-fallback timeout, is ambiguous and must never be queued
+from an earlier reconnect-only live error: the Bot API call may still deliver.
+The typed local timeout verdict preserves the existing two-value result seam;
+`test_ambiguous_standalone_timeout_is_not_replayed` exercises both execution
+lanes. Contract borrowed from
+[upstream PR #127188](https://github.com/NousResearch/hermes-agent/pull/127188),
+without its older scheduler or the unrelated retry-verdict changes.
 
 Rich capability rejection is WARNING-logged with the existing redaction helper and the
 adapter latch resets at the next polling generation. The latch still suppresses retries
