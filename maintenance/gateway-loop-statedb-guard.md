@@ -26,6 +26,9 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
   maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
   behind it); usermerge floor and bounded pages unchanged.
+- Each write's replaced/WAL-generation probe (stat of state.db and its sidecars, header pread)
+  first runs lock-free; only a doubtful result runs the authoritative probe under `self._lock`
+  (#105567's close race stays inside). 11:52: the lock holder sat in a kernel-stalled stat().
 - A full routing-index save (`replace_gateway_routing_entries`) writes only the difference,
   with unchanged full-replace semantics; it used to rewrite every row of the scope per update.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
@@ -54,7 +57,7 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
 `test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
 in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
-`tests/hermes_state/test_gateway_routing_replace_diff.py`, and
+`tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, and
 `test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
