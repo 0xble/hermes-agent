@@ -195,4 +195,3 @@ def test_marker_with_a_live_delegate_is_handed_to_it_at_finish(tmp_path: Path) -
     finally:
         if pid_file.exists():
             subprocess.run(['taskkill', '/F', '/PID', pid_file.read_text(encoding='utf-8-sig')], capture_output=True)
-
