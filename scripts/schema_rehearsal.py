@@ -109,10 +109,16 @@ def probes(path: Path) -> dict:
 
 def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     """Open the copy through the candidate's SessionDB in a fresh process under a scratch home."""
+    scratch_home = scratch_home.resolve()
+    from hermes_constants import get_hermes_home
+    live_home = get_hermes_home().resolve()
+    if (scratch_home == live_home or scratch_home.is_relative_to(live_home)
+            or not scratch_home.is_relative_to(Path(tempfile.gettempdir()).resolve())):
+        raise SystemExit("refusing: HERMES_HOME must be a fresh scratch directory")
     scratch_home.mkdir(parents=True, exist_ok=True)
     target = scratch_home / "state.db"
-    if target.exists() or target.is_symlink():
-        target.unlink()
+    if target.exists() or target.is_symlink() or any(scratch_home.iterdir()):
+        raise SystemExit("refusing: scratch home must be fresh, without an existing state.db")
     os.symlink(copy, target)
     code = (
         "import json, time; t=time.time(); import hermes_state; db=hermes_state.SessionDB(); "
@@ -230,7 +236,8 @@ def main(argv: list[str] | None = None) -> int:
     copy = args.copy.resolve()
     if not copy.is_file():
         raise SystemExit(f"{copy} is not a file")
-    if str(copy).startswith(str(Path.home() / ".hermes")):
+    from hermes_constants import get_hermes_home
+    if any(copy.is_relative_to(home.resolve()) for home in (get_hermes_home(), Path.home() / ".hermes")):
         raise SystemExit("refusing: that path is inside the live profile; pass a copy")
 
     report: dict = {"copy": str(copy), "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
