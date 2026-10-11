@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import threading
 from typing import Callable, Iterable, TypeVar
 
 logger = logging.getLogger("gateway.run")
@@ -63,26 +64,37 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
     """Run blocking ``claim()`` in a worker thread and return its result.
 
     The thread cannot be cancelled. If the awaiting task is cancelled first, the claim can still
-    succeed with nobody left to record it, stranding its lease until expiry. So on cancellation,
-    ``release`` runs (in a worker thread, same context) on whatever the claim returns, then the
-    ``CancelledError`` propagates.
+    succeed with nobody left to record it, stranding its lease until expiry. Refund abandoned
+    results off-loop in the copied context, even after the loop or default executor shuts down.
+    ``CancelledError`` still propagates to the caller.
     """
     loop = asyncio.get_running_loop()
     claim_ctx = contextvars.copy_context()
     release_ctx = claim_ctx.copy()
-    future = loop.run_in_executor(None, claim_ctx.run, claim)
+    lock = threading.Lock()
+    abandoned = False
+    handed_over: list[_T] = []
+
+    def _claim_and_handoff() -> _T:
+        result = claim()  # A failed claim has nothing to release.
+        with lock:
+            if not abandoned:
+                handed_over.append(result)
+                return result
+        release(result)  # No loop callback or executor submission during teardown.
+        return result
+
+    future = loop.run_in_executor(None, claim_ctx.run, _claim_and_handoff)
     try:
         return await asyncio.shield(future)
     except asyncio.CancelledError:
-        def _release_abandoned(done: asyncio.Future) -> None:
-            if done.cancelled() or done.exception() is not None:
-                return
-            try:
-                loop.run_in_executor(None, release_ctx.run, release, done.result())
-            except RuntimeError:  # executor already shut down; the lease expires on its own
-                logger.warning("Could not release an abandoned durable claim", exc_info=True)
-
-        future.add_done_callback(_release_abandoned)
+        with lock:
+            abandoned = True
+        if handed_over:
+            # The worker finished before cancellation, but its result was never consumed.
+            threading.Thread(
+                target=release_ctx.run, args=(release, handed_over[0]), daemon=False,
+            ).start()
         raise
 
 
