@@ -379,7 +379,7 @@ def _price_reference_response(
 ) -> tuple[Any, Any, str | None, str | None]:
     """Normalize a reference's usage with the slot's OWN provider/api_mode and price it
     at its own rate (hence fan-out cost is summed in dollars). Never raises."""
-    from agent.usage_pricing import estimate_usage_cost, normalize_usage
+    from agent.usage_pricing import billing_provider_identity, estimate_usage_cost, normalize_usage
     usage = CanonicalUsage()
     raw_usage = getattr(response, "usage", None)
     if raw_usage:
@@ -387,7 +387,8 @@ def _price_reference_response(
             usage = normalize_usage(raw_usage, provider=runtime.get("provider"), api_mode=runtime.get("api_mode"))
     try:
         cost = estimate_usage_cost(
-            slot.get("model") or "", usage, provider=runtime.get("provider"),
+            slot.get("model") or "", usage,
+            provider=billing_provider_identity(runtime.get("provider"), runtime.get("requested_provider")),
             base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
         )
         return usage, cost.amount_usd, cost.status, cost.source

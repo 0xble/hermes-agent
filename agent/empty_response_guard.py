@@ -143,9 +143,10 @@ def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
     if canonical is None:
         return None
     try:
-        from agent.usage_pricing import estimate_usage_cost
+        from agent.usage_pricing import billing_provider_identity, estimate_usage_cost
         result = estimate_usage_cost(
-            getattr(agent, "model", "") or "", canonical, provider=getattr(agent, "provider", None),
+            getattr(agent, "model", "") or "", canonical,
+            provider=billing_provider_identity(getattr(agent, "provider", None), getattr(agent, "requested_provider", None)),
             base_url=getattr(agent, "base_url", None), api_key=getattr(agent, "api_key", None),
         )
     except Exception:  # noqa: BLE001 — pricing must never break the loop

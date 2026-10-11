@@ -1,11 +1,12 @@
 """Configured subscriptions cost $0 marginally; token-priced routes still retain invoices."""
 
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
-from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, resolve_billing_route
+from agent.usage_pricing import CanonicalUsage, billing_provider_identity, estimate_usage_cost, resolve_billing_route
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_state import SessionDB
 
@@ -69,6 +70,98 @@ def test_configured_subscription_flows_through_main_turn_and_sessiondb(tmp_path,
             agent.close()
         db.close()
         reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram"])
+@pytest.mark.parametrize("requested", ["custom:included", "custom:metered", "custom"])
+def test_runtime_selected_route_persists_named_billing_identity(tmp_path, monkeypatch, platform, requested):
+    from agent import turn_usage
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from run_agent import AIAgent
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(json.dumps({"providers": {
+        "included": {"base_url": URL, "api_key": "fixture-placeholder",
+                     "billing_mode": "subscription_included"},
+        "metered": {"base_url": URL, "api_key": "fixture-placeholder"},
+    }}), encoding="utf-8")
+    token = set_hermes_home_override(home)
+    db = SessionDB(db_path=home / "state.db")
+    agent = None
+    try:
+        runtime = resolve_runtime_provider(
+            requested=requested, target_model=MODEL,
+            explicit_api_key="fixture-placeholder", explicit_base_url=URL)
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == requested
+        if platform == "cli":
+            from hermes_cli.cli_agent_setup_mixin import _current_runtime
+            runtime = _current_runtime(SimpleNamespace(
+                **{k: runtime[k] for k in ("api_key", "base_url", "provider", "requested_provider", "api_mode")},
+                acp_command=None, acp_args=[], _credential_pool=runtime.get("credential_pool")))
+        else:
+            from gateway.run import _runtime_agent_kwargs
+            from gateway.run_turn import GatewayTurnMixin
+            runtime = GatewayTurnMixin._resolve_turn_agent_config(
+                SimpleNamespace(_service_tier=None), "hi", MODEL, _runtime_agent_kwargs(runtime))["runtime"]
+        agent = AIAgent(
+            **runtime, model=MODEL, session_id="selected", platform=platform, session_db=db,
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            save_trajectories=False, enabled_toolsets=["file"])
+        assert (agent.provider, agent.requested_provider) == ("custom", requested)
+        # A subscription proxy can forward a list-price valuation, not an invoice.
+        response = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=1000, completion_tokens=50, cost=0.25), model=MODEL, id=None)
+        turn_usage.record_response_usage(
+            agent, response, messages=[{"role": "user", "content": "hi"}], api_call_count=1,
+            api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
+        db.flush_token_counts()
+        included = requested == "custom:included"
+        for table, clause in (("sessions", "id = 'selected'"),
+                              ("session_model_usage", "session_id = 'selected' AND task = ''")):
+            row = dict(db._conn.execute(
+                f"SELECT estimated_cost_usd, cost_status, cost_source, billing_mode, billing_provider "
+                f"FROM {table} WHERE {clause}"
+            ).fetchone())
+            # Per-model route keys use an empty string where aggregate columns use NULL.
+            row["billing_mode"] = row["billing_mode"] or None
+            assert row == {
+                "estimated_cost_usd": 0 if included else 0.25,
+                "cost_status": "included" if included else "actual",
+                "cost_source": "none" if included else "provider_cost_api",
+                "billing_mode": "subscription_included" if included else None,
+                "billing_provider": requested,
+            }
+        from agent.empty_response_guard import _estimate_attempt_cost
+        from agent.moa_loop import _price_reference_response
+        expected = Decimal("0") if included else Decimal("0.25")
+        assert _estimate_attempt_cost(agent, response) == expected
+        _, amount, status, source = _price_reference_response(response, {"model": MODEL}, runtime)
+        assert (amount, status, source) == (
+            expected, "included" if included else "actual", "none" if included else "provider_cost_api")
+        assert agent.provider == "custom"  # Billing must not change the transport.
+    finally:
+        if agent is not None:
+            agent.close()
+        db.close()
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("provider, requested, expected", [
+    ("custom", "custom:included", "custom:included"),
+    ("custom", "custom:metered", "custom:metered"),
+    ("custom", "CUSTOM:Included", "CUSTOM:Included"),
+    ("custom", "custom", "custom"),
+    ("custom", "auto", "custom"),
+    ("custom", None, "custom"),
+    ("openrouter", "custom:included", "openrouter"),
+    ("anthropic", "custom:included", "anthropic"),
+    ("codex", "custom:included", "codex"),
+    (None, "custom:included", None),
+])
+def test_billing_identity_never_changes_native_transport(provider, requested, expected):
+    assert billing_provider_identity(provider, requested) == expected
 
 
 def test_subscription_requires_exact_enabled_route_and_unambiguous_bare_custom(tmp_path, monkeypatch):

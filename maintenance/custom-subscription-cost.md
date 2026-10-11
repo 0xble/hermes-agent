@@ -30,6 +30,13 @@ read [that unit](provider-reported-cost.md) when changing the priced path.
   the existing normalization and enabled-entry rules, but evaluate unanimity
   before any display deduplication. This is a fork-only correction to the same
   configuration integration; the recorded upstream preflight remains applicable.
+- Runtime-identity repair: the second P1 on #478 showed that runtime resolution
+  kept `requested_provider=custom:<name>` but dispatched as `provider=custom`.
+  Main-turn billing now selects the named identity without changing transport,
+  and persists it to both session and per-model usage. CLI `_current_runtime`
+  and gateway `_runtime_agent_kwargs` / `_resolve_turn_agent_config` already
+  carry the selected identity into `AIAgent`; regressions exercise both paths.
+  Empty-response attempt pricing and MoA reference pricing use the same helper.
 - Regression proof: `tests/agent/test_custom_subscription_cost.py` exercises both
   config shapes, named/bare routes, same-process profile A/B/A switching, and
   real main-turn SessionDB persistence. Shared display-name regressions cover
@@ -86,6 +93,33 @@ worktree `.venv`. The full focused run (subscription, usage pricing,
 provider-reported persistence, config, and non-mutating normalization) passed
 274 tests with 0 failures and 4 Windows-only skips on macOS. Ruff and
 `scripts/check_fork_patches.py` passed.
+
+## Runtime-identity P1 regression evidence
+
+At `3a2314dfe81219ccfacd5b0f7760b3fce44bb65a`, the runtime-selected-route
+regression was RED: both CLI and gateway priced the explicitly selected included
+alias as `actual` / $0.25, and both named routes persisted `custom` instead of
+their declaration identity. Bare custom remained correctly metered. The same
+selection was GREEN after carrying billing identity to pricing and persistence:
+
+```text
+RED:   Summary: 1 files, 2 tests passed, 4 failed, 1 file FAILED (100% complete) in 9.5s (14 workers)
+GREEN: Summary: 1 files, 6 tests passed, 0 failed (100% complete) in 3.6s (14 workers)
+```
+
+Both used `scripts/run_tests.sh tests/agent/test_custom_subscription_cost.py -k
+runtime_selected_route` through `heavy-slot --label io-cost-p1b` and the private
+worktree `.venv`. The final wider run includes named/bare runtime paths,
+empty-response and MoA reference pricing, native-transport isolation, usage
+pricing, provider-reported persistence, runtime resolution/late binding, and
+custom provider switching/normalization:
+
+```text
+Summary: 9 files, 270 tests passed, 0 failed (100% complete) in 8.4s (14 workers)
+```
+
+Ruff, `git diff --check`, and `scripts/check_fork_patches.py` passed. No live
+configuration, runtime installation, or activation changed.
 
 ## Update and retirement
 

@@ -392,6 +392,18 @@ _SNAPSHOT_PROVIDER_ALIASES = {
 _GOOGLE_PROVIDER_NAMES = {"google", "gemini", "vertex", "google-gemini", "google-ai-studio", "google-vertex", "vertex-ai"}
 
 
+def billing_provider_identity(provider: Optional[str], requested_provider: Optional[str] = None) -> Optional[str]:
+    """Keep a selected custom declaration for billing, not transport dispatch.
+
+    Native/fallback transports must never inherit an old custom billing identity.
+    """
+    transport = (provider or "").strip().lower()
+    selected = (requested_provider or "").strip().lower()
+    if (transport in {"custom", "local"} or transport.startswith("custom:")) and selected.startswith("custom:"):
+        return requested_provider
+    return provider
+
+
 def resolve_billing_route(
     model_name: str, provider: Optional[str] = None, base_url: Optional[str] = None
 ) -> BillingRoute:

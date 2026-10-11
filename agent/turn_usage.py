@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage, with_served_service_tier
+from agent.usage_pricing import billing_provider_identity, estimate_usage_cost, normalize_usage, with_served_service_tier
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -216,7 +216,8 @@ def record_response_usage(
 
     # MoA: agent.model/provider are the virtual preset/"moa" with no pricing entry, silently
     # dropping aggregator spend. Price at the REAL model/provider from the aggregator slot.
-    _agg_cost_model, _agg_cost_provider, _agg_cost_base_url = agent.model, agent.provider, agent.base_url
+    _billing_provider = billing_provider_identity(agent.provider, getattr(agent, "requested_provider", None))
+    _agg_cost_model, _agg_cost_provider, _agg_cost_base_url = agent.model, _billing_provider, agent.base_url
     _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
     if _agg_slot and _agg_slot.get("model"):
         _agg_cost_model = _agg_slot["model"]
@@ -270,7 +271,7 @@ def record_response_usage(
                 estimated_cost_usd=_cost_delta,
                 cost_status=_persist_status,
                 cost_source=cost_result.source,
-                billing_provider=agent.provider,
+                billing_provider=_billing_provider,
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
