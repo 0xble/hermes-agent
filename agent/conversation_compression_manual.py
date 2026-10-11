@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 #: Every surface renders the same refusal; hard truncation has no persistence path outside the guarded
 #: ``_compress_context`` rotation, so ``--aggressive`` is refused rather than mis-parsed as a focus topic.
@@ -108,10 +108,13 @@ def estimate_request_tokens(agent: Any, messages: Sequence[Dict[str, Any]]) -> i
 def compress_now(
     agent: Any, history: Sequence[Dict[str, Any]], request: CompressRequest, *,
     system_message: Any = None, task_id: str = "default", skip_without_window: bool = False,
+    snapshot_is_current: Optional[Callable[[], bool]] = None,
 ) -> CompressResult:
     """Run one manual compression of ``history`` on ``agent`` and return the outcome; the caller installs
     ``after_messages`` (and re-anchors session ids) — history is never mutated here.
 
+    ``snapshot_is_current`` validates the host's snapshot after durable lease admission, before the
+    summarizer runs; the normal timeout/fallback pipeline remains in charge of the attempt.
     ``preview=True`` performs no compression and leaves ``agent`` untouched. A held compression lock
     yields ``lock_skipped`` with the agent's signal cleared and the deferred context-engine notification
     discarded; otherwise the caller must call ``finalize_context_engine_compression_notification(agent,
@@ -149,12 +152,14 @@ def compress_now(
         agent._compression_feasibility_checked = True
     with compression_level(compressor, level):
         return _compress_head(agent, before, head, tail, before_tokens, request, system_message=system_message,
-                              task_id=task_id, skip_without_window=skip_without_window)
+                              task_id=task_id, skip_without_window=skip_without_window,
+                              snapshot_is_current=snapshot_is_current)
 
 
 def _compress_head(
     agent: Any, before: List[Dict[str, Any]], head: List[Dict[str, Any]], tail: List[Dict[str, Any]],
     before_tokens: int, request: CompressRequest, *, system_message: Any, task_id: str, skip_without_window: bool,
+    snapshot_is_current: Optional[Callable[[], bool]] = None,
 ) -> CompressResult:
     from agent.context_compressor import _DB_PERSISTED_MARKER, _fresh_compaction_message_copy
     from agent.conversation_compression import finalize_context_engine_compression_notification
@@ -187,6 +192,7 @@ def _compress_head(
         compressed, _ = agent._compress_context(
             head, system_message, approx_tokens=before_tokens, focus_topic=request.focus_topic, force=True,
             defer_context_engine_notification=True, **({"task_id": task_id} if task_id != "default" else {}),
+            **({"snapshot_is_current": snapshot_is_current} if snapshot_is_current is not None else {}),
             **({"verbatim_tail": tail_rows} if tail_rows else {}))
     except Exception:
         finalize_context_engine_compression_notification(agent, committed=False)
@@ -198,8 +204,8 @@ def _compress_head(
         finalize_context_engine_compression_notification(agent, committed=False)
         return CompressResult("lock_skipped", before, before, before_tokens, before_tokens, request,
                               lock_holder=lock_signal if isinstance(lock_signal, str) else None)
-    # Stamped copies mean the in-place commit stored the tail and already returned head + tail. Rotation, a
-    # no-op or a rolled-back commit leave them unstamped, and the tail is then only in the caller's dicts.
+    # Stamped copies mean the commit (in place or rotated) stored the tail and already returned head + tail.
+    # A no-op or a rolled-back commit leaves them unstamped, and the tail is then only in the caller's dicts.
     if tail and not all(row.get(_DB_PERSISTED_MARKER) is True for row in tail_rows):
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
     after_tokens = estimate_request_tokens(agent, compressed)

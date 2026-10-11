@@ -669,7 +669,7 @@ def test_gateway_interpreter_ignores_unsupported_dangling_pointer(tmp_path, monk
 
 def test_incomplete_checkout_never_receipts_success_during_acknowledged_catchup(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     home = tmp_path / "profile"
     root = home / "releases" / ("a" * 40)
     _fake_release(root, root.name)
@@ -1014,16 +1014,16 @@ def test_successful_receipt_history_does_not_pin_every_old_release(tmp_path):
 
 
 def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypatch):
-    from hermes_cli import immutable_releases, update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import immutable_releases, update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
     release = home / "releases" / "current"
     _fake_release(release, "current")
     releases.promote(home, release)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+    monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
     monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
-    monkeypatch.setattr(update_cmd_fleet, "_collect_fleet_snapshot", lambda *a, **kw: [])
+    monkeypatch.setattr(update_cmd_fleet_verify, "_collect_fleet_snapshot", lambda *a, **kw: [])
     monkeypatch.setattr(update_cmd_fleet, "_clear_fleet_restart_pending_marker", lambda: None)
     monkeypatch.setattr(update_cmd_fleet, "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
     monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
@@ -1033,8 +1033,8 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
         restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
         externally_supervised_profiles=[], killed_pids=set())
     update_receipt.begin_update_receipt()
-    update_cmd_fleet._verify_fleet_after_update(restart, _pre_update_plan=None,
-        _windows_gateway_resume=None, node_failures=[], update_complete=True, rollback=True)
+    update_cmd_fleet_verify._verify_fleet_after_update(restart, _pre_update_plan=None,
+        _windows_gateway_resume=None, update_complete=True, rollback=True)
     receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
     assert receipt["outcome"] == "success"
     assert any(s["name"] == "release_retention" and not s["ok"] and
@@ -1042,7 +1042,7 @@ def test_retention_failure_is_advisory_after_verified_update(tmp_path, monkeypat
 
 
 def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monkeypatch):
-    from hermes_cli import update_cmd, update_cmd_fleet, update_receipt
+    from hermes_cli import update_cmd, update_cmd_fleet, update_cmd_fleet_verify, update_receipt
     from hermes_cli.update_cmd_fleet import _GatewayRestartOutcome
     home = tmp_path / "profile"
     releases_for_test = [home / "releases" / str(i) for i in range(7)]
@@ -1055,9 +1055,9 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
                               cwd=releases_for_test[0])
     try:
         monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setattr(update_cmd_fleet, "_print_legacy_units_warning", lambda: None)
+        monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
-        monkeypatch.setattr(update_cmd_fleet, "_collect_fleet_snapshot", lambda *a, **kw: [])
+        monkeypatch.setattr(update_cmd_fleet_verify, "_collect_fleet_snapshot", lambda *a, **kw: [])
         monkeypatch.setattr(update_cmd_fleet, "_clear_fleet_restart_pending_marker", lambda: None)
         monkeypatch.setattr(update_cmd._m(), "_fleet_probe_expected_runtimes", lambda *a, **kw: False)
         monkeypatch.setattr(update_cmd, "_surviving_pre_update_serve_runtimes", lambda *a: [])
@@ -1065,8 +1065,8 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
             restarted_services=[], failed_or_stale_units=[], relaunched_profiles=[],
             externally_supervised_profiles=[], killed_pids=set())
         update_receipt.begin_update_receipt()
-        update_cmd_fleet._verify_fleet_after_update(restart, _pre_update_plan=None,
-            _windows_gateway_resume=None, node_failures=[], update_complete=True, rollback=False)
+        update_cmd_fleet_verify._verify_fleet_after_update(restart, _pre_update_plan=None,
+            _windows_gateway_resume=None, update_complete=True, rollback=False)
         receipt = json.loads((home / "logs/update_receipts/latest.json").read_text())
         assert receipt["outcome"] == "success"
         assert releases_for_test[0].exists()
@@ -1294,7 +1294,7 @@ def test_update_stages_before_transaction_without_advancing_checkout(tmp_path, m
     monkeypatch.setattr(update_cmd._m(), "_desktop_packaged_executable", lambda *args: None)
     monkeypatch.setattr(update_cmd._m(), "_desktop_dist_exists", lambda *args: False)
     monkeypatch.setattr(update_cmd._m(), "_installed_desktop_apps", lambda *args: [])
-    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda: (False, ["git"], False))
+    monkeypatch.setattr(update_cmd, "_prepare_git_command", lambda **_: (False, ["git"], False))
     monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist")
     def inspect_before_stage(*args, **kwargs):
         assert not (home / "release-layout.json").exists()

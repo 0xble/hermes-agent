@@ -107,12 +107,110 @@ class TestFormatMessageCodeBlocks:
         result = adapter.format_message(text)
         assert r"echo \`hostname\`" in result
 
+    def test_fence_closes_only_on_its_own_line(self, adapter):
+        text = '```python\ns = "```"\nprint(s)\n```'
+        assert adapter.format_message(text) == '```python\ns = "\\`\\`\\`"\nprint(s)\n```'
+
+    @pytest.mark.parametrize("text, expected", [
+        (
+            "- item:\n    ```\n    x = ``y``\n    ```",
+            "\\- item:\n    ```\n    x = \\`\\`y\\`\\`\n    ```",
+        ),
+        (
+            "Here is the code: ```python\nx = ``y``\n```",
+            "Here is the code: ```python\nx = \\`\\`y\\`\\`\n```",
+        ),
+    ])
+    def test_multi_backticks_inside_nested_and_midline_fences_stay_literal(self, adapter, text, expected):
+        assert adapter.format_message(text) == expected
+
     def test_inline_code_no_double_escape(self, adapter):
         r"""Already-escaped backslashes should not be quadruple-escaped."""
         text = r"Use `\\server\share`"
         result = adapter.format_message(text)
         # \\ in input → \\\\ in output (each \ escaped once)
         assert r"`\\\\server\\share`" in result
+
+    def test_inline_triple_backticks_not_treated_as_fence(self, adapter):
+        r"""Inline ``` spans must not be swallowed by the fenced-block regex.
+
+        Regression for the over-matching fence regex that turned a single-line
+        inline triple-backtick span into a mangled MarkdownV2 <pre> entity
+        (Telegram: "can't find end of pre entity"), forcing a plain-text
+        fallback that dropped all rich formatting.
+        """
+        text = "the syntax is ```like this``` inline"
+        result = adapter.format_message(text)
+        # The fork's multi-backtick pass emits one inline entity, never a <pre> block.
+        assert result == "the syntax is `like this` inline"
+
+    def test_fence_and_inline_backticks_mixed(self, adapter):
+        r"""A real fenced block still gets protected even when the same message
+        also contains inline triple backticks elsewhere."""
+        text = "```\nx = 1\n```\nand inline ```y``` after"
+        result = adapter.format_message(text)
+        # The standalone fenced block is protected verbatim...
+        assert "```\nx = 1\n```" in result
+        # ...and the trailing inline ```y``` does not spawn a second,
+        # unbalanced fence — only the real block's two fences remain.
+        assert result.count("```") == 2
+        assert "y" in result
+
+    def test_fence_with_trailing_whitespace_on_close(self, adapter):
+        r"""A closing fence with trailing spaces must not double up the ```."""
+        text = "```\ncode\n```   "
+        result = adapter.format_message(text)
+        # Exactly one closing fence, not "``````".
+        assert "``````" not in result
+        assert "code" in result
+
+    def test_fence_with_crlf_line_endings_is_protected(self, adapter):
+        r"""A fenced block whose lines end in CRLF (``\r\n``) — e.g. content
+        that originated on Windows — must still be protected. The closing-fence
+        anchor tolerates a trailing ``\r`` before the line end; without it the
+        block goes unrecognized and its backticks are escaped into literal
+        ``\``` runs, dropping the code formatting."""
+        text = "```\r\ncode\r\n```\r\n"
+        result = adapter.format_message(text)
+        # Upstream consumes the closing line's optional carriage return.
+        assert result == "```\r\ncode\r\n```\n"
+
+    def test_midline_opened_fence_stays_protected(self, adapter):
+        r"""A fence opened after lead-in prose on the same line ("Here is the
+        code: ```") is a real <pre> block on main and must stay one: the
+        line-start-only anchor downgraded it to escaped literal prose."""
+        text = "Here is the code: ```python\nprint('hi')\n```"
+        assert adapter.format_message(text) == text
+
+    def test_list_nested_indented_fence_stays_protected(self, adapter):
+        r"""Fences indented by 4+ spaces (code nested in lists/blockquotes) are
+        real <pre> blocks on main and must stay one regardless of indent."""
+        text = "- item:\n    ```\n    code\n    ```"
+        result = adapter.format_message(text)
+        assert "    ```\n    code\n    ```" in result
+        assert "\\`" not in result
+
+    def test_midline_fence_after_inline_code_lead_in(self, adapter):
+        r"""An inline code span in the lead-in must not stop the fence opened
+        later on the same line from being protected."""
+        text = "use `foo` then: ```python\nx\n```"
+        result = adapter.format_message(text)
+        assert "```python\nx\n```" in result
+        assert "`foo`" in result
+        assert "\\`" not in result
+
+    def test_inline_pair_then_real_fence_both_handled(self, adapter):
+        r"""An inline triple-backtick pair on one line must not swallow a real
+        line-start fence that follows it (the pre-anchored regex over-matched
+        from the inline pair; the old unanchored regex matched from it too)."""
+        text = "the syntax is ```like this``` inline\n```python\nx\n```"
+        result = adapter.format_message(text)
+        # The real fence is protected verbatim...
+        assert "```python\nx\n```" in result
+        # ...the inline pair is escaped as literal text (no raw ``` for it)...
+        assert "like this" in result
+        # ...and exactly the one real block's two fences remain.
+        assert result.count("```") == 2
 
 
 @pytest.mark.asyncio

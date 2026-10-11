@@ -216,6 +216,9 @@ class TestCommandBoundaryFinalization:
         class _FakeLock:
             holder = None
 
+            def __init__(self, **_kw):  # cmd_update passes install_root
+                pass
+
             def acquire(self):
                 return True
 
@@ -315,6 +318,8 @@ def test_invalid_update_config_exits_cleanly_with_failed_receipt(receipt_home, m
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
     class FakeLock:
         holder = None
+        def __init__(self, **_kw):  # cmd_update passes install_root
+            pass
         def acquire(self):
             return True
         def release(self):
@@ -352,6 +357,8 @@ def test_unreadable_update_config_fails_cleanly(receipt_home, monkeypatch, capsy
 
     class FakeLock:
         holder = None
+        def __init__(self, **_kw):  # cmd_update passes install_root
+            pass
         def acquire(self):
             return True
         def release(self):

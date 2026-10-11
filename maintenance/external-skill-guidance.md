@@ -6,7 +6,7 @@ This maintenance unit owns the fork patch identity `external-skill-guidance`.
 
 ## Behavior
 
-When `skills.external_dirs` is configured, the cached foreground skills prompt tells agents that external skills are read-only installs and must be changed at their source in the owning repository, while preserving `skill_manage` guidance for locally owned skills. Background skill-review prompts carry the same source-maintenance instruction. Autonomous `skill_manage` refusals for external skills also name the owning repository as the change location.
+When `skills.external_dirs` is configured, the cached foreground skills prompt tells agents that external skills are read-only installs and must be changed at their source in the owning repository, while preserving `skill_manage` guidance for locally owned skills. Background skill-review prompts carry the same source-maintenance instruction. Autonomous `skill_manage` refusals for external skills also name the owning repository as the change location. Upstream `v0.21.6` dropped ownership gating for background-review content writes, so the fork keeps a narrow `_background_review_external_write_guard` in `tools/skill_manager_guards.py` that refuses only external-dir writes; every other skill follows upstream's relaxed rule.
 
 ## Source surfaces
 

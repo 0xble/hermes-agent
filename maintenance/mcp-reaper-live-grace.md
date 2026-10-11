@@ -27,6 +27,12 @@ reducing the grace for children that still own their spawn incarnation.
   with the original numeric SID/PGID, or if spawn capture produced no witnesses.
   Missing, dead or unreadable witnesses fail closed even for an include-active
   shutdown sweep; there is no release-only or empty-ledger exception.
+- Preserve upstream v0.21.6's leader fingerprint capture and drift-tolerant
+  PID-reuse rejection as an additional veto before each signal phase. An absent,
+  unreadable or matching fingerprint never grants ownership: live recorded
+  create-time witnesses remain mandatory. A reaped leader does not prevent
+  SIGKILL escalation for its verified SIGTERM-ignoring descendants; use their
+  incarnation handles rather than a numeric `killpg(pgid, 0)` adoption path.
 - Give all owned survivors one shared two-second SIGTERM grace using
   `psutil.wait_procs`, then revalidate before escalation. Never kill the gateway's
   own group. Windows tree signalling receives the original verified parent handle.
