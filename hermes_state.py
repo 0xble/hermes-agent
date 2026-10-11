@@ -1518,17 +1518,26 @@ class SessionDB(
         """
         if self._quarantine_reason() is not None:
             return
-        if not self._checkpoint_lock.acquire(blocking=False):
-            return
         try:
-            conn = self._checkpoint_conn_for_current_writer()
-            if conn is None:
-                return  # closed underneath the timer: nothing to checkpoint
-            result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-            if result and result[1] > 0:
-                logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
+            with self._maintenance_conn(blocking=False) as conn:
+                if conn is None:
+                    return  # closed underneath the timer, or another maintenance pass is running
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                if result and result[1] > 0:
+                    logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+
+    @contextmanager
+    def _maintenance_conn(self, *, blocking: bool = True) -> Iterator[Optional[sqlite3.Connection]]:
+        """The dedicated maintenance connection (periodic checkpoint, incremental FTS merge), held
+        exclusively for the block and used WITHOUT ``self._lock``. Yields None when the handle is
+        closed or read-only, or when *blocking* is False and another maintenance pass holds it."""
+        if not self._checkpoint_lock.acquire(blocking=blocking):
+            yield None
+            return
+        try:
+            yield self._checkpoint_conn_for_current_writer()
         finally:
             self._checkpoint_lock.release()
 
