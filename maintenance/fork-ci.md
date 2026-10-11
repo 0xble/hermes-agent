@@ -20,6 +20,16 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Shared update E2E signal injection must never enumerate or signal another file's
+processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
+scopes the command agent's process table and each signal request. Fallback close
+kills captured kernel process incarnations, including detached completion
+children, before the leak check reaps them. Kernel PID namespaces remain in use
+where available. No test is skipped and no worker count or timeout is relaxed.
+The post-commit restart oracle follows the pause-record recovery warning rather
+than the older fleet-restart wording, while still proving that the warning
+clears only after a gateway serves the new commit.
+
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
 runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
