@@ -95,6 +95,8 @@ class _Camofox:
                     tab_id = parsed.path.split("/")[2]
                     stub.tabs[query.get("userId")] = [
                         t for t in stub.tabs.get(query.get("userId"), []) if t["tabId"] != tab_id]
+                elif parsed.path.startswith("/sessions/"):
+                    stub.tabs.pop(parsed.path.split("/")[2], None)
                 return self._send({"ok": True})
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -332,8 +334,20 @@ def test_ephemeral_sessions_still_close_at_end_of_turn(camofox):
     with patch("tools.browser_camofox.requests.delete",
                side_effect=lambda url, **kw: deleted.append(url) or original(url, **kw)):
         assert _dispatch("browser_navigate", {"url": "https://shop.example.test/"}, "eph")["success"]
+        user_id = _user_id(camofox.cf, "eph")
         _end_turn("eph")
     assert "eph" not in camofox.cf._sessions
+    assert deleted == [f"{camofox.server.url}/tabs/created-1", f"{camofox.server.url}/sessions/{user_id}"]
+    assert user_id not in camofox.server.tabs
+
+
+def test_managed_sessions_do_not_delete_the_server_session(camofox):
+    deleted = []
+    original = requests.delete
+    with patch("tools.browser_camofox.requests.delete",
+               side_effect=lambda url, **kw: deleted.append(url) or original(url, **kw)):
+        assert _dispatch("browser_navigate", {"url": "https://shop.example.test/"}, "managed")["success"]
+        assert json.loads(camofox.cf.camofox_close("managed"))["closed"]
     assert len(deleted) == 1 and "/tabs/created-1" in deleted[0]
     assert not any("/sessions/" in path for path in deleted)
 
@@ -679,14 +693,52 @@ def test_ephemeral_close_deletes_protected_owned_tab_and_releases_lease(camofox,
 
     assert json.loads(cf.camofox_close("ephemeral"))["closed"]
 
-    assert _tab_deletes(camofox.server) == [(f"/tabs/{tab}", {"userId": user_id})]
-    assert all(t["tabId"] != tab for t in camofox.server.tabs[user_id])
+    assert _tab_deletes(camofox.server) == [
+        (f"/tabs/{tab}", {"userId": user_id}),
+        (f"/sessions/{user_id}", {}),
+    ]
+    assert user_id not in camofox.server.tabs
     assert "ephemeral" not in cf._sessions
     assert tab not in cf._protected_tab_ids and tab not in cf._protected_tabs_on_disk()
     assert tab not in cf._protected_tab_owners
     assert not any(owned[3] == tab for owned in cf._owned_tabs)
     assert key not in leases._handles and key not in leases._local_claims
     assert not leases._lease_path(key).exists()
+
+
+@pytest.mark.parametrize("exclusion", ["live-protection", "handoff", "shared-tab", "unreadable", "tab-delete-failure"])
+def test_ephemeral_close_does_not_bypass_tab_retention(camofox, monkeypatch, exclusion):
+    cf = camofox.cf
+    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    assert _dispatch("browser_navigate", {"url": "https://a.example.test/"}, "ephemeral")["success"]
+    session = cf._sessions["ephemeral"]
+    tab, user_id = session["tab_id"], session["user_id"]
+    if exclusion == "live-protection":
+        cf.quarantine_current_protected_tab("ephemeral")
+        cf._sessions["holder"] = {**session, "task_id": "holder"}
+        cf._protected_tab_owners[tab] = "holder"
+    elif exclusion == "handoff":
+        cf._handoffs_in_flight[user_id] = 1
+        monkeypatch.setattr(cf, "_handoffs_in_flight", cf._handoffs_in_flight.copy())
+    elif exclusion == "shared-tab":
+        cf._owned_tabs[cf._owned_tab_key("ephemeral", tab)]["session_key"] = SHARED
+    elif exclusion == "unreadable":
+        monkeypatch.setattr(cf, "_protected_tabs_on_disk", lambda: None)
+    else:
+        original_delete = cf._delete
+
+        def fail_tab_delete(path, **kwargs):
+            if path.startswith("/tabs/"):
+                raise requests.ConnectionError("fake tab close failure")
+            return original_delete(path, **kwargs)
+
+        monkeypatch.setattr(cf, "_delete", fail_tab_delete)
+    try:
+        assert json.loads(cf.camofox_close("ephemeral"))["closed"]
+        assert _tab_deletes(camofox.server) == []
+        assert any(t["tabId"] == tab for t in camofox.server.tabs[user_id])
+    finally:
+        cf._handoffs_in_flight.pop(user_id, None)
 
 
 def test_agent_close_does_not_delete_protected_adopted_tab(camofox):

@@ -725,10 +725,10 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
-    """End-of-turn cleanup closes disposable owned tabs, not persistent profiles or user tabs.
+    """End-of-turn cleanup closes disposable owned tabs every turn.
 
-    Managed bindings retain their account, kept/adopted tab and vault protection across turns.
-    Ephemeral sessions return ``False`` for the dedicated-session cleanup path.
+    Only kept, adopted, or handoff tabs survive. Managed bindings retain their account and vault
+    protection across turns; ephemeral sessions return ``False`` for dedicated-session cleanup.
     """
     camofox_cfg = _get_camofox_config()
     if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
@@ -1315,13 +1315,34 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
     return _tab_action(task_id, "press", "press", {"key": key}, lambda data: {"success": True, "pressed": key})
 
 
+def _ephemeral_session_delete_allowed(session: Dict[str, Any]) -> bool:
+    """Reap task-private contexts only after their disposable tabs are gone."""
+    if session.get("managed"):
+        return False
+    user_id = session["user_id"]
+    with _sessions_lock:
+        # Exact-tab cleanup preserves keeps, handoffs and live protection holders. Do not
+        # bypass those exclusions (or a failed tab DELETE) by destroying their context.
+        if (user_id in _handoffs_in_flight
+                or any(other.get("user_id") == user_id for other in _sessions.values())
+                or any(key[2] == get_camofox_url() and record["user_id"] == user_id
+                       for key, record in _owned_tabs.items())):
+            return False
+    try:
+        tabs = _get("/tabs", params={"userId": user_id}, timeout=5).get("tabs")
+    except Exception:
+        return False
+    # A user/adopted tab may exist without an ownership record. Unreadable listings fail closed.
+    return isinstance(tabs, list) and not tabs
+
+
 def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
     try:
-        _drop_session(task_id)  # quarantine any protected binding before exact cleanup
+        session = _drop_session(task_id)  # quarantine any protected binding before exact cleanup
         _delete_owned_tabs(task_id)
-        # Never delete the whole server identity: user/sibling tabs can arrive at any time.
-        # Empty contexts are the Camofox server's inactivity-reaper responsibility.
+        if session and _ephemeral_session_delete_allowed(session):
+            _delete(f"/sessions/{session['user_id']}")
         return json.dumps({"success": True, "closed": True})
     except Exception as e:
         return json.dumps({"success": True, "closed": True, "warning": str(e)})
