@@ -2240,15 +2240,17 @@ def pause_job(
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
     })
-    if updated is not None and not interrupt_running:
+    if updated is not None:
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == job["id"]:
+            # A run pausing its own job is still allowed to deliver this result, just like
+            # self-removal. Keep the marker alive so the scheduler records the paused timestamp.
             marker.paused_at = updated["paused_at"]
-    elif updated is not None:
-        from cron.scheduler_control import interrupt_job_run
-        receipt = interrupt_job_run(job)
-        if run_result is not None:
-            run_result.update(receipt)
+        elif interrupt_running:
+            from cron.scheduler_control import interrupt_job_run
+            receipt = interrupt_job_run(job)
+            if run_result is not None:
+                run_result.update(receipt)
     return updated
 
 
@@ -2406,22 +2408,24 @@ def remove_job(job_id: str, *, run_result: Optional[dict] = None) -> bool:
         marker = _self_removal_delivery.get()
         if marker is not None and marker.job_id == canonical_id:
             marker.removed = True
-        from cron.scheduler_control import interrupt_job_run
-        receipt = interrupt_job_run(job)
-        if run_result is not None:
-            run_result.update(receipt)
-        if job_output_dir.exists():
-            shutil.rmtree(job_output_dir)
-        try:
-            from cron.notepad import clear_notepad
-            clear_notepad(canonical_id)
-        except Exception:
-            logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
-        # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
-        _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
-        with _fire_fence_locks_guard:
-            _fire_fence_locks.pop(_fence_key, None)
-        return True
+
+    # Interrupt after releasing the jobs lock: cancellation may inspect or update the same store.
+    from cron.scheduler_control import interrupt_job_run
+    receipt = interrupt_job_run(job)
+    if run_result is not None:
+        run_result.update(receipt)
+    if job_output_dir.exists():
+        shutil.rmtree(job_output_dir)
+    try:
+        from cron.notepad import clear_notepad
+        clear_notepad(canonical_id)
+    except Exception:
+        logger.debug("Failed to clear notepad for removed job %s", canonical_id, exc_info=True)
+    # Prune the fire-fence lock entry so the registry doesn't grow monotonically.
+    _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
+    with _fire_fence_locks_guard:
+        _fire_fence_locks.pop(_fence_key, None)
+    return True
 
 
 def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:

@@ -89,7 +89,9 @@ def test_cancel_during_run_interrupts_before_next_side_effect(isolated_store, mo
     delivered.assert_not_called()
     if action == "pause":
         paused = jobs.get_job(job["id"])
+        assert paused is not None
         assert paused["state"] == "paused"
+        assert paused["last_error"] == scheduler._CANCELLED_INTERRUPTED
         assert not paused.get("fire_claim")
         shown = next(j for j in dispatch("list", include_disabled=True)["jobs"]
                      if j["job_id"] == job["id"])

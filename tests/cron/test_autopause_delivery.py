@@ -41,6 +41,33 @@ def test_unrunnable_claimed_job_autopauses_and_delivers_reason(tmp_path, monkeyp
         assert jobs.get_due_jobs() == []
 
 
+def test_run_pausing_own_job_still_delivers_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 3600)
+    delivered = Mock(return_value=None)
+    monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+
+    def run_job(job, *, cancel_event, **kwargs):
+        paused = jobs.pause_job(job["id"], reason="self pause")
+        assert paused is not None and paused["state"] == "paused"
+        assert not cancel_event.is_set()
+        return True, "output", "completed", None
+
+    monkeypatch.setattr(scheduler, "run_job", run_job)
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(prompt="work", schedule="every 5m", deliver="local")
+        claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+        assert isinstance(claimed, dict)
+        assert scheduler.run_one_job(claimed)
+        paused = jobs.get_job(job["id"])
+        assert paused is not None
+        assert paused["state"] == "paused"
+        assert paused["paused_at"]
+        assert paused["last_status"] == "ok"
+        assert not paused.get("fire_claim")
+    delivered.assert_called_once()
+
+
 def test_operator_pause_after_autopause_still_stops_delivery(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 3600)
@@ -51,7 +78,11 @@ def test_operator_pause_after_autopause_still_stops_delivery(tmp_path, monkeypat
     def run_job(job, *, cancel_event, **kwargs):
         result = scheduler._block_and_pause_job(job["id"], job["name"], "unrunnable")
         assert not cancel_event.is_set()
-        registry.dispatch("cronjob_manage", {"action": "pause", "job_id": job["id"]})
+        marker_token = jobs._self_removal_delivery.set(None)
+        try:
+            registry.dispatch("cronjob_manage", {"action": "pause", "job_id": job["id"]})
+        finally:
+            jobs._self_removal_delivery.reset(marker_token)
         assert cancel_event.is_set()
         return result
 

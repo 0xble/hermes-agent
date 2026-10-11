@@ -1949,6 +1949,10 @@ def _run_agent_with_watchdog(
         if agent is not None and hasattr(agent, "interrupt"):
             request_hard_interrupt(
                 agent, "Cron run cancelled or fire claim ownership lost", tool_reason="cron run cancelled")
+        with _running_lock:
+            control = _running_cancel_events.get(_inflight_key(job_id))
+        if control is not None and control.is_set():
+            raise RuntimeError(_CANCELLED_INTERRUPTED)
         raise RuntimeError(f"Cron job '{job_name}' lost its durable fire claim ownership")
 
     def _heartbeat_run_claim_if_due():
@@ -2860,6 +2864,7 @@ def run_one_job(
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_CANCELLED_INTERRUPTED = "Interrupted by cron schedule cancellation before terminal completion."
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
@@ -2869,10 +2874,15 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
     # Renewal rejects paused jobs, but terminal bookkeeping must still clear the
     # cancelled owner's claim. mark_job_run atomically compares the owner token.
     from cron.scheduler_control import owns_terminal_claim
+    with _running_lock:
+        control = _running_cancel_events.get(_inflight_key(job_id))
+    interrupted_error = (
+        _CANCELLED_INTERRUPTED if control is not None and control.is_set()
+        else _OWNERSHIP_LOST_INTERRUPTED)
     if fire_owner is not None and owns_terminal_claim(job_id, fire_owner) and mark_job_run(
-        job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
+        job_id, False, interrupted_error, expected_fire_owner=fire_owner,
     ):
-        finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
+        finish_execution(execution_id, success=False, error=interrupted_error)
     else:
         finish_execution(
             execution_id, success=False,
