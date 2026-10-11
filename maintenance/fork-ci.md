@@ -78,7 +78,16 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`,
+`native-test-coverage`.
+
+`native-test-coverage` keeps strict native assertions aligned with the upstream
+subprocess contract, including closed stdin for the Windows WhatsApp tree kill.
+Windows hand-off supervision has a separate test file from post-commit outcomes
+so intentional watchdog/probe waits do not consume the outcome suite's remaining
+300-second file budget. The runner cap, individual deadlines, platform markers,
+and assertions remain unchanged. Retire these adaptations when upstream carries
+equivalent strict assertions and bounded native test allocation.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
