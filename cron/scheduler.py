@@ -2868,7 +2868,8 @@ def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], executio
     terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
     # Renewal rejects paused jobs, but terminal bookkeeping must still clear the
     # cancelled owner's claim. mark_job_run atomically compares the owner token.
-    if fire_owner is not None and mark_job_run(
+    from cron.scheduler_control import owns_terminal_claim
+    if fire_owner is not None and owns_terminal_claim(job_id, fire_owner) and mark_job_run(
         job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner,
     ):
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)

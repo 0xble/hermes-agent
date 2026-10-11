@@ -18,6 +18,13 @@ receipts. Preserve existing self-removal delivery semantics (#111039): a run
 removing its own schedule is not an external operator stop. Detached workers are
 not falsely reported interrupted; remote pause must invalidate heartbeat renewal.
 
+Terminal bookkeeping must first confirm ownership: stale and replacement owners
+never call `mark_job_run`, while a paused own claim is still released through its
+owner-fenced terminal write. `tests/cron/test_autopause_delivery.py` covers this
+and scheduler auto-pause of malformed legacy jobs. Auto-pause may deliver the
+blocked-run reason from that exact run-local pause; an operator pause still
+interrupts it, and another owner or heartbeat context receives no exception.
+
 Upstream candidates: NousResearch/hermes-agent issue #133057 and PR #133169
 (`hermes cron cancel`); inspect their semantics before adoption. Retire this patch
 only when upstream also covers remove/pause, tool receipts, and running visibility

@@ -122,6 +122,7 @@ class _SelfRemovalDelivery:
     def __init__(self, job_id: str):
         self.job_id = job_id
         self.removed = False
+        self.paused_at: Optional[str] = None
 
 
 _self_removal_delivery: ContextVar[Optional[_SelfRemovalDelivery]] = ContextVar(
@@ -146,6 +147,13 @@ def self_removal_delivery_allowed(job_id: str) -> bool:
     if marker is None or marker.job_id != job_id or not marker.removed:
         return False
     return all(item.get("id") != job_id for item in load_jobs())
+
+
+def _self_pause_delivery_allowed(job: dict) -> bool:
+    """Only the run's exact internal auto-pause may finish its blocked-run alert."""
+    marker = _self_removal_delivery.get()
+    return bool(marker and marker.job_id == job.get("id") and marker.paused_at
+                and marker.paused_at == job.get("paused_at") and job.get("state") == "paused")
 
 # Import-time snapshot so deliberate re-pointing of CRON_DIR/JOBS_FILE/OUTPUT_DIR (the documented
 # escape hatch for tests/embedders) is distinguishable from the constants merely being stale.
@@ -2220,6 +2228,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 def pause_job(
     job_id: str, reason: Optional[str] = None, *, run_result: Optional[dict] = None,
+    interrupt_running: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -2231,7 +2240,11 @@ def pause_job(
         "paused_at": _hermes_now().isoformat(),
         "paused_reason": reason,
     })
-    if updated is not None:
+    if updated is not None and not interrupt_running:
+        marker = _self_removal_delivery.get()
+        if marker is not None and marker.job_id == job["id"]:
+            marker.paused_at = updated["paused_at"]
+    elif updated is not None:
         from cron.scheduler_control import interrupt_job_run
         receipt = interrupt_job_run(job)
         if run_result is not None:
@@ -2911,7 +2924,8 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
     report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
     def apply(jobs, _i, job):
-        return is_job_runnable(job) and _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
+        return (is_job_runnable(job) or _self_pause_delivery_allowed(job)) and _refresh_claim(
+            jobs, job.get("fire_claim"), expected_owner)
 
     return _with_job(job_id, apply, False)
 

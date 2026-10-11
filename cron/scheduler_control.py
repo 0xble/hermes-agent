@@ -44,6 +44,18 @@ def release_unstarted_claim(job: dict) -> None:
     jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
 
 
+def owns_terminal_claim(job_id: str, owner: str) -> bool:
+    """Rejected/missing claims cannot write a run; a paused own claim still needs release."""
+    from cron import scheduler as sched
+    from cron.jobs import get_job
+
+    if sched.heartbeat_fire_claim(job_id, expected_owner=owner):
+        return True
+    job = get_job(job_id)
+    return bool(job and job.get("state") == "paused"
+                and (job.get("fire_claim") or {}).get("by") == owner)
+
+
 def running_job_state(job: dict) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
