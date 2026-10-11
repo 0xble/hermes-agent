@@ -296,7 +296,10 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 # Camofox's tab group for a shared identity's visible pages (``browser_handoff``).
 SHARED_IDENTITY_GROUP = "__shared_identity__"
 _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
-_sessions_lock = threading.Lock()
+_sessions_lock = threading.RLock()
+# Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
+# keep the exact identity and profile separately until close is confirmed.
+_owned_tabs: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
 # A managed tab containing a filled date must never be adopted under another task.
 _protected_tab_ids: set[str] = set()
 # tab_id -> the task whose live protection covers it; only that task may keep the binding.
@@ -423,6 +426,9 @@ def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = Non
             _stale_tab_ids[session["user_id"]] = stale
         refused = _protected_tab_ids | quarantined | stale | {
             other["tab_id"] for key, other in _sessions.items() if key != task_id and other.get("tab_id")}
+        refused |= {key[3] for key, record in _owned_tabs.items()
+                    if key[1] != task_id and key[2] == get_camofox_url()
+                    and record["user_id"] == session["user_id"] and not record.get("kept")}
         handoff_pending = _handoffs_in_flight.get(session["user_id"], 0) > 0
         ranked = []
         for index, tab in enumerate(tabs):
@@ -437,10 +443,13 @@ def _adopt_existing_tab(session: Dict[str, Any], target_url: Optional[str] = Non
                     bool(session.get("adopt_any")))
             if any(rank):
                 ranked.append((rank, index, tab_id))
-        if ranked:
-            session["tab_id"] = max(ranked)[2]
-            session.pop("fresh", None)
-            logger.debug("Adopted existing Camofox tab %s for %s", session["tab_id"], session.get("user_id"))
+        from tools import browser_camofox_leases as leases
+        for _rank, _index, tab_id in sorted(ranked, reverse=True):
+            if leases.claim(get_camofox_url(), session["user_id"], tab_id):
+                session["tab_id"] = tab_id
+                session.pop("fresh", None)
+                logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
+                break
     return session
 
 
@@ -462,6 +471,82 @@ def get_session_account(task_id: Optional[str]) -> Optional[str]:
     with _sessions_lock:
         session = _sessions.get(task_id or "default")
         return session.get("account") if session else None
+
+
+def _owned_tab_key(task_id: Optional[str], tab_id: str) -> tuple[str, str, str, str]:
+    """Key ownership by served profile, task lineage, and exact server tab id."""
+    return (hermes_home_key(), task_id or "default", get_camofox_url(), tab_id)
+
+
+def _record_owned_tab(session: Dict[str, Any], tab_id: Optional[str]) -> None:
+    if not isinstance(tab_id, str) or not tab_id:
+        return
+    with _sessions_lock:
+        _owned_tabs[_owned_tab_key(session.get("task_id"), tab_id)] = {
+            "user_id": session["user_id"], "session_key": session.get("session_key"),
+            "kept": False,
+        }
+
+
+def keep_task_tabs(task_id: Optional[str], keep: bool = True) -> int:
+    """Keep or release cleanup protection for tabs created by a task.
+
+    This is intentionally exact-task and exact-tab state: adopted, shared, and unknown tabs
+    cannot become owned merely because they are visible in the same Camofox identity.
+    """
+    task = task_id or "default"
+    changed = 0
+    with _sessions_lock:
+        for (profile, owner, _server, _tab_id), record in _owned_tabs.items():
+            if profile == hermes_home_key() and owner == task and record.get("kept") != keep:
+                record["kept"] = keep
+                changed += 1
+    return changed
+
+
+def _delete_owned_tabs(task_id: Optional[str]) -> None:
+    """Close disposable owned tabs, retaining ownership when safety or I/O is uncertain."""
+    from tools import browser_camofox_leases as leases
+    task = task_id or "default"
+    # Keep the binding lock through DELETE. A sibling must not bind or keep the tab
+    # between the ownership check and destruction. The OS lease excludes other processes.
+    with _sessions_lock:
+        protected = _protected_tabs_on_disk()
+        if protected is None:
+            return
+        from agent.redact import has_vault_date_components
+        live = _sessions.get(task, {})
+        if live.get("tab_id") and has_vault_date_components(task):
+            protected = protected | {live["tab_id"]}
+        live_other_tabs = {
+            session.get("tab_id") for owner, session in _sessions.items()
+            if owner != task and session.get("tab_id")
+        }
+        for key, record in list(_owned_tabs.items()):
+            profile, owner, server, tab_id = key
+            if (profile != hermes_home_key() or owner != task or server != get_camofox_url()
+                    or record.get("kept") or record.get("session_key") == SHARED_IDENTITY_GROUP
+                    or record["user_id"] in _handoffs_in_flight
+                    or tab_id in live_other_tabs or tab_id in (_protected_tab_ids | protected)
+                    or not leases.claim(server, record["user_id"], tab_id)):
+                continue
+            # Also fence re-entrant adoption and stale server listings after a successful close.
+            stale = _stale_tab_ids.setdefault(record["user_id"], set())
+            was_stale = tab_id in stale
+            stale.add(tab_id)
+            try:
+                _delete(f"/tabs/{tab_id}", params={"userId": record["user_id"]}, timeout=10)
+            except Exception as exc:
+                if not was_stale:
+                    stale.discard(tab_id)
+                logger.warning("Camofox owned tab close failed for %s; retaining ownership: %s", tab_id, exc)
+                continue
+            _owned_tabs.pop(key, None)
+            leases.release(server, record["user_id"], tab_id)
+            session = _sessions.get(task)
+            if session and session.get("tab_id") == tab_id:
+                session["tab_id"] = None
+                session["carried"] = True
 
 
 def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[str, Any]:
@@ -531,10 +616,23 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Opti
             body["url"] = url
         data = _post("/tabs", body)
         session["tab_id"] = data.get("tabId")
-        # The tab this task opened itself (never an adopted or handed-off one): a finished
-        # subagent or one-shot run may close it (:func:`release_task_bindings`).
-        session["created_by_task"] = session["tab_id"]
+        _record_owned_tab(session, session.get("tab_id"))
+        from tools import browser_camofox_leases as leases
+        if session["tab_id"] and not leases.claim(get_camofox_url(), session["user_id"], session["tab_id"]):
+            session["tab_id"] = None
+            raise RuntimeError("Camofox tab is in use by another process; navigate again after it releases the tab")
     return session
+
+
+def _release_unused_tab_lease(tab_id: Optional[str], user_id: str) -> None:
+    if not tab_id:
+        return
+    server = get_camofox_url()
+    owned = any(k[2:] == (server, tab_id) and r["user_id"] == user_id for k, r in _owned_tabs.items())
+    bound = any(s.get("tab_id") == tab_id and s.get("user_id") == user_id for s in _sessions.values())
+    if not owned and not bound:
+        from tools import browser_camofox_leases as leases
+        leases.release(server, user_id, tab_id)
 
 
 def _drop_session_locked(key: str) -> Optional[Dict[str, Any]]:
@@ -547,6 +645,8 @@ def _drop_session_locked(key: str) -> Optional[Dict[str, Any]]:
     for tab_id in [t for t, owner in _protected_tab_owners.items() if owner == key]:
         del _protected_tab_owners[tab_id]
     clear_vault_date_components(key)
+    if session:
+        _release_unused_tab_lease(session.get("tab_id"), session["user_id"])
     return session
 
 
@@ -557,11 +657,11 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
-    """End-of-turn cleanup. Managed profiles (``True``) keep the task's tab binding, account and
-    vault protection, so the next turn continues in the same tab (for example the one a user
-    logged into after ``browser_handoff``); the binding is marked carried so the next turn may
-    still choose another account. Agent close releases it (:func:`release_task_bindings`).
-    ``False`` for ephemeral sessions so the caller falls back to :func:`camofox_close`."""
+    """End-of-turn cleanup closes disposable owned tabs, not persistent profiles or user tabs.
+
+    Managed bindings retain their account, kept/adopted tab and vault protection across turns.
+    Ephemeral sessions return ``False`` for the dedicated-session cleanup path.
+    """
     camofox_cfg = _get_camofox_config()
     if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
         key = task_id or "default"
@@ -571,6 +671,7 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
                 _drop_session_locked(key)
             elif session is not None:
                 session["carried"] = True
+        _delete_owned_tabs(key)
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
     return False
@@ -597,55 +698,34 @@ def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False
         # only the account and rebinds by navigating.
         _sessions[new_task_id] = {**old, "task_id": new_task_id, "carried": True, "superseded": False,
                                   "carried_from": old_task_id, "tab_id": None if protected else old.get("tab_id")}
+        if not protected:
+            for key, record in list(_owned_tabs.items()):
+                if key[:2] == (hermes_home_key(), old_task_id):
+                    _owned_tabs.pop(key)
+                    _owned_tabs[(key[0], new_task_id, key[2], key[3])] = record
         if move:
             _drop_session_locked(old_task_id)
 
 
 def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool = False) -> None:
-    """Agent close: forget these tasks' local tab bindings. A managed profile and its tabs stay on
-    the server for another task to adopt; an ephemeral session still open (a turn cut before its
-    cleanup, or headed mode) is deleted as :func:`camofox_close` would.
+    """Release this agent's bindings, including unused compression continuations.
 
-    ``close_created_tabs`` (a finished subagent or one-shot/cron run, whose tasks are never
-    resumed) also closes each released managed binding's tab on the server, but only a tab the
-    task opened itself via ``POST /tabs``: never an adopted, handed-off or shared-identity tab,
-    a protected or quarantined tab, or a tab another live task is still bound to."""
+    ``close_created_tabs`` closes exact POST-created ownership, including replaced bindings and
+    retryable turn-cleanup failures. Kept, user/adopted, protected and live sibling tabs survive.
+    Every agent close enables it; temporary agents with no task ownership cannot close siblings.
+    """
+    keys = {key or "default" for key in task_ids}
     with _sessions_lock:
-        keys = {key or "default" for key in task_ids}
-        # Include continuation ids carried from these tasks that no turn has used yet (a used one
-        # lost ``carried_from`` on first use and belongs to the agent now running it).
+        # Include unused compression continuations before closing their transferred ownership.
         while carried := {key for key, session in _sessions.items()
                           if key not in keys and session.get("carried")
                           and session.get("carried_from") in keys}:
             keys |= carried
-        dropped = [_drop_session_locked(key) for key in keys]  # quarantines protected tabs first
-        closable: Dict[str, str] = {}
+        for key in keys:
+            _drop_session_locked(key)  # quarantine before destroying tabs
         if close_created_tabs:
-            still_bound = {other.get("tab_id") for other in _sessions.values()}
-            quarantined = _protected_tabs_on_disk()
-            for session in dropped:
-                tab_id = session.get("tab_id") if session else None
-                if (tab_id and session.get("managed") and session.get("created_by_task") == tab_id
-                        and session.get("session_key") != SHARED_IDENTITY_GROUP
-                        and quarantined is not None  # unreadable quarantine fails closed
-                        and tab_id not in (_protected_tab_ids | quarantined)
-                        and tab_id not in still_bound):
-                    closable[tab_id] = session["user_id"]
-        # Refuse adoption before dropping the lock: the DELETE below is an external call, and a
-        # sibling task must not claim a tab in that gap.
-        for tab_id, user_id in closable.items():
-            _stale_tab_ids.setdefault(user_id, set()).add(tab_id)
-    for session in dropped:
-        if session and not session.get("managed"):
-            try:
-                _delete(f"/sessions/{session['user_id']}")
-            except Exception as exc:
-                logger.debug("Camofox ephemeral session close failed for %s: %s", session.get("user_id"), exc)
-    for tab_id, user_id in closable.items():
-        try:
-            _delete(f"/tabs/{tab_id}", params={"userId": user_id}, timeout=10)
-        except Exception as exc:
-            logger.debug("Camofox tab close failed for %s (%s): %s", tab_id, user_id, exc)
+            for key in keys:
+                _delete_owned_tabs(key)
 
 
 # ---- HTTP helpers ----
@@ -759,7 +839,11 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
             data = _post(f"/browser/identities/{session['user_id']}/release", {}, timeout=lifecycle_timeout)
             if data.get("ok") is not True or not isinstance(data.get("released"), bool):
                 return tool_error("Camofox did not confirm account release; the task's tab was not changed", success=False)
-            session["tab_id"] = None
+            with _sessions_lock:
+                prior_tab_id = session.get("tab_id")
+                keep_task_tabs(task_id, keep=False)
+                session["tab_id"] = None
+                _release_unused_tab_lease(prior_tab_id, session["user_id"])
             return json.dumps({"success": True, "account": session["account"], "released": data["released"]})
         prior_tab_id = session.get("tab_id")
         user_id = session["user_id"]
@@ -780,7 +864,12 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
                 is_protected = quarantined is None or tab_id in (_protected_tab_ids | quarantined)
                 owns_protection = (_protected_tab_owners.get(tab_id) == (task_id or "default")
                                    and has_vault_date_components(task_id or "default"))
-                session["tab_id"] = tab_id if not is_protected or owns_protection else None
+                from tools import browser_camofox_leases as leases
+                available = leases.claim(get_camofox_url(), user_id, tab_id)
+                session["tab_id"] = tab_id if available and (not is_protected or owns_protection) else None
+                for key, record in _owned_tabs.items():
+                    if key[2:] == (get_camofox_url(), tab_id) and record["user_id"] == user_id:
+                        record["kept"] = True
                 if session["tab_id"]:
                     session.pop("fresh", None)
                     # The visible tab now belongs to this task. Another task bound to it loses the
@@ -789,6 +878,7 @@ def camofox_handoff(account: str, task_id: Optional[str] = None, release: bool =
                         if other is not session and other.get("tab_id") == tab_id:
                             other["tab_id"] = None
                             other.pop("fresh", None)
+                _release_unused_tab_lease(prior_tab_id, user_id)
         finally:
             with _sessions_lock:
                 remaining = _handoffs_in_flight.get(user_id, 1) - 1
@@ -1118,11 +1208,10 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
     try:
-        session = _drop_session(task_id)
-        # Named and managed identities own a persistent Camofox profile. Drop
-        # only Hermes' local task handle so sibling tabs and cookies survive.
-        if session and not session.get("managed"):
-            _delete(f"/sessions/{session['user_id']}")
+        _drop_session(task_id)  # quarantine any protected binding before exact cleanup
+        _delete_owned_tabs(task_id)
+        # Never delete the whole server identity: user/sibling tabs can arrive at any time.
+        # Empty contexts are the Camofox server's inactivity-reaper responsibility.
         return json.dumps({"success": True, "closed": True})
     except Exception as e:
         return json.dumps({"success": True, "closed": True, "warning": str(e)})

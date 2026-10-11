@@ -100,16 +100,6 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         agent._replace_primary_openai_client(reason="fallback_timeout_apply")
 
 
-def _camofox_tabs_end_with_agent(agent: Any) -> bool:
-    """A delegated subagent, cron job or one-shot run is never resumed, so the Camofox tabs its
-    tasks opened close with it. A top-level interactive session keeps them for adoption across
-    turns and gateway restarts."""
-    if (getattr(agent, "_delegate_depth", 0) or 0) > 0 or getattr(agent, "platform", None) == "cron":
-        return True
-    from agent.oneshot_footprint import is_single_query_session
-    return is_single_query_session()
-
-
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -145,14 +135,13 @@ class ClientLifecycleMixin:
                     clear_file_ops_cache(owner)
 
         def release_camofox_tabs() -> None:
-            # Per-turn cleanup keeps a managed Camofox task's tab binding for its next turn; the
-            # agent's end releases the tasks it ran. Not ``task_id``: a temporary agent (hygiene,
-            # manual compression) shares the live session's id but owns none of its tabs.
+            # Turn cleanup closes disposable owned tabs; agent close retries interrupted turns.
+            # Not ``task_id``: hygiene/compression agents share the live session id but own no tabs.
             import sys
             camofox = sys.modules.get("tools.browser_camofox")
             if camofox is not None:
                 camofox.release_task_bindings(getattr(self, "_process_owner_task_ids", ()),
-                                              close_created_tabs=_camofox_tabs_end_with_agent(self))
+                                              close_created_tabs=True)
 
         for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
                      release_camofox_tabs, release_computer_use, forget_file_state):

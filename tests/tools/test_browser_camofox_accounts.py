@@ -157,7 +157,9 @@ def test_named_account_close_drops_local_handle_without_deleting_profile(tmp_pat
         camofox_navigate("https://example.com", task_id="persistent", account="brianle")
         result = json.loads(camofox_close(task_id="persistent"))
     assert result == {"success": True, "closed": True}
-    delete.assert_not_called()
+    delete.assert_called_once()
+    assert "/tabs/" in delete.call_args.args[0]
+    assert "/sessions/" not in delete.call_args.args[0]
 
 
 def test_account_schema_is_gated_to_camofox(monkeypatch):
