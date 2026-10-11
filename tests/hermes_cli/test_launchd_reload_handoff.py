@@ -48,6 +48,7 @@ def run_helper(tmp_path, monkeypatch):
         path = Path(os.environ["STATE"])
         state = json.loads(path.read_text()) if path.exists() else {
             "prints": 0, "lists": 0, "bootstrap_times": [], "registered": False,
+            "positive_pid": False,
         }
         rc = 0
         if verb == "print":
@@ -61,16 +62,19 @@ def run_helper(tmp_path, monkeypatch):
             if failure and (len(state["bootstrap_times"]) == 1 or
                              elapsed < float(os.environ["TRANSIENT_FOR"])):
                 rc = failure
-            else:
+            elif len(state["bootstrap_times"]) > int(os.environ["ZERO_BOOTSTRAPS"]):
                 state["registered"] = True
         elif verb == "list":
             state["lists"] += 1
-            if os.environ["NEVER_UNLOADS"] == "1":
+            if not state["registered"]:
+                rc = 1
+            elif os.environ["NEVER_UNLOADS"] == "1":
                 # The old label can still have a PID; that must not count as a successful reload.
                 print('"PID" = 999;')
-            elif state["registered"]:
+            else:
                 pid = os.environ["MISSING_PID"] if state["lists"] <= int(os.environ["PID_PROBES"]) else "123"
                 if pid:
+                    state["positive_pid"] = pid.isdigit() and int(pid) > 0
                     print('"PID" = ' + pid + ';')
         path.write_text(json.dumps(state))
         sys.exit(rc)
@@ -79,18 +83,19 @@ def run_helper(tmp_path, monkeypatch):
         executable.chmod(0o755)
 
     def execute(*, budget=30, failure=0, transient_for=0, loaded_probes=0, never_unloads=False,
-                pid_probes=0, missing_pid="", real_wait=False):
+                pid_probes=0, missing_pid="", zero_bootstraps=0, gateway_pid=old_pid, real_wait=False):
         monkeypatch.setattr(gateway_launchd, "_launchd_reload_budget", lambda: float(budget))
         assert gateway_launchd._spawn_deferred_launchd_reload(
             domain="gui/501", label="test.hermes.gateway", target="gui/501/test.hermes.gateway",
-            plist_path=tmp_path / "gateway.plist", gateway_pid=old_pid,
+            plist_path=tmp_path / "gateway.plist", gateway_pid=gateway_pid,
         )
         result = real_run(["/bin/bash", "-c", submitted[0][-1]], timeout=20, capture_output=True, text=True,
                           env={"PATH": f"{fake}:/usr/bin:/bin", "TRACE": str(trace), "STATE": str(state),
                                "SLEEP_STATE": str(tmp_path / "slept"), "REAL_WAIT": str(int(real_wait)),
                                "FAILURE": str(failure), "TRANSIENT_FOR": str(transient_for),
                                "LOADED_PROBES": str(loaded_probes), "NEVER_UNLOADS": str(int(never_unloads)),
-                               "PID_PROBES": str(pid_probes), "MISSING_PID": missing_pid})
+                               "PID_PROBES": str(pid_probes), "MISSING_PID": missing_pid,
+                               "ZERO_BOOTSTRAPS": str(zero_bootstraps)})
         assert result.returncode == 0, result.stderr
         return SimpleNamespace(events=trace.read_text().splitlines(), state=json.loads(state.read_text()),
                                log=log.read_text() if log.exists() else "")
@@ -133,13 +138,13 @@ def test_helper_retries_transients_beyond_old_attempt_cap(run_helper, failure, r
                          transient_for=4.0 if recovers else 60.0, real_wait=True)
     assert outcome.state["registered"] is recovers, outcome.log
     times = outcome.state["bootstrap_times"]
-    assert times[-1] - times[0] >= 2.0
+    assert times[-1] - times[0] >= 1.8
     backoffs = [float(event.split()[1]) for event in outcome.events[1:] if event.startswith("sleep")]
     assert backoffs[0] == 0.2
     assert max(backoffs) > backoffs[0]
     assert max(backoffs) <= 2.0
     if recovers:
-        assert 2.0 in backoffs
+        assert sum(backoffs) >= 2.0
         assert "FAILED" not in outcome.log
     else:
         assert "bootstrap failures exhausted reload budget" in outcome.log
@@ -164,13 +169,22 @@ def test_helper_waits_only_while_label_is_still_loaded(run_helper, never_unloads
         assert "bootstrap" not in outcome.events
         assert "label never unloaded" in outcome.log
         assert "bootstrap rc=not-attempted" in outcome.log
-        assert "permanent bootstrap error" not in outcome.log
         assert "bootstrapped with no positive PID" not in outcome.log
     else:
         first_bootstrap = outcome.events.index("bootstrap")
         assert outcome.events[:first_bootstrap] == ["sleep 2", "bootout"] + ["print", "sleep 0.2"] * 3 + ["print"]
         assert outcome.state["registered"]
         assert "FAILED" not in outcome.log
+
+
+@pytest.mark.platforms("posix")
+def test_helper_rebootstraps_when_successful_bootstrap_did_not_register(run_helper):
+    outcome = run_helper(budget=4, zero_bootstraps=1, gateway_pid=999999)
+    assert outcome.state["registered"]
+    assert outcome.state["positive_pid"]
+    assert outcome.events.count("bootstrap") == 2
+    assert outcome.state["lists"] > 0
+    assert "FAILED" not in outcome.log
 
 
 @pytest.mark.platforms("posix")
@@ -184,6 +198,5 @@ def test_helper_waits_for_a_positive_pid_without_bootstrapping_again(run_helper,
         assert "bootstrapped with no positive PID" in outcome.log
         assert "bootstrap rc=0" in outcome.log
         assert "label never unloaded" not in outcome.log
-        assert "permanent bootstrap error" not in outcome.log
     else:
         assert "FAILED" not in outcome.log

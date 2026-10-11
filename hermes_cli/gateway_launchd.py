@@ -542,7 +542,7 @@ def _spawn_deferred_launchd_reload(
     """Hand the bootout/bootstrap cycle to a transient ``launchctl submit`` job; True if spawned. The
     helper waits for the OLD gateway to exit (bootstrap during drain fails EIO), then probes label
     unload and retries every bootstrap failure with growing backoff until the separate reload
-    deadline. A successful bootstrap waits for a positive PID without registering again."""
+    deadline. A successful bootstrap waits for a positive PID while the label remains registered."""
     reload_log_path = _launchd_reload_log_path()
     with contextlib.suppress(OSError):
         reload_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -579,9 +579,14 @@ def _spawn_deferred_launchd_reload(
         f"  while :; do "
         f"    launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; _rc=$?; "
         f"    if [ $_rc -eq 0 ]; then _supervised=1; _reason='bootstrapped with no positive PID'; "
-        # Successful registration may not yet have a PID. Wait for supervision, not another bootstrap.
+        # Successful registration may not yet have a PID. Wait for supervision only while the label remains registered;
+        # macOS can report a successful bootstrap without registering the label at all.
         f"      while :; do if {listed}; then break; fi; "
-        f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; break; fi; "
+        f"        if ! launchctl list {q_label} >/dev/null 2>&1; then "
+        f"          _supervised=0; _rc=not-registered; _reason='bootstrap returned 0 but label was not registered'; break; fi; "
+        f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; "
+        f"      if [ $_supervised -eq 1 ]; then break; fi; "
+        f"    fi; "
         f"    _remaining=$((_deadline - $(date +%s))); if [ $_remaining -le 0 ]; then break; fi; "
         f"    echo \"[{stamp}] bootstrap failure ($_rc) for {q_target} — retrying\" >> {q_log}; "
         # Clip the growing delay to the remaining budget, then make one final attempt after that sleep.
