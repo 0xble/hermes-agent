@@ -137,6 +137,82 @@ def test_recycled_setsid_group_with_recorded_leader_is_not_signalled(monkeypatch
     killpg.assert_not_called()
 
 
+@pytest.mark.platforms("posix")
+def test_exited_replacement_leader_cannot_authorize_unwitnessed_survivor(monkeypatch):
+    """SID/PGID reuse remains unsafe after the replacement setsid leader exits."""
+    pid = 757575
+    original = Mock(pid=pid)
+    original.is_running.return_value = False
+    original.create_time.return_value = 100.0
+    survivor = Mock(pid=757576)
+    survivor.is_running.return_value = True
+    survivor.status.return_value = psutil.STATUS_RUNNING
+    survivor.create_time.return_value = 300.0
+    lifecycle._stdio_pids[pid] = "test"
+    lifecycle._stdio_processes[pid] = {pid: original}
+    lifecycle._stdio_pgids[pid] = pid
+    lifecycle._stdio_sessions[pid] = pid
+    # Both leaders are gone: only the replacement's child remains, with the
+    # same numeric SID/PGID but no connection to a recorded incarnation.
+    monkeypatch.setattr(psutil, "process_iter", lambda: [survivor])
+    monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid)
+    monkeypatch.setattr(lifecycle.os, "getsid", lambda _: pid)
+    kill, killpg, wait = Mock(), Mock(), Mock(return_value=([], [survivor]))
+    monkeypatch.setattr(lifecycle.os, "kill", kill)
+    monkeypatch.setattr(lifecycle.os, "killpg", killpg)
+    monkeypatch.setattr(psutil, "wait_procs", wait)
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool._update_death_supervisor",
+        lambda verb, pgids: calls.append((verb, set(pgids))),
+    )
+    server = SimpleNamespace(name="test")
+
+    transport.MCPServerTransportMixin._release_spawned_children(server, {pid})
+    lifecycle._kill_orphaned_mcp_children()
+
+    killpg.assert_not_called()
+    kill.assert_not_called()
+    survivor.send_signal.assert_not_called()
+    original.send_signal.assert_not_called()
+    wait.assert_not_called()
+    assert not any(pid in pgids for verb, pgids in calls if verb == "unregister")
+
+
+@pytest.mark.platforms("posix")
+def test_active_group_without_spawn_witness_is_not_signalled(monkeypatch):
+    """Failed process capture must not turn numeric SID/PGID into ownership."""
+    pid = 767676
+    survivor = Mock(pid=767677)
+    survivor.is_running.return_value = True
+    survivor.status.return_value = psutil.STATUS_RUNNING
+    survivor.create_time.return_value = 300.0
+    lifecycle._stdio_pids[pid] = "test"
+    lifecycle._stdio_processes[pid] = {}
+    lifecycle._stdio_pgids[pid] = pid
+    lifecycle._stdio_sessions[pid] = pid
+    monkeypatch.setattr(psutil, "process_iter", lambda: [survivor])
+    monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid)
+    monkeypatch.setattr(lifecycle.os, "getsid", lambda _: pid)
+    kill, killpg, wait = Mock(), Mock(), Mock(return_value=([], [survivor]))
+    monkeypatch.setattr(lifecycle.os, "kill", kill)
+    monkeypatch.setattr(lifecycle.os, "killpg", killpg)
+    monkeypatch.setattr(psutil, "wait_procs", wait)
+    calls = []
+    monkeypatch.setattr(
+        "tools.mcp_tool._update_death_supervisor",
+        lambda verb, pgids: calls.append((verb, set(pgids))),
+    )
+
+    lifecycle._kill_orphaned_mcp_children(include_active=True)
+
+    killpg.assert_not_called()
+    kill.assert_not_called()
+    survivor.send_signal.assert_not_called()
+    wait.assert_not_called()
+    assert not any(pid in pgids for verb, pgids in calls if verb == "unregister")
+
+
 def test_unverifiable_live_group_is_not_unregistered(monkeypatch):
     """A live group whose member identity cannot be read stays supervised."""
     pid = 737373

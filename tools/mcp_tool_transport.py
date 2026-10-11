@@ -336,8 +336,7 @@ class MCPServerTransportMixin:
                 original = _stdio_processes.get(pid, {})
                 members = _lifecycle._owned_mcp_processes(
                     original, pgid, os.getpgrp() if hasattr(os, "getpgrp") else None,
-                    leader_pid=pid, session_id=session_id,
-                    allow_unwitnessed_session=True,
+                    session_id=session_id,
                 )
                 # Keep the original leader handle as well as any late-discovered
                 # members so a later sweep refreshes only through live witnesses.

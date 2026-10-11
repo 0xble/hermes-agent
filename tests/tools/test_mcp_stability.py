@@ -354,12 +354,12 @@ class TestStdioPgroupReaping:
         reason="POSIX-only: requires os.killpg and os.setsid",
     )
     def test_grandchild_reaped_via_pgroup(self, tmp_path):
-        """A late child of a tracked wrapper is reaped after the wrapper exits.
+        """A late child witnessed at release is reaped after the wrapper exits.
 
         The wrapper is tracked before it creates the long-lived helper, matching
-        mcp-remote/npx: the spawn-time ledger has no descendant witness, so the
-        release-time session check must discover the helper without trusting a
-        recycled numeric PGID.
+        mcp-remote/npx. Release must capture the helper while the recorded wrapper
+        incarnation is still live; once that last witness exits, numeric SID/PGID
+        alone cannot distinguish this group from a recycled group.
         """
         import subprocess
         import sys
@@ -403,9 +403,13 @@ class TestStdioPgroupReaping:
             assert psutil.pid_exists(grandchild_pid)
             assert os.getpgid(grandchild_pid) == parent_pgid
 
+            # Preserve a descendant incarnation through the live recorded leader,
+            # then prove it remains usable after that leader has exited.
+            MCPServerTransportMixin._release_spawned_children(server, {parent.pid})
+            from tools.mcp_tool_lifecycle import _stdio_processes
+            assert grandchild_pid in _stdio_processes[parent.pid]
             parent.stdin.close()
             parent.wait(timeout=15)
-            MCPServerTransportMixin._release_spawned_children(server, {parent.pid})
             assert parent.pid in _orphan_stdio_pids
             assert psutil.pid_exists(grandchild_pid), "grandchild died before the reaper ran"
 
