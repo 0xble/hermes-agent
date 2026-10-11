@@ -15,6 +15,7 @@ LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
 # Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
 DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
+DEFAULT_CRON_MAX_PARALLEL_JOBS = 4
 
 
 def _aux(timeout, *, reasoning_effort=True, **extra):
@@ -1903,9 +1904,11 @@ DEFAULT_CONFIG = {
         # untouched. User-written bare platforms address home conversations, unlike `all`
         # broadcast expansions, which do not gain mirror eligibility.
         "mirror_delivery": False,
-        # Max due jobs run in parallel per tick. None/0 = unbounded (thread count only); 1 = serial.
+        # Max due jobs run in parallel per tick; 0 = unbounded (thread count only), 1 = serial.
+        # Bounded by default: after a restart every missed job is due on the first tick, and an
+        # unbounded fan-out saturates state.db writes alongside the resumed turns.
         # Env override: HERMES_CRON_MAX_PARALLEL.
-        "max_parallel_jobs": None,
+        "max_parallel_jobs": DEFAULT_CRON_MAX_PARALLEL_JOBS,
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,

@@ -3935,11 +3935,14 @@ class TestOptimizeFts:
         db.create_session(session_id="s1", source="cli")
         db.append_message(session_id="s1", role="user", content="bounded merge")
         statements = []
-        db._conn.set_trace_callback(statements.append)
+        # The merge runs on the maintenance connection, off the writer lock.
+        with db._maintenance_conn() as maintenance:
+            maintenance.set_trace_callback(statements.append)
         try:
             executed = db._merge_fts_incrementally(max_pages=37)
         finally:
-            db._conn.set_trace_callback(None)
+            with db._maintenance_conn() as maintenance:
+                maintenance.set_trace_callback(None)
 
         # At least one merge command per present FTS index, and never more
         # than the per-pass command cap per index.

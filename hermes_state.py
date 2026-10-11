@@ -58,6 +58,7 @@ from hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
+from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
 from hermes_state_dbfile import (
     _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -458,6 +459,30 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 # one-shots, recovery flows, and read-only cross-profile opens use SessionDB() directly with their own close().
 
 
+@contextmanager
+def _storage_write_in_progress():
+    """Mark this thread as inside a SessionDB write (queued on the writer lock, retrying a busy
+    database, or committing). The turn-liveness watchdog does not count that time as a stalled
+    turn: under write contention a turn can queue behind dozens of writers for minutes."""
+    thread = threading.current_thread()
+    depth = getattr(thread, "_hermes_storage_write_depth", 0)
+    thread._hermes_storage_write_depth = depth + 1
+    try:
+        yield
+    finally:
+        thread._hermes_storage_write_depth = depth
+        thread._hermes_storage_write_ended_at = time.time()
+
+
+def storage_write_activity(thread_id: Optional[int]) -> Tuple[bool, Optional[float]]:
+    """``(in_progress, last_ended_at)`` of SessionDB writes on thread *thread_id*."""
+    thread = threading._active.get(thread_id) if thread_id is not None else None  # noqa: SLF001
+    if thread is None:
+        return False, None
+    return (getattr(thread, "_hermes_storage_write_depth", 0) > 0,
+            getattr(thread, "_hermes_storage_write_ended_at", None))
+
+
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
@@ -578,6 +603,7 @@ class SessionDB(
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
+        check_loop_thread("SessionDB open")
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
@@ -593,7 +619,7 @@ class SessionDB(
             pass  # Diagnostic metadata must not prevent opening the database.
         finally:
             del caller
-        self._lock = threading.Lock()
+        self._lock = LoopGuardedLock("SessionDB writer lock")
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
@@ -628,6 +654,11 @@ class SessionDB(
         self._retire_connection: Optional[Callable[[Any], None]] = None
         self._connection_pinned = False  # one unmatched C reference taken at most once per handle
         self._wal_lock_guard: dict = {}  # hermes_state_lockguard.hold() record, see _open_writer
+        # Periodic checkpoints run on their own connection, outside self._lock (see _try_wal_checkpoint).
+        # Lock order: _checkpoint_lock before self._lock.
+        self._checkpoint_lock = threading.Lock()
+        self._checkpoint_conn: Optional[sqlite3.Connection] = None
+        self._checkpoint_conn_writer: Any = None  # the writer connection it was opened beside
         self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
         self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
         self._fts_enabled = self._fts_stale = self._trigram_available = False
@@ -995,6 +1026,13 @@ class SessionDB(
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
     ) -> T:
+        """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
+        with _storage_write_in_progress():
+            return self._execute_write_marked(fn, patience_s)
+
+    def _execute_write_marked(
+        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+    ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
@@ -1013,20 +1051,25 @@ class SessionDB(
         ioerr_begin_retried = False
         while True:
             self._raise_if_db_corrupt(storage=True)
-            # NOTE: the replaced/generation live probe runs INSIDE the lock below,
-            # not here. close() mutates _conn and _db_sidecar_identity under that
-            # same lock, ending the WAL generation (SQLite unlinks the -wal/-shm
-            # sidecars on a clean close). A lock-free probe that races close() can
-            # observe the mid-teardown state — sidecars already unlinked while
-            # _db_sidecar_identity is not yet cleared — and misclassify this
-            # process's OWN clean close as an externally deleted generation,
-            # raising a sticky DeletedWalGenerationError that permanently refuses
-            # later writes (#105567). Inside the lock the probe only ever sees the
-            # stable post-close state (identity cleared → adopt / reopen path).
+            # NOTE: the AUTHORITATIVE replaced/generation probe runs INSIDE the lock below.
+            # close() mutates _conn and _db_sidecar_identity under that same lock, ending the
+            # WAL generation (SQLite unlinks the -wal/-shm sidecars on a clean close). A
+            # lock-free probe that races close() can observe the mid-teardown state — sidecars
+            # already unlinked while _db_sidecar_identity is not yet cleared — and misclassify
+            # this process's OWN clean close as an externally deleted generation, raising a
+            # sticky DeletedWalGenerationError that permanently refuses later writes (#105567).
+            # The lock-free pre-probe below can therefore only CLEAR the healthy path: any doubt
+            # (a mismatch, nothing recorded, an error) defers to the in-lock probe, which only
+            # ever sees the stable post-close state. Its stat()/pread syscalls stall in the
+            # kernel on a saturated disk, and under the lock that stalled every queued writer.
+            generation_clean = self._db_generation_probe_clean()
             fn_started = False
             try:
                 with self._lock:
-                    self._raise_if_db_replaced()
+                    if generation_clean:
+                        self._raise_if_db_generation_flagged()
+                    else:
+                        self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -1308,11 +1351,39 @@ class SessionDB(
 
     def _raise_if_db_replaced(self) -> None:
         """Sticky-flag fast path (no log spam on every write), then the live probe."""
+        self._raise_if_db_generation_flagged()
+        self._halt_if_db_generation_changed()
+
+    def _raise_if_db_generation_flagged(self) -> None:
+        """The sticky replaced / lost-generation flags only (no filesystem syscalls)."""
         if self._db_replaced:
             raise StateDbReplacedError(_STATE_DB_REPLACED_MSG)
         if self._db_wal_generation_lost:
             raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
-        self._halt_if_db_generation_changed()
+
+    def _db_generation_probe_clean(self) -> bool:
+        """Lock-free healthy-path probe for writes: True only when the main file and every
+        recorded sidecar still carry the identities recorded under ``self._lock`` and the
+        header's application_id still matches. Pure (never adopts, never flags): any doubt
+        returns False so the authoritative probe runs under the lock (see _execute_write_marked)."""
+        if self._db_replaced or self._db_wal_generation_lost:
+            return False
+        try:
+            recorded_main, recorded_sidecars = self._db_file_identity, self._db_sidecar_identity
+            if recorded_main is None or (self._wal_active and not recorded_sidecars):
+                return False
+            if _stat_db_file_identity(self.db_path) != recorded_main:
+                return False
+            recorded_app = int(self._db_file_application_id or 0)
+            if recorded_app:
+                disk_app = _read_sqlite_application_id(self.db_path)
+                if disk_app and disk_app != recorded_app:
+                    return False
+            base = os.fspath(self.db_path)
+            return all(_stat_db_file_identity(Path(base + suffix)) == ident
+                       for suffix, ident in (recorded_sidecars or {}).items())
+        except Exception:
+            return False
 
     @classmethod
     def _is_structural_corruption_error(cls, exc: BaseException) -> bool:
@@ -1473,20 +1544,55 @@ class SessionDB(
 
         Previous TRUNCATE strategy caused B-tree corruption on large databases (65K+ pages) due to the
         exclusive-lock I/O pressure from checkpointing thousands of frames at once (issue #45383).
+
+        It runs on a dedicated connection WITHOUT ``self._lock``. A PASSIVE checkpoint needs no pause
+        in this process's writes, but on macOS ``checkpoint_fullfsync`` makes it wait for the whole
+        device's dirty data: under the writer lock, a busy disk stalled every Hermes writer (and the
+        loop-thread waits behind them) for the checkpoint's duration. The fullfsync barrier itself is
+        unchanged. One checkpoint runs at a time; a concurrent request skips to the next period.
         """
         if self._quarantine_reason() is not None:
             return
         try:
-            with self._lock:
-                if self._conn is None:
-                    return  # closed underneath the timer: nothing to checkpoint, nothing to re-guard
-                if self._wal_lock_guard:
-                    _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
-                result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            with self._maintenance_conn(blocking=False) as conn:
+                if conn is None:
+                    return  # closed underneath the timer, or another maintenance pass is running
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 if result and result[1] > 0:
                     logger.debug("WAL checkpoint: %d/%d pages checkpointed", result[2], result[1])
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
+
+    @contextmanager
+    def _maintenance_conn(self, *, blocking: bool = True) -> Iterator[Optional[sqlite3.Connection]]:
+        """The dedicated maintenance connection (periodic checkpoint, incremental FTS merge), held
+        exclusively for the block and used WITHOUT ``self._lock``. Yields None when the handle is
+        closed or read-only, or when *blocking* is False and another maintenance pass holds it."""
+        if not self._checkpoint_lock.acquire(blocking=blocking):
+            yield None
+            return
+        try:
+            yield self._checkpoint_conn_for_current_writer()
+        finally:
+            self._checkpoint_lock.release()
+
+    def _checkpoint_conn_for_current_writer(self) -> Optional[sqlite3.Connection]:
+        """The checkpoint connection beside the live writer, (re)opened when the writer was replaced.
+        Caller holds ``_checkpoint_lock``. Opening and closing descriptors on state.db happens under
+        ``self._lock`` so it pairs with the WAL lock guard exactly like a writer reopen."""
+        if self._checkpoint_conn is not None and self._checkpoint_conn_writer is self._conn:
+            return self._checkpoint_conn
+        with self._lock:
+            if self._conn is None or self.read_only:
+                return None
+            stale, self._checkpoint_conn = self._checkpoint_conn, None
+            if stale is not None:
+                self._close_connection_quietly(stale)
+            conn = self._open_writer_conn()
+            if self._wal_lock_guard:
+                _lockguard.hold(self.db_path, self._wal_lock_guard)  # its -shm/db descriptors too
+            self._checkpoint_conn, self._checkpoint_conn_writer = conn, self._conn
+            return conn
 
     def __enter__(self) -> "SessionDB":
         """``with SessionDB(path) as db:`` closes on exit; owners must release deterministically.
@@ -1531,7 +1637,9 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
-        with self._lock:
+        with self._checkpoint_lock, self._lock:  # an in-flight periodic checkpoint finishes first
+            checkpoint_conn, self._checkpoint_conn = self._checkpoint_conn, None
+            self._checkpoint_conn_writer = None
             if self._conn:
                 generation_lost = not self.read_only and (
                     self._db_wal_generation_lost
@@ -1558,9 +1666,15 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                if checkpoint_conn is not None and not retire_without_close:
+                    # Closed while the guard still holds, like a read-pool connection: its close
+                    # cannot cancel this handle's protection of the live generation.
+                    self._close_connection_quietly(checkpoint_conn)
                 _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
+                    if checkpoint_conn is not None:
+                        self._retire_connection(checkpoint_conn)  # its descriptors stay with the writer's
                     self._conn = None
                 else:
                     conn, self._conn = self._conn, None
@@ -1568,6 +1682,8 @@ class SessionDB(
                     # Only a clean close ends the generation; retain the recorded
                     # identity when retiring an unsafe handle.
                     self._db_sidecar_identity = {}
+            elif checkpoint_conn is not None:
+                self._close_connection_quietly(checkpoint_conn)
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
 
     def __del__(self) -> None:

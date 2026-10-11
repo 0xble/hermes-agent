@@ -30,6 +30,24 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolate_camofox_leases(tmp_path, monkeypatch):
+    """Keep Camofox lease files inside the per-test directory, never the host state dir."""
+    from tools import browser_camofox_leases as leases
+
+    monkeypatch.setattr(leases, "_lease_root", lambda: tmp_path / "camofox-tab-leases")
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+    yield
+    with leases._lock:
+        for server, user_id, tab_id in list(leases._handles):
+            leases.release(server, user_id, tab_id)
+        leases._local_claims.clear()
+
+
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -1504,6 +1522,21 @@ _REAL_INSTALLED_GUI_APPS = sorted({
     os.path.normcase(form) for app in packaged_gui_app_paths() if os.path.lexists(app)
     for form in (os.path.abspath(app), os.path.realpath(app))})
 
+# Installer destinations are account-scoped, outside HERMES_HOME. Capture both HOME and
+# the native account home before fixtures replace either, including currently absent dirs.
+_HOST_ACCOUNT_HOMES = {Path.home()}
+try:
+    import pwd
+    _HOST_ACCOUNT_HOMES.add(Path(pwd.getpwuid(os.getuid()).pw_dir))  # windows-footgun: ok — optional POSIX lookup after import pwd
+except (ImportError, KeyError, OSError):
+    pass
+_REAL_HOST_INSTALL_DIRS = sorted({
+    os.path.normcase(form)
+    for home in _HOST_ACCOUNT_HOMES
+    for directory in (home / ".local" / "bin", home / "Library" / "LaunchAgents")
+    for form in (os.path.abspath(directory), os.path.realpath(directory))
+})
+
 
 @pytest.fixture(autouse=True)
 def _forbid_real_hermes_home_io(monkeypatch, request):
@@ -1516,7 +1549,42 @@ def _forbid_real_hermes_home_io(monkeypatch, request):
         return
     from tests.home_io_guard import HomeIOGuard
 
-    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: _REAL_INSTALLED_GUI_APPS).install(monkeypatch)
+    HomeIOGuard(lambda: _REAL_HERMES_ROOT_CANDIDATES, lambda: {
+        "installed Hermes desktop app": _REAL_INSTALLED_GUI_APPS,
+        "host installation directory": _REAL_HOST_INSTALL_DIRS,
+    }).install(monkeypatch)
+
+
+@pytest.fixture
+def isolated_machine_home(tmp_path_factory, monkeypatch):
+    """Machine-changing tests opt into disposable account and child paths."""
+    # Separate from tmp_path: tests that inspect their fixture directory must not see
+    # the harness's home. Shell/native children inherit the same destination.
+    home = tmp_path_factory.mktemp("installer-home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+    if os.name == "nt":
+        for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
+            target = home / "AppData" / directory
+            target.mkdir(parents=True)
+            monkeypatch.setenv(name, str(target))
+    else:
+        # launchd deliberately consults pwd before HOME so profile pinning cannot move
+        # a real user's service. Keep that production resolver intact inside the fixture.
+        import pwd
+
+        getpwuid = pwd.getpwuid
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only branch
+
+        def isolated_account(account_uid):
+            record = getpwuid(account_uid)
+            if account_uid == uid:
+                record = pwd.struct_passwd((*record[:5], str(home), record[6]))
+            return record
+
+        monkeypatch.setattr(pwd, "getpwuid", isolated_account)
+    return home
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@ import { sourceRuntimeSettleCommand } from '../../tests/install/e2e-assets/sourc
 import { assertUpdateWindowBackendOrigin, assertUpdateWindowProcess } from '../../tests/install/e2e-assets/update-window-chat.mjs'
 
 import { assertChatCommit, newCompletedPair, readMockPrompts, type TranscriptMessage } from './desktop-chat-smoke.ts'
-import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readInstallationCommit } from './desktop-smoke-process.ts'
+import { assertBackendOrigin, localBackendProcess, macosListeningPids, readBundledBundleEnv, readInstallationCommit } from './desktop-smoke-process.ts'
 import { writeEnvFile, writeMockProviderConfig } from './mock-provider-config.ts'
 import { MOCK_REPLY, startMockServer } from './mock-server.ts'
 
@@ -146,6 +146,26 @@ test.runIf(process.platform === 'linux')('origin proof finds the live child list
     expect((): void => assertBackendOrigin(backend, os.tmpdir(), 'source')).toThrow('source tree')
     expect((): void => { localBackendProcess(port, child.pid!) }).toThrow('found 0')
   } finally { child.kill(); await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) }) }
+})
+
+test('macOS listener discovery skips empty ownership and intersects eligible PIDs with the port', (): void => {
+  const calls: Array<{ command: string; args: string[] }> = []
+
+  const query = (command: string, args: string[]): string => {
+    calls.push({ command, args })
+
+    return 'p42\nf7\np84\n'
+  }
+
+  expect(macosListeningPids(31337, [], query)).toEqual([])
+  expect(calls).toEqual([])
+  expect(macosListeningPids(31337, [42, 84], query)).toEqual([42, 84])
+  expect(calls).toEqual([{ command: '/usr/sbin/lsof', args: ['-nP', '-a', '-p', '42,84', '-iTCP:31337', '-sTCP:LISTEN', '-Fp'] }])
+
+  const noMatches = Object.assign(new Error('no matches'), { status: 1, stdout: '', stderr: '' })
+  expect(macosListeningPids(31337, [42], () => { throw noMatches })).toEqual([])
+  const nativeFailure = Object.assign(new Error('native failure'), { status: 1, stdout: '', stderr: 'permission denied' })
+  expect(() => macosListeningPids(31337, [42], () => { throw nativeFailure })).toThrow(nativeFailure)
 })
 
 test.runIf(process.platform === 'linux' || process.platform === 'darwin')('a shared host listener is proven by this home ledger, not Electron ancestry', async (): Promise<void> => {

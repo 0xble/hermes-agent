@@ -1321,6 +1321,7 @@ class TestDoctorXaiOAuthStatus:
 
 
 
+@pytest.mark.usefixtures("isolated_machine_home")
 class TestDoctorStaleMaxIterationsDrift:
     """Regression for #17534: a stale HERMES_MAX_ITERATIONS in .env shadows
     agent.max_turns in config.yaml. The repro symptom is config.yaml saying

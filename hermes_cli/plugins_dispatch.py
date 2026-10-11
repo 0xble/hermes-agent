@@ -11,6 +11,7 @@ import contextvars
 import copy
 import inspect
 import logging
+import os
 import queue
 import re
 import threading
@@ -56,6 +57,13 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 # Live workers a hung callback may accumulate before it is skipped outright (#105223 / #98382).
 _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
+
+
+def _callback_identity(cb: Callable) -> str:
+    """An attributable callback label without inspecting its arguments or instance state."""
+    module = getattr(cb, "__module__", type(cb).__module__)
+    name = getattr(cb, "__qualname__", type(cb).__qualname__)
+    return f"{module}.{name} [pid={os.getpid()}]"
 # A shell hook's wrapper cap sits this far above the spec's own subprocess timeout — the kill plus
 # pipe drain that follows a ``communicate`` expiry — so the shell layer's fail-open/fail-closed
 # decision is always the one that counts (#132096).
@@ -66,7 +74,7 @@ def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseExcepti
     """Block directive for a fail-closed hook whose callback raised: names the callback and the
     error (truncated — a hook that embeds tool args in its exception must not grow the tool
     result) so the operator can tell a crashing guard from a slow one."""
-    callback_name = getattr(cb, "__name__", repr(cb))
+    callback_name = _callback_identity(cb)
     return {"action": "block",
             "message": f"{hook_name} plugin callback {callback_name} raised {type(exc).__name__}: {str(exc)[:200]}"}
 
@@ -280,7 +288,7 @@ class PluginDispatchMixin:
         truncates the message so a hook that embeds tool args in its error cannot grow the set
         per call; the set is cleared on unload alongside the timeout-suppression map.
         """
-        callback_name = getattr(cb, "__name__", repr(cb))
+        callback_name = _callback_identity(cb)
         key = (hook_name, getattr(cb, "__module__", ""), getattr(cb, "__qualname__", callback_name),
                type(exc).__name__, str(exc)[:200])
         if key in self._hook_failures_reported:
@@ -298,7 +306,7 @@ class PluginDispatchMixin:
         suppressed, still running for this call id, over the abandoned-worker cap, timed out
         (worker abandoned, never joined), or the worker could not be started. Exceptions
         propagate."""
-        callback_name = getattr(cb, "__name__", repr(cb))
+        callback_name = _callback_identity(cb)
         # Suppression is a fact about the CALLBACK — a hung one must keep its back-off —
         # so that key stays coarse. The gate must instead tell CONCURRENT CALLS apart.
         suppression_key = (hook_name, id(cb))

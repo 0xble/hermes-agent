@@ -8,9 +8,14 @@ Fork patch identity: `state-db-lock-turn-survival`.
 
 ## Required behavior
 
-- A turn-lease refresh that hits a SQLite lock is a missed tick, not a lost lease. The
-  turn keeps running while the next renewal can still land before the row's committed
-  expiry. Once it cannot, the turn stops before a successor can reclaim the row.
+- A turn-lease refresh that hits a SQLite lock is a missed tick, not a lost lease. Before
+  the row's committed expiry the turn simply retries. Past it, each locked tick reads the
+  row (WAL reads never wait on the writer). The turn keeps running while the row still
+  names its holder, and it stops only when another holder has taken the row. The renewal
+  that finally lands is holder-qualified, so a successor that claimed the row in between
+  fails that renewal and stops the turn. This post-expiry tolerance is a fork change
+  (`gateway-loop-statedb-guard`, 2026-10-11). Upstream #134577 stops at expiry, which
+  killed about 10 resumed 9-35 minute turns at once under the restart herd.
 - When the post-tool flush fails and the tool round exits `session_persistence_failed`,
   the finalizer keeps that reason and its cause (`session_persistence_failed:locked`).
   The silent-tool-tail close must not overwrite it with `pending_tool_result`.

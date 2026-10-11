@@ -290,6 +290,39 @@ worker in its suite, or when pytest copies `loggerDict` before iterating it.
 
 ## Verification and retirement
 
+The host-installation tripwire also protects the captured account's `.local/bin`
+and `Library/LaunchAgents` from Python writes, removals and link publication.
+Reads remain available for command and service discovery. Script/installer tests
+own a temporary machine home through `HOME`, `Path.home()` and the current-UID
+`pwd` lookup, and their ordinary subprocesses inherit that home. Ordinary tests
+may opt into the same fixture when a real repair also publishes machine-level
+CLI paths, including the doctor stale-iterations repair regression. Other tests
+retain stable HOME semantics from upstream commit `ea8adb5e222d`; this is not a
+sandbox for native children that discard the fixture environment.
+
+Desktop smoke listener discovery on macOS intersects its existing ownership
+candidates with the listening port before opening process descriptors, and skips
+the native query when there are no candidates. This keeps unrelated host processes
+outside fixture discovery while retaining the OS-listener and provenance checks.
+
+Two disposable regressions were red on `cc277b4e2ffe`: host-installation paths
+were mutable, and installer subprocess destinations used the operator's home.
+Run `scripts/run_tests.sh tests/hermes_cli/test_real_home_tripwire.py
+tests/scripts/test_installer_home_isolation.py` for the boundary, then the full
+`tests/scripts` subsystem. Check the doctor opt-in with
+`scripts/run_tests.sh tests/hermes_cli/test_doctor.py -k TestDoctorStaleMaxIterationsDrift`.
+The Node gate covers `tests-js/scripts/desktop-smoke.test.ts`, including native
+host-ledger ownership and candidate-scoped discovery. Related upstream [PR #111453](https://github.com/NousResearch/hermes-agent/pull/111453)
+isolates individual host-service leaks, and [PR #76464](https://github.com/NousResearch/hermes-agent/pull/76464)
+skips legacy Node link publication during recovery. Both are merged, but neither
+replaces this shared write boundary. No new upstream contribution is claimed.
+Retire this adaptation when the accepted upstream release protects those
+destinations and installer machine homes through equivalent executable coverage.
+Rollback removes the added host-directory registry, restores the guard's app-only
+write callback, and removes the shared machine-home fixture, its consumers and
+regression. Reverting candidate-scoped native discovery restores the prior smoke
+helper without changing product runtime.
+
 The qualified checkpoint `ca6782850432927f33df4775cb6dd45bb51460d2`
 adds real-process Kanban and tenancy fixtures. Their OS home is separate from
 their explicit Hermes home so native service discovery assigns a unique profile

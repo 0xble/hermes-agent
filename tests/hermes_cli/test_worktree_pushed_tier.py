@@ -257,6 +257,27 @@ class TestCronWorktreeMaintenance:
 
         assert len(calls) == 1
 
+    def test_first_pass_waits_past_boot(self, monkeypatch):
+        """A boot already saturates disk and state.db: the first prune waits out the boot delay."""
+        import cron.scheduler as sched
+
+        calls = []
+        boot = time.monotonic()
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
+                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS
+                            + sched._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS)
+        monkeypatch.setattr(
+            sched.threading, "Thread",
+            lambda *a, **k: type("T", (), {"start": lambda self: calls.append(k.get("name"))})(),
+        )
+        sched._maybe_run_worktree_maintenance()
+        assert calls == []
+        # Once the boot delay has elapsed, the first pass runs.
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at",
+                            boot - sched._WORKTREE_MAINTENANCE_INTERVAL_SECONDS - 1)
+        sched._maybe_run_worktree_maintenance()
+        assert calls == ["cron-worktree-prune"]
+
     def test_repo_discovery_requires_worktrees_dir(self, monkeypatch, tmp_path):
         import cron.scheduler as sched
 
