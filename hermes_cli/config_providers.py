@@ -399,9 +399,24 @@ def get_custom_provider_billing_mode(base_url: str, provider: str) -> str:
     Entries come from the existing profile-scoped loader; do not cache by URL alone.
     Sharing a loopback host is not evidence that a route is subscription-backed.
     """
+    from hermes_cli.config import load_config_readonly
     from hermes_cli.providers import custom_provider_aliases
 
-    entries = list(_entries_for_route(base_url, None, None))
+    try:
+        config = load_config_readonly()
+    except Exception:
+        return ""
+    # The picker dedupes by display name/URL/model, which can hide a metered alias.
+    # Billing requires every enabled declaration, not that lossy display view.
+    candidates = providers_dict_to_custom_providers(config.get("providers"))
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if is_provider_enabled(entry):
+                normalized = _normalize_custom_provider_entry(entry)
+                if normalized is not None:
+                    candidates.append(normalized)
+    entries = list(_entries_for_route(base_url, candidates, config))
     if provider not in {"custom", "local"}:
         entries = [entry for entry in entries if provider in custom_provider_aliases(
             entry.get("name", ""), entry.get("provider_key", ""))]

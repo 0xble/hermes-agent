@@ -22,9 +22,20 @@ read [that unit](provider-reported-cost.md) when changing the priced path.
   read the same enabled route identity and profile-scoped configuration as other
   provider metadata. Named custom aliases match their own entry and URL. Bare
   `custom` is included only when all enabled entries at that exact URL opt in.
+  Billing reads every declaration in `providers` and legacy `custom_providers`,
+  without the picker's display-name/URL/model deduplication. Distinct aliases
+  with identical display names remain separate billing evidence.
+- Review repair: P1 on draft fork PR #478 demonstrated that picker deduplication
+  hid an undeclared/metered alias behind an included alias at the same URL. Keep
+  the existing normalization and enabled-entry rules, but evaluate unanimity
+  before any display deduplication. This is a fork-only correction to the same
+  configuration integration; the recorded upstream preflight remains applicable.
 - Regression proof: `tests/agent/test_custom_subscription_cost.py` exercises both
   config shapes, named/bare routes, same-process profile A/B/A switching, and
-  real main-turn SessionDB persistence. Existing
+  real main-turn SessionDB persistence. Shared display-name regressions cover
+  both declaration orders, each config shape and mixed legacy/keyed entries,
+  normalized trailing-slash URLs, disabled declarations, and positive reported
+  costs. Existing
   `tests/hermes_state/test_provider_reported_cost.py` exercises positive provider
   charges and nonzero main-turn actual cost persistence; nested/flat response
   parsing is covered by `tests/agent/test_usage_pricing.py`.
@@ -48,6 +59,33 @@ providers:
 Merge these fields into the existing entries; preserve every credential and
 other setting. Legacy `custom_providers` list entries support the same field.
 These settings affect future recording only, not historical unknown rows.
+
+An explicit `subscription_included` declaration intentionally takes precedence
+over a positive generic `raw_usage.cost`: subscription proxies may forward a
+list-price token valuation that is not an additional user charge. The recorded
+amount is marginal spend, not that valuation. Use this declaration only for a
+route whose requests are covered by the subscription; an actually metered route
+must omit it. Ambiguous bare routes do not qualify, so their positive reported
+cost remains `actual` / `provider_cost_api`. Provider-profile-specific cost
+results retain their existing precedence; this patch does not change them.
+
+## P1 regression evidence
+
+At `d20c7b4b2f276acdfa84f52f7e995e3769bac8c1`, the shared-display-name
+regression was RED before changing the implementation. After reading the raw
+route declarations, the same selection was GREEN:
+
+```text
+RED:   Summary: 1 files, 1 tests passed, 5 failed, 1 file FAILED (100% complete) in 1.7s (14 workers)
+GREEN: Summary: 1 files, 6 tests passed, 0 failed (100% complete) in 1.3s (14 workers)
+```
+
+Both used `scripts/run_tests.sh tests/agent/test_custom_subscription_cost.py -k
+shared_display_names` through the machine-wide heavy-slot gate and the private
+worktree `.venv`. The full focused run (subscription, usage pricing,
+provider-reported persistence, config, and non-mutating normalization) passed
+274 tests with 0 failures and 4 Windows-only skips on macOS. Ruff and
+`scripts/check_fork_patches.py` passed.
 
 ## Update and retirement
 

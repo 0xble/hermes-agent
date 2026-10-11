@@ -90,6 +90,58 @@ def test_subscription_requires_exact_enabled_route_and_unambiguous_bare_custom(t
     assert resolve_billing_route(MODEL, provider="openai-codex").billing_mode == "subscription_included"
 
 
+@pytest.mark.parametrize("shape", ["providers", "custom_providers", "mixed"])
+@pytest.mark.parametrize("included_first", [True, False])
+def test_shared_display_names_do_not_hide_metered_billing(tmp_path, monkeypatch, shape, included_first):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    entries = {
+        "included": {"name": "Proxy", "base_url": URL, "billing_mode": "subscription_included"},
+        "metered": {"name": "Proxy", "base_url": URL + "/"},
+    }
+    if not included_first:
+        entries = dict(reversed(list(entries.items())))
+    if shape == "mixed":
+        first, second = entries.items()
+        config = {"custom_providers": [first[1]], "providers": {second[0]: second[1]}}
+    else:
+        config = {shape: entries if shape == "providers" else list(entries.values())}
+    (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+    usage = CanonicalUsage(input_tokens=1000, output_tokens=50, raw_usage={"cost": 0.25})
+    result = estimate_usage_cost(MODEL, usage, provider="custom", base_url=URL)
+    assert (result.status, result.source, result.amount_usd) == ("actual", "provider_cost_api", 0.25)
+    for provider in ("custom", "local", "custom:Proxy"):
+        assert resolve_billing_route(MODEL, provider=provider, base_url=URL).billing_mode == "unknown"
+    # A keyed route still owns its declaration even when display names collide.
+    if "included" in config.get("providers", {}):
+        result = estimate_usage_cost(MODEL, usage, provider="custom:included", base_url=URL)
+        assert (result.status, result.source, result.amount_usd) == ("included", "none", 0)
+    if "metered" in config.get("providers", {}):
+        result = estimate_usage_cost(MODEL, usage, provider="custom:metered", base_url=URL)
+        assert (result.status, result.source, result.amount_usd) == ("actual", "provider_cost_api", 0.25)
+
+
+@pytest.mark.parametrize("shape", ["providers", "custom_providers"])
+@pytest.mark.parametrize("disabled", [False, " off ", 0])
+def test_disabled_declarations_do_not_veto_included_billing(tmp_path, monkeypatch, shape, disabled):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Disabled first: it must not mask the enabled declaration in either config shape.
+    entries = {
+        "metered": {"name": "Proxy", "url": URL + "/", "enabled": disabled},
+        "included": {"name": "Proxy", "api": URL, "billing_mode": "subscription_included"},
+    }
+    (home / "config.yaml").write_text(json.dumps({
+        shape: entries if shape == "providers" else list(entries.values()),
+    }), encoding="utf-8")
+    result = estimate_usage_cost(MODEL, CanonicalUsage(raw_usage={"cost": 0.25}),
+                                 provider="custom", base_url=URL)
+    assert (result.status, result.source, result.amount_usd) == ("included", "none", 0)
+
+
 def test_legacy_provider_migration_preserves_billing_declaration():
     from hermes_cli.config_providers import _custom_provider_entry_to_provider_config
 
