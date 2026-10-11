@@ -169,11 +169,17 @@ phase_stage() {
 
 find_installed_app() {
   # Require this installation's app, never an unrelated /Applications copy.
-  local cand
+  local cand executable
   for cand in \
     "$INSTALL_DIR/apps/desktop/release/mac-arm64/Hermes.app" \
     "$INSTALL_DIR/apps/desktop/release/mac/Hermes.app"; do
-    [ -d "$cand" ] && { printf '%s' "$cand"; return 0; }
+    [ -f "$cand/Contents/Info.plist" ] || continue
+    for executable in "$cand/Contents/MacOS/"*; do
+      [ -f "$executable" ] || continue
+      [ -x "$executable" ] || continue
+      printf '%s' "$cand"
+      return 0
+    done
   done
   return 1
 }
