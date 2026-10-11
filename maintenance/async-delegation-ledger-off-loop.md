@@ -35,6 +35,15 @@ calls are on `upstream/main` at `56f798641888`. The contribution branch is
 `upstream/async-delegation-ledger-off-loop`. The boot auto-resume path exists only in
 the fork.
 
+**Upstream PR (2026-10-10):** [PR 133834](https://github.com/NousResearch/hermes-agent/pull/133834)
+is a draft at `985238fe8778dcfb05b2027a02490b11aa6ead78`, rebased on upstream `9456670d`
+with the shutdown-refund fix. Its exact-head review approved it and local evidence passed. It
+cannot leave draft yet: GitHub refuses "Ready for review" because the author has reached the
+open pull request limit. It still refused at 37 ready PRs, after PR 106906 went back to
+draft. Each maintenance cycle, count the author's open ready PRs. Retry ready once the count is
+below 26, or earlier if a retry costs nothing. Rebase and re-review first if upstream moved.
+Do not draft other PRs to make room.
+
 ## Patch
 
 **Patch identity:** `async-delegation-ledger-off-loop`. Source surfaces:
