@@ -12,13 +12,17 @@ import sqlite3
 import sys
 import textwrap
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway import session_context
+from gateway.session_context import clear_session_vars, set_session_vars
+from agent.delegation_context import delegated_child_context
 from tools import mcp_tool, mcp_tool_discovery, mcp_tool_handlers, mcp_tool_loop
+from tools import mcp_tool_caller as caller
 
 CALLER = "hermes/caller"
 
@@ -191,7 +195,8 @@ def test_caller_identity_config_is_validated_like_other_booleans(monkeypatch, ca
 _mcp_server_mod = pytest.importorskip("mcp.server")
 
 
-def test_real_stdio_server_reads_identity_from_request_meta(home):
+@pytest.mark.parametrize("missing_cron_row", [False, True])
+def test_real_stdio_server_reads_identity_from_request_meta(home, missing_cron_row):
     """End to end over a real stdio MCP server: the request ``_meta`` it received names the
     calling turn, and a model-supplied ``_meta`` argument does not displace it."""
     if not hasattr(_mcp_server_mod, "MCPServer"):
@@ -199,7 +204,8 @@ def test_real_stdio_server_reads_identity_from_request_meta(home):
     from tools.mcp_tool_lifecycle import shutdown_mcp_servers
     from tools.registry import registry
 
-    _sessions_db(home, [("topic", "telegram", None), ("kid", "subagent", "topic")])
+    if not missing_cron_row:
+        _sessions_db(home, [("topic", "telegram", None), ("kid", "subagent", "topic")])
     script = home / "whoami_server.py"
     script.write_text(textwrap.dedent("""
         import json
@@ -222,7 +228,10 @@ def test_real_stdio_server_reads_identity_from_request_meta(home):
         result = {}
 
         def _turn():
-            _bind("kid", profile="")
+            if missing_cron_row:
+                session_context.set_session_vars(session_id="cron-missing", cron_session="1")
+            else:
+                _bind("kid", profile="")
             raw = registry.dispatch(tool, {"note": "n", "_meta": {CALLER: {"session_id": "forged"}}})
             result.update(json.loads(json.loads(raw)["result"]))
         thread = threading.Thread(target=_turn)
@@ -233,5 +242,65 @@ def test_real_stdio_server_reads_identity_from_request_meta(home):
 
     from hermes_cli.profiles import get_active_profile_name
     assert result["request_meta"][CALLER] == {
-        "profile": get_active_profile_name(), "session_id": "kid", "topic_session_id": "topic"}
+        "profile": get_active_profile_name(),
+        "session_id": "cron-missing" if missing_cron_row else "kid",
+        "topic_session_id": "cron-missing" if missing_cron_row else "topic"}
     assert result["note"] == "n"
+    if missing_cron_row:
+        assert not (home / "state.db").exists()
+
+
+def test_bound_cron_without_persistence_identifies_itself(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = set_session_vars(session_id="cron_missing", profile="default", cron_session="1")
+    try:
+        identity = caller.caller_identity_meta()[caller.CALLER_META_KEY]
+        assert identity == {"profile": "default", "session_id": "cron_missing",
+                            "topic_session_id": "cron_missing"}
+        assert not (tmp_path / "state.db").exists()
+        with delegated_child_context("child_missing"):
+            child = caller.caller_identity_meta()[caller.CALLER_META_KEY]
+            assert child["session_id"] == "child_missing"
+            assert child["topic_session_id"] is None
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_delegated_caller_resolves_nearest_non_subagent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT)")
+        conn.executemany("INSERT INTO sessions VALUES(?, ?, ?)", [
+            ("topic", "older_topic", "cron"), ("child", "topic", "subagent"),
+            ("grandchild", "child", "subagent"), ("older_topic", None, "telegram")])
+    tokens = set_session_vars(session_id="topic", profile="default", cron_session="1")
+    try:
+        with delegated_child_context("grandchild"):
+            identity = caller.caller_identity_meta()[caller.CALLER_META_KEY]
+            assert identity["session_id"] == "grandchild"
+            assert identity["topic_session_id"] == "topic"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_lineage_read_has_wall_clock_bound_and_only_one_stuck_worker(tmp_path, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def blocked_connect(*args, **kwargs):
+        calls.append(1)
+        entered.set()
+        release.wait(10)
+        raise sqlite3.OperationalError("unavailable")
+
+    monkeypatch.setattr(caller.sqlite3, "connect", blocked_connect)
+    monkeypatch.setattr(caller, "_DB_TIMEOUT_SECONDS", 0.1)
+    started = time.monotonic()
+    try:
+        assert caller._topic_session_id("child", tmp_path / "state.db") is None
+        assert entered.is_set()
+        assert caller._topic_session_id("another_child", tmp_path / "state.db") is None
+        assert len(calls) == 1
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()

@@ -220,6 +220,7 @@ def _iter_proc_fd_targets():
 _DARWIN_ALL_PIDS = 1
 _DARWIN_PIDLISTFDS = 1
 _DARWIN_PIDFDVNODEPATHINFO = 2
+_DARWIN_FDTYPE_VNODE = 1
 _DARWIN_PROC_FD_INFO_SIZE = 8  # struct proc_fdinfo { int32 proc_fd; uint32 proc_fdtype; }
 _DARWIN_FD_RECORD_SIZE = 1200  # PROC_PIDFDVNODEPATHINFO_SIZE
 # Field offsets inside that 1200-byte record.  libproc does not lay the header's structs out
@@ -238,6 +239,29 @@ _DARWIN_LIBPROC = None
 # can bound it: the whole pass runs in a daemon thread and is abandoned on
 # expiry, failing open per the guard's contract.
 _DARWIN_FD_SCAN_TIMEOUT_SECONDS = 5.0
+_DARWIN_FD_SCAN_COOLDOWN_SECONDS = 30.0
+_DARWIN_FD_SCAN_LOCK = threading.Lock()
+_DARWIN_FD_SCAN_WORKER = None
+_DARWIN_FD_SCAN_RETRY_AT = 0.0
+
+
+class _DarwinFDScan(threading.Thread):
+    """One shared descriptor enumeration, judged while each descriptor is current."""
+
+    def __init__(self):
+        super().__init__(name="sqlite-sidecar-holder-scan", daemon=True)
+        self.targets: List[Tuple[int, str, Tuple[int, int]]] = []
+        self.error: BaseException | None = None
+        self.cursor: Tuple[int | None, int | None, str] = (None, None, "proc_listpids")
+
+    def run(self):
+        try:
+            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+                if (target.casefold().endswith(("-wal", "-shm"))
+                        and _identity_is_truly_unlinked(identity, target)):
+                    self.targets.append((pid, target, identity))
+        except BaseException as exc:
+            self.error = exc
 
 
 def _darwin_libproc():
@@ -286,10 +310,13 @@ def _iter_darwin_fd_targets():
     import ctypes
 
     lib = _darwin_libproc()
+    scan = threading.current_thread()
     for pid in _darwin_all_pids(lib):
         size = 4096
         while True:
             listing = ctypes.create_string_buffer(size)
+            if isinstance(scan, _DarwinFDScan):
+                scan.cursor = (pid, None, "proc_pidinfo")
             used = lib.proc_pidinfo(pid, _DARWIN_PIDLISTFDS, 0, listing, size)
             if used <= 0:
                 break  # process gone, or not ours to inspect
@@ -299,8 +326,12 @@ def _iter_darwin_fd_targets():
         else:
             continue
         for offset in range(0, used - _DARWIN_PROC_FD_INFO_SIZE + 1, _DARWIN_PROC_FD_INFO_SIZE):
-            fd = struct.unpack_from("<i", listing.raw, offset)[0]
+            fd, fd_type = struct.unpack_from("<iI", listing.raw, offset)
+            if fd_type != _DARWIN_FDTYPE_VNODE:
+                continue
             record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
+            if isinstance(scan, _DarwinFDScan):
+                scan.cursor = (pid, fd, "proc_pidfdinfo")
             if lib.proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
                                   _DARWIN_FD_RECORD_SIZE) <= 0:
                 continue
@@ -309,6 +340,32 @@ def _iter_darwin_fd_targets():
                         struct.unpack_from("<Q", raw, _DARWIN_FD_INO_OFFSET)[0])
             target = raw[_DARWIN_FD_PATH_OFFSET:].split(b"\x00", 1)[0].decode("utf-8", "replace")
             yield pid, fd, target, identity
+
+
+def _darwin_self_sidecar_holders(watched: Dict[str, str]) -> List[Tuple[int, str]]:
+    """Inspect our sidecars without stat-ing every unrelated open vnode.
+
+    F_GETPATH retrieves the saved path without libproc's vn_stat of the vnode.
+    Only matching sidecars are fstat-ed, so an unrelated cloud/network file
+    cannot suppress the in-process lost-generation check during scan cooldown.
+    No descriptor is opened or closed, preserving SQLite's advisory locks.
+    """
+    import fcntl
+
+    holders = []
+    for fd_str in os.listdir("/dev/fd"):
+        with contextlib.suppress(OSError):
+            fd = int(fd_str)
+            target = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode("utf-8", "replace")
+            if (literal := watched.get(target.casefold())) is not None:
+                info = os.fstat(fd)
+                confirmed_path = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0].decode("utf-8", "replace")
+                confirmed = os.fstat(fd)
+                identity = (info.st_dev, info.st_ino)
+                if (confirmed_path == target and identity == (confirmed.st_dev, confirmed.st_ino)
+                        and _identity_is_truly_unlinked(identity, literal)):
+                    holders.append((os.getpid(), target))
+    return holders
 
 
 def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
@@ -322,34 +379,37 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # APFS/HFS+ are case-insensitive by default and libproc reports the pathname as the opener
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
-    holders: List[Tuple[int, str]] = []
-    errors: List[BaseException] = []
-
-    def _scan() -> None:
-        try:
-            for pid, _fd, target, identity in _iter_darwin_fd_targets():
-                literal = watched.get(target.casefold())
-                if literal is not None and _identity_is_truly_unlinked(identity, literal):
-                    holders.append((pid, target))
-        except BaseException as exc:
-            errors.append(exc)
-
-    # ponytail: abandoned daemon thread per timed-out scan; a kernel-blocked
-    # proc_pidfdinfo cannot be interrupted, so expiry leaks one thread that
-    # dies with the process. Fail open: partial/empty holders, never a refusal.
-    worker = threading.Thread(target=_scan, daemon=True)
-    worker.start()
+    if sys.platform == "darwin" and (holders := _darwin_self_sidecar_holders(watched)):
+        return holders
+    global _DARWIN_FD_SCAN_WORKER, _DARWIN_FD_SCAN_RETRY_AT
+    with _DARWIN_FD_SCAN_LOCK:
+        if time.monotonic() < _DARWIN_FD_SCAN_RETRY_AT:
+            return []
+        worker = _DARWIN_FD_SCAN_WORKER
+        if worker is None or not worker.is_alive():
+            worker = _DarwinFDScan()
+            _DARWIN_FD_SCAN_WORKER = worker
+            worker.start()
+    # A kernel-blocked descriptor read cannot be interrupted. Reuse that
+    # worker and the existing fail-open outcome rather than abandon another
+    # thread on every open. Judge identity when reading each descriptor: a
+    # healthy connection may close and unlink its sidecars before the scan ends.
     worker.join(_DARWIN_FD_SCAN_TIMEOUT_SECONDS)
     if worker.is_alive():
+        with _DARWIN_FD_SCAN_LOCK:
+            _DARWIN_FD_SCAN_RETRY_AT = time.monotonic() + _DARWIN_FD_SCAN_COOLDOWN_SECONDS
         logger.warning(
-            "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open",
+            "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open "
+            "(probe_pid=%s probe_fd=%s stage=%s)",
             _DARWIN_FD_SCAN_TIMEOUT_SECONDS,
             db_path,
+            *worker.cursor,
         )
         return []
-    if errors:
-        raise errors[0]
-    return holders
+    if worker.error is not None:
+        raise worker.error
+    return [(pid, target) for pid, target, _identity in tuple(worker.targets)
+            if target.casefold() in watched]
 
 
 def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:

@@ -475,6 +475,13 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
         <string>Background</string>
     </array>
 
+    <!-- Without a ProcessType, launchd starts the agent at UTILITY QoS, which
+         every child inherits: the gateway then loses CPU and I/O to any
+         terminal-launched test run (USER_INTERACTIVE) and its replies stall
+         under load. Interactive starts it at DEFAULT QoS, as apps run. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
     <key>RunAtLoad</key>
     <true/>
 

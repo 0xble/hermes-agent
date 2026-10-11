@@ -84,7 +84,8 @@ def _on_pre_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None
         return None
     now = time.time()
     try:
-        absent = frozenset(str(p) for p in (Path(s).expanduser() for s in extractor(args)) if not p.exists())
+        absent = frozenset(str(p) for p in (Path(s).expanduser() for s in extractor(args))
+                           if dg.in_cleanup_scope(p) and not p.exists())
     except Exception:
         absent = frozenset()
     with _lock:
@@ -113,10 +114,13 @@ def _on_post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = Non
             created = str(p) in absent and p.exists()
         except Exception:
             continue
-        category = dg.guess_category(p) if created else None
-        if category is not None and dg.track(str(p), category, silent=True) and category == "test":
-            with _lock:
-                _recent_test_tracks.setdefault(_owner(task_id, session_id), set()).add(str(p))
+        try:
+            category = dg.guess_category(p) if created else None
+            if category is not None and dg.track(str(p), category, silent=True) and category == "test":
+                with _lock:
+                    _recent_test_tracks.setdefault(_owner(task_id, session_id), set()).add(str(p))
+        except Exception as exc:
+            logger.warning("disk-cleanup could not track a created file: %s", exc)
 
 
 def _on_session_end(
@@ -131,7 +135,7 @@ def _on_session_end(
     try:
         summary = dg.quick()
     except Exception as exc:
-        logger.debug("disk-cleanup quick cleanup failed: %s", exc)
+        logger.warning("disk-cleanup quick cleanup failed: %s", exc)
         return
     if summary["deleted"] or summary["empty_dirs"]:
         dg._log(f"AUTO_QUICK (session_end): deleted={summary['deleted']} "

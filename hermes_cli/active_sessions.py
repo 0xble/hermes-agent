@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import collections
+import errno
 import math
 import os
 import time
@@ -189,27 +190,44 @@ def _lease_paths(
     return home / "runtime" / "active_sessions.json", home / "runtime" / "active_sessions.lock"
 
 
-def _flock(fh, *, lock: bool) -> None:
+def _flock(fh, *, lock: bool, nonblocking: bool = False) -> None:
     """Exclusive whole-file lock/unlock on ``fh`` (fcntl on POSIX, msvcrt on Windows)."""
     if os.name == "nt":
         import msvcrt
         fh.seek(0)
-        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if lock else msvcrt.LK_UNLCK, 1)
+        mode = (msvcrt.LK_NBLCK if nonblocking else msvcrt.LK_LOCK) if lock else msvcrt.LK_UNLCK
+        msvcrt.locking(fh.fileno(), mode, 1)
     else:
         import fcntl
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX if lock else fcntl.LOCK_UN)
+        mode = fcntl.LOCK_EX if lock else fcntl.LOCK_UN
+        fcntl.flock(fh.fileno(), mode | (fcntl.LOCK_NB if nonblocking else 0))
 
 
 class _FileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, timeout: float | None = None):
         self.path = path
+        self.timeout = timeout
         self._fh = None
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a+b")
         try:
-            _flock(self._fh, lock=True)
+            if self.timeout is None:
+                _flock(self._fh, lock=True)
+            else:
+                deadline = time.monotonic() + self.timeout
+                while True:
+                    try:
+                        _flock(self._fh, lock=True, nonblocking=True)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"file lock timed out: {self.path}") from exc
+                        time.sleep(min(0.01, remaining))
         except Exception as exc:
             self._fh.close()
             self._fh = None
