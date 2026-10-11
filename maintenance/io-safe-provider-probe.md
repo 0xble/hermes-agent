@@ -25,8 +25,16 @@ endpoint selected by `model.provider` (`providers`, legacy `custom_providers`,
 or bare `custom` with `model.base_url`). Credentials come from `api_key`,
 `key_env`/`api_key_env` in process environment, or the selected home's `.env`.
 Only `/models` is requested: no inference, credential refresh/commands, fallback,
-redirects, proxy-environment routing, or response-body inspection. Unsupported
-transports and missing credentials fail closed. HTTPS is required except for
+redirects, proxy-environment routing, or response-body inspection. The wire is
+the one the no-pool runtime would pick, not only the declared mode: undeclared
+modes go through `_detect_api_mode_for_url` (or `_resolve_plain_custom_api_mode`
+for bare `custom`), then the OpenCode-family re-derivation, Actual pinning and
+the `openai_runtime` overlay. Only `chat_completions`/`codex_responses` over a
+plain OpenAI client pass. Anthropic Messages (declared, `/anthropic`, Kimi
+`/coding`, Anthropic hosts, OpenCode model routing), Bedrock Converse, codex
+app-server, native Gemini/Vertex express and Bedrock Mantle SigV4 URLs, and the
+`moa`/`azure-foundry`/Vertex names claimed before custom lookup are refused, as
+are missing credentials. HTTPS is required except for
 loopback HTTP. Output is status-only and force-redacted; dependency logging and
 incidental configuration output are suppressed in this dedicated process.
 
@@ -37,7 +45,10 @@ and checks stdout, stderr and DEBUG-level file logging with redaction disabled
 in configuration. A disconnect and unsafe configurations are covered too. The
 runtime-parity regressions compare mixed keyed/legacy entries and conflicting
 inline/env credentials against the runtime's no-pool configured-provider path,
-then assert the actual request path and Authorization header. Pool rejection
+then assert the actual request path and Authorization header. The transport
+matrix first asserts the runtime's own resolution for each fixture (hostnames
+pinned to loopback), then that the probe refuses without opening a connection;
+OpenAI-compatible controls must still connect. Pool rejection
 also verifies that auth state is left unchanged.
 
 Upstream preflight: main `79b45d1647f6b5680768d851c4c406e8cc550a1e`

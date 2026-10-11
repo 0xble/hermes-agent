@@ -24,7 +24,9 @@ def _endpoint():
     from hermes_cli.config_providers import (
         _canonical_api_mode, _normalize_custom_provider_entry, get_compatible_custom_providers,
     )
-    from hermes_cli.runtime_provider import _get_named_custom_provider, _raise_if_provider_disabled
+    from hermes_cli.runtime_provider import (
+        _VERTEX_NAMES, _get_named_custom_provider, _raise_if_provider_disabled,
+    )
     from hermes_cli.runtime_provider_custom import _key_env_secret
     from hermes_constants import get_hermes_home
 
@@ -39,6 +41,10 @@ def _endpoint():
     model = config.get("model") or {}
     requested = str(model.get("provider") or "").strip().lower()
     _raise_if_provider_disabled(requested)
+    # Runtime ladder rung 2 claims these names before any custom entry
+    # (hermes_cli/runtime_provider.py:_resolve_requested_shortcuts).
+    if requested in {"moa", "azure-foundry", *_VERTEX_NAMES}:
+        raise ValueError
     entry = _get_named_custom_provider(requested) or {}
     if not entry and requested == "custom":
         entry = model
@@ -66,6 +72,10 @@ def _endpoint():
         raise ValueError
 
     base = str(entry.get("base_url") or "").strip().rstrip("/")
+    # The wire is what the runtime would pick, not just what config declares.
+    base, effective_mode = _runtime_transport(requested, entry, model, base)
+    if effective_mode not in {"chat_completions", "codex_responses"}:
+        raise ValueError
     # Do not call the full runtime builder: load_pool seeds/persists auth.json
     # (agent/credential_pool.py:3087-3119), and select can refresh credentials
     # (:1992-1998). Persisted pools are outside this static diagnostic boundary.
@@ -86,6 +96,52 @@ def _endpoint():
     # Validate the port before giving a malformed URL to the transport.
     parsed.port
     return base + "/models", key
+
+
+def _runtime_transport(requested, entry, model, base):
+    """(base_url, api_mode) the no-pool runtime would use for this route.
+
+    Composes the runtime's own read-only mode helpers in its order
+    (hermes_cli/runtime_provider_custom.py:_resolve_named_custom_runtime and
+    runtime_provider_backends.py:_resolve_openrouter_runtime, then the
+    resolve_runtime_provider overlay), skipping only its stateful pool rung and
+    the local model auto-detect GET. URL-routed client wires that keep
+    ``chat_completions`` (native Gemini, Bedrock Mantle SigV4) map to their own
+    pseudo-modes so the caller refuses them too.
+    """
+    from agent.bedrock_adapter import is_bedrock_openai_base_url
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+    from hermes_cli.auth import normalize_actual_base_url
+    from hermes_cli.config import split_model_config_default
+    from hermes_cli.models import normalize_opencode_base_url, opencode_model_api_mode
+    from hermes_cli.providers import is_actual_route
+    from hermes_cli.runtime_provider import (
+        _detect_api_mode_for_url, _maybe_apply_codex_app_server_runtime, _resolve_plain_custom_api_mode,
+    )
+    from hermes_cli.runtime_provider_custom import _opencode_family_for_custom
+
+    if entry is model:
+        mode = _resolve_plain_custom_api_mode(model, base)
+    else:
+        mode = entry.get("api_mode") or _detect_api_mode_for_url(base) or "chat_completions"
+    # Each rung's _runtime() pins Actual before the codex app-server overlay.
+    if is_actual_route("custom", base):
+        mode, base = "chat_completions", normalize_actual_base_url(base)
+    if entry is not model:
+        family = _opencode_family_for_custom(requested, base)
+        if family is not None and not entry.get("api_mode"):
+            effective_model = str(entry.get("model") or "").strip() or split_model_config_default(
+                model.get("default") or model.get("model"))[0]
+            if effective_model:
+                mode = opencode_model_api_mode(family, effective_model)
+            base = normalize_opencode_base_url(family, mode, base)
+    mode = _maybe_apply_codex_app_server_runtime(provider="custom", api_mode=mode, model_cfg=model,
+                                                 requested_provider=requested)
+    if is_native_gemini_base_url(base):
+        mode = "gemini_native"
+    elif is_bedrock_openai_base_url(base):
+        mode = "bedrock_mantle"
+    return base, mode
 
 
 def _emit(message):
