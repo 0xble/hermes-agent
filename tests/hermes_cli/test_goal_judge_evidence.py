@@ -157,6 +157,114 @@ def test_silent_repeat_still_rejudges_and_can_finish_from_evidence(hermes_home, 
     assert "wiki-check\\tpass" in prompts[0]
 
 
+@pytest.mark.parametrize("with_contract", [False, True])
+def test_silent_repeat_reasserts_standing_done_claim_with_older_citations(hermes_home, monkeypatch, with_contract):
+    sid = "standing-done-claim"
+    db = _session_db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Publish the verified wiki", max_turns=0, contract=(GoalContract(
+        outcome="Wiki published", verification="wiki-check passes on the published head") if with_contract else None))
+    claim = "Done. The wiki is published. Evidence: `gh pr checks 197 -R 0xble/Workspace`."
+    _record_tool_call(db, sid, "terminal", {"command": "gh pr checks 197 -R 0xble/Workspace"},
+                      PR_CHECK_OUTPUT, call_id="standing-proof")
+    db.append_message(sid, "assistant", claim)
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+        mgr.evaluate_after_turn(claim)
+    for i in range(goals._EVIDENCE_MAX_ENTRIES + 2):
+        _record_tool_call(db, sid, "read_file", {"path": f"notes-{i}"}, f"note {i}", call_id=f"note-{i}")
+    assert all("wiki-check" not in row["output"] for row in goals.collect_goal_evidence(sid))
+    # Reopen SQLite: the standing claim must not depend on an in-memory response cache.
+    db.close()
+    goals._DB_CACHE.clear()
+    seen = []
+
+    def judge(_call, system, prompt, _timeout):
+        seen.append((system, prompt))
+        return '{"verdict":"done","reason":"standing claim and recorded proof satisfy the goal"}'
+
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", judge)
+    mgr = GoalManager(session_id=sid)
+    decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert decision["verdict"] == "done"
+    assert mgr.state.status == "done"
+    assert len(seen) == 1
+    system, prompt = seen[0]
+    assert "silent turn re-asserts the standing claim" in system
+    assert "Previously reported and unchanged standing completion claim" in prompt
+    assert claim in prompt
+    assert "wiki-check\\tpass" in prompt
+    assert "Evidence the response cites, located verbatim" in prompt
+
+
+def test_standing_claim_uses_latest_visible_final_prose_from_this_goal_only(hermes_home):
+    sid = "standing-claim-lifetime"
+    db = _session_db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("Publish the wiki", max_turns=0)
+    db.append_message(sid, "assistant", "Done. Previous goal: `old-proof-111111`.", timestamp=state.created_at - 1)
+    assert goals.last_visible_done_claim(sid, since=state.created_at) == ""
+    db.append_message(sid, "assistant", "The goal is not done. I will finish it.")
+    assert goals.last_visible_done_claim(sid, since=state.created_at) == ""
+    db.append_message(sid, "assistant", "Done. First report: `proof-222222`.")
+    latest = "The work is complete. Evidence: `proof-333333`."
+    db.append_message(sid, "assistant", latest)
+    db.append_message(sid, "assistant", "Done. Hidden row: `proof-444444`.", display_kind="hidden")
+    db.append_message(sid, "assistant", "Done. Compression summary: `proof-555555`.", _compressed_summary=True)
+    db.append_message(sid, "assistant", "Done. Tool-call commentary.", tool_calls=[{
+        "id": "commentary", "function": {"name": "terminal", "arguments": "{}"},
+    }])
+    db.append_message(sid, "assistant", goals.SILENCE_MARKER)
+    assert goals.last_visible_done_claim(sid, since=state.created_at) == latest
+    assert goals.last_visible_done_claim("another-session", since=state.created_at) == ""
+
+
+def test_silent_turn_without_current_goal_claim_keeps_original_judge_input(hermes_home):
+    sid = "no-standing-claim"
+    db = _session_db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("Publish the wiki", max_turns=0)
+    db.append_message(sid, "assistant", "Done. Old goal: `old-proof-123456`.", timestamp=state.created_at - 1)
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE) as judge:
+        mgr.evaluate_after_turn(goals.SILENCE_MARKER)
+    assert judge.call_args.args[1] == goals.SILENCE_MARKER
+    assert judge.call_args.kwargs["standing_claim"] == ""
+    assert judge.call_args.kwargs["citations"]["evidence_ids"] == []
+
+
+@pytest.mark.parametrize("interrupt", ["evidence", "visible", "judge-failure"])
+def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(hermes_home, interrupt):
+    sid = "silent-stall-reset"
+    db = _session_db(sid)
+    mgr = GoalManager(sid)
+    mgr.set("Publish the wiki", max_turns=0)
+    limit = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+        for _ in range(limit - 1):
+            mgr.evaluate_after_turn(goals.SILENCE_MARKER)
+    assert mgr.state.consecutive_silent_no_progress == limit - 1
+    reply = goals.SILENCE_MARKER
+    verdict = PLAIN_CONTINUE
+    if interrupt == "evidence":
+        _record_tool_call(db, sid, "terminal", {"command": "wiki-check"}, "new result", call_id="fresh")
+    elif interrupt == "visible":
+        reply = "Still working; the verification step changed."
+    else:
+        verdict = ("continue", "judge unavailable", False, None, True)
+    with patch.object(goals, "judge_goal", return_value=verdict):
+        mgr.evaluate_after_turn(reply)
+    assert mgr.state.consecutive_silent_no_progress == 0
+    # Existing visible dispute counts must not force silent turns to pause early.
+    mgr.state.consecutive_disputes = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES - 1
+    mgr._save()
+    for i in range(limit):
+        mgr = GoalManager(sid)
+        with patch.object(goals, "judge_goal", return_value=DISPUTED):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER)
+        assert decision["should_continue"] == (i < limit - 1)
+    assert mgr.state.status == "cleared"
+    assert decision["verdict"] == "stalled"
+
+
 def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):
     sid = "evidence-gate"
     mgr = GoalManager(session_id=sid)

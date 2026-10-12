@@ -290,6 +290,11 @@ JUDGE_SYSTEM_PROMPT = (
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
+    "When the runtime supplies a previously reported standing completion claim, a "
+    "silent turn re-asserts the standing claim unchanged. Treat that claim as the "
+    "response for DONE (including an explicit completion confirmation or final "
+    "deliverable), together with its citations and recorded evidence. Silence "
+    "without a standing claim adds no completion assertion.\n"
     "DONE requires the deliverable to actually exist. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
     "DONE.\n\n"
@@ -407,10 +412,16 @@ JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
+JUDGE_STANDING_CLAIM_BLOCK_TEMPLATE = (
+    "Previously reported and unchanged standing completion claim from this goal "
+    "(the silent turn re-asserts this claim; it is agent prose, not proof):\n{claim}\n\n"
+)
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{standing_claim_block}"
     "{cited_block}"
     "{evidence_block}"
     "{background_block}"
@@ -425,6 +436,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
     "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{standing_claim_block}"
     "{cited_block}"
     "{evidence_block}"
     "{background_block}"
@@ -447,6 +459,7 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "{contract_block}\n\n"
     "{revisions_block}"
     "Agent's most recent response:\n{response}\n\n"
+    "{standing_claim_block}"
     "{cited_block}"
     "{evidence_block}"
     "{background_block}"
@@ -725,6 +738,9 @@ class GoalState:
     # Deterministic busy-loop backstop. A fingerprint of recorded tool evidence is the progress
     # signal; repeated automatic CONTINUEs with no new evidence and the same reason are parked.
     consecutive_no_progress: int = 0
+    # Silent CONTINUE turns with no new evidence use a terminal stall backstop,
+    # rather than a user-resumable pause or an endlessly rearmed timed park.
+    consecutive_silent_no_progress: int = 0
     # Escalation level for backoff parks within the current no-progress streak. Old rows default 0.
     backoff_level: int = 0
     last_progress_fingerprint: Optional[str] = None
@@ -738,7 +754,8 @@ class GoalState:
         raw_subgoals = data.get("subgoals") or []
         ints = {k: int(data.get(k) or 0) for k in (
             "turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "consecutive_disputes",
-            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress", "backoff_level")}
+            "waiting_on_delegations", "waiting_seconds", "consecutive_no_progress",
+            "consecutive_silent_no_progress", "backoff_level")}
         floats = {k: float(data.get(k) or 0.0) for k in (
             "created_at", "last_turn_at", "last_continuation_at", "waiting_until", "waiting_since")}
         return cls(
@@ -1728,6 +1745,44 @@ def _runtime_notice_label(row: Dict[str, Any]) -> str:
     return next((label for prefix, label in _RUNTIME_NOTICE_LABELS if text.startswith(prefix)), "")
 
 
+# Recognize explicit completion assertions, not plans ("will finish") or negations
+# ("not done"). This selects a claim to re-judge; it never establishes completion.
+_DONE_CLAIM_RE = re.compile(
+    r"(?:^|[.!?\n]\s*)(?:done|completed|finished|shipped|delivered)\b"
+    r"|\b(?:the\s+)?(?:goal|work|task|deliverable|implementation|request)\s+"
+    r"(?:is|was|has been)\s+(?:done|complete(?:d)?|finished|satisfied|shipped|delivered)\b"
+    r"|\bI(?:['’]ve| have)\s+(?:completed|finished|shipped|delivered)\b",
+    re.I,
+)
+
+
+def last_visible_done_claim(session_id: Optional[str], since: float = 0.0) -> str:
+    """Newest visible completion assertion during this goal, including archived rows.
+
+    Prose is only a standing claim, never evidence. Hidden rows, compression
+    summaries and tool-call commentary cannot supply a visible closeout.
+    """
+    db = _get_session_db()
+    reader = getattr(db, "messages_by_role", None) if db is not None else None
+    if not session_id or since <= 0 or db is None or reader is None:
+        return ""
+    try:
+        for row in reader(session_id, "assistant", since=since, limit=500):
+            content = row.get("content")
+            if not isinstance(content, str) or row.get("compressed_summary") or row.get("display_kind") == "hidden":
+                continue
+            if is_intentional_silence_response(content) or not _DONE_CLAIM_RE.search(content.replace("**", "")):
+                continue
+            # The role audit includes assistant tool-call rows. Only final prose
+            # is a visible report; consult the original row, not a display summary.
+            original = db.get_messages_around(session_id, row["id"], window=0).get("window") or []
+            if original and not original[0].get("tool_calls"):
+                return content
+    except Exception as exc:
+        logger.debug("goal standing claim: message read failed: %s", exc)
+    return ""
+
+
 def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> Dict[str, Any]:
     """Locate each identifier the response cites in tool results recorded since ``since``.
 
@@ -1875,6 +1930,7 @@ def judge_goal(
     evidence: Optional[List[Dict[str, Any]]] = None,
     citations: Optional[Dict[str, Any]] = None,
     revisions_block: str = "",
+    standing_claim: str = "",
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1907,6 +1963,8 @@ def judge_goal(
     common = dict(
         goal=goal,
         response=_judge_response_window(last_response),
+        standing_claim_block=(JUDGE_STANDING_CLAIM_BLOCK_TEMPLATE.format(claim=_judge_response_window(standing_claim))
+                              if standing_claim else ""),
         evidence_block=_render_evidence_block(evidence),
         cited_block=_render_cited_block(citations),
         revisions_block=(JUDGE_REVISIONS_BLOCK_TEMPLATE.format(revision_lines=revisions_block)
@@ -2250,6 +2308,7 @@ class GoalManager:
         self._state.consecutive_disputes = 0
         self._state.last_dispute_evidence = ""
         self._state.consecutive_no_progress = 0
+        self._state.consecutive_silent_no_progress = 0
         self._state.backoff_level = 0
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
@@ -2940,17 +2999,21 @@ class GoalManager:
              "output": f"exit {g.last_exit_code} (passed)\n{_tail((g.last_output_tail or '').strip(), _EVIDENCE_OUTPUT_CHARS)}".strip()}
             for g in state.gates
         ]
-        citations = resolve_cited_evidence(evidence_session_id or self.session_id, last_response,
+        silent = is_intentional_silence_response(last_response)
+        standing_claim = (last_visible_done_claim(evidence_session_id or self.session_id, since=state.created_at)
+                          if silent else "")
+        citations = resolve_cited_evidence(evidence_session_id or self.session_id, standing_claim or last_response,
                                            since=state.created_at)
         progress_fingerprint = _goal_progress_fingerprint(turn_evidence)
         new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
         # A bare silence marker is an explicit quiet repeat from a gateway-authored continuation.
         # It still reaches the judge: recorded evidence, not visible prose, is authoritative for completion.
-        silent_automatic = not user_initiated and is_intentional_silence_response(last_response)
+        silent_automatic = not user_initiated and silent
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
             evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+            standing_claim=standing_claim,
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -2981,6 +3044,12 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
+        if (verdict == "continue" and silent and not turn_evidence
+                and not parse_failed and not transport_failed):
+            state.consecutive_silent_no_progress += 1
+        else:
+            state.consecutive_silent_no_progress = 0
+
         # A dispute counts toward the stall breaker unless the reply cites a recorded result no
         # earlier dispute in this streak cited: new proof means converging, rewording is not.
         current = set(citations.get("evidence_ids") or [])
@@ -3036,9 +3105,21 @@ class GoalManager:
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
 
-        # Stall breaker: the agent keeps asserting completion and the judge keeps rejecting it.
-        # Another continuation only yields a restated claim, so the user decides.
-        if state.consecutive_disputes >= DEFAULT_MAX_CONSECUTIVE_DISPUTES:
+        # Stall breaker: repeated completion rechecks must converge. Silent stalls
+        # end without requiring user action; visible disputes retain their pause.
+        if state.consecutive_silent_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
+            # Reuse the convergence breaker, but clear this silent stall instead
+            # of pausing for user input. Inactive goals cannot wake or re-notify.
+            state.status = "cleared"
+            state.paused_reason = "silent completion rechecks produced no new evidence"
+            state.clear_wait()
+            state.consecutive_no_progress = 0
+            state.backoff_level = 0
+            self._save()
+            return _decision("cleared", False, None, "stalled", state.paused_reason,
+                             f"Goal stopped: {DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS} silent rechecks "
+                             "returned continue with no new evidence.")
+        if state.consecutive_disputes >= DEFAULT_MAX_CONSECUTIVE_DISPUTES and not silent:
             return self._pause_decision(
                 f"{_DISPUTED_PAUSE_PREFIX}{reason}", "disputed", reason,
                 f"⏸ Goal paused — the agent reports the goal is complete, but the judge disagreed "

@@ -77,6 +77,40 @@ async def test_silent_automatic_turn_rejudges_without_manufacturing_continuation
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("disputed", [False, True])
+async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(hermes_home, disputed):
+    harness = _harness(hermes_home)
+    _, adapter, entry, _, key = harness
+    limit = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
+    for i in range(limit):
+        adapter._pending_messages.clear()  # consume the previously admitted turn
+        _restart_db()
+        with patch.object(goals, "judge_goal", return_value=(
+            "continue", f"Criterion still lacks proof ({i})", False,
+            {"disputed": True} if disputed else None, False,
+        )):
+            mgr = await _turn(harness, "NO_REPLY" if i % 2 else "[SILENT]")
+        if i < limit - 1:
+            assert mgr.is_active() and key in adapter._pending_messages
+            assert adapter.sent == []
+    assert not mgr.is_active() and not mgr.has_goal()
+    assert mgr.state.status == "cleared", "a silent stall must not pause waiting for the user"
+    assert mgr.next_continuation_prompt() is None
+    assert key not in adapter._pending_messages
+    assert len(adapter.sent) == 1
+    assert "Goal stopped" in adapter.sent[0] and "no new evidence" in adapter.sent[0]
+    assert "/goal resume" not in adapter.sent[0]
+    _restart_db()
+    with patch.object(goals, "judge_goal") as judge:
+        # Already-admitted stale turns and a later user message must not replay the notice.
+        await _turn(harness, "NO_REPLY", user=True)
+        await _turn(harness, "status", user=True)
+        judge.assert_not_called()
+    assert len(adapter.sent) == 1
+    assert GoalManager(entry.session_id).state.status == "cleared"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lift", ["timer-evaluator", "session-evaluator", "pid-evaluator", "idle-cas"])
 async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_home, lift):
     harness = _harness(hermes_home)
