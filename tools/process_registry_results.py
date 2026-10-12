@@ -128,7 +128,9 @@ def save_completed_result(
         with _RESULT_WRITE_LOCK:
             existing = _read_existing_record(path)
             record[_CUT_RECEIPT_FIELD] = bool(
-                existing.get(_CUT_RECEIPT_FIELD) or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
+                getattr(session, "_cut_receipt", False)
+                or existing.get(_CUT_RECEIPT_FIELD)
+                or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
             )
             atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:

@@ -126,6 +126,36 @@ def test_bounded_kill_all_uses_small_cut_receipts_and_prunes_once(registry, monk
     prune.assert_called_once_with()
 
 
+def test_bounded_sweep_final_receipt_keeps_cut_retention(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    proc = _spawn_python_sleep(30)
+    try:
+        session = _make_session(sid="proc_sweep_real_child")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        record = json.loads(receipt.read_text(encoding="utf-8"))
+        assert record["completion_reason"] == "killed"
+        assert record["cut_receipt"] is True
+
+        newer = _make_session(sid="proc_normal_after_sweep", exited=True, exit_code=0)
+        newer.completion_reason = "exited"
+        receipts.save_completed_result(newer)
+        assert receipt.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_bounded_kill_all_skips_cut_receipts_past_deadline(registry, monkeypatch):
     session = _make_session(sid="proc_bounded_late")
     session.process = MagicMock(pid=12346)

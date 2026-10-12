@@ -633,6 +633,9 @@ class ProcessSession:
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.
     _scope_stop_pending: bool = field(default=False, repr=False)
+    # Stopped by a restart/bounded sweep: the final receipt keeps cut retention even when
+    # it is written before (or instead of) the pre-signal cut_pending snapshot.
+    _cut_receipt: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -2252,6 +2255,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             save_cut_pending_result(
                 session, source, include_output=deadline is None, prune=deadline is None,
             )
+            session._cut_receipt = True
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
         try:
@@ -3022,6 +3026,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         ) if session.id in escalated_ids else -signal.SIGTERM
                         session.completion_reason = "killed"
                         session.termination_source = source
+                        if source == "gateway_shutdown" or bounded_sweep:
+                            session._cut_receipt = True
                         if consume_output:
                             self._completion_consumed.add(session.id)
                     moved = self._move_to_finished(session)
