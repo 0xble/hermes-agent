@@ -138,7 +138,13 @@ strategy and cron-exclusion behavior.
 - `synthetic-prompt-memory-gate` moves the generated-prompt inventory to
   `agent/synthetic_prompt.py` and gates the core turn-start and post-turn recall paths on
   it, plus retention through `sync_all` provenance. It is core because the prefetch call
-  sites and turn provenance live in `agent/turn_context.py` and `run_agent.py`. No
+  sites and turn provenance live in `agent/turn_context.py` and `run_agent.py`. Automatic
+  recall peels attachment and reply context before applying the provider's query cap.
+  The gateway JSON-quotes complete reply text so embedded quotes and paragraph breaks
+  cannot impersonate the wrapper boundary. Native image turns use stored caption-only
+  text instead of their vision-enriched API copy. Proof: the producer-composed cases in
+  `tests/agent/test_attachment_recall_query.py` and full-quote round trips in
+  `tests/gateway/test_reply_to_injection.py`. No
   upstream issue or PR covered synthetic-turn recall as of 2026-10-05. Retire it when
   upstream skips provider prefetch for runtime-generated turns. Roll back by reverting
   its commit, which restores the `hindsight-session-lifecycle` retention-only filter in
