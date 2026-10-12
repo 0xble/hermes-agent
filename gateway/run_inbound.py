@@ -1129,7 +1129,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
     async def _hm_dispatch_canonical_command(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str,
-        canonical: Optional[str],
+        canonical: Optional[str], *, final_fence=None,
     ) -> Tuple[bool, Optional[str]]:
         """Dispatch built-in idle-path commands → ``(handled, result)``; prompt-rewriting commands
         mutate ``event.text`` and return ``(False, None)`` to fall through to the agent."""
@@ -1139,9 +1139,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         )
         if plain_handler is not None:
             async with self._async_profile_scope_for_source(source):
+                if final_fence is not None and not final_fence(event):
+                    return True, None
                 return True, await plain_handler(event)
         if canonical in self._HM_CANONICAL_COMMANDS:
-            return await getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")(event, source, _quick_key)
+            handler = getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")
+            if final_fence is not None and not final_fence(event):
+                return True, None
+            return await handler(event, source, _quick_key)
         return False, None
 
     async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
@@ -1173,7 +1178,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         return resolve_command(command) is not None
 
     async def _hm_dispatch_quick_and_plugin_commands(
-        self, event: "MessageEvent", source: SessionSource, command: Optional[str]
+        self, event: "MessageEvent", source: SessionSource, command: Optional[str], *, final_fence=None
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
@@ -1197,6 +1202,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 exec_cmd = qcmd.get("command", "")
                 if not exec_cmd:
                     return True, t("gateway.quick_command.no_command", command=command), command
+                if final_fence is not None and not final_fence(event):
+                    return True, None, command
                 return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
             if qtype != "alias":
                 return True, t("gateway.quick_command.unsupported_type", command=command), command
@@ -1223,8 +1230,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     user_args = event.get_command_args().strip()
                     with self._session_env_scope(_plugin_context):
                         if asyncio.iscoroutinefunction(plugin_handler):
+                            if final_fence is not None and not final_fence(event):
+                                return True, None, command
                             result = await plugin_handler(user_args)
                         else:
+                            if final_fence is not None and not final_fence(event):
+                                return True, None, command
                             result = await self._run_in_executor_with_context(plugin_handler, user_args)
                             if asyncio.iscoroutine(result):
                                 result = await result
@@ -1370,17 +1381,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             loop_identity = self._loop_wake_command_identity(event)
             if loop_identity is not None:
                 sid, tick = loop_identity
-                loop_fence = (sid, tick, self._current_session_run_generation(_quick_key))
+                loop_fence = (sid, tick, self._current_session_run_generation(_quick_key), None)
             if not await self._begin_command_loop_tick(event, source):
                 return True, None  # superseded /loop tick: its command must not run
 
         async def _loop_command_current() -> bool:
+            nonlocal loop_fence
             if loop_fence is None:
                 return True
-            sid, tick, run_generation = loop_fence
-            return await self._loop_wake_execution_current(
+            sid, tick, run_generation, _control_generation = loop_fence
+            if not await self._loop_wake_execution_current(
                 sid, tick, source, run_generation=run_generation,
-            )
+            ):
+                return False
+            from hermes_cli.loops import loop_control_generation
+            loop_fence = (sid, tick, run_generation, loop_control_generation(sid))
+            return True
+
+        def _final_loop_fence(current_event):
+            return self._loop_wake_execution_fence_sync(current_event, loop_fence)
 
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
@@ -1388,11 +1407,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # after resolution and immediately before entering an effectful handler.
             if not await _loop_command_current():
                 return True, None
-            _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
+            _handled, _result = await self._hm_dispatch_canonical_command(
+                event, source, _quick_key, canonical, final_fence=_final_loop_fence,
+            )
         if not _handled:
             if not await _loop_command_current():
                 return True, None
-            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
+            _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(
+                event, source, command, final_fence=_final_loop_fence,
+            )
         if not _handled:
             # Skill-slash resolution is disk-bound (cold skill scan, skill file loads, the
             # unavailable-skill rglob over every skills dir) and uncached on a first hit; on a

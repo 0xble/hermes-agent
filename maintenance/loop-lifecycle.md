@@ -51,6 +51,10 @@ A due gateway loop defers before claiming or entering the adapter whenever anoth
 
 Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, persistence failures, and ephemeral operation with the real SessionDB. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
 
+### Execution-entry fence
+
+Preparation may await command hooks, profile secret hydration, quick/plugin resolution, skill scanning, transcript/history loading, media preparation, and prompt-pin persistence. Those checks are early exits only. The authority is one shared synchronous exact-identity fence immediately before the canonical/quick/plugin handler or model-turn call; it compares the wake's session/tick identity, session run generation, and monotonic loop control generation, with no await between the fence and effect invocation.
+
 ## Upstream disposition and retirement
 
 This is a fork-only core adaptation for the external `loop_set` plugin contract. An upstream PR is a follow-up once the plugin contract and native `/loop` lifecycle API have stabilized. Retire this unit only when released upstream behavior provides the same versioned revisions, authority split, cross-surface cache freshness, and receipt registry contract; remove the fork implementation and tests after equivalent upstream coverage is verified.

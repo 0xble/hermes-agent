@@ -852,6 +852,30 @@ class GatewayGoalsMixin:
             run_generation is None or self._is_session_run_current(session_key, run_generation)
         )
 
+    def _loop_wake_execution_fence_sync(self, event: Any, fence: Optional[tuple]) -> bool:
+        """Final synchronous authority immediately before a loop-wake effect starts.
+
+        All preparation may await. This helper is deliberately synchronous and callers must invoke it
+        in the same event-loop step as the handler/model call: control writes advance the process-local
+        ``control_generation`` at their persistence chokepoint, while the immutable event identity and
+        session run generation prevent a different tick or reset successor from borrowing the call.
+        """
+        if fence is None:
+            return True
+        try:
+            sid, tick, run_generation, control_generation = fence
+        except (TypeError, ValueError):
+            return False
+        if self._loop_wake_command_identity(event) != (sid, tick):
+            return False
+        from hermes_cli.loops import loop_control_generation
+        return (
+            loop_control_generation(sid) == int(control_generation)
+            and (run_generation is None or self._is_session_run_current(
+                self._session_key_for_source(event.source), run_generation,
+            ))
+        )
+
     async def _begin_command_loop_tick(self, event: Any, source: Any) -> bool:
         """Persist execution before a /loop wake's command handler can perform effects.
 

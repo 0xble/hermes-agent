@@ -754,3 +754,91 @@ async def test_loop_wake_never_answers_clarification_registered_after_claim(cont
         owner.cancel()
         await asyncio.gather(owner, return_exceptions=True)
         runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_command_fence_survives_profile_hydration(control_home, monkeypatch):
+    """A control landing while the native profile secret loader hydrates must win."""
+    runner, _adapter, source, entry = native_runner(control_home)
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda _source: control_home
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set("/verbose", interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    fired = mgr.fire_tick()
+    assert fired == "/verbose"
+    state = mgr.state
+    tick = (state.created_at, state.ticks_fired)
+    hydration_started = threading.Event()
+    release_hydration = threading.Event()
+    effects = []
+
+    def blocked_secret_loader(_profile_home):
+        hydration_started.set()
+        assert release_hydration.wait(5)
+        return {}
+
+    from gateway import run as gateway_run
+    monkeypatch.setattr(gateway_run, "_load_profile_secret_scope", blocked_secret_loader)
+    runner._handle_verbose_command = AsyncMock(side_effect=lambda _event: effects.append("handler"))
+    event = MessageEvent(
+        text="/verbose", source=source, internal=True,
+        metadata={
+            "hermes_loop_wakeup": True,
+            "gateway_loop_tick": list(tick),
+            "gateway_session_id": entry.session_id,
+        },
+    )
+    dispatch = asyncio.create_task(runner._hm_dispatch_idle_commands(event, source, entry.session_key))
+    await asyncio.to_thread(hydration_started.wait, 5)
+    loops.LoopManager(entry.session_id).pause("test pause")
+    release_hydration.set()
+    result = await dispatch
+    assert result == (True, None)
+    assert effects == []
+    assert loops.load_loop(entry.session_id).status == "paused"
+    runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_command_final_fence_and_handler_share_event_loop_step(control_home):
+    runner, _adapter, source, entry = native_runner(control_home)
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set("/verbose", interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    assert mgr.fire_tick() == "/verbose"
+    state = mgr.state
+    tick = (state.created_at, state.ticks_fired)
+    steps = []
+    task = asyncio.current_task()
+    original_fence = runner._loop_wake_execution_fence_sync
+
+    def fenced(event, fence):
+        steps.append(("fence", asyncio.current_task()))
+        return original_fence(event, fence)
+
+    async def handler(_event):
+        assert steps[-1][0] == "fence"
+        assert steps[-1][1] is task
+        steps.append(("handler", asyncio.current_task()))
+        return "ok"
+
+    runner._loop_wake_execution_fence_sync = fenced
+    runner._handle_verbose_command = handler
+    event = MessageEvent(
+        text="/verbose", source=source, internal=True,
+        metadata={
+            "hermes_loop_wakeup": True,
+            "gateway_loop_tick": list(tick),
+            "gateway_session_id": entry.session_id,
+        },
+    )
+    handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+    assert (handled, result) == (True, "ok")
+    assert [step[0] for step in steps] == ["fence", "handler"]
+    assert steps[0][1] is steps[1][1] is task
+    runner.session_store.close_all_db_handles()

@@ -2542,6 +2542,11 @@ class GatewayTurnMixin:
                     _run_start_session_id, _loop_tick, source, run_generation=run_generation,
                 ):
                     return
+                from hermes_cli.loops import loop_control_generation
+                event._gateway_loop_execution_fence = (
+                    _run_start_session_id, _loop_tick, run_generation,
+                    loop_control_generation(_run_start_session_id),
+                )
                 event._gateway_loop_tick = _loop_tick
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
@@ -2564,6 +2569,11 @@ class GatewayTurnMixin:
                 if message_text is None:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
+            if _loop_tick is not None and not self._loop_wake_execution_fence_sync(
+                event, getattr(event, "_gateway_loop_execution_fence", None),
+            ):
+                return
+
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
