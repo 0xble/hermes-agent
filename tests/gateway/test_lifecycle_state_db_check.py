@@ -19,8 +19,11 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,8 +124,125 @@ def test_checker_reports_a_torn_btree_page(tmp_path: Path) -> None:
     assert "btreeInitPage" in verdict or "malformed" in verdict.lower()
 
 
+def test_first_header_probe_failure_keeps_delete_scan_before_claim(tmp_path: Path, monkeypatch) -> None:
+    """A failed first WAL probe must not defer a DELETE scan until after claiming."""
+    _write_sentinel(tmp_path)
+    import gateway.lifecycle_ledger as ledger
+
+    order = []
+    probe_calls = []
+
+    def probe(_home):
+        probe_calls.append(True)
+        if len(probe_calls) == 1:
+            raise RuntimeError("header read failed")
+        return False
+
+    monkeypatch.setattr(ledger, "_state_db_is_wal", probe)
+    monkeypatch.setattr(ledger, "_report_unclean_exit", lambda *args, **kwargs: order.append("scan"))
+    monkeypatch.setattr(ledger, "_write_sentinel", lambda *args, **kwargs: order.append("claim"))
+
+    record_startup(home=tmp_path)
+
+    assert order == ["scan", "claim"]
+    assert len(probe_calls) == 1
+
+
 def test_checker_tolerates_a_missing_store(tmp_path: Path) -> None:
     assert check_state_db_integrity(home=tmp_path) == "absent"
+
+
+def _foreign_exclusive_acquired(path: Path) -> bool:
+    """Try SQLite's exclusive WAL reset from a separate process."""
+    child = """
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    conn.execute(\"PRAGMA locking_mode=EXCLUSIVE\")
+    conn.execute(\"BEGIN IMMEDIATE\")
+    conn.execute(\"ROLLBACK\")
+    print(\"EXCLUSIVE_ACQUIRED\")
+except sqlite3.OperationalError:
+    print(\"REFUSED\")
+finally:
+    conn.close()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child, str(path)], capture_output=True, text=True, check=True,
+    )
+    return "EXCLUSIVE_ACQUIRED" in result.stdout
+
+
+def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A live WAL scan must remain visible while SessionDB runs its preopen probe.
+
+    The child process is the observation boundary: if the preopen probe closes a
+    descriptor for an untracked checker, SQLite's POSIX lock disappears and the
+    child can take the exclusive reset lock.
+    """
+    import gateway.lifecycle_ledger as ledger
+    import hermes_state_dbfile
+    from hermes_state import SessionDB
+
+    path = tmp_path / "state.db"
+    seed = SessionDB(db_path=path)
+    seed.close()
+    scan_started, release, result = threading.Event(), threading.Event(), []
+
+    class HeldQuickCheckConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if str(sql).lower().startswith("pragma quick_check"):
+                scan_started.set()
+                assert release.wait(timeout=5), "test did not release the WAL scan"
+            return super().execute(sql, parameters)
+
+    real_connect = sqlite3.connect
+
+    def connect_for_scan(database, *args, **kwargs):
+        kwargs["factory"] = HeldQuickCheckConnection
+        return real_connect(database, *args, **kwargs)
+
+    # The current implementation calls ledger.sqlite3.connect directly. Keep
+    # the same held connection when the fixed implementation uses the tracked
+    # state-db helper, without weakening that helper's real registration.
+    monkeypatch.setattr(ledger, "sqlite3", SimpleNamespace(connect=connect_for_scan))
+    real_tracked_connect = hermes_state_dbfile._connect_tracked_db
+
+    def tracked_connect_for_scan(database, *args, **kwargs):
+        kwargs["factory"] = HeldQuickCheckConnection
+        return real_tracked_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(hermes_state_dbfile, "_connect_tracked_db", tracked_connect_for_scan)
+
+    worker = threading.Thread(
+        target=lambda: result.append(check_state_db_integrity(home=tmp_path)),
+        name="held-wal-integrity-check",
+        daemon=True,
+    )
+    worker.start()
+    assert scan_started.wait(timeout=5), "WAL integrity scan did not reach quick_check"
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    assert has_live_connection(path), "WAL scan connection is not registered for preopen safety"
+
+    writer = SessionDB(db_path=path)
+    try:
+        writer.create_session("lock-probe", source="test")
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    try:
+        assert not _foreign_exclusive_acquired(path), (
+            "a foreign process acquired the exclusive WAL reset lock while the scan and writer were live"
+        )
+    finally:
+        writer.close()
+
+    assert not worker.is_alive(), "held WAL integrity scan did not finish"
+    assert result == ["ok"]
 
 
 # ── wiring into the unclean-exit path ───────────────────────────────────────

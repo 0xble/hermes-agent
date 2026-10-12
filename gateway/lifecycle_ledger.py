@@ -241,7 +241,8 @@ def check_state_db_integrity(home: Optional[Path] = None, *, renew_startup_lease
     if not path.exists():
         return "absent"
     try:
-        with closing(sqlite3.connect(str(path))) as conn:
+        from hermes_state_dbfile import _connect_tracked_db
+        with closing(_connect_tracked_db(str(path), tracking_path=path)) as conn:
             if renew_startup_lease:
                 _install_integrity_check_lease(conn)
             row = conn.execute("PRAGMA quick_check(1)").fetchone()
@@ -297,9 +298,13 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     if evidence is not None:
         try:
-            # DELETE/unreadable-header stores must complete the synchronous scan before
-            # this process claims the sentinel, preserving the base startup ordering.
-            wal_mode = _state_db_is_wal(home)
+            # A failed first header probe is non-WAL for ordering purposes: do not claim
+            # the new sentinel and then re-probe into a DELETE scan.
+            try:
+                wal_mode = _state_db_is_wal(home)
+            except Exception:
+                wal_mode = False
+                logger.debug("WAL-mode header probe failed; using synchronous integrity ordering", exc_info=True)
             if not wal_mode:
                 _report_unclean_exit(evidence, home, renew_startup_lease=True)
         except Exception:

@@ -123,6 +123,14 @@ Concurrency limits of the WAL background scan, accepted rather than bounded:
   213)` after 1.1 s, VACUUM ok, TRUNCATE `(0, 0, 0)` once the reader ended). Requested compaction (`_run_requested_state_db_compaction`)
   runs before `record_startup`, so it never overlaps the scan; the housekeeping
   auto-VACUUM waits for its first watch window and its own throttles.
+- The checker connection is opened through the tracked SQLite helper and stays
+  registered until the scan closes it. This in-process overlap is required:
+  `SessionDB` startup's header probe must see the live path and skip raw
+  `open()`/`close()`, because an untracked descriptor close can cancel this
+  process's POSIX locks. The pending and completed records intentionally retain
+  the same `gateway.previous_unclean_exit` tag; pair them by
+  `(prior_pid, prior_started_at)`, with `state_db_integrity: "pending"` versus
+  the completed verdict distinguishing the two stages.
 - Other processes (cron workers, CLI) can write throughout; only this
   process's own readiness was ever gated.
 
