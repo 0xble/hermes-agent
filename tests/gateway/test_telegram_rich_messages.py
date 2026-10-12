@@ -174,6 +174,29 @@ def test_adjacent_footnote_refs_get_a_superscript_separator():
     assert normalize_footnotes(result) == result
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Inline $[^2][^3]$ math",
+        "Inline $x_{[^2][^3]}$ math, then prose.",
+        "See <code>[^2][^3]</code> here",
+        "Keys <kbd>[^1][^2]</kbd> and <CODE class=\"x\">a[^1][^2]</CODE> stay",
+    ],
+)
+def test_adjacent_footnote_refs_in_inline_math_and_html_code_stay_literal(content):
+    """TeX math and inline HTML code are literal for Telegram, so no separator is injected there."""
+    from plugins.platforms.telegram.rich_markdown import normalize_footnotes
+
+    assert normalize_footnotes(content) == content
+    # Prose around them is still separated, and currency dollars do not open math.
+    for prose, expected in (
+        (f"{content} then refs[^1][^2]", f"{content} then refs[^1]<sup>,</sup>[^2]"),
+        ("Costs $5 and refs[^1][^2] then $6", "Costs $5 and refs[^1]<sup>,</sup>[^2] then $6"),
+        ("<b>Bold[^1][^2]</b>", "<b>Bold[^1]<sup>,</sup>[^2]</b>"),
+    ):
+        assert normalize_footnotes(prose) == expected
+
+
 def test_footnote_defs_after_a_list_get_a_spacer():
     from plugins.platforms.telegram.rich_markdown import normalize_footnotes
 

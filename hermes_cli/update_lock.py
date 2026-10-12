@@ -47,9 +47,6 @@ CREATE_TIME_TOLERANCE_SECONDS = 2.0
 # Our own creation time re-probed by the same clock: only the marker's 3-decimal rounding differs,
 # while two processes are at least one scheduler tick (10 ms) apart.
 _OWN_CREATE_TIME_EPSILON = 0.005
-# macOS shells read a creation time from `ps -o lstart` and write it as whole seconds (`ct:N.000`),
-# truncated. A whole-second claim inside the second we started in is still our incarnation.
-_WHOLE_SECOND_CT = 1.0
 
 # A claim published by create-then-write (filesystems without hard links) is briefly empty; an
 # empty marker this young is a claim in flight, not a dead one (contract A3).
@@ -185,17 +182,54 @@ def _windows_create_filetime(pid: int) -> int | None:
         kernel32.CloseHandle(handle)
 
 
+def _darwin_create_time(pid: int) -> float | None:
+    """Precise kernel clock; self-contained for the frozen no-site recovery closure."""
+    import ctypes
+
+    class ProcBsdInfo(ctypes.Structure):
+        # sys/proc_info.h: PROC_PIDTBSDINFO, also used by bootstrap marker.rs.
+        _fields_ = [
+            (name, ctypes.c_uint32) for name in (
+                "flags", "status", "xstatus", "pid", "ppid", "uid", "gid",
+                "ruid", "rgid", "svuid", "svgid", "reserved",
+            )
+        ] + [
+            ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+            ("nfiles", ctypes.c_uint32), ("pgid", ctypes.c_uint32),
+            ("pjobc", ctypes.c_uint32), ("tdev", ctypes.c_uint32),
+            ("tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32),
+            ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64),
+        ]
+
+    if not 0 < pid <= 0x7fffffff:
+        return None
+    try:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        probe = lib.proc_pidinfo
+        probe.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        probe.restype = ctypes.c_int
+        info = ProcBsdInfo()
+        size = ctypes.sizeof(info)
+        if probe(pid, 3, 0, ctypes.byref(info), size) != size or info.pid != pid:
+            return None
+        return info.start_sec + info.start_usec / 1_000_000
+    except (OSError, AttributeError):
+        return None
+
+
 def _stdlib_create_time(pid: int) -> float | None:
     """Creation time in unix seconds without psutil (``-I -S`` children, early recovery).
 
     Same clock psutil reports: Linux ``starttime / CLK_TCK + btime``, macOS the kernel start
-    time (``ps -o lstart=`` in UTC, second resolution — inside the 2 s tolerance), Windows the
+    time (``proc_pidinfo``, including fractional seconds), Windows the
     ``GetProcessTimes`` creation FILETIME.
     """
     try:
         if sys.platform == "win32":
             ticks = _windows_create_filetime(pid)
             return None if ticks is None else (ticks - _FILETIME_UNIX_EPOCH) / 1e7
+        if sys.platform == "darwin":
+            return _darwin_create_time(pid)
         if os.path.isdir("/proc"):
             with open(f"/proc/{pid}/stat", "rb") as fh:
                 stat = fh.read()
@@ -298,11 +332,7 @@ def _incarnation(pid: int, recorded: float | None, w: _World) -> bool | None:
     if pid == w.pid:  # we are alive by definition: only the incarnation is in question
         if w.ct is None:
             return recorded is None
-        if recorded is None:
-            return False
-        if abs(w.ct - recorded) <= _OWN_CREATE_TIME_EPSILON:
-            return True
-        return recorded.is_integer() and 0 <= w.ct - recorded < _WHOLE_SECOND_CT
+        return recorded is not None and abs(w.ct - recorded) <= _OWN_CREATE_TIME_EPSILON
     if not w.alive(pid):
         return False
     actual = None if recorded is None else w.ct_of(pid)
