@@ -14,14 +14,17 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   marker in a profile-local directory; it starts a new session and never carries
   raw credentials in a durable receipt.
 - Boot adoption matches the checkpoint by container or owner identity, restores
-  the live process without replaying a completion, and polls until exactly one
-  completion is emitted. A gone process without an exit file emits one `lost`
-  completion. The delivered marker makes restarts and concurrent pollers
-  idempotent; shutdown fences the old gateway's survivor pollers before teardown
-  so a completion is not claimed into a queue that the successor cannot drain.
+  the live process without rerunning the command, and polls for its completion.
+  A gone process without an exit file emits a `lost`
+  completion with `survivor_lost` provenance. Enqueueing is not delivery: pending
+  completions stay checkpointed and replay after a crash. The delivered marker is
+  written only on CLI consumption or successful gateway notification admission;
+  delivered markers suppress restart replays. Shutdown fences survivor pollers
+  before teardown. Run directories are pruned after acknowledged-result retention
+  expires, and immediately on spawn failure. Log polls read only a bounded tail.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
-  processes running. A dedicated `process_manage kill` or explicit internal
-  `gateway_stop_all` sweep still terminates them. This is the D3 operator-stop decision.
+  processes running. Explicit operator stop paths (`process.kill`, `cli.stop`,
+  `slash.stop`, and `process.stop`) still terminate them. This is the D3 operator-stop decision.
 - The terminal tool description limits restart survival to idempotent bounded
   work such as gates, tests, and builds, never external writes.
 

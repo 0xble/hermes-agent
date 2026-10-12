@@ -341,6 +341,73 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
 
 
 @pytest.mark.asyncio
+async def test_survivor_notification_acknowledges_only_successful_gateway_admission(tmp_path, monkeypatch):
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    run_dir = home / "process-runs" / "proc_notice"
+    run_dir.mkdir(parents=True)
+    session = ProcessSession(id="proc_notice", command="echo ok", task_id="task",
+                             session_key="session", survive_restart=True, exited=True,
+                             exit_code=0, notify_on_complete=True, log_path=str(run_dir / "out.log"),
+                             delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    registry._finished[session.id] = session
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "off"
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    attempts = []
+
+    async def admit(_text, _event, **kwargs):
+        assert not (run_dir / "delivered").exists()
+        attempts.append("admit")
+        return len(attempts) > 1
+
+    runner._enqueue_process_completion_notification = admit
+    runner._build_process_completion_event = lambda *_: {"type": "completion", "session_id": session.id,
+                                                         "output": "ok", "command": session.command,
+                                                         "exit_code": 0, "task_id": "task"}
+    await asyncio.wait_for(runner._run_process_watcher({
+        "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
+    }), timeout=5)
+    assert attempts == ["admit", "admit"]
+    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+    assert registry.is_completion_consumed(session.id)
+    await runner._run_process_watcher({
+        "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
+    })
+    assert attempts == ["admit", "admit"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fences_survivor_pollers_before_work_drain(monkeypatch):
+    from gateway.run_shutdown import GatewayShutdownMixin
+    from tools.process_registry import process_registry
+
+    runner, _ = make_restart_runner()
+    calls = []
+    monkeypatch.setattr(process_registry, "stop_survivor_pollers", lambda: calls.append("fence"))
+    runner._stop_hosted_room_worker = AsyncMock(return_value=True)
+    runner._stop_systemd_watchdog = AsyncMock()
+    runner._cancel_secondary_profile_reconnect_tasks = AsyncMock()
+    runner._notify_active_sessions_of_shutdown = AsyncMock()
+    runner._mark_api_runs_shutdown_requested = lambda: calls.append("begin-drain")
+    runner._stop_drain_active_work = AsyncMock(side_effect=lambda *_: calls.append("drain"))
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0)
+
+    await runner._stop_begin_teardown(ctx)
+    await runner._stop_drain_active_work(0, ctx)
+
+    assert calls == ["fence", "begin-drain", "drain"]
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_have_one_aggregate_deadline(monkeypatch):
     """A stuck transport must not serialize one timeout per active chat."""
     import asyncio

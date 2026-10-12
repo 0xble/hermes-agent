@@ -3070,10 +3070,13 @@ class GatewayNotificationsMixin:
                         busy_receipt_sent = True
                         message_text = self._format_process_final_message(session_id, session, "concise")
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
-                    if await delivery is False:
+                    admitted = await delivery
+                    if admitted is False:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
                         continue
+                    if admitted is True:
+                        process_registry.acknowledge_survivor_completion(session_id)
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).

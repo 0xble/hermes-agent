@@ -158,6 +158,13 @@ def spawn_background_process(
     exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
     """
     from tools.process_registry import process_registry
+    from agent.delegation_context import is_delegated_child_context
+
+    if survive_restart and is_delegated_child_context():
+        return json.dumps({"output": "", "exit_code": -1, "status": "error",
+                           "error": "survive_restart is unavailable in delegated child contexts: "
+                                    "the child cannot receive the completion after restart. "
+                                    "Ask the parent to launch this command."})
     from tools.terminal_tool import (
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )

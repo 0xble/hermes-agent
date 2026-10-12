@@ -4,6 +4,8 @@ import json
 import subprocess
 import time
 
+import pytest
+
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -42,6 +44,209 @@ def _checkpoint_survivor(registry, home, *, pid, session_id="proc_survivor", log
     return session
 
 
+@pytest.mark.parametrize("command,expected", [
+    ("printf 'plain-ok\\n'", "plain-ok"),
+    ("printf 'comment-ok\\n' # trailing comment", "comment-ok"),
+    ("cat <<EOF\nheredoc-ok\nEOF", "heredoc-ok"),
+], ids=["plain", "comment", "heredoc"])
+def test_survivor_wrapper_preserves_plain_comments_and_heredocs(tmp_path, monkeypatch, command, expected):
+    _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    session = registry.spawn_local(command, cwd=str(tmp_path), task_id="task", survive_restart=True)
+    session.notify_on_complete = True
+    registry._write_checkpoint()
+    event = registry.completion_queue.get(timeout=5)
+    assert event["completion_reason"] == "exited", event
+    assert event["exit_code"] == 0, event
+    assert expected in event["output"], event
+    assert session.process is not None
+    session.process.wait(timeout=3)
+
+
+def test_survivor_claim_without_delivery_is_replayed_after_restart(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="replayed\\n")
+    assert producer._claim_survivor_delivery(session) is True
+    # Also cover a persisted in-flight claim left by an interrupted predecessor.
+    from pathlib import Path
+    Path(session.delivered_path).write_text('{"state": "claimed"}')
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 1
+    event = successor.completion_queue.get(timeout=5)
+    assert event["session_id"] == session.id
+    assert event["completion_reason"] == "exited"
+    assert "replayed" in event["output"]
+
+
+def test_survivor_completed_but_undrained_checkpoint_replays_once(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="durable result\n")
+    producer._survivor_poller_loop(session)
+    assert producer.completion_queue.qsize() == 1
+    assert not (home / "process-runs" / session.id / "delivered").exists()
+    assert json.loads((home / "processes.json").read_text())[0]["session_id"] == session.id
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 1
+    recovered = successor.get(session.id)
+    assert recovered is not None and recovered._completion_event.wait(5)
+    assert successor.recover_from_checkpoint() == 0
+    events = successor.drain_notifications(session_key="session")
+    assert len(events) == 1
+    assert events[0][0]["session_id"] == session.id
+    assert successor.drain_notifications(session_key="session") == []
+    assert successor.is_completion_consumed(session.id)
+    assert json.loads((home / "processes.json").read_text()) == []
+
+
+def test_survivor_concurrent_successor_drains_deduplicate_the_notice(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="one result\n")
+    first, second = ProcessRegistry(), ProcessRegistry()
+    assert first.recover_from_checkpoint() == 1
+    assert second.recover_from_checkpoint() == 1
+    for successor in (first, second):
+        recovered = successor.get(session.id)
+        assert recovered is not None and recovered._completion_event.wait(5)
+    assert len(first.drain_notifications(session_key="session")) == 1
+    assert second.drain_notifications(session_key="session") == []
+
+
+def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path, monkeypatch):
+    from pathlib import Path
+    home = _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    session = _checkpoint_survivor(registry, home, pid=999999, log_text="x" * 100_000)
+    session.max_output_chars = 100
+    original_open = Path.open
+    reads = []
+
+    class BoundedFile:
+        def __init__(self, stream):
+            self.stream = stream
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.stream.close()
+        def seek(self, offset):
+            return self.stream.seek(offset)
+        def read(self, size=-1):
+            assert 0 <= size <= session.max_output_chars
+            reads.append(size)
+            return self.stream.read(size)
+
+    def instrumented_open(path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        return BoundedFile(stream) if str(path) == session.log_path and args == ("rb",) else stream
+
+    monkeypatch.setattr(Path, "open", instrumented_open)
+    registry._read_survivor_log(session)
+    registry._read_survivor_log(session)
+    assert reads == [100]
+    with original_open(Path(session.log_path), "a") as log:
+        log.write("y" * 10_000 + "TAIL")
+    registry._read_survivor_log(session)
+    assert reads == [100, 100]
+    assert len(session.output_buffer) <= 100
+    assert session.output_buffer.endswith("TAIL")
+
+
+def test_survive_restart_rejected_in_delegated_children(tmp_path, monkeypatch):
+    from agent.delegation_context import delegated_child_context
+    from tools.terminal_tool_background import spawn_background_process
+    from unittest.mock import Mock
+    import tools.process_registry as module
+
+    registry = Mock()
+    monkeypatch.setattr(module, "process_registry", registry)
+    with delegated_child_context("child"):
+        result = json.loads(spawn_background_process(
+            command="echo never", env_type="local", env=None, cwd=str(tmp_path),
+            effective_task_id="task", task_id="task", session_key="session",
+            workdir=None, effective_pty=False, notify_on_complete=True,
+            watch_patterns=None, approval_note=None, pty_disabled_reason=None,
+            survive_restart=True,
+        ))
+    assert result["status"] == "error"
+    assert "delegated child" in result["error"]
+    registry.spawn_local.assert_not_called()
+
+
+def test_survivor_delivered_marker_suppresses_restart_replay(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="delivered\\n")
+    producer._mark_survivor_delivered(session)
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 1
+    time.sleep(0.15)
+    assert successor.completion_queue.empty()
+
+
+def test_survivor_run_dir_pruned_after_delivered_session_ages_out(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    session = _checkpoint_survivor(registry, home, pid=999999, exit_code=0)
+    from tools.process_registry import FINISHED_TTL_SECONDS
+    session.started_at = time.time() - FINISHED_TTL_SECONDS - 1
+    registry._mark_survivor_delivered(session)
+    session.exited = True
+    registry._running.pop(session.id, None)
+    registry._finished[session.id] = session
+    registry._prune_if_needed()
+    assert not (home / "process-runs" / session.id).exists()
+
+
+def test_survivor_delivered_artifacts_are_pruned_on_boot_after_ttl(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    from tools.process_registry import FINISHED_TTL_SECONDS
+
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0)
+    producer._mark_survivor_delivered(session)
+    marker = Path(session.delivered_path)
+    expired = time.time() - FINISHED_TTL_SECONDS - 1
+    os.utime(marker, (expired, expired))
+    (home / "processes.json").unlink()
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 0
+    assert not marker.parent.exists()
+
+
+def test_survivor_pending_artifacts_and_results_are_not_pruned(tmp_path, monkeypatch):
+    from pathlib import Path
+    from tools.process_registry import FINISHED_TTL_SECONDS
+
+    home = _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    session = _checkpoint_survivor(registry, home, pid=999999, exit_code=0)
+    session.started_at = time.time() - FINISHED_TTL_SECONDS - 1
+    registry._survivor_poller_loop(session)
+    registry._prune_if_needed()
+    assert Path(session.log_path).parent.exists()
+    assert session.id in registry._finished
+    assert json.loads((home / "processes.json").read_text())[0]["session_id"] == session.id
+
+
+def test_survivor_spawn_failure_prunes_run_dir(tmp_path, monkeypatch):
+    import tools.process_registry as registry_module
+
+    home = _home(monkeypatch, tmp_path)
+    monkeypatch.setattr(registry_module.subprocess, "Popen", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("boom")))
+    registry = ProcessRegistry()
+    try:
+        registry.spawn_local("echo never", cwd=str(tmp_path), task_id="task", survive_restart=True)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("spawn_local should propagate the spawn failure")
+    assert not list((home / "process-runs").glob("*/"))
+
+
 def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeypatch):
     home = _home(monkeypatch, tmp_path)
     registry = ProcessRegistry()
@@ -52,7 +257,7 @@ def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeyp
     assert registry.kill_all(source="gateway_shutdown") == 0
     assert session.process.poll() is None
 
-    assert registry.kill_all(source="gateway_stop_all") == 1
+    assert registry.kill_all(source="cli.stop") == 1
     session.process.wait(timeout=3)
     assert (home / "process-runs" / session.id).exists()
 
@@ -126,7 +331,12 @@ def test_recovered_survivor_emits_single_completion_with_exit_code(tmp_path, mon
     assert "SURVIVOR_OK" in event["output"]
     time.sleep(0.1)
     assert recovered.completion_queue.empty()
-    assert json.loads((home / "process-runs" / session.id / "delivered").read_text()) == {"delivered": True}
+    assert not (home / "process-runs" / session.id / "delivered").exists()
+    recovered.acknowledge_survivor_completion(session.id)
+    assert json.loads((home / "process-runs" / session.id / "delivered").read_text())["delivered"] is True
+    snapshot = recovered.poll(session.id)
+    assert "SURVIVOR_OK" in snapshot["output_preview"]
+    assert "note" not in snapshot
     child.wait(timeout=3)
 
 
@@ -144,6 +354,7 @@ def test_recovered_survivor_gone_without_exit_file_reports_lost_once(tmp_path, m
         time.sleep(0.02)
     event = recovered.completion_queue.get(timeout=1)
     assert event["completion_reason"] == "lost"
+    assert event["termination_source"] == "survivor_lost"
     assert event["exit_code"] is None
     assert "partial output" in event["output"]
     time.sleep(0.1)
@@ -156,7 +367,7 @@ def test_stop_all_source_still_kills_survivors(tmp_path, monkeypatch):
     session = registry.spawn_local(
         "sleep 5", cwd=str(tmp_path), task_id="task", survive_restart=True,
     )
-    assert registry.kill_all(source="gateway_stop_all") == 1
+    assert registry.kill_all(source="cli.stop") == 1
     session.process.wait(timeout=3)
     assert session.process.poll() is not None
 
@@ -240,7 +451,8 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
     assert event["exit_code"] == 9
     assert "SURVIVOR_BOOT_OK" in event["output"]
     assert recovered.completion_queue.empty()
-    # Even replaying the old checkpoint cannot duplicate the completion claim.
+    recovered.acknowledge_survivor_completion(session_id)
+    # Even replaying the old checkpoint cannot duplicate an acknowledged completion.
     (home / "processes.json").write_text(checkpoint)
     again = ProcessRegistry()
     assert again.recover_from_checkpoint() == 1

@@ -1267,7 +1267,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         if survive_restart:
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
-            return self._spawn_local_survivor(session, safe_command, env_vars)
+            try:
+                return self._spawn_local_survivor(session, safe_command, env_vars)
+            except Exception:
+                self._remove_survivor_run_dir(session)
+                raise
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1752,7 +1756,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
-        return session_id in self._completion_consumed
+        if session_id in self._completion_consumed:
+            return True
+        session = self.get(session_id)
+        return bool(session is not None and session.survive_restart
+                    and self._survivor_delivery_state(session) == "delivered")
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
@@ -1972,6 +1980,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
                     continue
             if text := format_process_notification(evt):
+                if evt.get("type") == "completion":
+                    session = self.get(_evt_sid)
+                    if session is not None and session.survive_restart:
+                        if not self._mark_survivor_delivered(session):
+                            continue
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
@@ -2111,7 +2124,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if not finalizing:
                 self._poll_observed.add(session_id)
         if session.detached:
-            result.update(detached=True, note="Process recovered after restart -- output history unavailable")
+            result["detached"] = True
+            if not session.survive_restart:
+                result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
@@ -2144,6 +2159,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if exited and observed_completion_output and not finalizing:
             self._completion_consumed.add(session_id)
+            self.acknowledge_survivor_completion(session_id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2178,6 +2194,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             result = None
             if session.exited and not self._reader_finalizing(session):
                 self._completion_consumed.add(session_id)
+                self.acknowledge_survivor_completion(session_id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -2256,6 +2273,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             # the explicit kill result, matching wait/log consumption.
             if consume_output and not finalizing:
                 self._completion_consumed.add(session_id)
+                self.acknowledge_survivor_completion(session_id)
             session._kill_deadline = previous_kill_deadline
             return result
         # Keep an additive receipt before a restart/shutdown signal can outlive this
@@ -2342,6 +2360,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             # checkpoint forever after the deadline expires.
             session._kill_deadline = previous_kill_deadline
             session._kill_requested = False
+            if (consume_output and session.exited and session_id in self._completion_consumed
+                    and (deadline is None or time.monotonic() < deadline)):
+                self.acknowledge_survivor_completion(session_id)
 
     @staticmethod
     def _stop_scope(session: ProcessSession, deadline: Optional[float] = None) -> bool:
@@ -3096,8 +3117,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         """Drop expired finished sessions, then the oldest survivor while over
         MAX_PROCESSES. Must hold _lock. A session whose scope stop is still pending is kept
         either way: it is kill_all's only handle on a scope that may hold live descendants."""
+        self._prune_delivered_survivor_runs()
         now = time.time()
-        prunable = {sid: s for sid, s in self._finished.items() if not getattr(s, "_scope_stop_pending", False)}
+        prunable = {
+            sid: s for sid, s in self._finished.items()
+            if not getattr(s, "_scope_stop_pending", False)
+            and not (s.survive_restart and s.notify_on_complete
+                     and self._survivor_delivery_state(s) != "delivered")
+        }
         expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
         over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES
         if over_cap and (survivors := [sid for sid in prunable if sid not in expired]):
@@ -3110,6 +3137,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             # otherwise carry its OS handles to the grave unreleased. The
             # release is idempotent, so double-closing is safe.
             self._release_finished_handles(self._finished[sid])
+            self.prune_survivor_run_dir(self._finished[sid])
             del self._finished[sid]
         # Belt-and-suspenders against module-lifetime growth: forget consumed /
         # poll-observed marks for any session no longer tracked at all.

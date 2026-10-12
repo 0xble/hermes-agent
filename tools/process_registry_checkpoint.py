@@ -25,8 +25,13 @@ class ProcessCheckpointMixin:
         try:
             with self._lock:
                 entries = []
-                for s in self._running.values():
-                    if s.exited:
+                pending_survivors = [
+                    s for s in self._finished.values()
+                    if s.survive_restart and s.notify_on_complete
+                    and self._survivor_delivery_state(s) != "delivered"
+                ]
+                for s in (*self._running.values(), *pending_survivors):
+                    if s.exited and not s.survive_restart:
                         continue
                     # Backfill the start time so recovery can detect PID recycling
                     # even for sessions spawned before this field existed.
@@ -59,6 +64,7 @@ class ProcessCheckpointMixin:
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
 
+        self._prune_delivered_survivor_runs()
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
             return 0
@@ -75,7 +81,8 @@ class ProcessCheckpointMixin:
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
             with self._lock:
-                already_tracked = entry.get("session_id") in self._running
+                already_tracked = (entry.get("session_id") in self._running
+                                   or entry.get("session_id") in self._finished)
             if already_tracked:
                 continue
             if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
