@@ -17,7 +17,10 @@ from utils import atomic_json_write
 logger = logging.getLogger("tools.process_registry")
 
 RESULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+CUT_RECEIPT_RETENTION_SECONDS = 2 * 24 * 60 * 60
 MAX_RETAINED_RESULTS = 64
+MAX_RETAINED_CUT_RESULTS = 256
+_CUT_COMPLETION_REASONS = frozenset({"cut_pending"})
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
@@ -26,32 +29,54 @@ _RESULT_FIELDS = (
 
 
 def _result_paths():
-    """Prune by completion time, not start time (jobs can take days)."""
+    """Prune normal and pre-kill receipts independently by completion time."""
     directory = get_hermes_home() / "logs" / "process-results"
-    cutoff = time.time() - RESULT_RETENTION_SECONDS
-    retained = []
+    now = time.time()
+    retained = {"normal": [], "cut": []}
     for path in directory.glob("proc_*.json"):
         try:
             modified = path.stat().st_mtime
-            if modified < cutoff:
+            try:
+                record = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError, TypeError):
+                record = {}
+            kind = "cut" if record.get("completion_reason") in _CUT_COMPLETION_REASONS else "normal"
+            retention = CUT_RECEIPT_RETENTION_SECONDS if kind == "cut" else RESULT_RETENTION_SECONDS
+            if modified < now - retention:
                 path.unlink(missing_ok=True)
             else:
-                retained.append((modified, path))
+                retained[kind].append((modified, path))
         except FileNotFoundError:
             continue  # Another producer pruned it.
-    retained.sort(key=lambda item: (item[0], item[1].name), reverse=True)
-    for _, path in retained[MAX_RETAINED_RESULTS:]:
+    retained["normal"].sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    retained["cut"].sort(key=lambda item: (item[0], item[1].name), reverse=True)
+    for _, path in retained["normal"][MAX_RETAINED_RESULTS:]:
         path.unlink(missing_ok=True)
-    return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
+    for _, path in retained["cut"][MAX_RETAINED_CUT_RESULTS:]:
+        path.unlink(missing_ok=True)
+    return [
+        path
+        for _, path in sorted(
+            (*retained["normal"][:MAX_RETAINED_RESULTS], *retained["cut"][:MAX_RETAINED_CUT_RESULTS]),
+            key=lambda item: (item[0], item[1].name),
+            reverse=True,
+        )
+    ]
 
 
-def save_completed_result(session) -> None:
+def save_completed_result(
+    session, *, completion_reason: str | None = None, termination_source: str | None = None,
+) -> None:
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
     with session._lock:
         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
+    if completion_reason is not None:
+        record["completion_reason"] = completion_reason
+    if termination_source is not None:
+        record["termination_source"] = termination_source
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
@@ -65,6 +90,15 @@ def save_completed_result(session) -> None:
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+
+
+def save_cut_pending_result(session, source: str) -> None:
+    """Persist the last live snapshot before a restart or bounded sweep can cut it."""
+    save_completed_result(
+        session,
+        completion_reason="cut_pending",
+        termination_source=source,
+    )
 
 
 def _owns_result(owner: str, parent: str | None) -> bool:

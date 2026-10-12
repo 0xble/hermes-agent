@@ -74,6 +74,62 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    session = _make_session(sid="proc_cut_pending")
+    session.process = MagicMock(pid=12345)
+    registry._running[session.id] = session
+
+    def slow_signal(*_args, **_kwargs):
+        time.sleep(0.03)
+        return None
+
+    monkeypatch.setattr(registry, "_signal_kill", slow_signal)
+    monkeypatch.setattr(registry, "_stop_scope", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(registry, "_post_kill_survivors", lambda *_args, **_kwargs: [])
+
+    result = registry.kill_process(
+        session.id,
+        source="gateway_shutdown",
+        deadline=time.monotonic() + 0.005,
+    )
+
+    assert result["status"] == "killed"
+    receipt = home / "logs" / "process-results" / f"{session.id}.json"
+    assert receipt.exists()
+    record = json.loads(receipt.read_text(encoding="utf-8"))
+    assert record["completion_reason"] == "cut_pending"
+    assert record["termination_source"] == "gateway_shutdown"
+
+
+def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    directory = home / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 64)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_CUT_RESULTS", 256)
+
+    cut = directory / "proc_cut_old.json"
+    cut.write_text(json.dumps({"id": cut.stem, "completion_reason": "cut_pending"}), encoding="utf-8")
+    now = time.time()
+    os.utime(cut, (now - 60, now - 60))
+    for index in range(70):
+        path = directory / f"proc_normal_{index:03d}.json"
+        path.write_text(json.dumps({"id": path.stem, "completion_reason": "exited"}), encoding="utf-8")
+        os.utime(path, (now + index, now + index))
+
+    retained = receipts._result_paths()
+
+    assert cut in retained
+    assert len(retained) == 65
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(
