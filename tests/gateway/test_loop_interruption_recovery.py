@@ -757,7 +757,8 @@ async def test_loop_wake_never_answers_clarification_registered_after_claim(cont
 
 
 @pytest.mark.asyncio
-async def test_command_fence_survives_profile_hydration(control_home, monkeypatch):
+@pytest.mark.parametrize("control", ["pause", "clear", "replace", "session_reset"])
+async def test_command_fence_survives_profile_hydration(control_home, monkeypatch, control):
     """A control landing while the native profile secret loader hydrates must win."""
     runner, _adapter, source, entry = native_runner(control_home)
     runner.config.multiplex_profiles = True
@@ -776,6 +777,10 @@ async def test_command_fence_survives_profile_hydration(control_home, monkeypatc
     effects = []
 
     def blocked_secret_loader(_profile_home):
+        # A concurrent /new may enter its own profile scope; block only this dispatch's
+        # first hydration worker, not the control that must be allowed to supersede it.
+        if hydration_started.is_set():
+            return {}
         hydration_started.set()
         assert release_hydration.wait(5)
         return {}
@@ -792,13 +797,13 @@ async def test_command_fence_survives_profile_hydration(control_home, monkeypatc
         },
     )
     dispatch = asyncio.create_task(runner._hm_dispatch_idle_commands(event, source, entry.session_key))
-    await asyncio.to_thread(hydration_started.wait, 5)
-    loops.LoopManager(entry.session_id).pause("test pause")
+    assert await asyncio.to_thread(hydration_started.wait, 5), "native hydration was not reached"
+    await _apply_loop_control(control, runner, source, entry.session_id)
     release_hydration.set()
     result = await dispatch
     assert result == (True, None)
     assert effects == []
-    assert loops.load_loop(entry.session_id).status == "paused"
+    assert not _owns_executing_tick(loops.load_loop(entry.session_id), tick)
     runner.session_store.close_all_db_handles()
 
 
@@ -819,10 +824,11 @@ async def test_command_final_fence_and_handler_share_event_loop_step(control_hom
 
     def fenced(event, fence):
         steps.append(("fence", asyncio.current_task()))
+        asyncio.get_running_loop().call_soon(lambda: steps.append(("yielded", None)))
         return original_fence(event, fence)
 
     async def handler(_event):
-        assert steps[-1][0] == "fence"
+        assert steps[-1][0] == "fence", "effect entry yielded after the final fence"
         assert steps[-1][1] is task
         steps.append(("handler", asyncio.current_task()))
         return "ok"
@@ -839,6 +845,30 @@ async def test_command_final_fence_and_handler_share_event_loop_step(control_hom
     )
     handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
     assert (handled, result) == (True, "ok")
-    assert [step[0] for step in steps] == ["fence", "handler"]
+    assert [step[0] for step in steps[:2]] == ["fence", "handler"]
     assert steps[0][1] is steps[1][1] is task
     runner.session_store.close_all_db_handles()
+
+
+def test_shared_loop_effect_entry_has_no_preparation_after_final_fence():
+    """Guard the structure, not a particular preparation boundary in a caller."""
+    import ast
+    import inspect
+    import textwrap
+
+    for name in ("_invoke_loop_wake_effect", "_invoke_loop_wake_sync_effect"):
+        function = getattr(GatewayRunner, name)
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        body = tree.body[0].body
+        assert isinstance(body[-2], ast.If)
+        assert isinstance(body[-2].test, ast.UnaryOp)
+        assert body[-2].test.operand.func.attr == "_loop_wake_execution_fence_sync"
+        invocation = body[-1]
+        assert isinstance(invocation, ast.Return)
+        awaits = [node for node in ast.walk(invocation) if isinstance(node, ast.Await)]
+        if inspect.iscoroutinefunction(function):
+            assert len(awaits) == 1
+            assert isinstance(awaits[0].value, ast.Call)
+            assert awaits[0].value.func.id == "handler"
+        else:
+            assert not awaits

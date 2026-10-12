@@ -2569,15 +2569,12 @@ class GatewayTurnMixin:
                 if message_text is None:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
-            if _loop_tick is not None and not self._loop_wake_execution_fence_sync(
-                event, getattr(event, "_gateway_loop_execution_fence", None),
-            ):
-                return
-
-            agent_result = await self._run_agent(
+            started, agent_result = await self._invoke_loop_wake_effect(
+                event, getattr(event, "_gateway_loop_execution_fence", None), self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
@@ -2592,6 +2589,8 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            if not started:
+                return
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final

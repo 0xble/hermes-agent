@@ -861,7 +861,7 @@ class GatewayGoalsMixin:
         session run generation prevent a different tick or reset successor from borrowing the call.
         """
         if fence is None:
-            return True
+            return self._loop_wake_command_identity(event) is None
         try:
             sid, tick, run_generation, control_generation = fence
         except (TypeError, ValueError):
@@ -875,6 +875,23 @@ class GatewayGoalsMixin:
                 self._session_key_for_source(event.source), run_generation,
             ))
         )
+
+    async def _invoke_loop_wake_effect(self, event: Any, fence: Optional[tuple], handler, *args, **kwargs):
+        """The sole async effect-entry step: no preparation or yield after the final fence.
+
+        Return ``(started, result)`` so a superseded command is consumed silently rather than
+        falling through into another handler or model work. Awaiting a native async handler starts
+        its body in this same event-loop step; future dispatch preparation belongs outside here.
+        """
+        if not self._loop_wake_execution_fence_sync(event, fence):
+            return False, None
+        return True, await handler(*args, **kwargs)
+
+    def _invoke_loop_wake_sync_effect(self, event: Any, fence: Optional[tuple], handler, *args):
+        """Executor twin: fence in the worker that actually invokes a synchronous plugin."""
+        if not self._loop_wake_execution_fence_sync(event, fence):
+            return False, None
+        return True, handler(*args)
 
     async def _begin_command_loop_tick(self, event: Any, source: Any) -> bool:
         """Persist execution before a /loop wake's command handler can perform effects.
