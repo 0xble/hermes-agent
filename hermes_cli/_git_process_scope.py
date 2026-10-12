@@ -286,7 +286,7 @@ def _pack_held_proc(proc: Path, path: Path) -> bool:
             raise  # broken target is not negative holder proof
         if (st.st_dev, st.st_ino) in identity:
             return True
-    for line in proc.joinpath("maps").read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in proc.joinpath("maps").read_text(encoding="utf-8-sig", errors="replace").splitlines():
         fields = line.split(maxsplit=5)
         major, minor = (int(part, 16) for part in fields[3].split(":"))
         if (os.makedev(major, minor), int(fields[4])) in identity:
