@@ -181,6 +181,15 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
     names — the guard keeps failing closed."""
     try:
         fd_stat = os.stat(fd_path)
+        identity = (fd_stat.st_dev, fd_stat.st_ino)
+        if not _identity_is_truly_unlinked(identity, watched_path):
+            return False
+        # SQLite may unlink its checkpointed -shm sidecar before closing its FD.
+        # A close or FD reuse during the path stat is no longer a live holder.
+        target = os.readlink(fd_path)
+        confirmed = os.stat(fd_path)
+        return (canonical_sqlite_path(target) == canonical_sqlite_path(watched_path)
+                and identity == (confirmed.st_dev, confirmed.st_ino))
     except OSError as exc:
         # ENOENT: the descriptor was closed after /proc was read. ESRCH: the whole
         # process exited mid-scan. Neither can keep a retired generation alive, so
@@ -188,7 +197,6 @@ def _fd_is_truly_unlinked(fd_path: str, watched_path: str) -> bool:
         if exc.errno in (errno.ENOENT, errno.ESRCH):
             return False
         return True
-    return _identity_is_truly_unlinked((fd_stat.st_dev, fd_stat.st_ino), watched_path)
 
 
 def _iter_proc_fd_targets():
@@ -491,6 +499,14 @@ def refuse_deleted_wal_generation(db_path) -> None:
     from hermes_state_errors import _DELETED_WAL_GENERATION_MSG
     if not _deleted_sidecar_holders_for_open(db_path):
         return
+    if sys.platform.startswith("linux"):
+        # SQLite's normal close unlinks checkpointed sidecars before closing
+        # their descriptors. Let that short-lived holder settle before refusing
+        # a new opener, without permitting a persistent retired generation.
+        for delay in (0.01, 0.02, 0.04):
+            time.sleep(delay)
+            if not iter_deleted_sqlite_sidecar_holders(db_path):
+                return
     logger.error(_DELETED_WAL_GENERATION_MSG)
     raise DeletedWalGenerationError(_DELETED_WAL_GENERATION_MSG)
 

@@ -1207,7 +1207,8 @@ class SessionDB(
 
     def _ensure_db_file_generation(self) -> None:
         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
-        OR IGNORE); application_id is written only while 0 so racers converge. PASSIVE checkpoint only.
+        OR IGNORE); application_id is written only while 0 so racers converge. Checkpoint only when the
+        stamp or header is first established.
 
         See #45383.
         """
@@ -1223,7 +1224,8 @@ class SessionDB(
                 row = self._conn.execute(
                     "SELECT value FROM state_meta WHERE key = ?", (_STATE_DB_GENERATION_KEY,),
                 ).fetchone()
-                if not (row and row[0]):
+                generation_needs_checkpoint = not (row and row[0])
+                if generation_needs_checkpoint:
                     self._conn.execute(
                         "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
                         (_STATE_DB_GENERATION_KEY, token),
@@ -1239,11 +1241,17 @@ class SessionDB(
                 if current == 0:
                     current = (int(token[:8], 16) & 0x7FFFFFFF) or 1
                     self._conn.execute(f"PRAGMA application_id={current}")
+                    generation_needs_checkpoint = True
                 self._db_file_application_id = current
-                try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                except sqlite3.Error:
-                    pass
+                if generation_needs_checkpoint:
+                    try:
+                        # The header application_id and the state_meta row must be
+                        # durable before identity is recorded. Once both already
+                        # exist, a checkpoint here only makes every opener contend
+                        # with the live writer and can stall startup on a large WAL.
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    except sqlite3.Error:
+                        pass
         except sqlite3.Error as exc:
             logger.debug("state.db generation stamp skipped: %s", exc)
 
