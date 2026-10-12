@@ -616,8 +616,6 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_iteration_budget_warning_injected", False),
     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
     ("_pre_verify_nudges", 0),
-    # Gateway silence re-prompt: at most one per turn, across stop-gate continuations.
-    ("_gateway_silence_reprompted", False),
 )
 
 

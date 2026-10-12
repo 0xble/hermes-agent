@@ -58,33 +58,8 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
-    "_dropped_toolcall_nudge", "_gateway_silence_reprompt",
+    "_dropped_toolcall_nudge",
 )
-
-
-_GATEWAY_SILENCE_SCAFFOLDING_FLAG = "_gateway_silence_reprompt"
-
-
-def drop_gateway_silence_scaffolding(agent: Any, messages: Any) -> int:
-    """Remove every silence re-prompt row (marker + nudge) in place, wherever it sits.
-
-    The pair is appended together as assistant→user, so removing both keeps role alternation:
-    the row before the marker was already valid before the row after the nudge. Real tool rows
-    are untouched. Scaffolding is never flushed, so only the flush cursor needs re-counting."""
-    if not isinstance(messages, list):
-        return 0
-    flagged = [m for m in messages if isinstance(m, dict) and m.get(_GATEWAY_SILENCE_SCAFFOLDING_FLAG)]
-    if not flagged:
-        return 0
-    flagged_ids = {id(m) for m in flagged}
-    cursor = getattr(agent, "_last_flushed_db_idx", None)
-    # The flush cursor indexes the live list; a detached result copy must not shift it twice.
-    if messages is getattr(agent, "_session_messages", None) and isinstance(cursor, int) and cursor > 0:
-        agent._last_flushed_db_idx = cursor - sum(1 for m in messages[:cursor] if id(m) in flagged_ids)
-    messages[:] = [m for m in messages if id(m) not in flagged_ids]
-    # Positions shifted; force the bounded flush scan to start over.
-    agent._db_flush_scan_prefix = None
-    return len(flagged)
 
 
 @dataclass
@@ -122,7 +97,7 @@ def finish_text_response(
     stop gates accept it."""
     from agent.conversation_loop import (
         _CODEX_ACK_CONTINUATION_NUDGE, _DEGENERATE_FINAL_NUDGE, _DROPPED_TOOLCALL_NUDGE_CONTENT,
-        _GATEWAY_SILENCE_REPROMPT_NUDGE, _join_truncated_parts,
+        _join_truncated_parts
     )
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> FinalResponseVerdict:
@@ -404,47 +379,6 @@ def finish_text_response(
     # Genuine turn end (no dropped-tool-call mismatch): clear stall budget.
     agent._dropped_toolcall_retries = 0
 
-    # A model can incorrectly apply the gateway's silence convention to a human message. The
-    # gateway will replace that marker with a warning after this loop, so give the model one
-    # bounded chance to provide the useful status it omitted. The marker and nudge are both
-    # ephemeral scaffolding: they participate in the retry request but never become durable
-    # transcript rows. Gateway identity is deliberate here; CLI, cron, webhook and machinery
-    # turns must retain their existing silence behavior.
-    # The once-per-turn budget is turn-scoped agent state (reset in turn_context's
-    # _PER_TURN_RESET_STATE), never inferred from transcript rows: stop-gate continuations
-    # and the scaffolding drop below would otherwise re-arm it within the same turn.
-    from gateway.response_filters import is_intentional_silence_response, silence_allowed
-    if (
-        getattr(agent, "_gateway_session_key", None)
-        and is_intentional_silence_response(final_response)
-        and not silence_allowed(
-            getattr(agent, "_turn_display_kind", None),
-            getattr(agent, "_turn_reply_expected", None),
-        )
-        and not getattr(agent, "_gateway_silence_reprompted", False)
-    ):
-        agent._gateway_silence_reprompted = True
-        logger.warning(
-            "User-addressed gateway turn ended on a silence marker — re-prompting once "
-            "for a visible status (session=%s)", getattr(agent, "session_id", "none"),
-        )
-        _silence_msg = agent._build_assistant_message(assistant_message, finish_reason)
-        _silence_msg["_gateway_silence_reprompt"] = True
-        _silence_msg["content"] = final_response
-        append_message(messages, _silence_msg)
-        append_message(messages, {
-            "role": "user",
-            "content": _GATEWAY_SILENCE_REPROMPT_NUDGE,
-            "_gateway_silence_reprompt": True,
-        })
-        agent._session_messages = messages
-        # Reuse the display-only segment boundary before another request can append
-        # to the rejected marker. The gateway discards bare silence at boundaries;
-        # sending None to TTS (_stream_callback) would incorrectly end its stream.
-        agent._call_quietly(agent.stream_delta_callback, None)
-        final_response = None
-        return _verdict("continue")
-
     # Pop prefill / empty-retry scaffolding before the final response or
     # verification follow-up; it must not become durable transcript.
     while (
@@ -453,8 +387,6 @@ def finish_text_response(
         and any(messages[-1].get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
     ):
         messages.pop()
-    # The re-prompt may have continued through tool calls, leaving its pair mid-history.
-    drop_gateway_silence_scaffolding(agent, messages)
 
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,

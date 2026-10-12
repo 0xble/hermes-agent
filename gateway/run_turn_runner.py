@@ -1962,6 +1962,9 @@ class TurnRunner:
         ephemeral) + the gateway ephemeral prompt."""
         ctx = self._ctx
         combined = ctx.context_prompt or ""
+        if ctx.silence_retry:
+            from gateway.run_turn import _GATEWAY_SILENCE_RETRY_NOTE
+            combined = (combined + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
         for extra in (
             (ctx.channel_prompt or "").strip(),
             self._runner._get_system_prompt_for_channel(

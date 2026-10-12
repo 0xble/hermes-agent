@@ -167,6 +167,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
+        # Native/draft transports retain cumulative prose across tool boundaries. Marker hold-back
+        # must judge only the newest segment, not that earlier substantive preamble.
+        self._segment_start = 0
+        self._final_is_silence_marker = False
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
         # Copy blocks are delivered as separate messages after the turn, so they never
@@ -481,21 +485,6 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if self._use_draft_streaming and not self._stream_is_message():
             self._bump_draft_id()
 
-    async def _discard_silence_marker_segment(self) -> None:
-        """Drop a rejected bare-marker segment at a continuation boundary.
-
-        Unlike turn-final suppression, earlier finalized preambles stay; only this
-        segment's previews are retracted and nothing is recorded as delivered."""
-        if self._native_stream_opened:
-            await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
-        stale_ids = self._stale_preview_ids(segment_only=True)
-        await self._delete_previews(stale_ids, label="Silence-marker segment")
-        self._preview_message_ids.difference_update(stale_ids)
-        self._reset_message_state()
-        if self._use_draft_streaming and not self._stream_is_message():
-            self._bump_draft_id()
-        logger.info("Discarded streamed silence-marker segment before continuation (chat=%s)", self.chat_id)
-
     def _bump_draft_id(self) -> None:
         type(self)._draft_id_counter += 1
         self._draft_id = type(self)._draft_id_counter
@@ -594,6 +583,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._eager_reopen_seed()
                     continue
 
+                if tick.got_segment_break and _is_intentional_silence_response(
+                    self._clean_for_display(self._accumulated[self._segment_start:])
+                ):
+                    await self._suppress_silence_marker()
+                    self._copy_filter.message_boundary()
+                    await self._end_segment(tick)
+                    self._signal_flush(tick.flush_event)
+                    continue
+
                 if tick.got_done:
                     self._flush_think_buffer()
                     self._flush_copy_filter()
@@ -603,19 +601,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    if self._final_is_silence_marker or _is_intentional_silence_response(
+                        self._clean_for_display(self._accumulated)
+                    ):
                         await self._suppress_silence_marker()
                         return
-
-                # A rejected final may continue through text or tools. Never finalize its
-                # bare control marker at the boundary or carry it into the next segment.
-                if tick.got_segment_break and _is_intentional_silence_response(
-                    self._clean_for_display(self._accumulated)
-                ):
-                    await self._discard_silence_marker_segment()
-                    self._copy_filter.message_boundary()
-                    self._signal_flush(tick.flush_event)
-                    continue
 
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
@@ -768,6 +758,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         ownership).  Split delivery: wholesale adoption would repeat sealed heads, refusing
         makes the gateway resend the ENTIRE body — so append only the suffix when the final
         strictly prefix-extends the ledger."""
+        if _is_intentional_silence_response(final_raw):
+            self._final_is_silence_marker = True
+            return  # keep any cumulative preamble until segment-scoped final suppression
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
         final_raw = copy_free_text_for(self.adapter, final_raw)  # the buffers never hold copy blocks
@@ -823,7 +816,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # marker ("NO"→"NO_REPLY"), or while its last top-level line could be a trailing
         # marker after prose; got_done always resolves the buffer.
         _visible = self._clean_for_display(self._accumulated)
-        return should_edit and not _is_partial_silence_marker(_visible) and not (
+        _segment = self._clean_for_display(self._accumulated[self._segment_start:])
+        return should_edit and not _is_partial_silence_marker(_segment) and not (
             self.cfg.strip_trailing_silence_markers and _ends_with_partial_silence_marker(_visible)
         ) and not _ends_with_partial_loop_complete_marker(_visible)
 
@@ -1005,7 +999,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must keep its sentinel or every tool boundary posts a new message; the
         continuation goes out once via _send_fallback_final."""
         if self._cumulative_transport():
+            self._segment_start = len(self._accumulated)
             return
+        self._segment_start = 0
         # If the segment-break edit or send didn't land (flood control / fallback mode, or a
         # failed first send of a split tail with no message id yet), _accumulated holds unseen
         # pre-boundary text — flush it before the reset clears it.

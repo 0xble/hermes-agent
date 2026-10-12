@@ -404,13 +404,22 @@ class StreamFallbackMixin:
         """Retract any streamed preview when the final reply is a bare silence marker.  Flags
         stay False so the gateway's whole-response filter owns what goes out next: "" for a
         machinery turn, the visible fallback for a human one."""
+        # A cumulative transport's earlier tool preamble is not the rejected final segment. Keep
+        # it in the same append-only stream and close with those bytes, never an empty replacement.
+        prefix = self._accumulated[:self._segment_start] if self._cumulative_transport() else ""
+        if prefix:
+            self._accumulated = self._stream_ledger = prefix
+            await self._send_or_edit(prefix, finalize=True, is_turn_final=False)
+            self._clear_turn_final_flags()
+            return
         # A native-stream bubble isn't a deletable message — close an open one
         # (e.g. from an eager re-seed) with an empty finalize so it doesn't hang.
         if self._native_stream_opened:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
-        await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
-        self._preview_message_ids = set()
+        stale_ids = self._stale_preview_ids(segment_only=True)
+        await self._delete_previews(stale_ids, label="Silence-marker")
+        self._preview_message_ids.difference_update(stale_ids)
         self._message_id = None
         self._accumulated = self._stream_ledger = self._last_sent_text = ""
         self._already_sent = False

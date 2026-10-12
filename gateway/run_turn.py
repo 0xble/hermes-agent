@@ -85,6 +85,15 @@ _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "payload too large", "input is too long",
 )
 
+_GATEWAY_SILENCE_RETRY_NOTE = (
+    "[System note: the previous execution ended with an intentional-silence marker, but this turn "
+    "contains a human message addressed to you. Answer the latest genuine user request from the "
+    "conversation history now. A typed or out-of-band user message overrides any earlier relay "
+    "or notification 'no reply needed' framing. Do not repeat work or tool calls already completed; "
+    "continue from their results. Write a visible answer or a concise blocker, not NO_REPLY or [SILENT].]"
+)
+
+
 def _unexpected_silence_reply() -> str:
     """Reply when the model returned only a silence marker for a message that needed an answer."""
     return t("gateway.errors.unexpected_silence")
@@ -3986,7 +3995,10 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            # Runtime provenance describes the continuation row, not the original human's silence
+            # contract. A queued successor must not make the retry's second marker silently legal.
+            silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
+            if silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4566,6 +4578,49 @@ class GatewayTurnMixin:
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
+    async def _run_agent_silence_followup(self, response: dict, turn_ctx: TurnContext) -> dict:
+        """One gateway continuation after a rejected marker, with a fresh stream and no human input.
+
+        The first execution and its stream have finished. Put recovery guidance in the existing
+        API-only ephemeral prompt, not in a user/nudge pair that tools or compression could retain.
+        The empty runtime row has existing internal provenance; it cannot become the latest human
+        ask, title, or reply anchor. The outer human contract still owns the terminal verdict.
+        """
+        from gateway.run import _preserve_queued_followup_history_offset
+
+        session_id = response.get("session_id") or turn_ctx.session_id
+        await self._refresh_agent_cache_message_count(turn_ctx.session_key, session_id)
+        if not turn_ctx._run_still_current():
+            return response
+        adapter = self._delivery_adapter_for(turn_ctx.source)
+        completed = getattr(adapter, "_streaming_tts_completed_turns", None)
+        key_fn = getattr(adapter, "_streaming_tts_turn_key", None)
+        if completed is not None and callable(key_fn):
+            key = key_fn(turn_ctx.session_key, turn_ctx.run_generation)
+            if key:
+                completed.discard(key)
+        logger.info("Rejected human-turn silence; re-prompting once for session %s", turn_ctx.session_key)
+        followup = await self._run_agent(
+            message="", context_prompt=turn_ctx.context_prompt,
+            history=response.get("messages", turn_ctx.history), source=turn_ctx.source,
+            session_id=session_id, session_key=turn_ctx.session_key, run_generation=turn_ctx.run_generation,
+            _interrupt_depth=turn_ctx._interrupt_depth, event_message_id=turn_ctx.event_message_id,
+            inbound_message_id=turn_ctx.inbound_message_id, channel_prompt=turn_ctx.channel_prompt,
+            moa_config=turn_ctx.moa_config, message_type="voice" if turn_ctx.voice_turn else None,
+            internal=True, title_user_message="", persist_user_message="",
+            persist_user_display_kind="internal_notification", reply_expected=turn_ctx.reply_expected,
+            persist_user_display_metadata=reply_expected_metadata(turn_ctx.reply_expected),
+            _post_delivery_adapter=turn_ctx._post_delivery_adapter or adapter, _silence_retry=True,
+        )
+        merged = _preserve_queued_followup_history_offset(response, followup)
+        # A real queued successor owns its own verdict. Otherwise the synthetic continuation must
+        # not launder a second marker into permitted machinery silence or invent a ledger anchor.
+        if isinstance(merged, dict) and "queued_terminal_display_kind" not in merged:
+            merged = {**merged, "queued_terminal_display_kind": turn_ctx.persist_user_display_kind,
+                      "queued_terminal_reply_expected": turn_ctx.reply_expected,
+                      "queued_terminal_inbound_id": turn_ctx.inbound_message_id}
+        return merged
+
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str = None,
@@ -4580,6 +4635,7 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         title_user_message: Optional[str] = None,
+        _silence_retry: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -4611,13 +4667,15 @@ class GatewayTurnMixin:
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
-            channel_prompt=channel_prompt, moa_config=moa_config,
+            channel_prompt=channel_prompt, moa_config=moa_config, internal=internal,
+            event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            silence_retry=_silence_retry,
             _post_delivery_adapter=_post_delivery_adapter,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
@@ -4660,6 +4718,17 @@ class GatewayTurnMixin:
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+            if (
+                not _silence_retry and isinstance(response, dict)
+                and self._is_intentional_silence(response, response.get("final_response", ""))
+                and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
+                and turn_ctx._run_still_current()
+            ):
+                # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.
+                if turn_ctx.stream_consumer_holder[0] is not None:
+                    await self._await_stream_task(stream_task)
+                if turn_ctx._run_still_current():
+                    return await self._run_agent_silence_followup(response, turn_ctx)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(

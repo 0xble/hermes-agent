@@ -973,13 +973,6 @@ _DEGENERATE_FINAL_NUDGE = (
     "WAS your complete answer, send it again exactly as before.]"
 )
 
-# Re-prompt once when a user-addressed gateway turn ends on an intentional silence marker.
-_GATEWAY_SILENCE_REPROMPT_NUDGE = (
-    "[System: The user typed this message and expects a visible reply. Silence markers are only "
-    "for gateway-generated turns. Reply now with a short status of what you did or started, "
-    "without a silence marker.]"
-)
-
 # Re-prompt for finish_reason="tool_calls" with empty tool_calls (an interrupt mid-retry can persist it).
 _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "Your previous turn indicated a tool call but none was included. Do not narrate a plan or "
@@ -1771,15 +1764,6 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
-    # Early exits (interrupt, retry exhaustion, partial results) bypass finalize_turn; the
-    # silence re-prompt pair must leave no live-history trace on any path. Before the
-    # boundary export, which indexes the final list.
-    from agent.turn_final_response import drop_gateway_silence_scaffolding
-    _result_messages = result.get("messages") if isinstance(result, dict) else None
-    drop_gateway_silence_scaffolding(agent, _result_messages)
-    _live_messages = getattr(agent, "_session_messages", None)
-    if _live_messages is not _result_messages:
-        drop_gateway_silence_scaffolding(agent, _live_messages)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
