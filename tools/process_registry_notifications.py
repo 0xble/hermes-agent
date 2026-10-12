@@ -227,10 +227,26 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
+def _is_trusted_restart_cut(reason) -> bool:
+    from tools.delegation_resume import is_user_cancel_reason
+    normalized = str(reason).strip().casefold()
+    return (
+        not is_user_cancel_reason(normalized)
+        and (
+            normalized in {"gateway restart", "gateway_restart", "gateway restarting", "gateway shutdown (restart)"}
+        )
+    )
+
+
 def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
-    """Fixed parent-facing continuation block for gateway-cut work."""
-    if not evt.get("cut_reason"):
+    """Render restart recovery guidance only for trusted gateway restart cuts."""
+    cut_reason = evt.get("cut_reason")
+    if not cut_reason:
         return []
+    reason = str(cut_reason).strip()
+    # User cancellation and non-restart shutdowns are terminal notifications, not
+    # recovery offers. In particular, never turn a /stop cut into a resume action.
+    restart_cut = _is_trusted_restart_cut(reason)
     goals = evt.get("goals") or []
     indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
     recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
@@ -239,6 +255,8 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
     when = evt.get("completed_at") or time.time()
     stamp = time.strftime("%H:%M", time.localtime(when))
     detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
+    if not restart_cut:
+        return [f"Stopped ({reason}). {detail}"]
     return [
         f"Cut by gateway restart at {stamp}. {detail}",
         f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
@@ -264,12 +282,19 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
     lines += _cut_recovery_lines(evt, results)
+    restart_cut = False
     if evt.get("cut_reason"):
-        lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}",
-                  "This unit was cut by the gateway before its terminal result was trustworthy. "
-                  "Resume only the unfinished children after verifying recorded results and side effects."]
+        lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
+        restart_cut = _is_trusted_restart_cut(evt["cut_reason"])
+        lines.append(
+            "This unit was cut by the gateway before its terminal result was trustworthy. "
+            "Resume only the unfinished children after verifying recorded results and side effects."
+            if restart_cut else
+            "This unit was stopped before its terminal result was trustworthy; no continuation was requested."
+        )
     if evt.get("status") == "interrupted" or evt.get("cut_reason") or any(r.get("status") == "interrupted" for r in results):
-        lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+        if not evt.get("cut_reason") or restart_cut:
+            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
@@ -355,7 +380,8 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         if status == "interrupted":
             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
-            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+            if not evt.get("cut_reason") or _is_trusted_restart_cut(evt["cut_reason"]):
+                lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))

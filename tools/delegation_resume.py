@@ -713,6 +713,8 @@ def classify_outcome(record: Dict[str, Any]) -> Tuple[str, str]:
     stop_text = " ".join(str(x) for x in (record["event"].get("interrupt_reason"),
                                           record["result"].get("interrupt_reason"),
                                           *(r.get("interrupt_reason") for r in results)) if x).lower()
+    if is_user_cancel_reason(record["event"].get("cut_reason")) or is_user_cancel_reason(record["result"].get("cut_reason")):
+        return RETRY_NONE, "stopped by user"
     if (state in {"interrupted", "cancelled"} or any(r.get("status") == "interrupted" for r in results)) and is_user_cancel_reason(stop_text):
         return RETRY_NONE, "stopped by user"
     if state == "cancelled":

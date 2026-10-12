@@ -16,6 +16,29 @@ def test_scalar_cut_notice_uses_task_wording(goals):
     assert "delegate_task(action='resume', subagent_id='deleg_scalar_notice')" in text
 
 
+@pytest.mark.parametrize("cut_reason", [
+    "/stop", "user_stop", "session_reset", "gateway shutdown (/stop)",
+    "shutdown", "cli shutdown", "oneshot shutdown", "stopped before finishing",
+    "gateway shutdown", "gateway shutdown (post-interrupt)", "gateway shutdown (final-cleanup)",
+])
+@pytest.mark.parametrize("batch", [False, True])
+def test_user_stop_and_non_restart_shutdown_cut_notice_has_no_resume_or_gateway_restart(cut_reason, batch):
+    text = _format_async_delegation({
+        "type": "async_delegation",
+        "delegation_id": "deleg_user_stop_notice",
+        "is_batch": batch,
+        "goal": "2 parallel subagents" if batch else "first",
+        "goals": ["first", "second"] if batch else [],
+        **({"results": [{"task_index": 0, "status": "interrupted", "error": "cut"}]} if batch else {}),
+        "status": "interrupted",
+        "cut_reason": cut_reason,
+        "completed_at": 1_760_000_000.0,
+    })
+    assert "resume" not in text.lower()
+    assert "gateway restart" not in text.lower()
+    assert f"Stopped ({cut_reason})." in text
+
+
 def test_cut_batch_notice_has_fixed_resume_block():
     text = _format_async_delegation({
         "type": "async_delegation",
@@ -52,7 +75,8 @@ def test_cut_notice_includes_missing_children_but_not_other_units(indexes, expec
     assert f"Unfinished children: {expected}." in _format_async_delegation(evt)
 
 
-def test_live_cut_completion_preserves_unit_indexes_for_notice_and_resume(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cut_reason", ["gateway shutdown (restart)", "/stop", "oneshot shutdown"])
+def test_live_cut_completion_preserves_unit_indexes_for_notice_and_resume(tmp_path, monkeypatch, cut_reason):
     import json
     import queue
     import threading
@@ -79,10 +103,15 @@ def test_live_cut_completion_preserves_unit_indexes_for_notice_and_resume(tmp_pa
             max_async_children=1,
         )
         assert started.wait(5)
-        assert ad.interrupt_all("gateway shutdown (restart)") == 1
+        assert ad.interrupt_all(cut_reason) == 1
         event = q.get(timeout=5)
         assert event["task_indexes"] == [0, 2]
-        assert "Unfinished children: 3." in _format_async_delegation(event)
+        text = _format_async_delegation(event)
+        assert "Unfinished children: 3." in text
+        if cut_reason != "gateway shutdown (restart)":
+            assert "resume" not in text.lower()
+            assert "gateway restart" not in text.lower()
+            return
         parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()
         resume = json.loads(_handle_control_action("resume", handle["delegation_id"], None, parent))
         assert [task["goal"] for task in resume["tasks"]] == ["third"]
