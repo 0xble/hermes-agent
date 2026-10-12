@@ -5506,14 +5506,17 @@ class BasePlatformAdapter(ABC):
             headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
             if headroom < 1:
                 headroom = max(1, max_length // 2)
-            # Remainder fits in one final chunk; reserve a close only for a reopened fence
-            # that remains open at the end of the remainder.
-            final_close = ""
-            if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
-                final_close = FENCE_CLOSE
-            if _len(prefix) + _len(remaining) + _len(final_close) <= max_length - INDICATOR_RESERVE:
-                chunks.append(prefix + remaining + final_close)
-                break
+            # Remainder can only be final if it fits before any synthesized closing fence;
+            # avoid rescanning the entire remainder on every non-final iteration.
+            final_budget = max_length - INDICATOR_RESERVE
+            if _len(prefix) + _len(remaining) <= final_budget:
+                # Reserve a close only for a reopened fence that remains open at the end.
+                final_close = ""
+                if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
+                    final_close = FENCE_CLOSE
+                if _len(prefix) + _len(remaining) + _len(final_close) <= final_budget:
+                    chunks.append(prefix + remaining + final_close)
+                    break
             # Natural split (newline, then space); a custom _len budget maps to a codepoint offset.
             _cp_limit = (
                 _custom_unit_to_cp(remaining, headroom, _len) if _len is not len else headroom)

@@ -87,6 +87,43 @@ def test_plain_text_does_not_reserve_a_fence_that_is_not_needed():
         assert utf16_len(chunk) + 2 <= 4096
 
 
+def test_splitter_preserves_approved_chunk_boundaries():
+    plain_8150 = BasePlatformAdapter.truncate_message("x" * 8150, 4096, len_fn=utf16_len)
+    plain_8155 = BasePlatformAdapter.truncate_message("x" * 8155, 4096, len_fn=utf16_len)
+    plain_20000 = BasePlatformAdapter.truncate_message("x" * 20000, 4096, len_fn=utf16_len)
+    open_fence = BasePlatformAdapter.truncate_message(
+        "```python\n" + "x" * 8128, 4096, len_fn=utf16_len)
+
+    assert [len(chunk) for chunk in plain_8150] == [4083, 4079]
+    assert len(plain_8155) == 2
+    assert len(plain_20000) == 5
+    assert [len(chunk) for chunk in open_fence] == [4087, 4081]
+    for chunk in open_fence:
+        body = re.sub(r" \(\d+/\d+\)$", "", chunk)
+        assert body.startswith("```python\n")
+        assert body.endswith("\n```")
+        assert body.count("```") == 2
+
+
+def test_fence_state_scan_is_bounded_for_long_fenced_input(monkeypatch):
+    import gateway.platforms.base as base_module
+
+    scanned = 0
+    original = base_module.fence_state_after
+
+    def counting_fence_state(text, *args):
+        nonlocal scanned
+        scanned += len(text)
+        return original(text, *args)
+
+    monkeypatch.setattr(base_module, "fence_state_after", counting_fence_state)
+    content = "```python\n" + "x" * 100_000
+    chunks = BasePlatformAdapter.truncate_message(content, 4096, len_fn=utf16_len)
+
+    assert len(chunks) > 1
+    assert scanned <= 3 * len(content)
+
+
 def test_final_open_fence_is_closed_within_the_utf16_budget():
     content = "```python\n" + "x" * 185
     chunks = BasePlatformAdapter.truncate_message(content, 64, len_fn=utf16_len)
