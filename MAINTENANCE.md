@@ -314,6 +314,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove with the immutable post-swap hand-off.
 - **Rollback:** Revert the commits carrying `Fork-Patch: update-post-swap-claim`.
 
+## Active patch record: dead index-lock scan retry
+
+- **Patch identity:** `dead-index-lock-scan-retry`.
+- **Behavior:** On non-Windows launch recovery, keep polling a held-open process scan that is temporarily unknowable until the existing five-second deadline; if it remains unknowable, leave the lock in place fail-closed. Windows behavior is unchanged.
+- **Source surfaces:** `hermes_cli/_early_recovery.py` and `tests/hermes_cli/test_update_interrupted_pull.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_update_interrupted_pull.py`.
+- **Retirement:** Remove when the upstream recovery path retries transiently unknown holder scans without stranding a dead `index.lock`.
+- **Rollback:** Revert the commit carrying `Fork-Patch: dead-index-lock-scan-retry`.
+
 ## Active patch record: updater PID incarnation
 
 - **Patch identity:** `updater-pid-incarnation`.
