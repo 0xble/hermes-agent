@@ -119,6 +119,47 @@ def test_cached_document_and_audio_metadata_cannot_displace_request():
     assert auto_recall_query('"What car do I own?"') == '"What car do I own?"'
 
 
+@pytest.mark.parametrize("producer", ["tui_image", "untranscribed_audio"])
+@pytest.mark.parametrize("caption", ["", REQUEST])
+def test_current_attachment_producers_cannot_displace_the_caption(tmp_path, producer, caption):
+    if producer == "tui_image":
+        from tui_gateway.server import _build_image_ref_message
+
+        image = tmp_path / "windshield.jpg"
+        image.touch()
+        prompt = _build_image_ref_message(caption, [str(image)])
+    else:
+        prompt = GatewayInboundMixin._untranscribed_audio_note(str(tmp_path / "voice.ogg"))
+        if caption:
+            prompt += "\n\n" + caption
+    assert auto_recall_query(prompt) == caption
+
+
+@pytest.mark.parametrize("note", [
+    "[User sent a file: x]",
+    "[User sent an image: /cache/image.png]",
+    "[The user sent a voice message: /cache/voice.ogg (duration: 00:12)]",
+])
+def test_same_line_caption_with_brackets_survives_attachment_metadata(note):
+    caption = "what about [this]"
+    assert auto_recall_query(f"{note} {caption}") == caption
+
+
+@pytest.mark.parametrize("source", [PATH, "data:image/png;base64,aGVsbG8="])
+@pytest.mark.parametrize("analysis", ["", "error", "success"])
+def test_nonvision_image_fallback_recalls_only_successful_analysis(monkeypatch, source, analysis):
+    from agent.vision_message_prep import VisionMessagePrepMixin
+
+    mock = AsyncMock(side_effect=RuntimeError("vision unavailable")) if analysis == "error" else AsyncMock(
+        return_value=json.dumps({"analysis": DESCRIPTION if analysis == "success" else ""}))
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", mock)
+    runner = VisionMessagePrepMixin()
+    setattr(runner, "_anthropic_image_fallback_cache", {})
+    note = runner._describe_image_for_anthropic_fallback(source, "user")
+    assert auto_recall_query(note) == (DESCRIPTION.strip() if analysis == "success" else "")
+    assert auto_recall_query(note + "\n\n" + REQUEST) == REQUEST
+
+
 def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
     from plugins.memory.hindsight import HindsightMemoryProvider
     from unittest.mock import Mock

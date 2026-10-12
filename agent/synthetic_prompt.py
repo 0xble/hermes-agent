@@ -283,6 +283,16 @@ _IMAGE_RECALL_PREFIX = re.compile(
     r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
     re.DOTALL,
 )
+# Data-URL fallback in VisionMessagePrepMixin has no path/advice note. Try the paired form
+# first, so brackets inside normal vision descriptions still use the explicit advice boundary.
+_IMAGE_RECALL_DESCRIPTION = re.compile(
+    r"\[The user attached an image\. Here's what it contains:\n(?P<description>.*?)\](?=\n\n|$)",
+    re.DOTALL,
+)
+_IMAGE_REFERENCE_RECALL_PREFIX = re.compile(
+    r"\[The user attached an image: [^\n]*?\]\n"
+    r"\[Examine it with the vision_analyze tool using image_url: [^\n]*?\](?=\s|$)",
+)
 # Only known, single-line attachment metadata emitted by gateway/CLI producers, never arbitrary
 # bracketed human prose. Speech-to-text's quoted transcript is intentionally NOT a metadata note.
 _ATTACHMENT_RECALL_NOTE = re.compile(
@@ -291,8 +301,9 @@ _ATTACHMENT_RECALL_NOTE = re.compile(
     r"|a voice message: |a voice message but it came through empty or inaudible "
     r"|an image but I couldn't quite see it this time "
     r"|an image but something went wrong when I tried to look at it)"
-    r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \())"
-    r"[^\n]*\](?=\n|$)"
+    r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \()"
+    r"|voice message could not be transcribed automatically; the audio is available at: )"
+    r"[^\n]*?\](?=\s|$)"
 )
 
 
@@ -310,10 +321,16 @@ def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None
             if not human:
                 return None
             text = human
-        image = _IMAGE_RECALL_PREFIX.match(text)
-        note = None if image else _ATTACHMENT_RECALL_NOTE.match(text)
+        image = _IMAGE_RECALL_PREFIX.match(text) or _IMAGE_RECALL_DESCRIPTION.match(text)
+        note = None if image else (
+            _IMAGE_REFERENCE_RECALL_PREFIX.match(text) or _ATTACHMENT_RECALL_NOTE.match(text)
+        )
         if image:
-            descriptions.append(image.group("description").strip())
+            description = image.group("description").strip()
+            # VisionMessagePrepMixin puts failed analysis in the description field, not a
+            # separate failure wrapper. Its error is not a semantic image-only fallback.
+            if not re.fullmatch(r"Image analysis failed(?:\.|:.*)?", description, re.DOTALL):
+                descriptions.append(description)
         prefix = image or note
         if not prefix:
             return text
