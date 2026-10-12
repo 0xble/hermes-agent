@@ -277,7 +277,7 @@ async def test_undeliverable_result_with_live_parent_is_settled_quietly():
     assert action["kind"] == "terminal" and action["text"]
     runner = _runner()
     await runner._deliver_delegation_retry_action(action)
-    runner._classify_completion_target.assert_awaited_once_with("parent-1")
+    runner._classify_completion_target.assert_awaited_once_with("parent-1", settle_ended_tip=True)
     runner._deliver_platform_notice.assert_not_awaited()
     runner._is_user_authorized_for_source.assert_not_called()
     assert dr.retry_status("deleg_undeliverable_live")["retry_state"] == "reported"
