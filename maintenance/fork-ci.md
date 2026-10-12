@@ -307,6 +307,39 @@ each phase hook. `drain()` no longer starts a worker when none exists. Upstream
 main has the same worker and loop. Retire this when upstream drains or joins the
 worker in its suite, or when pytest copies `loggerDict` before iterating it.
 
+## Hostile Git file budgets
+
+The hostile Git commit and post-commit suites use bounded test files with at most
+two expensive cells each. Shared setup and helpers live in `_hostile_commit.py`,
+`_hostile_post.py`, and `_hostile_diagnostics.py`; underscored modules are not extra
+runner tasks. Commit cells retain a fresh install per test, since they deliberately
+corrupt their checkout. Post-commit cells retain module-scoped worlds within each
+bounded file; the SIGKILL and interrupted-tail cells have their own worlds. All
+17 original cells, marks, and assertions remain. The 900-second file bounds are
+unchanged.
+
+Phase markers identify installation, namespace startup/CLI/teardown, the active
+cell, and sandbox mode. Passive watchdogs emit bounded owned-log tails at
+180/360/540/720 seconds and Python stacks every 240 seconds, using original stderr
+so timeout kills do not discard pytest-captured diagnostics. They never query a
+potentially stuck namespace RPC.
+
+A file split is not Linux qualification. Before hosted hostile signal cells run
+without bubblewrap, require a verified namespace-containment prerequisite that
+restricts enumeration, signaling, and teardown to fixture-owned processes only
+in fallback mode, while preserving the full namespace process view under
+bubblewrap. Without that prerequisite, keep the draft unqualified and block
+hosted proof rather than dispatching unsafe cells or weakening them.
+
+Compare complete test-function ASTs against the exact base (including decorators,
+parameters, and assertions), verify that each of the 17 cells is collected once,
+and run `scripts/run_tests.sh tests/scripts/test_upgrade_hostile_diagnostics.py`
+through the canonical harness. On macOS the hostile cells retain their existing
+Linux platform skips; this proves collection, not Linux behavior. Require safe,
+exact-head hosted Linux proof before qualifying the regrouping. Retire this
+adaptation when the accepted upstream harness independently schedules the cells
+within the same finite budget without sacrificing fresh-install isolation.
+
 ## Verification and retirement
 
 The host-installation tripwire also protects the captured account's `.local/bin`
