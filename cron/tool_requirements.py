@@ -76,19 +76,30 @@ def _toolset_names(job: dict[str, Any]) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
 
 
-def _allows_terminal(names: list[str]) -> bool:
-    if any(name.lower() in {"all", "*", "terminal", "debugging", "coding"} for name in names):
-        return True
+def _available_tools(names: list[str], cfg: Optional[dict]) -> set[str]:
+    """Resolve static tools and apply the scheduler's final disabled-tool filter."""
     from toolsets import resolve_toolset
-    return any("terminal" in resolve_toolset(name) for name in names)
+    from model_tools import _apply_toolset_selection
+    from cron.scheduler import _resolve_cron_disabled_toolsets
+
+    tools: set[str] = set()
+    for name in _effective_toolsets(names, cfg):
+        tools.update(resolve_toolset(name))
+    _apply_toolset_selection(
+        tools, _resolve_cron_disabled_toolsets(cfg or {}), quiet_mode=True, disable=True
+    )
+    return tools
 
 
-def _allows_relay(names: list[str]) -> bool:
+def _allows_terminal(names: list[str], cfg: Optional[dict]) -> bool:
+    return "terminal" in _available_tools(names, cfg)
+
+
+def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
     """Relay is plugin/MCP-backed in some deployments, so name matching is intentional."""
-    if any("relay" in name.lower() for name in names):
-        return True
-    from toolsets import resolve_toolset
-    return any(any("relay" in tool.lower() for tool in resolve_toolset(name)) for name in names)
+    from cron.scheduler import _resolve_cron_disabled_toolsets
+    disabled = {name.lower() for name in _resolve_cron_disabled_toolsets(cfg or {})}
+    return any("relay" in name.lower() and name.lower() not in disabled for name in names)
 
 
 def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
@@ -102,7 +113,12 @@ def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
         except Exception:
             cfg = {}
     try:
-        return _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
+        effective = _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
+        from hermes_cli.tools_config import _prune_toolsets_stripped_by_disabled
+        from cron.scheduler import _resolve_cron_disabled_toolsets
+        return sorted(_prune_toolsets_stripped_by_disabled(
+            set(effective), _resolve_cron_disabled_toolsets(cfg or {})
+        ))
     except Exception:
         return [name for name in names if name != "no_mcp"]
 
@@ -135,12 +151,12 @@ def job_tool_requirement_issues(
 
     issues: list[str] = []
     shell_reason = _first_requirement(combined, _SHELL_REQUIREMENT_PATTERNS)
-    if shell_reason and not _allows_terminal(names):
+    if shell_reason and not _allows_terminal(names, cfg):
         issues.append(
             f"prompt requires {shell_reason}, but enabled_toolsets {stored!r} do not include terminal access"
         )
     relay_reason = _first_requirement(combined, _RELAY_REQUIREMENT_PATTERNS)
-    if relay_reason and not (_allows_terminal(names) or _allows_relay(names)):
+    if relay_reason and not (_allows_terminal(names, cfg) or _allows_relay(names, cfg)):
         issues.append(
             f"prompt requires {relay_reason}, but enabled_toolsets {stored!r} (effective: {names!r}) do not include terminal or a relay toolset"
         )
