@@ -28,6 +28,8 @@ def _process(proc_root, pid, cwd, *, name="git", argv=("git", "fetch", "origin")
     (proc / "cwd").symlink_to(cwd, target_is_directory=True)
     (proc / "cmdline").write_bytes(b"\0".join(os.fsencode(x) for x in argv) + b"\0")
     (proc / "environ").write_bytes(b"\0".join(os.fsencode(x) for x in env) + b"\0")
+    (proc / "fd").mkdir()
+    (proc / "maps").write_text("")
     return proc
 
 

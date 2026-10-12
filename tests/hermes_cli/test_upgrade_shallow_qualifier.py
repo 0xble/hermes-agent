@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from tests.e2e.core.upgrade import _install_helpers as I
-from tests.e2e.core.upgrade.git import test_shallow_install as qualifier
+from tests.e2e.core.upgrade.git import _shallow_install as qualifier
+from tests.e2e.core.upgrade.git import test_shallow_install_checked as checked
 
 
 def test_current_source_is_never_classified_as_the_historical_gap():
@@ -42,7 +43,7 @@ def run(**overrides):
 
 def test_measured_n1_plain_fetch_timeout_is_the_existing_gap():
     with pytest.raises(pytest.xfail.Exception, match="#123254"):
-        qualifier.test_passive_checks_do_not_push_the_next_update_into_orphan_divergence({"checked": run()})
+        checked.test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(run())
 
 
 @pytest.mark.parametrize("overrides", [
@@ -59,5 +60,4 @@ def test_measured_n1_plain_fetch_timeout_is_the_existing_gap():
 ])
 def test_nearby_failures_remain_hard_failures(overrides):
     with pytest.raises(AssertionError, match="N-1 -> HEAD update failed"):
-        qualifier.test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(
-            {"checked": run(**overrides)})
+        checked.test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(run(**overrides))

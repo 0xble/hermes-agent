@@ -48,7 +48,28 @@ Any other configuration remains a conservative veto. A live owner of the target
 repository still blocks cleanup, and unresolvable symlink loops veto rather than
 raise. Non-Linux probes are unchanged.
 The live-writer veto, age floors and exact debris prefixes must survive any
-adoption or refactor. Guard surfaces are
+adoption or refactor. Unknown ownership remains a global veto for **locks**:
+a lock writer can close its descriptor while waiting in an editor. The specific
+v-d6b regression was an HTTP backend child `git upload-pack --stateless-rpc .`:
+`enter_repo` already changed its cwd to the served Git directory, so its relative
+operand blocked removal of unrelated, hour-old `tmp_pack_*` after a successful
+update. Neither that operand nor relative `-C` reconstructs its launch cwd.
+
+Temp packs have a narrower exception for those launch-relative shapes and
+`clone`: retain provable current/shared repository owners and explicit resource
+paths, then inspect **every** process's descriptors and mappings. Device/inode
+comparison protects hardlinks and closed-fd mmap holders; a pack-directory
+handle protects pending outputs. Aged unheld packs may then be swept even beside
+unplaced unrelated Git. Unknown configuration/output forms, rejected metadata
+(including malformed `HEAD`), unreadable live process/fd/maps visibility and
+unavailable `/proc` still veto. A disappearing process/fd is not a live holder.
+Young files retain the unchanged 600-second floor. Normal Git transfer temps
+stay open until promotion; visible repository owners retain packs even with
+closed handles. Non-Linux retains the conservative fallback. Do not reuse
+`_held_open_proc`'s fd-only mode as negative proof: it ignores fd errors and
+misses mmap holders.
+
+Guard surfaces are
 `tests/hermes_cli/test_gitlock_process_scope.py`, `test_gitlock.py`,
 `test_gitlock_tmp_packs.py`, and the foreign-state/truthful-outcome Linux cells.
 Retire the Linux bridge when equivalent repository-scoped safety is adopted.
@@ -64,3 +85,18 @@ historical gap, not a claim that the old release now updates successfully.
 `tests/hermes_cli/test_upgrade_shallow_qualifier.py` guards the classification.
 Remove both expected-failure forms once N-1 carries the pre-fetch repair; do
 not extend them to HEAD behavior or raise fetch deadlines to hide overfetch.
+
+Shallow-install qualification reuses the original depth1/checked/prefetched
+builders in `_shallow_install.py`, but each world has a runner-managed file
+(`test_shallow_install.py`, `test_shallow_install_checked.py`, and
+`test_shallow_install_prefetched.py`). The depth1 file still shares one world
+between its two assertions. This removes the three-world module-fixture join
+that consumed the entire file budget before any assertion ran. Historical
+pinned N-1 installation, full update sequence, byte bounds and strict rejection
+are unchanged; the upgrade directory's autodiscovery grants each file the
+existing finite 900-second bound. Phase messages and one 840-second traceback
+stay on the runner pipe before its process-tree kill. Local extraction,
+collection and strict-guard tests do not prove Linux historical acceptance;
+the hosted Linux lane must measure the three files and truthful-outcome cell.
+Stack fit: Python stdlib, pytest and `scripts/run_tests.sh`; no dependencies or
+services added.

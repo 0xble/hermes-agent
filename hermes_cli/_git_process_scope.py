@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
+class _UnplacedGit(ValueError):
+    """Launch-relative ownership needs file-holder proof for packs, never locks."""
+
+
 _PROC_ROOT = Path("/proc")
 _linux_process_scope = sys.platform == "linux"
 
@@ -128,7 +132,7 @@ def _server_repository(operands: list[str]) -> str:
     if not os.path.isabs(path):
         # enter_repo() resolves it against the launch cwd and then chdirs, so /proc's cwd
         # may already be the repository (or not yet): its owner cannot be reconstructed.
-        raise ValueError("launch cwd cannot be reconstructed")
+        raise _UnplacedGit("launch cwd cannot be reconstructed")
     base = path.rstrip("/") or "/"
     for suffix in ("",) if strict else ("/.git", "", ".git/.git", ".git"):
         candidate = Path(base + suffix)
@@ -178,7 +182,7 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
         if arg == "-C" or arg.startswith("-C"):
             # /proc cwd may already reflect -C; replaying a relative launch path
             # can misidentify an outer repository. Retain the veto.
-            raise ValueError("launch cwd cannot be reconstructed")
+            raise _UnplacedGit("launch cwd cannot be reconstructed")
         elif arg == "--git-dir":
             git_dir = next(args)
         elif arg.startswith("--git-dir="):
@@ -193,7 +197,9 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
             if arg in ("upload-pack", "receive-pack"):
                 # The server enters its operand repository (enter_repo), not cwd or GIT_DIR.
                 return _repository_dirs(cwd, _server_repository(list(args)))
-            if arg in ("clone", "init"):
+            if arg == "clone":
+                raise _UnplacedGit("Git may create a repository outside cwd")
+            if arg == "init":
                 raise ValueError("Git may create a repository outside cwd")
             break
     return _repository_dirs(cwd, git_dir)
@@ -228,4 +234,100 @@ def git_process_running_for(repo_root: Path, fallback: Callable[[], bool]) -> bo
                 return True
     return False
 
+def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool:
+    # Do not replay -C or a server operand against post-enter_repo cwd. Retain a
+    # visible local/shared owner and explicit paths; the holder scan covers the
+    # unplaced remainder. Rejected metadata is still unknown, not unrelated.
+    from hermes_cli._early_recovery import git_works_in
 
+    cwd = proc.joinpath("cwd").resolve(strict=True)
+    try:
+        if target & _repository_dirs(cwd):
+            return True
+    except ValueError as exc:
+        if str(exc) != "repository ownership unavailable":
+            raise
+    argv = os.fsdecode(proc.joinpath("cmdline").read_bytes()).strip("\0").split("\0")
+    # A -C/clone exception may precede still-unparsed global or clone config.
+    # Permit custody pairs only; do not silently lose those original vetoes.
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "-c":
+            if not _neutral_config(next(args, "")):
+                return True
+        elif arg.startswith("-c") and not _neutral_config(arg[2:]):
+            return True
+        elif arg.startswith(("--config", "--work-tree", "--bare", "--git-dir", "--separate-git-dir")):
+            return True
+    env = proc.joinpath("environ").read_bytes().split(b"\0")
+    if any(entry.startswith(b"GIT_DIR=") and entry != b"GIT_DIR=" for entry in env):
+        return True  # relative launch context is unproven, even for an explicit GIT_DIR
+    places = [str(p) for p in target | {Path(repo_root).resolve()}]
+    return git_works_in(argv, str(cwd), None, places)
+
+
+def _pack_held_proc(proc: Path, path: Path) -> bool:
+    """An fd, directory handle or mmap retains a pack; incomplete visibility vetoes.
+
+    Compare inode/device, not link text: hardlinks and mmap with a closed fd are
+    live too. Unlike _early_recovery._held_open_proc's fd-only mode, errors must
+    not become proof of absence. Git keeps transfer temps open until promotion;
+    known repository owners are additionally retained even with closed handles.
+    """
+    identity = {(st.st_dev, st.st_ino) for st in (path.stat(), path.parent.stat())}
+    for fd in proc.joinpath("fd").iterdir():
+        try:
+            st = fd.stat()
+        except FileNotFoundError:
+            try:
+                os.readlink(fd)
+            except FileNotFoundError:
+                continue  # descriptor disappeared, not an unreadable live handle
+            raise  # broken target is not negative holder proof
+        if (st.st_dev, st.st_ino) in identity:
+            return True
+    for line in proc.joinpath("maps").read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split(maxsplit=5)
+        major, minor = (int(part, 16) for part in fields[3].split(":"))
+        if (os.makedev(major, minor), int(fields[4])) in identity:
+            return True
+    return False
+
+
+def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -> bool:
+    """Packs need holder proof; launch-relative Git elsewhere need not veto them.
+
+    Locks continue to use git_process_running_for without this exception. Unknown
+    metadata/config/output shapes and inaccessible live processes remain vetoes.
+    Non-Linux retains the existing repository/global probe.
+    """
+    if not _linux_process_scope:
+        return fallback()
+    try:
+        target = _repository_dirs(Path(repo_root).resolve())
+        processes = list(_PROC_ROOT.iterdir())
+    except (OSError, RuntimeError, ValueError):
+        return True
+    for proc in processes:
+        if not proc.name.isdecimal():
+            continue
+        try:
+            name = proc.joinpath("comm").read_text(encoding="utf-8-sig").strip()
+            if name == "git" or name.startswith("git-"):
+                try:
+                    if target & _process_repository_dirs(proc):
+                        return True
+                except _UnplacedGit:
+                    if _unplaced_pack_owner(proc, target, repo_root):
+                        return True
+            if _pack_held_proc(proc, path):
+                return True
+        except (OSError, RuntimeError, ValueError, StopIteration, IndexError):
+            try:
+                proc.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            return True
+    return False
