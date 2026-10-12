@@ -1915,7 +1915,9 @@ def _queue_for_live_reconnect(
         logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
                        t.job.get("id"), t.where, exc_info=True)
         return
-    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
+    row_count = len(rows)
+    row_label = "row" if row_count == 1 else "rows"
+    note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
     if media_files:
         note += f" ({len(media_files)} attachment(s) not queued)"
     logger.warning("Job '%s': %s", t.job.get("id"), note)

@@ -83,6 +83,8 @@ def test_timeout_preserves_only_unattempted_payloads(monkeypatch, timed_out_payl
         queue.assert_called_once()
         assert queue.call_args.args[1:3] == ("", media)
         assert queue.call_args.kwargs["copy_blocks"] == remaining_copies
+        row_label = "row" if len(remaining_copies) == 1 else "rows"
+        assert f"queued {len(remaining_copies)} delivery {row_label} for telegram:42" in delivery_errors[-1]
         assert "1 attachment(s) not queued" in delivery_errors[-1]
     else:
         queue.assert_not_called()
