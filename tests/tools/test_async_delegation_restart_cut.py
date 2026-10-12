@@ -127,6 +127,23 @@ def test_prune_cap_ignores_exempt_rows_and_evicts_superseded_first():
     assert all(f"exempt-{i}" in remaining for i in range(18))
 
 
+def test_resumable_ceiling_bounds_retry_owed_rows_separately():
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for index in range(502):
+            conn.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, state, delivery_state, "
+                "retry_state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"owed-{index}", "s", "p", "interrupted", "delivered", "scheduled", now, now + index),
+            )
+    ad._prune_durable_records()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM async_delegations WHERE retry_state='scheduled'").fetchone() == (500,)
+        assert conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id='owed-0'").fetchone() is None
+        assert conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id='owed-501'").fetchone() == (1,)
+
+
 def test_restart_cut_row_survives_100_dispatches():
     delegation_id, _event = _cut_batch([
         {"task_index": 0, "status": "interrupted", "error": "cut"},
