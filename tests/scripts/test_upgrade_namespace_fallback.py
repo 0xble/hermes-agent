@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from importlib.util import module_from_spec, spec_from_file_location
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+from types import ModuleType
 from typing import TYPE_CHECKING, Iterator
 
 import pytest
@@ -66,15 +68,38 @@ def test_agent_enumeration_and_signals_follow_explicit_mode(proc_table, monkeypa
     ]
 
 
+@pytest.fixture
+def controlled_nshost(monkeypatch):
+    """Exercise the real host class without importing its POSIX-only dependencies."""
+    from tests.e2e.core import dashboard, upgrade
+
+    helpers = ModuleType("tests.e2e.core.upgrade._helpers")
+    reaper = ModuleType("tests.e2e.core.dashboard._reaper")
+    for package, name, module in ((upgrade, "_helpers", helpers), (dashboard, "_reaper", reaper)):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        # A native test may already have imported the real dependency in this process.
+        monkeypatch.setattr(package, name, module, raising=False)
+    source = Path(__file__).resolve().parents[1] / "e2e/core/upgrade/handoff/_nshost.py"
+    spec = spec_from_file_location("controlled_namespace_host", source)
+    assert spec is not None and spec.loader is not None
+    module = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    # Missing Unix imports/APIs must not be hidden by the test runner's import cache.
+    with monkeypatch.context() as import_guard:
+        import_guard.setitem(sys.modules, "pwd", None)
+        import_guard.delattr(os, "getuid", raising=False)
+        spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize("isolated,mode", [(True, "pid"), (False, "home")])
-def test_host_passes_actual_isolation_mode_only_to_agent(tmp_path, monkeypatch, isolated, mode):
+def test_host_passes_actual_isolation_mode_only_to_agent(tmp_path, monkeypatch, isolated, mode, controlled_nshost):
     from unittest.mock import Mock
 
-    from tests.e2e.core.upgrade.handoff import _nshost
-
-    monkeypatch.setattr(_nshost.H, "BWRAP_OK", isolated)
-    monkeypatch.setattr(_nshost.H, "sandbox_argv", lambda argv, **kwargs: argv)
-    monkeypatch.setattr(_nshost._reaper, "adopt_orphans", Mock())
+    _nshost = controlled_nshost
+    monkeypatch.setattr(_nshost.H, "BWRAP_OK", isolated, raising=False)
+    monkeypatch.setattr(_nshost.H, "sandbox_argv", lambda argv, **kwargs: argv, raising=False)
+    monkeypatch.setattr(_nshost._reaper, "adopt_orphans", Mock(), raising=False)
     monkeypatch.setattr(_nshost.threading, "Thread", Mock())
     monkeypatch.setattr(_nshost.NamespaceHost, "call", Mock(return_value={"pid": 101}))
     popen = Mock()

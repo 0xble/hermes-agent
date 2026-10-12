@@ -30,7 +30,10 @@ through the agent invocation environment: `pid` preserves every PID-namespace
 process even when its HOME changes or is absent; `home` alone enables fallback
 HOME filtering. Missing/invalid mode or missing fallback HOME fails closed.
 Controlled process-table regressions cover both modes without host signalling;
-native Linux regressions retain foreign-sibling refusal and detached cleanup.
+controlled host regressions load the actual NamespaceHost implementation with
+local helper/reaper stubs, without importing Unix-only dependencies. All eight
+controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
+regressions retain foreign-sibling refusal and detached cleanup.
 No test is skipped and no worker count or timeout is relaxed.
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
