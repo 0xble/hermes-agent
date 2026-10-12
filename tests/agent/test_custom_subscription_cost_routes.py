@@ -240,7 +240,7 @@ def test_auto_vision_records_selected_destination_billing(billing_fixture, monke
     if fallback:
         # Keep the real auto-vision chain: declared support rejects the main model and the strict
         # backend boundary supplies the fallback transport. The physical send is mocked below.
-        monkeypatch.setattr(aux, "_vision_supports_declared", lambda *_a: False)
+        monkeypatch.setattr(aux, "_main_model_supports_vision", lambda *_a: False)
         monkeypatch.setattr(aux, "_resolve_strict_vision_backend", lambda provider, model=None:
             (SimpleNamespace(base_url=fallback_url, api_key="fallback-key"), MODEL)
             if provider == "openrouter" else (None, None))
