@@ -18,12 +18,18 @@ first turn. The delivery path treated `_discovered=True` as equivalent to
 contention, `pre_llm_call` observed an empty hook registry, so the turn still
 completed but the plugin marker and injected canary were absent.
 
-`_delivery_manager()` now joins the background worker unconditionally before
-checking the discovery flag. Every registry reader on the delivery path goes
-through it: `invoke_hook`, `has_hook`, middleware, and the streaming hook
-snapshot `iter_hook_callbacks`. The regression tests force the intermediate
-state (`_discovered=True` while discovery is in flight), both with a stubbed
-join and with a real worker thread that registers `pre_llm_call` late.
+`_delivery_manager()` joins the background worker before checking readiness. The
+recursion guard (`_discovered`) is not readiness (`_discovery_complete`): a timeout
+or re-entry during the sweep refuses partial delivery. A sibling foreground
+sweep is also awaited through the existing discovery lock. Every registry reader
+on the delivery path goes through this barrier: `invoke_hook`, `has_hook`,
+middleware, and the streaming snapshot `iter_hook_callbacks`.
+
+Regression workers are event-gated rather than sleep-gated. Concurrent independent
+tool deliveries carry distinct `tool_call_id` values so this readiness proof does
+not collide with the bounded callback gate. A same-call variant deliberately
+reuses the identity and verifies that in-flight duplicate suppression remains in
+place; production deduplication is unchanged.
 
 ## Verification and retirement
 

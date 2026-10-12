@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
 
@@ -84,11 +86,10 @@ def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypa
     assert executions == ["discovery_probe"]
 
 
+@contextmanager
 def _inflight_discovery(monkeypatch):
-    """A real worker thread that registers `pre_llm_call` late while `_discovered` is already True
-    (discover_and_load() publishes the flag before loading)."""
+    """Register late only when a delivery joins the in-flight discovery worker."""
     import threading
-    import time
 
     import hermes_cli.plugins as plugins
     from tests.plugin_helpers import mark_plugin_discovery_started
@@ -99,72 +100,123 @@ def _inflight_discovery(monkeypatch):
     def callback(**_kwargs):
         return None
 
-    started = threading.Event()
+    started, release = threading.Event(), threading.Event()
 
     def late_registration():
         started.set()
-        time.sleep(0.3)
+        assert release.wait(10)
         manager._hooks.setdefault("pre_llm_call", []).append(callback)
         manager._discovery_complete = True
+
+    join = plugins._join_background_discovery
+
+    def join_and_release():
+        release.set()
+        join()
 
     worker = threading.Thread(target=late_registration, name="plugin-discovery", daemon=True)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr(plugins, "_background_discovery_thread", worker)
+    monkeypatch.setattr(plugins, "_join_background_discovery", join_and_release)
     worker.start()
-    assert started.wait(5)
-    return plugins, callback, worker
+    try:
+        assert started.wait(5)
+        yield plugins, callback
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
 
 
 def test_has_hook_sees_hook_registered_by_inflight_discovery(monkeypatch):
-    plugins, _callback, worker = _inflight_discovery(monkeypatch)
-    assert plugins.has_hook("pre_llm_call") is True
-    worker.join(5)
+    with _inflight_discovery(monkeypatch) as (plugins, _callback):
+        assert plugins.has_hook("pre_llm_call") is True
 
 
 def test_streaming_hook_snapshot_sees_hook_registered_by_inflight_discovery(monkeypatch):
-    plugins, callback, worker = _inflight_discovery(monkeypatch)
-    assert callback in plugins.iter_hook_callbacks("pre_llm_call")
-    worker.join(5)
+    with _inflight_discovery(monkeypatch) as (plugins, callback):
+        assert callback in plugins.iter_hook_callbacks("pre_llm_call")
 
 
-def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkeypatch):
-    """Concurrent tool workers both lazily discover: the one that loses the sweep lock must wait
-    for completion instead of failing its tool, and still see hooks registered by that sweep."""
+@pytest.mark.parametrize("same_tool_call", [False, True], ids=["independent-calls", "same-call-reentry"])
+def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkeypatch, same_tool_call):
+    """Independent deliveries wait for discovery, without colliding in the callback gate."""
     import threading
 
     import hermes_cli.plugins as plugins
 
     manager = plugins.PluginManager()
     entered, release = threading.Event(), threading.Event()
-    seen = []
+    sibling_waiting, first_callback = threading.Event(), threading.Event()
+    release_callback, sibling_done = threading.Event(), threading.Event()
+    seen, result, first_result = [], {}, {}
+
+    def callback(**kwargs):
+        seen.append(kwargs["n"])
+        if kwargs["n"] == 1:
+            first_callback.set()
+            assert release_callback.wait(10)
+        return "ran"
 
     def load():
         entered.set()
         assert release.wait(10)
-        manager._hooks.setdefault("post_tool_call", []).append(lambda **kw: seen.append(kw) or "ran")
+        manager._hooks.setdefault("post_tool_call", []).append(callback)
+
+    await_discovery = plugins._await_foreground_discovery
+
+    def observe_wait(active_manager):
+        if threading.current_thread().name == "sibling-delivery":
+            sibling_waiting.set()
+        return await_discovery(active_manager)
+
+    invoke = manager.invoke_hook
+
+    def ordered_delivery(hook_name, **kwargs):
+        # Hold the first callback open while the sibling dispatches. A fixture accidentally
+        # giving both calls the same identity must fail deterministically, not pass by luck.
+        if kwargs["n"] == 2:
+            assert first_callback.wait(5)
+        return invoke(hook_name, **kwargs)
+
+    def deliver(n, destination):
+        try:
+            call_id = "first-tool" if n == 1 or same_tool_call else "sibling-tool"
+            destination["value"] = plugins.invoke_hook("post_tool_call", n=n, tool_call_id=call_id)
+        except Exception as exc:  # surfaced in the main test thread
+            destination["error"] = exc
+        finally:
+            if n == 2:
+                sibling_done.set()
 
     monkeypatch.setattr(manager, "_discover_and_load_inner", load)
     monkeypatch.setattr(manager, "_refresh_secret_sources_after_discovery", lambda: None)
+    monkeypatch.setattr(plugins, "_await_foreground_discovery", observe_wait)
+    monkeypatch.setattr(manager, "invoke_hook", ordered_delivery)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
-    first = threading.Thread(target=lambda: plugins.invoke_hook("post_tool_call", n=1), daemon=True)
+    first = threading.Thread(target=deliver, args=(1, first_result), daemon=True)
+    worker = threading.Thread(target=deliver, args=(2, result), name="sibling-delivery", daemon=True)
     first.start()
-    assert entered.wait(5)
-    result = {}
-
-    def sibling():
-        try:
-            result["value"] = plugins.invoke_hook("post_tool_call", n=2)
-        except Exception as exc:  # pragma: no cover - the regression
-            result["error"] = exc
-
-    worker = threading.Thread(target=sibling, daemon=True)
-    worker.start()
-    worker.join(0.3)
-    assert worker.is_alive(), "sibling must wait for the in-flight sweep, not deliver or fail early"
-    release.set()
-    worker.join(5)
-    first.join(5)
-    assert result == {"value": ["ran"]}
+    try:
+        assert entered.wait(5)
+        worker.start()
+        assert sibling_waiting.wait(5), "sibling must reach the discovery barrier"
+        assert result == {}
+        assert seen == [], "no callback may see the partial registry"
+        release.set()
+        assert first_callback.wait(5)
+        assert sibling_done.wait(5)
+        assert result == {"value": [] if same_tool_call else ["ran"]}
+        assert sorted(seen) == ([1] if same_tool_call else [1, 2])
+    finally:
+        release.set()
+        release_callback.set()
+        first.join(5)
+        if worker.ident is not None:
+            worker.join(5)
+    assert not first.is_alive()
+    assert not worker.is_alive()
+    assert first_result == {"value": ["ran"]}
 
 
 def test_sweep_thread_reentry_still_refuses_partial_registry(monkeypatch):
