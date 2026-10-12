@@ -31,3 +31,14 @@ def test_installer_machine_home_covers_python_account_and_child_paths(tmp_path_f
     target = Path(json.loads(result.stdout))
     assert target == home / ".local" / "bin" / "node"
     assert target.read_text(encoding="utf-8-sig") == "fixture"
+
+
+@pytest.mark.platforms("windows")
+def test_installer_machine_home_keeps_the_powershell_module_cache_shared():
+    """Installer destinations move into the per-test home; Windows PowerShell's
+    module-analysis cache must not, or every child re-scans every module."""
+    home = Path.home()
+    assert Path(os.environ["LOCALAPPDATA"]).is_relative_to(home)
+    cache = Path(os.environ["PSModuleAnalysisCachePath"])
+    assert cache.name == "ModuleAnalysisCache"
+    assert not cache.is_relative_to(home)

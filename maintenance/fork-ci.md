@@ -89,6 +89,22 @@ so intentional watchdog/probe waits do not consume the outcome suite's remaining
 and assertions remain unchanged. Retire these adaptations when upstream carries
 equivalent strict assertions and bounded native test allocation.
 
+`fork-ci-reliability` also owns the Windows half of `isolated_machine_home`. It
+moves LOCALAPPDATA/APPDATA into the per-test home, but pins
+`PSModuleAnalysisCachePath` to the cache under the inherited LOCALAPPDATA.
+`bin/ci` sets that variable, but `scripts/run_tests.sh` drops it under `env -i`.
+Without the pin, every test hands Windows PowerShell an empty module-analysis
+cache. The fixture arrived with #487 (`69ecc3a6`), and the native Windows
+timings changed with it. On the same runner image, the hand-off lineage, marker
+and marker-lock files ran in 16.9 s, 54.6 s and 22.5 s before the change. After
+it they ran 263-301 s, hit the 300-second cap, or failed. The marker-lock kill
+cell also failed: its child finder must see the suspended update child before
+`Add-MarkerDelegate` gives up on the held lock (`MarkerLockTimeoutMs`,
+10 s) and terminates the child. The cache holds no installer output, so
+destination isolation is unchanged. No timeout, deadline, marker or assertion
+changed. Retire this pin when upstream isolates the machine home without
+resetting the PowerShell module cache.
+
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
 `ci-gate-cancelled-blocks` owns the requirement that interruption cannot count as

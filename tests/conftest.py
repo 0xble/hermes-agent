@@ -1565,6 +1565,15 @@ def isolated_machine_home(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setattr(Path, "home", lambda: home)
     if os.name == "nt":
+        # Windows PowerShell keys its module-analysis cache off LOCALAPPDATA. An empty
+        # per-test LOCALAPPDATA makes every powershell.exe child redo uncached command
+        # discovery across the runner's module set, which starved the hand-off tests'
+        # bounded windows. The cache is shell state, not an installer destination:
+        # keep it where the harness already had it.
+        inherited = os.environ.get("LOCALAPPDATA")
+        if inherited and not os.environ.get("PSModuleAnalysisCachePath"):
+            monkeypatch.setenv("PSModuleAnalysisCachePath", os.path.join(
+                inherited, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache"))
         for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
             target = home / "AppData" / directory
             target.mkdir(parents=True)
