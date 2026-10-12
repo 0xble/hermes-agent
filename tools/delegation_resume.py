@@ -557,7 +557,7 @@ _RETRY_SELECT = """SELECT delegation_id, origin_session, origin_ui_session_id, p
                             WHERE e.delegation_id=async_delegations.delegation_id
                               AND e.event_kind='terminal_fallback')),
        delivery_state, retry_state, retry_reason, retry_due_at, retry_notices,
-       retry_claim, retry_claimed_at, retry_root, retry_attempt, retry_root_started_at, retry_replacement
+       retry_claim, retry_claimed_at, retry_root, retry_attempt, retry_root_started_at, retry_replacement, resume_claim
 FROM async_delegations"""
 
 
@@ -571,7 +571,7 @@ def _retry_record(row) -> Dict[str, Any]:
         event=event, delivery_state=row[16] or "", retry_state=row[17] or RETRY_NONE, retry_reason=row[18] or "",
         retry_due_at=row[19], retry_notices=int(row[20] or 0), retry_claim=row[21] or "",
         retry_claimed_at=row[22], retry_root=row[23] or row[0], retry_attempt=int(row[24] or 0),
-        retry_root_started_at=row[25] or row[5], retry_replacement=row[26] or "",
+        retry_root_started_at=row[25] or row[5], retry_replacement=row[26] or "", resume_claim=row[27] or "",
     )
     return record
 
@@ -716,7 +716,10 @@ def classify_outcome(record: Dict[str, Any]) -> Tuple[str, str]:
     if state == "cancelled":
         return RETRY_NONE, "cancelled"
     if _goal_count(task) > 1 or task.get("task_indexes"):
-        # Fan-out units: per-index retry would need to reconcile siblings' side effects; surface instead.
+        # Lost-owner/cut batches go through the same retry claim as scalar work;
+        # the claim returns state-verifying briefs only for unfinished indexes.
+        if state in RESUMABLE_STATES and _batch_recovery_candidates(record):
+            return "retry", state
         done = len(results) - len(failed)
         return RETRY_TERMINAL, f"{len(failed) or 'some'} of {_goal_count(task)} parallel tasks did not finish ({done} done); needs review"
     if state in _LOST_OWNER_STATES or (failed and all(r.get("status") == "interrupted" for r in failed)):
@@ -832,6 +835,8 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
                AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
                                WHERE e.delegation_id=async_delegations.delegation_id
                                  AND e.delivery_state='pending')
+               AND NOT (COALESCE(json_extract(event_json, '$.cut_reason'), '') != ''
+                        AND (delivery_state='delivered' OR retry_notices > 0))
                ORDER BY updated_at ASC LIMIT ?""", (now, now - NOTICE_GRACE_S, now, stale, limit)).fetchall()
         for row in rows:
             record = _retry_record(row)
@@ -936,6 +941,14 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
                 else INELIGIBLE_STATE
         if reason := _expire_retry(conn, record, now):
             return record, reason
+        task = record.get("task") or {}
+        candidates = _batch_recovery_candidates(record)
+        if task.get("is_batch") or task.get("task_indexes") or _goal_count(task) > 1:
+            if not candidates:
+                return record, INELIGIBLE_PARTIAL
+            if conn.execute("SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? LIMIT 1",
+                            (delegation_id,)).fetchone():
+                return record, INELIGIBLE_CLAIMED
         claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
         if claim is None:
             return record, INELIGIBLE_CLAIMED
@@ -984,11 +997,43 @@ def _replacement_source(conn, new: Dict[str, Any], task_text: str) -> Optional[D
     return prior if same_owner else None
 
 
+def _replacement_children(conn, prior: Dict[str, Any], new: Dict[str, Any]) -> Optional[List[int]]:
+    """Indexes named by child recovery briefs, or None for the scalar contract.
+
+    A parent cannot turn a batch claim into a scalar whole-batch replay by
+    dropping the child marker. Every named index must be claimed and unspent.
+    """
+    task = prior.get("task") or {}
+    if not (task.get("task_indexes") or _goal_count(task) > 1 or conn.execute(
+            "SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? LIMIT 1",
+            (prior["delegation_id"],)).fetchone()):
+        return None
+    import re
+    return sorted({int(index) for index in re.findall(r"RECOVERY CHILD INDEX: (\d+)", str(new.get("context") or ""))})
+
+
 def replacement_admission_error(conn, new: Dict[str, Any], task_text: str) -> Optional[str]:
     """Recheck in the INSERT transaction; commit expiry without inserting a child."""
     prior = _replacement_source(conn, new, task_text)
     if prior is None:
         return None
+    indexes = _replacement_children(conn, prior, new)
+    if indexes is not None:
+        if not indexes:
+            return "batch recovery requires a claimed child index; no replacement was started"
+        for index in indexes:
+            child = conn.execute("SELECT claim, replacement_delegation_id FROM async_delegation_child_recovery "
+                                 "WHERE delegation_id=? AND task_index=?", (prior["delegation_id"], index)).fetchone()
+            expected_claim = prior["retry_claim"] if prior["retry_state"] != RETRY_NONE else prior["resume_claim"]
+            if child is None or child[0] != expected_claim:
+                return "child recovery claim missing or superseded; no replacement was started"
+            if child[1]:
+                return "child recovery claim already consumed; no replacement was started"
+        if prior["retry_state"] == RETRY_NONE:
+            return None
+        if prior["retry_state"] != RETRY_DISPATCHING:
+            return "child recovery claim cancelled or not taken; no replacement was started"
+        return _expire_retry(conn, prior, time.time())
     # Legacy/CLI/TUI rows have no durable retry state, but an explicit recovery
     # claim authorizes exactly the first replacement spawn. Admission is paired
     # with link_replacement() below, which records that replacement atomically.
@@ -1030,6 +1075,23 @@ def link_replacement(conn, new: Dict[str, Any], task_text: str) -> None:
     if prior is None:
         return
     new_id, dispatched_at = new["delegation_id"], new["dispatched_at"]
+    indexes = _replacement_children(conn, prior, new)
+    if indexes is not None:
+        for index in indexes:
+            conn.execute("UPDATE async_delegation_child_recovery SET replacement_delegation_id=? "
+                         "WHERE delegation_id=? AND task_index=? AND replacement_delegation_id IS NULL",
+                         (new_id, prior["delegation_id"], index))
+        if prior["retry_state"] == RETRY_DISPATCHING:
+            conn.execute("UPDATE async_delegations SET retry_root=?, retry_attempt=?, retry_root_started_at=? "
+                         "WHERE delegation_id=?",
+                         (prior["retry_root"], prior["retry_attempt"] + 1,
+                          prior["retry_root_started_at"] or dispatched_at, new_id))
+            conn.execute("UPDATE async_delegations SET retry_state='dispatched', retry_replacement=?, updated_at=? "
+                         "WHERE delegation_id=? AND retry_state='dispatching' AND NOT EXISTS "
+                         "(SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? "
+                         "AND replacement_delegation_id IS NULL)",
+                         (new_id, time.time(), prior["delegation_id"], prior["delegation_id"]))
+        return
     if prior["retry_state"] == RETRY_NONE:
         # Legacy explicit-resume rows have no retry claim state to advance. The
         # guarded write is the durable admission receipt for the one allowed
