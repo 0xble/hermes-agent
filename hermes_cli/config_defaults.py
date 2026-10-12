@@ -503,6 +503,12 @@ DEFAULT_CONFIG = {
         # browser_cdp / browser_evaluate capabilities.
         "extension_control": {"enabled": False, "developer_mode": False},
     },
+    # Heavy background deletes (dependency-install orphan collection, the periodic worktree
+    # pruner) run only inside this local-time window, "HH:MM-HH:MM" (may wrap midnight). A daytime
+    # mass delete on a nearly full APFS volume stalls every writer, state.db included. "" = any time.
+    "maintenance": {
+        "deletion_window": "02:00-05:00",
+    },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or
     # enabled=True (most users never use /rollback). Single shared shadow store with real pruning.

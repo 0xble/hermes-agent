@@ -12,6 +12,7 @@ no network and no mocks.
 import os
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,30 @@ class TestAttendedGcPushedTier:
 
 
 class TestCronWorktreeMaintenance:
+    @pytest.fixture(autouse=True)
+    def _inside_deletion_window(self, monkeypatch):
+        import hermes_time
+
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 12, 3, 0).astimezone())
+
+    def test_outside_deletion_window_leaves_the_throttle_unspent(self, monkeypatch):
+        import cron.scheduler as sched
+        import hermes_time
+
+        calls = []
+        monkeypatch.setattr(sched, "_last_worktree_maintenance_at", None)
+        monkeypatch.setattr(
+            sched.threading, "Thread",
+            lambda *a, **k: type("T", (), {"start": lambda self: calls.append(k.get("name"))})(),
+        )
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 12, 14, 0).astimezone())
+        sched._maybe_run_worktree_maintenance()
+        assert calls == [] and sched._last_worktree_maintenance_at is None
+
+        monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 10, 13, 2, 30).astimezone())
+        sched._maybe_run_worktree_maintenance()
+        assert calls == ["cron-worktree-prune"]
+
     def test_throttle_dispatches_once_per_interval(self, monkeypatch):
         import cron.scheduler as sched
 

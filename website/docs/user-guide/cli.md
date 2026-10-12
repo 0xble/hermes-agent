@@ -116,7 +116,8 @@ Safety guarantees (all modes, any age):
   checked-out branches, and `main`/`master`/`develop` are always kept.
 
 The same conservative pruner also runs from the cron scheduler (at most once
-every 6 hours, in the background), so gateway-only machines — where nobody
+every 6 hours, in the background, and only inside `maintenance.deletion_window`,
+default `02:00-05:00` local), so gateway-only machines — where nobody
 launches `hermes -w` for days — no longer accumulate merged scratch trees
 between CLI sessions.
 
