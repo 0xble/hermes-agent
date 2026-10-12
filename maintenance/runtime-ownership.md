@@ -11,7 +11,7 @@ health claims.
 | Surface | Owner and invariant | Required proof after an authorized change |
 |---|---|---|
 | Personal source | `~/Repos/hermes-agent`, owned fork `main` | Published and local source identity agree. |
-| Personal runtime | `~/.hermes/hermes-agent`, launchd-supervised gateway, profile `~/.hermes` | Read running-code identity, profile, and supervisor state independently of source HEAD. |
+| Personal runtime | Immutable release `~/.hermes/releases/<sha>` selected by the `~/.hermes/current` symlink (`previous` is the rollback release), launchd-supervised gateway, profile `~/.hermes`. `~/.hermes/hermes-agent` is only the updater's fetch checkout and never runs the gateway ([S2](seamless-restart-s2.md)). | Resolve `current` to its release SHA and read the gateway's pinned interpreter and import path independently of source HEAD and of the fetch checkout. |
 | LPG runtime | `~/Repos/lpg/apps/agent` signed release route, host `/opt/agent/current` and `/opt/hermes/current` | Verify both agent release and runtime artifact identities, company overlay, and supervisor. |
 | Meridian runtime | `~/Repos/meridian-next/apps/agent` signed release route | Verify agent/runtime release chain on-host. The old standalone `meridian-agent` repository is not the release owner. |
 
@@ -97,11 +97,11 @@ Company updates continue through their signed release owners, not these personal
 
 ## Recovery and acceptance
 
-Preserve the personal capture at `~/.hermes-cutover-capture-20260919T050807Z`,
-legacy installed checkout `~/.hermes/hermes-agent.legacy`, and code archive at
-`~/Repos/archive/hermes-agent-legacy-20260919/` until independently verified
-replacement recovery and acceptance permit retirement. Revalidate existence and
-restore integrity before relying on these dated recovery locations. A Git bundle
+The personal code rollback point is the `~/.hermes/previous` release, and the
+native updater's release transaction receipts record each pointer change. The
+September 19 cutover recovery locations (`~/.hermes-cutover-capture-20260919T050807Z`,
+`~/.hermes/hermes-agent.legacy` and `~/Repos/archive/hermes-agent-legacy-20260919/`)
+were no longer present on 2026-10-11. Do not rely on them. A release or Git bundle
 preserves code, not profile databases, browser state, secrets, or external memories.
 Company recovery must include the signed prior release and its matching state.
 
