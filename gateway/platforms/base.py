@@ -5494,7 +5494,8 @@ class BasePlatformAdapter(ABC):
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+        # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
+        INDICATOR_RESERVE = _len(fr" \({len(content)}/{len(content)}\)" + "\n")
         FENCE_CLOSE = "\n```"
         chunks: List[str] = []
         remaining = content
@@ -5505,13 +5506,17 @@ class BasePlatformAdapter(ABC):
             headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
             if headroom < 1:
                 headroom = max(1, max_length // 2)
-            # Remainder fits in one final chunk; close a reopened fence if still open.
-            if _len(prefix) + _len(remaining) <= max_length - INDICATOR_RESERVE:
-                final_chunk = prefix + remaining
+            # Remainder can only be final if it fits before any synthesized closing fence;
+            # avoid rescanning the entire remainder on every non-final iteration.
+            final_budget = max_length - INDICATOR_RESERVE
+            if _len(prefix) + _len(remaining) <= final_budget:
+                # Reserve a close only for a reopened fence that remains open at the end.
+                final_close = ""
                 if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
-                    final_chunk += FENCE_CLOSE
-                chunks.append(final_chunk)
-                break
+                    final_close = FENCE_CLOSE
+                if _len(prefix) + _len(remaining) + _len(final_close) <= final_budget:
+                    chunks.append(prefix + remaining + final_close)
+                    break
             # Natural split (newline, then space); a custom _len budget maps to a codepoint offset.
             _cp_limit = (
                 _custom_unit_to_cp(remaining, headroom, _len) if _len is not len else headroom)
