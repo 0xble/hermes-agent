@@ -12,12 +12,13 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize(
     "exit_signal,matching_child_probes",
-    [(signal.SIGTERM, 1), (signal.SIGTERM, 2), (signal.SIGKILL, 3), (signal.SIGKILL, 4)],
+    [("SIGTERM", 1), ("SIGTERM", 2), ("SIGKILL", 3), ("SIGKILL", 4)],
     ids=["term-before-enqueue", "term-before-worker-signal", "kill-before-enqueue", "kill-before-worker-signal"],
 )
 def test_bounded_kill_validates_descendant_identity_before_signaling(
     monkeypatch, exit_signal, matching_child_probes
 ):
+    exit_signal = getattr(signal, exit_signal)
     registry = ProcessRegistry()
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
     session = ProcessSession(id="proc_reused_descendant", command="worker", task_id="t1")
