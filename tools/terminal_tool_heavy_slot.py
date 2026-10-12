@@ -108,8 +108,8 @@ def _is_targeted(args: list[str]) -> bool:
             if arg in _TARGETED_FLAGS or (name != arg and name in _TARGETED_VALUE_FLAGS | {"--tb", "--color"}):
                 continue
             return False  # unknown option: may add workers, so keep the slot
-        if not _TEST_FILE.search(arg):
-            return False  # a directory, `run` subcommand target set, or anything broad
+        if "$" in arg or not _TEST_FILE.search(arg):
+            return False  # unresolved expansion, directory, or anything broad
         files += 1
     return 1 <= files <= _MAX_TARGETED_FILES
 
@@ -309,17 +309,53 @@ def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
     return _dispatcher(executable) + rewritten
 
 
+def _runtime_target_check() -> str:
+    """Recheck expanded argv, not shell variable names, without starting another interpreter.
+
+    Only one existing Python file is exempt here. Prefix utilities can change cwd/env,
+    and selection/plugin/config overrides are deliberately left to the slot. Generate
+    option patterns from the static classifier's allowlists so unknown flags stay heavy.
+    """
+    runners = "|".join(sorted(_PY_RUNNERS))
+    flags = "|".join(sorted(_TARGETED_FLAGS | {"--"}))
+    values = _TARGETED_VALUE_FLAGS - {"-k", "-m", "-p", "-o", "-t", "--testNamePattern"}
+    value_flags = "|".join(sorted(values))
+    inline_values = "|".join(f"{flag}=*" for flag in sorted(values | {"--color"}))
+    return (
+        '_hermes_hs_targeted() { case "${1##*/}" in '
+        f'{runners}|run_tests.sh) shift ;; '
+        'python*) [ "$#" -ge 3 ] && [ "$2" = -m ] || return 1; '
+        f'case "$3" in {runners}) shift 3 ;; *) return 1 ;; esac ;; '
+        '*) return 1 ;; esac; '
+        'local _hermes_hs_files=0 _hermes_hs_skip=0 _hermes_hs_arg; '
+        'for _hermes_hs_arg in "$@"; do '
+        'if [ "$_hermes_hs_skip" = 1 ]; then _hermes_hs_skip=0; continue; fi; '
+        'case "$_hermes_hs_arg" in '
+        f'{flags}|{inline_values}) ;; '
+        f'{value_flags}) _hermes_hs_skip=1 ;; '
+        '-*) return 1 ;; '
+        '*.py|*.py::*) [ -f "${_hermes_hs_arg%%::*}" ] || return 1; '
+        '_hermes_hs_files=$((_hermes_hs_files + 1)) ;; '
+        '*) return 1 ;; esac; done; '
+        '[ "$_hermes_hs_skip" = 0 ] && [ "$_hermes_hs_files" = 1 ]; }'
+    )
+
+
 def _dispatcher(executable: str) -> str:
     """Shell function the rewritten commands call.
 
     A name the session shell resolves itself (alias, function, builtin) runs exactly as
-    before: the user's own wrapper decides whether and how to throttle. Only an external
-    program goes through the helper, labelled with the cwd it runs in. Prefix assignments
-    (``FOO=1 pytest``) reach either path because the shell applies them to the call.
+    before: the user's own wrapper decides whether and how to throttle. An external
+    program bypasses the helper only when its expanded arguments prove a single test
+    target; otherwise it takes the slot, labelled with the cwd it runs in. Prefix
+    assignments (``FOO=1 pytest``) reach either path because the shell applies them to
+    the call.
     """
     resolve = '$(type -t -- "$1" 2>/dev/null || whence -w -- "$1" 2>/dev/null)'  # bash, then zsh
     shell_owned = 'alias|function|builtin|keyword|*": alias"|*": function"|*": builtin"|*": reserved"'
     run_in_shell = '_hermes_hs_name=$1; shift; eval "$_hermes_hs_name \\"\\$@\\""'
     run_in_slot = f'{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
     return (f'{_DISPATCH}() {{ _hermes_hs_label=$1; shift; case "{resolve}" in '
-            f'{shell_owned}) {run_in_shell} ;; *) {run_in_slot} ;; esac; }}\n')
+            f'{shell_owned}) {run_in_shell} ;; '
+            f'*) if _hermes_hs_targeted "$@"; then "$@"; else {run_in_slot}; fi ;; esac; }}; '
+            f'{_runtime_target_check()}\n')
