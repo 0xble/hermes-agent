@@ -153,6 +153,38 @@ def test_cut_pending_write_does_not_overwrite_final_receipt(tmp_path, monkeypatc
     assert record["cut_receipt"] is True
 
 
+def test_cut_receipt_marker_survives_large_output_and_command(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+
+    finalized = _make_session(sid="proc_cut_large_output")
+    receipts.save_cut_pending_result(finalized, "gateway_shutdown", prune=False)
+    finalized.output_buffer = "x" * 8192
+    finalized.exited = True
+    finalized.exit_code = -15
+    finalized.completion_reason = "killed"
+    finalized.termination_source = "gateway_shutdown"
+    receipts.save_completed_result(finalized, prune=False)
+
+    pending = _make_session(sid="proc_cut_long_command")
+    pending.command = "echo " + "y" * 4096
+    receipts.save_cut_pending_result(pending, "gateway_shutdown", include_output=False, prune=False)
+
+    directory = home / "logs" / "process-results"
+    for path in (directory / "proc_cut_large_output.json", directory / "proc_cut_long_command.json"):
+        assert receipts._is_cut_receipt(path), path.name
+
+    newer = _make_session(sid="proc_normal_newer", exited=True, exit_code=0)
+    newer.completion_reason = "exited"
+    receipts.save_completed_result(newer)
+
+    assert (directory / "proc_cut_large_output.json").exists()
+    assert (directory / "proc_cut_long_command.json").exists()
+
+
 def test_cut_pending_receipts_are_not_loaded_as_completed(tmp_path, monkeypatch):
     from gateway import session_context
     from tools import process_registry_results as receipts

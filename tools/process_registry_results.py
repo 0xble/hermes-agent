@@ -47,6 +47,13 @@ def _is_cut_receipt(path) -> bool:
     )
 
 
+def _header_first(record: dict) -> dict:
+    """Put the retention-classifier keys first: ``_is_cut_receipt`` reads only the file header,
+    and ``output``/``command`` can be hundreds of KB."""
+    head = {key: record[key] for key in (_CUT_RECEIPT_FIELD, "completion_reason") if key in record}
+    return {**head, **{key: value for key, value in record.items() if key not in head}}
+
+
 def _read_existing_record(path) -> dict:
     try:
         record = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -115,7 +122,7 @@ def save_completed_result(
             record[_CUT_RECEIPT_FIELD] = bool(
                 existing.get(_CUT_RECEIPT_FIELD) or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
             )
-            atomic_json_write(path, record, mode=0o600)
+            atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:
                 _result_paths()
     except OSError:
@@ -148,7 +155,7 @@ def save_cut_pending_result(
             record[_CUT_RECEIPT_FIELD] = True
             record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
             record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
-            atomic_json_write(path, record, mode=0o600)
+            atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:
                 _result_paths()
     except OSError:
