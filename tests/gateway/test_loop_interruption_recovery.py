@@ -341,3 +341,99 @@ async def test_reset_after_admission_does_not_execute_old_tick(control_home):
     await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
     assert executions == []
     runner.session_store.close_all_db_handles()
+
+
+def loop_command_dispatch(runner, source, entry):
+    async def dispatch(event):
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        if handled:
+            return result
+        generation = runner._begin_session_run_generation(entry.session_key)
+        try:
+            return await runner._handle_message_with_agent(event, source, entry.session_key, generation)
+        finally:
+            await runner._run_post_turn_hooks(
+                agent_result="LOOP_COMPLETE", source=source, is_internal=True, event=event,
+            )
+    return dispatch
+
+
+@pytest.mark.asyncio
+async def test_interrupted_effectful_loop_command_is_parked_not_refunded(control_home):
+    runner, adapter, source, entry = native_runner(control_home)
+    runner.config.quick_commands = {"effect": {"type": "exec", "command": "echo effect"}}
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set("/effect", interval_seconds=60, times=3, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    effects = []
+
+    async def effect(command, exec_cmd):
+        effects.append(loops.load_loop(entry.session_id).claim_phase)
+        raise asyncio.CancelledError  # process interrupted after the external effect
+
+    runner._hm_run_exec_quick_command = effect
+    adapter.set_message_handler(loop_command_dispatch(runner, source, entry))
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+        assert effects == ["executing"], "effectful command ran while its tick was still refundable"
+        await scan(runner, entry.session_id)  # ownerless recovery after the interruption
+        saved = loops.load_loop(entry.session_id)
+        assert saved.status == "paused" and "outcome unknown" in saved.paused_reason
+        assert saved.ticks_fired == 1 and not saved.awaiting_response
+        await scan(runner, entry.session_id)
+        assert effects == ["executing"]  # never replayed
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("race", ["owner_after_claim", "wake_already_admitted"])
+async def test_loop_wake_never_answers_clarification_registered_after_claim(control_home, race):
+    from tools import clarify_gateway
+
+    runner, adapter, source, entry = native_runner(control_home)
+    create_loop(entry, source)
+    key = entry.session_key
+    owner = asyncio.create_task(asyncio.Event().wait())
+    pending = []
+
+    def human_turn_takes_session():
+        adapter._active_sessions[key] = asyncio.Event()
+        adapter._session_tasks[key] = owner
+        runner._running_agents[key] = object()
+        pending.append(clarify_gateway.register(f"race-{race}", key, "Which option?", None))
+
+    adapter.set_message_handler(lambda event: runner._hm_pending_reply_intercepts(event, source, key))
+    try:
+        if race == "owner_after_claim":
+            async def worker(func, *args, **kwargs):
+                result = await asyncio.to_thread(func, *args, **kwargs)
+                if getattr(func, "__name__", "") == "fire_tick" and result:
+                    human_turn_takes_session()  # the executor hop lets a human turn win
+                return result
+
+            runner._run_in_executor_with_context = worker
+            await scan(runner, entry.session_id)
+            saved = loops.load_loop(entry.session_id)
+            assert not saved.awaiting_response and saved.ticks_fired == 0  # unstarted claim refunded
+        else:
+            # Structural guard: even an already-built gateway wake cannot answer a human prompt.
+            human_turn_takes_session()
+            wake = runner._synthetic_prompt_event(source, "loop wake text", internal=True, reply_expected=False)
+            wake.metadata.update({"hermes_loop_wakeup": True})
+            await adapter.handle_message(wake)
+            assert await runner._hm_pending_reply_intercepts(wake, source, key) is None
+        assert pending and not pending[0].event.is_set(), "a synthetic loop wake answered the human clarification"
+        assert adapter._session_tasks[key] is owner and not owner.done()
+        await adapter.handle_message(MessageEvent(text="Use the blue option", source=source))
+        assert clarify_gateway.wait_for_response(pending[0].clarify_id, 1) == "Use the blue option"
+    finally:
+        for entry_ in pending:
+            clarify_gateway.resolve_gateway_clarify(entry_.clarify_id, "cleanup")
+            clarify_gateway.wait_for_response(entry_.clarify_id, 1)
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        runner.session_store.close_all_db_handles()

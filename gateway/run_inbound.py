@@ -1349,8 +1349,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Replies owned by in-flight work: pending /update prompt, clarify, slash-confirm.
-        Only events that may control the gateway (``allow_gateway_control``) can answer them."""
-        if not event.allow_gateway_control:
+        Only events that may control the gateway (``allow_gateway_control``) can answer them, and
+        never a gateway-authored synthetic event (``internal``): a wake is not a human answer."""
+        if not event.allow_gateway_control or getattr(event, "internal", False):
             return None
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
@@ -1363,6 +1364,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
+        if event.get_command() and not await self._begin_command_loop_tick(event, source):
+            return True, None  # superseded /loop tick: its command must not run
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)

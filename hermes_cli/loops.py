@@ -932,9 +932,16 @@ class LoopManager(LoopRevisionsMixin):
         return self._save_tick_outcome(fired, settle, expected_phase="claimed", owns_turn=owns_turn)
 
     def start_tick(self, tick: Tuple[Any, Any]) -> bool:
-        """Durably fence model execution to the exact admitted loop instance/tick."""
+        """Durably fence execution to the exact admitted loop instance/tick.
+
+        Idempotent for that exact tick: a /loop command wake is fenced before its handler runs,
+        and a prompt rewrite falling through to the model passes the model-turn fence again."""
         s = self._state
-        if s is None or (s.created_at, s.ticks_fired) != tick or s.claim_phase != "claimed":
+        if s is None or (s.created_at, s.ticks_fired) != tick:
+            return False
+        if s.claim_phase == "executing":
+            return self._save_tick_outcome(s.ticks_fired, lambda state: None, expected_phase="executing")
+        if s.claim_phase != "claimed":
             return False
         return self._save_tick_outcome(
             s.ticks_fired, lambda state: setattr(state, "claim_phase", "executing"),

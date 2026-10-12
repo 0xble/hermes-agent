@@ -798,24 +798,51 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
-    async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
-        """Settle only a command dispatch that completed without falling through to model work."""
+    @staticmethod
+    def _loop_wake_command_identity(event: Any) -> Optional[tuple]:
+        """``(session_id, tick)`` for a gateway-authored /loop wake carrying an exact tick, else None."""
         metadata = getattr(event, "metadata", None) or {}
         raw_tick = metadata.get("gateway_loop_tick")
         sid = metadata.get("gateway_session_id")
         if (not getattr(event, "internal", False) or not metadata.get("hermes_loop_wakeup")
                 or not sid or not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2):
-            return
+            return None
+        return sid, tuple(raw_tick)
+
+    async def _loop_wake_current_entry(self, sid: str, source: Any) -> Any:
         current = await self._run_in_executor_with_context(
             self.session_store.lookup_by_session_key, self._session_key_for_source(source),
         )
-        if current is None or current.session_id != sid:
-            return
+        return current if current is not None and current.session_id == sid else None
+
+    async def _begin_command_loop_tick(self, event: Any, source: Any) -> bool:
+        """Persist execution before a /loop wake's command handler can perform effects.
+
+        Quick-command exec and plugin handlers act outside the model turn, so an interruption
+        inside them must leave an ``executing`` tick that recovery parks, never a ``claimed`` one it
+        refunds and replays. False means the exact tick was superseded (reset, stop, re-set) and the
+        command must not run. Prompt rewrites that fall through reach the model-turn fence, which
+        accepts this already-executing tick.
+        """
+        identity = self._loop_wake_command_identity(event)
+        if identity is None:
+            return True
+        sid, tick = identity
+        if await self._loop_wake_current_entry(sid, source) is None:
+            return False
         from hermes_cli.loops import LoopManager
 
-        tick = tuple(raw_tick)
         mgr = await self._run_in_executor_with_context(LoopManager, sid)
-        if await self._run_in_executor_with_context(mgr.start_tick, tick):
+        return bool(await self._run_in_executor_with_context(mgr.start_tick, tick))
+
+    async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
+        """Settle only a command dispatch that completed without falling through to model work."""
+        identity = self._loop_wake_command_identity(event)
+        if identity is None:
+            return
+        sid, tick = identity
+        current = await self._loop_wake_current_entry(sid, source)
+        if current is not None:
             await self._post_turn_loop_completion(
                 session_entry=current, source=source, final_response="", loop_tick=tick,
             )
@@ -935,6 +962,12 @@ class GatewayGoalsMixin:
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
         wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
         if not wakeup:
+            return
+        if _turn_owner_exists():
+            # A human turn won the executor hop. The wake was never admitted, so only this
+            # unstarted claim is refunded; the owner's prompts are never offered the wake text.
+            with suppress(Exception):
+                await self._run_in_executor_with_context(mgr.abandon_tick)
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
         # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
