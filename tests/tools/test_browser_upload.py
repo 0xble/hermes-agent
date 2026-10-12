@@ -3,6 +3,9 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+import requests
+
 from tools.browser_camofox import camofox_navigate, camofox_upload
 
 
@@ -29,7 +32,10 @@ def test_stages_outside_file_into_uploads_root_and_posts_ref(mock_post, monkeypa
     src.write_bytes(b"png-bytes")
     _open_tab(mock_post, "up1")
 
-    mock_post.return_value = _resp({"ok": True, "attached": ["x"], "via": "filechooser"})
+    mock_post.side_effect = [
+        _resp({"result": 0}),
+        _resp({"ok": True, "attached": ["x"], "via": "filechooser"}),
+    ]
     result = json.loads(camofox_upload([str(src)], ref="@e7", task_id="up1"))
 
     assert result["success"] is True
@@ -57,9 +63,10 @@ def test_file_already_in_root_is_not_copied(mock_post, monkeypatch, tmp_path):
     inside.write_bytes(b"%PDF")
     _open_tab(mock_post, "up2")
 
-    mock_post.return_value = _resp({"ok": True, "via": "direct_input"})
-    json.loads(camofox_upload([str(inside)], selector="iframe >> internal:control=enter-frame >> button",
-                              task_id="up2"))
+    mock_post.side_effect = [_resp({"result": 0}), _resp({"ok": True, "via": "filechooser"})]
+    result = json.loads(camofox_upload(
+        [str(inside)], selector="iframe >> internal:control=enter-frame >> button", task_id="up2"))
+    assert result["success"] is True
 
     body = mock_post.call_args.kwargs["json"]
     assert body["path"] == [str(inside.resolve())]
@@ -113,6 +120,65 @@ def test_named_trigger_refused_when_top_page_has_file_input(mock_post, monkeypat
     assert not mock_post.call_args.args[0].endswith("/upload")
     # The count must pierce open shadow roots, matching Playwright's locator semantics.
     assert "shadowRoot" in mock_post.call_args.kwargs["json"]["expression"]
+
+
+@pytest.mark.parametrize("trigger", [
+    {"ref": "@e7"},
+    {"selector": "iframe >> internal:control=enter-frame >> #up"},
+])
+@pytest.mark.parametrize("evaluate_reply", [
+    405, 501, 404, {}, {"result": None}, {"result": "0"}, {"result": False},
+    {"result": -1}, {"result": 0.0},
+])
+@patch("tools.browser_camofox.requests.post")
+def test_named_trigger_refused_when_top_level_count_unknown(
+        mock_post, monkeypatch, tmp_path, trigger, evaluate_reply):
+    from tools.registry import registry
+    import tools.browser_tool  # noqa: F401 (registers real upload dispatch)
+
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(tmp_path / "uploads"))
+    src = tmp_path / "logo.png"
+    src.write_bytes(b"x")
+    _open_tab(mock_post, "unknown-count")
+    mock_post.reset_mock()
+
+    if isinstance(evaluate_reply, int):
+        response = _resp({"error": "evaluate route unavailable"})
+        response.status_code = evaluate_reply
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+    else:
+        response = _resp(evaluate_reply)
+    mock_post.side_effect = [response, _resp({"ok": True, "via": "direct_input"})]
+    raw = registry.dispatch(
+        "browser_upload", {"paths": [str(src)], **trigger}, task_id="unknown-count")
+    result = json.loads(raw) if isinstance(raw, str) else raw
+
+    assert result["success"] is False
+    assert "cannot verify" in result["error"].lower()
+    assert "top-level" in result["error"] and "named trigger" in result["error"]
+    assert "first" in result["error"] and "another upload route" in result["error"]
+    assert len(mock_post.call_args_list) == 1
+    assert mock_post.call_args.args[0].endswith("/evaluate")
+
+
+@patch("tools.browser_camofox.requests.post")
+def test_upload_without_trigger_does_not_require_count(mock_post, monkeypatch, tmp_path):
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    monkeypatch.setenv("CAMOFOX_UPLOADS_DIR", str(tmp_path / "uploads"))
+    src = tmp_path / "logo.png"
+    src.write_bytes(b"x")
+    _open_tab(mock_post, "default-upload")
+    mock_post.reset_mock()
+    mock_post.return_value = _resp({"ok": True, "via": "direct_input"})
+
+    result = json.loads(camofox_upload([str(src)], task_id="default-upload"))
+
+    assert result["success"] is True and result["via"] == "direct_input"
+    assert len(mock_post.call_args_list) == 1
+    assert mock_post.call_args.args[0].endswith("/upload")
+    assert "ref" not in mock_post.call_args.kwargs["json"]
+    assert "selector" not in mock_post.call_args.kwargs["json"]
 
 
 @patch("tools.browser_camofox.requests.post")

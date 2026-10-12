@@ -365,7 +365,7 @@ def build_recovery_instruction(record: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Durable automatic retry (guarantee: delivered completion OR one visible line)
+# Durable automatic retry (guarantee: durable result/retry settlement)
 # ---------------------------------------------------------------------------
 #
 # Messaging-gateway-origin background units are inserted ``retry_state='armed'``. CLI/TUI
@@ -380,11 +380,12 @@ def build_recovery_instruction(record: Dict[str, Any]) -> str:
 # and returns actions. A due 'scheduled' row becomes a parent notice telling it to
 # call ``delegate_task(action='resume')`` and spawn with the recovery brief. A
 # notice the parent ignores (e.g. NO_REPLY) is re-sent once after
-# NOTICE_GRACE_S. If it is still undispatched, the row turns 'terminal' and the
-# gateway posts one plain line to the user itself, so the guarantee never rests
-# on model compliance. The spawn of the replacement is linked back through the
-# recovery brief's heading (``_persist_dispatch`` -> :func:`link_replacement`),
-# which carries the lineage budget forward.
+# NOTICE_GRACE_S. If it is still undispatched, the row becomes terminal and is
+# settled quietly. The sole direct terminal report is a successful result whose
+# durable delivery was lost and whose parent session is gone. The spawn of the
+# replacement is linked back through the recovery brief's heading
+# (``_persist_dispatch`` -> :func:`link_replacement`), which carries the lineage
+# budget forward.
 
 RETRY_ARMED = "armed"
 RESULT_UNDELIVERABLE = "result_undeliverable"
@@ -760,12 +761,13 @@ def release_notice(delegation_id: str, claim: str) -> bool:
 
 
 def mark_retry_terminal(delegation_id: str, claim: str, reason: str) -> bool:
-    """Parent conversation is gone: the user still gets the terminal line."""
+    """Parent conversation is gone: settle the retry as terminal without another parent wake."""
     return _settle(delegation_id, claim, RETRY_NOTICING,
                    "retry_state='terminal', retry_claim=NULL, retry_reason=?", (reason,))
 
 
 def mark_terminal_reported(delegation_id: str, claim: str) -> bool:
+    """Settle a terminal action after its notice was sent or deliberately kept quiet."""
     return _settle(delegation_id, claim, RETRY_REPORTING, "retry_state='reported'", ())
 
 
@@ -953,7 +955,7 @@ def retry_note(plan: Optional[Dict[str, Any]]) -> str:
     if plan["retry_state"] == RETRY_SCHEDULED:
         return (f"Hermes will retry this automatically at {_when(plan['due_at'])} (retry {plan['attempt']}/"
                 f"{MAX_RETRY_ATTEMPTS}, {plan['reason']}); you will get a notice then. Do not re-dispatch it yourself.")
-    return f"Hermes will not retry this ({plan['reason']}); the user is being told it stopped."
+    return f"Hermes will not retry this ({plan['reason']})."
 
 
 def build_retry_notice(record: Dict[str, Any]) -> str:
@@ -968,45 +970,21 @@ def build_retry_notice(record: Dict[str, Any]) -> str:
         f"{attempt}/{MAX_RETRY_ATTEMPTS}. Do it now: call delegate_task(action='resume', subagent_id='{did}'), "
         "then call delegate_task with the returned goal and pass 'recovery_context' verbatim as context. "
         "If it is no longer wanted, say so to the user. "
-        + ("If you do not dispatch it, Hermes will tell the user the task stopped." if reprompt else
+        + ("If you do not dispatch it, Hermes will stop retrying it." if reprompt else
            "Replying NO_REPLY without dispatching does not cancel the retry; you will be asked once more.")
         + f"]\n{PROCESS_NOTIFICATION_END}"
     )
 
 
-_TERMINAL_REASON_LABELS = {
-    "billing": "provider rejected the request",
-    "authentication": "provider rejected the request",
-    "auth_permanent": "provider rejected the request",
-    "auth": "provider rejected the request",
-    "content_policy_blocked": "provider rejected the request",
-    "format_error": "provider rejected the request",
-    "context_length_exceeded": "provider rejected the request",
-    "rate_limit": "rate-limited too many times",
-    "upstream_rate_limit": "rate-limited too many times",
-    "timeout": "timed out too many times",
-}
-
-
-def _terminal_reason_label(reason: str) -> str:
-    # Never interpolate exception text: only fixed categories can cross the egress boundary.
-    if reason.startswith("retry budget exhausted"):
-        return "still failing after 24h" if "24h" in reason else "retry limit reached"
-    if reason.startswith("the parent did not dispatch the retry"):
-        return "the retry was not dispatched"
-    if reason == "its conversation ended before the retry could run":
-        return "its conversation ended"
-    if reason == RESULT_UNDELIVERABLE:
-        return "it finished, but its result could not be delivered"
-    return _TERMINAL_REASON_LABELS.get(reason, "the task failed")
-
-
 def build_terminal_line(record: Dict[str, Any]) -> str:
+    """Return user-facing terminal text only for a completed result that lost its delivery."""
+    if str(record.get("retry_reason") or "") != RESULT_UNDELIVERABLE:
+        return ""
     from agent.redact import redact_for_egress
 
     goal = redact_for_egress(str((record.get("task") or {}).get("goal") or "background task"))
     goal = " ".join(goal.split())
     if len(goal) > 120:
         goal = goal[:117] + "…"
-    why = _terminal_reason_label(str(record.get("retry_reason") or ""))
-    return f"Background task stopped: {goal} — {why}."
+    # Never interpolate exception text: only fixed wording crosses the egress boundary.
+    return f"Background task finished: {goal} — its result could not be delivered."

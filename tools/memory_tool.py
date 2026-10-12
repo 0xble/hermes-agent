@@ -169,27 +169,36 @@ def destructive_ops(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _background_delete_gate(store, action, operations, target="memory", content=None,
-                            old_text=None) -> Optional[str]:
+                            old_text=None) -> Tuple[Optional[str], bool]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
-    store instead of merely denied: the fork's own review summary is never published back, so
-    a plain denial would drop the consolidation request with no surfacing path at all. A
-    staging failure fails closed to a plain denial."""
+    single or inside a batch — require owner opt-in and a durable journal observer. Returns
+    ``(result, require_durable)``: a result string when the op must not proceed; otherwise
+    whether the commit must still find a durable observer (``_commit_unattended``)."""
     from tools.skill_provenance import is_unattended_review
 
     if not is_unattended_review():
-        return None
-    # Owner opt-in: trust the unattended fork with replace/remove (memory.write_approval still applies).
-    if is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False):
-        return None
+        return None, False
     payload = ({"action": "batch", "target": target, "operations": operations}
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
-        return None
-    detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
-              else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
+        return None, False
+    # Opt-in alone must not allow deletion when the journal plugin is missing or outdated.
+    from tools.memory_transactions import has_durable_memory_transaction_observer
+    if (is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False)
+            and has_durable_memory_transaction_observer()):
+        return None, True
+    return _stage_background_delete(store, payload), False
+
+
+def _stage_background_delete(store, payload: Dict[str, Any]) -> str:
+    """Stage instead of merely denying: the fork's own review summary is never published
+    back, so a plain denial would drop the consolidation request with no surfacing path at
+    all. A staging failure fails closed to a plain denial."""
+    batch = payload["action"] == "batch"
+    detail = ("; ".join(_batch_op_line(op) for op in payload["operations"]) if batch
+              else _batch_op_line(payload))
     try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
@@ -197,13 +206,12 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         FAILURE_CLASS.set("staged")
         record = wa.stage_write(
             wa.MEMORY, payload,
-            summary=(f"background review consolidation ({'batch' if operations is not None else action} "
-                     f"on {target}): {detail}")[:200],
+            summary=f"background review consolidation ({payload['action']} on {payload['target']}): {detail}"[:200],
             origin=wa.current_origin())
         return json.dumps({
             "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
             "message": ("Background review may not delete memory entries unattended. The proposed "
-                        f"{'batch' if operations is not None else action} was staged for your approval — "
+                        f"{payload['action']} was staged for your approval — "
                         "review it with /memory pending (approve to apply, discard to drop)."),
         }, ensure_ascii=False)
     except Exception:
@@ -212,6 +220,21 @@ def _background_delete_gate(store, action, operations, target="memory", content=
         return tool_error(
             "Background review may not delete memory entries ('replace'/'remove', including in a "
             "batch); 'add' is still available.", success=False)
+
+
+def _commit_unattended(store, require_durable: bool, payload: Dict[str, Any], commit) -> Tuple[str, str]:
+    """Run *commit*; a durable-path admission must find a durable observer in the snapshot
+    the commit itself uses, else nothing is written and the op is staged as at admission."""
+    if not require_durable:
+        return _applied(commit())
+    from tools.memory_transactions import DurableMemoryObserverUnavailable, require_durable_memory_observer
+    try:
+        with require_durable_memory_observer():
+            result = commit()
+    except DurableMemoryObserverUnavailable:
+        logger.warning("Durable memory journal disappeared before an unattended delete committed; staging")
+        return "rejected", _stage_background_delete(store, payload)
+    return _applied(result)
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
@@ -256,14 +279,16 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if operations:
         if not isinstance(operations, list):
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
-        denied = _background_delete_gate(store, action, operations, target)
+        denied, require_durable = _background_delete_gate(store, action, operations, target)
         if denied is not None:
             return "rejected", denied
         # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
         gate_result = _apply_write_gate(store, "batch", target, None, None, operations)
         if gate_result is not None:
             return "rejected", gate_result
-        return _applied(store.apply_batch(target, operations))
+        return _commit_unattended(store, require_durable,
+                                  {"action": "batch", "target": target, "operations": operations},
+                                  lambda: store.apply_batch(target, operations))
     # Reject calls that provide neither action (single-op) nor operations
     # (batch).  Without this guard the dispatch falls through to the generic
     # "Unknown action 'None'" error, which gives the model no signal about
@@ -275,12 +300,16 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
         )
     if action not in _STORE_ACTIONS:
         return _invalid(f"Unknown action '{action}'. Use: add, replace, remove")
-    invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(store, action, None, target, content, old_text)
-               or _apply_write_gate(store, action, target, content, old_text))
+    invalid = _validate_single_op(store, action, target, content, old_text)
+    require_durable = False
+    if invalid is None:
+        invalid, require_durable = _background_delete_gate(store, action, None, target, content, old_text)
+    invalid = invalid or _apply_write_gate(store, action, target, content, old_text)
     if invalid is not None:
         return "rejected", invalid
-    return _applied(_STORE_ACTIONS[action][0](store, target, content, old_text))
+    return _commit_unattended(store, require_durable,
+                              {"action": action, "target": target, "content": content, "old_text": old_text},
+                              lambda: _STORE_ACTIONS[action][0](store, target, content, old_text))
 
 
 def get_builtin_memory_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -807,8 +807,8 @@ class GoalState:
         self.waiting_since = 0.0
         if not preserve_notice_key:
             self.last_wait_notice_key = None
+            self.last_continuation_notice_key = None
         self.last_age_notice_key = None
-        self.last_continuation_notice_key = None
         self.barrier_rearms = 0
         self.barrier_recheck_at = 0.0
 
@@ -3079,7 +3079,7 @@ class GoalManager:
         # Reuse S1's durable notice identity so continuation and parked-state notices
         # remain coordinated across internal turns and gateway restarts.
         notice_key = f"continuation|reason:{reason_text}"
-        if state.last_continuation_notice_key == notice_key:
+        if silent_automatic or state.last_continuation_notice_key == notice_key:
             notice = ""
         else:
             state.last_continuation_notice_key = notice_key
