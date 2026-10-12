@@ -738,7 +738,7 @@ class GoalState:
     # Deterministic busy-loop backstop. A fingerprint of recorded tool evidence is the progress
     # signal; repeated automatic CONTINUEs with no new evidence and the same reason are parked.
     consecutive_no_progress: int = 0
-    # Silent CONTINUE turns with no new evidence use a terminal stall backstop,
+    # Silent CONTINUE/disputed turns with no new actionable evidence use a terminal stall backstop,
     # rather than a user-resumable pause or an endlessly rearmed timed park.
     consecutive_silent_no_progress: int = 0
     # Escalation level for backoff parks within the current no-progress streak. Old rows default 0.
@@ -2948,13 +2948,20 @@ class GoalManager:
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
-        # Start every active post-turn evaluation with a zeroed durable streak. Only an autonomous
-        # silence marker can carry the prior count forward, and it is committed again only after the
-        # whole evaluation reaches the ordinary CONTINUE dispatch path below. This makes every early
-        # return (wait, gate, dispute, budget, error, and so on) break consecutive silent rechecks.
-        silent_recheck = not user_initiated and is_intentional_silence_response(last_response)
-        prior_silent_rechecks = state.consecutive_silent_no_progress if silent_recheck else 0
-        state.consecutive_silent_no_progress = 0
+        # Only a real break in silence resets the terminal silent-recheck streak. Discover the
+        # current turn's evidence before any wait or gate return so an actionable result can reset
+        # it even when this evaluator does not reach the judge.
+        silent = is_intentional_silence_response(last_response)
+        silent_automatic = not user_initiated and silent
+        previous_turn_at = state.last_turn_at
+        evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at, max_entries=None)
+        turn_evidence = _evidence_for_turn(evidence, previous_turn_at)
+        evidence_scan_truncated_for_turn = _evidence_scan_truncated_for_turn(evidence, previous_turn_at)
+        new_eligible_non_read_only = (
+            evidence_scan_truncated_for_turn or not _evidence_only_read_only_status(turn_evidence)
+        )
+        if not silent_automatic or new_eligible_non_read_only:
+            state.consecutive_silent_no_progress = 0
 
         if is_continuation_gap_wait(state) and not self._barrier_holds():
             # The gap elapsed, so the idle ticker dispatched (or is dispatching) this continuation
@@ -2983,7 +2990,6 @@ class GoalManager:
             state.clear_wait(preserve_notice_key=True)
 
         state.turns_used += 1
-        previous_turn_at = state.last_turn_at
         state.last_turn_at = time.time()
 
         # Gates run BEFORE the judge: a failing gate is deterministic evidence the goal is not done,
@@ -2994,9 +3000,6 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
-        evidence = collect_goal_evidence(evidence_session_id or self.session_id, since=state.created_at, max_entries=None)
-        turn_evidence = _evidence_for_turn(evidence, previous_turn_at)
-        evidence_scan_truncated_for_turn = _evidence_scan_truncated_for_turn(evidence, previous_turn_at)
         # Keep the judge-facing ledger bounded even though progress classification needs the
         # complete current-turn slice. A bounded scan that omitted rows fails closed below.
         evidence = evidence[-_EVIDENCE_MAX_ENTRIES:]
@@ -3008,7 +3011,6 @@ class GoalManager:
              "output": f"exit {g.last_exit_code} (passed)\n{_tail((g.last_output_tail or '').strip(), _EVIDENCE_OUTPUT_CHARS)}".strip()}
             for g in state.gates
         ]
-        silent = is_intentional_silence_response(last_response)
         standing_claim = (last_visible_done_claim(evidence_session_id or self.session_id, since=state.created_at)
                           if silent else "")
         citations = resolve_cited_evidence(evidence_session_id or self.session_id, standing_claim or last_response,
@@ -3017,7 +3019,6 @@ class GoalManager:
         new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
         # A bare silence marker is an explicit quiet repeat from a gateway-authored continuation.
         # It still reaches the judge: recorded evidence, not visible prose, is authoritative for completion.
-        silent_automatic = not user_initiated and silent
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
@@ -3036,11 +3037,7 @@ class GoalManager:
         # wording or changing command output; a write/actionable result resets the streak.
         if progress_fingerprint:
             state.last_progress_fingerprint = progress_fingerprint
-        automatic_read_only = (
-            not user_initiated
-            and not evidence_scan_truncated_for_turn
-            and _evidence_only_read_only_status(turn_evidence)
-        )
+        automatic_read_only = not user_initiated and not new_eligible_non_read_only
         if automatic_read_only:
             # WAIT and CONTINUE share one durable no-progress streak. Changing status output,
             # judge wording, and a repeated parked turn are not actionable progress.
@@ -3053,12 +3050,15 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
-        silent_streak = (
-            prior_silent_rechecks + 1
-            if (silent_recheck and verdict == "continue" and automatic_read_only
-                and not disputed and not parse_failed and not transport_failed)
-            else 0
-        )
+        # A silent autonomous turn advances only after the judge actually returned CONTINUE (plain
+        # or disputed) and the current turn had no eligible non-read-only evidence. All other judged
+        # outcomes leave the prior streak untouched; transport/parse failures are explicitly not
+        # convergence evidence.
+        if verdict in {"done", "blocked"}:
+            state.consecutive_silent_no_progress = 0
+        elif (silent_automatic and verdict == "continue" and not new_eligible_non_read_only
+              and not parse_failed and not transport_failed):
+            state.consecutive_silent_no_progress += 1
 
         # A dispute counts toward the stall breaker unless the reply cites a recorded result no
         # earlier dispute in this streak cited: new proof means converging, rewording is not.
@@ -3117,7 +3117,7 @@ class GoalManager:
 
         # Stall breaker: repeated completion rechecks must converge. Silent stalls
         # end before read-only backoff can re-arm; visible disputes retain their pause.
-        if silent_streak >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
+        if state.consecutive_silent_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
             # Reuse the convergence breaker, but clear this silent stall instead
             # of pausing for user input. Inactive goals cannot wake or re-notify.
             state.status = "cleared"
@@ -3173,9 +3173,6 @@ class GoalManager:
         else:
             state.last_continuation_notice_key = notice_key
             notice = f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}"
-        # The streak is durable only for a candidate that survived every early-return path and is
-        # actually dispatching the next autonomous continuation.
-        state.consecutive_silent_no_progress = silent_streak
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,

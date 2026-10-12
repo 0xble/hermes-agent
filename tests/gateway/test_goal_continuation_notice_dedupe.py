@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -106,12 +107,6 @@ async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(herme
         if i < limit - 1:
             assert mgr.is_active() and key in adapter._pending_messages
             assert adapter.sent == []
-    if disputed:
-        assert mgr.is_active() and mgr.state.status == "active"
-        assert mgr.state.consecutive_silent_no_progress == 0
-        assert mgr.is_parked()
-        assert len(adapter.sent) == 1 and "Goal parked" in adapter.sent[0]
-        return
     assert not mgr.is_active() and not mgr.has_goal()
     assert mgr.state.status == "cleared", "a silent stall must not pause waiting for the user"
     assert not mgr.is_parked() and mgr.state.waiting_until == 0
@@ -129,6 +124,77 @@ async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(herme
         judge.assert_not_called()
     assert len(adapter.sent) == 1
     assert GoalManager(entry.session_id).state.status == "cleared"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disputed", [False, True])
+@pytest.mark.parametrize("interleave", [None, "backoff", "timed-wait", "delegation-wait"])
+async def test_default_gap_silent_judgments_converge_across_nonjudging_waits(hermes_home, monkeypatch, disputed, interleave):
+    harness = _harness(hermes_home)
+    runner, adapter, entry, source, key = harness
+    # Omit the gap override: exercise the actual gateway default/config reader.
+    runner.config.goals = {"max_turns": 0}
+    gap = runner._goal_min_continuation_gap_from_config()
+    assert gap == goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS
+    mgr = GoalManager(entry.session_id)
+    mgr.set("Publish the wiki", max_turns=0)
+    clock = [time.time() + 1]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    verdict = ("continue", REASON, False, {"disputed": True} if disputed else None, False)
+    with patch.object(goals, "judge_goal", return_value=verdict) as judge:
+        mgr = await _turn(harness, "[SILENT]")
+        assert judge.call_count == 1 and mgr.state.consecutive_silent_no_progress == 1
+        adapter._pending_messages.clear()
+        if interleave:
+            # These are already-established waits. Their held turns do not invoke the judge and
+            # must neither invent a fresh notice nor erase the earlier silent judgment.
+            if interleave == "backoff":
+                mgr._no_progress_wait(mgr.state, "no progress yet")
+            elif interleave == "timed-wait":
+                mgr.wait_for_seconds(60, reason="external check pending")
+            else:
+                mgr.wait_for_seconds(60, reason="delegation pending", on_delegations=1)
+            mgr.state.last_wait_notice_key = mgr._wait_notice_key(mgr.state)
+            mgr._save()
+            _restart_db()
+            with patch.object(goals, "count_active_delegations", return_value=1 if interleave == "delegation-wait" else 0):
+                mgr = await _turn(harness, "NO_REPLY")
+            assert judge.call_count == 1
+            assert mgr.state.consecutive_silent_no_progress == 1
+            assert adapter.sent == []
+            clock[0] = mgr.state.waiting_until + 1
+
+        # The second actual judgment is followed by a pacing early return, not dispatch. The
+        # increment must already be durable there, and the held turn must leave it unchanged.
+        clock[0] += 1
+        _restart_db()
+        mgr = await _turn(harness, "NO_REPLY")
+        assert judge.call_count == 2 and mgr.state.consecutive_silent_no_progress == 2
+        assert goals.is_continuation_gap_wait(mgr.state)
+        assert adapter.sent == [] and key not in adapter._pending_messages
+        _restart_db()
+        mgr = await _turn(harness, "[SILENT]")
+        assert judge.call_count == 2 and mgr.state.consecutive_silent_no_progress == 2
+        assert adapter.sent == []
+        clock[0] = mgr.state.waiting_until + 1
+        _restart_db()
+        mgr = await _turn(harness, "[SILENT]")
+        assert judge.call_count == 3
+        assert mgr.state.consecutive_silent_no_progress == 3
+        assert mgr.state.status == "cleared" and not mgr.has_goal()
+        assert mgr.state.waiting_until == 0 and not mgr.is_parked()
+        assert mgr.state.backoff_level == 0 and mgr.state.consecutive_no_progress == 0
+        assert key not in adapter._pending_messages and mgr.next_continuation_prompt() is None
+        assert len(adapter.sent) == 1 and adapter.sent[0].startswith("Goal stopped:")
+        notice = list(adapter.sent)
+        for _ in range(2):
+            clock[0] += gap + 1
+            _restart_db()
+            await runner._post_turn_goal_continuation(
+                session_entry=entry, source=source, final_response="NO_REPLY",
+            )
+        assert judge.call_count == 3 and adapter.sent == notice
+        assert GoalManager(entry.session_id).state.status == "cleared"
 
 
 @pytest.mark.asyncio

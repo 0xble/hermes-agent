@@ -238,8 +238,8 @@ def test_silent_turn_without_current_goal_claim_keeps_original_judge_input(herme
     assert judge.call_args.kwargs["citations"]["evidence_ids"] == []
 
 
-@pytest.mark.parametrize("interrupt", ["evidence", "visible", "judge-failure", "user-silent"])
-def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(hermes_home, interrupt):
+@pytest.mark.parametrize("interrupt", ["evidence", "visible", "user-judge-failure", "user-silent"])
+def test_silent_stall_resets_only_for_real_breaks_in_silence(hermes_home, interrupt):
     sid = "silent-stall-reset"
     db = _session_db(sid)
     mgr = GoalManager(sid)
@@ -255,22 +255,25 @@ def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(herme
         _record_tool_call(db, sid, "terminal", {"command": "wiki-check"}, "new result", call_id="fresh")
     elif interrupt == "visible":
         reply = "Still working; the verification step changed."
-    elif interrupt == "judge-failure":
+    elif interrupt == "user-judge-failure":
         verdict = ("continue", "judge unavailable", False, None, True)
     with patch.object(goals, "judge_goal", return_value=verdict):
-        mgr.evaluate_after_turn(reply, user_initiated=interrupt != "evidence")
+        mgr.evaluate_after_turn(reply, user_initiated=interrupt in {"user-judge-failure", "user-silent"})
     assert mgr.state.consecutive_silent_no_progress == 0
     assert mgr.state.status == "active"
+    # A visible autonomous reply breaks silence, but may still enter the independent ordinary
+    # no-progress backoff. Lift that hold before the next judged silent recheck.
+    mgr.stop_waiting()
     # Existing visible dispute counts must not force silent turns to pause early.
     mgr.state.consecutive_disputes = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES - 1
     mgr._save()
     mgr = GoalManager(sid)
     with patch.object(goals, "judge_goal", return_value=DISPUTED):
         decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
-    assert decision["should_continue"] is True
-    assert mgr.state.consecutive_silent_no_progress == 0
+    assert decision["status"] == "active"  # ordinary no-progress backoff is not a dispute pause
+    assert mgr.state.consecutive_silent_no_progress == 1
     assert mgr.state.status == "active"
-    assert decision["verdict"] == "continue"
+    assert decision["verdict"] in {"continue", "wait"}
 
 
 def test_gate_failure_between_silent_rechecks_resets_streak(hermes_home):
@@ -295,9 +298,43 @@ def test_gate_failure_between_silent_rechecks_resets_streak(hermes_home):
     assert resumed["status"] == "active"
     assert resumed["should_continue"] is False
     assert resumed["verdict"] == "wait"
-    assert mgr.state.consecutive_silent_no_progress == 0
+    assert mgr.state.consecutive_silent_no_progress == 1
 
 
+
+
+@pytest.mark.parametrize("interrupt", ["user-silent", "visible", "evidence"])
+@pytest.mark.parametrize("early_exit", ["gate", "timed-wait"])
+def test_real_break_resets_before_nonjudging_exit(hermes_home, interrupt, early_exit):
+    sid = f"silent-entry-reset-{interrupt}-{early_exit}"
+    db = _session_db(sid)
+    mgr = GoalManager(sid)
+    mgr.set("Publish the wiki", max_turns=0)
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+        for _ in range(2):
+            mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert mgr.state.consecutive_silent_no_progress == 2
+    if early_exit == "gate":
+        mgr.add_gate("wiki-check")
+    else:
+        mgr.wait_for_seconds(60, reason="external check pending")
+    if interrupt == "evidence":
+        _record_tool_call(db, sid, "write_file", {"path": "wiki.md"}, "saved", call_id="new-action")
+    reply = "Verification changed." if interrupt == "visible" else goals.SILENCE_MARKER
+    with patch.object(goals, "judge_goal") as judge, \
+            patch.object(goals, "run_gate", return_value=(False, 1, "still failing")):
+        mgr.evaluate_after_turn(reply, user_initiated=interrupt == "user-silent")
+    judge.assert_not_called()
+    assert GoalManager(sid).state.consecutive_silent_no_progress == 0
+    if early_exit == "timed-wait":
+        mgr.stop_waiting()
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE), \
+            patch.object(goals, "run_gate", return_value=(True, 0, "passed")):
+        resumed = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert resumed["status"] == "active"
+    # A held wait did not complete a turn: its new evidence is still current when the judge resumes.
+    expected = 0 if interrupt == "evidence" and early_exit == "timed-wait" else 1
+    assert GoalManager(sid).state.consecutive_silent_no_progress == expected
 
 
 @pytest.mark.parametrize(
@@ -320,7 +357,7 @@ def test_gate_failure_between_silent_rechecks_resets_streak(hermes_home):
         "continuation_gap",
     ],
 )
-def test_every_post_turn_early_return_breaks_silent_streak(hermes_home, early_return):
+def test_post_turn_exit_classifies_silent_streak_by_progress_and_judgment(hermes_home, early_return):
     sid = f"silent-stall-early-{early_return}"
     mgr = GoalManager(session_id=sid)
     mgr.set("Publish the wiki", max_turns=0)
@@ -408,7 +445,12 @@ def test_every_post_turn_early_return_breaks_silent_streak(hermes_home, early_re
             decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
 
     assert decision is not None
-    assert mgr.state.consecutive_silent_no_progress == 0
+    expected = {
+        "blocked": 0, "done": 0, "dispute": 0,  # visible disputed user turn
+        "silent_stall": goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS,
+        "max_turns": 2, "delegation": 2, "no_progress": 2, "continuation_gap": 2,
+    }.get(early_return, 1)
+    assert GoalManager(sid).state.consecutive_silent_no_progress == expected
 
 
 def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):
