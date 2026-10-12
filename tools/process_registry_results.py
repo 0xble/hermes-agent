@@ -40,7 +40,10 @@ def _result_paths():
                 record = json.loads(path.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError, TypeError):
                 record = {}
-            kind = "cut" if record.get("completion_reason") in _CUT_COMPLETION_REASONS else "normal"
+            kind = "cut" if (
+                record.get("completion_reason") in _CUT_COMPLETION_REASONS
+                or (record.get("completion_reason") == "killed" and record.get("termination_source"))
+            ) else "normal"
             retention = CUT_RECEIPT_RETENTION_SECONDS if kind == "cut" else RESULT_RETENTION_SECONDS
             if modified < now - retention:
                 path.unlink(missing_ok=True)
