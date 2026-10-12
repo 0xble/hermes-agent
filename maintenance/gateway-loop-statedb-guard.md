@@ -53,6 +53,33 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
 
+## Crash-recovery integrity scan
+
+After an unclean prior life, `gateway/lifecycle_ledger.py::record_startup` must
+claim the new sentinel and return without waiting for `PRAGMA quick_check(1)`.
+The context-bound daemon worker keeps the original integrity verdict and ERROR
+on corruption, then appends `gateway.previous_unclean_exit` to exit-diag. The
+WARNING and `prior_unclean_exit` / `prior_suspected_oom` flags remain synchronous.
+The worker never renews a startup-watchdog lease: unrelated startup must still
+prove its own progress. A daemon can be interrupted by process exit; no extra
+shutdown wait or timeout increase is introduced.
+
+The 2026-10-12 production SIGKILL recovery respawned in 0.5 s, listened on its
+control socket at 00:22:05.461 PDT, then stalled until 00:24:19.534 before reporting
+the prior unclean life. Telegram polling was healthy at 00:24:21.3. A healthy
+28 GB state.db returned `ok`; its synchronous integrity scan cost 134 s.
+Upstream main `590af66a58c2b3eb3c5edd1dcfefa09c625ae18a` still runs this check
+synchronously. Upstream `2a8c3b313c72` extended the watchdog lease while it ran;
+this patch preserves corruption detection without putting the scan on the
+readiness path or masking startup stalls with background progress.
+
+Proof: `tests/gateway/test_lifecycle_state_db_check.py` holds an injected checker
+behind a threading event, proves startup returns with the sentinel claimed
+before release, then proves the persisted verdict and corruption ERROR. Clean
+boots do not scan. `tests/gateway/test_lifecycle_ledger.py` preserves unclean/OOM
+flags and the existing exit-diag schema. Retire this offload only when upstream
+provides equivalent readiness and forensics behavior.
+
 ## 2026-10-10 and 2026-10-11 incidents
 
 The gateway exited with code 75 four times on 2026-10-10 (19:07, 19:31, 19:33 and 19:44 PDT)

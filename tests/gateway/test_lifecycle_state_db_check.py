@@ -8,14 +8,18 @@ it on 2026-08-30 17:15 and surfaced as "Session not found".
 
 ``record_startup`` already detects the unclean exit and logs "SIGKILL / OOM /
 VM death" — it just never looked at the database that death may have torn.
-The check is gated on the unclean exit precisely because it costs ~2s on a
-500MB store; a clean boot must not pay it.
+The check is gated on the unclean exit and runs off the startup path: a
+large healthy store must not delay readiness, and a clean boot must not scan.
 """
 from __future__ import annotations
 
 import json
+import logging
+import threading
 import sqlite3
 from pathlib import Path
+
+import pytest
 
 from gateway.lifecycle_ledger import (
     check_state_db_integrity,
@@ -64,6 +68,29 @@ def _exit_diag_records(home: Path) -> list:
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 
 
+@pytest.fixture(autouse=True)
+def integrity_workers(monkeypatch):
+    """Join real checker threads before assertions or fixture teardown."""
+    import agent.memory_provider as provider
+
+    workers = []
+    spawn = provider.spawn_context_thread
+
+    def track(*args, **kwargs):
+        worker = spawn(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    def wait():
+        for worker in workers:
+            worker.join(timeout=5)
+            assert not worker.is_alive(), "integrity checker did not finish"
+
+    monkeypatch.setattr(provider, "spawn_context_thread", track)
+    yield wait
+    wait()
+
+
 # ── the checker itself ──────────────────────────────────────────────────────
 
 
@@ -86,26 +113,28 @@ def test_checker_tolerates_a_missing_store(tmp_path: Path) -> None:
 # ── wiring into the unclean-exit path ───────────────────────────────────────
 
 
-def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path) -> None:
+def test_unclean_exit_records_the_corruption_verdict(tmp_path: Path, integrity_workers, caplog) -> None:
     _make_state_db(tmp_path, corrupt=True)
     _write_sentinel(tmp_path)
 
     evidence = record_startup(home=tmp_path)
 
     assert evidence is not None
-    assert evidence["state_db_integrity"] != "ok"
+    integrity_workers()
     record = _exit_diag_records(tmp_path)[0]
-    assert record["state_db_integrity"] != "ok"
+    assert record["state_db_integrity"] not in ("ok", "absent")
+    assert any(r.levelno == logging.ERROR and "FAILED integrity check" in r.message for r in caplog.records)
 
 
-def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path) -> None:
+def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path, integrity_workers) -> None:
     _make_state_db(tmp_path, corrupt=False)
     _write_sentinel(tmp_path)
 
     evidence = record_startup(home=tmp_path)
 
     assert evidence is not None
-    assert evidence["state_db_integrity"] == "ok"
+    integrity_workers()
+    assert _exit_diag_records(tmp_path)[0]["state_db_integrity"] == "ok"
 
 
 def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> None:
@@ -124,56 +153,55 @@ def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> N
     assert not called, "integrity check ran on a clean boot"
 
 
-# ── startup-watchdog lease during the check (#115542) ───────────────────────
-
-
-def _armed_handle(monkeypatch):
-    """A real, thread-less StartupWatchdogHandle installed as the module singleton.
-
-    ``report_startup_progress`` resolves the singleton, so the lease bookkeeping the
-    check performs lands on this handle; no watchdog thread means nothing can exit pytest.
-    """
+@pytest.mark.parametrize("verdict", ["ok", "btree page is corrupt"])
+def test_startup_claims_and_returns_while_integrity_check_is_running(
+    tmp_path: Path, monkeypatch, integrity_workers, caplog, verdict
+) -> None:
+    """A held check cannot hold up readiness, its verdict, or the unclean warning."""
+    import gateway.lifecycle_ledger as ledger
     import hermes_startup_watchdog as sw
+    from agent.memory_provider import spawn_context_thread
 
     handle = sw.StartupWatchdogHandle(timeout_s=300.0, exit_code=75)
     monkeypatch.setattr(sw, "_handle", handle)
-    return handle
-
-
-def test_unclean_exit_check_renews_the_startup_lease_while_sqlite_progresses(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """A 37 GB store needs ~4200 s of quick_check; one 900 s entry lease cannot cover it
-    and the watchdog killed every boot with exit 75 (#115542). The check must keep renewing
-    a phase-owned lease from SQLite's progress handler for as long as the PRAGMA advances,
-    through the real unclean-exit entry point.
-    """
-    import gateway.lifecycle_ledger as ledger
-
-    handle = _armed_handle(monkeypatch)
-    # Renew on every handler tick so the renewal count is deterministic, not clock-bound.
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_LEASE_RENEW_S", 0.0)
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
-    _make_state_db(tmp_path, corrupt=False)
     _write_sentinel(tmp_path)
+    started, release, returned = threading.Event(), threading.Event(), threading.Event()
+    result = []
 
-    evidence = record_startup(home=tmp_path)
+    def slow_check(*, home):
+        assert home == tmp_path
+        started.set()
+        assert release.wait(timeout=5), "test did not release the checker"
+        return verdict
 
-    assert evidence is not None and evidence["state_db_integrity"] == "ok"
-    assert handle._lease_phase == "state_db_unclean_integrity_check"
-    assert handle._lease_count > 1, "lease was taken once at entry and never renewed"
+    def boot():
+        result.append(record_startup(home=tmp_path))
+        returned.set()
 
+    monkeypatch.setattr(ledger, "check_state_db_integrity", slow_check)
+    # Keep a regression on the old synchronous implementation bounded too.
+    caller = spawn_context_thread(boot, name="test-startup-caller")
+    caller.start()
+    try:
+        assert started.wait(timeout=2), "integrity check was not started"
+        assert returned.wait(timeout=2), "startup waited on the integrity check"
+        assert not release.is_set()
+        sentinel = json.loads(get_lifecycle_sentinel_path(tmp_path).read_text())
+        assert sentinel["phase"] == "running" and sentinel["prior_unclean_exit"] is True
+        assert result[0]["prior_pid"] == _DEAD_PID
+        assert "state_db_integrity" not in result[0]
+        assert _exit_diag_records(tmp_path) == []
+        assert "exited UNCLEANLY" in caplog.text
+        assert handle._lease_count == 0, "background work masked startup liveness"
+    finally:
+        release.set()
+        caller.join(timeout=5)
+        integrity_workers()
 
-def test_unclean_exit_check_keeps_the_verdict_contract_under_the_lease(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """The progress handler must never convert corruption into success or abort the PRAGMA:
-    a torn page still yields the first complaint, and the phase is still on record."""
-    handle = _armed_handle(monkeypatch)
-    _make_state_db(tmp_path, corrupt=True)
-
-    verdict = check_state_db_integrity(home=tmp_path)
-
-    assert verdict not in ("ok", "absent") and not verdict.startswith("check-failed")
-    assert handle._lease_phase == "state_db_unclean_integrity_check"
-    assert check_state_db_integrity(home=tmp_path / "nowhere") == "absent"
+    record = _exit_diag_records(tmp_path)[0]
+    assert record["tag"] == "gateway.previous_unclean_exit"
+    assert record["prior_pid"] == _DEAD_PID
+    assert record["state_db_integrity"] == verdict
+    errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("FAILED integrity check" in msg for msg in errors) == (verdict != "ok")
+    assert handle._lease_count == 0
