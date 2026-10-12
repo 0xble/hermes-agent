@@ -2903,9 +2903,10 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, main_runtime_source: Any = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        self._main_runtime_source = main_runtime_source
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
         # Per-model context_length overrides live in custom_providers; without them deferred
@@ -3988,12 +3989,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: Dict[str, str] = {}
+        # Compressor state owns transport; only inherit the live selected declaration when
+        # it describes that same route (switch/fallback/recovery may move either independently).
+        main_runtime = {
+            "model": self.model, "provider": self.provider, "base_url": self.base_url,
+            "api_key": self.api_key, "api_mode": self.api_mode,
+        }
+        source = getattr(self, "_main_runtime_source", None)
+        live = source() if callable(source) else {}
+        if isinstance(live, dict) and all(live.get(k) == main_runtime.get(k) for k in ("model", "provider", "base_url")):
+            main_runtime["requested_provider"] = live.get("requested_provider")
         call_kwargs: Dict[str, Any] = {
             "task": "compression",
-            "main_runtime": {
-                "model": self.model, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
-                "api_mode": self.api_mode,
-            },
+            "main_runtime": main_runtime,
             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,
             # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
             # (thinking models burn it on reasoning). Timeout comes from call_llm config.

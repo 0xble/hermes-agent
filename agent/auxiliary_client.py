@@ -3824,7 +3824,9 @@ def _retry_same_provider_sync(*, resolved_provider: str, resolved_api_mode: Opti
         task=task, resolved_provider=resolved_provider, resolved_api_mode=resolved_api_mode, async_mode=False, **prep,
     )
     return _validate_llm_response(
-        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode), task,
+        _relay_sync_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
+        task, provider=_effective_provider_for_client(retry_client, resolved_provider),
+        base_url=str(getattr(retry_client, "base_url", "") or ""),
     )
 
 
@@ -3834,7 +3836,8 @@ async def _retry_same_provider_async(*, resolved_provider: str, resolved_api_mod
     )
     return _validate_llm_response(
         await _relay_async_completion(retry_client, retry_kwargs, provider=resolved_provider, api_mode=resolved_api_mode),
-        task,
+        task, provider=_effective_provider_for_client(retry_client, resolved_provider),
+        base_url=str(getattr(retry_client, "base_url", "") or ""),
     )
 
 
@@ -4168,7 +4171,7 @@ def _call_fallback_candidate_sync(
                     force_stream=_provider_requires_stream(dest.provider, dest.base_url),
                 ),
             ),
-            task,
+            task, provider=dest.provider, base_url=dest.base_url,
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs
 
@@ -4218,7 +4221,7 @@ async def _call_fallback_candidate_async(
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
         return _validate_llm_response(
             await _relay_async_completion(client, request_kwargs, provider=dest.provider, api_mode=dest.api_mode),
-            task,
+            task, provider=dest.provider, base_url=dest.base_url,
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs_async
 
@@ -4577,6 +4580,8 @@ def _warn_stale_openai_base_url(runtime_provider: str) -> None:
 def _main_route_target(runtime: Dict[str, Any], task: Optional[str]) -> Tuple[str, str, str, Any, str]:
     """Step-1 target: (provider, model, base_url, api_key, api_mode) of the main runtime, after the
     fast-model opt-in and the MoA aggregator substitution."""
+    # Keep the live transport provider here; the selected custom alias is attached to the
+    # resolved route below for billing only, after its endpoint and credential are chosen.
     main_provider = str(runtime.get("provider", "") or _read_main_provider() or "")
     main_model = str(runtime.get("model") or _read_main_model() or "")
     runtime_base_url = str(runtime.get("base_url") or "")
@@ -4702,7 +4707,10 @@ def _resolve_auto_route(
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
-        return routed
+        from agent.usage_pricing import billing_provider_identity
+        client, resolved_model, transport_provider = routed
+        selected = billing_provider_identity(transport_provider, runtime.get("requested_provider"))
+        return client, resolved_model, selected or transport_provider
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -5686,7 +5694,9 @@ def _vision_auto_route(
     if main_provider and main_provider not in {"auto", "", "moa"}:
         client, default_model = _vision_main_provider_client(main_provider, main_model, runtime, resolved_model, resolved_api_mode)
         if client is not None:
-            return _finalize_vision_client(main_provider, client, default_model, resolved_model, async_mode)
+            from agent.usage_pricing import billing_provider_identity
+            selected = billing_provider_identity(main_provider, runtime.get("requested_provider"))
+            return _finalize_vision_client(selected or main_provider, client, default_model, resolved_model, async_mode)
     # Aggregators use their dedicated vision model, not the user's main model.
     for candidate in _VISION_AUTO_PROVIDER_ORDER:
         if candidate == main_provider:
@@ -5814,7 +5824,8 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
-    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in
+                        (*_MAIN_RUNTIME_FIELDS, "requested_provider")) if provider == "auto" else ()
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
@@ -6835,9 +6846,8 @@ def _validate_llm_response(
     passes here exactly once; *provider*/*base_url* are optional hints.
 
     See #7264.
-    Recording is best-effort and never affects validation. *provider*/*base_url* are optional accounting
-    hints — fallback-path calls omit them and the row keeps the model (read from the response itself) with
-    an empty route. See #23270.
+    Record the successful route, including retries and fallback, so callers that own accounting
+    (MoA) can price the same destination rather than the originally requested slot.
     """
     if response is None:
         raise RuntimeError(
@@ -6845,6 +6855,11 @@ def _validate_llm_response(
         )
     response = _unwrap_data_envelope(response, task)
     from agent.aux_accounting import record_aux_usage
+    with contextlib.suppress(AttributeError, TypeError):
+        response._hermes_billing_route = {
+            "model": str(getattr(response, "model", "") or ""), "provider": provider,
+            "base_url": str(base_url or "").rstrip("/"),
+        }
     record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Adapter SimpleNamespace responses are fine — they have .choices[0].message.
     try:
@@ -7527,7 +7542,10 @@ def _prepare_aux_request(
         _get_task_no_progress_timeout(task)
         if isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) else None
     )
-    request_provider = effective_provider or resolved_provider
+    from agent.usage_pricing import billing_provider_identity
+    request_provider = billing_provider_identity(
+        effective_provider or resolved_provider,
+        provider if str(provider or "").startswith("custom:") else resolved_provider) or ""
     if not async_mode:
         compression_config = _get_auxiliary_task_config("compression") if task == "compression" else {}
         _, effective_extra_body = _compression_fast_lane_controls(
@@ -8157,7 +8175,8 @@ def _ladder_step_call(
 ) -> Tuple[str, tuple, Dict[str, Any]]:
     """Resolve a ladder step into ``(kind, args, kwargs)`` for the sync/async performer."""
     if step.kind == "call":
-        return "call", step.args, dict(provider=req.resolved_provider, api_mode=req.resolved_api_mode)
+        return "call", step.args, dict(
+            provider=_effective_provider_for_client(step.args[0], req.request_provider), api_mode=req.resolved_api_mode)
     if step.kind == "retry_same_provider":
         retry_provider, retry_model = step.args
         return "retry", (), dict(retry_kwargs, resolved_provider=retry_provider, resolved_model=retry_model)
@@ -8211,7 +8230,7 @@ def _call_llm_impl(
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
 
-    def _primary(**validate_kw: Any) -> Any:
+    def _primary() -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
         # incomplete chunked read / 5xx / 408) before the except-chain below escalates to provider/model
         # fallback. A dropped connection shouldn't abandon an otherwise-healthy provider — this especially
@@ -8232,14 +8251,14 @@ def _call_llm_impl(
                         request_provider, req.base_info or req.resolved_base_url),
                 ),
             ),
-            task, **validate_kw,
+            task, provider=request_provider, base_url=req.base_info,
         )
     try:
         # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
         # transient blips before escalating to fallback — a dropped connection shouldn't
         # abandon a healthy provider (matters for pinned MoA advisors).
         try:
-            return _primary(provider=request_provider, base_url=req.base_info)
+            return _primary()
         except Exception as transient_err:
             if not _should_retry_same_provider(task, transient_err, ""):
                 raise
@@ -8262,7 +8281,9 @@ def _call_llm_impl(
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+                return _validate_llm_response(
+                    _relay_sync_completion(*args, **kw), task, provider=kw["provider"],
+                    base_url=str(getattr(args[0], "base_url", req.base_info) or ""))
             if kind == "retry":
                 return _retry_same_provider_sync(**kw)
             return _call_fallback_candidate_sync(*args, **kw)
@@ -8389,14 +8410,14 @@ async def _async_call_llm_impl(
         async def _acreate(_kwargs: Dict[str, Any]) -> Any:
             return await _acreate_with_progress(client, _kwargs, task, force_stream=_force_stream_async)
 
-        async def _primary(**validate_kw: Any) -> Any:
+        async def _primary() -> Any:
             return _validate_llm_response(
                 await _relay_async_completion(
                     client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
                     create=_acreate),
-                task, **validate_kw)
+                task, provider=request_provider, base_url=req.base_info)
         try:
-            return await _primary(provider=request_provider, base_url=req.base_info)
+            return await _primary()
         except Exception as transient_err:
             # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
             if not _should_retry_same_provider(task, transient_err, " (async)"):
@@ -8408,7 +8429,9 @@ async def _async_call_llm_impl(
         async def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":
-                return _validate_llm_response(await _relay_async_completion(*args, **kw), task)
+                return _validate_llm_response(
+                    await _relay_async_completion(*args, **kw), task, provider=kw["provider"],
+                    base_url=str(getattr(args[0], "base_url", req.base_info) or ""))
             if kind == "retry":
                 return await _retry_same_provider_async(**kw)
             fb_client, fb_model, fb_label = args

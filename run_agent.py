@@ -505,7 +505,7 @@ class AIAgent(
         """Return the live main runtime for session-scoped auxiliary routing."""
         return {
             key: getattr(self, key, "") or ""
-            for key in ("model", "provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id")
+            for key in ("model", "provider", "requested_provider", "base_url", "api_key", "api_mode", "auth_mode", "session_id")
         }
 
     _check_compression_model_feasibility = _forward("agent.conversation_compression", "check_compression_model_feasibility")

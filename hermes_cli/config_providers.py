@@ -119,7 +119,7 @@ _KNOWN_PROVIDER_KEYS = {
     "api_mode", "transport", "model", "default_model", "models", "models_discovered",
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
-    "catalog_provider", "session_affinity_header"}
+    "catalog_provider", "session_affinity_header", "billing_mode"}
 
 
 def _pick_provider_base_url(entry: Dict[str, Any], provider_key: str) -> str:
@@ -270,6 +270,7 @@ def _normalize_custom_provider_entry(
 
     # Per-provider extra HTTP headers may carry credentials — never log them downstream.
     _put("extra_headers", normalize_extra_headers(entry.get("extra_headers")))
+    _put("billing_mode", _stripped("billing_mode"))
     _put("session_affinity_header", _stripped("session_affinity_header"))
     _put("ssl_ca_cert", _stripped("ssl_ca_cert"))
 
@@ -293,7 +294,7 @@ def _custom_provider_entry_to_provider_config(
     for field in (
         "name", "api_key", "key_env", "key_cmd", "models", "models_discovered", "context_length",
         "rate_limit_delay", "discover_models", "extra_body", "extra_headers",
-        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider"):
+        "session_affinity_header", "ssl_ca_cert", "ssl_verify", "catalog_provider", "billing_mode"):
         if field in normalized:
             provider_entry[field] = normalized[field]
     if "model" in normalized:
@@ -390,6 +391,38 @@ def _entries_for_route(
         entry_url = normalize_route_base_url(entry.get("base_url"))
         if entry_url and entry_url == target_url:
             yield entry
+
+
+def get_custom_provider_billing_mode(base_url: str, provider: str) -> str:
+    """Explicit subscription opt-in for a named route, or unanimous bare-custom entries.
+
+    Entries come from the existing profile-scoped loader; do not cache by URL alone.
+    Sharing a loopback host is not evidence that a route is subscription-backed.
+    """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.providers import custom_provider_aliases
+
+    try:
+        config = load_config_readonly()
+    except Exception:
+        return ""
+    # The picker dedupes by display name/URL/model, which can hide a metered alias.
+    # Billing requires every enabled declaration, not that lossy display view.
+    candidates = providers_dict_to_custom_providers(config.get("providers"))
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        for entry in legacy:
+            if is_provider_enabled(entry):
+                normalized = _normalize_custom_provider_entry(entry)
+                if normalized is not None:
+                    candidates.append(normalized)
+    entries = list(_entries_for_route(base_url, candidates, config))
+    if provider not in {"custom", "local"}:
+        entries = [entry for entry in entries if provider in custom_provider_aliases(
+            entry.get("name", ""), entry.get("provider_key", ""))]
+    if entries and all(entry.get("billing_mode") == "subscription_included" for entry in entries):
+        return "subscription_included"
+    return ""
 
 
 def get_custom_provider_api_mode(

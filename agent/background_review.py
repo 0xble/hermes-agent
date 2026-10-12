@@ -251,7 +251,8 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[Dict[str, Any]] = Non
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
     parent = {
-        "provider": agent.provider, "model": agent.model,
+        "provider": agent.provider, "requested_provider": getattr(agent, "requested_provider", None),
+        "model": agent.model,
         "api_key": parent_runtime.get("api_key") or None, "base_url": parent_runtime.get("base_url") or None,
         "api_mode": "codex_responses" if parent_api_mode == "codex_app_server" else parent_api_mode,
         "credential_pool": getattr(agent, "_credential_pool", None),
@@ -275,7 +276,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[Dict[str, Any]] = Non
         )
         return {
             "provider": rp.get("provider") or task_provider, "model": rp.get("model") or task_model,
-            **{key: rp.get(key) for key in ("api_key", "base_url", "api_mode", "credential_pool", "command")},
+            **{key: rp.get(key) for key in ("api_key", "base_url", "api_mode", "credential_pool", "command", "requested_provider")},
             "request_overrides": dict(rp.get("request_overrides") or {}),
             "args": list(rp.get("args") or []), "routed": True,
         }
@@ -763,8 +764,16 @@ _USAGE_COUNTERS = (
 
 def _snapshot_review_usage(review_agent: Any) -> Dict[str, Any]:
     """Snapshot in-memory usage counters from a review fork (pre-close)."""
+    from agent.usage_pricing import billing_provider_identity
+    route = {}
+    if getattr(review_agent, "provider", None) == "moa":
+        route = getattr(getattr(review_agent, "client", None), "last_aggregator_billing_route", None) or {}
     return {
-        **{key: getattr(review_agent, key, None) for key in ("model", "provider", "base_url")},
+        **{key: route.get(key) or getattr(review_agent, key, None) for key in ("model", "base_url")},
+        "provider": route.get("provider") or billing_provider_identity(
+            getattr(review_agent, "provider", None), getattr(review_agent, "requested_provider", None)),
+        "cost_status": getattr(review_agent, "session_cost_status", None),
+        "cost_source": getattr(review_agent, "session_cost_source", None),
         **{key: int(getattr(review_agent, f"session_{key}", 0) or 0) for key in _USAGE_COUNTERS},
         "estimated_cost_usd": getattr(review_agent, "session_estimated_cost_usd", None),
     }
@@ -785,6 +794,8 @@ def _record_review_usage_to_parent(parent_agent: Any, usage: Dict[str, Any]) -> 
             session_id, task="background_review", model=usage.get("model"),
             billing_provider=usage.get("provider"), billing_base_url=usage.get("base_url"),
             estimated_cost_usd=usage.get("estimated_cost_usd"),
+            cost_status=usage.get("cost_status"), cost_source=usage.get("cost_source"),
+            billing_mode="subscription_included" if usage.get("cost_status") == "included" else None,
             api_call_count=counts.pop("api_calls"), **counts,
         )
     except Exception as e:
@@ -924,6 +935,7 @@ def _fork_init_kwargs(agent: Any, rt: Dict[str, Any], routed: bool, max_iteratio
     kwargs: Dict[str, Any] = {
         "model": rt.get("model") or agent.model, "max_iterations": max_iterations, "quiet_mode": True,
         "platform": agent.platform, "provider": rt.get("provider") or agent.provider,
+        "requested_provider": rt.get("requested_provider"),
         "api_mode": rt.get("api_mode"), "base_url": rt.get("base_url") or None,
         "api_key": rt.get("api_key") or None, "credential_pool": rt.get("credential_pool"),
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,

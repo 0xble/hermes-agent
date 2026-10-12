@@ -379,15 +379,19 @@ def _price_reference_response(
 ) -> tuple[Any, Any, str | None, str | None]:
     """Normalize a reference's usage with the slot's OWN provider/api_mode and price it
     at its own rate (hence fan-out cost is summed in dollars). Never raises."""
-    from agent.usage_pricing import estimate_usage_cost, normalize_usage
+    from agent.usage_pricing import billing_provider_identity, estimate_usage_cost, normalize_usage
     usage = CanonicalUsage()
+    response_route = getattr(response, "_hermes_billing_route", None)
+    if isinstance(response_route, dict):
+        runtime = {**runtime, **response_route}
     raw_usage = getattr(response, "usage", None)
     if raw_usage:
         with contextlib.suppress(Exception):  # pragma: no cover - defensive
             usage = normalize_usage(raw_usage, provider=runtime.get("provider"), api_mode=runtime.get("api_mode"))
     try:
         cost = estimate_usage_cost(
-            slot.get("model") or "", usage, provider=runtime.get("provider"),
+            runtime.get("model") or slot.get("model") or "", usage,
+            provider=billing_provider_identity(runtime.get("provider"), runtime.get("requested_provider")),
             base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
         )
         return usage, cost.amount_usd, cost.status, cost.source
@@ -1196,7 +1200,11 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        agg_runtime = _slot_runtime(aggregator)
+        agg_runtime = dict(_slot_runtime(aggregator))
+        # Resolve once for the send; retain only non-secret billing coordinates (also for streams).
+        self.last_aggregator_billing_route = {
+            key: agg_runtime.get(key) for key in ("model", "provider", "base_url", "api_mode")
+        }
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
@@ -1243,6 +1251,9 @@ class MoAChatCompletions:
             )
             agg_messages = retry_messages
             agg_response = send(messages=agg_messages)
+        response_route = getattr(agg_response, "_hermes_billing_route", None)
+        if isinstance(response_route, dict):
+            self.last_aggregator_billing_route.update({key: value for key, value in response_route.items() if value})
         if trace is not None:
             # Trace the exact aggregator INPUT as sent (persisted copy redacted; live input raw).
             trace["aggregator_input_messages"] = (
@@ -1484,6 +1495,10 @@ class MoAClient:
     @property
     def last_aggregator_slot(self) -> Any:
         return getattr(self.chat.completions, "last_aggregator_slot", None)
+
+    @property
+    def last_aggregator_billing_route(self) -> Any:
+        return getattr(self.chat.completions, "last_aggregator_billing_route", None)
 
     def consume_and_save_trace(self, session_id: Any = None, aggregator_output_fallback: Any = None) -> None:
         return self.chat.completions.consume_and_save_trace(session_id, aggregator_output_fallback=aggregator_output_fallback)
