@@ -22,6 +22,7 @@ from tests.scripts.desktop_update.windows_handoff_support import (
     _script,
     _finish,
     _op,
+    _log,
     _HeldLock,
     _custodian,
 )
@@ -136,7 +137,9 @@ def test_script_killed_before_publishing_the_delegate_runs_no_update(tmp_path: P
         child = subprocess.run([POWERSHELL, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(finder),
                                 '-Parent', str(script.pid), '-Seconds', '60'],
                                capture_output=True, text=True, timeout=90)
-        assert child.returncode == 0, 'the update child never appeared'
+        assert child.returncode == 0, (
+            f'the update child never appeared; finder stdout={child.stdout!r} '
+            f'stderr={child.stderr!r}; hand-off exit={script.poll()}; log={_log(home)}')
         child_pid = int(child.stdout)
         subprocess.run(['taskkill', '/F', '/PID', str(script.pid)], capture_output=True, check=True)
         script.wait(timeout=30)

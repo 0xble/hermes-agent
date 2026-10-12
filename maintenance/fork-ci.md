@@ -89,21 +89,38 @@ so intentional watchdog/probe waits do not consume the outcome suite's remaining
 and assertions remain unchanged. Retire these adaptations when upstream carries
 equivalent strict assertions and bounded native test allocation.
 
-`fork-ci-reliability` also owns the Windows half of `isolated_machine_home`. It
-moves LOCALAPPDATA/APPDATA into the per-test home, but pins
-`PSModuleAnalysisCachePath` to the cache under the inherited LOCALAPPDATA.
-`bin/ci` sets that variable, but `scripts/run_tests.sh` drops it under `env -i`.
-Without the pin, every test hands Windows PowerShell an empty module-analysis
-cache. The fixture arrived with #487 (`69ecc3a6`), and the native Windows
-timings changed with it. On the same runner image, the hand-off lineage, marker
-and marker-lock files ran in 16.9 s, 54.6 s and 22.5 s before the change. After
-it they ran 263-301 s, hit the 300-second cap, or failed. The marker-lock kill
-cell also failed: its child finder must see the suspended update child before
-`Add-MarkerDelegate` gives up on the held lock (`MarkerLockTimeoutMs`,
-10 s) and terminates the child. The cache holds no installer output, so
-destination isolation is unchanged. No timeout, deadline, marker or assertion
-changed. Retire this pin when upstream isolates the machine home without
-resetting the PowerShell module cache.
+`fork-ci-reliability` also owns the Windows half of `isolated_machine_home`.
+It moves LOCALAPPDATA/APPDATA into the per-test home while keeping shell cache
+state separate. The canonical shell runner now preserves the explicit
+`PSModuleAnalysisCachePath` provided by `bin/ci`; direct runner calls retain the
+inherited-LOCALAPPDATA fallback. A behavioral shell canary was red when the
+allowlist dropped the explicit path and green after forwarding it. Installer
+destination isolation is unchanged.
+
+The earlier cache-placement diagnosis did **not** resolve the native regression:
+nightly [38226819827, Windows job 114768030470](https://github.com/0xble/hermes-agent/actions/runs/38226819827/job/114768030470)
+at `d52d86d1eccda1f908e37fc6fe1cacab7f88e64f` killed lineage and marker at the
+300-second file cap and failed marker-lock's unpublished-child assertion.
+The same-image fast baseline ran these files in 16.9 s, 54.6 s and 22.5 s;
+current quiet-dot output cannot prove the timing of each remaining cell or
+exclude a hang. Therefore these files are not split and no deadline, timeout,
+selection, platform marker or assertion is relaxed.
+
+Native qualification retains verbose, uncaptured per-cell progress and pytest
+durations. The three failing protocol files also emit monotonic start/finish
+records, and the marker-lock failure includes the isolated hand-off log and
+finder output. The native cache boundary reads actual PowerShell-child values
+and records CIM lookup duration, rather than only examining Python's environment.
+These observations distinguish shell startup, child publication and aggregate
+cost before another repair is proposed; they do not themselves establish native
+green. Keep the PR draft until the original native reproduction passes.
+
+The missing uv-shim-validation script and checkout-relative Windows cache
+artifacts are also present in the verified pre-sync baseline; they are separate
+inherited observations, not newly attributed to this candidate. Retire the
+cache forwarding/fallback when the accepted upstream runner preserves equivalent
+isolated cache state, and remove the targeted timing records after native
+root-cause qualification.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 

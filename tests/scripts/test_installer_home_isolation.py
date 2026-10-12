@@ -41,4 +41,22 @@ def test_installer_machine_home_keeps_the_powershell_module_cache_shared():
     assert Path(os.environ["LOCALAPPDATA"]).is_relative_to(home)
     cache = Path(os.environ["PSModuleAnalysisCachePath"])
     assert cache.name == "ModuleAnalysisCache"
+    assert cache.is_absolute()
     assert not cache.is_relative_to(home)
+    shell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    result = subprocess.run(
+        [str(shell), "-NoProfile", "-Command", "\n".join([
+            "$watch = [Diagnostics.Stopwatch]::StartNew()",
+            "$process = Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\"",
+            "@{cache=$env:PSModuleAnalysisCachePath; local=$env:LOCALAPPDATA; "
+            "profile=$env:USERPROFILE; process=$process.ProcessId; "
+            "systemdrive=$env:SystemDrive; elapsed=$watch.Elapsed.TotalSeconds} | ConvertTo-Json -Compress",
+        ])],
+        capture_output=True, text=True, encoding="utf-8", timeout=60, check=True,
+    )
+    observed = json.loads(result.stdout)
+    assert Path(observed["cache"]) == cache
+    assert Path(observed["local"]).is_relative_to(home)
+    assert Path(observed["profile"]) == home
+    assert observed["process"] > 0
+    print(f"[windows-cache-boundary] {observed}", flush=True)
