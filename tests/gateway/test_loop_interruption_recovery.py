@@ -146,6 +146,60 @@ async def test_live_or_restart_owner_keeps_claim_even_a_day_later(control_home, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["claimed", "executing", "legacy"])
+@pytest.mark.parametrize("response", ["Answer to an unrelated user question", "LOOP_COMPLETE", ""])
+async def test_post_turn_requires_exact_loop_wake_identity(control_home, phase, response):
+    runner, adapter, source, entry = native_runner(control_home)
+    try:
+        mgr = create_loop(entry, source)
+        assert mgr.fire_tick()
+        state = mgr.state
+        assert state is not None
+        tick = (state.created_at, state.ticks_fired)
+        if phase == "executing":
+            assert mgr.start_tick(tick)
+        elif phase == "legacy":
+            state.claim_phase = ""
+            loops.save_loop(entry.session_id, state)
+        db = goals._get_session_db()
+        assert db is not None
+        before = db.get_meta("loop:" + entry.session_id)
+        # The same session may answer a human or unrelated autonomous event while
+        # an interrupted wake is still claimed. Text (even LOOP_COMPLETE) is not identity.
+        for internal, metadata in [
+            (False, {}),
+            (True, {}),
+            (True, {"gateway_loop_tick": [tick[0]]}),
+            (True, {"gateway_loop_tick": [tick[0], tick[1] + 1]}),
+            (True, {"gateway_loop_tick": [tick[0] + 1, tick[1]]}),
+        ]:
+            event = MessageEvent(text="unrelated turn", source=source, internal=internal, metadata=metadata)
+            await runner._run_post_turn_hooks(
+                agent_result=response, source=source, is_internal=internal, event=event,
+            )
+            assert db.get_meta("loop:" + entry.session_id) == before
+        await runner._post_turn_loop_completion(
+            session_entry=entry, source=None, final_response=response, loop_tick=None,
+        )
+        assert db.get_meta("loop:" + entry.session_id) == before
+        # The owning wake still settles, including silent or interrupted replies.
+        event = MessageEvent(
+            text="loop wake", source=source, internal=True,
+            metadata={"gateway_loop_tick": list(tick)},
+        )
+        await runner._run_post_turn_hooks(
+            agent_result=response, source=source, is_internal=True, event=event,
+        )
+        saved = loops.load_loop(entry.session_id)
+        assert saved is not None
+        assert not saved.awaiting_response
+        assert saved.ticks_fired == tick[1]
+        assert saved.status == ("done" if response == "LOOP_COMPLETE" else "active")
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_public_new_retires_goal_and_claim_without_carryover(control_home):
     runner, adapter, source, entry = native_runner(control_home)
     old = entry.session_id

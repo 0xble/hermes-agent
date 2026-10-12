@@ -123,6 +123,8 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
+    tick = (mgr.state.created_at, mgr.state.ticks_fired)
 
     entry = _FakeSessionEntry()
     await GatewayRunner._post_turn_loop_completion(
@@ -204,6 +206,8 @@ async def test_non_streamed_stripped_reply_still_completes_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
+    tick = (mgr.state.created_at, mgr.state.ticks_fired)
 
     event = _make_event("wakeup")
     event._raw_final_response = "CI is done.\nLOOP_COMPLETE"
@@ -227,7 +231,9 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
+    tick = (mgr.state.created_at, mgr.state.ticks_fired)
     assert mgr.is_due() is False
 
     event = _make_event("wakeup")
@@ -256,13 +262,16 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
 
+    event = _make_event("wakeup")
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock()
     await GatewayRunner._run_post_turn_hooks(
         runner,
         agent_result={"final_response": ""},
-        source=_make_event("wakeup").source,
+        source=event.source,
         is_internal=True,
         event=_loop_wake_event(mgr),
     )
@@ -283,12 +292,15 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    event = _make_event("wakeup")
+    assert mgr.state is not None
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
             agent_result={"final_response": "still working"},
-            source=_make_event("wakeup").source,
+            source=event.source,
             is_internal=True,
             event=_loop_wake_event(mgr),
         )

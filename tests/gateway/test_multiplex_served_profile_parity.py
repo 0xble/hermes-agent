@@ -105,6 +105,7 @@ def test_loop_completion_persists_into_the_served_profiles_store(served):
         mgr = LoopManager(session_id=entry.session_id)
         mgr.set("check", interval_seconds=300, route={"platform": "telegram", "chat_id": "1001", "profile": "alpha"})
         assert mgr.fire_tick()
+        assert mgr.state is not None
         # The completed turn's wake carries the tick it ran (see loop_wake_metadata).
         asyncio.run(runner._post_turn_loop_completion(
             session_entry=entry, source=_alpha_source(), final_response="done",

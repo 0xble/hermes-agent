@@ -768,14 +768,19 @@ class GatewayGoalsMixin:
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
-        / --until judge / caps and schedules the next tick for the idle wakeup watcher."""
+        / --until judge / caps and schedules the next tick for the idle wakeup watcher.
+
+        A normal user turn has no loop-tick identity. It must not settle a claimed wakeup merely
+        because the session currently has one awaiting response; only the synthetic event carrying
+        the exact ``gateway_loop_tick`` may do that.
+        """
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
 
         mgr = await self._post_turn_manager(session_entry, "loop completion", "loops", _load)
         state = mgr.state if mgr is not None else None
-        if state is None or not state.awaiting_response:
+        if state is None or not state.awaiting_response or loop_tick is None:
             return
         if loop_tick is None and state.last_fired_at >= getattr(self, "_gateway_started_at", 0.0):
             # This turn ran no loop wake, and the in-flight tick was claimed by this process, so its
