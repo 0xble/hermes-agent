@@ -39,8 +39,7 @@ def _plugin_skill_path(name: str):
     if ":" not in name:
         return None
     try:
-        from hermes_cli.plugins import discover_plugins, get_plugin_manager
-        discover_plugins()  # idempotent
+        from hermes_cli.plugins import get_plugin_manager
         path = get_plugin_manager().find_plugin_skill(name)
     except Exception:
         return None
@@ -76,28 +75,96 @@ def _toolset_names(job: dict[str, Any]) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
 
 
-def _available_tools(names: list[str], cfg: Optional[dict]) -> set[str]:
-    """Resolve the same native and legacy tool names the runtime selects, then apply its denylist."""
-    from model_tools import _select_tool_names
-    from cron.scheduler import _resolve_cron_disabled_toolsets
+_LEGACY_TOOLSET_MAP = {
+    "web_tools": ["web_search", "web_extract"],
+    "terminal_tools": ["terminal"],
+    "vision_tools": ["vision_analyze"],
+    "image_tools": ["image_generate"],
+    "skills_tools": ["skills_list", "skill_view", "skill_manage"],
+    "browser_tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",
+                      "browser_back", "browser_press", "browser_get_images", "browser_vision", "browser_console"],
+    "cronjob_tools": ["cronjob_manage"],
+    "file_tools": ["read_file", "write_file", "patch", "search_files"],
+    "tts_tools": ["text_to_speech"],
+}
 
-    return _select_tool_names(
-        list(names), _resolve_cron_disabled_toolsets(cfg or {}), quiet_mode=True
-    )
+
+def _static_tool_names(names: list[str]) -> set[str]:
+    """Resolve built-in and legacy toolsets without importing runtime/plugin discovery."""
+    from toolsets import TOOLSETS, TOOLSET_SESSION_PLATFORMS
+
+    def resolve(name: str, visited: set[str] | None = None) -> set[str]:
+        visited = set() if visited is None else visited
+        if name in visited:
+            return set()
+        visited.add(name)
+        if name in {"all", "*"}:
+            return {
+                tool
+                for toolset_name in TOOLSETS
+                if toolset_name not in TOOLSET_SESSION_PLATFORMS
+                for tool in resolve(toolset_name, visited.copy())
+            }
+        definition = TOOLSETS.get(name)
+        if not definition:
+            return set()
+        tools = set(definition.get("tools", []))
+        for included in definition.get("includes", []):
+            tools.update(resolve(included, visited.copy()))
+        return tools
+
+    tools: set[str] = set()
+    for name in names:
+        if name in _LEGACY_TOOLSET_MAP:
+            tools.update(_LEGACY_TOOLSET_MAP[name])
+        else:
+            tools.update(resolve(name))
+    return tools
+
+
+def _static_disabled_tool_names(names: list[str]) -> set[str]:
+    """Resolve the scheduler denylist without importing ``model_tools`` or plugin code."""
+    return _static_tool_names(names)
+
+
+def _disabled_toolset_names(cfg: Optional[dict]) -> list[str]:
+    """Mirror cron's static denylist without importing the runtime scheduler."""
+    disabled = ["messaging", "clarify"] if (cfg or {}).get("cron", {}).get("allow_agent_scheduling") else ["cronjob", "messaging", "clarify"]
+    from agent.skill_utils import parse_config_string_list
+    for name in parse_config_string_list((cfg or {}).get("agent", {}).get("disabled_toolsets")):
+        name = str(name).strip()
+        if name and name not in disabled:
+            disabled.append(name)
+    return disabled
+
+
+def _available_tools(names: list[str], cfg: Optional[dict]) -> set[str]:
+    """Resolve built-in and legacy names, then apply the scheduler's denylist statically."""
+    tools = _static_tool_names(names)
+    tools.difference_update(_static_disabled_tool_names(_disabled_toolset_names(cfg)))
+    return tools
 
 
 def _allows_terminal(names: list[str], cfg: Optional[dict]) -> bool:
     return "terminal" in _available_tools(names, cfg)
 
 
+def _configured_enabled_mcp_server_names(cfg: Optional[dict]) -> set[str]:
+    """Read only native MCP declarations; portable plugin discovery is intentionally excluded."""
+    from tools.mcp_tool_common import mcp_server_enabled
+    servers = (cfg or {}).get("mcp_servers") or {}
+    return {
+        str(name) for name, server_cfg in servers.items()
+        if isinstance(server_cfg, dict) and mcp_server_enabled(server_cfg)
+    }
+
+
 def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
     """Relay may be a native toolset or a configured MCP server."""
     if any("relay" in tool.lower() for tool in _available_tools(names, cfg)):
         return True
-    from hermes_cli.tools_config import enabled_mcp_server_names
-    from cron.scheduler import _resolve_cron_disabled_toolsets
-    enabled_mcp = enabled_mcp_server_names(cfg or {})
-    disabled = {name.lower() for name in _resolve_cron_disabled_toolsets(cfg or {})}
+    enabled_mcp = _configured_enabled_mcp_server_names(cfg)
+    disabled = {name.lower() for name in _disabled_toolset_names(cfg)}
     for name in names:
         lowered = name.lower()
         if name in enabled_mcp and "relay" in lowered:
@@ -108,13 +175,14 @@ def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
 
 
 def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
-    """The allowlist the scheduler actually runs with: enabled MCP servers are merged onto a
-    non-empty per-job list (honoring ``no_mcp`` and explicit servers). Reads local config only."""
-    from cron.scheduler import _merge_mcp_into_per_job_toolsets
-    try:
-        return _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
-    except Exception:
-        return [name for name in names if name != "no_mcp"]
+    """Mirror cron's MCP merge using only the native config declarations."""
+    result = [name for name in names if name != "no_mcp"]
+    if "no_mcp" in names:
+        return result
+    enabled_mcp = _configured_enabled_mcp_server_names(cfg)
+    if set(result) & enabled_mcp:
+        return result
+    return result + sorted(enabled_mcp - set(result))
 
 
 def job_tool_requirement_issues(
