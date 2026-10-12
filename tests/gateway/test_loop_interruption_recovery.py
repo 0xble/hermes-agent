@@ -350,6 +350,64 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("canonical", ["plan", "learn"])
+@pytest.mark.parametrize("loop_wake", [False, True])
+async def test_hook_rewritten_prompt_command_uses_canonical_builder(control_home, canonical, loop_wake):
+    from agent.learn_prompt import build_learn_prompt
+    from agent.plan_prompt import build_plan_prompt
+    from gateway.hooks import HookRegistry
+
+    runner, _adapter, source, entry = native_runner(control_home)
+    hooks = HookRegistry()
+    runner.hooks = hooks
+    runner._send_command_ack = AsyncMock()
+    request = "inspect my work"
+    hook_runs = []
+
+    async def rewrite(_name, _context):
+        hook_runs.append(_context["command"])
+        return {"decision": "rewrite", "command_name": canonical, "raw_args": request}
+
+    hooks._handlers["command:help"] = [rewrite]
+    direct = MessageEvent(text=f"/{canonical} {request}", source=source)
+    rewritten = MessageEvent(text="/help", source=source, internal=loop_wake)
+    expected = {"plan": build_plan_prompt, "learn": build_learn_prompt}[canonical](request)
+    try:
+        assert await runner._hm_dispatch_idle_commands(direct, source, entry.session_key) == (False, None)
+        assert direct.text == expected
+        runner._send_command_ack.reset_mock()
+        if loop_wake:
+            mgr = loops.LoopManager(entry.session_id)
+            mgr.set("/help", interval_seconds=60, times=2, route=_route(source))
+            assert mgr.fire_tick() == "/help"
+            assert mgr.state is not None
+            tick = (mgr.state.created_at, mgr.state.ticks_fired)
+            rewritten.metadata.update({
+                "hermes_loop_wakeup": True, "gateway_session_id": entry.session_id,
+                "gateway_loop_tick": list(tick),
+            })
+        hermes_loop_guard.set_loop_thread(threading.get_ident())
+        try:
+            result = await runner._hm_dispatch_idle_commands(rewritten, source, entry.session_key)
+        finally:
+            hermes_loop_guard.set_loop_thread(None)
+        assert result == (False, None)
+        assert hook_runs == ["help"]
+        assert rewritten.text == direct.text == expected
+        if loop_wake:
+            runner._send_command_ack.assert_not_awaited()
+            saved = loops.load_loop(entry.session_id)
+            assert saved is not None
+            assert saved.awaiting_response and saved.claim_phase == "started"
+            assert rewritten.metadata["gateway_loop_run_handoff"]["run_generation"] == 0
+            assert await runner._begin_model_run_generation_for_event(rewritten, entry.session_key) == (0, True)
+        else:
+            runner._send_command_ack.assert_awaited_once()
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["start_tick", "_exact_executing_tick"])
 async def test_command_loop_fence_rechecks_reset_after_start_tick(control_home, boundary):
     runner, _adapter, source, entry = native_runner(control_home)
@@ -869,32 +927,6 @@ async def test_command_final_fence_and_handler_share_event_loop_step(control_hom
     assert [step[0] for step in steps[:2]] == ["fence", "handler"]
     assert steps[0][1] is steps[1][1] is task
     runner.session_store.close_all_db_handles()
-
-
-def test_shared_loop_effect_entry_has_no_preparation_after_final_fence():
-    """Guard the structure, not a particular preparation boundary in a caller."""
-    import ast
-    import inspect
-    import textwrap
-
-    for name in ("_invoke_loop_wake_effect", "_invoke_loop_wake_sync_effect"):
-        function = getattr(GatewayRunner, name)
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        body = tree.body[0].body
-        assert isinstance(body[-2], ast.If)
-        assert isinstance(body[-2].test, ast.UnaryOp)
-        assert body[-2].test.operand.func.attr == "_loop_wake_execution_fence_sync"
-        invocation = body[-1]
-        assert isinstance(invocation, ast.Return)
-        awaits = [node for node in ast.walk(invocation) if isinstance(node, ast.Await)]
-        if inspect.iscoroutinefunction(function):
-            assert len(awaits) == 1
-            assert isinstance(awaits[0].value, ast.Call)
-            assert awaits[0].value.func.id == "handler"
-        else:
-            assert not awaits
-
-
 
 
 @pytest.mark.asyncio

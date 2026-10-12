@@ -870,7 +870,7 @@ class GatewayGoalsMixin:
             )
         )
 
-    async def _invoke_loop_wake_effect(self, event: Any, fence: Optional[tuple], handler, *args, **kwargs):
+    async def _invoke_loop_wake_effect(self, event: Any, handler, *args, **kwargs):
         """Commit the durable start off-loop, then fence and enter the effect without yielding.
 
         SessionDB locks cannot be acquired on the gateway loop thread. The transaction is the
@@ -878,6 +878,7 @@ class GatewayGoalsMixin:
         it see a started tick (never refundable). The final local fence additionally drops a /new,
         /stop, or loop control that wins the executor-return gap.
         """
+        fence = getattr(event, "_gateway_loop_execution_fence", None)
         if fence is not None:
             sid, tick, run_generation, control_generation = fence
             if control_generation is None:
@@ -893,8 +894,9 @@ class GatewayGoalsMixin:
             return False, None
         return True, await handler(*args, **kwargs)
 
-    def _invoke_loop_wake_sync_effect(self, event: Any, fence: Optional[tuple], handler, *args):
+    def _invoke_loop_wake_sync_effect(self, event: Any, handler, *args):
         """Commit and fence a synchronous plugin in the worker that actually invokes it."""
+        fence = getattr(event, "_gateway_loop_execution_fence", None)
         if not self._loop_wake_execution_fence_sync(event, fence):
             return False, None
         if fence is not None:

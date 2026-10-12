@@ -2569,7 +2569,7 @@ class GatewayTurnMixin:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
             started, agent_result = await self._invoke_loop_wake_effect(
-                event, getattr(event, "_gateway_loop_execution_fence", None), self._run_agent,
+                event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
