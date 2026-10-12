@@ -248,6 +248,83 @@ async def test_public_new_retires_goal_and_claim_without_carryover(control_home)
 
 
 @pytest.mark.asyncio
+async def test_due_loop_cannot_answer_live_human_clarification(control_home):
+    from tools import clarify_gateway
+
+    runner, adapter, source, entry = native_runner(control_home)
+    create_loop(entry, source)
+    pending = clarify_gateway.register("loop-owner-question", entry.session_key, "What should I do?", None)
+    owner = asyncio.create_task(asyncio.Event().wait())
+    adapter._active_sessions[entry.session_key] = asyncio.Event()
+    adapter._session_tasks[entry.session_key] = owner
+    runner._running_agents[entry.session_key] = object()
+    adapter.set_message_handler(
+        lambda event: runner._hm_pending_reply_intercepts(event, source, entry.session_key)
+    )
+    try:
+        await scan(runner, entry.session_id)
+        assert not pending.event.is_set(), "a synthetic loop wake answered the human clarification"
+        saved = loops.load_loop(entry.session_id)
+        assert not saved.awaiting_response and saved.ticks_fired == 0
+        assert adapter._session_tasks[entry.session_key] is owner and not owner.done()
+        # A real human answer still reaches the native adapter's inline clarify path.
+        await adapter.handle_message(MessageEvent(text="Use the blue option", source=source))
+        assert clarify_gateway.wait_for_response(pending.clarify_id, 1) == "Use the blue option"
+    finally:
+        clarify_gateway.resolve_gateway_clarify(pending.clarify_id, "cleanup")
+        clarify_gateway.wait_for_response(pending.clarify_id, 1)
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["/learn reusable checking", "/plan disposable work", "/start"])
+async def test_native_loop_command_settles_only_after_its_dispatch_path(control_home, prompt):
+    runner, adapter, source, entry = native_runner(control_home)
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set(prompt, interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    runner._send_command_ack = AsyncMock()  # controlled outbound transport
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(
+        runner._PreparedTurn([], "", "rewritten work", "rewritten work", None, None), {},
+    ))
+    executions = []
+
+    async def model(**kwargs):
+        saved = loops.load_loop(entry.session_id)
+        executions.append((saved.awaiting_response, saved.claim_phase, saved.ticks_fired))
+        raise asyncio.CancelledError  # stop at the real model-entry fence
+
+    runner._run_agent = model
+
+    async def dispatch(event):
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        if handled:
+            return result
+        generation = runner._begin_session_run_generation(entry.session_key)
+        try:
+            return await runner._handle_message_with_agent(event, source, entry.session_key, generation)
+        finally:
+            await runner._run_post_turn_hooks(
+                agent_result="LOOP_COMPLETE", source=source, is_internal=True, event=event,
+            )
+
+    adapter.set_message_handler(dispatch)
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+        assert executions == ([] if prompt == "/start" else [(True, "executing", 1)])
+        saved = loops.load_loop(entry.session_id)
+        assert not saved.awaiting_response and saved.ticks_fired == 1
+        assert saved.status == "active"  # cancellation/silent command schedules the next tick
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_reset_after_admission_does_not_execute_old_tick(control_home):
     runner, adapter, source, entry = native_runner(control_home)
     mgr = create_loop(entry, source)

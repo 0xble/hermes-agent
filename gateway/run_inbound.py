@@ -1376,6 +1376,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _result = await self._run_in_executor_with_context(
                 self._hm_skill_slash_rewrite, event, source, _quick_key, command)
             _handled = _result is not None
+        if _handled:
+            # A slash prefix is not completion: prompt/skill/plugin rewrites fall through
+            # to the model and its own exact-identity loop lifecycle hooks.
+            await self._post_command_loop_completion(event, source)
         if _handled and canonical != "retry":  # /retry returns the re-run agent turn's own reply
             _result = as_command_reply(_result)
         return _handled, _result

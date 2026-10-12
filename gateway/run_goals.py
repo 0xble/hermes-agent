@@ -798,6 +798,28 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
+    async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
+        """Settle only a command dispatch that completed without falling through to model work."""
+        metadata = getattr(event, "metadata", None) or {}
+        raw_tick = metadata.get("gateway_loop_tick")
+        sid = metadata.get("gateway_session_id")
+        if (not getattr(event, "internal", False) or not metadata.get("hermes_loop_wakeup")
+                or not sid or not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2):
+            return
+        current = await self._run_in_executor_with_context(
+            self.session_store.lookup_by_session_key, self._session_key_for_source(source),
+        )
+        if current is None or current.session_id != sid:
+            return
+        from hermes_cli.loops import LoopManager
+
+        tick = tuple(raw_tick)
+        mgr = await self._run_in_executor_with_context(LoopManager, sid)
+        if await self._run_in_executor_with_context(mgr.start_tick, tick):
+            await self._post_turn_loop_completion(
+                session_entry=current, source=source, final_response="", loop_tick=tick,
+            )
+
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
@@ -889,7 +911,9 @@ class GatewayGoalsMixin:
             if outcome:
                 logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
             return
-        if now < state.next_due_at:
+        if now < state.next_due_at or _turn_owner_exists():
+            # The adapter routes pending clarification replies before admission. A wake must
+            # never enter that path as a fabricated human answer while another turn owns it.
             return
         def _due_manager():
             if goal_blocks_loop_tick(sid):
@@ -904,7 +928,7 @@ class GatewayGoalsMixin:
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if check_paused("loop", logger):
+        if check_paused("loop", logger) or _turn_owner_exists():
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
@@ -932,16 +956,17 @@ class GatewayGoalsMixin:
             from hermes_cli.session_controls import loop_wake_metadata
             is_command = wakeup.lstrip().startswith("/")
             event.metadata.update(loop_wake_metadata(sid, mgr.state, command=is_command))
-            # Require the adapter's admission receipt: a refusal without an exception (an
-            # occupied internal slot) must roll the tick back for the next scan, never leave it
-            # claimed with no turn to settle it.
+            # the turn runner durably marks execution immediately before model work. Lightweight
+            # native/plugin doubles without the adapter receipt surface retain the legacy direct path.
             from gateway.wake import admit_internal_event
-            await admit_internal_event(adapter, event)
-            # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook. Persist the execution fence before settling the exact claim. If the
-            # command was suppressed by a control fence, start_tick refuses and the claim remains
-            # unrefunded rather than being replayed.
-            if is_command:
+            if hasattr(adapter, "_message_handler"):
+                await admit_internal_event(adapter, event)
+            else:
+                await adapter.handle_message(event)
+            # Native adapters settle command-only ticks at the handled-command boundary;
+            # rewriting commands retain their claim until the model-turn hooks run. Legacy direct
+            # adapters have no dispatch lifecycle, so settle their command tick inline.
+            if not hasattr(adapter, "_message_handler") and is_command:
                 if not await self._run_in_executor_with_context(mgr.start_tick, tick):
                     raise RuntimeError("slash-command loop claim was superseded before execution")
                 await self._run_in_executor_with_context(
