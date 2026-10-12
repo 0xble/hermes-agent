@@ -172,16 +172,18 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                             old_text=None) -> Optional[str]:
     """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
     stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
-    store instead of merely denied: the fork's own review summary is never published back, so
+    single or inside a batch — require owner opt-in and a durable journal observer. Otherwise
+    the op is staged instead of merely denied: the fork's own review summary is never published back, so
     a plain denial would drop the consolidation request with no surfacing path at all. A
     staging failure fails closed to a plain denial."""
     from tools.skill_provenance import is_unattended_review
 
     if not is_unattended_review():
         return None
-    # Owner opt-in: trust the unattended fork with replace/remove (memory.write_approval still applies).
-    if is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False):
+    # Opt-in alone must not allow deletion when the journal plugin is missing or outdated.
+    from tools.memory_transactions import has_durable_memory_transaction_observer
+    if (is_truthy_value(get_builtin_memory_config().get("background_review_allow_delete"), default=False)
+            and has_durable_memory_transaction_observer()):
         return None
     payload = ({"action": "batch", "target": target, "operations": operations}
                if operations is not None else

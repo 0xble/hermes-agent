@@ -1023,11 +1023,68 @@ class TestBackgroundReviewDeleteGate:
         assert result["success"] is True
         assert "rewritten by refine" in store._entries_for("memory")
 
-    def test_owner_opt_in_applies_unattended_delete(self, store, tmp_path, monkeypatch):
-        # memory.background_review_allow_delete: the owner trusts the unattended fork, so a
-        # consolidation batch applies directly instead of staging for /memory pending.
+    @pytest.mark.parametrize("observer_mode", ["absent", "nondurable", "other_profile"])
+    @pytest.mark.parametrize("operation", ["remove", "replace", "batch"])
+    def test_owner_opt_in_stages_without_current_profile_durable_journal(
+        self, store, tmp_path, monkeypatch, observer_mode, operation
+    ):
+        from contextlib import contextmanager
+        from tools.memory_transactions import register_memory_transaction_observer
+        from tools.write_approval import MEMORY, get_pending
+
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text("memory:\n  background_review_allow_delete: true\n")
+        store.add("memory", "stale fact to remove")
+        path = store._path_for("memory")
+        before = path.read_text()
+        seen = []
+
+        @contextmanager
+        def observe(transaction):
+            seen.append(transaction)
+            yield
+
+        unregister = lambda: None
+        if observer_mode == "nondurable":
+            unregister = register_memory_transaction_observer("test", observe)
+        elif observer_mode == "other_profile":
+            monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other"))
+            unregister = register_memory_transaction_observer("test", observe, durable=True)
+            monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        token = set_current_write_origin("background_review")
+        try:
+            if operation == "batch":
+                raw = memory_tool(operations=[
+                    {"action": "remove", "old_text": "stale fact"},
+                    {"action": "add", "content": "replacement fact"},
+                ], store=store)
+            else:
+                raw = memory_tool(action=operation, old_text="stale fact",
+                                  content="replacement fact", store=store)
+            result = json.loads(raw)
+            assert result.get("staged") is True
+            assert path.read_text() == before
+            pending = get_pending(MEMORY, result["pending_id"])
+            assert pending is not None and pending["origin"] == "background_review"
+            assert seen == []
+        finally:
+            reset_current_write_origin(token)
+            unregister()
+
+    def test_owner_opt_in_applies_unattended_delete(self, store, tmp_path, monkeypatch):
+        # Owner opt-in still requires a durable observer for this profile.
+        from contextlib import contextmanager
+        from tools.memory_transactions import register_memory_transaction_observer
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("memory:\n  background_review_allow_delete: true\n")
+        journal = tmp_path / "journal.json"
+
+        @contextmanager
+        def observe(transaction):
+            journal.write_text(json.dumps({"before": transaction.before, "after": transaction.after}))
+            yield
+
+        unregister = register_memory_transaction_observer("test", observe, durable=True)
         store.add("memory", "stale entry to consolidate")
         token = set_current_write_origin("background_review")
         try:
@@ -1037,6 +1094,10 @@ class TestBackgroundReviewDeleteGate:
             ], store=store))
         finally:
             reset_current_write_origin(token)
+            unregister()
+        assert json.loads(journal.read_text()) == {
+            "before": "stale entry to consolidate", "after": "consolidated entry",
+        }
         assert result["success"] is True
         assert not result.get("staged")
         entries = store._entries_for("memory")

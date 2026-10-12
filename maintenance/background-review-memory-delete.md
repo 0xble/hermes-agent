@@ -7,7 +7,10 @@ section. The patch identity is `background-review-memory-delete`.
 ## Behavior
 
 `memory.background_review_allow_delete: true` lets the unattended background
-review fork apply `replace` and `remove` (single or batched) directly. The
+review fork apply `replace` and `remove` (single or batched) directly **only if a
+durable memory-transaction observer is registered for the current profile**. A
+missing journal plugin, an old plugin without the durability declaration, or an
+observer registered for another profile leaves the operation staged. The
 default (`false` or unset) keeps upstream #105921 behavior: those ops are staged
 for `/memory pending`. `memory.write_approval` still gates every write when on.
 
@@ -24,9 +27,17 @@ Neither supplies a transactional rollback journal.
 
 ## Verification
 
-`scripts/run_tests.sh tests/tools/test_memory_tool.py tests/agent/test_background_review_memory_scope.py`.
+`scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_memory_transactions.py tests/agent/test_background_review_memory_scope.py`.
 `test_owner_opt_in_applies_unattended_delete` writes the flag to a temp
-`config.yaml` and proves a batch applies through the real config loader.
+`config.yaml` and proves a batch applies through the real config loader with a
+durable before/after journal. Regression tests prove absent, non-durable, and
+other-profile observers stage remove/replace/batches without changing memory.
+
+The observer API defaults `durable=False`; a plugin promises durable rollback by
+registering with `durable=True` and must refuse the write if it cannot prepare
+its journal. The agents repo's `memory-journal` plugin makes this declaration.
+Land the Hermes gate first, then the plugin update: the intermediate old plugin
+stages consolidation rather than silently permitting an unjournaled delete.
 
 ## Retirement and rollback
 
