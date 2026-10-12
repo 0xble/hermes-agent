@@ -39,6 +39,11 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
   maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
   behind it); usermerge floor and bounded pages unchanged.
+- Generation stamping checkpoints only until its `application_id` is visible in the main DB file.
+  A reader can block the first PASSIVE checkpoint and leave both the header and `state_meta` row
+  WAL-only; later warm opens retry until the header is durable. The lock-safe header probe avoids
+  cancelling process-wide SQLite locks. Fully checkpointed warm opens still skip the checkpoint
+  (#494), and its deleted-sidecar descriptor rechecks remain unchanged.
 - Each write's replaced/WAL-generation probe (stat of state.db and its sidecars, header pread)
   first runs lock-free; only a doubtful result runs the authoritative probe under `self._lock`
   (#105567's close race stays inside). 11:52: the lock holder sat in a kernel-stalled stat().
@@ -70,6 +75,9 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
 `test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
 in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
+`tests/hermes_state/test_generation_checkpoint_durability.py` (real reader-blocked first checkpoint;
+main-file-only snapshot proves header and row durability after a warm open),
+`test_warm_writable_open_skips_generation_checkpoint` in `tests/hermes_state/test_hermes_state.py`,
 `tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, and
 `test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 
