@@ -112,6 +112,50 @@ def test_redirected_resources_never_lose_the_live_writer_veto(scope, mode):
     assert lock.exists() and debris.exists()
 
 
+@pytest.mark.parametrize("source", ["argv", "argv-joined", "inherited"])
+def test_updater_custody_config_does_not_hide_an_unrelated_repository(scope, source):
+    # Every updater Git carries these flags; a concurrent update of another
+    # checkout must not veto recovery here, or dead transfers' packs pile up.
+    table, ours, other = scope
+    flags = ("gc.autoDetach=false", "maintenance.auto=false", "core.fsmonitor=false", "credential.helper=",
+             f"core.hooksPath={os.devnull}")
+    argv, env = ("git", "fetch", "origin"), ()
+    if source == "argv":
+        argv = ("git", *[x for flag in flags for x in ("-c", flag)], "fetch", "origin")
+    elif source == "argv-joined":
+        argv = ("git", *[f"-c{flag}" for flag in flags], "fetch", "origin")
+    else:
+        argv = ("git-index-pack", "--stdin")
+        env = ("GIT_CONFIG_PARAMETERS='gc.autodetach'='false' 'maintenance.auto'='false' 'credential.helper'=''",)
+    _process(table, 123, other, argv=argv, env=env)
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == [str(debris)]
+
+
+@pytest.mark.parametrize("source", ["argv", "inherited"])
+def test_updater_custody_config_on_the_target_repository_still_vetoes(scope, source):
+    table, ours, _ = scope
+    argv, env = ("git", "-c", "gc.autoDetach=false", "fetch"), ()
+    if source == "inherited":
+        argv, env = ("git", "fetch"), ("GIT_CONFIG_PARAMETERS='maintenance.auto'='false'",)
+    _process(table, 123, ours, argv=argv, env=env)
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert debris.exists()
+
+
+@pytest.mark.parametrize("env", [
+    "GIT_CONFIG_PARAMETERS='gc.autodetach'='false' 'core.worktree'='/elsewhere'",
+    "GIT_CONFIG_PARAMETERS='unterminated",
+])
+def test_inherited_config_beyond_custody_keeps_the_veto(scope, env):
+    table, ours, other = scope
+    _process(table, 123, other, argv=("git", "fetch"), env=(env,))
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert debris.exists()
+
+
 @pytest.mark.parametrize("store", ["objects", "objects/pack"])
 def test_shared_symlinked_object_store_keeps_live_debris(scope, store):
     table, ours, other = scope
@@ -165,6 +209,19 @@ def test_unreadable_git_ownership_keeps_resources(scope):
     table, ours, other = scope
     proc = _process(table, 123, other)
     (proc / "environ").unlink()
+    lock = _aged(ours / ".git" / "index.lock")
+    assert gitlock.clear_stale_git_locks(ours) == []
+    assert lock.exists()
+
+
+def test_symlink_loop_in_git_metadata_never_raises(scope):
+    # Python 3.11's non-strict resolve() raises RuntimeError on a loop; the
+    # sweep's contract is to veto or proceed, never to propagate.
+    table, ours, _ = scope
+    loop = ours / ".git" / "loop"
+    loop.symlink_to(loop)
+    (ours / ".git" / "commondir").write_text("loop\n")
+    _process(table, 123, ours)
     lock = _aged(ours / ".git" / "index.lock")
     assert gitlock.clear_stale_git_locks(ours) == []
     assert lock.exists()
