@@ -50,9 +50,14 @@ authorization settles the obligation without delivery.
     or an older build is reclaimed after `RETRY_CLAIM_TTL_S` and settles quietly.
   - A `result_undeliverable` action first classifies its parent with the shared
     async-completion target classifier. A live, idle-ended, or live
-    compression-continued parent settles quietly. An unavailable session DB or
-    in-flight rotation stays owed with capped backoff. Only a missing parent or a
-    user-boundary end (`/new`, user exit, session switch) is gone. Then the line is
+    compression-continued parent settles quietly. A compressed parent whose
+    continuation has since ended is classified by that continuation's own end
+    reason, the same way: idle settles quietly, a user boundary is gone. Only this
+    report path does so; completion delivery keeps retrying an ended continuation,
+    because it cannot inject into one. An unavailable session DB, a missing
+    continuation, a compression-ended continuation, or an in-flight rotation stays
+    owed with capped backoff. Only a missing parent or a user-boundary end (`/new`,
+    user exit, session switch) of the parent or its ended continuation is gone. Then the line is
     sent straight to the user with `_deliver_platform_notice` and never passes
     through the model. Only an affirmative adapter delivery receipt settles it as
     `reported`; failed, missing, or privacy-skipped sends remain owed with 5m-to-60m

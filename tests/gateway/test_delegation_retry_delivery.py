@@ -337,6 +337,73 @@ async def test_undeliverable_result_with_routable_parent_uses_real_classifier_qu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tip_end", [
+    "new_session", "user_exit", "session_switch", "idle",
+    "compression", "missing_tip", "rotation", "db_unavailable",
+])
+async def test_undeliverable_result_after_compressed_parent_settles_or_retries(monkeypatch, tip_end):
+    """An ended continuation is not necessarily an in-flight compression rotation."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(dr.time, "time", lambda: 1_800_000_100.0)
+    did = "deleg_compressed_terminal"
+    _undeliverable_row(did)
+    (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    sessions = {
+        "parent-1": {"ended_at": 1.0, "end_reason": "compression"},
+        "tip-1": {"ended_at": 2.0, "end_reason": tip_end},
+    }
+    if tip_end == "missing_tip":
+        sessions.pop("tip-1")
+    runner = _runner()
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=lambda sid: sessions.get(sid)),
+        get_compression_tip=AsyncMock(
+            return_value="parent-1" if tip_end == "rotation" else "tip-1",
+            side_effect=RuntimeError("DB unavailable") if tip_end == "db_unavailable" else None),
+    )
+    runner._classify_completion_target = GatewayRunner._classify_completion_target.__get__(runner)
+    await runner._deliver_delegation_retry_action(action)
+    sends = runner._deliver_platform_notice.await_count
+    record = dr.retry_status(did)
+    again = dr.sweep_retries(now=1_800_100_000.0)
+    print(f"{tip_end}: sends={sends}, retry_state={record['retry_state']}, reowed={bool(again)}")
+    uncertain = tip_end in {"compression", "missing_tip", "rotation", "db_unavailable"}
+    assert sends == (1 if tip_end in {"new_session", "user_exit", "session_switch"} else 0)
+    runner._inject_watch_notification.assert_not_awaited()
+    if uncertain:
+        assert record["retry_state"] == "terminal"
+        assert len(again) == 1 and again[0]["kind"] == "terminal"
+    else:
+        assert record["retry_state"] == "reported"
+        assert again == []
+    if sends:
+        assert runner._deliver_platform_notice.await_args.args[1] == (
+            "Background task finished: make the model — its result could not be delivered.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tip_end", ["new_session", "user_exit", "session_switch", "idle"])
+async def test_async_completion_with_ended_compression_tip_still_waits_for_live_tip(tip_end):
+    """Terminal-report policy must not falsely acknowledge an ordinary completion."""
+    from types import SimpleNamespace
+
+    runner = _runner()
+    sessions = {"parent-1": {"ended_at": 1.0, "end_reason": "compression"},
+                "tip-1": {"ended_at": 2.0, "end_reason": tip_end}}
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=lambda sid: sessions.get(sid)),
+        get_compression_tip=AsyncMock(return_value="tip-1"))
+    runner._classify_completion_target = GatewayRunner._classify_completion_target.__get__(runner)
+    runner._completion_delivery_ready = GatewayRunner._completion_delivery_ready.__get__(runner)
+    claim = await runner._preflight_completion_delivery({
+        "type": "async_delegation", "delegation_id": "deleg_waiting", "parent_session_id": "parent-1"})
+    assert claim.proceed is False and claim.early_result is False
+    assert claim.claim_id == ""
+    runner._deliver_platform_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("private", [False, True])
 async def test_terminal_notice_is_interim_and_never_seals_an_open_stream(private):
     """A stream-is-the-message adapter seals the first unmarked send; the out-of-band terminal line must be interim."""

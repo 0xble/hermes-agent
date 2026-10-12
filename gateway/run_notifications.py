@@ -1979,11 +1979,15 @@ class GatewayNotificationsMixin:
                 self._completion_deliveries_inflight.add(identity)
             return seen
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(self, parent_session_id: str, *, settle_ended_tip: bool = False) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
         session live or compression-rotated with a live continuation; the resolver still retargets),
         ``"terminal"`` (parent gone for good — unknown / user boundary like /new; drop the durable row
-        rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim)."""
+        rather than falsely ack), ``"retry"`` (DB unavailable / rotation mid-flight; release the claim).
+
+        ``settle_ended_tip`` classifies an ENDED compression continuation by its own end reason, like
+        an uncompressed parent. Only terminal reports may use it: completion injection cannot follow an
+        ended tip, so for deliveries that state stays ``"retry"`` rather than a falsely acked drop."""
         from gateway.run import _USER_BOUNDARY_END_REASONS
         session_db = await asyncio.to_thread(lambda: getattr(self, "_session_db", None))
         if session_db is None:
@@ -2011,9 +2015,13 @@ class GatewayNotificationsMixin:
         except Exception:
             logger.debug("Async-completion pre-flight tip lookup failed for %s", parent_session_id, exc_info=True)
             return "retry"
-        if tip is None or tip.get("ended_at"):
+        if tip is None or not tip.get("ended_at"):
+            return "retry" if tip is None else "deliver"
+        tip_end_reason = str(tip.get("end_reason") or "")
+        if not settle_ended_tip or tip_end_reason == "compression":
+            # A compression-ended tip means the next continuation is not visible yet.
             return "retry"
-        return "deliver"
+        return "terminal" if tip_end_reason in _USER_BOUNDARY_END_REASONS else "deliver"
 
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
@@ -2676,7 +2684,8 @@ class GatewayNotificationsMixin:
                     await asyncio.to_thread(dr.mark_terminal_reported, delegation_id, claim)
                     return
                 # A completed result is user-visible only when no parent conversation can receive it.
-                verdict = await self._classify_completion_target(parent_session_id) if parent_session_id else "terminal"
+                verdict = (await self._classify_completion_target(parent_session_id, settle_ended_tip=True)
+                           if parent_session_id else "terminal")
                 if verdict != "terminal":
                     settle = dr.mark_terminal_reported if verdict == "deliver" else dr.release_terminal_report
                     await asyncio.to_thread(settle, delegation_id, claim)
