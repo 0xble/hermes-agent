@@ -37,6 +37,15 @@ _FOOTNOTE_REF = r"\[\^[^\]\s]+\]"
 _ADJACENT_REF_RE = re.compile(rf"{_FOOTNOTE_REF}(?={_FOOTNOTE_REF}(?!:))")
 _FOOTNOTE_DEF_RE = re.compile(rf"^{_FOOTNOTE_REF}:")
 _MATH_DELIMITERS = (("$$", "$$"), ("\\[", "\\]"), ("\\(", "\\)"))
+# Closed single-dollar math, as the adapter's currency guard (``_RICH_CURRENCY_PROTECTED_RE``) keeps
+# it: ``$5 and refs ... $6`` is currency, not math, so references between the amounts stay prose.
+_INLINE_DOLLAR_MATH_RE = re.compile(
+    r"(?<![\\$])\$(?![\s$])"
+    r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+[A-Za-z]{2,}\b)"
+    r"[^$\n]*?(?<![\s([{,:;])\$(?![\w$])"
+)
+# Inline HTML whose content Telegram shows literally; formatting tags such as <b> still wrap prose.
+_LITERAL_HTML_RE = re.compile(r"<(code|kbd|samp|pre)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 _REFS_KEY = "telegram_adjacent_footnote_ends"
 _LITERAL_BLOCKS = frozenset({"fence", "code_block", "html_block"})
 _LIST_OPENS = frozenset({"bullet_list_open", "ordered_list_open"})
@@ -55,7 +64,22 @@ def _math_rule(state, silent: bool) -> bool:
                 state.push("text", "", 0).content = state.src[state.pos:close + len(closer)]
             state.pos = close + len(closer)
             return True
-    return False
+    return _literal_span(state, silent, _INLINE_DOLLAR_MATH_RE)
+
+
+def _literal_html_rule(state, silent: bool) -> bool:
+    """Consume a literal inline HTML container (``<code>…</code>``) whole."""
+    return _literal_span(state, silent, _LITERAL_HTML_RE)
+
+
+def _literal_span(state, silent: bool, pattern: "re.Pattern[str]") -> bool:
+    match = pattern.match(state.src, state.pos)
+    if not match or match.end() > state.posMax:
+        return False
+    if not silent:
+        state.push("text", "", 0).content = match.group(0)
+    state.pos = match.end()
+    return True
 
 
 def _adjacent_ref_rule(state, silent: bool) -> bool:
@@ -78,6 +102,7 @@ def _adjacent_ref_rule(state, silent: bool) -> bool:
 
 _PARSER = MarkdownIt("commonmark")
 _PARSER.inline.ruler.before("escape", "telegram_math", _math_rule)
+_PARSER.inline.ruler.before("html_inline", "telegram_literal_html", _literal_html_rule)
 _PARSER.inline.ruler.before("link", "telegram_adjacent_footnote", _adjacent_ref_rule)
 
 
