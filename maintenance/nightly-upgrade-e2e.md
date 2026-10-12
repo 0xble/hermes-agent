@@ -40,7 +40,13 @@ branch qualifier share a recovery veto: a host-wide `pgrep -x git` also sees
 unrelated E2E installs and smart-HTTP transfers. The PM checkout identity does
 not own this Git sweep. Linux recovery now binds observed process ownership to
 repository metadata (including shared worktree metadata); inaccessible or
-redirected ownership still vetoes deletion. Non-Linux probes are unchanged.
+redirected ownership still vetoes deletion. The updater's custody configuration
+(disabled detached maintenance, fsmonitor, credential helpers and hooks) does
+not redirect Git resource ownership. Recognize those exact key/value pairs in
+argv and inherited `GIT_CONFIG_PARAMETERS`, then compare repositories normally.
+Any other configuration remains a conservative veto. A live owner of the target
+repository still blocks cleanup, and unresolvable symlink loops veto rather than
+raise. Non-Linux probes are unchanged.
 The live-writer veto, age floors and exact debris prefixes must survive any
 adoption or refactor. Guard surfaces are
 `tests/hermes_cli/test_gitlock_process_scope.py`, `test_gitlock.py`,
