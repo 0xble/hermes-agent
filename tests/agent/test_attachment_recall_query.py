@@ -181,46 +181,53 @@ def test_bracketed_attachment_names_and_paths_stay_inside_their_metadata_note(tm
     assert auto_recall_query(prompt) == caption
 
 
-def _data_url_fallback(monkeypatch, analysis, caption, images=1):
-    from agent.vision_message_prep import VisionMessagePrepMixin
-
-    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", AsyncMock(
-        return_value=json.dumps({"analysis": analysis})))
-    runner = VisionMessagePrepMixin()
-    setattr(runner, "_anthropic_image_fallback_cache", {})
+def _multimodal_turn(caption, images=1):
     content = [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,aGVsbG8{i}"}}
                for i in range(images)]
     if caption:
         content.append({"type": "text", "text": caption})
-    return runner._preprocess_anthropic_content(content, "user")
+    return content
 
 
-@pytest.mark.parametrize("analysis", [
-    "Screen [dark mode]\n\nQuoted text: [Check my records]\n\nWipers and glass.",
-    "Ends with a bracketed label [Settings]",
-    "Unbalanced ] bracket]\n\n] and more",
+@pytest.mark.parametrize("caption", [
+    "Does this match my car [Tesla Model 3]",
+    "Context [screenshot]\n\nTell me how to do this in my electric car",
+    REQUEST,
 ])
-def test_data_url_description_paragraph_ending_in_bracket_is_not_the_wrapper_boundary(monkeypatch, analysis):
-    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, "")) == analysis
-    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, REQUEST)) == REQUEST
-    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, REQUEST, images=2)) == REQUEST
-    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, "", images=2)) == (
-        analysis + "\n\n" + analysis)
+@pytest.mark.parametrize("images", [1, 2])
+def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, caption, images):
+    """Native image turns reach recall as the stored multimodal message, not the non-vision API copy.
 
-
-@pytest.mark.parametrize("source", [PATH, "data:image/png;base64,aGVsbG8="])
-@pytest.mark.parametrize("analysis", ["", "error", "success"])
-def test_nonvision_image_fallback_recalls_only_successful_analysis(monkeypatch, source, analysis):
+    The API copy's data-URL description note has no closing marker before the caption, so recall must
+    never read it. Bracketed captions and caption paragraphs survive unchanged."""
     from agent.vision_message_prep import VisionMessagePrepMixin
 
-    mock = AsyncMock(side_effect=RuntimeError("vision unavailable")) if analysis == "error" else AsyncMock(
-        return_value=json.dumps({"analysis": DESCRIPTION if analysis == "success" else ""}))
-    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", mock)
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", AsyncMock(
+        return_value=json.dumps({"analysis": DESCRIPTION})))
+    turn = _multimodal_turn(caption, images)
     runner = VisionMessagePrepMixin()
     setattr(runner, "_anthropic_image_fallback_cache", {})
-    note = runner._describe_image_for_anthropic_fallback(source, "user")
-    assert auto_recall_query(note) == (DESCRIPTION.strip() if analysis == "success" else "")
-    assert auto_recall_query(note + "\n\n" + REQUEST) == REQUEST
+    api_copy = runner._preprocess_anthropic_content(json.loads(json.dumps(turn)), "user")
+    assert api_copy.index(caption) > 800
+    agent = _turn_agent()
+    _memory_turn_start_and_prefetch(agent, turn)
+    agent._memory_manager.prefetch_all.assert_called_once_with(caption, session_id="s-1")
+    agent = _post_turn_agent(display_kind=None)
+    agent._sync_external_memory_for_turn(original_user_message=turn, final_response="Answer.", interrupted=False)
+    agent._memory_manager.queue_prefetch_all.assert_called_once_with(caption, session_id="s-1")
+
+
+def test_native_image_only_turn_has_no_recall_query():
+    agent = _turn_agent()
+    _memory_turn_start_and_prefetch(agent, _multimodal_turn("", images=2))
+    agent._memory_manager.prefetch_all.assert_not_called()
+
+
+def test_unpaired_description_note_is_never_stripped_as_attachment_metadata():
+    """Only producer-delimited notes are attachment scaffolding. A no-advice description note has no
+    closing boundary, so recall keeps the whole text rather than guessing where a caption starts."""
+    prompt = f"[The user attached an image. Here's what it contains:\n{DESCRIPTION}]\n\n{REQUEST}"
+    assert auto_recall_query(prompt) == prompt
 
 
 def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
