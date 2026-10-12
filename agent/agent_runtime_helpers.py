@@ -31,6 +31,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
+from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.message_metadata import MERGED_TURN_PREFIX
 from agent.turn_context import drop_stale_api_content
@@ -1425,31 +1426,6 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
         return False
 
 
-def _adopt_shared_primary_cooldown(agent) -> bool:
-    """Start a fresh agent on the configured fallback when another process armed the primary route."""
-    if not getattr(agent, "_fallback_chain", None):
-        return False  # nothing to adopt onto; skip the state-file lock on every turn
-    try:
-        from agent.shared_primary_cooldown import get_cooldown, is_active, route_from_agent
-        record = get_cooldown(route_from_agent(agent))
-        if not is_active(record):
-            # Keep an expired record as a recovery probe: the first successful primary request
-            # clears it atomically and owns the sole recovery notice. None drops a record that
-            # was cleared elsewhere (another process recovered, or `hermes fallback cooldowns clear`).
-            agent._shared_primary_cooldown_record = record
-            return False
-        from agent.error_classifier import FailoverReason
-        try:
-            reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
-        except ValueError:
-            reason = FailoverReason.rate_limit
-        from agent.chat_completion_helpers import try_activate_fallback
-        return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
-    except Exception:
-        logger.debug("Shared primary cooldown adoption failed; using normal runtime", exc_info=True)
-        return False
-
-
 def _refresh_from_shared_cooldown(agent) -> str:
     """Sync an agent already on a provider fallback with the shared primary record.
 
@@ -1500,6 +1476,8 @@ def restore_primary_runtime(agent) -> bool:
     shared_state = "unavailable"
     if getattr(agent, "_provider_fallback_active", False):  # not `/model --once`
         shared_state = _refresh_from_shared_cooldown(agent)
+        if shared_state == "unavailable":
+            return False  # no verified reset/clear: stay on fallback even without a cached deadline
     cleared_elsewhere = held_shared_record and shared_state == "absent"
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()

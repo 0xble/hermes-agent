@@ -24,7 +24,13 @@ An agent already on a provider fallback re-reads the shared record at every turn
 start. While the record is active, the agent stays on the fallback and its in-memory
 deadline follows the record, so a longer window that another process re-armed wins.
 Restore only proceeds once the shared window has passed or the record is gone, and
-restore never rewrites the record.
+restore never rewrites the record. Unreadable or malformed state files are not cleared
+outages: fresh agents with a fallback chain use that chain without re-arming state or
+inventing a record, and cached provider-fallback agents stay on fallback even after their
+local deadline passes. Existing cached records and deadlines are preserved. If no
+configured fallback can bind, turn-start adoption refuses the turn rather than probing
+the primary. A successful read of absent or expired state releases this hold; agents
+without a fallback chain retain the existing state-file skip.
 
 Overload (`FailoverReason.overloaded`: HTTP 529 or 503 unless the body reads as context
 overflow, any 5xx or 400 whose body names a local memory ceiling, a 429 with overload
@@ -76,7 +82,8 @@ and clears it with one recovery notice.
 
 - `agent/shared_primary_cooldown.py`: file-locked, atomic per-`HERMES_HOME` state.
 - `agent/fallback_cooldown.py`: writer and shared backoff escalation.
-- `agent/agent_runtime_helpers.py`: fresh-agent adoption, the turn-start shared-record refresh for
+- `agent/shared_primary_cooldown_runtime.py`: fresh-agent adoption, including unavailable-state fallback.
+- `agent/agent_runtime_helpers.py`: the turn-start shared-record refresh for
   agents already on a fallback, and turn-start gating.
 - `agent/chat_completion_helpers.py` and `agent/chat_completion_nonstream.py`: notice claim and recovery clear.
 - `hermes_cli/fallback_cmd.py`, `hermes_cli/subcommands/fallback.py`: `status` and `cooldowns [clear]`.

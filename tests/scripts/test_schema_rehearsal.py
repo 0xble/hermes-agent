@@ -144,6 +144,33 @@ def test_candidate_open_refuses_nonfresh_scratch_home(rehearsal, tmp_path, monke
     assert copy.read_bytes() == b"disposable copy"
 
 
+@pytest.mark.parametrize("location", ["equal", "nested", "symlink_nested"])
+def test_candidate_open_refuses_scratch_inside_live_home(rehearsal, tmp_path, monkeypatch, location):
+    live = tmp_path / "live-profile"
+    live.mkdir()
+    copy = tmp_path / "copy.db"
+    copy.write_bytes(b"disposable copy")
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
+    home = live if location == "equal" else live / "scratch"
+    if location == "symlink_nested":
+        alias = tmp_path / "profile-alias"
+        alias.symlink_to(live, target_is_directory=True)
+        home = alias / "scratch"
+    spawned = []
+
+    def spawn(*args, **kwargs):
+        spawned.append(args)
+        return type("Result", (), {"returncode": 0, "stdout": '{"opened": true}', "stderr": ""})()
+
+    monkeypatch.setattr(rehearsal.subprocess, "run", spawn)
+    with pytest.raises(SystemExit, match="fresh scratch"):
+        rehearsal.open_with_candidate(copy, home, "python")
+    assert not spawned
+    assert not (live / "scratch").exists()
+    assert copy.read_bytes() == b"disposable copy"
+
+
 def test_candidate_open_uses_fresh_home_and_real_candidate(rehearsal, v2_copy, tmp_path, monkeypatch):
     import sys
     monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
