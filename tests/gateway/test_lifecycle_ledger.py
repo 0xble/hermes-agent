@@ -62,29 +62,6 @@ def _exit_diag_records(home: Path) -> list[dict]:
     ]
 
 
-@pytest.fixture(autouse=True)
-def integrity_workers(monkeypatch):
-    """Join real checker threads before assertions or fixture teardown."""
-    import agent.memory_provider as provider
-
-    workers = []
-    spawn = provider.spawn_context_thread
-
-    def track(*args, **kwargs):
-        worker = spawn(*args, **kwargs)
-        workers.append(worker)
-        return worker
-
-    def wait():
-        for worker in workers:
-            worker.join(timeout=5)
-            assert not worker.is_alive(), "integrity checker did not finish"
-
-    monkeypatch.setattr(provider, "spawn_context_thread", track)
-    yield wait
-    wait()
-
-
 # ---------------------------------------------------------------------------
 # sample_memory
 # ---------------------------------------------------------------------------
@@ -143,7 +120,7 @@ def test_running_sentinel_from_dead_pid_is_unclean(tmp_path: Path) -> None:
     assert evidence["prior_started_at"] == "2026-07-11T04:30:00+00:00"
 
 
-def test_record_startup_persists_unclean_report_and_reclaims(tmp_path: Path, integrity_workers) -> None:
+def test_record_startup_persists_unclean_report_and_reclaims(tmp_path: Path) -> None:
     _write_sentinel(tmp_path, {
         "phase": "running",
         "pid": _DEAD_PID,
@@ -154,7 +131,6 @@ def test_record_startup_persists_unclean_report_and_reclaims(tmp_path: Path, int
     evidence = record_startup(home=tmp_path)
     assert evidence is not None
 
-    integrity_workers()
     records = _exit_diag_records(tmp_path)
     assert len(records) == 1
     assert records[0]["tag"] == "gateway.previous_unclean_exit"
