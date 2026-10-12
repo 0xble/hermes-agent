@@ -5506,12 +5506,13 @@ class BasePlatformAdapter(ABC):
             headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
             if headroom < 1:
                 headroom = max(1, max_length // 2)
-            # Remainder fits in one final chunk; close a reopened fence if still open.
-            if _len(prefix) + _len(remaining) + _len(FENCE_CLOSE) <= max_length - INDICATOR_RESERVE:
-                final_chunk = prefix + remaining
-                if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
-                    final_chunk += FENCE_CLOSE
-                chunks.append(final_chunk)
+            # Remainder fits in one final chunk; reserve a close only for a reopened fence
+            # that remains open at the end of the remainder.
+            final_close = ""
+            if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
+                final_close = FENCE_CLOSE
+            if _len(prefix) + _len(remaining) + _len(final_close) <= max_length - INDICATOR_RESERVE:
+                chunks.append(prefix + remaining + final_close)
                 break
             # Natural split (newline, then space); a custom _len budget maps to a codepoint offset.
             _cp_limit = (

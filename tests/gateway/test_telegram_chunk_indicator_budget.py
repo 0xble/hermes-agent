@@ -75,3 +75,26 @@ def test_splitter_budgets_actual_indicators_at_arbitrary_limits(limit, count, fe
             body = body.removeprefix("```\n").removesuffix("\n```")
         bodies.append(body)
     assert "".join(bodies) == character * count
+
+
+def test_plain_text_does_not_reserve_a_fence_that_is_not_needed():
+    content = "x" * 8155
+    chunks = BasePlatformAdapter.truncate_message(content, 4096, len_fn=utf16_len)
+
+    assert len(chunks) == 2
+    assert "".join(re.sub(r" \(\d+/\d+\)$", "", chunk) for chunk in chunks) == content
+    for chunk in chunks:
+        assert utf16_len(chunk) + 2 <= 4096
+
+
+def test_final_open_fence_is_closed_within_the_utf16_budget():
+    content = "```python\n" + "x" * 185
+    chunks = BasePlatformAdapter.truncate_message(content, 64, len_fn=utf16_len)
+
+    assert len(chunks) == 5
+    for index, chunk in enumerate(chunks, 1):
+        body = re.sub(r" \(\d+/\d+\)$", "", chunk)
+        assert body.startswith("```python\n")
+        assert body.endswith("\n```")
+        assert body.count("```") == 2
+        assert utf16_len(chunk) + 2 <= 64
