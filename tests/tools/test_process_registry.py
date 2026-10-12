@@ -113,7 +113,6 @@ def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
     directory.mkdir(parents=True)
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
     monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 64)
-    monkeypatch.setattr(receipts, "MAX_RETAINED_CUT_RESULTS", 256)
 
     cut = directory / "proc_cut_old.json"
     cut.write_text(json.dumps({"id": cut.stem, "completion_reason": "cut_pending"}), encoding="utf-8")
@@ -128,6 +127,12 @@ def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
 
     assert cut in retained
     assert len(retained) == 65
+    # Finalizing a pre-kill receipt must not return it to the normal 64-result budget.
+    cut.write_text(json.dumps({
+        "id": cut.stem, "completion_reason": "killed", "termination_source": "gateway_shutdown",
+    }), encoding="utf-8")
+    os.utime(cut, (now - 60, now - 60))
+    assert cut in receipts._result_paths()
 
 
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
