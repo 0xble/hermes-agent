@@ -190,6 +190,22 @@ def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypat
     assert "terminal access" in capsys.readouterr().out
 
 
+def test_cron_doctor_expands_environment_config(tmp_path, monkeypatch, capsys):
+    from cron.jobs import create_job
+    from hermes_cli.cron import cron_doctor
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("REVIEW_DISABLED_TS", "terminal")
+    create_job(
+        prompt="Add with `loops finding add`", name="env-disabled-terminal",
+        schedule="every 1h", enabled_toolsets=["terminal"], deliver="local",
+    )
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {"agent": {"disabled_toolsets": ["${REVIEW_DISABLED_TS}"]}})
+    assert cron_doctor() == 1
+    assert "terminal access" in capsys.readouterr().out
+
+
 def test_cron_doctor_handles_null_config_sections(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
@@ -236,3 +252,15 @@ def test_capability_diagnostics_do_not_discover_plugins(monkeypatch):
     monkeypatch.setattr(plugins, "discover_plugins", lambda: (_ for _ in ()).throw(AssertionError("discovery")))
     job = {"enabled_toolsets": ["terminal"], "prompt": "Add with `loops finding add`."}
     assert job_tool_requirement_issues(job, cfg={}) == []
+
+
+def test_absolute_attached_skill_identifier_is_normalized(tmp_path, monkeypatch):
+    from cron import tool_requirements
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    skill_dir = tmp_path / "skills" / "audit"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Run `loops finding add --text result`.\n")
+    job = {"enabled_toolsets": ["file"], "skills": [str(skill_dir)]}
+    issues = tool_requirements.job_tool_requirement_issues(job, cfg={})
+    assert len(issues) == 1 and "terminal" in issues[0]

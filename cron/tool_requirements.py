@@ -48,7 +48,9 @@ def _plugin_skill_path(name: str):
 
 def _attached_skill_content(name: str) -> str:
     """Read raw attached instructions; doctor must not run skill preprocessing/setup."""
+    from agent.skill_utils import normalize_skill_lookup_name
     from tools.skills_tool import _locate_skill, _skill_lookup_path_error, _skill_search_dirs
+    name = normalize_skill_lookup_name(name)
     if _skill_lookup_path_error(name):
         return ""
     path = _plugin_skill_path(name)
