@@ -34,15 +34,30 @@ _RELAY_REQUIREMENT_PATTERNS = (
 )
 
 
+def _plugin_skill_path(name: str):
+    """Registered ``plugin:skill`` path, resolved the way ``skill_view`` does (without serving it)."""
+    if ":" not in name:
+        return None
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        discover_plugins()  # idempotent
+        path = get_plugin_manager().find_plugin_skill(name)
+    except Exception:
+        return None
+    return path if path is not None and path.exists() else None
+
+
 def _attached_skill_content(name: str) -> str:
     """Read raw attached instructions; doctor must not run skill preprocessing/setup."""
     from tools.skills_tool import _locate_skill, _skill_lookup_path_error, _skill_search_dirs
     if _skill_lookup_path_error(name):
         return ""
-    roots, _ = _skill_search_dirs()
-    error, _, path = _locate_skill(name, name.replace(":", "/") if ":" in name else None, roots)
-    if error or path is None:
-        return ""
+    path = _plugin_skill_path(name)
+    if path is None:
+        roots, _ = _skill_search_dirs()
+        error, _, path = _locate_skill(name, name.replace(":", "/") if ":" in name else None, roots)
+        if error or path is None:
+            return ""
     try:
         return path.read_text(encoding="utf-8-sig")
     except OSError:
@@ -76,18 +91,37 @@ def _allows_relay(names: list[str]) -> bool:
     return any(any("relay" in tool.lower() for tool in resolve_toolset(name)) for name in names)
 
 
+def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
+    """The allowlist the scheduler actually runs with: enabled MCP servers are merged onto a
+    non-empty per-job list (honoring ``no_mcp`` and explicit servers). Reads local config only."""
+    from cron.scheduler import _merge_mcp_into_per_job_toolsets
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+    try:
+        return _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
+    except Exception:
+        return [name for name in names if name != "no_mcp"]
+
+
 def job_tool_requirement_issues(
     job: dict[str, Any], *, skill_loader: Callable[[str], str] = _attached_skill_content,
+    cfg: Optional[dict] = None,
 ) -> list[str]:
     """Return warnings for a restricted job whose prompt/skills need unavailable tools.
 
     An absent allowlist means the platform default and is deliberately ignored. A
-    non-empty allowlist is checked fail-closed; malformed values produce no warning
-    here because the job-store normalizer owns that validation.
+    non-empty allowlist is checked fail-closed against its effective runtime value;
+    malformed values produce no warning here because the job-store normalizer owns
+    that validation.
     """
-    names = _toolset_names(job)
-    if not names or job.get("no_agent"):
+    stored = _toolset_names(job)
+    if not stored or job.get("no_agent"):
         return []
+    names = _effective_toolsets(stored, cfg)
 
     texts = [("prompt", str(job.get("prompt") or ""))]
     skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
@@ -103,11 +137,11 @@ def job_tool_requirement_issues(
     shell_reason = _first_requirement(combined, _SHELL_REQUIREMENT_PATTERNS)
     if shell_reason and not _allows_terminal(names):
         issues.append(
-            f"prompt requires {shell_reason}, but enabled_toolsets {names!r} do not include terminal access"
+            f"prompt requires {shell_reason}, but enabled_toolsets {stored!r} do not include terminal access"
         )
     relay_reason = _first_requirement(combined, _RELAY_REQUIREMENT_PATTERNS)
     if relay_reason and not (_allows_terminal(names) or _allows_relay(names)):
         issues.append(
-            f"prompt requires {relay_reason}, but enabled_toolsets {names!r} do not include terminal or a relay toolset"
+            f"prompt requires {relay_reason}, but enabled_toolsets {stored!r} (effective: {names!r}) do not include terminal or a relay toolset"
         )
     return issues

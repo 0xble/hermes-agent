@@ -96,3 +96,48 @@ def test_attached_skill_text_is_checked():
         skill_loader=lambda _name: "Use Pick the Destination when no owner is live.",
     )
     assert any("relay" in issue for issue in issues)
+
+
+_RELAY_MCP_CFG = {"mcp_servers": {"relay": {"command": "relay", "args": ["mcp"]}}}
+
+
+def test_enabled_relay_mcp_server_satisfies_relay_step_like_the_scheduler():
+    from cron.scheduler import _resolve_cron_enabled_toolsets
+    job = {"enabled_toolsets": ["file"], "prompt": "If needed, use Pick the Destination."}
+    assert "relay" in _resolve_cron_enabled_toolsets(job, _RELAY_MCP_CFG)
+    assert job_tool_requirement_issues(job, cfg=_RELAY_MCP_CFG) == []
+
+
+def test_no_mcp_sentinel_keeps_relay_step_flagged():
+    job = {"enabled_toolsets": ["file", "no_mcp"], "prompt": "If needed, use Pick the Destination."}
+    issues = job_tool_requirement_issues(job, cfg=_RELAY_MCP_CFG)
+    assert len(issues) == 1 and "relay" in issues[0]
+
+
+def test_explicit_other_mcp_server_does_not_merge_relay():
+    cfg = {"mcp_servers": {**_RELAY_MCP_CFG["mcp_servers"], "github": {"command": "gh-mcp"}}}
+    job = {"enabled_toolsets": ["file", "github"], "prompt": "If needed, use Pick the Destination."}
+    assert job_tool_requirement_issues(job, cfg=cfg)
+
+
+def test_relay_mcp_server_does_not_satisfy_shell_step():
+    job = {"enabled_toolsets": ["file"], "prompt": "Add it with `loops finding add --job x`."}
+    issues = job_tool_requirement_issues(job, cfg=_RELAY_MCP_CFG)
+    assert len(issues) == 1 and "terminal access" in issues[0]
+
+
+def test_registered_plugin_skill_is_read_from_its_plugin_path(tmp_path, monkeypatch):
+    from cron import tool_requirements
+    skill = tmp_path / "SKILL.md"
+    skill.write_text("---\nname: ship\n---\nRun `custom-check --json`.\n")
+
+    class _PM:
+        def find_plugin_skill(self, name):
+            return skill if name == "acme:ship" else None
+
+    import hermes_cli.plugins as plugins
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **k: None)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: _PM())
+    assert "custom-check" in tool_requirements._attached_skill_content("acme:ship")
+    issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["acme:ship"]}, cfg={})
+    assert len(issues) == 1 and "terminal" in issues[0]
