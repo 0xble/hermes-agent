@@ -1,7 +1,7 @@
 """Gateway-owned recovery: a folded human ask gets one fresh execution, not an agent-loop nudge."""
 from __future__ import annotations
 
-import time
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -69,7 +69,24 @@ def harness(monkeypatch, tmp_path):
     assert runner._session_key_for_source(source) == SESSION_KEY
     event = MessageEvent(text=RELAY_TEXT, source=source, message_id="relay-1", reply_expected=False)
     state.turn.event = event
-    calls, consumers = [], []
+    calls, consumers, preview_ticks = [], [], []
+    tick_done = threading.Event()
+    delta_pending = threading.Event()
+    fire_delta = agent._fire_stream_delta
+
+    def fire_and_tick(text):
+        # Hold the provider worker until the real consumer has considered this delta.
+        # Force the edit timer due, rather than hoping a wall-clock sleep hits a tick.
+        if not consumers or not consumers[-1]._run_still_current():
+            fire_delta(text)
+            return
+        tick_done.clear()
+        consumers[-1]._last_edit_time = 0.0
+        fire_delta(text)
+        delta_pending.set()
+        assert tick_done.wait(5.0), "stream consumer did not process the delta"
+
+    monkeypatch.setattr(agent, "_fire_stream_delta", fire_and_tick)
 
     def resolve(turn_runner, route, platform_key, ephemeral, *args):
         ctx = turn_runner._ctx
@@ -90,14 +107,26 @@ def harness(monkeypatch, tmp_path):
         if getattr(adapter, "_silence_test_transport", None) == "draft":
             consumer.cfg.transport = "draft"
         consumers.append(consumer)
+        should_edit = consumer._should_edit
+
+        def observe_tick(tick):
+            result = should_edit(tick)
+            if delta_pending.is_set() and consumer._queue.empty():
+                preview_ticks.append((consumer._accumulated, result))
+                delta_pending.clear()
+                tick_done.set()
+            return result
+
+        consumer._should_edit = observe_tick
         return consumer
 
     monkeypatch.setattr(stream_mod, "GatewayStreamConsumer", capture_consumer)
     return SimpleNamespace(agent=agent, runner=runner, adapter=adapter, event=event,
-                           state=state, calls=calls, consumers=consumers)
+                           state=state, calls=calls, consumers=consumers, preview_ticks=preview_ticks)
 
 
-async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, first_tool=True):
+async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, first_tool=True,
+               fragmented=False):
     stages = iter(finals)
     first = True
 
@@ -124,16 +153,27 @@ async def _run(h, finals, *, typed=True, preamble=False, display_kind=None, firs
             response = _mock_response(content=stage, finish_reason="stop") if isinstance(stage, str) else stage
         if callable(getattr(h, "model_hook", None)):
             h.model_hook(response)
-        content = response.choices[0].message.content
-        if content and h.agent.stream_delta_callback:
-            h.agent._fire_stream_delta(content)
-            time.sleep(0.08)  # allow a real preview tick before authoritative finish()
-        return response
+        if not kwargs.get("stream"):
+            return response
+        # Return an actual provider iterator. Previously this stub emitted deltas
+        # AND returned a completed object to the streaming parser; its fallback
+        # replayed the content, making NO_REPLYNO_REPLY an ordinary visible segment.
+        message = response.choices[0].message
+        tools = [SimpleNamespace(index=i, id=tool.id, function=tool.function)
+                 for i, tool in enumerate(message.tool_calls or [])] or None
+        parts = [message.content]
+        if fragmented and message.content == "NO_REPLY":
+            parts = ["NO_", "REPLY"]
+        chunks = [SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=part, tool_calls=tools if i == 0 else None),
+            finish_reason=None)]) for i, part in enumerate(parts)]
+        chunks.append(SimpleNamespace(choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason=response.choices[0].finish_reason)]))
+        return iter(chunks)
 
     h.agent.client.chat.completions.create.side_effect = model
-    # Replace the provider boundary, not its client below the streaming parser: the fake returns
-    # a completed response after emitting deltas exactly once, as the real boundary does.
-    h.agent._interruptible_api_call = h.agent.client.chat.completions.create
+    h.agent._interruptible_api_call = lambda kw: h.agent.client.chat.completions.create(**kw)
     return await h.runner._run_agent(message=h.event.text, context_prompt="", history=[],
         source=h.event.source, session_id="silence-test", session_key=SESSION_KEY,
         run_generation=1, reply_expected=h.event.reply_expected,
@@ -413,7 +453,33 @@ async def test_direct_human_text_retry_has_no_original_tool_execution(harness):
     assert h.agent.client.chat.completions.create.call_count == 2
     assert not any(row.get("role") == "tool" for row in result["messages"])
     assert result["final_response"] == ANSWER
+    assert h.preview_ticks == [("NO_REPLY", False), (ANSWER, True)]
     assert all("NO_REPLY" not in text for text in _payloads(h)), _payloads(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["edit", "native", "draft"])
+@pytest.mark.parametrize("first_tool", [False, True])
+@pytest.mark.parametrize("retry_marker", [False, True])
+async def test_fragmented_marker_is_held_at_each_due_preview_tick(
+    harness, monkeypatch, transport, first_tool, retry_marker,
+):
+    h = harness
+    if not first_tool:
+        h.event = MessageEvent(text=TYPED_TEXT, source=h.event.source, message_id="human-1")
+        h.state.turn.event = h.event
+    if transport != "edit":
+        _cumulative_adapter(h, transport, monkeypatch)
+    result = await _run(h, ["NO_REPLY", "NO_REPLY" if retry_marker else ANSWER],
+                        typed=first_tool, first_tool=first_tool, fragmented=True)
+    assert len(h.calls) == 2
+    assert result["final_response"] == ("NO_REPLY" if retry_marker else ANSWER)
+    marker_ticks = [(text.strip(), edit) for text, edit in h.preview_ticks if text.strip().startswith("NO_")]
+    assert marker_ticks == [("NO_", False), ("NO_REPLY", False)] * (2 if retry_marker else 1)
+    assert all("NO_" not in text for text in _payloads(h)), _payloads(h)
+    assert (await _shape(h, result))[:2] == (
+        _unexpected_silence_reply() if retry_marker else ANSWER, False,
+    )
 
 
 @pytest.mark.asyncio
