@@ -2836,3 +2836,20 @@ class TestOwnerSubjectRecall:
         p._do_recall("when is my birthday")
         p._client.arecall.assert_not_called()
         assert p._client.areflect.call_args.kwargs["query"] == "when is my birthday"
+
+
+    def test_one_failed_request_keeps_the_other_results(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+
+        async def _arecall(**kwargs):
+            if kwargs["query"].endswith("(Brian Le)"):
+                raise RuntimeError("owner request failed")
+            return SimpleNamespace(results=[SimpleNamespace(id="g1", text="Original memory")])
+
+        p._client.arecall = AsyncMock(side_effect=_arecall)
+        assert p._do_recall("where do we live") == ("- Original memory", 1)
+
+    def test_owner_name_inside_another_word_still_adds_the_owner_query(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Ann")
+        assert p._owner_subject_query("when is my anniversary") == "when is my anniversary (Ann)"
+        assert p._owner_subject_query("what did ann say to me") is None

@@ -1130,7 +1130,8 @@ class HindsightMemoryProvider(MemoryProvider):
         never replaces them (see ``_recall_with_owner_subject``).
         """
         owner = self._recall_owner_subject
-        if not owner or owner.lower() in query.lower() or not _FIRST_PERSON.search(query):
+        if (not owner or not _FIRST_PERSON.search(query)
+                or re.search(rf"(?<!\w){re.escape(owner)}(?!\w)", query, re.IGNORECASE)):
             return None
         return f"{query} ({owner})"
 
@@ -1152,9 +1153,14 @@ class HindsightMemoryProvider(MemoryProvider):
             return kw
 
         async def _both(client):
-            return await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)))
+            return await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)),
+                                        return_exceptions=True)
 
-        original, owner = (resp.results or [] for resp in self._run_hindsight_operation(_both))
+        responses = self._run_hindsight_operation(_both)
+        if all(isinstance(resp, BaseException) for resp in responses):
+            raise responses[0]
+        # The twin only supplements: one failed request must not discard the other's results.
+        original, owner = ([] if isinstance(resp, BaseException) else resp.results or [] for resp in responses)
         merged, seen, used = [], set(), 0
         for pair in itertools.zip_longest(original, owner):
             for result in pair:
