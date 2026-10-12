@@ -58,6 +58,14 @@ strategy and cron-exclusion behavior.
   formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- A generated-only turn also excludes its assistant reply from automatic transcript retention.
+  Filtering only the user half creates an orphan assistant result that can turn test, relay or
+  recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
+  result-wording rules. Preserve assistant context when a real human suffix survives, and do not
+  drop ordinary assistant-only or recalled-context-only turns without generated provenance.
+  Proof: `tests/plugins/memory/test_hindsight_generated_turns.py` and the existing provider suite.
+  Retire when the selected upstream provider applies the same whole-turn exclusion. Revert only
+  that patch to restore user-side-only filtering.
 - Template boundary rule: when a template's closing paragraph appears more than once, the LAST
   copy is the generated boundary. Every template is tried and the FURTHEST boundary wins, because
   templates share openings and a payload can hold a complete sibling template (a goal quoting a
@@ -111,7 +119,8 @@ strategy and cron-exclusion behavior.
 
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
   `hindsight-cron-retention`, `hindsight-bundled-provider`,
-  `memory-note-not-authoritative`, `synthetic-prompt-memory-gate`. Local narrow patches
+  `memory-note-not-authoritative`, `synthetic-prompt-memory-gate`,
+  `hindsight-generated-turn-retention`. Local narrow patches
   on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
