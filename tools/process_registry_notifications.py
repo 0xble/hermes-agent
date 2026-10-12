@@ -231,10 +231,11 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
     """Fixed parent-facing continuation block for gateway-cut work."""
     if not evt.get("cut_reason"):
         return []
-    unfinished = [str((r.get("task_index", i) + 1)) for i, r in enumerate(results)
-                  if r.get("status") not in _DONE]
-    if not unfinished:
-        unfinished = ["1"]
+    goals = evt.get("goals") or []
+    indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
+    recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
+    unfinished = [str(index + 1) for index in indexes
+                  if recorded.get(index, {}).get("status") not in _DONE]
     when = evt.get("completed_at") or time.time()
     stamp = time.strftime("%H:%M", time.localtime(when))
     return [

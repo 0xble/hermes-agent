@@ -91,3 +91,36 @@ def test_unclaimed_child_marker_does_not_authorize_replacement():
                                   context=f"RECOVERY OF INTERRUPTED DELEGATION {did}.\nRECOVERY CHILD INDEX: 0",
                                   session_key="telegram:dm:1", parent_session_id="owner",
                                   origin_session_id="owner", dispatched_at=time.time()))
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_unresumed_cut_has_explicit_contract_then_expires_and_prunes(batch, monkeypatch):
+    did, event, now = cut_row(batch=batch)
+    ad._attach_retry_note(event)
+    assert "action='resume'" in event["retry_note"]
+    assert "retry automatically" not in event["retry_note"]
+    claim = ad.claim_event_delivery(event, "test")
+    assert ad.complete_completion_delivery(did, claim)
+    assert dr.sweep_retries(now=now + 301) == []
+    assert dr.sweep_retries(now=now + dr.MAX_LINEAGE_AGE_S + 1) == []
+    expired = dr.retry_status(did)
+    assert expired["retry_state"] == "reported"
+    assert "24h" in expired["retry_reason"]
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET updated_at=? WHERE delegation_id=?",
+                     (now - ad._DURABLE_RETENTION_SECONDS - 1, did))
+    ad._prune_durable_records()
+    assert dr.retry_status(did) is None
+
+
+def test_unspent_cut_claim_rearms_quietly_for_explicit_resume():
+    did, event, now = cut_row()
+    dr.schedule_retry(did, now=now)
+    delivery = ad.claim_event_delivery(event, "test")
+    assert ad.complete_completion_delivery(did, delivery)
+    first, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    assert dr.sweep_retries(now=first["retry_claimed_at"] + dr.NOTICE_GRACE_S + 1) == []
+    again, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    assert [task["goal"] for task in again["recovery_tasks"]] == ["second", "third"]

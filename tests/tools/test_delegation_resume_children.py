@@ -100,3 +100,79 @@ def test_batch_resume_preserves_recorded_child_evidence():
         conn.execute("UPDATE async_delegations SET retry_state='none' WHERE delegation_id=?", (did,))
     payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
     assert "/tmp/second.txt" in payload["tasks"][0]["context"]
+
+
+def _scheduled_batch(did="deleg_retry_release"):
+    did = _batch_row(did)
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_reason='timeout', "
+                     "retry_due_at=?, retry_root=?, retry_root_started_at=?, delivery_state='delivered' "
+                     "WHERE delegation_id=?", (now,did,now,did))
+    return did
+
+
+def _persist_child(did, task):
+    ad._persist_dispatch(dict(delegation_id=did, goal=task["goal"], context=task["context"],
+                             role="leaf", session_key="telegram:dm:1", parent_session_id="sess-owner",
+                             origin_session_id="sess-owner", dispatched_at=time.time()))
+
+
+def test_batch_failed_persist_releases_child_claims_then_resume(monkeypatch):
+    did = _scheduled_batch()
+    payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert payload["status"] == "retry_claimed"
+    persist = ad._persist_dispatch
+    ran = []
+    with monkeypatch.context() as m:
+        m.setattr(ad, "_persist_dispatch", lambda record: (_ for _ in ()).throw(OSError("persist failed")))
+        task = payload["tasks"][0]
+        result = ad.dispatch_async_delegation(
+            goal=task["goal"], context=task["context"], role="leaf", model="m", toolsets=None,
+            session_key="telegram:dm:1", parent_session_id="sess-owner",
+            runner=lambda: ran.append(True), max_async_children=1,
+        )
+    assert result["status"] == "rejected"
+    assert result["no_inline_fallback"] is True
+    assert not ran
+    assert ad._persist_dispatch == persist
+    retry = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert retry["status"] == "retry_claimed"
+    assert [task["goal"] for task in retry["tasks"]] == ["second", "third"]
+    for i, task in enumerate(retry["tasks"]):
+        _persist_child(f"deleg_released_child_{i}", task)
+    assert dr.retry_status(did)["retry_state"] == "dispatched"
+
+
+def test_unspawned_batch_claim_rearms_after_grace_notice():
+    did = _scheduled_batch("deleg_grace_batch")
+    first, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    now = first["retry_claimed_at"] + dr.NOTICE_GRACE_S + 1
+    actions = dr.sweep_retries(now=now)
+    assert len(actions) == 1 and actions[0]["kind"] == "notice"
+    assert dr.mark_notice_accepted(did, actions[0]["claim"], now=now)
+    again, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    assert [task["goal"] for task in again["recovery_tasks"]] == ["second", "third"]
+
+
+def test_release_preserves_consumed_child_and_stale_release_cannot_clear_new_claim():
+    did = _scheduled_batch("deleg_partial_release")
+    first, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    _persist_child("deleg_consumed_second", first["recovery_tasks"][0])
+    assert dr.release_retry_dispatch(first)
+    again, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    assert [task["goal"] for task in again["recovery_tasks"]] == ["third"]
+    assert not dr.release_retry_dispatch(first)
+    _persist_child("deleg_only_third", again["recovery_tasks"][0])
+    assert dr.retry_status(did)["retry_state"] == "dispatched"
+    with pytest.raises(dr.RetryAdmissionError, match="consumed|superseded"):
+        _persist_child("deleg_duplicate_second", first["recovery_tasks"][0])
+
+
+def test_retry_notice_tells_fanout_parent_to_use_tasks_list():
+    did = _scheduled_batch("deleg_notice_tasks")
+    assert "delegate_task(tasks=<returned tasks list>)" in dr.build_retry_notice(dr.retry_status(did))

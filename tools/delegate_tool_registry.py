@@ -432,9 +432,10 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
         "recovery_context": build_recovery_instruction(record),
         "note": (
             "This claim is one-shot and already spent — no second recovery brief will be issued for "
-            "this delegation. Nothing has been spawned. To act on it, call delegate_task normally "
-            "with the original goal and pass 'recovery_context' verbatim as the task's context. The "
-            "replacement subagent must verify current workspace and external state before doing any "
+            "this delegation. Nothing has been spawned. If 'tasks' is present, call "
+            "delegate_task(tasks=<returned tasks list>), preserving each child's context verbatim. "
+            "Otherwise call delegate_task with the original goal and pass 'recovery_context' verbatim "
+            "as the task's context. The replacement subagent must verify current workspace and external state before doing any "
             "new work: the interrupted run may have completed side effects it never reported."
         ),
     }, ensure_ascii=False)

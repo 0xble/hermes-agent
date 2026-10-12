@@ -415,6 +415,9 @@ def _prune_durable_records() -> None:
                 conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETRY_OWED_SQL}",
                              evict)
                 _log_pruned_ids("pending-cap", evict)
+        conn.execute("DELETE FROM async_delegation_child_recovery WHERE NOT EXISTS "
+                     "(SELECT 1 FROM async_delegations a WHERE a.delegation_id="
+                     "async_delegation_child_recovery.delegation_id)")
         conn.execute(
             """DELETE FROM async_delegation_events
                WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?""",
@@ -455,7 +458,8 @@ def _attach_retry_note(evt: Dict[str, Any]) -> None:
             record = retry_status(delegation_id)
             if record and record["retry_state"] in {"scheduled", "terminal"}:
                 plan = {"retry_state": record["retry_state"], "reason": record["retry_reason"],
-                        "due_at": record["retry_due_at"], "attempt": record["retry_attempt"] + 1}
+                        "due_at": record["retry_due_at"], "attempt": record["retry_attempt"] + 1,
+                        "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
     except Exception:  # the retry sweep classifies later if the ledger is unavailable
@@ -2075,6 +2079,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     if is_batch:
         payload = {
             "is_batch": True, "results": result.get("results") or [],
+            **({"task_indexes": list(record["task_indexes"])} if record.get("task_indexes") is not None else {}),
             "live_transcripts": result.get("live_transcripts"), "error": result.get("error"),
             "total_duration_seconds": result.get("total_duration_seconds"),
             **({"group": result["group"]} if result.get("group") is not None else {})}

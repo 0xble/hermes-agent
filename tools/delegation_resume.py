@@ -8,11 +8,10 @@ Scope (deliberately narrow — see ``maintenance/delegation-restart.md`` slice 2
   parent model acts on with a normal, fully-authorized ``delegate_task`` spawn.
   Everything a resumed run does is therefore visible in the parent's own
   transcript and subject to every existing spawn gate (pause, depth, capacity).
-* Eligibility is intentionally minimal: a SINGLE-task delegation whose owner
-  stopped without a trustworthy terminal result, that carries a routable origin,
-  and that has no partial per-child results to reconcile. Batches, units with
-  recorded partial results and stateless origins are refused with a truthful
-  reason instead of guessed at.
+* A single-goal delegation keeps the existing scalar recovery path, even when
+  it has background batch-format metadata. Real fan-outs use durable per-child
+  claims: only unfinished, unconsumed children may be replaced, and recorded
+  successes are never rerun. Stateless origins are refused rather than guessed at.
 * The claim is DURABLE and ONE-SHOT (``resume_state``/``resume_attempts`` on the
   row). A restart loop, a double-delivered completion, or two consumers racing
   after a restart can produce at most one recovery brief per delegation.
@@ -110,7 +109,9 @@ def _batch_recovery_candidates(record: Dict[str, Any]) -> List[Dict[str, Any]]:
     task = record.get("task") or {}
     goals = list(task.get("goals") or [])
     indexes = task.get("task_indexes") or list(range(len(goals)))
-    if not task.get("is_batch") and len(indexes) <= 1:
+    # All background dispatches use batch formatting, even for one goal.
+    # Only real fan-outs use child claims; preserve scalar retry admission.
+    if len(goals) <= 1:
         return []
     result = record.get("result") or {}
     recorded = {entry.get("task_index"): entry for entry in result.get("results") or []
@@ -768,6 +769,7 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
     if verdict == RETRY_NONE:
         return None
     return {"delegation_id": delegation_id, "retry_state": verdict, "reason": reason, "due_at": due,
+            "cut_reason": record["event"].get("cut_reason"),
             "attempt": record["retry_attempt"] + (1 if verdict == RETRY_SCHEDULED else 0)}
 
 
@@ -836,13 +838,33 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
                                WHERE e.delegation_id=async_delegations.delegation_id
                                  AND e.delivery_state='pending')
                AND NOT (COALESCE(json_extract(event_json, '$.cut_reason'), '') != ''
-                        AND (delivery_state='delivered' OR retry_notices > 0))
-               ORDER BY updated_at ASC LIMIT ?""", (now, now - NOTICE_GRACE_S, now, stale, limit)).fetchall()
+                        AND (delivery_state='delivered' OR retry_notices > 0)
+                        AND retry_state IN ('scheduled','notified')
+                        AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+               ORDER BY updated_at ASC LIMIT ?""",
+            (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
         for row in rows:
             record = _retry_record(row)
+            dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
             if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
                 _expire_retry(conn, record, now)
             state = record["retry_state"]
+            if record["event"].get("cut_reason") and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0):
+                # The cut completion/accepted continuation notice owns the one
+                # parent wake. Recovery is explicit, not an automatic rerun.
+                if state == RETRY_TERMINAL:
+                    conn.execute("UPDATE async_delegations SET retry_state='reported', retry_claim=NULL, "
+                                 "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
+                                 (now, record["delegation_id"]))
+                elif state == RETRY_DISPATCHING:
+                    conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
+                                 "retry_claimed_at=NULL, retry_due_at=?, updated_at=? WHERE delegation_id=? "
+                                 "AND retry_state='dispatching' AND retry_claim=?",
+                                 (record["retry_root_started_at"] + MAX_LINEAGE_AGE_S, now,
+                                  record["delegation_id"], dispatch_claim))
+                if dispatch_claim is not None:
+                    _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                continue
             if state == RETRY_NOTICING:  # crashed mid-injection: same notice again
                 state, record["retry_state"] = RETRY_SCHEDULED, RETRY_NOTICING
             if state == RETRY_REPORTING:
@@ -861,6 +883,8 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
             else:
                 claim = _claim(conn, record, record["retry_state"], RETRY_NOTICING, now)
                 if claim:
+                    if dispatch_claim is not None:
+                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
                     actions.append(_action(record, "notice", claim))
     return actions
 
@@ -943,11 +967,17 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
             return record, reason
         task = record.get("task") or {}
         candidates = _batch_recovery_candidates(record)
-        if task.get("is_batch") or task.get("task_indexes") or _goal_count(task) > 1:
+        if _goal_count(task) > 1:
             if not candidates:
                 return record, INELIGIBLE_PARTIAL
-            if conn.execute("SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? LIMIT 1",
-                            (delegation_id,)).fetchone():
+            existing = dict(conn.execute(
+                "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
+                "WHERE delegation_id=?", (delegation_id,)))
+            # Consumed claims are permanent evidence, not a barrier to claiming
+            # the remaining children after a partial persist/release.
+            if any(child["task_index"] in existing and not existing[child["task_index"]] for child in candidates):
+                return record, INELIGIBLE_CLAIMED
+            if all(existing.get(child["task_index"]) for child in candidates):
                 return record, INELIGIBLE_CLAIMED
         claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
         if claim is None:
@@ -975,14 +1005,31 @@ def is_recovery_spawn(record: Dict[str, Any]) -> bool:
     return bool(m and m.group(1) != record.get("delegation_id"))
 
 
+def _release_unspent_batch_children(conn, delegation_id: str, claim: str) -> None:
+    """Re-arm only unspent children owned by this exact row claim.
+
+    Consumed children remain durable one-shot evidence, even if a sibling failed
+    to persist. Call only inside the guarded row transition's transaction.
+    """
+    conn.execute("DELETE FROM async_delegation_child_recovery WHERE delegation_id=? "
+                 "AND claim=? AND replacement_delegation_id IS NULL", (delegation_id, claim))
+
+
 def release_retry_dispatch(record: Dict[str, Any]) -> bool:
-    """Return a claimed retry to the scheduler after replacement persistence fails."""
+    """Return a failed persist and its unspent child claims to the scheduler atomically."""
+    ad = _ad()
     now = time.time()
     due = now + _backoff(int(record.get("retry_attempt") or 0))
-    return _settle(
-        record["delegation_id"], record.get("retry_claim", ""), RETRY_DISPATCHING,
-        "retry_state='scheduled', retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=?", (due,)
-    )
+    did, claim = record["delegation_id"], record.get("retry_claim", "")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        changed = conn.execute(
+            "UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
+            "retry_claimed_at=NULL, retry_due_at=?, updated_at=? "
+            "WHERE delegation_id=? AND retry_state='dispatching' AND retry_claim=?",
+            (due, now, did, claim)).rowcount
+        if changed:
+            _release_unspent_batch_children(conn, did, claim)
+        return changed == 1
 
 
 def _replacement_source(conn, new: Dict[str, Any], task_text: str) -> Optional[Dict[str, Any]]:
@@ -1004,7 +1051,7 @@ def _replacement_children(conn, prior: Dict[str, Any], new: Dict[str, Any]) -> O
     dropping the child marker. Every named index must be claimed and unspent.
     """
     task = prior.get("task") or {}
-    if not (task.get("task_indexes") or _goal_count(task) > 1 or conn.execute(
+    if not (_goal_count(task) > 1 or conn.execute(
             "SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? LIMIT 1",
             (prior["delegation_id"],)).fetchone()):
         return None
@@ -1137,6 +1184,11 @@ def retry_note(plan: Optional[Dict[str, Any]]) -> str:
     """One line for the completion notice so the parent does not dispatch a duplicate (R5)."""
     if not plan:
         return ""
+    if plan["retry_state"] == RETRY_SCHEDULED and plan.get("cut_reason"):
+        return (f"Work was cut before finishing. To continue call delegate_task(action='resume', "
+                f"subagent_id='{plan['delegation_id']}') and use its state-verification brief. "
+                "Do not rerun completed children. This recovery window expires after the 24h lineage budget; "
+                "Hermes will not automatically rerun this cut work or send another continuation notice.")
     if plan["retry_state"] == RETRY_SCHEDULED:
         return (f"Hermes will retry this automatically at {_when(plan['due_at'])} (retry {plan['attempt']}/"
                 f"{MAX_RETRY_ATTEMPTS}, {plan['reason']}); you will get a notice then. Do not re-dispatch it yourself.")
@@ -1148,13 +1200,15 @@ def build_retry_notice(record: Dict[str, Any]) -> str:
     did = record["delegation_id"]
     attempt = record["retry_attempt"] + 1
     reprompt = record["retry_notices"] >= 1
+    spawn = ("then call delegate_task(tasks=<returned tasks list>), preserving each child's context verbatim. "
+             "Do not rerun completed children. " if _goal_count(record.get("task") or {}) > 1 else
+             "then call delegate_task with the returned goal and pass 'recovery_context' verbatim as context. ")
     return (
         f"[IMPORTANT: AUTOMATIC RETRY DUE — {did}] "
         + ("REMINDER: the previous retry notice was not acted on. " if reprompt else "")
         + f"A background delegation stopped ({record['retry_reason']}) and Hermes scheduled retry "
         f"{attempt}/{MAX_RETRY_ATTEMPTS}. Do it now: call delegate_task(action='resume', subagent_id='{did}'), "
-        "then call delegate_task with the returned goal and pass 'recovery_context' verbatim as context. "
-        "If it is no longer wanted, say so to the user. "
+        + spawn + "If it is no longer wanted, say so to the user. "
         + ("If you do not dispatch it, Hermes will stop retrying it." if reprompt else
            "Replying NO_REPLY without dispatching does not cancel the retry; you will be asked once more.")
         + f"]\n{PROCESS_NOTIFICATION_END}"
