@@ -409,7 +409,13 @@ class StreamFallbackMixin:
         prefix = self._accumulated[:self._segment_start] if self._cumulative_transport() else ""
         if prefix:
             self._accumulated = self._stream_ledger = prefix
-            await self._send_or_edit(prefix, finalize=True, is_turn_final=False)
+            if self._native_stream_opened:
+                # This is a transport close, not delivery of the rejected turn-final. Native
+                # segment flushes deliberately do not finalize, so use the boundary owner.
+                await self._finalize_boundary_stream("Silence-marker")
+                self._close_native_state()
+            else:
+                await self._send_or_edit(prefix, finalize=True, is_turn_final=False)
             self._clear_turn_final_flags()
             return
         # A native-stream bubble isn't a deletable message — close an open one

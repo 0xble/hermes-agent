@@ -1,6 +1,6 @@
 # Gateway human-turn silence re-prompt
 
-This unit owns one gateway-level recovery execution when a human-addressed turn ends on a bare silence marker.
+This unit owns one gateway-level recovery execution when a locally executed human-addressed turn ends on a bare silence marker.
 
 ## Preserve
 
@@ -9,7 +9,8 @@ This unit owns one gateway-level recovery execution when a human-addressed turn 
 - The retry's own result is terminal: tools, stop gates, compression, or another folded message cannot renew its budget. A second bare marker reaches the unchanged human-turn visible fallback. A separate queued or subsequent genuine human turn gets its own retry.
 - Recovery guidance uses the existing API-only ephemeral system prompt, not an assistant/user nudge pair. The continuation's empty runtime row carries `internal_notification` provenance; it cannot replace the latest genuine user ask, session title, or inbound delivery anchor. The note is absent from live/result message history, SQLite content and sidecars, trajectories, compression input, and subsequent queued turns. No agent transcript scaffolding or compressor-specific flags belong to this patch.
 - A queued terminal turn owns its own silence verdict; absent a genuine successor, the original human verdict and inbound ID must survive the internal retry. Never allow the retry's internal display kind to legalize a second marker.
-- Fresh execution means a fresh stream consumer. Bare-marker segment previews must be held back on edit, native, and stream-is-the-message draft transports. Cumulative adapters keep earlier tool preambles while removing only the rejected final segment; neither the first marker nor its retry may appear in sent, edited, or native/draft frame payloads.
+- Fresh execution means a fresh stream consumer. Bare-marker segment previews must be held back on edit, native, and stream-is-the-message draft transports. Cumulative adapters keep earlier tool preambles while removing only the rejected final segment; neither the first marker nor its retry may appear in sent, edited, or native/draft frame payloads. Close an open native stream with the retained preamble through the existing boundary finalizer before recovery starts, without claiming turn-final delivery.
+- Proxy turns do not get this retry; the existing human-turn warning remains. The API requires non-empty final conversation content and cannot represent an empty internal continuation: a system-only/empty-row request returns 400, while omitting the empty row makes the preceding assistant marker new user input. Do not change API-server validation or invent a persisted user nudge to work around that contract.
 
 ## Provenance and patches
 

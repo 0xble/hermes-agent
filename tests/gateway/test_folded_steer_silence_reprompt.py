@@ -200,6 +200,65 @@ async def test_folded_human_gets_one_gateway_retry(harness, marker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+async def test_proxy_silence_keeps_fallback_without_retry(harness, monkeypatch, marker):
+    """Real proxy route needs a new non-empty conversation row; a system note is not one."""
+    from unittest.mock import AsyncMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    h = harness
+    api = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    monkeypatch.setattr(api, "_ensure_session_db", lambda: None)
+    remote_run = AsyncMock(return_value=({"final_response": marker, "completed": True}, {}))
+    monkeypatch.setattr(api, "_run_agent", remote_run)
+    app = web.Application()
+    app["api_server_adapter"] = api
+    app.router.add_post("/v1/chat/completions", api._handle_chat_completions)
+    note = {"role": "system", "content": "Answer the latest human request; do not return a silence marker."}
+    async with TestClient(TestServer(app)) as client:
+        # Removing the empty runtime row leaves only a system note: rejected. Retaining the
+        # silent result as the last row would instead promote that assistant marker to user
+        # input (the route always executes its final non-system row), not continue it.
+        for messages in ([note], [note, {"role": "user", "content": ""}]):
+            rejected = await client.post("/v1/chat/completions", json={"messages": messages})
+            assert rejected.status == 400
+            assert "No user message found" in (await rejected.json())["error"]["message"]
+        assert remote_run.await_count == 0
+        system_last = await client.post("/v1/chat/completions", json={"messages": [
+            {"role": "user", "content": TYPED_TEXT}, {"role": "assistant", "content": marker}, note,
+        ]})
+        assert system_last.status == 200
+        assert remote_run.await_args.kwargs["user_message"] == marker
+        assert remote_run.await_args.kwargs["conversation_history"] == [{"role": "user", "content": TYPED_TEXT}]
+        assert remote_run.await_args.kwargs["ephemeral_system_prompt"] == note["content"]
+        remote_run.reset_mock()
+
+        monkeypatch.setattr(h.runner, "_get_proxy_url", lambda: str(client.make_url("")).rstrip("/"))
+        result = await h.runner._run_agent(
+            message=TYPED_TEXT, context_prompt="", history=[], source=h.event.source,
+            session_id="", session_key=SESSION_KEY, run_generation=1,
+            reply_expected=None, event_message_id="typed-1", inbound_message_id="typed-1",
+        )
+    assert remote_run.await_count == 1
+    assert remote_run.await_args.kwargs["user_message"] == TYPED_TEXT
+    assert remote_run.await_args.kwargs["ephemeral_system_prompt"] is None
+    assert result["final_response"] == marker
+    shaped = await h.runner._hmwa_shape_agent_response(
+        result, h.event.source, history=[], session_entry=SimpleNamespace(session_id="silence-test"),
+        session_key=None, _quick_key=SESSION_KEY, run_generation=1, _run_start_session_id="silence-test",
+        _platform_name="telegram", _msg_start_time=0.0, reply_expected=None, persist_user_display_kind=None,
+    )
+    assert shaped[:2] == (_unexpected_silence_reply(), False)
+    assert not h.calls  # no local execution/retry was substituted for the proxy turn
+    assert all(marker not in payload for payload in _payloads(h))
+
+
+@pytest.mark.asyncio
 async def test_second_marker_is_terminal_and_human_fallback_remains(harness):
     h = harness
     result = await _run(h, ["NO_REPLY", "NO_REPLY"])
@@ -258,8 +317,26 @@ async def test_edit_transport_keeps_earlier_preamble_when_final_marker_is_reject
 async def test_cumulative_preamble_survives_without_marker_frames(harness, monkeypatch, transport, marker):
     h = harness
     _cumulative_adapter(h, transport, monkeypatch)
+
+    native_at_retry = []
+
+    def check_retry_start(response):
+        if transport == "native" and len(h.calls) == 2:
+            native_at_retry.append((
+                h.consumers[0]._native_stream_opened, h.adapter.frames[-1].copy(),
+                h.consumers[0]._accumulated, h.consumers[0].final_content_delivered,
+            ))
+
+    h.model_hook = check_retry_start
     result = await _run(h, [marker, ANSWER], preamble=True)
     assert result["final_response"] == ANSWER
+    if transport == "native":
+        assert len(native_at_retry) == 1
+        opened, frame, prefix, delivered = native_at_retry[0]
+        assert not opened
+        assert frame == {"text": prefix, "finalize": True}
+        assert prefix.startswith("Checking the brief.")
+        assert not delivered
     assert len(h.consumers) == 2
     first, retry = h.consumers
     assert first._cumulative_transport() and retry._cumulative_transport()

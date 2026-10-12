@@ -4641,6 +4641,8 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            # Local-only recovery: the proxy API requires a new non-empty conversation row,
+            # not the empty internal continuation. Preserve its existing human silence fallback.
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
