@@ -60,7 +60,7 @@ def _attached_skill_content(name: str) -> str:
             return ""
     try:
         return path.read_text(encoding="utf-8-sig")
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
 
 
@@ -95,8 +95,16 @@ def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
     if any("relay" in tool.lower() for tool in _available_tools(names, cfg)):
         return True
     from hermes_cli.tools_config import enabled_mcp_server_names
+    from cron.scheduler import _resolve_cron_disabled_toolsets
     enabled_mcp = enabled_mcp_server_names(cfg or {})
-    return any(name in enabled_mcp and "relay" in name.lower() for name in names)
+    disabled = {name.lower() for name in _resolve_cron_disabled_toolsets(cfg or {})}
+    for name in names:
+        lowered = name.lower()
+        if name in enabled_mcp and "relay" in lowered:
+            aliases = {lowered, f"mcp-{lowered}", f"{lowered}-mcp"}
+            if not aliases & disabled:
+                return True
+    return False
 
 
 def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:

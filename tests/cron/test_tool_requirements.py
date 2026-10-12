@@ -185,6 +185,26 @@ def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypat
         name="synthetic-disabled-terminal", schedule="every 1h",
         enabled_toolsets=["terminal"], deliver="local",
     )
-    monkeypatch.setattr(config, "load_config_readonly", lambda: {"agent": {"disabled_toolsets": ["terminal"]}})
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {"agent": {"disabled_toolsets": ["terminal"]}})
     assert cron_doctor() == 1
     assert "terminal access" in capsys.readouterr().out
+
+
+def test_cron_doctor_config_read_does_not_create_config_backups(tmp_path, monkeypatch, capsys):
+    from hermes_cli.cron import cron_doctor
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("agent:\n  disabled_toolsets: [terminal]\n")
+    assert not (tmp_path / "config").exists()
+    assert cron_doctor() == 0
+    capsys.readouterr()
+    assert not (tmp_path / "config").exists()
+
+
+def test_attached_non_utf8_skill_does_not_abort_diagnostics(tmp_path, monkeypatch):
+    from cron import tool_requirements
+
+    skill = tmp_path / "SKILL.md"
+    skill.write_bytes(b"---\nname: bad\n---\n\xff")
+    monkeypatch.setattr(tool_requirements, "_plugin_skill_path", lambda _name: skill)
+    assert tool_requirements._attached_skill_content("plugin:bad") == ""

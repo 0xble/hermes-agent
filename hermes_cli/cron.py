@@ -758,8 +758,8 @@ def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
     try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly()
+        from hermes_cli.config import read_raw_config_readonly
+        cfg = read_raw_config_readonly()
     except Exception:
         cfg = {}
     jobs = [job for job in list_jobs(include_disabled=True)
