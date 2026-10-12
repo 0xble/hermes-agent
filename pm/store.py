@@ -209,7 +209,10 @@ def _legacy_tar_filter(member, dest: str):
         if os.path.commonpath([target, dest]) != dest:
             raise tarfile.ExtractError(f"archive path escapes destination: {name!r}")
 
-    name = member.name.rstrip("/")
+    original_name = member.name
+    if os.path.isabs(original_name):
+        raise tarfile.ExtractError(f"absolute archive path: {original_name!r}")
+    name = original_name.rstrip("/")
     contained(name)
     if member.issym() or member.islnk():
         if os.path.isabs(member.linkname):

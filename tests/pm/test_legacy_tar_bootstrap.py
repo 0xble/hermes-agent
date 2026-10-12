@@ -4,7 +4,7 @@ import tarfile
 
 import pytest
 
-from pm.store import extract_tar
+from pm.store import _legacy_tar_filter, extract_tar
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +91,14 @@ def test_historical_tarfile_refuses_unsafe_members(tmp_path, name, kind, value):
     with pytest.raises(tarfile.TarError):
         extract_tar(archive([(name, kind, value)]), tmp_path / "dest")
     assert victim.read_bytes() == b"original"
+
+
+def test_historical_tarfile_refuses_root_members_before_extraction(tmp_path):
+    dest = tmp_path / "dest"
+    for name in ("/", "////"):
+        member = tarfile.TarInfo(name)
+        with pytest.raises(tarfile.ExtractError):
+            _legacy_tar_filter(member, str(dest))
 
 
 @pytest.mark.platforms("posix")

@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
+
+from hermes_cli import _git_process_scope as scopeprobe
+from tests.hermes_cli.test_gitlock_process_scope import _process
 
 from hermes_cli.gitlock import (
     STALE_TMP_PACK_MIN_AGE_SECONDS,
@@ -21,9 +25,20 @@ from hermes_cli.gitlock import (
 )
 
 
+@pytest.fixture(autouse=True)
+def idle_process_table(tmp_path, monkeypatch):
+    # Isolate the OS boundary, not the holder/ownership decision under test.
+    table = tmp_path / "proc"
+    table.mkdir()
+    monkeypatch.setattr(scopeprobe, "_PROC_ROOT", table)
+    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+    return table
+
+
 def _mkrepo(tmp_path: Path) -> Path:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     pack = tmp_path / ".git" / "objects" / "pack"
-    pack.mkdir(parents=True)
+    pack.mkdir(parents=True, exist_ok=True)
     return tmp_path
 
 
@@ -34,7 +49,6 @@ def _age(path: Path, seconds: float) -> None:
 
 def test_removes_old_tmp_pack_debris(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
 
     debris = []
@@ -52,7 +66,6 @@ def test_removes_old_tmp_pack_debris(tmp_path, monkeypatch):
 
 def test_spares_fresh_debris_and_real_packs(tmp_path, monkeypatch):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
 
     fresh = pack / "tmp_pack_fresh"           # a fetch may be writing this NOW
@@ -69,9 +82,12 @@ def test_spares_fresh_debris_and_real_packs(tmp_path, monkeypatch):
     assert fresh.exists() and real_pack.exists() and real_idx.exists()
 
 
-def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch):
+def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch, idle_process_table):
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: True)
+    if scopeprobe._linux_process_scope:
+        _process(idle_process_table, 123, repo)
+    else:
+        monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: True)
     pack = repo / ".git" / "objects" / "pack"
     p = pack / "tmp_pack_old"
     p.write_bytes(b"x")
@@ -84,9 +100,9 @@ def test_skips_sweep_while_git_is_running(tmp_path, monkeypatch):
 def test_bare_repo_pack_dir_is_swept(tmp_path, monkeypatch):
     """A bare repo (e.g. the checkpoint store) has no .git/ layer — objects/pack hangs directly
     off the repo root, where a gc killed mid-repack strands the same debris (#115410)."""
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
+    subprocess.run(["git", "init", "--bare", "--quiet", str(tmp_path)], check=True)
     pack = tmp_path / "objects" / "pack"
-    pack.mkdir(parents=True)
+    pack.mkdir(parents=True, exist_ok=True)
     debris = pack / "tmp_pack_killedGc"
     debris.write_bytes(b"x" * 256)
     _age(debris, STALE_TMP_PACK_MIN_AGE_SECONDS + 60)
@@ -108,7 +124,6 @@ def test_windows_readonly_debris_is_cleared(tmp_path, monkeypatch):
     read-only file with EACCES — the exact rule that let aborted-fetch debris survive this
     sweep for months (#116384). Runs on a real Windows host: no faked unlink, no faked OS."""
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
     pack = repo / ".git" / "objects" / "pack"
 
     debris = pack / "tmp_pack_ReadOnly"
@@ -125,7 +140,6 @@ def test_unlink_failure_is_surfaced_at_warning(tmp_path, monkeypatch, caplog):
     """The skip used to be logged at debug, which hid the months-long Windows no-op sweep;
     a cleaner that fails silently is worse than none, so every skip must be visible (#116384)."""
     repo = _mkrepo(tmp_path)
-    monkeypatch.setattr("hermes_cli.gitlock._git_proc_running_for", lambda _root: False)
     pack = repo / ".git" / "objects" / "pack"
     stuck = pack / "tmp_pack_stuck"
     stuck.write_bytes(b"x")
