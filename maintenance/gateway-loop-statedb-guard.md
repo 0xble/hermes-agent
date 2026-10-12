@@ -76,6 +76,84 @@ recorded separately by the native updater's `~/.hermes/logs/update_receipts/` an
 Revert this query change to roll back; retire it when an upstream release supplies
 archive-bounded id-ordered replay.
 
+## Crash-recovery integrity scan
+
+After an unclean prior life, `gateway/lifecycle_ledger.py::record_startup` logs
+that WARNING and sets `prior_unclean_exit` / `prior_suspected_oom` on the new
+sentinel. In WAL mode it claims that sentinel before the asynchronous scan; in
+DELETE/unreadable-header mode it completes the synchronous scan before claiming
+it. Where `PRAGMA quick_check(1)` runs depends on the on-disk journal mode, read
+lock-free from header bytes 18/19:
+
+- **WAL (default):** `record_startup` first appends a
+  `gateway.previous_unclean_exit` record with `state_db_integrity: "pending"`, then
+  a context-bound daemon worker runs the scan. The worker logs ERROR on corruption
+  and appends the completed verdict to exit-diag. It never renews a startup-watchdog
+  lease (unrelated startup must prove its own progress). Process exit can
+  interrupt it; no shutdown wait or timeout increase is introduced.
+  If exit interrupts the worker or thread startup fails, the pending record keeps
+  the prior-life evidence after the sentinel has been claimed. It is not an
+  integrity verdict; the later record for the same prior life carries that result.
+- **Anything else (DELETE / unreadable header):** the scan runs synchronously
+  inside `record_startup`, before this process claims the new sentinel and before
+  `runner.start()` opens any SessionDB writer, under the renewed
+  `state_db_unclean_integrity_check` lease
+  (#115542), exactly as before this patch. Keeping the prior life as sentinel
+  owner until the scan ends means a watchdog exit during a stalled scan cannot
+  mark that prior life clean and suppress the next boot's check.
+  A rollback-journal reader holds SHARED
+  for the whole scan, so a background scan would fail every writer with
+  `database is locked` (review repro: `SessionDB.create_session` failed after
+  60.1 s). Stores on `database.journal_mode: delete` (virtiofs/NFS/SMB) or forced
+  to DELETE by the WAL-reset gate keep the slow crash-restart; that is the price
+  of losing no writes.
+
+Concurrency limits of the WAL background scan, accepted rather than bounded:
+
+- Its read transaction pins one snapshot for the whole scan (134 s on the 28 GB
+  store; about 4200 s on a ~37 GB store in the worst observed case). Writers
+  proceed, but no checkpoint can reset or truncate the WAL past that snapshot for
+  the full scan duration, so `state.db-wal` can grow with every write until the
+  scan ends; the next checkpoint after it reclaims as usual.
+- A `wal_checkpoint(TRUNCATE)` in that window waits out its connection's busy
+  timeout, then returns `busy=1` without resetting (no exception). The
+  post-VACUUM TRUNCATE in `hermes_state_maintenance.py::vacuum` therefore leaves
+  the WAL at its high-water mark until a later checkpoint. `VACUUM` itself
+  succeeds beside the pinned reader (probed on SQLite 3.53.1: TRUNCATE `(1, 2423,
+  213)` after 1.1 s, VACUUM ok, TRUNCATE `(0, 0, 0)` once the reader ended). Requested compaction (`_run_requested_state_db_compaction`)
+  runs before `record_startup`, so it never overlaps the scan; the housekeeping
+  auto-VACUUM waits for its first watch window and its own throttles.
+- The checker connection is opened through the tracked SQLite helper and stays
+  registered until the scan closes it. This in-process overlap is required:
+  `SessionDB` startup's header probe must see the live path and skip raw
+  `open()`/`close()`, because an untracked descriptor close can cancel this
+  process's POSIX locks. The pending and completed records intentionally retain
+  the same `gateway.previous_unclean_exit` tag; pair them by
+  `(prior_pid, prior_started_at)`, with `state_db_integrity: "pending"` versus
+  the completed verdict distinguishing the two stages.
+- Other processes (cron workers, CLI) can write throughout; only this
+  process's own readiness was ever gated.
+
+The 2026-10-12 production SIGKILL recovery respawned in 0.5 s, listened on its
+control socket at 00:22:05.461 PDT, then stalled until 00:24:19.534 before reporting
+the prior unclean life. Telegram polling was healthy at 00:24:21.3. A healthy
+28 GB state.db returned `ok`; its synchronous integrity scan cost 134 s.
+Upstream main `590af66a58c2b3eb3c5edd1dcfefa09c625ae18a` still runs this check
+synchronously. Upstream `2a8c3b313c72` extended the watchdog lease while it ran;
+this patch preserves corruption detection without putting the scan on the
+readiness path or masking startup stalls with background progress.
+
+Proof: `tests/gateway/test_lifecycle_state_db_check.py` builds real WAL and
+DELETE stores. WAL: an event-held checker proves startup returns with the
+sentinel claimed, a pending diagnostic already written before the scan begins,
+and no lease taken, then the persisted verdict and corruption
+ERROR. DELETE: the held checker proves `record_startup` does not return until
+the scan ends, after which a zero-timeout writer commits; the scan renews the
+startup lease. Both modes persist healthy/corrupt verdicts; clean boots never
+scan. `tests/gateway/test_lifecycle_ledger.py` (unchanged) preserves unclean/OOM
+flags and the exit-diag schema. Retire this split only when upstream provides
+equivalent readiness and forensics behavior.
+
 ## 2026-10-10 and 2026-10-11 incidents
 
 The gateway exited with code 75 four times on 2026-10-10 (19:07, 19:31, 19:33 and 19:44 PDT)
