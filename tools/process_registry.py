@@ -1636,7 +1636,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                     # Give the wrapper's final printf a short chance to become visible before
                     # reporting a genuinely lost process.
                     time.sleep(0.05)
-                    if not exit_path.exists():
+                    if not exit_path.exists() or not exit_path.read_text(encoding="utf-8", errors="replace").strip():
                         self._finish_survivor(session, None, "lost", "gateway_shutdown")
                         return
                 if log_path.exists():
@@ -2132,7 +2132,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         stdout pipe open, the reader blocks forever and poll() keeps returning "running" indefinitely (issue
         #17327 — 74 polls over 7 minutes on Feishu).
         """
-        if session is None or session.exited:
+        if session is None or session.exited or session.survive_restart:
             return
         proc = getattr(session, "process", None)
         if proc is None:
@@ -2789,14 +2789,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and not s.exited and s.survive_restart
             ]
-            if source == "gateway_shutdown" and restart_survivors:
-                self._write_checkpoint()
-                logger.info(
-                    "Shutdown: left %d restart-surviving process(es) running",
-                    len(restart_survivors),
-                )
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]
+        if source == "gateway_shutdown" and restart_survivors:
+            self._write_checkpoint()
+            logger.info(
+                "Shutdown: left %d restart-surviving process(es) running",
+                len(restart_survivors),
+            )
         def _retry_finished_scopes() -> int:
             # Like gone detached scopes, finished-scope retries can exhaust the
             # budget. Preserve upstream's retry/accounting after the bounded sweep.

@@ -109,3 +109,90 @@ def test_stop_all_source_still_kills_survivors(tmp_path, monkeypatch):
     assert registry.kill_all(source="gateway_stop_all") == 1
     session.process.wait(timeout=3)
     assert session.process.poll() is not None
+
+
+def test_terminal_opt_in_reaches_wrapper_and_checkpoints_notification_route(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import tools.process_registry as registry_module
+    import tools.terminal_tool as terminal
+    from tools.terminal_tool_background import _spawn
+    from unittest.mock import Mock
+
+    home = _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    plan = SimpleNamespace(
+        env_type="local", cwd=str(tmp_path), effective_task_id="task", config={},
+        effective_timeout=5, promoted_from_foreground_timeout=None, host_cwd=str(tmp_path),
+    )
+    monkeypatch.setattr(terminal, "_plan_execution", lambda *_a, **_k: plan)
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *_a: SimpleNamespace(env={}))
+    monkeypatch.setattr(terminal, "_pre_exec_block", lambda *_a, **_k: None)
+    monkeypatch.setattr(terminal, "_run_approval_guards", lambda *_a, **_k: SimpleNamespace(note=None))
+    result = json.loads(terminal.terminal_tool(
+        "sleep 0.3; printf 'SURVIVOR_TOOL_OK\\n'; exit 7", task_id="task", background=True,
+        notify_on_complete=True, survive_restart=True, _host_local=True,
+    ))
+    assert result.get("survive_restart") is True, result
+    session = registry.get(result["session_id"])
+    assert session is not None and session.process is not None
+    checkpoint = json.loads((home / "processes.json").read_text())
+    assert checkpoint[0]["notify_on_complete"] is True
+    assert checkpoint[0]["session_key"] == "task"
+    event = registry.completion_queue.get(timeout=5)
+    assert event["exit_code"] == 7
+    assert "SURVIVOR_TOOL_OK" in event["output"]
+    assert registry.poll(session.id)["exit_code"] == 7
+    session.process.wait(timeout=3)
+
+    # Existing sandbox backgrounds must not receive the local-only keyword.
+    sandbox_registry = Mock()
+    _spawn(sandbox_registry, command="echo ok", env=SimpleNamespace(), env_type="docker",
+           effective_task_id="task", task_id="task", session_key="task",
+           cwd=str(tmp_path), effective_pty=False)
+    assert "survive_restart" not in sandbox_registry.spawn_via_env.call_args.kwargs
+    for options in ({"background": False}, {"background": True, "pty": True}):
+        rejected = json.loads(terminal.terminal_tool("echo no", survive_restart=True, _host_local=True, **options))
+        assert rejected["status"] == "error"
+        assert "non-PTY" in rejected["error"]
+
+
+def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tmp_path, monkeypatch):
+    import sys
+    import textwrap
+
+    home = _home(monkeypatch, tmp_path)
+    # A separate producer exits without cleanup, as the old gateway does after
+    # its survivor-excluding shutdown sweep. Only the real wrapper owns the job.
+    producer = subprocess.run([sys.executable, "-c", textwrap.dedent(f"""
+        import os
+        from pathlib import Path
+        import tools.process_registry as module
+        module.get_hermes_home = lambda: Path({str(home)!r})
+        registry = module.ProcessRegistry()
+        session = registry.spawn_local(
+            "sleep 0.4; printf 'SURVIVOR_BOOT_OK\\\\n'; exit 9",
+            cwd={str(tmp_path)!r}, task_id="task", session_key="session", survive_restart=True,
+        )
+        session.notify_on_complete = True
+        registry._write_checkpoint()
+        assert registry.kill_all(source="gateway_shutdown") == 0
+        print(session.id, flush=True)
+        os._exit(0)
+    """)], capture_output=True, text=True, timeout=10)
+    assert producer.returncode == 0, producer.stderr
+    session_id = producer.stdout.strip()
+    checkpoint = (home / "processes.json").read_text()
+    recovered = ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    event = recovered.completion_queue.get(timeout=5)
+    assert event["session_id"] == session_id
+    assert event["exit_code"] == 9
+    assert "SURVIVOR_BOOT_OK" in event["output"]
+    assert recovered.completion_queue.empty()
+    # Even replaying the old checkpoint cannot duplicate the completion claim.
+    (home / "processes.json").write_text(checkpoint)
+    again = ProcessRegistry()
+    assert again.recover_from_checkpoint() == 1
+    time.sleep(0.2)
+    assert again.completion_queue.empty()

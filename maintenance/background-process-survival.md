@@ -18,10 +18,11 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   completion is emitted. A gone process without an exit file emits one `lost`
   completion. The delivered marker makes restarts and concurrent pollers
   idempotent.
-- `gateway_stop_all` leaves opted-in processes running. Only the dedicated
-  kill-processes path terminates them. This is the D3 operator-stop decision.
-- The terminal tool description says that background execution is for idempotent
-  bounded work such as gates, tests, and builds, never external writes.
+- `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
+  processes running. A dedicated `process_manage kill` or explicit internal
+  `gateway_stop_all` sweep still terminates them. This is the D3 operator-stop decision.
+- The terminal tool description limits restart survival to idempotent bounded
+  work such as gates, tests, and builds, never external writes.
 
 ## Provenance and patches
 
