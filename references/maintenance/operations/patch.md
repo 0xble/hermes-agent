@@ -1,5 +1,25 @@
 # Maintained fork patch register
 
+## background-review-memory-delete: durable observer requirement
+
+- **Status:** Candidate; not landed or activated.
+- **Contract:** Owner opt-in may bypass staging only with a durable transaction observer registered for the current profile. Missing, old, or other-profile observers stage all destructive single/batch operations. Commit-time durability: a durable-path admission commits only if the observer snapshot used by that commit (`observe_memory_transaction`, under the registry lock, before writing) still contains a durable current-profile observer; otherwise `DurableMemoryObserverUnavailable` aborts before any write and the tool stages the op. Undo semantics stay unchanged.
+- **Source surfaces:** `tools/memory_tool.py`, `tools/memory_transactions.py`; unit `maintenance/background-review-memory-delete.md`. The companion agents plugin declares `durable=True` on its existing registration.
+- **Upstream findings:** Fork-only opt-in to upstream #105921; no matching durable-observer opt-in repair found.
+- **Verification:** Red regression: 6 failed for remove/replace/batch with absent/non-durable observers; 6 failed for remove/replace/batch when the durable observer is unregistered or non-durably replaced between admission and commit. `scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_memory_transactions.py tests/agent/test_background_review_memory_scope.py`.
+- **Rollback:** Revert the observer declaration/check changes and their tests only; retain the existing opt-in/staging implementation. Reverting only the plugin declaration safely returns unattended destructive operations to staging.
+- **Retirement:** Remove when upstream provides the complete opt-in plus profile-scoped durable rollback contract. Land Hermes before the plugin to avoid an unjournaled gap.
+
+## memory-context-note-stripping
+
+- **Status:** Candidate; not landed or activated.
+- **Contract:** Strip exact current/legacy notes only; preserve unrelated same-prefix recalled facts and adjacent whitespace. Fence suppression is unchanged.
+- **Source surfaces:** `agent/memory_manager.py::_INTERNAL_NOTE_RE`, `tests/agent/test_memory_provider.py`; unit `maintenance/memory-context-note-stripping.md`.
+- **Upstream findings:** Adapted exact-note matching from yingliang-zhang's open NousResearch/hermes-agent#64421 at `7e16b919d113a870af7302e2e513f77f46f54298`, not its other provider/prefetch changes.
+- **Verification:** Red regression: 2 failed on synthetic same-prefix passport/lease facts. `scripts/run_tests.sh tests/agent/test_memory_provider.py`.
+- **Rollback:** Revert the exact-note matcher and its tests only; retain the separate background-delete gate repair.
+- **Retirement:** Remove when a released upstream sanitizer satisfies the same preservation and exact-wrapper contract.
+
 ## auto-recovery-ladder-notice
 
 - **Status:** Active; published candidate pending protected landing.
