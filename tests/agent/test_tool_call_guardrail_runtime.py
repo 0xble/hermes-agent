@@ -588,3 +588,88 @@ def test_loop_cap_repeated_calls_in_final_completion_never_execute_or_loop(tool_
     assert "without making progress" not in result["final_response"]
     assert all(not str(m.get("tool_call_id", "")).startswith("again-")
                for m in result["messages"])
+
+
+@pytest.mark.parametrize("delivery", ["full", "terminal_only", "partial", "empty", "failed_delivery", "tool_only"])
+def test_loop_cap_codex_stream_delivers_final_answer_once(delivery):
+    """Exercise the real interruptible call and Codex event consumer, not a summary stub."""
+    agent = _make_agent("web_search", config={
+        "tool_loop_guardrails": {"loop_caps": {"max_web_searches": 1}},
+    })
+    agent.api_mode = "codex_responses"
+    agent.model = "test-codex"
+    answer = "Answer from evidence."
+    calls = [{"type": "function_call", "id": f"item-{i}", "call_id": f"cap-{i}",
+              "name": "web_search", "arguments": json.dumps({"query": f"distinct {i}"})}
+             for i in range(3)]
+
+    def message(text):
+        return {"type": "message", "id": "msg-answer", "role": "assistant",
+                "status": "completed", "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]}
+
+    def events(output, delta=""):
+        # Terminal output can be longer than the visible deltas. Do not equate a prefix
+        # with successful full delivery (#88954).
+        rows = ([{"type": "response.output_text.delta", "delta": delta,
+                  "item_id": "msg-answer", "output_index": 0, "content_index": 0}]
+                if delta else [])
+        rows.extend({"type": "response.output_item.done", "output_index": i, "item": item}
+                    for i, item in enumerate(output))
+        rows.append({"type": "response.completed", "response": {
+            "id": "resp-cap", "status": "completed", "model": agent.model,
+            "output": output, "usage": None,
+        }})
+
+        def sdk_value(value):
+            if isinstance(value, dict):
+                return SimpleNamespace(**{k: sdk_value(v) for k, v in value.items()})
+            if isinstance(value, list):
+                return [sdk_value(v) for v in value]
+            return value
+
+        return iter(sdk_value(row) for row in rows)
+
+    final_output = ([] if delivery == "empty" else calls if delivery == "tool_only"
+                    else [message(answer)])
+    delta = answer if delivery in {"full", "failed_delivery"} else "Answer" if delivery == "partial" else ""
+    # Prior tool-round commentary deliberately matches the answer. It must not count
+    # as delivery of a terminal-only final completion.
+    agent.client.responses.create.side_effect = [events(calls, answer), events(final_output, delta)]
+    deltas = []
+    text_attempts = []
+
+    def deliver(text):
+        if isinstance(text, str):
+            text_attempts.append(text)
+            if delivery == "failed_delivery" and len(text_attempts) == 2:
+                raise RuntimeError("display rejected final stream delta")
+        deltas.append(text)
+
+    agent.stream_delta_callback = deliver
+    with (
+        patch("model_tools.handle_function_call", return_value='{"evidence":"collected"}') as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Research and answer.")
+
+    assert dispatch.call_count == 1
+    assert agent.client.responses.create.call_count == 2
+    assert result["turn_exit_reason"] == "tool_cap_answer"
+    final_text = result["final_response"]
+    text_deltas = [d for d in deltas if isinstance(d, str)]
+    if delivery in {"empty", "tool_only"}:
+        assert "per-turn limit" in final_text
+    else:
+        assert final_text == answer
+    # The initial answer-shaped commentary is separate. A full final stream must
+    # appear only once, while partial and failed delivery still receive complete text.
+    expected = [answer, "Answer", answer] if delivery == "partial" else [answer, final_text]
+    assert text_deltas == expected, f"callback deltas: {deltas!r}"
+    assert deltas[-1] is None
+    assert [m["content"] for m in result["messages"] if m.get("role") == "user"] == ["Research and answer."]
+    results = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert {m["tool_call_id"] for m in results} == {c["call_id"] for c in calls}
+    assert sum("loop_web_search_cap" in m["content"] for m in results) == 2
