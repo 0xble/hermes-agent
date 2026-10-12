@@ -129,9 +129,12 @@ def _static_disabled_tool_names(names: list[str]) -> set[str]:
 
 def _disabled_toolset_names(cfg: Optional[dict]) -> list[str]:
     """Mirror cron's static denylist without importing the runtime scheduler."""
-    disabled = ["messaging", "clarify"] if (cfg or {}).get("cron", {}).get("allow_agent_scheduling") else ["cronjob", "messaging", "clarify"]
+    root = cfg or {}
+    cron_cfg = root.get("cron") or {}
+    agent_cfg = root.get("agent") or {}
+    disabled = ["messaging", "clarify"] if cron_cfg.get("allow_agent_scheduling") else ["cronjob", "messaging", "clarify"]
     from agent.skill_utils import parse_config_string_list
-    for name in parse_config_string_list((cfg or {}).get("agent", {}).get("disabled_toolsets")):
+    for name in parse_config_string_list(agent_cfg.get("disabled_toolsets")):
         name = str(name).strip()
         if name and name not in disabled:
             disabled.append(name)

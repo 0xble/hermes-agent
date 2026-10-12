@@ -190,6 +190,21 @@ def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypat
     assert "terminal access" in capsys.readouterr().out
 
 
+def test_cron_doctor_handles_null_config_sections(tmp_path, monkeypatch, capsys):
+    from cron.jobs import create_job
+    from hermes_cli.cron import cron_doctor
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    create_job(
+        prompt="Add with `loops finding add`", name="null-config-sections",
+        schedule="every 1h", enabled_toolsets=["file"], deliver="local",
+    )
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {"cron": None, "agent": None})
+    assert cron_doctor() == 1
+    assert "terminal access" in capsys.readouterr().out
+
+
 def test_cron_doctor_config_read_does_not_create_config_backups(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
