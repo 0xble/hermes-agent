@@ -21,9 +21,21 @@ completed but the plugin marker and injected canary were absent.
 `_delivery_manager()` joins the background worker before checking readiness. The
 recursion guard (`_discovered`) is not readiness (`_discovery_complete`): a timeout
 or re-entry during the sweep refuses partial delivery. A sibling foreground
-sweep is also awaited through the existing discovery lock. Every registry reader
+sweep is also awaited through the existing discovery lock. The barrier helpers live in
+`hermes_cli/plugins_dispatch.py` and are re-exported by the facade. Every registry reader
 on the delivery path goes through this barrier: `invoke_hook`, `has_hook`,
 middleware, and the streaming snapshot `iter_hook_callbacks`.
+
+Async hook delivery awaits discovery off-loop with `asyncio.to_thread`, then awaits
+callbacks on the caller's event loop. Gateway post-admission and platform-event probes
+also run off-loop; platform-event sync delivery runs there too. Synchronous delivery
+called directly on a running loop refuses unready discovery without joining or acquiring
+the lock. The `pre_tool_call` directive path turns that refusal into a block, never an
+empty policy decision. No hook is delivered against a half-loaded registry.
+
+Plain `discover_plugins()` listing/completion callers log a warning and return the
+available registry on a background join timeout, without starting a second sweep. The
+strict timeout exception remains in hook delivery, not in skill command completion.
 
 Regression workers are event-gated rather than sleep-gated. Concurrent independent
 tool deliveries carry distinct `tool_call_id` values so this readiness proof does

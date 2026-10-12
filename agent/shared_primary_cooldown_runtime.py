@@ -17,7 +17,8 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         # without inventing an outage record, re-arming it, or dropping cached state.
         logger.warning("Shared primary cooldown unavailable; refusing a primary probe", exc_info=True)
         from agent.chat_completion_helpers import try_activate_fallback
-        if try_activate_fallback(agent):
+        from agent.error_classifier import FailoverReason
+        if try_activate_fallback(agent, FailoverReason.cooldown_state_unreadable):
             return True
         # Construction suppresses adoption errors; the turn-start check retries and must
         # refuse the turn if no fallback can be bound, rather than use the primary.

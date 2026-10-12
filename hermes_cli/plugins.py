@@ -57,6 +57,7 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
     _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
+    _await_foreground_discovery, _delivery_manager,
     format_system_prompt_sections, is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
@@ -1759,9 +1760,12 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
 
 
 def discover_plugins(force: bool = False) -> None:
-    """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
-    background discovery instead of racing a second scan."""
-    _join_background_discovery()
+    """Discover and load all plugins, degrading if a background scan is still stuck."""
+    try:
+        _join_background_discovery()
+    except RuntimeError as exc:
+        logger.warning("background plugin discovery did not finish; using the available registry: %s", exc)
+        return
     get_plugin_manager().discover_and_load(force=force)
 
 
@@ -1850,40 +1854,6 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
 
 
-def _delivery_manager() -> PluginManager:
-    """Active manager, lazily discovering if it never ran — delivery must not depend on WHICH
-    surface imported us (dashboards/TUI/cron never import model_tools). ``getattr`` default
-    ``True`` leaves test doubles untouched.
-
-    Hook/middleware delivery must not depend on WHICH surface imported us: dashboards, TUI slash workers,
-    query mode, and cron delivery paths never import ``model_tools`` (whose import side-effect is the
-    discovery trigger on the interactive CLI path), so hooks registered by user plugins were silently dead
-    on those surfaces (#50776, #67597, #67890, #50937; tracking #64178 — salvaged from PR #64188).
-    """
-    manager = get_plugin_manager()
-    # The recursion guard is not readiness: delivery requires the entire hook sweep.
-    _join_background_discovery()
-    if not getattr(manager, "_discovered", True):
-        manager.discover_and_load()
-    if not getattr(manager, "_discovery_complete", True) and _await_foreground_discovery(manager):
-        if not getattr(manager, "_discovered", True):
-            manager.discover_and_load()  # the sweep we waited on failed and reset; retry it here
-    if not getattr(manager, "_discovery_complete", True):
-        raise RuntimeError("Plugin discovery incomplete; defer hook delivery until loading finishes")
-    return manager
-
-
-def _await_foreground_discovery(manager: PluginManager, timeout: float = 30.0) -> bool:
-    """Wait (bounded) for a sweep another thread holds, e.g. a sibling concurrent tool worker's lazy
-    discovery. Never waits from a plugin-load worker (its parent holds the lock), and the RLock admits
-    a same-thread re-entry immediately, so register()-time delivery still sees an incomplete registry."""
-    lock = getattr(manager, "_discovery_lock", None)
-    if lock is None or in_plugin_load_worker() or not lock.acquire(timeout=timeout):
-        return False
-    lock.release()
-    return True
-
-
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
 
@@ -1899,9 +1869,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """:func:`invoke_hook` for callers on an event loop: ``async def`` callbacks are awaited
-    there instead of bridged through a helper thread (see ``PluginManager.ainvoke_hook``)."""
-    return await _delivery_manager().ainvoke_hook(hook_name, **kwargs)
+    """:func:`invoke_hook` for callers on an event loop: discovery barriers run off-loop, while
+    callbacks are awaited on the caller's loop (see ``PluginManager.ainvoke_hook``)."""
+    manager = await asyncio.to_thread(_delivery_manager)
+    return await manager.ainvoke_hook(hook_name, **kwargs)
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:

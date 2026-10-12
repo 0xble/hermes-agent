@@ -47,7 +47,6 @@ def test_fresh_agent_never_probes_primary_while_state_is_unavailable(tmp_path, m
         )
         assert record is not None
         path = cooldown._state_path()
-        original = path.read_text(encoding="utf-8-sig")
         real_read = Path.read_text
         if failure == "permission":
 
@@ -75,8 +74,7 @@ def test_fresh_agent_never_probes_primary_while_state_is_unavailable(tmp_path, m
             # A genuine successful read of cleared state releases the fail-closed hold.
             if failure == "permission":
                 monkeypatch.setattr(Path, "read_text", real_read)
-            path.write_text(original, encoding="utf-8")
-            cooldown.clear_cooldowns(all_routes=True)
+            cooldown.clear_cooldowns(all_routes=True)  # operator recovery also accepts corrupt state
             result = agent.run_conversation("recovered state")
             assert result["final_response"] == "OK from primary-model"
             assert len(stub.primary_requests()) == 1
@@ -124,6 +122,9 @@ def test_unavailable_adoption_keeps_cached_record_and_deadline(tmp_path, monkeyp
         assert agent.model == "fallback-one"
         assert agent._shared_primary_cooldown_record == record
         assert agent._rate_limited_until == deadline
+        notices = getattr(agent, "_pending_fallback_notice", [])
+        assert any("cooldown state unreadable" in notice for notice in notices)
+        assert not any("provider failure" in notice for notice in notices)
     finally:
         agent.close()
 

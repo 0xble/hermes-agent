@@ -35,7 +35,11 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   canonical row counts, metadata, and fork-only rows. Search changes from the upstream
   FTS v2-to-v3 migration require independent canonical-projection and rank-1 index
   integrity checks. Unexpected differences and query errors fail the rehearsal.
-  A successful open alone is insufficient.
+  A successful open alone is insufficient. Candidate homes must be fresh and resolve under
+  the temporary root or `$HERMES_HOME/cache/scratch`. When Hermes sets `TMPDIR` inside its
+  home, that resolved temporary subtree is allowed too. The live home, any ancestor, and
+  live-home descendants outside those scratch roots are refused before candidate startup.
+  Path resolution includes symlink aliases; an existing `state.db` is never unlinked.
 - `scripts/sync_fork_candidate.py` builds candidates only; `scripts/check_fork_patches.py`
   proves trailers, unit ownership, extension registration, config keys, and the native
   update receipt; with immutable releases, compare receipt and live gateway to the

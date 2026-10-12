@@ -112,8 +112,14 @@ def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     scratch_home = scratch_home.resolve()
     from hermes_constants import get_hermes_home
     live_home = get_hermes_home().resolve()
-    if (scratch_home.is_relative_to(live_home)
-            or not scratch_home.is_relative_to(Path(tempfile.gettempdir()).resolve())):
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    scratch_root = (live_home / "cache" / "scratch").resolve()
+    under_temp = scratch_home.is_relative_to(temp_root)
+    under_scratch = scratch_home.is_relative_to(scratch_root)
+    safe_live_temp = temp_root != live_home and temp_root.is_relative_to(live_home) and under_temp
+    if (scratch_home == live_home or live_home.is_relative_to(scratch_home)
+            or not (under_temp or under_scratch)
+            or (scratch_home.is_relative_to(live_home) and not (under_scratch or safe_live_temp))):
         raise SystemExit("refusing: HERMES_HOME must be a fresh scratch directory")
     scratch_home.mkdir(parents=True, exist_ok=True)
     target = scratch_home / "state.db"

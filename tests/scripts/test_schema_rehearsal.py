@@ -144,15 +144,15 @@ def test_candidate_open_refuses_nonfresh_scratch_home(rehearsal, tmp_path, monke
     assert copy.read_bytes() == b"disposable copy"
 
 
-@pytest.mark.parametrize("location", ["equal", "nested", "symlink_nested"])
-def test_candidate_open_refuses_scratch_inside_live_home(rehearsal, tmp_path, monkeypatch, location):
+@pytest.mark.parametrize("location", ["equal", "ancestor", "nested", "symlink_nested"])
+def test_candidate_open_refuses_live_home_or_its_ancestor(rehearsal, tmp_path, monkeypatch, location):
     live = tmp_path / "live-profile"
     live.mkdir()
     copy = tmp_path / "copy.db"
     copy.write_bytes(b"disposable copy")
     monkeypatch.setenv("HERMES_HOME", str(live))
     monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
-    home = live if location == "equal" else live / "scratch"
+    home = live if location == "equal" else tmp_path if location == "ancestor" else live / "scratch"
     if location == "symlink_nested":
         alias = tmp_path / "profile-alias"
         alias.symlink_to(live, target_is_directory=True)
@@ -169,6 +169,28 @@ def test_candidate_open_refuses_scratch_inside_live_home(rehearsal, tmp_path, mo
     assert not spawned
     assert not (live / "scratch").exists()
     assert copy.read_bytes() == b"disposable copy"
+
+
+@pytest.mark.parametrize("location", ["scratch_temp", "explicit_scratch", "nested_temp", "symlink_temp"])
+def test_candidate_open_accepts_hermes_temp_scratch_home(rehearsal, v2_copy, tmp_path, monkeypatch, location):
+    import sys
+    live = tmp_path / "live-profile"
+    scratch_root = live / "cache" / "scratch"
+    live.mkdir()
+    temp_root = live / "temporary" if location == "nested_temp" else scratch_root
+    home = temp_root / "candidate"
+    if location == "explicit_scratch":
+        temp_root = tmp_path
+    elif location == "symlink_temp":
+        alias = tmp_path / "profile-alias"
+        alias.symlink_to(live, target_is_directory=True)
+        home = alias / "cache" / "scratch" / "candidate"
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(temp_root))
+    result = rehearsal.open_with_candidate(v2_copy, home, sys.executable)
+    assert result["opened"] and result["exit"] == 0, result
+    assert (home / "state.db").resolve() == v2_copy.resolve()
 
 
 def test_candidate_open_uses_fresh_home_and_real_candidate(rehearsal, v2_copy, tmp_path, monkeypatch):

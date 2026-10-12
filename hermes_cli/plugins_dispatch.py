@@ -59,6 +59,47 @@ _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
+def _delivery_manager():
+    """Only deliver from a complete registry; synchronous loop callers refuse instead of blocking.
+
+    Lazy foreground/background barriers preserve one-shot parity. Async callers acquire this
+    manager off-loop, then await callbacks on their original loop. Look up facade seams lazily
+    so scoped managers and compatibility monkeypatches retain one authoritative import path.
+    """
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        worker = plugins._background_discovery_thread
+        if (not getattr(manager, "_discovery_complete", True)
+                or not getattr(manager, "_discovered", True)
+                or (worker is not None and worker.is_alive())):
+            raise RuntimeError("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
+        return manager
+    plugins._join_background_discovery()
+    if not getattr(manager, "_discovered", True):
+        manager.discover_and_load()
+    if not getattr(manager, "_discovery_complete", True) and plugins._await_foreground_discovery(manager):
+        if not getattr(manager, "_discovered", True):
+            manager.discover_and_load()  # retry a failed sweep after its lock was released
+    if not getattr(manager, "_discovery_complete", True):
+        raise RuntimeError("Plugin discovery incomplete; defer hook delivery until loading finishes")
+    return manager
+
+
+def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
+    """Bounded wait for a sibling sweep, never from its own plugin-load worker."""
+    from hermes_cli import plugins
+    lock = getattr(manager, "_discovery_lock", None)
+    if lock is None or plugins.in_plugin_load_worker() or not lock.acquire(timeout=timeout):
+        return False
+    lock.release()
+    return True
+
+
 def _callback_identity(cb: Callable) -> str:
     """An attributable callback label without inspecting its arguments or instance state."""
     module = getattr(cb, "__module__", type(cb).__module__)

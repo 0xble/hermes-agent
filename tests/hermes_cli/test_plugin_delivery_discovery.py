@@ -219,6 +219,115 @@ def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkey
     assert first_result == {"value": ["ran"]}
 
 
+def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypatch):
+    import asyncio
+    import threading
+
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    seen = []
+    loop_thread = threading.get_ident()
+    lock = manager._discovery_lock
+
+    class ObservedLock:
+        def acquire(self, **kwargs):
+            assert threading.get_ident() != loop_thread, "discovery lock blocked the event-loop thread"
+            waiting.set()
+            return lock.acquire(**kwargs)
+
+        def release(self):
+            lock.release()
+
+    def reload():
+        with lock:
+            manager._discovered = True
+            manager._discovery_complete = False
+            entered.set()
+            assert release.wait(15)
+            manager._hooks["pre_gateway_dispatch"] = [lambda **kwargs: seen.append("ready") or "ready"]
+            manager._discovery_complete = True
+
+    monkeypatch.setattr(manager, "_discovery_lock", ObservedLock())
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", None)
+    worker = threading.Thread(target=reload)
+    worker.start()
+    assert entered.wait(5)
+
+    async def exercise():
+        delivered = asyncio.create_task(plugins.ainvoke_hook("pre_gateway_dispatch"))
+        try:
+            reached = await asyncio.to_thread(waiting.wait, 5)
+            if not reached:
+                release.set()
+                await delivered  # surface the wrong-thread lock assertion, not a watchdog symptom
+            assert reached, "delivery never reached the barrier off-loop"
+            assert not delivered.done()
+            assert seen == [], "no delivery against the half-loaded registry"
+        finally:
+            release.set()
+        assert await delivered == ["ready"]
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert seen == ["ready"]
+
+
+def test_sync_event_loop_probe_and_policy_refuse_unready_discovery(monkeypatch):
+    import asyncio
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    manager._discovered = True
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_join_background_discovery", lambda: pytest.fail("joined on loop"))
+    monkeypatch.setattr(plugins, "_await_foreground_discovery", lambda _: pytest.fail("locked on loop"))
+
+    async def exercise():
+        with pytest.raises(RuntimeError, match="discovery incomplete"):
+            plugins.has_hook("gateway_platform_event")
+        directive = plugins._get_pre_tool_call_directive_details("terminal", {})
+        assert directive.action == "block"
+        assert "unavailable" in (directive.message or "")
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("listing", ["discover", "skill_commands"])
+def test_discovery_listing_degrades_when_background_join_times_out(monkeypatch, caplog, listing):
+    import hermes_cli.plugins as plugins
+
+    class SlowThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            return None
+
+    class Manager:
+        def discover_and_load(self, *, force=False):
+            pytest.fail("must not race a second discovery after timeout")
+
+        def list_plugin_skill_metadata(self):
+            return []
+
+    monkeypatch.setattr(plugins, "_background_discovery_thread", SlowThread())
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: Manager())
+    with caplog.at_level("WARNING"):
+        if listing == "discover":
+            plugins.discover_plugins()
+        else:
+            from agent.skill_commands import get_plugin_skill_commands
+            assert get_plugin_skill_commands() == {}
+    assert "background plugin discovery did not finish" in caplog.text
+
+
 def test_sweep_thread_reentry_still_refuses_partial_registry(monkeypatch):
     """Re-entrant delivery from inside the sweep (register()-time hook) stays fail closed."""
     import hermes_cli.plugins as plugins
