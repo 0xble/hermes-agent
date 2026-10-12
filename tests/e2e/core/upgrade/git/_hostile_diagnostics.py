@@ -52,7 +52,7 @@ def hostile_diagnostics(request):
     # fixture output would otherwise vanish when the file runner SIGKILLs pytest.
     capture = request.config.pluginmanager.getplugin("capturemanager")
     with capture.global_and_fixture_disabled():
-        _STREAM = os.fdopen(os.dup(sys.stderr.fileno()), "w")
+        _STREAM = os.fdopen(os.dup(sys.stderr.fileno()), "w", encoding="utf-8")  # windows-footgun: ok - writes original stderr
     stopped = threading.Event()
 
     def watch():
