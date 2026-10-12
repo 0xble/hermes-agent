@@ -5494,7 +5494,8 @@ class BasePlatformAdapter(ABC):
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
-        INDICATOR_RESERVE = 10   # room for " (XX/XX)"
+        # Room for " (XXX/XXX)" plus Telegram's MarkdownV2 escaping of both parentheses.
+        INDICATOR_RESERVE = 12
         FENCE_CLOSE = "\n```"
         chunks: List[str] = []
         remaining = content

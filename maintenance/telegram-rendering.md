@@ -73,8 +73,11 @@ adjacent references, which joins the same run as "2,3" with each number still
 tappable, and puts an empty `<!-- -->` line before definitions that follow a
 list, which ends the list without rendering a block. `markdown-it-py` (already a
 dependency) finds both: block tokens locate code and lists, and a custom inline
-rule marks only references it reaches as prose, so code, TeX math, link
-destinations, autolinks, inline HTML and escapes stay literal. It runs on send, finalized edit,
+rule marks only references it reaches as prose, so code, TeX math (including
+closed single-dollar `$…$`, recognized with the same currency guard as the
+adapter), link destinations, autolinks, inline HTML and the contents of literal
+inline HTML containers (`<code>`, `<kbd>`, `<samp>`, `<pre>`) and escapes stay
+literal. It runs on send, finalized edit,
 and draft, and is idempotent. Verified against live `sendRichMessage` output on
 2026-09-30.
 
@@ -83,7 +86,8 @@ and draft, and is idempotent. Verified against live `sendRichMessage` output on
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
   `telegram-ordered-list-separation`, `telegram-footnote-refs`,
-  `telegram-progress-literal`, `telegram-table-boundaries`.
+  `telegram-progress-literal`, `telegram-table-boundaries`,
+  `telegram-chunk-indicator-budget`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -314,6 +318,13 @@ the first definition after a list: resend the probes from the footnote
 regressions through raw `sendRichMessage` without `normalize_footnotes` and
 check the returned blocks. Rollback removes that function and its call in
 `_rich_message_payload`.
+
+Long split replies reserve 12 UTF-16 units for the ` (N/M)` chunk indicator.
+Telegram's MarkdownV2 path escapes both parentheses and can lift the suffix off
+a synthesized closing fence, so the old 10-unit reserve let 100+ chunk single
+line fences reach 4,097 units. `tests/gateway/test_telegram_chunk_indicator_budget.py`
+pins the fix, which follows upstream PR #126100. Retire this reserve when a
+released upstream `truncate_message` passes that regression unchanged.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,
