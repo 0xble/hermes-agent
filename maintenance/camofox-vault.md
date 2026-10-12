@@ -171,6 +171,33 @@ the browser vault fill tool, or the 1Password backends.
 - Surfaces: `tools/browser_camofox*.py`, `tools/browser_tool.py`, `toolsets.py`,
   `agent/vault_login_classifier.py`, `agent/vault_backends/`, `tools/browser_vault_tool.py`.
 
+## Vault OTP and checkout hardening
+
+- `vault-origin-aliases` also governs authenticator codes: resolve a handle's login
+  metadata and exact allowed origins before minting an OTP; alias-only origins use the
+  password-fill consent/refusal cache and revalidate config after consent. Re-read the
+  live page origin after inspection; never authorize the requested or stale focus origin.
+  Keep the checked origin in the atomic write script, including after a user-code wait.
+- `vault-card-redaction-scope` keeps PAN/CVC global and low-entropy card metadata scoped.
+  Register canonical PAN digits even when the manager stores spaces/dashes, then redact
+  known PANs with whitespace/dash formatting without broadening short CVC matching.
+- `slice-9-vault-op-cards` ignores issue/start/valid-from date heuristics despite MM/YY
+  placeholders and permits masked password-type CVV only when classified as `cc-csc`.
+- Narrow fixes adapted from open upstream PRs
+  [128194](https://github.com/NousResearch/hermes-agent/pull/128194) at
+  `d0761c1092601b685c77259c7e4c966a7852cbe6` (OTP origin and stale navigation),
+  [136639](https://github.com/NousResearch/hermes-agent/pull/136639) at
+  `227a3f196dbeac096d419cd8dc901f1ecd182995` (PAN variants and issue dates), and
+  [134723](https://github.com/NousResearch/hermes-agent/pull/134723) at
+  `0811fe95947d932d01470f1b6b614485470f079f` (masked CVV). Inspection pinned released
+  upstream/main to `1fd18277267152893a8a24792b79213e7ca3f899`; these fixes were not
+  present there. Retire the adaptations only when released upstream satisfies both the
+  exact-origin alias-consent contract and this fork's scoped card redaction contract.
+- Regression: `tests/tools/test_browser_vault_otp_origin.py` (registered handler, synthetic
+  manager, isolated home) and `tests/tools/test_browser_vault_manager_card.py` (fill boundary,
+  PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
+  the existing identities; do not retire the surrounding fork features.
+
 ## Verification
 
 `scripts/run_tests.sh` on `tests/tools/test_browser_camofox_accounts.py`,
