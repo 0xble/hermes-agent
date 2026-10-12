@@ -323,6 +323,17 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when the upstream recovery path retries transiently unknown holder scans without stranding a dead `index.lock`.
 - **Rollback:** Revert the commit carrying `Fork-Patch: dead-index-lock-scan-retry`.
 
+## Active patch record: updater PID incarnation
+
+- **Patch identity:** `updater-pid-incarnation`.
+- **Behavior:** An updater's own PID is its current incarnation only when the recorded creation time is within the strict 5 ms own-process epsilon. A high-resolution `ct:N.000` from an earlier incarnation no longer passes because the process started at `N.5`. macOS shell hand-offs stay compatible because `marker.sh` reads the kernel's sub-second creation time instead of writing whole seconds, and the no-site Python reader uses `proc_pidinfo`. Cross-process tolerance and no-ct/unreadable-clock behavior are unchanged.
+- **Source surfaces:** `hermes_cli/update_lock.py` (`_incarnation`, `_stdlib_create_time`, `_darwin_create_time`), `scripts/desktop-update/marker.sh` (`proc_ct`), `tests/hermes_cli/test_update_incarnation.py`, and the native macOS tests in `tests/scripts/desktop_update/`.
+- **Upstream status:** The shell clock is salvaged from upstream PR #134551 with original authorship. Upstream PR #135407 provided the stdlib reader approach but keeps the `a28a5d03` / #134928 whole-second exception, which this patch removes.
+- **Focused regression:** `scripts/run_tests.sh --file-retries 0 -j 2 tests/hermes_cli/test_update_incarnation.py tests/hermes_cli/test_update_pause_record.py tests/hermes_cli/test_update_lock.py tests/scripts/desktop_update/test_macos_handoff_identity.py tests/scripts/desktop_update/test_desktop_update_posix_marker_macos_ct.py`.
+- **Verification:** The new regression files fail on the frozen base (5 failed, 8 passed) and pass on the candidate (13 passed). The final eight-file run, including all four wider-regression failures, passes on native macOS (172 passed, 12 platform skips), using the private test environment and CI-style isolated Git configuration. The two positive handoff fixtures use a real parent instead of a child stand-in; the runtime-host ancestry guard is unchanged. Source-only fork validation reports 0 problems.
+- **Retirement:** Remove once upstream ships a precise macOS shell producer and strict own-PID validation, and these regressions pass there without the fork patch.
+- **Rollback:** Revert the commits carrying `Fork-Patch: updater-pid-incarnation`. Revert all of them together: restoring the strict rule without the precise producer would break macOS hand-offs.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
