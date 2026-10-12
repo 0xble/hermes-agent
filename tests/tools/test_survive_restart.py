@@ -57,6 +57,56 @@ def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeyp
     assert (home / "process-runs" / session.id).exists()
 
 
+def test_scoped_survivor_spawn_gets_user_bus_env(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import tools.process_registry as registry_module
+
+    registry = ProcessRegistry()
+    seen = {}
+    monkeypatch.setattr(
+        registry_module,
+        "restart_safe_gateway_child_argv",
+        lambda *args, **kwargs: SimpleNamespace(mode="scoped", argv=["systemd-run", "--user"]),
+    )
+
+    def add_bus_env(env):
+        seen["base"] = dict(env)
+        result = dict(env)
+        result["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/123/bus"
+        return result
+
+    monkeypatch.setattr(registry_module, "systemd_user_bus_env", add_bus_env)
+    fake_proc = MagicMock(pid=4242)
+    monkeypatch.setattr(registry_module.subprocess, "Popen", MagicMock(return_value=fake_proc))
+    monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: 1)
+    monkeypatch.setattr(registry, "_track_started", lambda *args, **kwargs: None)
+
+    session = registry.spawn_local("echo scoped", cwd=str(tmp_path), task_id="task", survive_restart=True)
+
+    assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+    assert seen["base"]
+    assert registry_module.subprocess.Popen.call_args.kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"] == \
+        "unix:path=/run/user/123/bus"
+
+
+def test_shutdown_stops_survivor_poller_before_it_claims_delivery(tmp_path, monkeypatch):
+    """A shutdown fence must beat the old gateway's poller/marker race."""
+    home = _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    session = _checkpoint_survivor(registry, home, pid=999999, exit_code=0)
+    session.process = None
+    monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "running")
+    claimed = []
+    monkeypatch.setattr(registry, "_claim_survivor_delivery", lambda _session: claimed.append(True) or True)
+
+    registry.stop_survivor_pollers()
+    registry._survivor_poller_loop(session)
+
+    assert claimed == []
+    assert session.exited is False
+
+
 def test_recovered_survivor_emits_single_completion_with_exit_code(tmp_path, monkeypatch):
     home = _home(monkeypatch, tmp_path)
     producer = ProcessRegistry()

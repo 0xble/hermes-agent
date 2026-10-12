@@ -17,7 +17,8 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   the live process without replaying a completion, and polls until exactly one
   completion is emitted. A gone process without an exit file emits one `lost`
   completion. The delivered marker makes restarts and concurrent pollers
-  idempotent.
+  idempotent; shutdown fences the old gateway's survivor pollers before teardown
+  so a completion is not claimed into a queue that the successor cannot drain.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
   processes running. A dedicated `process_manage kill` or explicit internal
   `gateway_stop_all` sweep still terminates them. This is the D3 operator-stop decision.

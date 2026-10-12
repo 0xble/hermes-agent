@@ -765,6 +765,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # Completions the agent already consumed via wait()/read_log() (output in
         # hand): drain loops AND gateway/tui watchers skip them.
         self._completion_consumed: set = set()
+        # Shutdown fences survivor pollers before the old gateway can claim a completion
+        # into an in-memory queue that the successor cannot drain.
+        self._survivor_pollers_stopped = threading.Event()
+        self._survivor_poller_fence = threading.Lock()
         # Sessions merely *observed* exited via poll(). poll() is read-only and must NOT
         # mark consumed (a status check would suppress the watcher's autonomous delivery
         # turn), but the CLI has the poll result inline in the same turn, so
@@ -2654,9 +2658,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         Returns how many it stopped. A session whose systemd scope did not stop is not counted
         (its descendants may live on), and a later sweep retries it even after it finished.
 
-        Sessions with ``persist_on_release=True`` are skipped when ``source`` is an
-        agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
-        timeout, or ``agent_close``): an explicitly persisted background job must survive
+        Sessions with ``persist_on_release=True`` or ``survive_restart=True`` are skipped when
+        ``source`` is an agent-lifecycle sweep (the default ``kill_all`` release path, a gateway turn
+        timeout, or ``agent_close``): an explicitly persistent background job must survive
         session end / compression / error recovery (#41225). An explicit operator stop
         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
         reaches them, so the user can always stop a persisted process on purpose."""
@@ -2667,7 +2671,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
-                and not (lifecycle and s.persist_on_release)
+                and not (lifecycle and (s.persist_on_release or s.survive_restart))
                 and not (source == "gateway_shutdown" and s.survive_restart)
             ]
             targets = [s for s in candidates if not s.exited]

@@ -51,6 +51,9 @@ class ProcessCheckpointMixin:
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
         were recovered as detached sessions."""
+        survivor_pollers_stopped = getattr(self, "_survivor_pollers_stopped", None)
+        if survivor_pollers_stopped is not None:
+            survivor_pollers_stopped.clear()
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,

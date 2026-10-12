@@ -12,9 +12,10 @@ from unittest.mock import MagicMock, patch
 from tools.process_registry import ProcessRegistry, ProcessSession, _CHECKPOINT_FIELDS
 
 
-def _make_session(sid="proc_test123", task_id="t1", persist=False) -> ProcessSession:
+def _make_session(sid="proc_test123", task_id="t1", persist=False, survive=False) -> ProcessSession:
     s = ProcessSession(id=sid, command="sleep 60", task_id=task_id, started_at=0.0)
     s.persist_on_release = persist
+    s.survive_restart = survive
     return s
 
 
@@ -94,6 +95,33 @@ def test_agent_close_owned_loop_skips_persisted_sessions(registry, monkeypatch):
     assert [c[0] for c in calls] == ["proc_volatile"]
     assert all(c[1]["source"] == "agent_close" for c in calls)
     assert persisted.exited is False
+
+
+def test_agent_close_owned_loop_skips_survive_restart_sessions(registry, monkeypatch):
+    """agent.close() must not kill a restart-surviving process before the shutdown sweep."""
+    from types import SimpleNamespace
+
+    from agent.client_lifecycle import ClientLifecycleMixin
+    import tools.process_registry as registry_module
+
+    survivor = _make_session(sid="proc_survivor", task_id="turn-1", survive=True)
+    volatile = _make_session(sid="proc_volatile", task_id="turn-1")
+    registry._running[survivor.id] = survivor
+    registry._running[volatile.id] = volatile
+    calls = _fake_kill_collector(registry)
+
+    agent = SimpleNamespace(_process_owner_task_ids=("turn-1",))
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    import run_agent as ra
+    monkeypatch.setattr(ra, "cleanup_vm", lambda *a, **k: None)
+    monkeypatch.setattr(ra, "cleanup_browser", lambda *a, **k: None)
+    import tools.computer_use.tool as cu
+    monkeypatch.setattr(cu, "release_computer_use_session", lambda *a, **k: None)
+
+    ClientLifecycleMixin._close_task_resources(agent, "turn-1")
+
+    assert [c[0] for c in calls] == ["proc_volatile"]
+    assert survivor.exited is False
 
 
 def test_explicit_operator_stop_still_reaches_persisted_sessions(registry):

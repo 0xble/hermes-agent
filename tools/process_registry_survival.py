@@ -47,6 +47,8 @@ class ProcessSurvivalMixin:
         if dispatch.mode == "scoped":
             session.systemd_unit = f"hermes-worker-{session.id}.scope"
         spawn_env = self._spawn_env(env_vars)
+        if dispatch.mode == "scoped":
+            spawn_env = registry.systemd_user_bus_env(spawn_env)
         proc = subprocess.Popen(
             dispatch.argv,
             text=True,
@@ -67,11 +69,41 @@ class ProcessSurvivalMixin:
             raise
         return session
 
+    def stop_survivor_pollers(self) -> None:
+        """Fence survivor pollers before gateway shutdown drains in-memory notifications."""
+        stopped = getattr(self, "_survivor_pollers_stopped", None)
+        fence = getattr(self, "_survivor_poller_fence", None)
+        if stopped is not None:
+            if fence is None:
+                stopped.set()
+            else:
+                with fence:
+                    stopped.set()
+
+    def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
+        """Finish only while the shutdown fence is open; return whether delivery was queued."""
+        stopped = getattr(self, "_survivor_pollers_stopped", None)
+        fence = getattr(self, "_survivor_poller_fence", None)
+        if fence is None:
+            if stopped is not None and stopped.is_set():
+                return False
+            self._finish_survivor(session, exit_code, reason, source)
+            return True
+        with fence:
+            if stopped is not None and stopped.is_set():
+                return False
+            self._finish_survivor(session, exit_code, reason, source)
+            return True
+
     def _survivor_poller_loop(self, session: ProcessSession):
         """Collect a file-backed local survivor after this or a successor gateway boots."""
+        if getattr(getattr(self, "_survivor_pollers_stopped", None), "is_set", lambda: False)():
+            return
         exit_path = Path(session.exit_path)
         log_path = Path(session.log_path)
         while not session.exited:
+            if getattr(getattr(self, "_survivor_pollers_stopped", None), "is_set", lambda: False)():
+                return
             if session._kill_requested:
                 time.sleep(0.05)
                 continue
@@ -84,7 +116,8 @@ class ProcessSurvivalMixin:
                         exit_code = int(exit_text.splitlines()[-1])
                     except ValueError:
                         exit_code = -1
-                    self._finish_survivor(session, exit_code, "exited", "")
+                    if not self._finish_survivor_if_allowed(session, exit_code, "exited", ""):
+                        return
                     return
                 alive = (
                     session.process.poll() is None
@@ -96,7 +129,8 @@ class ProcessSurvivalMixin:
                     # reporting a genuinely lost process.
                     time.sleep(0.05)
                     if not exit_path.exists() or not exit_path.read_text(encoding="utf-8", errors="replace").strip():
-                        self._finish_survivor(session, None, "lost", "gateway_shutdown")
+                        if not self._finish_survivor_if_allowed(session, None, "lost", "gateway_shutdown"):
+                            return
                         return
                 if log_path.exists():
                     output = log_path.read_text(encoding="utf-8", errors="replace")
@@ -104,7 +138,7 @@ class ProcessSurvivalMixin:
                         session.output_buffer = output[-session.max_output_chars:]
                         session.total_output_chars = len(output)
             except OSError:
-                self._finish_survivor(session, None, "lost", "gateway_shutdown")
+                self._finish_survivor_if_allowed(session, None, "lost", "gateway_shutdown")
                 return
             time.sleep(0.1)
 
