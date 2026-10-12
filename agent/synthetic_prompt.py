@@ -283,15 +283,15 @@ _IMAGE_RECALL_PREFIX = re.compile(
     r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
     re.DOTALL,
 )
-# Data-URL fallback in VisionMessagePrepMixin has no path/advice note. Try the paired form
-# first, so brackets inside normal vision descriptions still use the explicit advice boundary.
-_IMAGE_RECALL_DESCRIPTION = re.compile(
-    r"\[The user attached an image\. Here's what it contains:\n(?P<description>.*?)\](?=\n\n|$)",
-    re.DOTALL,
-)
+# VisionMessagePrepMixin's data-URL fallback has no advice note, only this header + `]`. Its
+# notes are joined by a blank line, then a blank line + the caption. Try the paired form first.
+_IMAGE_DESCRIPTION_HEADER = "[The user attached an image. Here's what it contains:\n"
+_NEXT_IMAGE_DESCRIPTION = "]\n\n" + _IMAGE_DESCRIPTION_HEADER
+# Names and paths can contain `] `; no producer puts human text on a note's own line, so a
+# single-line note ends at its line's last `]`.
 _IMAGE_REFERENCE_RECALL_PREFIX = re.compile(
-    r"\[The user attached an image: [^\n]*?\]\n"
-    r"\[Examine it with the vision_analyze tool using image_url: [^\n]*?\](?=\s|$)",
+    r"\[The user attached an image: [^\n]*\]\n"
+    r"\[Examine it with the vision_analyze tool using image_url: [^\n]*\](?=\n|$)",
 )
 # Only known, single-line attachment metadata emitted by gateway/CLI producers, never arbitrary
 # bracketed human prose. Speech-to-text's quoted transcript is intentionally NOT a metadata note.
@@ -303,8 +303,31 @@ _ATTACHMENT_RECALL_NOTE = re.compile(
     r"|an image but something went wrong when I tried to look at it)"
     r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \()"
     r"|voice message could not be transcribed automatically; the audio is available at: )"
-    r"[^\n]*?\](?=\s|$)"
+    r"[^\n]*\](?=\n|$)"
 )
+
+
+def _image_description_end(text: str) -> int | None:
+    """Index of the closing `]` of a data-URL image note at the start of ``text``, else None.
+
+    The description is free model text and the caption carries no marker, so the producer's format
+    is ambiguous; anchor only on what it guarantees. A following note starts with its exact header.
+    A message ending in `]` is image-only (the whole remainder is the description). Otherwise the
+    caption follows the last `]` + blank line: brackets in description paragraphs cannot leak into
+    it. Known limits, both from captions only: one ending in `]` is indistinguishable from an
+    image-only note and recalls with the description, and one with its own `]` + blank line
+    recalls only its tail.
+    """
+    if not text.startswith(_IMAGE_DESCRIPTION_HEADER):
+        return None
+    start = len(_IMAGE_DESCRIPTION_HEADER)
+    following = text.find(_NEXT_IMAGE_DESCRIPTION, start)
+    if following >= 0:
+        return following
+    if text.endswith("]"):
+        return len(text) - 1
+    end = text.rfind("]\n\n", start)
+    return end if end >= 0 else None
 
 
 def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
@@ -321,20 +344,28 @@ def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None
             if not human:
                 return None
             text = human
-        image = _IMAGE_RECALL_PREFIX.match(text) or _IMAGE_RECALL_DESCRIPTION.match(text)
-        note = None if image else (
+        image = _IMAGE_RECALL_PREFIX.match(text)
+        if image and _NEXT_IMAGE_DESCRIPTION in image.group("description"):
+            image = None  # A data-URL note precedes a paired note; don't span both.
+        description_end = None if image else _image_description_end(text)
+        note = None if image or description_end is not None else (
             _IMAGE_REFERENCE_RECALL_PREFIX.match(text) or _ATTACHMENT_RECALL_NOTE.match(text)
         )
-        if image:
-            description = image.group("description").strip()
+        if image or description_end is not None:
+            description = (image.group("description") if image else
+                           text[len(_IMAGE_DESCRIPTION_HEADER):description_end]).strip()
             # VisionMessagePrepMixin puts failed analysis in the description field, not a
             # separate failure wrapper. Its error is not a semantic image-only fallback.
             if not re.fullmatch(r"Image analysis failed(?:\.|:.*)?", description, re.DOTALL):
                 descriptions.append(description)
         prefix = image or note
-        if not prefix:
+        if prefix:
+            end = prefix.end()
+        elif description_end is not None:
+            end = description_end + 1
+        else:
             return text
-        text = text[prefix.end():].strip()
+        text = text[end:].strip()
     fallback = "\n\n".join(description for description in descriptions if description)
     return fallback if include_synthetic else human_prompt_text(fallback)
 

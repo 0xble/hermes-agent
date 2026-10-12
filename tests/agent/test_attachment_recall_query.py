@@ -140,9 +140,72 @@ def test_current_attachment_producers_cannot_displace_the_caption(tmp_path, prod
     "[User sent an image: /cache/image.png]",
     "[The user sent a voice message: /cache/voice.ogg (duration: 00:12)]",
 ])
-def test_same_line_caption_with_brackets_survives_attachment_metadata(note):
-    caption = "what about [this]"
-    assert auto_recall_query(f"{note} {caption}") == caption
+def test_same_line_text_after_metadata_is_a_documented_limitation(note):
+    """Known limitation: no producer puts human text on a note's line, and names/paths can contain
+    `] `, so a single-line note ends at its line's last `]`. A hand-typed same-line lookalike is
+    consumed with the note (recall skipped) rather than leaking metadata into the query."""
+    assert auto_recall_query(f"{note} what about [this]") == ""
+    assert auto_recall_query(f"{note} what about [this]\n\n{REQUEST}") == REQUEST
+
+
+BRACKETED = "invoice [final] copy"
+
+
+@pytest.mark.parametrize("producer", ["document", "text_document", "placeholder", "media_file", "tui_image"])
+@pytest.mark.parametrize("caption", ["", REQUEST])
+def test_bracketed_attachment_names_and_paths_stay_inside_their_metadata_note(tmp_path, producer, caption):
+    from gateway.run import _build_document_context_note, _build_media_placeholder
+    from gateway.platforms.event import MessageType
+
+    if producer == "document":
+        prompt = _build_document_context_note(f"{BRACKETED}.pdf", "/cache/invoice.pdf", "application/pdf")
+    elif producer == "text_document":
+        prompt = _build_document_context_note(f"{BRACKETED}.txt", f"/cache/{BRACKETED}.txt", "text/plain",
+                                              content_inlined=False)
+    elif producer == "placeholder":
+        prompt = _build_media_placeholder(SimpleNamespace(
+            media_urls=[f"/cache/{BRACKETED}.bin"], media_types=["application/octet-stream"],
+            message_type=MessageType.DOCUMENT))
+    elif producer == "media_file":
+        # The display name is sanitized but the cached path keeps the original characters.
+        prompt = GatewayInboundMixin._prepend_inbound_media_file_notes(
+            "", [], [str(tmp_path / f"a_b_{BRACKETED}.mp4")]).strip()
+    else:
+        from tui_gateway.server import _build_image_ref_message
+
+        image = tmp_path / f"{BRACKETED}.jpg"
+        image.touch()
+        prompt = _build_image_ref_message("", [str(image)])
+    if caption:
+        prompt += "\n\n" + caption
+    assert auto_recall_query(prompt) == caption
+
+
+def _data_url_fallback(monkeypatch, analysis, caption, images=1):
+    from agent.vision_message_prep import VisionMessagePrepMixin
+
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", AsyncMock(
+        return_value=json.dumps({"analysis": analysis})))
+    runner = VisionMessagePrepMixin()
+    setattr(runner, "_anthropic_image_fallback_cache", {})
+    content = [{"type": "image_url", "image_url": {"url": f"data:image/png;base64,aGVsbG8{i}"}}
+               for i in range(images)]
+    if caption:
+        content.append({"type": "text", "text": caption})
+    return runner._preprocess_anthropic_content(content, "user")
+
+
+@pytest.mark.parametrize("analysis", [
+    "Screen [dark mode]\n\nQuoted text: [Check my records]\n\nWipers and glass.",
+    "Ends with a bracketed label [Settings]",
+    "Unbalanced ] bracket]\n\n] and more",
+])
+def test_data_url_description_paragraph_ending_in_bracket_is_not_the_wrapper_boundary(monkeypatch, analysis):
+    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, "")) == analysis
+    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, REQUEST)) == REQUEST
+    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, REQUEST, images=2)) == REQUEST
+    assert auto_recall_query(_data_url_fallback(monkeypatch, analysis, "", images=2)) == (
+        analysis + "\n\n" + analysis)
 
 
 @pytest.mark.parametrize("source", [PATH, "data:image/png;base64,aGVsbG8="])
