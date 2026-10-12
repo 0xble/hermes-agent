@@ -52,11 +52,31 @@ logger = logging.getLogger("gateway.run")
 
 def _eventless_followup_reply_expected(text: Any) -> bool:
     """Derive the reply contract from leftover text when no event object survived the drain."""
-    from gateway.run_busy import _steer_text_without_origin
+    from gateway.run_busy import _STEER_ORIGIN_FOOTER, _STEER_ORIGIN_HEADER, _parse_steer_origin
 
-    event = MessageEvent(text=_steer_text_without_origin(str(text)), reply_expected=None)
-    apply_agent_origin_reply_expectation(event)
-    return event.reply_expected if event.reply_expected is not None else True
+    # steer() and _requeue_pending_steer() join independently authored envelopes.
+    # A relay edge header in one must never grant silence to a human sibling.
+    segments = str(text).split("\n" + _STEER_ORIGIN_HEADER)
+    for index, segment in enumerate(segments):
+        if index:
+            segment = _STEER_ORIGIN_HEADER + segment
+        origin = {}
+        body = segment
+        if segment.startswith(_STEER_ORIGIN_HEADER):
+            parsed = _parse_steer_origin(segment)
+            if parsed is None:
+                return True  # Damaged envelopes are not proof of relay provenance.
+            origin, body = parsed
+        if _STEER_ORIGIN_FOOTER in body:
+            return True  # A damaged header left an unparsed envelope in the body.
+        expectation = origin.get("reply_expected")
+        if expectation is not None and expectation is not False:
+            return True  # Explicit True (or invalid control data) requires a reply.
+        event = MessageEvent(text=body, reply_expected=None)
+        apply_agent_origin_reply_expectation(event)
+        if event.reply_expected is not False:
+            return True
+    return False
 
 
 _tool_call_logger_lock = threading.Lock()

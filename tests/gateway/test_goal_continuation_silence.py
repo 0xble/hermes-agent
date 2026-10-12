@@ -201,13 +201,23 @@ async def test_eventless_followup_requeues_with_its_own_reply_contract(
     hermes_home, origin, defer, text, expected_reply_expected
 ):
     """Real leftover steer envelopes keep relay silence; human text still requires a reply."""
+    await _assert_eventless_followup_reply_contract(
+        hermes_home, origin, defer, text, expected_reply_expected,
+    )
+
+
+async def _assert_eventless_followup_reply_contract(
+    hermes_home, origin, defer, text, expected_reply_expected, explicit_reply_expected=None,
+):
     from gateway.response_filters import display_kind_for_event
     from gateway.turn_context import TurnContext
 
     runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
     runner._draining = False
     if origin == "steer":
-        text = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
+        text = runner._steer_text_with_origin(
+            text, MessageEvent(text=text, source=src, reply_expected=explicit_reply_expected),
+        )
     result: dict[str, object] = {"messages": []}
     if origin == "interrupt":
         result.update(interrupted=True, interrupt_message=text)
@@ -246,12 +256,58 @@ async def test_eventless_followup_requeues_with_its_own_reply_contract(
     assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is (not expected_reply_expected)
 
 
-@pytest.mark.parametrize("damage", ["header", "invalid-json", "nonobject-json", "footer"])
-def test_eventless_followup_does_not_scan_arbitrary_origin_preambles(hermes_home, damage):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+async def test_addressed_relay_leftover_handoff_keeps_explicit_reply_expected(hermes_home, defer):
+    await _assert_eventless_followup_reply_contract(
+        hermes_home, "steer", defer,
+        "[relay from=agent:source receipt=r1]\nplease answer me", True, True,
+    )
+
+
+@pytest.mark.parametrize("joiner", ["steer", "requeue"])
+@pytest.mark.parametrize(
+    ("texts", "expected_reply_expected"),
+    [
+        (("[relay from=agent:source receipt=r1]\nNO_REPLY", "please show me the current status"), True),
+        (("please show me the current status", "NO_REPLY\n[relay from=agent:source receipt=r2]"), True),
+        (("[relay from=agent:source receipt=r1]\nNO_REPLY", "NO_REPLY\n[relay from=agent:source receipt=r2]"), False),
+    ],
+    ids=("relay-human", "human-trailing-relay", "relay-relay"),
+)
+def test_joined_eventless_steers_require_a_reply_if_any_segment_is_human(
+    hermes_home, joiner, texts, expected_reply_expected
+):
+    from agent.agent_runtime_helpers import _requeue_pending_steer
+    from agent.interrupt_control import InterruptControlMixin
     from gateway.run_turn import _eventless_followup_reply_expected
 
     runner, _, _, src, _ = _runner_with_goal(hermes_home)
-    text = "[relay from=agent:source receipt=r1]\nNO_REPLY"
+    agent = InterruptControlMixin()
+    for text in texts:
+        wrapped = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
+        if joiner == "steer":
+            assert agent.steer(wrapped) is True
+        else:
+            _requeue_pending_steer(agent, wrapped)
+
+    reply_expected = _eventless_followup_reply_expected(agent._pending_steer)
+    assert reply_expected is expected_reply_expected
+    assert silence_allowed(None, reply_expected) is (not expected_reply_expected)
+
+
+@pytest.mark.parametrize("damage", ["header", "invalid-json", "nonobject-json", "footer"])
+@pytest.mark.parametrize("relay_header_position", ["leading", "trailing"])
+@pytest.mark.parametrize("position", ["single", "before-relay", "after-relay"])
+def test_eventless_followup_does_not_scan_arbitrary_origin_preambles(
+    hermes_home, damage, relay_header_position, position
+):
+    from gateway.run_turn import _eventless_followup_reply_expected
+
+    runner, _, _, src, _ = _runner_with_goal(hermes_home)
+    relay_header = "[relay from=agent:source receipt=r1]"
+    text = (f"{relay_header}\nNO_REPLY" if relay_header_position == "leading"
+            else f"NO_REPLY\n{relay_header}")
     lines = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src)).split("\n")
     line_index, replacement = {
         "header": (0, "quoted example:"),
@@ -260,4 +316,13 @@ def test_eventless_followup_does_not_scan_arbitrary_origin_preambles(hermes_home
         "footer": (2, "a different instruction"),
     }[damage]
     lines[line_index] = replacement
-    assert _eventless_followup_reply_expected("\n".join(lines)) is True
+    damaged = "\n".join(lines)
+    if position != "single":
+        from agent.interrupt_control import InterruptControlMixin
+
+        valid = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
+        agent = InterruptControlMixin()
+        for segment in ((damaged, valid) if position == "before-relay" else (valid, damaged)):
+            assert agent.steer(segment) is True
+        damaged = agent._pending_steer
+    assert _eventless_followup_reply_expected(damaged) is True

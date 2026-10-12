@@ -67,9 +67,30 @@ async def test_busy_injection_preserves_original_routing_fields(route, platform,
                       _hash_chat_id if key in ("chat_id", "chat_id_alt", "parent_chat_id") else _hash_id)
             expected[key] = hasher(value)
             assert origin[key] != value
+    expected["reply_expected"] = event.reply_expected
     assert origin == expected
     assert asdict(source) == original_source
     assert event.text == ("/steer request" if route == "explicit" else "request")
+
+
+@pytest.mark.parametrize("reply_expected", [True, False, None])
+@pytest.mark.parametrize("redact_pii", [False, True])
+@pytest.mark.parametrize("relay", [False, True])
+def test_leftover_origin_reply_contract_is_not_pii(reply_expected, redact_pii, relay, tmp_path, monkeypatch):
+    from gateway.run_turn import _eventless_followup_reply_expected
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        f"privacy:\n  redact_pii: {str(redact_pii).lower()}\n", encoding="utf-8",
+    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1")
+    text = "[relay from=agent:source receipt=r1]\nstatus?" if relay else "status?"
+    event = MessageEvent(text=text, source=source, reply_expected=reply_expected)
+    rendered = GatewayRunner(config=GatewayConfig())._steer_text_with_origin(text, event)
+
+    assert json.loads(rendered.splitlines()[1])["reply_expected"] is reply_expected
+    # Explicit False alone must not turn a human steer into silent machinery.
+    assert _eventless_followup_reply_expected(rendered) is (not relay or reply_expected is True)
 
 
 def test_origin_is_lossless_data_not_new_prompt_lines_or_a_guessed_target():
