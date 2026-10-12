@@ -206,7 +206,11 @@ def _legacy_tar_filter(member, dest: str):
         if os.path.isabs(name):
             raise tarfile.ExtractError(f"absolute archive path: {name!r}")
         target = os.path.realpath(os.path.join(dest, name))
-        if os.path.commonpath([target, dest]) != dest:
+        try:
+            inside = os.path.commonpath([target, dest]) == dest
+        except ValueError:  # another drive (Windows ``C:foo``) is outside too
+            inside = False
+        if not inside:
             raise tarfile.ExtractError(f"archive path escapes destination: {name!r}")
 
     original_name = member.name

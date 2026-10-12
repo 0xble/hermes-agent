@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -111,6 +112,45 @@ def test_permission_errors_on_live_holder_visibility_keep_packs(scope, monkeypat
         fd.unlink()
     monkeypatch.setattr(type(pack), "stat", denied_stat)
     monkeypatch.setattr(type(pack), "read_text", denied_read)
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert pack.exists()
+
+
+@pytest.mark.platforms("posix")
+def test_unreadable_foreign_non_git_processes_do_not_veto(scope, monkeypatch):
+    """A non-root sweep cannot read root's or another user's /proc fd/maps. Those processes
+    cannot write the pack directory, so they cannot be its live writer (review of #479)."""
+    table, ours, _ = scope
+    proc = _process(table, 1, Path("/"), name="systemd", argv=("/sbin/init",))
+    pack_dir = ours / ".git" / "objects" / "pack"
+    pack_dir.chmod(0o755)
+    pack = _aged(pack_dir / "tmp_pack_dead")
+    original_iterdir, original_stat = type(pack).iterdir, type(pack).stat
+    foreign = os.getuid() + 1 if os.getuid() else 1
+
+    class _Stat:
+        st_uid = foreign
+
+    def denied(path):
+        if path == proc / "fd":
+            raise PermissionError(path)
+        return original_iterdir(path)
+
+    def foreign_owner(path, *args, **kwargs):
+        return _Stat() if path == proc else original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(pack), "iterdir", denied)
+    monkeypatch.setattr(type(pack), "stat", foreign_owner)
+    assert gitlock.clear_stale_tmp_packs(ours) == [str(pack)]
+    assert not pack.exists()
+
+    # Our own uid, or a Git of any uid, stays a veto when it cannot be inspected.
+    pack = _aged(pack_dir / "tmp_pack_dead")
+    _Stat.st_uid = os.getuid()
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert pack.exists()
+    _Stat.st_uid = foreign
+    (proc / "comm").write_text("git\n")
     assert gitlock.clear_stale_tmp_packs(ours) == []
     assert pack.exists()
 

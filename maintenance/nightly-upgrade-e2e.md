@@ -61,8 +61,12 @@ paths, then inspect **every** process's descriptors and mappings. Device/inode
 comparison protects hardlinks and closed-fd mmap holders; a pack-directory
 handle protects pending outputs. Aged unheld packs may then be swept even beside
 unplaced unrelated Git. Unknown configuration/output forms, rejected metadata
-(including malformed `HEAD`), unreadable live process/fd/maps visibility and
-unavailable `/proc` still veto. A disappearing process/fd is not a live holder.
+(including malformed `HEAD`), unreadable fd/maps of our own uid's processes or
+of any Git, an unnamed process that could write the pack directory, and
+unavailable `/proc` still veto. Another user's non-Git process (root's PID 1, a
+daemon) is never readable by a non-root sweeper and cannot create or promote
+packs; it does not block the sweep. A disappearing process/fd is not a live
+holder.
 Young files retain the unchanged 600-second floor. Normal Git transfer temps
 stay open until promotion; visible repository owners retain packs even with
 closed handles. Non-Linux retains the conservative fallback. Do not reuse

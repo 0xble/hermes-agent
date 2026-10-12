@@ -311,6 +311,7 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -
     for proc in processes:
         if not proc.name.isdecimal():
             continue
+        name = None
         try:
             name = proc.joinpath("comm").read_text(encoding="utf-8-sig").strip()
             if name == "git" or name.startswith("git-"):
@@ -324,10 +325,32 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -
                 return True
         except (OSError, RuntimeError, ValueError, StopIteration, IndexError):
             try:
-                proc.stat()
+                uid = proc.stat().st_uid
             except FileNotFoundError:
                 continue
             except OSError:
                 return True
+            if _uninspectable_non_git(name, uid, path.parent):
+                continue
             return True
     return False
+
+
+def _uninspectable_non_git(name: Optional[str], uid: int, directory: Path) -> bool:
+    """Another user's non-Git process whose fd/maps we may not read cannot veto a sweep.
+
+    A non-root sweeper can never read root's or other users' fd/maps, so treating that as a
+    veto would stop every sweep on an ordinary host. Only Git creates, promotes or renames
+    ``tmp_*`` packs; a non-Git reader keeps its inode after unlink, so its data is safe.
+    Git (by name), our own uid, and an unknown name for a process that could write the
+    directory (as in _early_recovery._could_write) remain vetoes.
+    """
+    if uid == os.geteuid():  # windows-footgun: ok — Linux-only path (_linux_process_scope)
+        return False
+    if name is not None:
+        return not (name == "git" or name.startswith("git-"))
+    try:
+        st = os.stat(directory)
+    except OSError:
+        return False
+    return not (uid in (0, st.st_uid) or st.st_mode & 0o022)
