@@ -75,6 +75,10 @@ _DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM 
                                "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
                                "AND (display_order IS NULL OR display_identity IS NULL)" + _DISPLAY_ACTIVE_CLAUSE)
 _SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
+# Display-fold plan: row id -> (stored identity, recomputed identity, user display_metadata).
+# The third slot is _NOT_A_USER_ROW for every non-user row (only user rows key on metadata).
+_NOT_A_USER_ROW = object()
+_FoldPlan = Dict[int, Tuple[Optional[bytes], bytes, Any]]
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
@@ -948,7 +952,7 @@ class SessionMessagesMixin:
         self, conn, session_id: str, compacted_messages: List[Dict[str, Any]], covered: List[int], *,
         tail_count: int, carried_messages: Optional[List[Dict[str, Any]]], patched_model_config: Any,
         patch: bool, merged_away: Set[int],
-        fold_plan: Optional[Dict[int, Tuple[Optional[bytes], bytes]]] = None,
+        fold_plan: Optional[_FoldPlan] = None,
     ) -> int:
         """Archive *covered* as summarized and clone every other active row after the new set.
 
@@ -1238,8 +1242,8 @@ class SessionMessagesMixin:
         # copy in a newer generation has a higher id than messages emitted after the original.
         return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
 
-    def _display_fold_plan(self, session_id: str) -> Optional[Dict[int, Tuple[Optional[bytes], bytes]]]:
-        """``{row id: (stored identity, recomputed identity)}`` for every display-visible row of
+    def _display_fold_plan(self, session_id: str) -> Optional[_FoldPlan]:
+        """``{row id: (stored identity, recomputed identity, user metadata)}`` for every display-visible row of
         *session_id*, read from one pooled-reader snapshot WITHOUT the writer lock.
 
         Recomputing the display key decodes every row the session ever compacted (thousands of
@@ -1248,12 +1252,14 @@ class SessionMessagesMixin:
         ``archive_and_compact``). The plan is only a hint: :meth:`_reconcile_display_orders`
         reuses a recomputed identity only while the row's stored identity still equals the one
         this snapshot saw. A content, role, timestamp, tool or display_kind change in between
-        nulls the stored identity (``messages_display_identity_update``), so that row and every
-        row the snapshot did not see are recomputed under the lock. ``None`` (no WAL reader, a
-        read-only store, any read error) keeps the full in-lock scan."""
+        nulls the stored identity (``messages_display_identity_update``). ``display_metadata``
+        is the one key input that trigger does not watch, and only user rows key on it, so the
+        plan keeps each user row's metadata and the lock re-reads that column for user rows only.
+        Every changed row and every row the snapshot did not see is recomputed under the lock.
+        ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
         if not session_id or getattr(self, "read_only", False) or not getattr(self, "_wal_active", False):
             return None
-        plan: Dict[int, Tuple[Optional[bytes], bytes]] = {}
+        plan: _FoldPlan = {}
         try:
             with self._read_ctx() as conn:
                 if conn is self._conn:  # degraded read path runs on the writer under its lock
@@ -1266,8 +1272,9 @@ class SessionMessagesMixin:
                         if not rows:
                             break
                         for row in rows:
-                            plan[row["id"]] = (row["display_identity"],
-                                               self._display_identity(self._display_dedupe_key(row)))
+                            plan[row["id"]] = (
+                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)),
+                                row["display_metadata"] if row["role"] == "user" else _NOT_A_USER_ROW)
                         last_id = rows[-1]["id"]
                 finally:
                     if conn.in_transaction:
@@ -1287,7 +1294,7 @@ class SessionMessagesMixin:
         return [rows[row_id] for row_id in sorted(rows)]
 
     def _reconcile_display_orders(self, conn, session_id: str,
-                                  plan: Optional[Dict[int, Tuple[Optional[bytes], bytes]]] = None) -> None:
+                                  plan: Optional[_FoldPlan] = None) -> None:
         """Re-fold split display generations by the recomputed display key.
 
         A compaction generation that computed the display identity differently (or cloned
@@ -1326,10 +1333,20 @@ class SessionMessagesMixin:
             conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
 
     def _fold_display_orders(self, conn, visible: List[Tuple[int, Optional[bytes], Optional[int]]],
-                             plan: Dict[int, Tuple[Optional[bytes], bytes]]) -> None:
+                             plan: _FoldPlan) -> None:
         """The full scan's fold over *visible*, recomputing only rows *plan* cannot vouch for."""
         stale = [row_id for row_id, stored, _order in visible
                  if stored is None or plan.get(row_id, (None,))[0] != stored]
+        stale_set = set(stale)
+        # A role change nulls the stored identity, so an unchanged row keeps the snapshot's role.
+        users = [row_id for row_id, _stored, _order in visible
+                 if row_id not in stale_set and plan[row_id][2] is not _NOT_A_USER_ROW]
+        for start in range(0, len(users), 500):
+            chunk = users[start:start + 500]
+            for row_id, metadata in conn.execute(
+                    f"SELECT id, display_metadata FROM messages WHERE id IN ({_placeholders(chunk)})", chunk):
+                if metadata != plan[row_id][2]:
+                    stale.append(row_id)
         fresh: Dict[int, bytes] = {}
         for start in range(0, len(stale), 500):
             chunk = stale[start:start + 500]
