@@ -306,20 +306,22 @@ async def _send_telegram_copy_document(token, chat_id, message, thread_id=None):
 
 def _telegram_rich_adapter(message, bot, rich_messages, allow_cjk_rich_messages=False):
     """Return a lightweight adapter carrying the live rich eligibility rules."""
-    from gateway.config import _coerce_bool, normalize_telegram_rich_messages
-    mode = normalize_telegram_rich_messages(rich_messages)
-    if mode == "never" or not inspect.iscoroutinefunction(getattr(bot, "do_api_request", None)):
+    try:
+        from gateway.config import _coerce_bool, normalize_telegram_rich_messages
+        mode = normalize_telegram_rich_messages(rich_messages)
+        if mode == "never" or not inspect.iscoroutinefunction(getattr(bot, "do_api_request", None)):
+            return None
+        from plugins.platforms.telegram.adapter import TelegramAdapter, _normalize_dollar_entities
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter._rich_message_mode = mode
+        adapter._rich_messages_enabled = True
+        adapter._allow_cjk_rich_messages = _coerce_bool(allow_cjk_rich_messages, default=False)
+        adapter._rich_send_disabled = False
+        adapter._bot = bot
+        return adapter if adapter._should_attempt_rich(_normalize_dollar_entities(message)) else None
+    except Exception as error:  # health: allow BLE001 -- Optional rich setup has not sent anything; legacy delivery remains safe.
+        logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _sanitize_error_text(error))
         return None
-    from plugins.platforms.telegram.adapter import TelegramAdapter, _normalize_dollar_entities
-    adapter = TelegramAdapter.__new__(TelegramAdapter)
-    adapter._rich_message_mode = mode
-    adapter._rich_messages_enabled = True
-    adapter._allow_cjk_rich_messages = _coerce_bool(allow_cjk_rich_messages, default=False)
-    adapter._rich_send_disabled = False
-    adapter._bot = bot
-    if not adapter._should_attempt_rich(_normalize_dollar_entities(message)):
-        return None
-    return adapter
 
 
 async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_link_previews, adapter):
@@ -332,12 +334,21 @@ async def _send_telegram_rich(bot, chat_id, message, thread_kwargs, *, disable_l
     """
     adapter._disable_link_previews = disable_link_previews
     payload = {**adapter._rich_payload_base(chat_id, message), **thread_kwargs}
+    flood_retried = False
 
     while True:
         try:
             response = await bot.do_api_request("sendRichMessage", api_kwargs=dict(payload))
             break
         except Exception as error:  # health: allow BLE001 -- Bot API boundary returns sanitized errors; only definite rejection permits resend.
+            if not flood_retried and getattr(error, "retry_after", None) is not None:
+                delay = _telegram_retry_delay(error, 0)
+                if delay is not None:
+                    flood_retried = True
+                    logger.warning("Telegram rich send rate-limited, retrying once in %.1fs: %s",
+                                   delay, _sanitize_error_text(error))
+                    await asyncio.sleep(delay)
+                    continue
             if _is_telegram_thread_not_found(error) and payload.get("message_thread_id") is not None:
                 logger.warning("Thread %s not found in rich Telegram send, retrying without message_thread_id",
                                payload.pop("message_thread_id"))
