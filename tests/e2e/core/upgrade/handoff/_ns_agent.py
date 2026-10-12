@@ -50,13 +50,18 @@ def _read(path: str) -> bytes:
 
 
 def _procs() -> list[dict]:
-    # CI may lack usable bubblewrap. HOME is already the fixture's process
-    # ownership boundary in _reaper: never expose other files' processes to
-    # signal-injection cells when /proc is the shared runner's process table.
-    home = os.environ.get("HOME")
-    if not home:
-        return []
-    needle = f"HOME={home}".encode()
+    # NamespaceHost explicitly declares which ownership boundary it established.
+    # A real PID namespace includes children with changed/missing HOME; only the
+    # no-bwrap fallback uses _reaper's exact HOME boundary on the shared runner.
+    mode = os.environ.get("HERMES_E2E_NAMESPACE_MODE")
+    needle = None
+    if mode == "home":
+        home = os.environ.get("HOME")
+        if not home:
+            return []
+        needle = f"HOME={home}".encode()
+    elif mode != "pid":
+        return []  # Undeclared/invalid isolation is never permission to scan the host.
     rows = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -66,7 +71,7 @@ def _procs() -> list[dict]:
         if fields is None:
             continue
         environment = _read(f"/proc/{pid}/environ").split(b"\0")
-        if needle not in environment:
+        if needle is not None and needle not in environment:
             continue
         env = {}
         for item in environment:

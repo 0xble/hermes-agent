@@ -43,7 +43,8 @@ class NamespaceHost:
         _reaper.adopt_orphans()
         self._proc = subprocess.Popen(
             H.sandbox_argv([sys.executable, "-u", str(_AGENT)], writable=[root]),
-            env=env, cwd=str(root), text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            env={**env, "HERMES_E2E_NAMESPACE_MODE": "pid" if self._isolated else "home"},
+            cwd=str(root), text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=open(root / "ns-agent.stderr", "w"),  # noqa: SIM115 - lives as long as the sandbox
             start_new_session=True,
         )
@@ -108,7 +109,7 @@ class NamespaceHost:
         return int(msg["pid"])
 
     def procs(self) -> list[dict]:
-        """Fixture-owned processes, with PIDs as the sandbox sees them."""
+        """Every namespace process, or exact-HOME-owned processes in the CI fallback."""
         return self.call({"op": "procs"}, timeout=60)["procs"]
 
     def kill(self, pid: int, sig: int = signal.SIGTERM) -> bool:

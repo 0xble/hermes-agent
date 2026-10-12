@@ -14,7 +14,75 @@ import pytest
 if TYPE_CHECKING:
     from tests.e2e.core.upgrade.handoff._nshost import NamespaceHost
 
-pytestmark = pytest.mark.platforms("linux")
+@pytest.fixture
+def proc_table(monkeypatch):
+    """Controlled /proc boundary: no native process discovery or signalling."""
+    from unittest.mock import Mock
+
+    from tests.e2e.core.upgrade.handoff import _ns_agent as agent
+
+    environments = {
+        101: b"HOME=/fixture/home\0HERMES_E2E_UNIT=owned\0",
+        102: b"HOME=/fixture/home-other\0HERMES_E2E_UNIT=changed-home\0",
+        103: b"HERMES_E2E_UNIT=no-home\0",
+    }
+    listdir = os.listdir
+    # /proc directory entries are strings; the kernel stat fields stay controlled.
+    monkeypatch.setattr(os, "listdir", lambda path: [str(pid) for pid in environments]
+                        if path == "/proc" else listdir(path))
+    monkeypatch.setattr(agent, "_stat", lambda pid: ["S", "1"] + ["0"] * 17 + [str(pid)])
+    monkeypatch.setattr(agent, "_read", lambda path: environments[int(path.split("/")[2])]
+                        if path.endswith("/environ") else b"python\0worker\0")
+    monkeypatch.setattr(os, "getpid", lambda: 101)
+    kill = Mock()
+    monkeypatch.setattr(os, "kill", kill)
+    return agent, kill
+
+
+@pytest.mark.parametrize("mode,home,expected", [
+    ("pid", "/fixture/home", {101, 102, 103}),
+    ("pid", None, {101, 102, 103}),
+    ("home", "/fixture/home", {101}),
+    ("home", None, set()),
+    (None, "/fixture/home", set()),
+    ("invalid", "/fixture/home", set()),
+])
+def test_agent_enumeration_and_signals_follow_explicit_mode(proc_table, monkeypatch, mode, home, expected):
+    agent, kill = proc_table
+    for key, value in (("HERMES_E2E_NAMESPACE_MODE", mode), ("HOME", home)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    rows = agent._procs()
+    assert {row["pid"] for row in rows} == expected
+    if 102 in expected:
+        assert next(row for row in rows if row["pid"] == 102)["env"]["HERMES_E2E_UNIT"] == "changed-home"
+    assert agent._kill({"pid": 101}) == {"ok": False}  # Never signal the agent itself.
+    for pid in (102, 103, 999, -1):
+        assert agent._kill({"pid": pid}) == {"ok": pid in expected}
+    assert [call.args for call in kill.call_args_list] == [
+        (pid, signal.SIGTERM) for pid in (102, 103) if pid in expected
+    ]
+
+
+@pytest.mark.parametrize("isolated,mode", [(True, "pid"), (False, "home")])
+def test_host_passes_actual_isolation_mode_only_to_agent(tmp_path, monkeypatch, isolated, mode):
+    from unittest.mock import Mock
+
+    from tests.e2e.core.upgrade.handoff import _nshost
+
+    monkeypatch.setattr(_nshost.H, "BWRAP_OK", isolated)
+    monkeypatch.setattr(_nshost.H, "sandbox_argv", lambda argv, **kwargs: argv)
+    monkeypatch.setattr(_nshost._reaper, "adopt_orphans", Mock())
+    monkeypatch.setattr(_nshost.threading, "Thread", Mock())
+    monkeypatch.setattr(_nshost.NamespaceHost, "call", Mock(return_value={"pid": 101}))
+    popen = Mock()
+    monkeypatch.setattr(_nshost.subprocess, "Popen", popen)
+    env = {"HOME": str(tmp_path), "HERMES_E2E_NAMESPACE_MODE": "inherited-wrong-mode"}
+    _nshost.NamespaceHost(tmp_path, env)
+    assert popen.call_args.kwargs["env"]["HERMES_E2E_NAMESPACE_MODE"] == mode
+    assert env["HERMES_E2E_NAMESPACE_MODE"] == "inherited-wrong-mode"
 
 
 @contextmanager
@@ -36,6 +104,7 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Namespace
         assert host.close() == []
 
 
+@pytest.mark.platforms("linux")
 def test_fallback_neither_exposes_nor_signals_another_fixture(tmp_path, monkeypatch):
     sibling = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"],
@@ -58,6 +127,7 @@ def test_fallback_neither_exposes_nor_signals_another_fixture(tmp_path, monkeypa
         sibling.wait(timeout=10)
 
 
+@pytest.mark.platforms("linux")
 def test_fallback_close_reaps_a_detached_completion_child(tmp_path, monkeypatch):
     from tests.e2e.core.dashboard import _reaper
 
