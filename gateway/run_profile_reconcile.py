@@ -238,6 +238,7 @@ class GatewayProfileReconcileMixin:
                     await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
+        await self._prime_profile_session_dbs(profile_homes)
 
     async def _unserve_profile(self, name: str, home: "Path") -> None:
         """Stop and unroute one profile: cancel its reconnects, tear down its adapters, drop its
