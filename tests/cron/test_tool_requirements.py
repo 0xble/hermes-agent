@@ -276,3 +276,52 @@ def test_absolute_attached_skill_identifier_is_normalized(tmp_path, monkeypatch)
     job = {"enabled_toolsets": ["file"], "skills": [str(skill_dir)]}
     issues = tool_requirements.job_tool_requirement_issues(job, cfg={})
     assert len(issues) == 1 and "terminal" in issues[0]
+
+
+def test_attached_bundle_members_and_instruction_are_scanned(tmp_path, monkeypatch):
+    from agent.skill_utils import TIER_LOCAL
+    from tools import skills_tool
+
+    skills = tmp_path / "skills"
+    (skills / "audit").mkdir(parents=True)
+    (skills / "audit" / "SKILL.md").write_text("---\nname: audit\n---\nRun `loops finding add --text x`.\n")
+    (skills / "daily").mkdir()
+    (skills / "daily" / "SKILL.md").write_text("---\nname: daily\n---\nRead files only.\n")
+    bundles = tmp_path / "bundles"
+    bundles.mkdir()
+    (bundles / "daily.yaml").write_text("name: daily\nskills: [audit]\ninstruction: Use Pick the Destination.\n")
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
+    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={})
+    assert len(issues) == 2
+    assert "terminal access" in issues[0] and "relay" in issues[1]
+
+
+def test_project_skill_diagnosis_persists_nothing_under_home(tmp_path, monkeypatch):
+    import agent.skill_utils as su
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "proj"
+    (repo / ".git").mkdir(parents=True)
+    skill = repo / ".hermes" / "skills" / "audit"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: audit\n---\nRun `loops finding add --text x`.\n")
+    (home / "config.yaml").write_text(f"skills:\n  external_dirs: []\n  trusted_project_dirs: ['{repo}']\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.chdir(repo)
+    su._external_dirs_cache_clear()
+    su._PROJECT_QUARANTINE_CACHE.clear()
+    before = sorted(p.relative_to(home) for p in home.rglob("*"))
+    try:
+        issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["audit"]}, cfg={})
+    finally:
+        su._external_dirs_cache_clear()
+    assert len(issues) == 1 and "terminal" in issues[0]
+    assert sorted(p.relative_to(home) for p in home.rglob("*")) == before
+
+
+def test_execute_code_without_terminal_call_needs_no_shell():
+    job = {"enabled_toolsets": ["file", "code_execution"],
+           "prompt": "Use execute_code(...) to batch read_file calls."}
+    assert job_tool_requirement_issues(job, cfg={}) == []
