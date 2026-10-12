@@ -254,6 +254,8 @@ class TestReclaim:
         assert archived[0].read_text() == "important scribbles\n"
         assert not (native_home / ".hermes").exists()
 
+    # Windows forbids '"' and newlines in filenames.
+    @pytest.mark.platforms("posix")
     def test_reclaim_preserves_quoted_untracked_filenames(self, repo, tmp_path, monkeypatch):
         """An ordinary file must not mask a quoted filename lost during archive."""
         archive_home = tmp_path / "archive-home"
