@@ -113,10 +113,11 @@ _EVIDENCE_MAX_ENTRIES = 8
 _EVIDENCE_SCAN_ROWS = 120
 _EVIDENCE_OUTPUT_CHARS = 800
 _EVIDENCE_CALL_CHARS = 240
-# Bookkeeping and retrieval tools prove nothing about the goal's outcome.
+# Goal/memory bookkeeping cannot independently prove an outcome. Capability
+# discovery, installation and readback can be the outcome itself, so keep their
+# recorded results in both the recent ledger and the cited-evidence lookup.
 _EVIDENCE_EXCLUDED_TOOLS = frozenset({
-    "skill_view", "skills_list", "skill_manage", "tool_search", "tool_describe", "memory",
-    "session_search", "todo", "todo_list", "clarify", "goal_set",
+    "memory", "session_search", "todo", "todo_list", "clarify", "goal_set",
 })
 _EVIDENCE_EXCLUDED_TOOL_PREFIXES = ("hindsight_",)
 # Passed to the SessionDB finders so exclusions apply before their row limits.
@@ -1532,7 +1533,7 @@ _READ_ONLY_STATUS_CALL_RE = re.compile(
 )
 _READ_ONLY_STATUS_TOOLS = frozenset({
     "browser_console", "browser_get_images", "browser_snapshot", "read_file", "search_files",
-    "web_extract", "web_search",
+    "web_extract", "web_search", "skill_view", "skills_list", "tool_search", "tool_describe",
 })
 
 

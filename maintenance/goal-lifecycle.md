@@ -67,6 +67,22 @@ Failed or interrupted model turns do not run completion judging.
   red without the patch. Rollback reverts the source change; old goal rows load
   with a zero dispute counter and no schema change.
 
+- Fork patch identity: `goal-capability-evidence`. Corrects the shared exclusions
+  used by `goal-judge-evidence` and `goal-adaptive`: capability discovery,
+  installation and readback results can prove the goal's outcome. `skill_view`,
+  `skills_list`, `skill_manage`, `tool_search` and `tool_describe` reach the bounded,
+  redacted recent ledger and citation lookup, including archived results. Merely
+  reading/discovering a capability remains read-only for no-progress detection;
+  `skill_manage` remains actionable. Goal/memory bookkeeping stays excluded.
+  This fixes a skill-deployment goal whose judge repeatedly requested a successful
+  load that the evidence filter hid, even when full (not deduplicated) results
+  existed. No forced DONE, pause, budget, delivery or prompt change is introduced.
+  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_capability_evidence.py
+  tests/hermes_cli/test_goal_judge_evidence.py tests/hermes_cli/test_goal_adaptive.py`.
+  Retire when the selected upstream passes the same recorded-capability proof;
+  rollback restores only these evidence/read-only classifications. No schema or
+  live-state migration is needed.
+
 - Fork patch identity: `unlimited-goal-budget`. `goals.max_turns: 0` is a durable unlimited sentinel: config consumers preserve zero, serialized and migrated goal rows round-trip it, and the standing-goal continuation checks skip only the finite budget pause. Kanban task budgets retain their existing single-shot and finite semantics. Done, blocked, judge-failure, dispute, wait, pause, resume, clear, and positive finite budgets remain unchanged. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/tui_gateway/test_goal_command.py`. Retire when the selected upstream release preserves zero through the same surfaces and passes this proof; rollback reverts this identity's normalization, budget guards, notices, docs, and tests.
 
 - Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork

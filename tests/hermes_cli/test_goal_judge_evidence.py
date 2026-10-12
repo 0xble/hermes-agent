@@ -94,7 +94,7 @@ def test_evidence_excludes_bookkeeping_tools_and_pre_goal_results(hermes_home):
     time.sleep(0.01)
     since = time.time()
     time.sleep(0.01)
-    _record_tool_call(db, sid, "skill_view", {"name": "hermes"}, "skill body", call_id="skill")
+    _record_tool_call(db, sid, "goal_set", {"action": "status"}, "goal state", call_id="goal")
     _record_tool_call(db, sid, "hindsight_recall", {"query": "x"}, "memories", call_id="mem")
     _record_tool_call(db, sid, "terminal", {"command": "./bin/check"}, "90 passed", call_id="check")
 
