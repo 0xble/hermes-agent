@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -42,6 +43,9 @@ def _repository_dirs(cwd: Path, git_dir: Optional[str] = None) -> set[Path]:
         for parent in (cwd, *cwd.parents):
             marker = parent / ".git"
             if marker.is_dir():
+                # Git skips metadata it rejects and keeps walking: never stop at it, never guess past it.
+                if not _is_git_directory(marker):
+                    raise ValueError("repository metadata Git would reject")
                 metadata = marker.resolve()
                 break
             if marker.is_file():
@@ -51,6 +55,8 @@ def _repository_dirs(cwd: Path, git_dir: Optional[str] = None) -> set[Path]:
                 metadata = (parent / relative.strip()).resolve()
                 break
             if (parent / "HEAD").is_file() and (parent / "objects").is_dir():
+                if not _is_git_directory(parent):
+                    raise ValueError("repository metadata Git would reject")
                 metadata = parent.resolve()
                 break
         if metadata is None:
@@ -73,11 +79,30 @@ _SERVER_FLAGS = frozenset({
 })
 
 
+_HEX_OID = re.compile(rb"[0-9a-fA-F]{40}")
+
+
+def _valid_head(head: Path) -> bool:
+    """Git's validate_headref() for a regular HEAD file."""
+    if head.is_symlink():
+        # Git's symlink rule has differed across versions; an unproven choice keeps the veto.
+        raise ValueError("symlinked HEAD")
+    if not head.is_file():
+        return False
+    with head.open("rb") as stream:
+        content = stream.read(255).partition(b"\0")[0]
+    if content.startswith(b"ref:"):
+        if content[4:].lstrip(b" \t\n\r").startswith(b"refs/"):
+            return True
+    return _HEX_OID.match(content) is not None
+
+
 def _is_git_directory(path: Path) -> bool:
-    # Git's is_git_directory(): HEAD plus objects/ and refs/, in the common dir when linked.
+    # Git's is_git_directory(): a valid HEAD plus objects/ and refs/, in the common dir when
+    # linked. enter_repo() skips a candidate whose HEAD Git rejects, so this must reject it too.
     common = path / "commondir"
     store = path / common.read_text(encoding="utf-8-sig").strip() if common.is_file() else path
-    return (path / "HEAD").is_file() and (store / "objects").is_dir() and (store / "refs").is_dir()
+    return (store / "objects").is_dir() and (store / "refs").is_dir() and _valid_head(path / "HEAD")
 
 
 def _server_repository(operands: list[str]) -> str:
@@ -111,7 +136,11 @@ def _server_repository(operands: list[str]) -> str:
             prefix, separator, relative = candidate.read_text(encoding="utf-8-sig").strip().partition(":")
             if prefix != "gitdir" or not separator or not relative.strip():
                 raise ValueError("unrecognized gitfile")
-            return str(candidate.parent / relative.strip())
+            # Git commits to a gitfile and fails if its target is invalid; it never falls through.
+            target = candidate.parent / relative.strip()
+            if not _is_git_directory(target):
+                raise ValueError("gitfile target is not a repository")
+            return str(target)
         if candidate.is_dir() and _is_git_directory(candidate):
             return str(candidate)
     raise ValueError("server repository unavailable")

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import os
+import select
+import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -254,6 +257,105 @@ def test_strict_upload_pack_enters_only_an_exact_repository(scope, tmp_path, ope
     target, store = _served(ours, tmp_path, operand)
     _process(table, 123, other, argv=("git", "upload-pack", "--strict", target))
     _assert_vetoed(store)
+
+
+@contextmanager
+def _live_server(form: str, command: str, operand: Path, store: Path, cwd: Path):
+    # Only the later repository advertises this ref: the wire response proves Git's
+    # choice, independently of our process-scope resolver and simulated /proc boundary.
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+    subprocess.run(["git", "init", "--bare", str(store)], cwd=store.parent, env=env, check=True, capture_output=True)
+    oid = subprocess.run(["git", f"--git-dir={store}", "hash-object", "-w", "--stdin"],
+                         input=b"repository ownership proof", cwd=store, env=env, check=True, capture_output=True).stdout.strip()
+    subprocess.run(["git", f"--git-dir={store}", "update-ref", "refs/tags/actual-owner", os.fsdecode(oid)],
+                   cwd=store, env=env, check=True, capture_output=True)
+    name, argv = _server_argv(form, command, str(operand))
+    if form == "dashed":
+        exec_path = subprocess.run(["git", "--exec-path"], cwd=store, env=env, check=True, capture_output=True).stdout.strip()
+        argv = (str(Path(os.fsdecode(exec_path)) / name), *argv[1:])
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert process.stdout is not None
+        advertisement = b""
+        deadline = time.monotonic() + 10
+        while not advertisement.endswith(b"0000"):
+            ready, _, _ = select.select([process.stdout], [], [], max(0, deadline - time.monotonic()))
+            assert ready, "Git server did not advertise its selected repository"
+            chunk = os.read(process.stdout.fileno(), 4096)
+            assert chunk, "Git server exited before advertising its selected repository"
+            advertisement += chunk
+        assert oid + b" refs/tags/actual-owner" in advertisement
+        assert process.poll() is None
+        yield process, name, argv
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.communicate(timeout=10)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("form", ["git", "dashed"])
+@pytest.mark.parametrize("command", ["upload-pack", "receive-pack"])
+@pytest.mark.parametrize("head_kind", ["malformed", "symlink"])
+def test_live_server_skips_invalid_earlier_head_without_losing_its_veto(scope, tmp_path, form, command, head_kind):
+    table, _, other = scope
+    operand = _repo(tmp_path / "served")
+    head = operand / ".git" / "HEAD"
+    head.write_bytes(b"not a Git HEAD\n")
+    if head_kind == "symlink":
+        malformed = head.with_name("invalid-head")
+        head.rename(malformed)
+        head.symlink_to(malformed)
+    store = tmp_path / "served.git"
+    with _live_server(form, command, operand, store, other) as (process, name, argv):
+        # Model the observed process after enter_repo() has chdir'd to the real store.
+        _process(table, process.pid, store, name=name, argv=argv)
+        debris = _aged(store / "objects" / "pack" / "tmp_pack_live")
+        removed = gitlock.clear_stale_tmp_packs(store)
+        assert debris.exists(), f"deleted a live server's temporary pack: {removed}"
+        assert removed == []
+
+
+@pytest.mark.parametrize("gitfile", [False, True])
+@pytest.mark.parametrize("head,symlink,accepted", [
+    (b"ref: refs/heads/main\n", False, True),
+    (b"0123456789abcdef0123456789abcdef01234567\n", False, True),
+    (b"not a Git HEAD\n", False, False),
+    (b"", False, False),
+    (b"\xef\xbb\xbfref: refs/heads/main\n", False, False),
+    (b"ref:\trefs/heads/topic.name\n", False, True),
+    (b"ref: heads/main\n", False, False),
+    (b"ref: refs/heads/main\n", True, False),  # symlinked HEAD is never treated as proven
+])
+def test_only_proven_server_heads_allow_unrelated_cleanup(scope, tmp_path, head, symlink, accepted, gitfile):
+    table, ours, other = scope
+    metadata = other / ".git"
+    (metadata / "HEAD").write_bytes(head)
+    if symlink:
+        (metadata / "HEAD").rename(metadata / "head-target")
+        (metadata / "HEAD").symlink_to(metadata / "head-target")
+    if gitfile:
+        linked = tmp_path / "gitfile-checkout"
+        linked.mkdir()
+        (linked / ".git").write_text(f"gitdir: {metadata}\n")
+        other = linked
+    _process(table, 123, ours, argv=("git", "receive-pack", str(other)))
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == ([str(debris)] if accepted else [])
+    assert debris.exists() is not accepted
+
+
+def test_discovery_skips_nested_metadata_git_rejects(scope):
+    # Git ignores a nested .git with an invalid HEAD and keeps walking up to ours.
+    table, ours, _ = scope
+    nested = _repo(ours / "vendor")
+    (nested / ".git" / "HEAD").write_bytes(b"not a Git HEAD\n")
+    _process(table, 123, nested)
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert debris.exists()
 
 
 @pytest.mark.parametrize("form", ["git", "dashed"])
