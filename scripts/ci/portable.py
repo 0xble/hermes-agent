@@ -285,6 +285,9 @@ def environment(home: Path) -> dict[str, str]:
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
         'PYTHONUTF8': '1', 'CI': 'true',
     })
+    for key in ('HERMES_NATIVE_ONLY_FILES', 'HERMES_WINDOWS_PROTOCOL_DIAGNOSTICS'):
+        if key in os.environ:
+            env[key] = os.environ[key]
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
     if os.name == 'nt':
