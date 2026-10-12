@@ -844,9 +844,10 @@ class GatewayGoalsMixin:
             return int(getattr(state, "control_generation", 0) or 0)
 
         current = await self._run_in_executor_with_context(_exact_executing_tick)
-        # No await after this check: /new, pause, clear, or re-set may win even the validation
-        # worker's return gap. The loop-control fence is process-local state updated synchronously
-        # by LoopManager writes, while the worker snapshot covers cross-process durable state.
+        # No await after this check: any loop control (set, replace, pause, resume, clear, /new)
+        # may win even the validation worker's return gap. ``save_loop`` is the single writer of
+        # the stored control generation and mirrors it into this process-local fence synchronously,
+        # so comparing it with the worker's stored snapshot catches every control path at once.
         return bool(current is not None) and loop_control_generation(sid) == current and (
             run_generation is None or self._is_session_run_current(session_key, run_generation)
         )

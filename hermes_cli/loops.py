@@ -327,8 +327,10 @@ class LoopState:
     max_ticks: int = DEFAULT_MAX_TICKS  # config backstop; 0 = unlimited
     ticks_fired: int = 0
     created_at: float = 0.0
-    # Monotonic in-process control fence. Pause/clear/resume/set bump it so an already admitted
-    # tick cannot cross a control boundary during the executor return gap.
+    # Monotonic control fence, owned by ``save_loop``: any write that changes the status or loop
+    # instance, or (outside tick lifecycle) clears/replaces the in-flight tick, bumps it so an
+    # admitted tick cannot cross a control boundary during the executor return gap. Callers never
+    # set it; a cached copy can never write an older value back over the stored row.
     control_generation: int = 0
     last_fired_at: float = 0.0
     next_due_at: float = 0.0
@@ -467,8 +469,37 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
     return state
 
 
-def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
-    """Persist a loop to SessionDB. No-op if DB unavailable."""
+def _next_control_generation(session_id: str, stored: Optional[LoopState], state: LoopState, *,
+                             tick_lifecycle: bool) -> int:
+    """The control fence *state* must carry when it replaces *stored* (the single bump rule).
+
+    The stored row (and this process's fence) is authoritative, never the writer's cached copy,
+    so a stale manager cannot regress the fence. The fence advances when the write changes the
+    status or the loop instance (``created_at``): set, replace, pause, resume, clear, stop
+    verdicts, recovery parking and session-reset retirement. Outside the tick lifecycle's own
+    settle/refund writes it also advances when the in-flight tick is cleared or replaced. A
+    definition-only revise keeps the in-flight tick by design and so leaves the fence alone.
+    """
+    current = max(loop_control_generation(session_id),
+                  int(getattr(stored, "control_generation", 0) or 0))
+    if stored is None:
+        return max(current, int(state.control_generation or 0))
+    changed = stored.status != state.status or stored.created_at != state.created_at
+    if not tick_lifecycle and stored.awaiting_response and (
+        not state.awaiting_response or stored.ticks_fired != state.ticks_fired
+    ):
+        changed = True
+    return current + 1 if changed else current
+
+
+def save_loop(session_id: str, state: LoopState, *, cursor=None, tick_lifecycle: bool = False) -> None:
+    """Persist a loop to SessionDB. No-op if DB unavailable.
+
+    The one write path for ``loop:*`` rows and the control-fence chokepoint: the stored row is
+    read in the same transaction and ``state.control_generation`` is assigned from it (see
+    :func:`_next_control_generation`). ``tick_lifecycle`` marks the tick claim/settle writes,
+    whose clearing of their own in-flight tick is not a control boundary.
+    """
     if not session_id:
         return
     db = _get_session_db()
@@ -479,13 +510,23 @@ def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
 
         _warn_dropped_write("LoopManager", "loop", session_id)
         return
-    # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
-    state.mutation_id = uuid.uuid4().hex
+    key = _meta_key(session_id)
+
+    def write(conn) -> bool:
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        stored = _parse_state(row[0]) if row and row[0] else None
+        state.control_generation = _next_control_generation(
+            session_id, stored, state, tick_lifecycle=tick_lifecycle)
+        # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
+        state.mutation_id = uuid.uuid4().hex
+        db.set_meta(key, state.to_json(), cursor=conn)
+        return True
+
     if cursor is not None:
         # Transaction owners must see failures, not report an unapplied control as successful.
-        db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
-    else:
-        _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
+        write(cursor)
+    elif not _db_op("set_meta", lambda: db._execute_write(write), False):
+        return  # unapplied: the process fence must not run ahead of the stored row
     _remember_control_generation(session_id, state)
 
 
@@ -493,7 +534,6 @@ def clear_loop(session_id: str) -> None:
     """Mark a loop cleared in the DB (preserved for audit, status=cleared)."""
     state = load_loop(session_id)
     if state is not None:
-        state.control_generation = max(state.control_generation, loop_control_generation(session_id)) + 1
         state.status = "cleared"
         save_loop(session_id, state)
 
@@ -629,6 +669,7 @@ class LoopManager(LoopRevisionsMixin):
         return self._state is not None and self._state.status in {"active", "paused"}
 
     def _save(self) -> LoopState:
+        """Persist a user/agent control; ``save_loop`` assigns its control fence."""
         snapshot = getattr(self, "_evaluation_snapshot", None)
         if snapshot is not None:
             # Staged settlement/revision: the snapshot CAS commits, never this direct write.
@@ -704,11 +745,6 @@ class LoopManager(LoopRevisionsMixin):
             until=(until or "").strip(),
             max_ticks=max_ticks_default(),
             created_at=now,
-            control_generation=max(
-                loop_control_generation(self.session_id),
-                int(getattr(self._state, "control_generation", 0) or 0),
-                int(getattr(stored, "control_generation", 0) or 0),
-            ) + 1,
             next_due_at=now,
             route=dict(route or {}),
         )
@@ -720,7 +756,6 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         if not s or s.status not in {"active", "paused"}:
             return None
-        s.control_generation = max(s.control_generation, loop_control_generation(self.session_id)) + 1
         s.status, s.paused_reason, s.awaiting_response = "paused", reason, False
         return self._save()
 
@@ -729,7 +764,6 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         if not s or s.status == "cleared":
             return None
-        s.control_generation = max(s.control_generation, loop_control_generation(self.session_id)) + 1
         s.status, s.paused_reason, s.awaiting_response = "active", None, False
         # Re-arm relative to now so a long pause doesn't fire instantly N times.
         delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
@@ -740,9 +774,6 @@ class LoopManager(LoopRevisionsMixin):
     def clear(self) -> bool:
         if self._state is None or self._state.status == "cleared":
             return False
-        self._state.control_generation = max(
-            self._state.control_generation, loop_control_generation(self.session_id)
-        ) + 1
         self._state.status = "cleared"
         self._state.awaiting_response = False
         self._save()
@@ -796,14 +827,20 @@ class LoopManager(LoopRevisionsMixin):
 
         A scheduler loads its manager before awaiting the executor that fires the tick, so a pause,
         stop, revise or re-set can commit in between; saving the cached copy would resurrect it. The
-        claim applies only while the stored row is still this loop instance, active and idle. A
+        claim applies only while the stored row is still this loop instance, active, idle and at the
+        cached control generation (compare-and-swap): a control another manager committed since this
+        one loaded rejects the claim and refreshes the cache, never writing the stale fence back. A
         revise in between fires the stored (revised) definition; otherwise the caller's copy fires."""
         s = self._state
         # An unbound manager is intentionally ephemeral: there is no stored row to fence against.
         db = _get_session_db() if self._cursor is None and self.session_id else None
         if db is None:
             claim(s)
-            self._save()
+            if self._cursor is None:
+                save_loop(self.session_id, s, tick_lifecycle=True)
+            else:
+                save_loop(self.session_id, s, cursor=self._cursor, tick_lifecycle=True)
+            self._mark_synced()
             return True
 
         def write(conn) -> Optional[LoopState]:
@@ -814,6 +851,7 @@ class LoopManager(LoopRevisionsMixin):
             if (
                 stored is None or stored.status != "active" or stored.awaiting_response
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+                or stored.control_generation != s.control_generation
             ):
                 return None
             # Another writer's schedule since this manager's last sync governs: a revise,
@@ -825,7 +863,7 @@ class LoopManager(LoopRevisionsMixin):
             base = s if stored.version == s.version else stored
             claimed = _parse_state(base.to_json())
             claim(claimed)
-            save_loop(self.session_id, claimed, cursor=conn)
+            save_loop(self.session_id, claimed, cursor=conn, tick_lifecycle=True)
             return claimed
 
         try:
@@ -860,7 +898,11 @@ class LoopManager(LoopRevisionsMixin):
             return False
         if db is None:
             settle(s)
-            self._save()
+            if self._cursor is None:
+                save_loop(self.session_id, s, tick_lifecycle=True)
+            else:
+                save_loop(self.session_id, s, cursor=self._cursor, tick_lifecycle=True)
+            self._mark_synced()
             return True
 
         def write(conn) -> Optional[LoopState]:
@@ -876,7 +918,7 @@ class LoopManager(LoopRevisionsMixin):
             ):
                 return None
             settle(stored)
-            save_loop(self.session_id, stored, cursor=conn)
+            save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
             return stored
 
         try:

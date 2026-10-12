@@ -944,6 +944,32 @@ class TestControls:
         mgr.pause(reason="user-interrupted")
         assert mgr.state.awaiting_response is False
 
+    def test_control_fence_is_assigned_by_the_save_chokepoint(self, hermes_home):
+        """Every control bumps the stored fence; a definition-only revise and the tick's own
+        claim/start do not; a stale cached copy can never write an older fence back."""
+        from hermes_cli.loops import LoopManager, load_loop, loop_control_generation
+
+        mgr = LoopManager(session_id="c4")
+        mgr.set("poll", interval_seconds=300)
+        gens = [load_loop("c4").control_generation]
+        stale = LoopManager(session_id="c4")
+        for control in (lambda m: m.pause(), lambda m: m.resume(), lambda m: m.clear()):
+            control(LoopManager(session_id="c4"))
+            gens.append(load_loop("c4").control_generation)
+        assert gens == sorted(set(gens)), gens
+        stale.state.status = "active"
+        stale._save()  # a cached copy written blindly still cannot regress the fence
+        assert load_loop("c4").control_generation == gens[-1] + 1
+        assert loop_control_generation("c4") == gens[-1] + 1
+
+        fresh = LoopManager(session_id="c5")
+        fresh.set("poll", interval_seconds=300)
+        before = load_loop("c5").control_generation
+        assert fresh.fire_tick()
+        assert fresh.start_tick((fresh.state.created_at, fresh.state.ticks_fired))
+        assert fresh.revise(reason="slower", interval_seconds=600)["ok"]
+        assert load_loop("c5").control_generation == before
+
 
 
 # ──────────────────────────────────────────────────────────────────────

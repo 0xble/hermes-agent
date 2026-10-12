@@ -431,9 +431,92 @@ async def test_model_loop_fence_rechecks_reset_after_start_tick(control_home, bo
         runner.session_store.close_all_db_handles()
 
 
+# Every public LoopManager method is either a read / tick-lifecycle call or a user/agent
+# control. Controls are enumerated from the class, so a new control API without fence
+# coverage fails here instead of reaching review.
+_LOOP_NON_CONTROL_API = frozenset({
+    "state", "refresh", "is_active", "has_loop", "status_line", "is_due",
+    "fire_tick", "complete_tick", "abandon_tick", "start_tick", "recover_tick",
+})
+_REPLACE_REQUEST = "please replace the loop with replacement work now"
+
+
+def _public_loop_controls():
+    return sorted(
+        name for name in vars(loops.LoopManager)
+        if not name.startswith("_") and name not in _LOOP_NON_CONTROL_API
+    )
+
+
+def _route(source):
+    return {"platform": "telegram", "chat_id": source.chat_id, "chat_type": "dm", "user_id": source.user_id}
+
+
+def _accepted(result):
+    assert result["ok"], result
+    return result
+
+
+async def _session_reset(runner, source, sid):
+    runner._session_db = None
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = lambda source: ""
+    runner._telegram_topic_new_header = lambda source: ""
+    await runner._handle_reset_command(MessageEvent(text="/new", source=source))
+
+
+def _pause_then_resume_elsewhere(sid):
+    loops.LoopManager(sid).pause()
+    loops.LoopManager(sid).resume()
+
+
+# name -> (runner, source, sid) -> None | awaitable. Each control runs through a FRESH manager,
+# i.e. a second manager than the one that loaded or claimed the tick.
+LOOP_CONTROLS = {
+    "set": lambda runner, source, sid: loops.LoopManager(sid).set(
+        "replacement work", interval_seconds=60, times=2, route=_route(source)),
+    "replace": lambda runner, source, sid: _accepted(loops.LoopManager(sid).replace(
+        prompt="replacement work", interval_seconds=60, times=2, reason="user asked to replace it",
+        user_quote="replace the loop with replacement work", user_messages=[_REPLACE_REQUEST])),
+    "revise": lambda runner, source, sid: _accepted(loops.LoopManager(sid).revise(
+        reason="slow the cadence", interval_seconds=120)),
+    "pause": lambda runner, source, sid: loops.LoopManager(sid).pause(),
+    "resume": lambda runner, source, sid: loops.LoopManager(sid).resume(),
+    "clear": lambda runner, source, sid: loops.LoopManager(sid).clear(),
+}
+# Control paths outside the class's public methods.
+LOOP_EXTRA_CONTROLS = {
+    "clear_loop": lambda runner, source, sid: loops.clear_loop(sid),
+    "pause_resume_second_manager": lambda runner, source, sid: _pause_then_resume_elsewhere(sid),
+    "session_reset": _session_reset,
+}
+LOOP_CONTROL_CASES = _public_loop_controls() + sorted(LOOP_EXTRA_CONTROLS)
+
+
+async def _apply_loop_control(name, runner, source, sid):
+    control = LOOP_CONTROLS.get(name) or LOOP_EXTRA_CONTROLS.get(name)
+    assert control is not None, f"LoopManager.{name} is a public control with no fence coverage"
+    result = control(runner, source, sid)
+    if asyncio.iscoroutine(result):
+        await result
+
+
+def test_every_public_loop_control_has_fence_coverage():
+    assert set(_public_loop_controls()) == set(LOOP_CONTROLS)
+
+
+def _owns_executing_tick(state, tick):
+    return (
+        state is not None and state.status == "active" and state.awaiting_response
+        and state.claim_phase == "executing" and (state.created_at, state.ticks_fired) == tick
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("control", ["pause", "clear", "replace"])
-async def test_model_loop_fence_rechecks_loop_control_after_exact_tick(control_home, control):
+@pytest.mark.parametrize("control", LOOP_CONTROL_CASES)
+async def test_model_loop_fence_rechecks_every_control_after_exact_tick(control_home, control):
+    """A control landing in the exact-executing-tick executor return gap either keeps the
+    durable tick (and the work runs) or ends it (and no superseded work starts)."""
     runner, adapter, source, entry = native_runner(control_home)
     create_loop(entry, source)
     executions = []
@@ -446,28 +529,16 @@ async def test_model_loop_fence_rechecks_loop_control_after_exact_tick(control_h
         raise asyncio.CancelledError
 
     runner._run_agent = model
-    runner._session_db = None
-    runner._cleanup_old_agent_for_reset = AsyncMock()
-    runner._reset_notice_session_info = lambda source: ""
-    runner._telegram_topic_new_header = lambda source: ""
     original_executor = runner._run_in_executor_with_context
-    control_done = False
+    tick = None
 
     async def executor(func, *args, **kwargs):
-        nonlocal control_done
+        nonlocal tick
         result = await original_executor(func, *args, **kwargs)
-        if getattr(func, "__name__", "") == "_exact_executing_tick" and not control_done:
-            control_done = True
-            mgr = loops.LoopManager(entry.session_id)
-            if control == "pause":
-                mgr.pause()
-            elif control == "clear":
-                mgr.clear()
-            else:
-                mgr.set("replacement work", interval_seconds=60, times=2, route={
-                    "platform": "telegram", "chat_id": source.chat_id,
-                    "chat_type": "dm", "user_id": source.user_id,
-                })
+        if getattr(func, "__name__", "") == "_exact_executing_tick" and tick is None:
+            stored = loops.load_loop(entry.session_id)
+            tick = (stored.created_at, stored.ticks_fired)
+            await _apply_loop_control(control, runner, source, entry.session_id)
         return result
 
     runner._run_in_executor_with_context = executor
@@ -478,16 +549,46 @@ async def test_model_loop_fence_rechecks_loop_control_after_exact_tick(control_h
     try:
         await scan(runner, entry.session_id)
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
-        assert control_done, "test did not reach the exact execution return boundary"
-        assert executions == [], f"model work ran after /loop {control} won the exact execution gap"
+        assert tick is not None, "test did not reach the exact execution return boundary"
         saved = loops.load_loop(entry.session_id)
-        if control == "pause":
-            assert saved.status == "paused"
-        elif control == "clear":
-            assert saved.status == "cleared"
+        owned = _owns_executing_tick(saved, tick)
+        if owned:
+            assert executions == [entry.session_id], f"{control} kept the tick but its work never started"
         else:
-            assert saved.status == "active"
-            assert saved.prompt == "replacement work"
+            assert executions == [], f"superseded work ran after {control} won the exact execution gap"
+        if control in {"set", "replace"}:
+            assert not owned and saved.prompt == "replacement work"
+        if control == "revise":
+            assert owned, "a revise keeps the in-flight tick by design"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.parametrize("control", LOOP_CONTROL_CASES)
+def test_stale_manager_claim_never_regresses_stored_control_generation(control_home, control, monkeypatch):
+    """A manager loaded before another manager's control must not write its cached control
+    generation back: the stored row's generation wins, and a claim it does make passes the
+    execution fence (no fenced-out claim later parked as an unknown execution)."""
+    runner, _adapter, source, entry = native_runner(control_home)
+    sid = entry.session_id
+    try:
+        create_loop(entry, source)
+        stale = loops.LoopManager(sid)
+        assert stale.is_due()
+        asyncio.run(_apply_loop_control(control, runner, source, sid))
+        controlled = loops.load_loop(sid)
+        later = time.time() + 600
+        monkeypatch.setattr(loops.time, "time", lambda: later)
+        claimed = bool(stale.fire_tick())
+        stored = loops.load_loop(sid)
+        assert stored.control_generation >= controlled.control_generation, (
+            f"stale claim after {control} wrote generation {stored.control_generation} "
+            f"over stored {controlled.control_generation}"
+        )
+        assert loops.loop_control_generation(sid) == stored.control_generation
+        if claimed:
+            assert stored.status == "active" and stored.awaiting_response
+            assert stored.created_at == controlled.created_at
     finally:
         runner.session_store.close_all_db_handles()
 
