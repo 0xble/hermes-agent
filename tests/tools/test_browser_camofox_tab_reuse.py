@@ -187,16 +187,24 @@ def test_owned_tab_closes_at_end_of_turn(camofox, headed):
     assert _dispatch("browser_navigate", {"url": "https://shop.example.test/b"}, "chat")["success"]
     assert camofox.server.tab_posts() == ["/tabs", "/tabs"]
 
-def test_handoff_tab_persists_across_turns(camofox):
+@pytest.mark.parametrize("managed_persistence", [False, True])
+def test_handoff_tab_persists_across_turns(camofox, managed_persistence):
+    (camofox.home / "config.yaml").write_text(
+        "browser:\n  cloud_provider: camofox\n  camofox:\n"
+        f"    managed_persistence: {str(managed_persistence).lower()}\n", encoding="utf-8")
     handoff = _dispatch("browser_handoff", {"account": "brianle"}, "chat")
     assert handoff["success"] and handoff["tabId"] == "visible-tab"
+    user_id = _user_id(camofox.cf, "chat")
     _end_turn("chat")  # the user logs in on the visible tab between turns
 
     assert _dispatch("browser_snapshot", {}, "chat")["success"]
     result = _dispatch("browser_navigate", {"url": "https://login.example.test/account"}, "chat")
     assert result["success"] and result["account"] == "brianle"
+    assert _user_id(camofox.cf, "chat") == user_id
+    assert camofox.cf._sessions["chat"]["tab_id"] == handoff["tabId"]
     assert camofox.server.tab_posts() == []
     assert camofox.server.acted_on() == ["visible-tab"]
+    assert not any(method == "DELETE" for method, _, _ in camofox.server.calls)
 
 
 def test_handoff_sends_prior_binding_and_keeps_server_returned_own_tab(camofox):
