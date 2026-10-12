@@ -310,7 +310,8 @@ _ATTACHMENT_RECALL_NOTE = re.compile(
 # GatewayInboundMixin._prepend_inbound_reply_context. It must be peeled before the
 # attachment notes, or a reply caption still lands beyond the provider's query cap.
 _REPLY_RECALL_PREFIX = re.compile(
-    r'\[Replying to(?: your previous message)?: ".*?"\]\n\n', re.DOTALL,
+    r'\[Replying to(?: your previous message)?: '
+    r'"(?:\\.|[^"\\])*"\]\n\n',
 )
 _TRIGGER_RECALL_PREFIX = re.compile(
     r"\[Triggering message id: `[^\n]+` — use as `message_id` for reply/react/pin "
@@ -322,28 +323,59 @@ _RECALL_CONTEXT_PREFIXES = (
 )
 
 
+def _strip_recall_context(text: str) -> tuple[str, list[str]]:
+    """Remove producer-owned attachment/reply scaffolding wherever it occurs in a turn.
+
+    Synthetic recall deliberately keeps generated text, so it cannot use ``human_prompt_text``
+    as a boundary first. Search rather than only matching at offset 0 because a generated notice
+    may wrap the attachment enrichment. The meaningful image descriptions are retained separately
+    for the image-only fallback.
+    """
+    descriptions: list[str] = []
+    while text:
+        matches = [match for pattern in _RECALL_CONTEXT_PREFIXES
+                   if (match := pattern.search(text))]
+        if not matches:
+            break
+        prefix = min(matches, key=lambda match: match.start())
+        if "description" in prefix.re.groupindex:
+            description = prefix.group("description").strip()
+            if description:
+                descriptions.append(description)
+        text = (text[:prefix.start()] + text[prefix.end():]).strip()
+    return text, descriptions
+
+
 def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
     """Prefer the request over prepended attachment context, with an image-only fallback.
 
     This affects recall only, not human_prompt_text (retention) or the model's original prompt.
-    Recheck generated prefixes after peeling attachment notes: either prefix can wrap the other.
-    A generated/trivial suffix is not an image-only turn and must not fall back to its description.
+    Attachment scaffolding is removed independently of synthetic-turn filtering, so enabling
+    synthetic recall cannot move a human caption beyond the provider's query budget.
     """
-    descriptions = []
+    descriptions: list[str] = []
     while text:
         if not include_synthetic:
             human = human_prompt_text(text)
             if not human:
-                return None
+                # A generated suffix after an image description is not a human query. An
+                # actually image-only turn has no suffix and may use the description fallback.
+                return None if text else human_prompt_text("\n\n".join(descriptions))
             text = human
-        prefix = next((match for pattern in _RECALL_CONTEXT_PREFIXES
-                       if (match := pattern.match(text))), None)
-        if not prefix:
-            return text
-        if "description" in prefix.re.groupindex:
-            descriptions.append(prefix.group("description").strip())
-        text = text[prefix.end():].strip()
-    fallback = "\n\n".join(description for description in descriptions if description)
+        stripped, found = _strip_recall_context(text)
+        descriptions.extend(found)
+        if stripped == text:
+            break
+        text = stripped
+    if include_synthetic:
+        human = human_prompt_text(text)
+        if human and human != text:
+            # Keep the generated text in the query, but put the actual human request first so
+            # the provider's bounded input cannot discard it behind a long runtime notice.
+            return f"{human}\n\n{text}" if text else human
+    if text:
+        return text
+    fallback = "\n\n".join(descriptions)
     return fallback if include_synthetic else human_prompt_text(fallback)
 
 

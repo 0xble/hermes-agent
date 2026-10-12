@@ -110,6 +110,28 @@ def test_reply_pointer_cannot_override_generated_turn_provenance(enrich):
     assert auto_recall_query(prompt, platform="cron") == ""
 
 
+@pytest.mark.parametrize("generated", [_process_notice, _goal_prompt])
+def test_synthetic_recall_keeps_generated_text_but_removes_attachment_scaffolding(enrich, generated):
+    before = generated()
+    query = auto_recall_query(
+        before + "\n\n" + enrich(REQUEST), include_synthetic=True,
+    )
+    assert before in query
+    assert REQUEST in query
+    assert DESCRIPTION not in query
+    assert query.index(REQUEST) < 800
+
+
+@pytest.mark.parametrize("generated", [_process_notice, _goal_prompt])
+def test_synthetic_recall_removes_attachment_scaffolding_inside_enrichment(enrich, generated):
+    query = auto_recall_query(
+        enrich(generated() + "\n\n" + REQUEST), include_synthetic=True,
+    )
+    assert generated() in query
+    assert REQUEST in query
+    assert DESCRIPTION not in query
+
+
 def test_long_gateway_image_prefix_recalls_the_actual_personal_request(enrich):
     prompt = enrich(REQUEST)
     assert prompt.index(REQUEST) > 800
