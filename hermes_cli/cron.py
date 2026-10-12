@@ -731,6 +731,8 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
             issues.append(issue)
+    from cron.tool_requirements import job_tool_requirement_issues
+    issues.extend(job_tool_requirement_issues(job))
     script = str(job.get("script") or "").strip()
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
