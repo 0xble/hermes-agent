@@ -22,7 +22,10 @@ visible blank row. Headings, lists, blockquotes, fenced code, tables,
 `<details>`, and display math keep their raw boundaries. The normalized payload,
 not the source, is counted against the rich character limit. Runs of three or
 more newlines collapse to the same single spacer, and normalization is
-idempotent.
+idempotent. A pipe table also gets a blank line, not a hard break, on any side
+where a single newline separates it from other content: Telegram cannot open a
+table inside a caption's open paragraph, and GFM continues a table through prose
+directly below it as one more row.
 
 Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
 two currency amounts in a sentence render as an unwrapped italic formula with
@@ -70,8 +73,11 @@ adjacent references, which joins the same run as "2,3" with each number still
 tappable, and puts an empty `<!-- -->` line before definitions that follow a
 list, which ends the list without rendering a block. `markdown-it-py` (already a
 dependency) finds both: block tokens locate code and lists, and a custom inline
-rule marks only references it reaches as prose, so code, TeX math, link
-destinations, autolinks, inline HTML and escapes stay literal. It runs on send, finalized edit,
+rule marks only references it reaches as prose, so code, TeX math (including
+closed single-dollar `$…$`, recognized with the same currency guard as the
+adapter), link destinations, autolinks, inline HTML and the contents of literal
+inline HTML containers (`<code>`, `<kbd>`, `<samp>`, `<pre>`) and escapes stay
+literal. It runs on send, finalized edit,
 and draft, and is idempotent. Verified against live `sendRichMessage` output on
 2026-09-30.
 
@@ -80,7 +86,8 @@ and draft, and is idempotent. Verified against live `sendRichMessage` output on
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
   `telegram-ordered-list-separation`, `telegram-footnote-refs`,
-  `telegram-progress-literal`.
+  `telegram-progress-literal`, `telegram-table-boundaries`,
+  `telegram-chunk-indicator-budget`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -125,6 +132,16 @@ Open [upstream PR 76368](https://github.com/NousResearch/hermes-agent/pull/76368
 touches the same function but only stops hard-break markers next to block lines.
 The paragraph still absorbs a list not starting at 1, so it does not replace
 this patch.
+
+Table boundaries: ported from open [upstream PR 102929](https://github.com/NousResearch/hermes-agent/pull/102929)
+by i-Hun, head `89a57e4f8a11ec7a623b15eb8b19b722fed3d69f`, adopted 2026-10-11
+with authorship kept. The fork's `_rich_normalize_linebreaks` had diverged
+(paragraph materialization, ordered-list separation), so the boundary promotion
+was re-applied to the fork's region loop; the PR's regression file is carried
+unchanged. Prose under a table joining it as a row was reproduced locally with
+markdown-it; the caption-above-table failure rests on the PR's
+`sendRichMessage` echo evidence and was not reproduced locally. Retire when a
+released upstream version carries equivalent behavior and regressions.
 
 Telegram unsupported link targets: adopted from the archived fork's HERMES-065
 implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
@@ -301,6 +318,25 @@ the first definition after a list: resend the probes from the footnote
 regressions through raw `sendRichMessage` without `normalize_footnotes` and
 check the returned blocks. Rollback removes that function and its call in
 `_rich_message_payload`.
+
+Long split replies derive their indicator reserve from the source codepoint
+length: every iteration consumes at least one codepoint, so neither the chunk
+index nor total can exceed that bound. The reserve measures the bounded suffix,
+both MarkdownV2 parenthesis escapes, and a possible fence-separation newline
+through the caller's length function. The final-chunk budget also includes fence
+closure. Tiny limits retain monotonic progress even when a single codepoint or
+the required wrappers cannot fit.
+
+Upstream PR #126100 supplies the static three-digit fix (12 units), not this
+arbitrary-width protection: four-digit counts still reached 4,097–4,098 UTF-16
+units on that candidate. The dynamic bound is fork-owned under the existing
+`telegram-chunk-indicator-budget` identity until an upstream equivalent covers
+the full behavior. `tests/gateway/test_telegram_chunk_indicator_budget.py` checks
+actual mocked outbound payloads at 99/100, 999/1000, and higher counts, including
+astral characters, exact indices/totals, and balanced fences. Its cheap helper
+cases cover arbitrary budgets/count widths and final reopened-fence closure.
+Retire only when a released upstream splitter passes these regressions unchanged;
+an open PR or static reserve increase alone does not qualify.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,

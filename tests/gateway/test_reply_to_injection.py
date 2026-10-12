@@ -7,6 +7,7 @@ in the conversation history. History can contain the same or similar text
 multiple times, and without an explicit pointer the agent has to guess
 which prior message the user is referencing.
 """
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,6 +16,13 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+
+
+def _quoted_reply_text(prompt: str) -> str:
+    pointer = prompt.split('[Replying to: ', 1)[1]
+    quote, end = json.JSONDecoder().raw_decode(pointer)
+    assert pointer[end:].startswith("]\n\n")
+    return quote
 
 
 def _make_runner() -> GatewayRunner:
@@ -83,7 +91,7 @@ async def test_telegram_long_reply_reaches_prompt_without_losing_later_items():
         event=event, source=event.source, history=history,
     )
     assert result is not None
-    assert quoted in result
+    assert _quoted_reply_text(result) == quoted
     assert result.endswith("Review all five companies.")
     assert history == [{"role": "user", "content": "Previous request"}]
 
@@ -108,7 +116,7 @@ async def test_quoted_reply_references_stay_literal_while_typed_ones_expand(tmp_
     quoted = ("x " * 300) + f"\nsee @file:{payload.name} for details"
     quoted_ref = MessageEvent(text="what does this say?", source=source, reply_to_message_id="7", reply_to_text=quoted)
     result = await runner._prepare_inbound_message_text(event=quoted_ref, source=source, history=[])
-    assert quoted in result
+    assert _quoted_reply_text(result) == quoted
     assert "LOCAL-FILE-MARKER" not in result
     runner._resolve_session_agent_runtime_async.assert_not_awaited()
 

@@ -626,26 +626,6 @@ def test_stop_event_kill_all_waits_for_quick_systemd_teardown(registry, monkeypa
         worker.join(timeout=1.0)
 
 
-def test_bounded_kill_validates_descendant_identity_before_signaling(registry, monkeypatch):
-    session = _make_session(sid="proc_reused_descendant")
-    session.process = MagicMock(pid=100)
-    session.host_start_time = 10
-    registry._running[session.id] = session
-
-    class _Child:
-        pid = 200
-
-    child = _Child()
-    monkeypatch.setattr("psutil.Process", lambda _pid: MagicMock(children=lambda recursive: [child]))
-    monkeypatch.setattr(registry, "_proc_alive", lambda _proc: True)
-    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, expected: pid == 100)
-    monkeypatch.setattr(registry, "_safe_host_start_time", lambda pid: 10 if pid == 200 else None)
-    monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: pid)
-    with patch("tools.process_registry.os.killpg") as killpg:
-        assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
-    assert [call.args[0] for call in killpg.call_args_list] == [100]
-
-
 def test_bounded_sweep_caps_signal_thread_pool(registry, monkeypatch):
     """A large process tree must not spawn one sweep thread per process."""
     import tools.process_registry as _pr

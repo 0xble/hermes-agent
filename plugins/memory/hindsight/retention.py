@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from agent.synthetic_prompt import human_prompt_text, text_after_generated_prefix
+from agent.synthetic_prompt import human_prompt_text, is_runtime_prompt, text_after_generated_prefix
 
 
 @dataclass
@@ -66,10 +66,15 @@ def filter_retain_messages(
     The user side keeps only its human-authored part (``agent.synthetic_prompt``, shared with the
     auto-recall gate): generated notices and prompts are dropped by their formatter boundary or by
     the turn's runtime-owned provenance, never by generic status wording. Recalled memory context is
-    excluded. Assistant text loses only exact silence markers and a small, explicit set of one-line
-    status-only responses.
+    excluded. A generated-only user turn drops its assistant side too: without a human part,
+    that reply is runtime process chatter, not a separate conversation. Real turns keep assistant
+    text except exact silence markers and a small, explicit set of one-line status-only responses.
     """
     user = human_prompt_text(user_content, display_kind=display_kind, platform=platform)
+    if user is None and ((user_content or "").strip() or is_runtime_prompt(
+        display_kind=display_kind, platform=platform,
+    )):
+        return None, None
     user = _clean_message(user, preserve_unmatched_literal=True) or None if user else None
     assistant = _clean_message(assistant_content)
     if not assistant or _is_machine_notice(assistant) or _is_assistant_status_only(assistant):

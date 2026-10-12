@@ -1735,12 +1735,12 @@ class SessionMessagesMixin:
             return best if best is not None else session_id
 
     def _fetch_conversation_rows(self, session_ids: List[str], active_clause: str, *, with_session_id: bool):
-        """``_CONVERSATION_ROW_COLUMNS`` rows for *session_ids* ORDER BY id (timestamps are not monotonic
-        and would break tool-call adjacency)."""
+        """Rows in id order (timestamps regress). Active replay sorts +id so SQLite can select
+        (session_id, active) instead of scanning archived rows in rowid order just to elide a sort."""
         return self._read_all(
             f"SELECT {'session_id, ' if with_session_id else ''}{self._CONVERSATION_ROW_COLUMNS} "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)})"
-            f"{active_clause} ORDER BY id", tuple(session_ids))
+            f"{active_clause} ORDER BY {'+id' if active_clause == ' AND active = 1' else 'id'}", tuple(session_ids))
 
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
