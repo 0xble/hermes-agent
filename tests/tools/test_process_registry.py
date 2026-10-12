@@ -156,6 +156,75 @@ def test_bounded_sweep_final_receipt_keeps_cut_retention(registry, tmp_path, mon
         proc.wait(timeout=5)
 
 
+def test_reader_finalized_receipt_keeps_cut_retention_when_scope_stop_fails(
+    registry, tmp_path, monkeypatch,
+):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    proc = _spawn_python_sleep(30)
+    try:
+        session = _make_session(sid="proc_reader_won_scope_failed")
+        session.process = proc
+        session.pid = proc.pid
+        session.systemd_unit = "hermes-worker-proc_reader_won_scope_failed.scope"
+        registry._running[session.id] = session
+
+        def _reader_finishes_then_scope_fails(_unit, timeout=None):
+            # The reader thread observes the TERM'd child and finalizes first.
+            proc.wait(timeout=5)
+            with session._lock:
+                session.exited = True
+                session.exit_code = proc.returncode
+            registry._move_to_finished(session)
+            return False
+
+        monkeypatch.setattr(
+            "tools.process_registry._stop_systemd_unit", _reader_finishes_then_scope_fails,
+        )
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        assert json.loads(receipt.read_text(encoding="utf-8"))["cut_receipt"] is True
+        newer = _make_session(sid="proc_normal_after_failed_scope", exited=True, exit_code=0)
+        newer.completion_reason = "exited"
+        receipts.save_completed_result(newer)
+        assert receipt.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_bounded_sweep_prunes_once_through_real_finalization(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    scans = []
+    real_scan = receipts._result_paths
+    monkeypatch.setattr(receipts, "_result_paths", lambda: (scans.append(1), real_scan())[1])
+    procs = [_spawn_python_sleep(30), _spawn_python_sleep(30)]
+    try:
+        for index, proc in enumerate(procs):
+            session = _make_session(sid=f"proc_prune_once_{index}")
+            session.process = proc
+            session.pid = proc.pid
+            registry._running[session.id] = session
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        assert len(scans) == 1
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
 def test_cut_pending_write_never_nests_session_lock_inside_result_lock(tmp_path, monkeypatch):
     from tools import process_registry_results as receipts
 
@@ -965,14 +1034,14 @@ def test_move_to_finished_rechecks_deadline_before_checkpoint(registry):
     registry._running[session.id] = session
     session._kill_deadline = time.monotonic() + 0.1
 
-    def slow_save(_session):
+    def slow_save(_session, **_kwargs):
         time.sleep(0.15)
 
     with patch("tools.process_registry.save_completed_result", side_effect=slow_save) as save, \
          patch.object(registry, "_write_checkpoint") as checkpoint:
         assert registry._move_to_finished(session) is True
 
-    save.assert_called_once_with(session)
+    save.assert_called_once_with(session, prune=False)
     checkpoint.assert_not_called()
 
 

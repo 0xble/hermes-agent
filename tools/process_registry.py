@@ -1640,7 +1640,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 # Keep the session tracked until its result is durable. A finite
                 # parent must not observe completion and exit during this write.
                 if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
-                    save_completed_result(session)
+                    # A bounded stop owns one final prune; its finalizers only write.
+                    if session._kill_deadline is None:
+                        save_completed_result(session)
+                    else:
+                        save_completed_result(session, prune=False)
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
@@ -2858,6 +2862,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             if deadline is not None:
                 for session in targets:
                     session._kill_deadline = deadline
+            # Mark before any signal: a reader that finalizes during TERM, or a failed scope
+            # teardown that skips reconciliation, must still write a cut-retention receipt.
+            for session in signalable:
+                session._cut_receipt = True
             escalated_ids: set[str] = set()
             systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
@@ -3026,13 +3034,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         ) if session.id in escalated_ids else -signal.SIGTERM
                         session.completion_reason = "killed"
                         session.termination_source = source
-                        if source == "gateway_shutdown" or bounded_sweep:
-                            session._cut_receipt = True
                         if consume_output:
                             self._completion_consumed.add(session.id)
                     moved = self._move_to_finished(session)
                     if not moved and (deadline is None or time.monotonic() < deadline):
-                        save_completed_result(session)
+                        # The sweep prunes once at the end; a per-session scan here would not.
+                        save_completed_result(session, prune=False)
                     killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]
