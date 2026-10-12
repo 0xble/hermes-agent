@@ -68,6 +68,31 @@ def test_gateway_reply_and_trigger_wrappers_do_not_hide_attachment_caption(
         queued._memory_manager.queue_prefetch_all.assert_not_called()
 
 
+@pytest.mark.parametrize("platform", ["telegram", "discord"])
+def test_reply_context_delimiter_collision_preserves_the_quote_and_caption(enrich, monkeypatch, platform):
+    from gateway.config import Platform
+
+    monkeypatch.setattr("gateway.session._discord_tools_loaded", lambda: True)
+    quoted = 'Available modes: ["front", "rear"]\n\nUse the rear defroster only for the rear window.'
+    event = SimpleNamespace(
+        message_id="42", reply_to_message_id="41", reply_to_text=quoted,
+        reply_to_is_own_message=False,
+    )
+    source = SimpleNamespace(platform=Platform(platform))
+    prompt = GatewayInboundMixin._prepend_inbound_reply_context(event, source, enrich(REQUEST))
+    assert auto_recall_query(prompt, platform=platform) == REQUEST
+    pointer = prompt.split('[Replying to: ', 1)[1].split(']\n\n', 1)[0]
+    assert json.loads(pointer) == quoted
+    immediate = _turn_agent(platform=platform)
+    _memory_turn_start_and_prefetch(immediate, prompt)
+    immediate._memory_manager.prefetch_all.assert_called_once_with(REQUEST, session_id=immediate.session_id)
+    queued = _post_turn_agent(display_kind=None, platform=platform)
+    queued._sync_external_memory_for_turn(
+        original_user_message=prompt, final_response="answer", interrupted=False,
+    )
+    queued._memory_manager.queue_prefetch_all.assert_called_once_with(REQUEST, session_id=queued.session_id)
+
+
 def test_discord_trigger_without_reply_does_not_hide_attachment_caption(enrich, monkeypatch):
     from gateway.config import Platform
 
