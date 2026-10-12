@@ -1071,6 +1071,61 @@ class TestBackgroundReviewDeleteGate:
             reset_current_write_origin(token)
             unregister()
 
+    @pytest.mark.parametrize("swap", ["unregister", "nondurable_replacement"])
+    @pytest.mark.parametrize("operation", ["remove", "replace", "batch"])
+    def test_durable_admission_cannot_commit_after_journal_disappears(
+        self, store, tmp_path, monkeypatch, swap, operation
+    ):
+        # Admission and commit are separate: a plugin unload/replacement between them must
+        # not let the destructive write commit with no journal (it is staged instead).
+        from contextlib import contextmanager
+        import tools.memory_tool as mt
+        from tools.memory_transactions import register_memory_transaction_observer
+        from tools.write_approval import MEMORY, get_pending
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("memory:\n  background_review_allow_delete: true\n")
+        store.add("memory", "stale fact to remove")
+        path = store._path_for("memory")
+        before = path.read_text()
+        journal = []
+
+        @contextmanager
+        def observe(transaction):
+            journal.append(transaction)
+            yield
+
+        unregisters = [register_memory_transaction_observer("journal", observe, durable=True)]
+        approval_gate = mt._apply_write_gate
+
+        def gate_after_unload(*args, **kwargs):
+            unregisters.pop(0)()
+            if swap == "nondurable_replacement":
+                unregisters.append(register_memory_transaction_observer("journal", observe))
+            return approval_gate(*args, **kwargs)
+
+        monkeypatch.setattr(mt, "_apply_write_gate", gate_after_unload)
+        token = set_current_write_origin("background_review")
+        try:
+            if operation == "batch":
+                raw = memory_tool(operations=[
+                    {"action": "remove", "old_text": "stale fact"},
+                    {"action": "add", "content": "replacement fact"},
+                ], store=store)
+            else:
+                raw = memory_tool(action=operation, old_text="stale fact",
+                                  content="replacement fact", store=store)
+        finally:
+            reset_current_write_origin(token)
+            for unregister in unregisters:
+                unregister()
+        result = json.loads(raw)
+        assert path.read_text() == before
+        assert journal == []
+        assert result.get("staged") is True
+        pending = get_pending(MEMORY, result["pending_id"])
+        assert pending is not None and pending["origin"] == "background_review"
+
     def test_owner_opt_in_applies_unattended_delete(self, store, tmp_path, monkeypatch):
         # Owner opt-in still requires a durable observer for this profile.
         from contextlib import contextmanager

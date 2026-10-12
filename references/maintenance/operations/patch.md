@@ -3,10 +3,10 @@
 ## background-review-memory-delete: durable observer requirement
 
 - **Status:** Candidate; not landed or activated.
-- **Contract:** Owner opt-in may bypass staging only with a durable transaction observer registered for the current profile. Missing, old, or other-profile observers stage all destructive single/batch operations. Undo semantics stay unchanged.
+- **Contract:** Owner opt-in may bypass staging only with a durable transaction observer registered for the current profile. Missing, old, or other-profile observers stage all destructive single/batch operations. Commit-time durability: a durable-path admission commits only if the observer snapshot used by that commit (`observe_memory_transaction`, under the registry lock, before writing) still contains a durable current-profile observer; otherwise `DurableMemoryObserverUnavailable` aborts before any write and the tool stages the op. Undo semantics stay unchanged.
 - **Source surfaces:** `tools/memory_tool.py`, `tools/memory_transactions.py`; unit `maintenance/background-review-memory-delete.md`. The companion agents plugin declares `durable=True` on its existing registration.
 - **Upstream findings:** Fork-only opt-in to upstream #105921; no matching durable-observer opt-in repair found.
-- **Verification:** Red regression: 6 failed for remove/replace/batch with absent/non-durable observers. `scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_memory_transactions.py tests/agent/test_background_review_memory_scope.py`.
+- **Verification:** Red regression: 6 failed for remove/replace/batch with absent/non-durable observers; 6 failed for remove/replace/batch when the durable observer is unregistered or non-durably replaced between admission and commit. `scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_memory_transactions.py tests/agent/test_background_review_memory_scope.py`.
 - **Rollback:** Revert the observer declaration/check changes and their tests only; retain the existing opt-in/staging implementation. Reverting only the plugin declaration safely returns unattended destructive operations to staging.
 - **Retirement:** Remove when upstream provides the complete opt-in plus profile-scoped durable rollback contract. Land Hermes before the plugin to avoid an unjournaled gap.
 

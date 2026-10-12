@@ -14,6 +14,16 @@ observer registered for another profile leaves the operation staged. The
 default (`false` or unset) keeps upstream #105921 behavior: those ops are staged
 for `/memory pending`. `memory.write_approval` still gates every write when on.
 
+Admission is not trusted at commit. A destructive write admitted on the durable
+path runs under `require_durable_memory_observer()`, and
+`observe_memory_transaction` re-checks the observer snapshot it actually uses
+for that commit, under the registry lock and before any write. If a plugin
+unload or non-durable replacement removed the durable observer in between, it
+raises `DurableMemoryObserverUnavailable`; nothing is written or journaled and
+the tool stages the operation exactly as an admission without a journal would.
+Attended, non-review, `add`-only writes and `compare_and_restore` do not set the
+requirement and are unchanged.
+
 The personal profile enables it so near-limit consolidation proposals land
 without a manual approve step.
 
@@ -32,6 +42,10 @@ Neither supplies a transactional rollback journal.
 `config.yaml` and proves a batch applies through the real config loader with a
 durable before/after journal. Regression tests prove absent, non-durable, and
 other-profile observers stage remove/replace/batches without changing memory.
+`test_durable_admission_cannot_commit_after_journal_disappears` unregisters or
+non-durably replaces the observer at the approval-gate checkpoint (after
+admission, before commit) and proves remove/replace/batch stage with the file
+unchanged and zero journal callbacks.
 
 The observer API defaults `durable=False`; a plugin promises durable rollback by
 registering with `durable=True` and must refuse the write if it cannot prepare
