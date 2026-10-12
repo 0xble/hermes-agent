@@ -7,7 +7,12 @@ subgoals. Only the assistant-response preview is bounded. Admitted real user
 input revives a judge-blocked goal before model work without resetting its budget.
 Explicit pauses, interrupts, exhausted budgets, failed judges, unauthorized input,
 hidden messages, relayed agents, and synthetic notifications do not revive it.
-Failed or interrupted model turns do not run completion judging.
+Failed or interrupted model turns do not run completion judging. The autonomous
+silent-recheck streak is zeroed at the start of every active post-turn evaluation;
+only an exact silence marker from an autonomous turn that reaches an ordinary
+CONTINUE dispatch with no new eligible evidence may carry it forward. Every gate,
+wait, parked, dispute, budget, done, blocked, judge-error, or other early return
+leaves the streak at zero.
 
 ## Provenance and adaptation
 

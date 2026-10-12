@@ -2948,6 +2948,14 @@ class GoalManager:
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
 
+        # Start every active post-turn evaluation with a zeroed durable streak. Only an autonomous
+        # silence marker can carry the prior count forward, and it is committed again only after the
+        # whole evaluation reaches the ordinary CONTINUE dispatch path below. This makes every early
+        # return (wait, gate, dispute, budget, error, and so on) break consecutive silent rechecks.
+        silent_recheck = not user_initiated and is_intentional_silence_response(last_response)
+        prior_silent_rechecks = state.consecutive_silent_no_progress if silent_recheck else 0
+        state.consecutive_silent_no_progress = 0
+
         if is_continuation_gap_wait(state) and not self._barrier_holds():
             # The gap elapsed, so the idle ticker dispatched (or is dispatching) this continuation
             # at the deadline. Pace the next one from there even if its CAS clear has not landed.
@@ -3045,11 +3053,12 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
-        if (verdict == "continue" and silent_automatic and automatic_read_only
-                and not parse_failed and not transport_failed):
-            state.consecutive_silent_no_progress += 1
-        else:
-            state.consecutive_silent_no_progress = 0
+        silent_streak = (
+            prior_silent_rechecks + 1
+            if (silent_recheck and verdict == "continue" and automatic_read_only
+                and not disputed and not parse_failed and not transport_failed)
+            else 0
+        )
 
         # A dispute counts toward the stall breaker unless the reply cites a recorded result no
         # earlier dispute in this streak cited: new proof means converging, rewording is not.
@@ -3108,7 +3117,7 @@ class GoalManager:
 
         # Stall breaker: repeated completion rechecks must converge. Silent stalls
         # end before read-only backoff can re-arm; visible disputes retain their pause.
-        if state.consecutive_silent_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
+        if silent_streak >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
             # Reuse the convergence breaker, but clear this silent stall instead
             # of pausing for user input. Inactive goals cannot wake or re-notify.
             state.status = "cleared"
@@ -3164,6 +3173,9 @@ class GoalManager:
         else:
             state.last_continuation_notice_key = notice_key
             notice = f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}"
+        # The streak is durable only for a candidate that survived every early-return path and is
+        # actually dispatching the next autonomous continuation.
+        state.consecutive_silent_no_progress = silent_streak
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,

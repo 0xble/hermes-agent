@@ -264,13 +264,151 @@ def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(herme
     # Existing visible dispute counts must not force silent turns to pause early.
     mgr.state.consecutive_disputes = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES - 1
     mgr._save()
-    for i in range(limit):
-        mgr = GoalManager(sid)
-        with patch.object(goals, "judge_goal", return_value=DISPUTED):
+    mgr = GoalManager(sid)
+    with patch.object(goals, "judge_goal", return_value=DISPUTED):
+        decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert decision["should_continue"] is True
+    assert mgr.state.consecutive_silent_no_progress == 0
+    assert mgr.state.status == "active"
+    assert decision["verdict"] == "continue"
+
+
+def test_gate_failure_between_silent_rechecks_resets_streak(hermes_home):
+    sid = "silent-stall-gate-reset"
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Publish the wiki", max_turns=0)
+    mgr.add_gate("wiki-check")
+    gate_results = iter([
+        (True, 0, "pass"),
+        (True, 0, "pass"),
+        (False, 1, "still failing"),
+        (True, 0, "pass"),
+    ])
+    with patch.object(goals, "run_gate", side_effect=lambda *_args, **_kwargs: next(gate_results)), \
+            patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+        mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+        mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+        failed = mgr.evaluate_after_turn("The user-visible turn is still working.")
+        resumed = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+
+    assert failed["verdict"] == "gate_failed"
+    assert resumed["status"] == "active"
+    assert resumed["should_continue"] is False
+    assert resumed["verdict"] == "wait"
+    assert mgr.state.consecutive_silent_no_progress == 0
+
+
+
+
+@pytest.mark.parametrize(
+    "early_return",
+    [
+        "quality_gate",
+        "judge_wait",
+        "parked",
+        "live_blocked",
+        "live_parked",
+        "blocked",
+        "done",
+        "transport_error",
+        "parse_error",
+        "silent_stall",
+        "dispute",
+        "max_turns",
+        "delegation",
+        "no_progress",
+        "continuation_gap",
+    ],
+)
+def test_every_post_turn_early_return_breaks_silent_streak(hermes_home, early_return):
+    sid = f"silent-stall-early-{early_return}"
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Publish the wiki", max_turns=0)
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+        mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert mgr.state.consecutive_silent_no_progress == 1
+    mgr.state.consecutive_no_progress = 0
+    mgr.state.backoff_level = 0
+    mgr._save()
+
+    decision = None
+    if early_return == "quality_gate":
+        mgr.add_gate("wiki-check")
+        with patch.object(goals, "run_gate", return_value=(False, 1, "still failing")):
             decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
-        assert decision["should_continue"] == (i < limit - 1)
-    assert mgr.state.status == "cleared"
-    assert decision["verdict"] == "stalled"
+    elif early_return == "judge_wait":
+        wait = ("wait", "waiting for the check", False, {"seconds": 1}, False)
+        with patch.object(goals, "judge_goal", return_value=wait):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "parked":
+        mgr.wait_for_seconds(60, reason="parked test")
+        decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "live_blocked":
+        mgr.state.waiting_on_pid = 1
+        mgr.state.waiting_since = time.time()
+        mgr.state.waiting_reason = "live blocker"
+        mgr._save()
+        with patch.object(mgr, "_stage_live_barrier", return_value=(False, None, "blocked")):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "live_parked":
+        mgr.state.waiting_on_pid = 1
+        mgr.state.waiting_since = time.time()
+        mgr.state.waiting_reason = "live wait"
+        mgr._save()
+        with patch.object(mgr, "_stage_live_barrier", return_value=(True, None, None)):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "blocked":
+        blocked = ("blocked", "needs user input", False, None, False)
+        with patch.object(goals, "judge_goal", return_value=blocked):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "done":
+        done = ("done", "finished", False, None, False)
+        with patch.object(goals, "judge_goal", return_value=done):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "transport_error":
+        mgr.state.consecutive_transport_failures = goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES - 1
+        mgr._save()
+        failure = ("continue", "judge unavailable", False, None, True)
+        with patch.object(goals, "judge_goal", return_value=failure):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "parse_error":
+        mgr.state.consecutive_parse_failures = goals.DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES - 1
+        mgr._save()
+        failure = ("continue", "unparseable judge output", True, None, False)
+        with patch.object(goals, "judge_goal", return_value=failure):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "silent_stall":
+        mgr.state.consecutive_silent_no_progress = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS - 1
+        mgr._save()
+        with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "dispute":
+        mgr.state.consecutive_disputes = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES - 1
+        mgr._save()
+        with patch.object(goals, "judge_goal", return_value=DISPUTED):
+            decision = mgr.evaluate_after_turn("Done, but I need review.")
+    elif early_return == "max_turns":
+        mgr.state.max_turns = mgr.state.turns_used + 1
+        mgr._save()
+        with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "delegation":
+        with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False, active_delegations=1)
+    elif early_return == "no_progress":
+        mgr.state.consecutive_no_progress = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS - 1
+        mgr._save()
+        with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    elif early_return == "continuation_gap":
+        mgr.min_continuation_gap_seconds = 60
+        mgr.state.last_continuation_at = time.time()
+        mgr._save()
+        with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+
+    assert decision is not None
+    assert mgr.state.consecutive_silent_no_progress == 0
 
 
 def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):

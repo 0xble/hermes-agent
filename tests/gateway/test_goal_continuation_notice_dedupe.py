@@ -106,6 +106,12 @@ async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(herme
         if i < limit - 1:
             assert mgr.is_active() and key in adapter._pending_messages
             assert adapter.sent == []
+    if disputed:
+        assert mgr.is_active() and mgr.state.status == "active"
+        assert mgr.state.consecutive_silent_no_progress == 0
+        assert mgr.is_parked()
+        assert len(adapter.sent) == 1 and "Goal parked" in adapter.sent[0]
+        return
     assert not mgr.is_active() and not mgr.has_goal()
     assert mgr.state.status == "cleared", "a silent stall must not pause waiting for the user"
     assert not mgr.is_parked() and mgr.state.waiting_until == 0
