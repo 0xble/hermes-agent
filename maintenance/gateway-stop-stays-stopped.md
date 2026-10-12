@@ -47,6 +47,9 @@ async-delegation or process-completion injection, or goal pause/revival.
   `hermes_cli/goals_pause.py` acquires SQLite's writer before that final ownership
   check and CAS-validates the loaded goal snapshot. The transaction orders the
   pause ahead of successor goal writes while generation admission remains nonblocking.
+  If a user-turn claim lands after that check but before commit, its goal write waits
+  for the pause and then overwrites the stopped snapshot; `/new` invalidates before
+  route replacement, so its successor cannot inherit the pause.
   Lock order is route store, goal DB, short generation check. Compression may advance
   the same stopped entry to its live tip; a reset/new owner may not receive the pause.
 - Between-turn `/stop` replies "Stopped" when it paused a goal, not only when

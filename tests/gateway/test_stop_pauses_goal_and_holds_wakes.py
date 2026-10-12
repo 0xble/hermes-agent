@@ -353,7 +353,11 @@ async def test_stop_pause_write_is_atomic_with_owner_claim(monkeypatch, claim_ki
     def claim_newer_owner():
         claiming.set()
         if claim_kind == "generation":
+            # A user turn claims the next generation without waiting for the goal writer.
             return runner._begin_session_run_generation(key)
+        # /new invalidates first, then waits on the route replacement; both happen while the
+        # stop's SQLite transaction is between its final ownership check and commit.
+        runner._invalidate_session_run_generation(key, reason="session_reset")
         return runner.session_store.reset_session(key)
 
     def set_newer_goal():
