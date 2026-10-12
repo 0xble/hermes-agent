@@ -83,6 +83,13 @@ async def test_goal_continuation_recheck_runs_off_the_loop():
         return False
 
     runner._goal_still_active_for_session = still_active
+
+    async def delivered(*_args, **_kwargs):
+        # Pin the first-response delivery outcome: an undelivered response defers the follow-up
+        # before the goal recheck, which would let this test pass without exercising it.
+        return True
+
+    runner._run_agent_deliver_first_response = delivered
     source = _source()
     ctx = TurnContext(source=source, context_prompt="", channel_prompt=None, session_key="k",
                       session_id="sess", run_generation=1, history=[])
