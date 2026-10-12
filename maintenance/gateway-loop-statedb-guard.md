@@ -1,7 +1,8 @@
 # Gateway loop state.db guard
 
 Load this unit when gateway async code reads or writes `state.db` or the session store, or when
-changing what a gateway restart starts at once (restart auto-resume, cron catch-up).
+changing what a gateway restart starts at once (restart auto-resume, cron catch-up), or changing
+native active-conversation replay access paths in `hermes_state_messages.py`.
 
 ## Required behavior
 
@@ -52,6 +53,25 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
+
+## Active replay access path
+
+Source: `hermes_state_messages.py::_fetch_conversation_rows`; proof:
+`tests/hermes_state/test_active_conversation_replay.py`. On fork base
+`54f27baa0695c9b0f8bf57ba0184944130afb8ba`, the exact public replay projection chose
+`idx_messages_session_id`, filtering 332,311 archived rows to restore 173 live rows.
+Active-only `ORDER BY +id` lets SQLite use the existing `(session_id, active, timestamp)`
+index and sort only live rows, preserving integer id order without a forced-index dependency.
+Nine paired warm reads in one read-only snapshot: full SQL median 165.91 → 0.73 ms;
+public replay with alternation repair 167.32 → 3.71 ms. A second archive-heavy session and
+2k/20k disposable generations preserve every selected column and decoded message in order.
+The regression is red on the base (10x archives cost 10x VM steps) and green after the fix.
+Display/audit predicates and sorts, lineage, repair, prompt sidecars, and compaction tail
+watermarks are unchanged. Upstream `835c3dd038d903182a66ecc45e34bf5e0de65f00` has the same
+query; related PR/issue searches found no matching access-path fix. This is a narrow fork
+candidate for parent review, not installed or integrated; upstream contribution is deferred
+to the delivery owner. Revert this query change to roll back; retire it when an upstream
+release supplies archive-bounded id-ordered replay.
 
 ## 2026-10-10 and 2026-10-11 incidents
 
