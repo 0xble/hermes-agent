@@ -20,6 +20,25 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Shared update E2E signal injection must never enumerate or signal another file's
+processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
+scopes the command agent's process table and each signal request. Fallback close
+kills captured kernel process incarnations, including detached completion
+children, before the leak check reaps them. Kernel PID namespaces remain in use
+where available. NamespaceHost explicitly passes `HERMES_E2E_NAMESPACE_MODE`
+through the agent invocation environment: `pid` preserves every PID-namespace
+process even when its HOME changes or is absent; `home` alone enables fallback
+HOME filtering. Missing/invalid mode or missing fallback HOME fails closed.
+Controlled process-table regressions cover both modes without host signalling;
+controlled host regressions load the actual NamespaceHost implementation with
+local helper/reaper stubs, without importing Unix-only dependencies. All eight
+controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
+regressions retain foreign-sibling refusal and detached cleanup.
+No test is skipped and no worker count or timeout is relaxed.
+The post-commit restart oracle follows the pause-record recovery warning rather
+than the older fleet-restart wording, while still proving that the warning
+clears only after a gateway serves the new commit.
+
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
 runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
