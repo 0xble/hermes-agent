@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -85,14 +86,15 @@ class ProcessCheckpointMixin:
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
             fate = self._detached_host_fate(pid, entry.get("host_start_time"))
-            if fate == "reused":
+            survivor = bool(entry.get("survive_restart"))
+            if fate == "reused" and not survivor:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
                     "start time no longer matches — PID was recycled onto "
                     "an unrelated process; refusing to adopt or signal it.",
                     entry.get("session_id", "?"), pid)
                 continue
-            if fate != "running":
+            if fate != "running" and not survivor:
                 systemd_unit = entry.get("systemd_unit", "")
                 if systemd_unit and not _stop_systemd_unit(systemd_unit):
                     logger.warning(
@@ -112,6 +114,16 @@ class ProcessCheckpointMixin:
                 self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+            if session.survive_restart:
+                from contextvars import copy_context
+                poller = threading.Thread(
+                    target=copy_context().run,
+                    args=(self._survivor_poller_loop, session),
+                    daemon=True,
+                    name=f"proc-survivor-poller-{session.id}",
+                )
+                session._reader_thread = poller
+                poller.start()
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:
                 self.pending_watchers.append({

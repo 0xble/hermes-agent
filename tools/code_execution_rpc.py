@@ -22,7 +22,7 @@ from tools.registry import tool_error
 logger = logging.getLogger("tools.code_execution_tool")
 
 # Terminal parameters that must not be used from ephemeral sandbox scripts.
-_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release"}
+_TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify", "notify_on_complete", "watch_patterns", "heartbeat", "persist_on_release", "survive_restart"}
 
 
 def nested_tool_call_id(task_id) -> str:

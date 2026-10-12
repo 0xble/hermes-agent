@@ -597,6 +597,10 @@ class ProcessSession:
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
+    survive_restart: bool = False              # explicit local non-PTY restart survival claim
+    log_path: str = ""                         # file-backed survivor stdout/stderr
+    exit_path: str = ""                        # wrapper exit code file
+    delivered_path: str = ""                   # atomic exactly-once notification marker
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -638,6 +642,7 @@ class ProcessSession:
     _reader_selectable: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
     _kill_deadline: Optional[float] = field(default=None, repr=False)
+    _kill_requested: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         # A session built without an explicit owner is owned by its own task, so ownership checks compare
@@ -686,7 +691,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release")
+    "heartbeat_seconds", "persist_on_release", "survive_restart", "log_path", "exit_path", "delivered_path")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -1068,6 +1073,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
+        if session.survive_restart:
+            return session
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
             return session
@@ -1235,10 +1242,54 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
         return session
 
+    def _spawn_local_survivor(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
+        """Launch an explicitly restart-surviving local command without a gateway pipe."""
+        if _IS_WINDOWS:
+            raise ValueError("survive_restart is not supported on Windows")
+        run_dir = get_hermes_home() / "process-runs" / session.id
+        run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        session.survive_restart = True
+        session.log_path = str(run_dir / "out.log")
+        session.exit_path = str(run_dir / "exit")
+        session.delivered_path = str(run_dir / "delivered")
+        q = shlex.quote
+        wrapped = (
+            f"( {safe_command} ) > {q(session.log_path)} 2>&1; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path)}"
+        )
+        command_argv = [_find_shell(), "-lic", f"set +m; {wrapped}"]
+        dispatch = restart_safe_gateway_child_argv(
+            command_argv,
+            unit_suffix=session.id,
+            require_restart_safe_scope=False,
+            outlives_parent=False,
+        )
+        spawn_env = self._spawn_env(env_vars)
+        proc = subprocess.Popen(
+            dispatch.argv,
+            text=True,
+            cwd=session.cwd,
+            env=spawn_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}),
+        )
+        session.process = proc
+        session.pid = proc.pid
+        session.host_start_time = self._safe_host_start_time(session.pid)
+        try:
+            self._track_started(session, self._survivor_poller_loop, f"proc-survivor-poller-{session.id}")
+        except Exception:
+            self._reap_untracked(session, proc)
+            raise
+        return session
+
     def spawn_local(
         self, command: str, cwd: str = None, task_id: str = "", session_key: str = "",
         env_vars: dict = None, use_pty: bool = False, owner_task_id: str = "",
-        persist_on_release: bool = False) -> ProcessSession:
+        persist_on_release: bool = False, survive_restart: bool = False) -> ProcessSession:
         """Spawn a background process locally (TERMINAL_ENV=local; other backends use
         spawn_via_env()). ``use_pty`` requests a pseudo-terminal via ptyprocess/pywinpty
         for interactive CLIs, falling back to a plain pipe when unavailable or failing.
@@ -1251,7 +1302,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
 
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
-                                    persist_on_release=persist_on_release)
+                                    persist_on_release=persist_on_release, survive_restart=survive_restart)
+        if survive_restart:
+            if use_pty:
+                raise ValueError("survive_restart is only supported for non-PTY commands")
+            return self._spawn_local_survivor(session, safe_command, env_vars)
         pty_scope_attempted = False
         if use_pty:
             try:
@@ -1551,6 +1606,57 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 self._finish_exited(session, -1, reason="lost", source="backend_lost")
                 return
 
+    def _survivor_poller_loop(self, session: ProcessSession):
+        """Collect a file-backed local survivor after this or a successor gateway boots."""
+        exit_path = Path(session.exit_path)
+        log_path = Path(session.log_path)
+        while not session.exited:
+            if session._kill_requested:
+                time.sleep(0.05)
+                continue
+            try:
+                exit_text = ""
+                if exit_path.exists():
+                    exit_text = exit_path.read_text(encoding="utf-8", errors="replace").strip()
+                if exit_text:
+                    try:
+                        exit_code = int(exit_text.splitlines()[-1])
+                    except ValueError:
+                        exit_code = -1
+                    self._finish_survivor(session, exit_code, "exited", "")
+                    return
+                alive = (
+                    session.process.poll() is None
+                    if session.process is not None
+                    else self._detached_host_fate(session.pid, session.host_start_time) == "running"
+                )
+                if not alive:
+                    # Give the wrapper's final printf a short chance to become visible before
+                    # reporting a genuinely lost process.
+                    time.sleep(0.05)
+                    if not exit_path.exists():
+                        self._finish_survivor(session, None, "lost", "gateway_shutdown")
+                        return
+                if log_path.exists():
+                    output = log_path.read_text(encoding="utf-8", errors="replace")
+                    with session._lock:
+                        session.output_buffer = output[-session.max_output_chars:]
+                        session.total_output_chars = len(output)
+            except OSError:
+                self._finish_survivor(session, None, "lost", "gateway_shutdown")
+                return
+            time.sleep(0.1)
+
+    def _finish_survivor(self, session: ProcessSession, exit_code, reason: str, source: str) -> None:
+        try:
+            output = Path(session.log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            output = ""
+        with session._lock:
+            session.output_buffer = output[-session.max_output_chars:]
+            session.total_output_chars = len(output)
+        self._finish_exited(session, exit_code, reason=reason, source=source)
+
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
         pty = session._pty
@@ -1657,11 +1763,30 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 session._completion_event.set()
         return was_running
 
+    def _claim_survivor_delivery(self, session: ProcessSession) -> bool:
+        """Claim one durable completion notification across gateway boots."""
+        if not session.delivered_path:
+            return True
+        try:
+            path = Path(session.delivered_path)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as marker:
+                json.dump({"delivered": True}, marker)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            logger.warning("Could not claim survivor completion %s", session.id, exc_info=True)
+            return True
+
     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
         if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
             self._write_checkpoint()
         if was_running and session.notify_on_complete:
+            if session.survive_restart and not self._claim_survivor_delivery(session):
+                return
             notification = {
                 "type": "completion",
                 "session_id": session.id,
@@ -2242,6 +2367,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             return result
         # Keep an additive receipt before a restart/shutdown signal can outlive this
         # gateway. The normal completion write below may be fenced by the shared deadline.
+        session._kill_requested = True
         if (source == "gateway_shutdown" or deadline is not None) and (
             session._pty
             or session.process
@@ -2532,6 +2658,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 entry["notify_on_complete"] = True
             if s.persist_on_release:
                 entry["persist_on_release"] = True
+            if s.survive_restart:
+                entry["survive_restart"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
                 entry["exited_at"] = s.exited_at
@@ -2649,6 +2777,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and s.persist_on_release)
+                and not (source == "gateway_shutdown" and s.survive_restart)
             ]
             targets = [s for s in candidates if not s.exited]
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
