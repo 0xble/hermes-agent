@@ -5494,8 +5494,8 @@ class BasePlatformAdapter(ABC):
         _len = len_fn or len
         if _len(content) <= max_length:
             return [content]
-        # Room for " (XXX/XXX)" plus Telegram's MarkdownV2 escaping of both parentheses.
-        INDICATOR_RESERVE = 12
+        # Every split consumes a source codepoint, so len(content) bounds both indicator numbers.
+        INDICATOR_RESERVE = _len(fr" \({len(content)}/{len(content)}\)" + "\n")
         FENCE_CLOSE = "\n```"
         chunks: List[str] = []
         remaining = content
@@ -5507,7 +5507,7 @@ class BasePlatformAdapter(ABC):
             if headroom < 1:
                 headroom = max(1, max_length // 2)
             # Remainder fits in one final chunk; close a reopened fence if still open.
-            if _len(prefix) + _len(remaining) <= max_length - INDICATOR_RESERVE:
+            if _len(prefix) + _len(remaining) + _len(FENCE_CLOSE) <= max_length - INDICATOR_RESERVE:
                 final_chunk = prefix + remaining
                 if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
                     final_chunk += FENCE_CLOSE

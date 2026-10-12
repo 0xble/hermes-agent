@@ -1,38 +1,77 @@
-"""Every MarkdownV2 chunk of a long split reply fits Telegram's 4096 UTF-16 unit limit.
+"""Final MarkdownV2 chunks fit Telegram's UTF-16 limit at count-width boundaries.
 
-``truncate_message()`` reserves room for its `` (N/M)`` suffix, but the Telegram send path then
-escapes it to `` \\(N/M\\)`` (two units longer) and lifts it off a synthesized closing fence onto
-its own line. A single fenced line long enough for 100+ hard splits therefore produced chunks of
-4098 units, which Telegram rejects as too long. Same reserve as upstream PR #126100.
+Upstream PR #126100's static reserve covers three-digit indicators only. The
+fork also budgets arbitrary count widths, both escaped parentheses, and fence
+separation; the fake transport observes the real send path without network I/O.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+import re
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import utf16_len
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from gateway.platforms.base import BasePlatformAdapter, utf16_len
+from plugins.platforms.telegram.adapter import TelegramAdapter, _separate_chunk_indicator_from_fence
 
 
 @pytest.mark.asyncio
-async def test_long_single_line_fence_chunks_fit_telegram_limit():
+@pytest.mark.parametrize("count,body_units,character", [
+    (99, 4069, "x"), (100, 4069, "x"),
+    (999, 4067, "x"), (1000, 4067, "x"), (1001, 4067, "x"),
+    (1004, 4067, "x"), (1004, 4066, "😀"),
+])
+async def test_long_single_line_fence_chunks_fit_telegram_limit(count, body_units, character):
     sent: list[str] = []
 
     async def fake_send_message(text: str, **_kw):
         sent.append(text)
-        return MagicMock(message_id=len(sent))
+        return SimpleNamespace(message_id=len(sent))
 
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._rich_send_disabled = True
     adapter._bot = MagicMock()
-    adapter._bot.send_message = AsyncMock(side_effect=fake_send_message)
+    adapter._bot.send_message = fake_send_message
     adapter._telegram_chat_outbound_slot_secs = 0
-
-    result = await adapter.send("4242", "```\n" + "x" * 420_000 + "\n```")
+    # Fill the head chunks and leave a small tail. These source lengths bound the
+    # indicator to six/seven digits; UTF-16 units, not codepoints, fill the body.
+    repeats = (body_units // utf16_len(character)) * (count - 1) + 50
+    result = await adapter.send("4242", "```\n" + character * repeats + "\n```")
 
     assert result.success is True
-    assert len(sent) >= 100  # three-digit indicators: the widest escaped suffix
-    assert sent[-1].endswith(f"```\n\\({len(sent)}/{len(sent)}\\)")
     oversized = [(i, utf16_len(text)) for i, text in enumerate(sent) if utf16_len(text) > adapter.MAX_MESSAGE_LENGTH]
-    assert not oversized, f"{len(oversized)} chunks over {adapter.MAX_MESSAGE_LENGTH} UTF-16 units: {oversized[:3]}"
+    assert not oversized, f"{len(oversized)} oversized chunks: {oversized[:3]}"
+    assert len(sent) == count
+    for index, text in enumerate(sent, 1):
+        assert text.endswith(f"```\n\\({index}/{count}\\)")
+        body = text.removesuffix(f"\n\\({index}/{count}\\)")
+        assert body.startswith("```\n") and body.endswith("\n```")
+        assert body.count("```") == 2
+    assert sum(text.count(character) for text in sent) == repeats
+
+
+@pytest.mark.parametrize("limit,count,fenced", [
+    (32, 9, False), (64, 100, False), (128, 1000, False), (256, 10000, False),
+    (32, 43, True), (64, 94, True), (32, 100_000, False),
+])
+@pytest.mark.parametrize("len_fn,character", [(len, "x"), (utf16_len, "😀")])
+def test_splitter_budgets_actual_indicators_at_arbitrary_limits(limit, count, fenced, len_fn, character):
+    content = ("```\n" if fenced else "") + character * count
+    chunks = BasePlatformAdapter.truncate_message(content, limit, len_fn=len_fn)
+    assert len(chunks) <= len(content)
+    if count == 100_000:
+        assert len(chunks) >= 10_000  # five-digit counts without megabyte transport fixtures
+    bodies = []
+    for index, chunk in enumerate(chunks, 1):
+        escaped = re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
+        payload = _separate_chunk_indicator_from_fence(escaped)
+        assert len_fn(payload) <= limit
+        if len(chunks) > 1:
+            assert chunk.endswith(f" ({index}/{len(chunks)})")
+        body = re.sub(r" \(\d+/\d+\)$", "", chunk)
+        if fenced:
+            assert body.startswith("```\n") and body.endswith("\n```")
+            body = body.removeprefix("```\n").removesuffix("\n```")
+        bodies.append(body)
+    assert "".join(bodies) == character * count

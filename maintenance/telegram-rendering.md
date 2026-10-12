@@ -319,12 +319,24 @@ regressions through raw `sendRichMessage` without `normalize_footnotes` and
 check the returned blocks. Rollback removes that function and its call in
 `_rich_message_payload`.
 
-Long split replies reserve 12 UTF-16 units for the ` (N/M)` chunk indicator.
-Telegram's MarkdownV2 path escapes both parentheses and can lift the suffix off
-a synthesized closing fence, so the old 10-unit reserve let 100+ chunk single
-line fences reach 4,097 units. `tests/gateway/test_telegram_chunk_indicator_budget.py`
-pins the fix, which follows upstream PR #126100. Retire this reserve when a
-released upstream `truncate_message` passes that regression unchanged.
+Long split replies derive their indicator reserve from the source codepoint
+length: every iteration consumes at least one codepoint, so neither the chunk
+index nor total can exceed that bound. The reserve measures the bounded suffix,
+both MarkdownV2 parenthesis escapes, and a possible fence-separation newline
+through the caller's length function. The final-chunk budget also includes fence
+closure. Tiny limits retain monotonic progress even when a single codepoint or
+the required wrappers cannot fit.
+
+Upstream PR #126100 supplies the static three-digit fix (12 units), not this
+arbitrary-width protection: four-digit counts still reached 4,097–4,098 UTF-16
+units on that candidate. The dynamic bound is fork-owned under the existing
+`telegram-chunk-indicator-budget` identity until an upstream equivalent covers
+the full behavior. `tests/gateway/test_telegram_chunk_indicator_budget.py` checks
+actual mocked outbound payloads at 99/100, 999/1000, and higher counts, including
+astral characters, exact indices/totals, and balanced fences. Its cheap helper
+cases cover arbitrary budgets/count widths and final reopened-fence closure.
+Retire only when a released upstream splitter passes these regressions unchanged;
+an open PR or static reserve increase alone does not qualify.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,
