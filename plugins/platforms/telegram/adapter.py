@@ -8905,11 +8905,12 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     if not token:
         from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
         token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
-    disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+    extra = getattr(pconfig, "extra", None) or {}
     from tools.send_message_tool import _send_telegram
     return await _send_telegram(
         token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=disable_link_previews, force_document=force_document)
+        disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,
+        rich_messages=extra.get("rich_messages"), allow_cjk_rich_messages=extra.get("allow_cjk_rich_messages", False))
 
 
 def interactive_setup() -> None:

@@ -106,11 +106,12 @@ preserves the existing success/error receipt shape and chat-id spelling.
 `MeteredBot` unwraps the raw endpoint and `api_kwargs` before passing a
 `do_api_request` through the existing chat budget. Rich attempts, stale-thread
 retries, and MarkdownV2 fallback all spend the same slots (45/min private,
-15/min group per process, including other metered traffic); there is no new
-limiter, producer cadence, or retry loop. Durable penalty deadlines remain
-shared across processes; the slot clock itself remains process-local, an
-existing limitation. A usual brief now spends one rich request instead of
-multiple chunk requests. Flood refusals spend no fallback request.
+15/min group per process, including other metered traffic). There is no new
+limiter or producer cadence; the only retry addition is a single bounded inline
+retry after a short `RetryAfter`. Durable penalty deadlines remain shared across
+processes; the slot clock itself remains process-local, an existing limitation.
+A usual brief now spends one rich request instead of multiple chunk requests.
+Flood refusals spend no fallback request.
 
 **Verification:** `tests/tools/test_send_message_tool.py::TestStandaloneTelegramRichMessages`
 drives the resolved-config dispatcher and standalone Bot API boundary with
