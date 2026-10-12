@@ -15,7 +15,13 @@ changing what a gateway restart starts at once (restart auto-resume, cron catch-
   and `SessionDB.__init__` checks too: a blocking use on the registered thread raises
   `LoopThreadBlockingError` under pytest and logs one WARNING per call site in production
   (never raises there). `/subgoal`, `/heartbeat` and `/loop` run their manager loads and writes
-  through `_run_in_executor_with_context`.
+  through `_run_in_executor_with_context`. Sites the guard named on the live gateway also run off
+  the loop: the stale Telegram topic-binding prune in `_send_with_retry`, the queued goal
+  continuation's active-goal recheck, `/reasoning` (typed, picked, `/model --reasoning`) and the
+  topic-session reasoning pick (session-store write), the process watcher's registry lookup
+  (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
+  topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
+  profile's handles (primed off the loop at startup and on hot-add).
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
   clean verdict for 10 s while both sidecars keep their identity, never while one is missing,
@@ -83,9 +89,11 @@ main-file-only snapshot proves header and row durability after a warm open),
 
 Further proof surface: `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`,
 `test_goal_family_commands_keep_loop_live` in `tests/gateway/test_turn_state_db_off_loop.py`, and the
-boot-delay case in `tests/hermes_cli/test_worktree_pushed_tier.py`. Known remaining loop sites (logged
-by the guard in production): startup/reconnect sync helpers (`_normalize_source_for_session_key`) and
-first-access `_session_db` opens for an unwarmed profile scope.
+boot-delay case in `tests/hermes_cli/test_worktree_pushed_tier.py`, and
+`tests/gateway/test_loop_thread_statedb_sites.py`. Known remaining loop site: adapter-reconnect
+recovery (`_recover_spool_after_reconnect`) stays synchronous on purpose (e0ba43707ba1): its
+candidate snapshot, spool claim and key resolution must finish before the per-session reconnect
+gate is installed, with no await in between, or fresh inbound can overtake a claimed follow-up.
 
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
 upstream bounds restart replay and cron catch-up itself.

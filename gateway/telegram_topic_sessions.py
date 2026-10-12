@@ -151,7 +151,8 @@ async def _apply_session_settings(runner, dest: SessionSource, entry, model, eff
         if getattr(result, "warning_message", ""):
             warnings.append(result.warning_message)
     if effort is not None:
-        runner._set_reasoning_override(entry.session_key, effort)
+        # Persists through the session store, whose lock is held across a state.db write.
+        await asyncio.to_thread(runner._set_reasoning_override, entry.session_key, effort)
     return warnings
 
 

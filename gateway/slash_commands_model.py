@@ -434,7 +434,8 @@ class GatewayModelCommandsMixin:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
-            reply += "\n" + self._apply_reasoning_selection(
+            reply += "\n" + await asyncio.to_thread(
+                self._apply_reasoning_selection,
                 ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                 persist_global=ctx.persist_global and global_error is None)
         return reply
@@ -843,7 +844,9 @@ class GatewayModelCommandsMixin:
         )
         platform_key = _platform_config_key(event.source.platform)
         if raw_args:  # typed path — same applier the picker uses
-            return self._apply_reasoning_selection(session_key, platform_key, args, persist_global=persist_global)
+            # The applier persists through the session store (state.db): run it off the loop.
+            return await asyncio.to_thread(
+                self._apply_reasoning_selection, session_key, platform_key, args, persist_global=persist_global)
         rc = self._reasoning_config
         # Labels tell the truth about the route: a Hermes-internal step (``ultra``) that the wire
         # clamps is shown as "ultra (sends max on this route)" instead of a distinct level (#61634).
@@ -871,7 +874,7 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            return self._apply_reasoning_selection(session_key, platform_key, value)
+            return await asyncio.to_thread(self._apply_reasoning_selection, session_key, platform_key, value)
 
         picker_sent = await self._try_send_choice_picker(
             event,

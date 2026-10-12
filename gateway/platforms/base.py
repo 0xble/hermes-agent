@@ -4031,7 +4031,8 @@ class BasePlatformAdapter(ABC):
                 mark_stale(chat_id, thread_id)
             prune = getattr(self, "_prune_stale_dm_topic_binding", None)
             if callable(prune):
-                prune(chat_id, thread_id, metadata=topic_meta)
+                # A state.db write: run it off the loop, still before the root-chat fallback send.
+                await asyncio.to_thread(prune, chat_id, thread_id, metadata=topic_meta)
             root_meta = {key: value for key, value in topic_meta.items() if key not in {
                 "thread_id", "message_thread_id", "direct_messages_topic_id",
                 "telegram_direct_messages_topic_id", "telegram_reply_to_message_id",
