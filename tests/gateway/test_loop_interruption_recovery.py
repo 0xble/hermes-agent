@@ -146,6 +146,30 @@ async def test_live_or_restart_owner_keeps_claim_even_a_day_later(control_home, 
 
 
 @pytest.mark.asyncio
+async def test_recovery_write_boundary_rechecks_live_owner(control_home):
+    runner, _adapter, source, entry = native_runner(control_home)
+    mgr = create_loop(entry, source)
+    assert mgr.fire_tick()
+    before = loops.load_loop(entry.session_id)
+    assert before is not None
+    injections = []
+
+    async def worker(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "<lambda>":
+            runner._running_agents[entry.session_key] = object()
+            injections.append("live owner appears at recovery worker boundary")
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    runner._run_in_executor_with_context = worker
+    await scan(runner, entry.session_id)
+    after = loops.load_loop(entry.session_id)
+    assert after is not None
+    assert injections
+    assert after.awaiting_response and after.ticks_fired == before.ticks_fired
+    runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["claimed", "executing", "legacy"])
 @pytest.mark.parametrize("response", ["Answer to an unrelated user question", "LOOP_COMPLETE", ""])
 async def test_post_turn_requires_exact_loop_wake_identity(control_home, phase, response):

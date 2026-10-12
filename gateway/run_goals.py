@@ -884,7 +884,7 @@ class GatewayGoalsMixin:
             if _turn_owner_exists():
                 return
             outcome = await self._run_in_executor_with_context(
-                lambda: LoopManager(session_id=sid).recover_tick()
+                lambda: LoopManager(session_id=sid).recover_tick(owns_turn=_turn_owner_exists)
             )
             if outcome:
                 logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
