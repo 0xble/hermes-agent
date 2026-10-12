@@ -19,10 +19,10 @@ def _runner(command):
     async def _resolve(event, source, qk):
         return False, None, command, None
 
-    async def _canonical(event, source, qk, canonical):
+    async def _canonical(event, source, qk, canonical, *, loop_fence=None):
         return False, None
 
-    async def _quick(event, source, cmd):
+    async def _quick(event, source, cmd, *, loop_fence=None):
         return False, None, cmd
 
     runner._hm_resolve_command = _resolve

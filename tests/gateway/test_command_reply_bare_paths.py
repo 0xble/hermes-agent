@@ -86,7 +86,7 @@ async def test_gateway_dispatch_marks_slash_replies_as_command_replies(path):
     async def _resolve(event, source, qk):
         return False, None, "goal", "goal"
 
-    async def _canonical(event, source, qk, canonical):
+    async def _canonical(event, source, qk, canonical, *, loop_fence=None):
         return True, reply
 
     async def _busy(event, cmd_def, qk, source):
