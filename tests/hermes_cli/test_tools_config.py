@@ -959,7 +959,7 @@ def test_explicit_plugin_toolset_admitted_in_platform_toolsets(monkeypatch):
         _tc_mod, "_get_plugin_toolset_keys", lambda: {"dplat_client"},
     )
     # Discover_plugins must succeed silently under the stub.
-    monkeypatch.setattr(_plugins_mod, "discover_plugins", lambda: None)
+    monkeypatch.setattr(_plugins_mod, "discover_plugins", lambda *a, **k: None)
     # Resolve dplat_call inside the dplat_client toolset — _get_platform_tools
     # ends up calling resolve_toolset() which can fall back to the registry
     # for plugin-provided names. Patch resolve_toolset for "dplat_client".

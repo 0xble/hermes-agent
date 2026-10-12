@@ -115,7 +115,18 @@ async def _async_delivery_snapshot(hook_name: str):
             finally:
                 if lock is not None:
                     lock.release()
-        manager = await asyncio.to_thread(_delivery_manager)
+        if ready:
+            # Deferred loading, activation and unload can hold the registry lock
+            # without clearing readiness. _delivery_manager would return at once;
+            # wait once off-loop instead of busy-spinning through worker hops.
+            try:
+                available = await asyncio.to_thread(plugins._await_foreground_discovery, manager)
+            except Exception as exc:
+                raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry lock wait failed") from exc
+            if not available:
+                raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry lock wait timed out")
+        else:
+            manager = await asyncio.to_thread(_delivery_manager)
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:

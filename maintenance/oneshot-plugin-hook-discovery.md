@@ -29,7 +29,12 @@ middleware, and the streaming snapshot `iter_hook_callbacks`.
 Async hook delivery snapshots a complete registry under a nonblocking sweep-lock
 probe, then releases the lock before callbacks. This gives ready registries a no-yield
 fast path and prevents a concurrent forced reload from exposing an empty/partial
-callback list between the readiness probe and dispatch. Cold startup and forced
+callback list between the readiness probe and dispatch. A ready registry can still
+be locked by deferred platform loading, activation or single-plugin unload; that
+contention waits through the existing bounded foreground-lock barrier off-loop,
+then re-probes readiness. It must not spin through worker hops just because
+`_delivery_manager()` can already return the ready manager. Timeout or lock-wait
+failure refuses policy delivery with `PluginDiscoveryIncomplete`. Cold startup and forced
 reload await discovery off-loop with `asyncio.to_thread`, then await
 callbacks on the caller's event loop. `pre_gateway_dispatch` is an ingress policy
 gate, not a fail-open observer: the first message waits for its skip/rewrite policy,

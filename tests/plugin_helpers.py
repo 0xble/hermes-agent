@@ -19,4 +19,4 @@ def mock_completed_plugin_discovery(monkeypatch) -> None:
     manager = plugins.PluginManager()
     mark_plugin_discovery_complete(manager)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
-    monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **k: None)

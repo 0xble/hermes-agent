@@ -173,3 +173,103 @@ def test_startup_refuses_incomplete_registry_after_join_timeout(monkeypatch):
         GatewayStartupMixin._start_register_plugins_relay_hooks()
     relay_registration.assert_not_called()
     config_hooks.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ready_registry_waits_off_loop_for_contended_lock_without_busy_spin(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    manager._discovered = manager._discovery_complete = True
+    lock = manager._discovery_lock
+    entered, release = threading.Event(), threading.Event()
+    barrier = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    attempts = []
+    thread_hops = []
+    to_thread = asyncio.to_thread
+
+    class ObservedLock:
+        def acquire(self, *, blocking=True, timeout=-1):
+            attempts.append((threading.get_ident(), blocking, timeout))
+            if not blocking:
+                assert len(attempts) <= 3, "ready-lock contention caused a busy-spin"
+                return lock.acquire(blocking=False)
+            assert threading.get_ident() != loop_thread, "lock wait blocked the loop"
+            loop.call_soon_threadsafe(barrier.set)
+            return lock.acquire(timeout=timeout)
+
+        def release(self):
+            lock.release()
+
+    async def counted_to_thread(func, *args, **kwargs):
+        thread_hops.append(func)
+        assert len(thread_hops) == 1, "ready-lock contention repeated worker hops without waiting"
+        return await to_thread(func, *args, **kwargs)
+
+    def hold_ready_registry():
+        # Deferred loading, activation and unload can hold the lock with readiness intact.
+        with lock:
+            entered.set()
+            assert release.wait(15)
+            manager._hooks["pre_gateway_dispatch"] = [lambda **_: {"action": "skip"}]
+
+    monkeypatch.setattr(manager, "_discovery_lock", ObservedLock())
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", None)
+    monkeypatch.setattr(asyncio, "to_thread", counted_to_thread)
+    worker = threading.Thread(target=hold_ready_registry, daemon=True)
+    worker.start()
+    assert entered.wait(5)
+    delivered = asyncio.create_task(plugins.ainvoke_hook("pre_gateway_dispatch"))
+    reached = asyncio.create_task(barrier.wait())
+    try:
+        done, _ = await asyncio.wait({delivered, reached}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        if delivered in done:
+            await delivered  # Surface a repeated-hop failure rather than a guard timeout.
+        assert reached in done, "ready registry never waited for contention off-loop"
+        assert not delivered.done()
+        assert len(thread_hops) == 1
+        release.set()
+        assert await delivered == [{"action": "skip"}]
+        assert [blocking for _, blocking, _ in attempts] == [False, True, False]
+        assert attempts[1][2] > 0, "worker lock wait needs a bounded timeout"
+    finally:
+        release.set()
+        reached.cancel()
+        await asyncio.gather(reached, delivered, return_exceptions=True)
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "lock-error"])
+async def test_ready_registry_contention_timeout_refuses_policy_without_repeated_hops(monkeypatch, failure):
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    manager._discovered = manager._discovery_complete = True
+    loop_thread = threading.get_ident()
+    attempts = []
+
+    class TimedOutLock:
+        def acquire(self, *, blocking=True, timeout=-1):
+            attempts.append((threading.get_ident(), blocking, timeout))
+            assert len(attempts) <= 2, "ready-lock timeout caused repeated acquire attempts"
+            if blocking:
+                assert threading.get_ident() != loop_thread
+                assert timeout > 0
+                if failure == "lock-error":
+                    raise OSError("registry lock wait failed")
+            return False
+
+        def release(self):
+            pytest.fail("must not release an unacquired lock")
+
+    monkeypatch.setattr(manager, "_discovery_lock", TimedOutLock())
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", None)
+    with pytest.raises(plugins.PluginDiscoveryIncomplete, match="discovery incomplete"):
+        await plugins.ainvoke_hook("pre_gateway_dispatch")
+    assert [blocking for _, blocking, _ in attempts] == [False, True]
