@@ -1261,9 +1261,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         dispatch = restart_safe_gateway_child_argv(
             command_argv,
             unit_suffix=session.id,
-            require_restart_safe_scope=False,
+            require_restart_safe_scope=True,
             outlives_parent=False,
         )
+        if dispatch.mode == "scoped":
+            session.systemd_unit = f"hermes-worker-{session.id}.scope"
         spawn_env = self._spawn_env(env_vars)
         proc = subprocess.Popen(
             dispatch.argv,
@@ -2448,6 +2450,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # Leaving it set makes a later reader callback skip both the completion receipt and
             # checkpoint forever after the deadline expires.
             session._kill_deadline = previous_kill_deadline
+            session._kill_requested = False
 
     @staticmethod
     def _stop_scope(session: ProcessSession, deadline: Optional[float] = None) -> bool:
@@ -2772,14 +2775,26 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         reaches them, so the user can always stop a persisted process on purpose."""
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
         with self._lock:
+            all_sessions = (*self._running.values(), *self._finished.values())
             candidates = [
-                s for s in (*self._running.values(), *self._finished.values())
+                s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and s.persist_on_release)
                 and not (source == "gateway_shutdown" and s.survive_restart)
             ]
             targets = [s for s in candidates if not s.exited]
+            restart_survivors = [
+                s for s in all_sessions
+                if (task_id is None or s.owner_task_id == task_id)
+                and s.id not in exclude_ids and not s.exited and s.survive_restart
+            ]
+            if source == "gateway_shutdown" and restart_survivors:
+                self._write_checkpoint()
+                logger.info(
+                    "Shutdown: left %d restart-surviving process(es) running",
+                    len(restart_survivors),
+                )
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]
         def _retry_finished_scopes() -> int:
