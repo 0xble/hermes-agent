@@ -122,8 +122,93 @@ class TestGatewaySilenceRecovery:
         assert result["final_response"] == "[SILENT]"
         assert loop_agent.client.chat.completions.create.call_count == 2
 
+    @pytest.mark.parametrize("interrupted", [False, True], ids=["completed", "interrupted"])
+    def test_scaffolding_removed_after_tool_continuation_and_next_turn_reprompts(self, loop_agent, interrupted):
+        """The re-prompt may continue through a tool call; its marker and nudge must not survive
+        mid-history, or the next human turn inherits a spent retry from stale scaffolding."""
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        loop_agent.valid_tool_names = {"web_search"}
 
-def _run_gateway(agent, stages, *, persist_user_display_kind=None, persist_user_display_metadata=None):
+        stages = iter([_final("NO_REPLY"), _tool_round("call_1")])
+
+        def model_call(*_args, **_kwargs):
+            stage = next(stages, None)
+            if stage is not None:
+                return stage
+            assert loop_agent._session_messages[-1]["role"] == "tool"
+            if interrupted:
+                loop_agent.interrupt()
+            return _final("Workbook built: 3 sheets.")
+
+        first = _run_gateway(loop_agent, model_call)
+
+        if interrupted:
+            assert first["interrupted"] is True
+        else:
+            assert first["final_response"] == "Workbook built: 3 sheets."
+        assert loop_agent.client.chat.completions.create.call_count == 3
+        history = first["messages"]
+        assert not any(m.get("_gateway_silence_reprompt") for m in history)
+        assert [m.get("content") for m in history].count(GATEWAY_SILENCE_REPROMPT) == 0
+        assert "NO_REPLY" not in [m.get("content") for m in history]
+        assert [m["role"] for m in history] == ["user", "assistant", "tool", "assistant"]
+        assert history[2]["tool_call_id"] == "call_1"
+        assert history[2]["content"] == "ok"
+        assert not any(m.get("_gateway_silence_reprompt") for m in loop_agent._session_messages)
+
+        loop_agent.client.chat.completions.create.reset_mock()
+        second = _run_gateway(
+            loop_agent, [_final("NO_REPLY"), _final("Second status.")], conversation_history=history,
+        )
+
+        assert second["final_response"] == "Second status."
+        assert loop_agent.client.chat.completions.create.call_count == 2
+        assert _user_rows_sent(loop_agent, 1)[-1] == GATEWAY_SILENCE_REPROMPT
+
+    def test_stop_gate_continuation_does_not_reset_reprompt_budget(self, loop_agent, monkeypatch):
+        """A verification stop gate continues the same turn; the turn still gets one re-prompt."""
+        loop_agent._gateway_session_key = "agent:main:telegram:dm:test"
+        monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+        nudges = iter(["verify it"])
+        with patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=lambda **_kwargs: next(nudges, None),
+        ):
+            result = _run_gateway(
+                loop_agent,
+                [_final("NO_REPLY"), _final("Answer one."), _final("NO_REPLY"), _final("Answer two.")],
+            )
+
+        assert loop_agent.client.chat.completions.create.call_count == 3
+        assert [rows[-1] for rows in map(lambda i: _user_rows_sent(loop_agent, i), range(3))].count(
+            GATEWAY_SILENCE_REPROMPT
+        ) == 1
+        # The second bare marker ends the turn; the gateway replaces it with its fallback.
+        assert result["final_response"] == "NO_REPLY"
+        assert not any(m.get("_gateway_silence_reprompt") for m in result["messages"])
+
+        import asyncio
+        from types import SimpleNamespace
+        from gateway.config import GatewayConfig, Platform
+        from gateway.run import GatewayRunner
+        from gateway.run_turn import _unexpected_silence_reply
+        from gateway.session import SessionSource
+
+        runner = GatewayRunner(GatewayConfig())
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="123")
+        response, intentional, _ = asyncio.run(runner._hmwa_shape_agent_response(
+            result, source, history=[], session_entry=SimpleNamespace(session_id=result.get("session_id")),
+            session_key=None, _quick_key=loop_agent._gateway_session_key, run_generation=1,
+            _run_start_session_id=result.get("session_id"), _platform_name="telegram", _msg_start_time=0.0,
+        ))
+        assert response == _unexpected_silence_reply()
+        assert intentional is False
+
+
+def _run_gateway(
+    agent, stages, *, persist_user_display_kind=None, persist_user_display_metadata=None,
+    conversation_history=None,
+):
     agent.client.chat.completions.create.side_effect = stages
     with (
         patch.object(agent, "_persist_session"),
@@ -133,6 +218,7 @@ def _run_gateway(agent, stages, *, persist_user_display_kind=None, persist_user_
     ):
         return agent.run_conversation(
             "build the workbook",
+            conversation_history=conversation_history,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata or {},
         )

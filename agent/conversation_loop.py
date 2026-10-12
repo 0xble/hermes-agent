@@ -1771,6 +1771,15 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+    # Early exits (interrupt, retry exhaustion, partial results) bypass finalize_turn; the
+    # silence re-prompt pair must leave no live-history trace on any path. Before the
+    # boundary export, which indexes the final list.
+    from agent.turn_final_response import drop_gateway_silence_scaffolding
+    _result_messages = result.get("messages") if isinstance(result, dict) else None
+    drop_gateway_silence_scaffolding(agent, _result_messages)
+    _live_messages = getattr(agent, "_session_messages", None)
+    if _live_messages is not _result_messages:
+        drop_gateway_silence_scaffolding(agent, _live_messages)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

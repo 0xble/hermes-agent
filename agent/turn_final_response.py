@@ -62,6 +62,31 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
+_GATEWAY_SILENCE_SCAFFOLDING_FLAG = "_gateway_silence_reprompt"
+
+
+def drop_gateway_silence_scaffolding(agent: Any, messages: Any) -> int:
+    """Remove every silence re-prompt row (marker + nudge) in place, wherever it sits.
+
+    The pair is appended together as assistant→user, so removing both keeps role alternation:
+    the row before the marker was already valid before the row after the nudge. Real tool rows
+    are untouched. Scaffolding is never flushed, so only the flush cursor needs re-counting."""
+    if not isinstance(messages, list):
+        return 0
+    flagged = [m for m in messages if isinstance(m, dict) and m.get(_GATEWAY_SILENCE_SCAFFOLDING_FLAG)]
+    if not flagged:
+        return 0
+    flagged_ids = {id(m) for m in flagged}
+    cursor = getattr(agent, "_last_flushed_db_idx", None)
+    # The flush cursor indexes the live list; a detached result copy must not shift it twice.
+    if messages is getattr(agent, "_session_messages", None) and isinstance(cursor, int) and cursor > 0:
+        agent._last_flushed_db_idx = cursor - sum(1 for m in messages[:cursor] if id(m) in flagged_ids)
+    messages[:] = [m for m in messages if id(m) not in flagged_ids]
+    # Positions shifted; force the bounded flush scan to start over.
+    agent._db_flush_scan_prefix = None
+    return len(flagged)
+
+
 @dataclass
 class FinalResponseVerdict:
     """``action``: ``"break"`` (turn ends with ``final_response``), ``"continue"`` (a
@@ -385,11 +410,10 @@ def finish_text_response(
     # ephemeral scaffolding: they participate in the retry request but never become durable
     # transcript rows. Gateway identity is deliberate here; CLI, cron, webhook and machinery
     # turns must retain their existing silence behavior.
+    # The once-per-turn budget is turn-scoped agent state (reset in turn_context's
+    # _PER_TURN_RESET_STATE), never inferred from transcript rows: stop-gate continuations
+    # and the scaffolding drop below would otherwise re-arm it within the same turn.
     from gateway.response_filters import is_intentional_silence_response, silence_allowed
-    _gateway_silence_retry_spent = any(
-        isinstance(_message, dict) and _message.get("_gateway_silence_reprompt")
-        for _message in messages
-    )
     if (
         getattr(agent, "_gateway_session_key", None)
         and is_intentional_silence_response(final_response)
@@ -397,8 +421,9 @@ def finish_text_response(
             getattr(agent, "_turn_display_kind", None),
             getattr(agent, "_turn_reply_expected", None),
         )
-        and not _gateway_silence_retry_spent
+        and not getattr(agent, "_gateway_silence_reprompted", False)
     ):
+        agent._gateway_silence_reprompted = True
         logger.warning(
             "User-addressed gateway turn ended on a silence marker — re-prompting once "
             "for a visible status (session=%s)", getattr(agent, "session_id", "none"),
@@ -424,6 +449,8 @@ def finish_text_response(
         and any(messages[-1].get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS)
     ):
         messages.pop()
+    # The re-prompt may have continued through tool calls, leaving its pair mid-history.
+    drop_gateway_silence_scaffolding(agent, messages)
 
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,

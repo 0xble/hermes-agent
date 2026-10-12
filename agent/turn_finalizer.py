@@ -221,6 +221,8 @@ def _drop_transcript_scaffolding(agent, messages) -> None:
     the synthetic verification nudges go; the assistant candidate persists (#65919)."""
     agent._drop_trailing_empty_response_scaffolding(messages)
     _drop_verification_continuation_scaffolding(messages)
+    from agent.turn_final_response import drop_gateway_silence_scaffolding
+    drop_gateway_silence_scaffolding(agent, messages)
 
 
 def _recover_final_from_stream(agent, final_response, interrupted, failed) -> Tuple[Any, bool]:
