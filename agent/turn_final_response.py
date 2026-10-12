@@ -438,6 +438,10 @@ def finish_text_response(
             "_gateway_silence_reprompt": True,
         })
         agent._session_messages = messages
+        # Reuse the display-only segment boundary before another request can append
+        # to the rejected marker. The gateway discards bare silence at boundaries;
+        # sending None to TTS (_stream_callback) would incorrectly end its stream.
+        agent._call_quietly(agent.stream_delta_callback, None)
         final_response = None
         return _verdict("continue")
 

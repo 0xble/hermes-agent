@@ -14,6 +14,7 @@ also proves the re-prompt reads ``_turn_reply_expected`` at final-response time.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -59,7 +60,7 @@ def agent():
     return agent
 
 
-def _run_relay_turn(agent, finals, *, typed_steer):
+def _run_relay_turn(agent, finals, *, typed_steer, stream_consumer=None):
     """Run a relay-opened turn; optionally fold a typed message in during the first model call."""
     runner = gateway_run.GatewayRunner(GatewayConfig())
     relay = MessageEvent(text=RELAY_TEXT, source=_source(), message_id="relay-1", reply_expected=False)
@@ -77,9 +78,24 @@ def _run_relay_turn(agent, finals, *, typed_steer):
             tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="call_1")],
         )
 
-    agent.client.chat.completions.create.side_effect = _sequence(
-        [first_call] + [_mock_response(content=text, finish_reason="stop") for text in finals]
-    )
+    stages = _sequence([first_call] + [
+        _mock_response(content=text, finish_reason="stop") if isinstance(text, str) else text
+        for text in finals
+    ])
+
+    def model_call(*args, **kwargs):
+        response = stages(*args, **kwargs)
+        content = response.choices[0].message.content
+        if stream_consumer is not None and content:
+            agent.stream_delta_callback(content)
+            agent._record_streamed_assistant_text(content)
+            if not is_intentional_silence_response(content):
+                # Observe the streamed answer BEFORE finish(final_text) can correct a stale
+                # preview. A real tool/flush boundary must never deliver the rejected marker.
+                assert stream_consumer.flush_pending_sync(timeout=5.0)
+        return response
+
+    agent.client.chat.completions.create.side_effect = model_call
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -95,7 +111,7 @@ def _run_relay_turn(agent, finals, *, typed_steer):
 def _sequence(stages):
     stages = list(stages)
 
-    def call(*args, **kwargs):
+    def call(*args, **kwargs) -> Any:
         stage = stages.pop(0)
         return stage(*args, **kwargs) if callable(stage) else stage
     return call
@@ -151,6 +167,71 @@ async def test_relay_only_turn_stays_silent_without_reprompt(agent):
     response, intentional = await _delivered(runner, relay, result)
     assert intentional is True
     assert is_intentional_silence_response(response)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_continuation", [False, True], ids=["direct-text", "tool"])
+async def test_streamed_rejected_marker_is_discarded_before_continuation(agent, tool_continuation):
+    import asyncio
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.test_stream_consumer_silence import _make_adapter, _sent_and_edited
+
+    answer = "Started the requested work."
+    finals: list[str | SimpleNamespace] = ["NO_REPLY"]
+    if tool_continuation:
+        finals.append(_mock_response(
+            content="", finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="call_2")],
+        ))
+    finals.append(answer)
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "chat_1", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+    )
+    agent.stream_delta_callback = consumer.on_delta
+    task = asyncio.create_task(consumer.run())
+    try:
+        runner, relay, result = await asyncio.to_thread(
+            _run_relay_turn, agent, finals, typed_steer=True, stream_consumer=consumer,
+        )
+    finally:
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert agent.client.chat.completions.create.call_count == (4 if tool_continuation else 3)
+    assert result["final_response"] == answer
+    assert await _delivered(runner, relay, result) == (answer, False)
+    payloads = _sent_and_edited(adapter)
+    assert payloads and all("NO_REPLY" not in text for text in payloads), payloads
+    assert consumer._delivered_segment_texts == [answer]
+    assert consumer.has_durably_delivered_text(answer)
+
+
+@pytest.mark.asyncio
+async def test_streamed_relay_only_turn_stays_silent_without_reprompt(agent):
+    import asyncio
+    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    from tests.gateway.test_stream_consumer_silence import _make_adapter, _sent_and_edited
+
+    adapter = _make_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "chat_1", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+    )
+    agent.stream_delta_callback = consumer.on_delta
+    task = asyncio.create_task(consumer.run())
+    try:
+        runner, relay, result = await asyncio.to_thread(
+            _run_relay_turn, agent, ["NO_REPLY"], typed_steer=False, stream_consumer=consumer,
+        )
+    finally:
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=5.0)
+
+    assert agent.client.chat.completions.create.call_count == 2
+    assert (await _delivered(runner, relay, result))[1] is True
+    assert _sent_and_edited(adapter) == []
+    assert consumer._delivered_segment_texts == []
+    assert not consumer.final_content_delivered
 
 
 async def _call(agent, finals, typed_steer):

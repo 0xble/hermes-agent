@@ -481,6 +481,21 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if self._use_draft_streaming and not self._stream_is_message():
             self._bump_draft_id()
 
+    async def _discard_silence_marker_segment(self) -> None:
+        """Drop a rejected bare-marker segment at a continuation boundary.
+
+        Unlike turn-final suppression, earlier finalized preambles stay; only this
+        segment's previews are retracted and nothing is recorded as delivered."""
+        if self._native_stream_opened:
+            await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
+        stale_ids = self._stale_preview_ids(segment_only=True)
+        await self._delete_previews(stale_ids, label="Silence-marker segment")
+        self._preview_message_ids.difference_update(stale_ids)
+        self._reset_message_state()
+        if self._use_draft_streaming and not self._stream_is_message():
+            self._bump_draft_id()
+        logger.info("Discarded streamed silence-marker segment before continuation (chat=%s)", self.chat_id)
+
     def _bump_draft_id(self) -> None:
         type(self)._draft_id_counter += 1
         self._draft_id = type(self)._draft_id_counter
@@ -591,6 +606,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
                         await self._suppress_silence_marker()
                         return
+
+                # A rejected final may continue through text or tools. Never finalize its
+                # bare control marker at the boundary or carry it into the next segment.
+                if tick.got_segment_break and _is_intentional_silence_response(
+                    self._clean_for_display(self._accumulated)
+                ):
+                    await self._discard_silence_marker_segment()
+                    self._copy_filter.message_boundary()
+                    self._signal_flush(tick.flush_event)
+                    continue
 
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)

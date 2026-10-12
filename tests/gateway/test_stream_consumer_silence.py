@@ -196,6 +196,40 @@ class TestStreamedSilenceSuppression:
 
         assert any("No problem" in t for t in interim), interim
 
+    @pytest.mark.asyncio
+    async def test_marker_segment_boundary_discards_only_marker_preview(self):
+        """A rejected marker at a continuation boundary is retracted, not finalized.
+
+        An earlier finalized preamble stays, and the next answer starts clean."""
+        import asyncio
+
+        adapter = _make_adapter()
+        ids = iter(("preamble", "marker", "answer"))
+        adapter.send = AsyncMock(side_effect=lambda **_: SimpleNamespace(
+            success=True, message_id=next(ids)))
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("Checking.")
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 5.0)
+        consumer.on_segment_break()
+        # Force the marker preview the pre-fix tool boundary would have finalized.
+        consumer.on_delta("NO_REPLY")
+        await asyncio.sleep(0.05)
+        consumer._message_id = "marker"
+        consumer._track_preview_id("marker")
+        consumer.on_segment_break()
+        consumer.on_delta("Done.")
+        consumer.finish()
+        await runner
+
+        adapter.delete_message.assert_awaited_once_with("chat_1", "marker")
+        assert all("NO_REPLY" not in t for t in _sent_and_edited(adapter))
+        assert consumer._delivered_segment_texts == ["Checking."]
+        assert consumer.delivered_final_matches("Done.") is True
+
 
 def test_ends_with_partial_silence_marker_scopes_to_last_top_level_line():
     from gateway.response_filters import ends_with_partial_silence_marker as f
