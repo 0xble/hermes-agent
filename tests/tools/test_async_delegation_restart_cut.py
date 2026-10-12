@@ -127,7 +127,7 @@ def test_prune_cap_ignores_exempt_rows_and_evicts_superseded_first():
     assert all(f"exempt-{i}" in remaining for i in range(18))
 
 
-def test_resumable_ceiling_bounds_retry_owed_rows_separately():
+def test_resumable_ceiling_never_deletes_retry_owed_rows():
     now = time.time()
     with ad._DB_LOCK, ad._transaction() as conn:
         for index in range(502):
@@ -139,8 +139,8 @@ def test_resumable_ceiling_bounds_retry_owed_rows_separately():
             )
     ad._prune_durable_records()
     with ad._DB_LOCK, ad._transaction() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM async_delegations WHERE retry_state='scheduled'").fetchone() == (500,)
-        assert conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id='owed-0'").fetchone() is None
+        assert conn.execute("SELECT COUNT(*) FROM async_delegations WHERE retry_state='scheduled'").fetchone() == (502,)
+        assert conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id='owed-0'").fetchone() == (1,)
         assert conn.execute("SELECT 1 FROM async_delegations WHERE delegation_id='owed-501'").fetchone() == (1,)
 
 
@@ -162,3 +162,86 @@ def test_restart_cut_row_survives_100_dispatches():
         assert conn.execute(
             "SELECT state FROM async_delegations WHERE delegation_id=?", (delegation_id,)
         ).fetchone() == ("interrupted",)
+
+
+@pytest.mark.parametrize("reason", ["gateway shutdown (post-interrupt)", "cli shutdown"])
+def test_completed_single_runner_wins_over_interrupt_all(reason):
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(5)
+        return {"status": "completed", "summary": "finished"}
+
+    handle = ad.dispatch_async_delegation(
+        goal="single", context="ctx", toolsets=None, role="leaf", model="m",
+        session_key="session", parent_session_id="parent", runner=runner,
+        interrupt_fn=lambda reason=None: release.set(), max_async_children=1,
+    )
+    assert handle["status"] == "dispatched"
+    assert started.wait(5)
+    assert ad.interrupt_all(reason) == 1
+    event = _event_for(handle["delegation_id"])
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?",
+            (handle["delegation_id"],),
+        ).fetchone() == ("completed",)
+    from tools.delegation_resume import inspect_resumable
+    record, reason = inspect_resumable(handle["delegation_id"])
+    assert record is not None
+    assert reason == "not_interrupted"
+    assert event["status"] == "completed"
+    assert "cut_reason" not in event
+
+
+def _insert_history(did, state, delivery, updated):
+    task = json.dumps({"goal": "single", "role": "leaf"})
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("""INSERT INTO async_delegations
+            (delegation_id,origin_session,parent_session_id,state,delivery_state,
+             dispatched_at,updated_at,task_json) VALUES (?, 's', 'p', ?, ?, ?, ?, ?)""",
+            (did,state,delivery,updated,updated,task))
+
+
+@pytest.mark.parametrize("protected_kind", ["pending", "retry_owed"])
+def test_resumable_cap_keeps_delivery_and_retry_obligations(monkeypatch, protected_kind):
+    now = time.time()
+    _insert_history("owed", "interrupted", "pending" if protected_kind == "pending" else "delivered", now - 50)
+    _insert_history("evictable", "interrupted", "delivered", now)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state=? WHERE delegation_id='owed'",
+                     ("scheduled" if protected_kind == "retry_owed" else "none",))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_RESUMABLE", 1)
+    ad._prune_durable_records()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        ids = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert "owed" in ids
+    assert "evictable" not in ids
+
+
+@pytest.mark.parametrize("outbox", [False, True])
+def test_completion_does_not_steal_boot_notice_claim(outbox):
+    from tools import delegation_resume as dr
+    did = "boot_claim"
+    _insert_history(did, "interrupted", "pending", time.time())
+    boot, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert boot is not None
+    if outbox:
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute("""INSERT INTO async_delegation_events
+                (event_id,delegation_id,event_kind,event_json,created_at,updated_at)
+                VALUES ('cut-event',?,'completion','{}',?,?)""", (did,time.time(),time.time()))
+        claim = ad._claim_outbox_delivery("cut-event", "test")
+    else:
+        claim = ad.claim_event_delivery({"type": "async_delegation", "delegation_id": did}, "test")
+    assert claim is not None
+    assert ad.complete_completion_delivery(did, claim)
+    assert dr.release_auto_resume_trigger(did, boot["auto_resume_claim"])
+    again, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert again is not None
+    assert dr.complete_auto_resume_trigger(did, again["auto_resume_claim"])

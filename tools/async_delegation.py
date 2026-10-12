@@ -388,6 +388,7 @@ def _prune_durable_records() -> None:
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
                   AND {_RESUMABLE_RETENTION_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RETRY_OWED_SQL}
                 ORDER BY updated_at ASC, delegation_id ASC
                 LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
         )]
@@ -603,13 +604,6 @@ def _update_outbox_delivery(event_id: str, claim_id: str, action: str) -> bool:
                    WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
                 (now, now, event_id, claim_id),
             )
-            if cur.rowcount == 1:
-                conn.execute(
-                    """UPDATE async_delegations SET auto_resume_state='delivered', updated_at=?
-                       WHERE delegation_id=(SELECT delegation_id FROM async_delegation_events WHERE event_id=?)
-                         AND auto_resume_state='claimed'""",
-                    (now, event_id),
-                )
         elif action == "release":
             capped = conn.execute(
                 """UPDATE async_delegation_events SET delivery_state='dropped',
@@ -1191,9 +1185,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return _update_outbox_delivery(event_id, claim_id, "complete")
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
-                  delivered_at=?, updated_at=?, auto_resume_state=CASE
-                    WHEN auto_resume_state='claimed' THEN 'delivered' ELSE auto_resume_state END,
-                  delivery_claim=NULL, delivery_claimed_at=NULL
+                  delivered_at=?, updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
 
@@ -2046,7 +2038,7 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
         live = _records.get(delegation_id)
         if live is not None:
             _transition_memory_locked(live, status, expected="finalizing")
-            live["_durable_state"] = live.get("_terminal_state") or status
+            live["_durable_state"] = snapshot.get("_terminal_state") or status
         _prune_completed_locked()
     # A terminal event does not free a submitted slot; only release_slot does.
 
@@ -2057,6 +2049,20 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
     must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly."""
     is_batch = bool(record.get("is_batch"))
+    if record.get("_cut_reason"):
+        if is_batch:
+            indexes = record.get("task_indexes") or list(range(len(record.get("goals") or [])))
+            children = {r.get("task_index", i): r for i, r in enumerate(result.get("results") or [])}
+            unfinished = any(
+                index not in children or children[index].get("status") in {"interrupted", "cancelled", "unknown", "stalled"}
+                for index in indexes
+            )
+        else:
+            unfinished = (result.get("status") or status) not in {"completed", "success"}
+        if unfinished:
+            record["_terminal_state"] = "interrupted"
+        else:
+            record.pop("_cut_reason", None)
     label = " batch" if is_batch else ""
     try:
         from tools.process_registry import process_registry
@@ -2558,9 +2564,8 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
             else:
                 interrupt_fn = live.get("interrupt_fn")
                 if caller == "interrupt_all":
-                    # Preserve the truthful lifecycle classification even when a
-                    # batch later returns a mixed/completed aggregate status.
-                    live["_terminal_state"] = "interrupted"
+                    # A signal is only a cut request. A runner that finishes
+                    # successfully before returning must keep its completed result.
                     live["_cut_reason"] = reason
         if persist_wait is not None:
             persist_wait.wait(30)
