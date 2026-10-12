@@ -20,6 +20,16 @@ Hermes application checkout. A selected lane (`check --lane`) is partial evidenc
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
 
+Shared update E2E signal injection must never enumerate or signal another file's
+processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
+scopes the command agent's process table and each signal request. Fallback close
+kills captured kernel process incarnations, including detached completion
+children, before the leak check reaps them. Kernel PID namespaces remain in use
+where available. No test is skipped and no worker count or timeout is relaxed.
+The post-commit restart oracle follows the pause-record recovery warning rather
+than the older fleet-restart wording, while still proving that the warning
+clears only after a gateway serves the new commit.
+
 Portable Python execution passes `--file-retries 0`, including E2E and native OS
 qualification. A fail-once test stays failed at the gate entrypoint. Interactive
 runner defaults remain unchanged. The Windows Desktop cwd self-test retains its
@@ -78,7 +88,16 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`,
+  `native-test-coverage`.
+
+`native-test-coverage` keeps strict native assertions aligned with the upstream
+subprocess contract, including closed stdin for the Windows WhatsApp tree kill.
+Windows hand-off supervision has a separate test file from post-commit outcomes
+so intentional watchdog/probe waits do not consume the outcome suite's remaining
+300-second file budget. The runner cap, individual deadlines, platform markers,
+and assertions remain unchanged. Retire these adaptations when upstream carries
+equivalent strict assertions and bounded native test allocation.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
@@ -287,6 +306,32 @@ loop belongs to pytest, so `tests/conftest.py` drains the worker at the end of
 each phase hook. `drain()` no longer starts a worker when none exists. Upstream
 main has the same worker and loop. Retire this when upstream drains or joins the
 worker in its suite, or when pytest copies `loggerDict` before iterating it.
+
+## Windows native installer harness
+
+The `fork-ci-reliability` identity keeps the native lane's uv-shim case after
+PM replaced PATH-shim salvage with a pinned artifact. Upstream added the old
+suite in `d0dbf2cbb697`; the qualified-checkpoint merge `f787eedef477` omitted it
+relative to its contributing parent while the fork lane still referenced it.
+The replacement tests real native exit codes, relocated launchers, pinned-store
+reuse/recovery, final staged validation, and digest rejection. The dispatch
+contract now also checks that every named suite exists.
+
+Both `portable.environment()` and `run_tests.sh` stripped `SystemDrive`.
+Windows Common AppData can resolve from `%SystemDrive%\ProgramData`; stripping
+that drive leaves shell caches under a literal relative directory in the
+checkout. Keep `SystemDrive`, `SystemRoot`, `ProgramData`, and `ALLUSERSPROFILE`
+through both allowlists, without forwarding credentials or relocating per-user
+AppData out of its disposable home. The shell boundary also forwards the
+explicit isolated `PSModuleAnalysisCachePath` that `portable.environment()`
+already supplies; otherwise pytest's PowerShell children lose that override
+and can create `Microsoft/Windows/PowerShell/ModuleAnalysisCache` in cwd.
+Portable tests cover the env mapping and the actual shell-to-pytest boundary.
+`source_unchanged` remains unchanged and rejects new files, including those
+cache paths. Native PS 5.1/pwsh execution and a clean
+Windows checkout after the full native lane remain separate proof requirements.
+Retire this adaptation only when the upstream-native harness carries these
+contracts and system-location variables through its isolation boundaries.
 
 ## Verification and retirement
 

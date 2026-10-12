@@ -195,32 +195,3 @@ def test_marker_with_a_live_delegate_is_handed_to_it_at_finish(tmp_path: Path) -
     finally:
         if pid_file.exists():
             subprocess.run(['taskkill', '/F', '/PID', pid_file.read_text(encoding='utf-8-sig')], capture_output=True)
-
-
-@pytest.mark.platforms('windows')
-def test_watchdog_remap_after_banner_reports_interrupted_followups(tmp_path: Path) -> None:
-    code, out, argv, result, _ = _handoff(
-        tmp_path, '-NoGateway', HANDOFF_HANG='Update complete! (v1.0.0)',
-        HERMES_UPDATE_STEP_IDLE_SECONDS='3',
-    )
-    assert code == 0, out
-    assert (result['ok'], result['manual']) == (True, True), result
-    assert any('interrupted' in w for w in result['warnings']), result
-
-
-@pytest.mark.platforms('windows')
-def test_cpu_busy_pipe_silent_update_is_not_killed_by_the_idle_watchdog(tmp_path: Path) -> None:
-    code, out, argv, result, _ = _handoff(
-        tmp_path, '-NoGateway', HANDOFF_BUSY_SECONDS='15', HERMES_UPDATE_STEP_IDLE_SECONDS='4',
-    )
-    assert code == 0, out
-    assert (result['ok'], result['warnings']) == (True, []), result
-
-
-@pytest.mark.platforms('windows')
-def test_hanging_update_help_probe_is_bounded(tmp_path: Path) -> None:
-    code, out, argv, result, _ = _handoff(
-        tmp_path, '-NoGateway', '-ProbeTimeoutSeconds', '10', timeout=120, HANDOFF_HELP_HANG='1',
-    )
-    assert code == 0, out
-    assert argv[0][:2] == ['update', '--yes'] and '--keep-stash' not in argv[0], argv

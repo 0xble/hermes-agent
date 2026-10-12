@@ -50,6 +50,13 @@ def _read(path: str) -> bytes:
 
 
 def _procs() -> list[dict]:
+    # CI may lack usable bubblewrap. HOME is already the fixture's process
+    # ownership boundary in _reaper: never expose other files' processes to
+    # signal-injection cells when /proc is the shared runner's process table.
+    home = os.environ.get("HOME")
+    if not home:
+        return []
+    needle = f"HOME={home}".encode()
     rows = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -58,8 +65,11 @@ def _procs() -> list[dict]:
         fields = _stat(pid)
         if fields is None:
             continue
+        environment = _read(f"/proc/{pid}/environ").split(b"\0")
+        if needle not in environment:
+            continue
         env = {}
-        for item in _read(f"/proc/{pid}/environ").split(b"\0"):
+        for item in environment:
             key, sep, value = item.partition(b"=")
             if sep and key in (b"HERMES_HOME", b"INVOCATION_ID", b"HERMES_E2E_UNIT"):
                 env[key.decode()] = value.decode(errors="replace")
@@ -117,8 +127,11 @@ def _spawn(req: dict) -> dict:
 
 
 def _kill(req: dict) -> dict:
+    pid = int(req["pid"])
+    if pid == os.getpid() or not any(row["pid"] == pid for row in _procs()):
+        return {"ok": False}
     try:
-        os.kill(int(req["pid"]), int(req.get("sig", signal.SIGTERM)))
+        os.kill(pid, int(req.get("sig", signal.SIGTERM)))
         return {"ok": True}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
