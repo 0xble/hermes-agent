@@ -200,7 +200,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Behavior:** Before a gateway turn closes, an exact `NO_REPLY`/`[SILENT]` final visible response on a user-typed turn receives one bounded model nudge for a short visible status. The nudge and discarded marker are ephemeral. Internal notification turns, `reply_expected=False` turns, non-gateway lanes, and a second marker are not re-prompted.
 - **Source surfaces:** `agent/turn_final_response.py`, `agent/conversation_loop.py`, `agent/session_persistence.py`, and `tests/agent/test_degenerate_final_recovery.py`.
 - **Upstream status:** related merged PR [NousResearch/hermes-agent#111624](https://github.com/NousResearch/hermes-agent/pull/111624) adds the downstream fallback for a human silence marker; no upstream re-prompt equivalent found.
-- **Focused regression:** `scripts/run_tests.sh tests/agent/test_degenerate_final_recovery.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_degenerate_final_recovery.py tests/gateway/test_folded_steer_silence_reprompt.py`.
 - **Retirement:** Remove when released upstream re-prompts a user-typed gateway silence marker once before applying its fallback.
 - **Rollback:** Revert commits carrying `Fork-Patch: gateway-silence-reprompt`.
 

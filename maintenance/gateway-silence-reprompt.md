@@ -5,6 +5,7 @@ This unit owns the core retry that prevents a user-typed gateway turn from endin
 ## Preserve
 
 - A gateway turn with a human display kind (`None`) and unknown or true reply expectation must receive one model re-prompt when its final visible text is exactly `NO_REPLY` or `[SILENT]`.
+- The check reads `agent._turn_reply_expected` at final-response time, so a typed message folded into a running relay or notification turn (`gateway/run_busy.py::_fold_into_running_turn`) makes that turn re-promptable.
 - Internal notification turns, turns with `reply_expected=False`, non-gateway lanes, and a second silence marker remain bounded and retain their existing silence behavior.
 - The first marker and nudge are request scaffolding only; neither may become a durable transcript row.
 
@@ -24,4 +25,4 @@ Compare the current final-text continuation path with upstream's silence filteri
 
 ## Verify and recover
 
-Run `scripts/run_tests.sh tests/agent/test_degenerate_final_recovery.py` and the affected gateway silence suites. The regression covers both marker spellings, one successful re-prompt, machinery and unaddressed controls, and the exactly-one retry bound. Rollback is the focused revert of commits carrying `Fork-Patch: gateway-silence-reprompt`; the existing downstream gateway fallback remains available if the retry is removed.
+Run `scripts/run_tests.sh tests/agent/test_degenerate_final_recovery.py tests/gateway/test_folded_steer_silence_reprompt.py` and the affected gateway silence suites. The regressions cover both marker spellings, one successful re-prompt, machinery and unaddressed controls, the exactly-one retry bound, and a typed message steered into a running `reply_expected=False` relay turn through the real busy fold (re-prompt, then visible answer; a second marker gets the gateway fallback; a relay-only turn stays silent). Rollback is the focused revert of commits carrying `Fork-Patch: gateway-silence-reprompt`; the existing downstream gateway fallback remains available if the retry is removed.
