@@ -180,7 +180,6 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
             evidence["suspected_oom"] = True
     return evidence
 
-
 # Startup-watchdog lease held while a SYNCHRONOUS unclean-exit integrity check runs (#115542):
 # ``PRAGMA quick_check(1)`` is one monolithic SQLite operation and per-call leases clamp at
 # 900s, so one entry lease cannot cover a multi-thousand-second healthy check on a huge store.
@@ -278,11 +277,12 @@ def _warn_unclean_exit(evidence: Dict[str, Any]) -> None:
 def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Detect and claim synchronously, then integrity-check the store per its journal mode.
 
-    WAL (the default): a daemon worker owns a copy of the evidence and appends its verdict to
-    ``gateway-exit-diag.log`` when finished, so a minutes-long scan of a huge store stays off
-    the readiness path. A WAL reader never blocks writers; it only pins its snapshot, so
-    checkpoints cannot reset ``state.db-wal`` until it ends (``maintenance/
-    gateway-loop-statedb-guard.md``). Anything else (DELETE / unreadable header): a rollback
+    WAL (the default): a pending diagnostic record is written before a daemon worker owns a
+    copy of the evidence and runs the scan; the worker appends the completed verdict when
+    finished, so a minutes-long scan of a huge store stays off the readiness path. A WAL reader
+    never blocks writers; it only pins its snapshot, so checkpoints cannot reset
+    ``state.db-wal`` until it ends (``maintenance/gateway-loop-statedb-guard.md``). Anything
+    else (DELETE / unreadable header): a rollback
     reader holds SHARED for the whole scan and would fail every writer with "database is
     locked", so it runs here, before any SessionDB writer of ours exists, under a startup
     lease, and the returned evidence carries ``state_db_integrity``. Never raises.
@@ -319,6 +319,13 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
             if not _state_db_is_wal(home):
                 _report_unclean_exit(evidence, home, renew_startup_lease=True)
                 return evidence
+            _append_exit_diag(
+                {
+                    "ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(),
+                    **evidence, "state_db_integrity": "pending",
+                },
+                home,
+            )
             from agent.memory_provider import spawn_context_thread
 
             spawn_context_thread(

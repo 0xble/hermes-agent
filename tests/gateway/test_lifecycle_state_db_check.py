@@ -140,7 +140,9 @@ def test_unclean_exit_persists_the_verdict_in_either_journal_mode(
 
     assert evidence is not None
     assert integrity_workers() == (1 if journal == "wal" else 0)
-    verdict = _exit_diag_records(tmp_path)[0]["state_db_integrity"]
+    records = _exit_diag_records(tmp_path)
+    assert len(records) == (2 if journal == "wal" else 1)
+    verdict = records[-1]["state_db_integrity"]
     if journal == "delete":
         assert evidence["state_db_integrity"] == verdict, "synchronous path returns its verdict"
     failed = any(r.levelno == logging.ERROR and "FAILED integrity check" in r.message for r in caplog.records)
@@ -164,7 +166,7 @@ def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch, inte
     assert not called, "integrity check ran on a clean boot"
 
 
-def _held_check(monkeypatch, verdict=None):
+def _held_check(monkeypatch, verdict=None, *, on_start=None):
     """Replace the checker with one that blocks until released; returns (started, release, calls)."""
     import gateway.lifecycle_ledger as ledger
 
@@ -173,6 +175,8 @@ def _held_check(monkeypatch, verdict=None):
 
     def held(**kw):
         calls.append(kw)
+        if on_start is not None:
+            on_start()
         started.set()
         assert release.wait(timeout=5), "test did not release the checker"
         return real(**kw) if verdict is None else verdict
@@ -202,7 +206,10 @@ def test_wal_startup_returns_while_integrity_check_is_running(
     handle = _armed_handle(monkeypatch)
     _make_state_db(tmp_path, corrupt=False, journal="wal")
     _write_sentinel(tmp_path)
-    started, release, calls = _held_check(monkeypatch, verdict)
+    before_scan = []
+    started, release, calls = _held_check(
+        monkeypatch, verdict, on_start=lambda: before_scan.extend(_exit_diag_records(tmp_path))
+    )
 
     caller, returned, result = _boot_in_thread(tmp_path)
     try:
@@ -213,7 +220,12 @@ def test_wal_startup_returns_while_integrity_check_is_running(
         assert sentinel["phase"] == "running" and sentinel["prior_unclean_exit"] is True
         assert result[0]["prior_pid"] == _DEAD_PID
         assert "state_db_integrity" not in result[0]
-        assert _exit_diag_records(tmp_path) == []
+        assert len(before_scan) == 1, "unclean-exit evidence was not persisted before the scan"
+        pending = before_scan[0]
+        assert pending["tag"] == "gateway.previous_unclean_exit"
+        assert pending["prior_pid"] == _DEAD_PID
+        assert pending["state_db_integrity"] == "pending"
+        assert _exit_diag_records(tmp_path) == before_scan
         assert "exited UNCLEANLY" in caplog.text
         assert handle._lease_count == 0, "background work masked startup liveness"
     finally:
@@ -222,7 +234,10 @@ def test_wal_startup_returns_while_integrity_check_is_running(
         integrity_workers()
 
     assert calls == [{"home": tmp_path, "renew_startup_lease": False}]
-    record = _exit_diag_records(tmp_path)[0]
+    records = _exit_diag_records(tmp_path)
+    assert len(records) == 2
+    assert records[0] == pending, "completion rewrote the original evidence"
+    record = records[-1]
     assert record["tag"] == "gateway.previous_unclean_exit"
     assert record["prior_pid"] == _DEAD_PID
     assert record["state_db_integrity"] == verdict

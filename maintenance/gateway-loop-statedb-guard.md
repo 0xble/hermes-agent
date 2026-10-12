@@ -60,11 +60,15 @@ the new sentinel, logs the WARNING and sets `prior_unclean_exit` /
 `prior_suspected_oom` synchronously. Where `PRAGMA quick_check(1)` runs depends on
 the on-disk journal mode, read lock-free from header bytes 18/19:
 
-- **WAL (default):** a context-bound daemon worker runs the scan after
-  `record_startup` returns, then logs ERROR on corruption and appends
-  `gateway.previous_unclean_exit` to exit-diag. It never renews a startup-watchdog
+- **WAL (default):** `record_startup` first appends a
+  `gateway.previous_unclean_exit` record with `state_db_integrity: "pending"`, then
+  a context-bound daemon worker runs the scan. The worker logs ERROR on corruption
+  and appends the completed verdict to exit-diag. It never renews a startup-watchdog
   lease (unrelated startup must prove its own progress). Process exit can
   interrupt it; no shutdown wait or timeout increase is introduced.
+  If exit interrupts the worker or thread startup fails, the pending record keeps
+  the prior-life evidence after the sentinel has been claimed. It is not an
+  integrity verdict; the later record for the same prior life carries that result.
 - **Anything else (DELETE / unreadable header):** the scan runs synchronously
   inside `record_startup`, before `runner.start()` opens any SessionDB writer of
   this process, under the renewed `state_db_unclean_integrity_check` lease
@@ -78,9 +82,10 @@ the on-disk journal mode, read lock-free from header bytes 18/19:
 Concurrency limits of the WAL background scan, accepted rather than bounded:
 
 - Its read transaction pins one snapshot for the whole scan (134 s on the 28 GB
-  store). Writers proceed, but no checkpoint can reset the WAL past that
-  snapshot, so `state.db-wal` grows with every write until the scan ends; the
-  next checkpoint after it reclaims as usual.
+  store; about 4200 s on a ~37 GB store in the worst observed case). Writers
+  proceed, but no checkpoint can reset or truncate the WAL past that snapshot for
+  the full scan duration, so `state.db-wal` can grow with every write until the
+  scan ends; the next checkpoint after it reclaims as usual.
 - A `wal_checkpoint(TRUNCATE)` in that window waits out its connection's busy
   timeout, then returns `busy=1` without resetting (no exception). The
   post-VACUUM TRUNCATE in `hermes_state_maintenance.py::vacuum` therefore leaves
@@ -103,7 +108,8 @@ readiness path or masking startup stalls with background progress.
 
 Proof: `tests/gateway/test_lifecycle_state_db_check.py` builds real WAL and
 DELETE stores. WAL: an event-held checker proves startup returns with the
-sentinel claimed and no lease taken, then the persisted verdict and corruption
+sentinel claimed, a pending diagnostic already written before the scan begins,
+and no lease taken, then the persisted verdict and corruption
 ERROR. DELETE: the held checker proves `record_startup` does not return until
 the scan ends, after which a zero-timeout writer commits; the scan renews the
 startup lease. Both modes persist healthy/corrupt verdicts; clean boots never
