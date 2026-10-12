@@ -225,6 +225,43 @@ def test_bounded_sweep_prunes_once_through_real_finalization(registry, tmp_path,
             proc.wait(timeout=5)
 
 
+def test_bounded_sweep_writes_cut_receipt_before_signals(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    proc = _spawn_python_sleep(30)
+    seen_at_signal = []
+    real_killpg = os.killpg
+    real_kill = os.kill
+    path = home / "logs" / "process-results" / "proc_receipt_before_term.json"
+
+    def _killpg_records_receipt(pgid, sig):
+        seen_at_signal.append(path.exists())
+        return real_killpg(pgid, sig)
+
+    def _kill_records_receipt(pid, sig):
+        if pid == proc.pid and sig != 0:
+            seen_at_signal.append(path.exists())
+        return real_kill(pid, sig)
+
+    try:
+        session = _make_session(sid="proc_receipt_before_term")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+        monkeypatch.setattr(os, "killpg", _killpg_records_receipt)
+        monkeypatch.setattr(os, "kill", _kill_records_receipt)
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        assert seen_at_signal and seen_at_signal[0] is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_cut_pending_write_never_nests_session_lock_inside_result_lock(tmp_path, monkeypatch):
     from tools import process_registry_results as receipts
 

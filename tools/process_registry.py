@@ -2866,6 +2866,21 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # teardown that skips reconciliation, must still write a cut-retention receipt.
             for session in signalable:
                 session._cut_receipt = True
+            # Small pre-signal receipts, capped at half the remaining budget so the signals
+            # themselves always keep the other half; any session not covered here gets one
+            # more attempt after the signals.
+            pre_signal_receipts: set[str] = set()
+            if source == "gateway_shutdown" or bounded_sweep:
+                receipt_cutoff = None if deadline is None else (
+                    time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+                )
+                for session in signalable:
+                    if (stop_event is not None and stop_event.is_set()) or (
+                        receipt_cutoff is not None and time.monotonic() >= receipt_cutoff
+                    ):
+                        break
+                    save_cut_pending_result(session, source, include_output=False, prune=False)
+                    pre_signal_receipts.add(session.id)
             escalated_ids: set[str] = set()
             systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
@@ -3057,6 +3072,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         killed += 1
             if source == "gateway_shutdown" or bounded_sweep:
                 for session in signalable:
+                    if session.id in pre_signal_receipts:
+                        continue
                     # Receipts are evidence, not the stop itself: never let them spend the
                     # restart's shared deadline once the signals have gone out.
                     if bounded_sweep and (

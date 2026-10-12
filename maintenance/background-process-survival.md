@@ -30,7 +30,8 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   `0xble/hermes-agent` fork; do not push to `NousResearch`.
 - Follow-up cut-receipt finalization fixes keep final receipts authoritative,
   exclude `cut_pending` from terminal-result loading, mark cut receipts explicitly
-  for retention, and keep bounded sweeps signal-first with small receipts.
+  for retention, and write small bounded-sweep receipts before signalling within half
+  the remaining budget, retrying any uncovered session once after the signals.
 - Compatibility is additive: new checkpoint and receipt keys have safe absence
   behavior so an older release can roll back without a destructive migration.
 - Do not touch `gateway/platforms/event.py`, `response_filters.py`, locales, or
