@@ -2695,10 +2695,19 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
-        if event.get("bot_id") or event.get("bot_profile") or event.get("subtype") == "bot_message":
+        if event.get("subtype") == "bot_message":
             return True
         profile = event.get("user_profile")
         if isinstance(profile, dict) and bool(profile.get("is_bot")):
+            return True
+        user = event.get("user")
+        if user and user in self._slack_api_human_users() and not self._is_own_bot_user(user):
+            # A user-token (``xoxp-``) post by an allowlisted person: Slack stamps the posting app's
+            # ``bot_id``/``bot_profile``/``app_id`` on it and omits ``client_msg_id``, but the author
+            # is that human. Classic bot posts (``subtype=bot_message``) have no such user and are
+            # already handled above, and this app's own bot user is never allowlisted.
+            return False
+        if event.get("bot_id") or event.get("bot_profile"):
             return True
         # App-originated events may lack bot_id/subtype but carry app_id and no client_msg_id
         # (humans have one) → bot-authored unless the user is in _slack_api_human_users
@@ -2706,8 +2715,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Real human-authored messages normally carry client_msg_id, so treat the combination as
         # app/bot-authored (#35777).
         if event.get("app_id") and not event.get("client_msg_id"):
-            return event.get("user") not in self._slack_api_human_users()
+            return True
         return False
+
+    def _is_own_bot_user(self, user_id: str) -> bool:
+        """True for this app's own bot user in any connected workspace (echo-loop guard)."""
+        return user_id == getattr(self, "_bot_user_id", None) or user_id in getattr(
+            self, "_team_bot_user_ids", {}).values()
 
     def _resolve_thread_ts(
         self, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
