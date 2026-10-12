@@ -876,8 +876,6 @@ def _release_dead_index_lock(git_dir: Path, root: Path | None = None, *, any_git
                 return True
             except PermissionError:  # Windows: open in a live process
                 pass
-        elif held is None:
-            return False
         if time.monotonic() > deadline:
             return False
         time.sleep(0.1)
