@@ -188,7 +188,14 @@ _AUTONOMOUS_REPLY_RULES = (
     f"{SILENCE_MARKER} and nothing else. Never post status like \"no change\", \"still waiting\", "
     "plain acknowledgements, \"next check at\", or what you did not do.\n"
     "When something changed, report only the new fact or needed action briefly, in one or two short lines. "
-    "Claiming done (with an Evidence section) and being blocked or needing input still require a visible reply.\n"
+    "The FIRST time you claim the goal is done, include an Evidence section with exact proof and make that "
+    "claim visible. Make a done claim visible again only when its substance changed because new evidence, "
+    "new state, or a changed blocker appeared. If you already reported done and nothing material changed "
+    "since that report, reply with exactly "
+    f"{SILENCE_MARKER} and nothing else; the runtime will still re-check completion. "
+    "The FIRST time you are blocked or need user input, say so visibly. While the same blocker or input need "
+    "is unchanged, reply with exactly "
+    f"{SILENCE_MARKER} and nothing else.\n"
 )
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -2937,20 +2944,14 @@ class GoalManager:
                                            since=state.created_at)
         progress_fingerprint = _goal_progress_fingerprint(turn_evidence)
         new_progress = bool(progress_fingerprint and progress_fingerprint != state.last_progress_fingerprint)
-        # A bare silence marker is an explicit no-op from a gateway-authored continuation. Do not
-        # send it to the judge: silence is not a parse failure or a dispute, and the existing
-        # no-progress/backoff logic should decide when to park the goal.
+        # A bare silence marker is an explicit quiet repeat from a gateway-authored continuation.
+        # It still reaches the judge: recorded evidence, not visible prose, is authoritative for completion.
         silent_automatic = not user_initiated and is_intentional_silence_response(last_response)
-        if silent_automatic:
-            verdict, reason, parse_failed, wait_directive, transport_failed = (
-                "continue", state.last_reason or "no material change since the last update", False, None, False
-            )
-        else:
-            verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
-                state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
-                contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-                evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
-            )
+        verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
+            state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
+            contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
+            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+        )
         state.last_verdict = verdict
         state.last_reason = reason
         # A judged CONTINUE is a real transition out of the parked state. The

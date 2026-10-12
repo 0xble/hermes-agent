@@ -249,14 +249,18 @@ class TestGoalManager:
         )
         assert goals.SILENCE_MARKER not in gate
 
-    def test_silent_automatic_continuation_skips_judge_and_counts_no_progress(self, hermes_home):
+    def test_silent_automatic_continuation_rejudges_and_counts_no_progress(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
         manager = GoalManager(session_id="silent-continuation", default_max_turns=20)
         manager.set("wait for an external result")
-        with patch.object(goals, "judge_goal", side_effect=AssertionError("judge must be skipped")):
+        with patch.object(
+            goals, "judge_goal", return_value=("continue", "still waiting", False, None, False),
+        ) as judge:
             decision = manager.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+        judge.assert_called_once()
+        assert judge.call_args.args[1] == goals.SILENCE_MARKER
         assert decision["should_continue"] is True
         assert manager.state.consecutive_parse_failures == 0
         assert manager.state.consecutive_disputes == 0

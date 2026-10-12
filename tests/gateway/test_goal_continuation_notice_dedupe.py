@@ -56,7 +56,7 @@ def _restart_db():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
 @pytest.mark.parametrize("prior_notice", [False, True])
-async def test_silent_automatic_turn_never_manufactures_continuation_notice(hermes_home, marker, prior_notice):
+async def test_silent_automatic_turn_rejudges_without_manufacturing_continuation_notice(hermes_home, marker, prior_notice):
     harness = _harness(hermes_home)
     _, adapter, entry, _, key = harness
     with patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)) as judge:
@@ -67,7 +67,8 @@ async def test_silent_automatic_turn_never_manufactures_continuation_notice(herm
         _restart_db()
         judge.reset_mock()
         mgr = await _turn(harness, marker)
-        judge.assert_not_called()
+        judge.assert_called_once()
+        assert judge.call_args.args[1] == marker
     assert adapter.sent == []
     assert mgr.state.last_continuation_notice_key == previous
     assert mgr.state.status == "active"

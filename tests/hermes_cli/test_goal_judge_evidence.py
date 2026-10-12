@@ -132,6 +132,31 @@ def test_prompt_without_evidence_is_unchanged(monkeypatch):
     assert "Tool results recorded" not in prompts[0]
 
 
+def test_unchanged_done_repeat_is_explicitly_silent():
+    assert goals.SILENCE_MARKER in goals._AUTONOMOUS_REPLY_RULES
+    assert "FIRST time" in goals._AUTONOMOUS_REPLY_RULES
+    assert "nothing material changed" in goals._AUTONOMOUS_REPLY_RULES
+    assert "still require a visible reply" not in goals._AUTONOMOUS_REPLY_RULES
+
+
+def test_silent_repeat_still_rejudges_and_can_finish_from_evidence(hermes_home, monkeypatch):
+    sid = "silent-repeat-rejudge"
+    db = _session_db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Write the systems wiki", contract=GoalContract(
+        outcome="PR open with every page", verification="wiki-check passes on the PR head"))
+    _record_tool_call(db, sid, "terminal", {"command": "gh pr checks 197 -R 0xble/Workspace"},
+                      PR_CHECK_OUTPUT, call_id="silent-call")
+    prompts = _capture_prompts(monkeypatch, ['{"verdict":"done","reason":"recorded proof is sufficient"}'])
+
+    decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+
+    assert decision["verdict"] == "done"
+    assert len(prompts) == 1
+    assert goals.SILENCE_MARKER in prompts[0]
+    assert "wiki-check\\tpass" in prompts[0]
+
+
 def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):
     sid = "evidence-gate"
     mgr = GoalManager(session_id=sid)
