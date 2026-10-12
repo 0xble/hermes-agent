@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import inspect
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -23,6 +24,13 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _complete_loop_tick(manager, response: str, tick=None):
+    """Call native completion while tolerating older test/plugin seams."""
+    if "tick" in inspect.signature(manager.complete_tick).parameters:
+        return manager.complete_tick(response, tick=tick)
+    return manager.complete_tick(response)
 
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
 _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
@@ -788,46 +796,96 @@ class GatewayGoalsMixin:
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
-        """Inject one due /loop wakeup into its session, applying every deferral rule. ``profile`` is
-        the store being scanned (None = default); a ``profile`` persisted in the route wins."""
+        """Inject one due /loop wakeup into its session, applying every deferral rule.
+
+        A persisted claim is not replayed merely because its process disappeared.  The existing
+        gateway ownership fences first prove that no live, admitted, queued, or restart-recovering
+        turn owns it.  An unstarted claim is refunded; an executing or legacy/unknown claim is
+        parked with an honest ambiguous-effects reason.
+        """
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
-        if state.awaiting_response or now < state.next_due_at:
-            return
         route = state.route or {}
         platform_name = route.get("platform", "")
         chat_id = route.get("chat_id", "")
         if not platform_name or not chat_id:
             return  # CLI / TUI-owned loop — their own schedulers drive it.
         profile = route.get("profile") or profile
-        # The loop's OWN profile's adapter map, fail closed: ``self.adapters`` is the default profile's,
-        # so a secondary session's wakeup would inject via the default bot on a bare chat_id (a
-        # Telegram DM lands in the user's chat with the other bot).
         adapters = self._adapters_for_profile(profile)
         adapter = next((a for p, a in adapters.items() if p.value == platform_name), None)
         if adapter is None:
-            if sid not in warned_no_route:
-                warned_no_route.add(sid)
-                logger.debug(
-                    "loop wakeup: no adapter for platform %r (session %s, profile %s)", platform_name, sid, profile,
-                )
             return
-
         source = await asyncio.to_thread(self._build_process_event_source, {
-            "session_key": "",
-            "platform": platform_name,
-            "chat_id": chat_id,
+            "session_key": "", "platform": platform_name, "chat_id": chat_id,
             **{k: route.get(k, "") for k in ("chat_type", "thread_id", "user_id", "user_name")},
         })
         if source is None:
             return
         if profile and not getattr(source, "profile", None):
-            source.profile = profile  # session key + runtime scope of the injected turn
+            source.profile = profile
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
-        if session_key and session_key in self._running_agents:
-            return  # busy — stays due, next scan retries
+        if not session_key:
+            return
+
+        def _turn_owner_exists() -> bool:
+            if self._is_session_running(session_key) or session_key in self._running_agents:
+                return True
+            if session_key in getattr(adapter, "_active_sessions", {}):
+                return True
+            with suppress(Exception):
+                if self._queue_depth(session_key, adapter=adapter) > 0:
+                    return True
+            with suppress(Exception):
+                entry = self.session_store._entries.get(session_key)
+                if entry is not None and getattr(entry, "resume_pending", False):
+                    return True
+            return False
+
+        # A reset makes the route resolve to a different durable session. Clear only with that
+        # positive proof; route lookup or adapter failures above retain the row for retry.
+        try:
+            lookup = getattr(self.session_store, "lookup_by_session_key", None)
+            current = (
+                await self._run_in_executor_with_context(lookup, session_key)
+                if lookup is not None else None
+            )
+        except Exception:
+            logger.debug("loop wakeup: session ownership lookup failed", exc_info=True)
+            return
+        if current is not None and current.session_id != sid:
+            # Compression deliberately carries conversation responsibility forward; an
+            # explicit /new reset does not. Follow the existing compression tip before
+            # retiring an orphaned old row.
+            try:
+                tip = await self._run_in_executor_with_context(
+                    lambda: self.session_store._db_for_key(session_key).get_compression_tip(sid)
+                )
+            except Exception:
+                logger.debug("loop wakeup: compression lineage lookup failed", exc_info=True)
+                return
+            if tip == current.session_id:
+                return
+            try:
+                await self._run_in_executor_with_context(
+                    lambda: LoopManager(session_id=sid).clear()
+                )
+            except Exception:
+                logger.debug("loop wakeup: orphan cleanup failed", exc_info=True)
+            return
+
+        if state.awaiting_response:
+            if _turn_owner_exists():
+                return
+            outcome = await self._run_in_executor_with_context(
+                lambda: LoopManager(session_id=sid).recover_tick()
+            )
+            if outcome:
+                logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
+            return
+        if now < state.next_due_at:
+            return
         def _due_manager():
             if goal_blocks_loop_tick(sid):
                 return None
@@ -854,6 +912,7 @@ class GatewayGoalsMixin:
         # prompt.
         # #85957: same client-owns-the-turn rule as the raw-key branch above — persist the completion as a
         # delivery row, never self-post it as a new role=user prompt.
+        tick = (mgr.state.created_at, mgr.state.ticks_fired)
         try:
             logger.info(
                 "loop wakeup #%s — injecting for %s chat=%s thread=%s",
@@ -874,17 +933,21 @@ class GatewayGoalsMixin:
             from gateway.wake import admit_internal_event
             await admit_internal_event(adapter, event)
             # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick once the command was admitted (caps +
-            # scheduling). The command wake's fence accepts this exact tick even when that
-            # completion reached a cap, so the final requested run is never dropped.
+            # completion hook. Persist the execution fence before settling the exact claim. If the
+            # command was suppressed by a control fence, start_tick refuses and the claim remains
+            # unrefunded rather than being replayed.
             if is_command:
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
+                if not await self._run_in_executor_with_context(mgr.start_tick, tick):
+                    raise RuntimeError("slash-command loop claim was superseded before execution")
+                await self._run_in_executor_with_context(
+                    functools.partial(_complete_loop_tick, mgr, "", tick)
+                )
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-            # Off-loop: the rollback is a conditional SessionDB write and, when compression
-            # migrated the loop after fire_tick(), follows the claim to the continuation.
             with suppress(Exception):
-                await self._run_in_executor_with_context(mgr.abandon_tick)
+                await self._run_in_executor_with_context(
+                    mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
+                )
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

@@ -42,6 +42,7 @@ normalization can manufacture retry/cleanup notices. Silent replies still
 skip the loop judge. This repair changes neither self-paced backoff nor the user's
 cadence/quote-authority policy. The moved revision bodies are unchanged except
 for late imports and their CAS wrappers.
+The gateway persists loop ownership in three phases: ``claimed`` before adapter admission, ``executing`` immediately before model work, and settled after the turn. On startup or a later scan, it may refund a positively unstarted claim only when no live, admitted, queued, or restart-recovering owner exists. Executing, legacy, or otherwise ambiguous claims are parked with an explicit unknown-effects reason; they are never blindly replayed. Explicit ``/new`` retires the old conversation's loop and goal instead of transferring them; compression follows the existing lineage tip and preserves responsibility. Topic identity remains bound to the active session; reset and compression are separate boundaries.
 
 ## Proof surface
 

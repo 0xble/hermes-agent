@@ -332,6 +332,9 @@ class LoopState:
     # True between "wakeup injected" and "that turn's response evaluated": stops a tick from
     # double-firing mid-turn and tells the post-turn hook the turn that just ended was ours.
     awaiting_response: bool = False
+    # Empty on legacy claims: execution may already have happened. New gateway
+    # claims are marked before admission, and executing is persisted before model work.
+    claim_phase: str = ""  # claimed | executing | empty (legacy/unknown)
     # Definition version the in-flight tick fired with; completion judges against it, so a revise
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
@@ -711,6 +714,7 @@ class LoopManager(LoopRevisionsMixin):
         if self._state is None or self._state.status == "cleared":
             return False
         self._state.status = "cleared"
+        self._state.awaiting_response = False
         self._save()
         self._state = None
         return True
@@ -740,6 +744,7 @@ class LoopManager(LoopRevisionsMixin):
             state.tick_id = uuid.uuid4().hex  # survives revisions, changes on every claim
             state.last_fired_at = time.time()
             state.awaiting_response = True
+            state.claim_phase = "claimed"
             state.fired_version = state.version
             # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
             # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
@@ -804,7 +809,7 @@ class LoopManager(LoopRevisionsMixin):
         self._adopt(claimed)
         return True
 
-    def _save_tick_outcome(self, fired_ticks: int, settle) -> bool:
+    def _save_tick_outcome(self, fired_ticks: int, settle, *, expected_phase=None, owns_turn=None) -> bool:
         """Settle the fired tick on the stored loop inside one write transaction.
 
         A user or cross-session pause, stop, resume, replace or re-set can land while the tick's
@@ -836,6 +841,8 @@ class LoopManager(LoopRevisionsMixin):
             if (
                 stored is None or stored.status != "active" or not stored.awaiting_response
                 or stored.created_at != s.created_at or stored.ticks_fired != fired_ticks
+                or (expected_phase is not None and stored.claim_phase != expected_phase)
+                or (owns_turn is not None and owns_turn())
             ):
                 return None
             settle(stored)
@@ -872,12 +879,7 @@ class LoopManager(LoopRevisionsMixin):
         self._mark_synced()
 
     def _follow_compression(self) -> bool:
-        """Rebind this manager to the compression continuation that now owns its loop.
-
-        ``migrate_loop_to_session`` copies the row verbatim and archives the parent as cleared,
-        so a manager loaded before the rotation would otherwise settle against the archived row.
-        Only a validated compression successor holding the same loop instance qualifies; a fork,
-        a user stop (no successor row), or an ambiguous lineage leaves the manager unchanged."""
+        """Rebind this manager to a verified compression continuation holding the same loop."""
         s = self._state
         if s is None or self._cursor is not None:
             return False
@@ -897,28 +899,25 @@ class LoopManager(LoopRevisionsMixin):
                 "reason": "loop changed during the tick", "message": ""}
 
     @snapshot_control
-    def abandon_tick(self, *, tick: Optional[Tuple[float, int]] = None) -> None:
-        """Roll back a fired tick whose turn never ran.
-
-        ``tick`` fences the rollback to the wake that is being abandoned. Without that fence, a
-        stale early-exit handler could undo a newer tick claimed after the original wake was queued.
-        """
+    def abandon_tick(self, *, tick: Optional[Tuple[Any, Any]] = None, owns_turn=None) -> bool:
+        """Refund only an unstarted claim; started or unknown claims are never replayed."""
         s = self._state
-        if s is None or not s.awaiting_response:
-            return
+        if s is None or not s.awaiting_response or s.claim_phase != "claimed":
+            return False
         if tick is not None:
             try:
                 instance, fired = tick
             except (TypeError, ValueError):
-                return
+                return False
             if s.created_at != instance or s.ticks_fired != fired:
                 if not self._follow_compression():
-                    return
+                    return False
                 s = self._state
-                if s is None or not s.awaiting_response or s.created_at != instance or s.ticks_fired != fired:
-                    return
-        else:
-            fired = s.ticks_fired
+                if s is None or not s.awaiting_response or s.claim_phase != "claimed":
+                    return False
+                if s.created_at != instance or s.ticks_fired != fired:
+                    return False
+        fired = s.ticks_fired
 
         def settle(state: LoopState) -> None:
             state.awaiting_response = False
@@ -930,7 +929,35 @@ class LoopManager(LoopRevisionsMixin):
             else:
                 state.next_due_at = time.time()
 
-        self._save_tick_outcome(fired, settle)
+        return self._save_tick_outcome(fired, settle, expected_phase="claimed", owns_turn=owns_turn)
+
+    def start_tick(self, tick: Tuple[Any, Any]) -> bool:
+        """Durably fence model execution to the exact admitted loop instance/tick."""
+        s = self._state
+        if s is None or (s.created_at, s.ticks_fired) != tick or s.claim_phase != "claimed":
+            return False
+        return self._save_tick_outcome(
+            s.ticks_fired, lambda state: setattr(state, "claim_phase", "executing"),
+            expected_phase="claimed",
+        )
+
+    def recover_tick(self, *, owns_turn=None) -> str:
+        """Reconcile an ownerless claim without assuming external effects are replayable.
+
+        The driver proves idle ownership; the write boundary repeats that check and
+        compares the phase so execution beginning during the worker hop wins.
+        """
+        s = self._state
+        if s is None or not s.awaiting_response:
+            return ""
+        if s.claim_phase == "claimed":
+            return "unstarted claim refunded" if self.abandon_tick(owns_turn=owns_turn) else ""
+        reason = "interrupted loop tick: execution outcome unknown; inspect effects before /loop resume"
+        def park(state):
+            self._apply_stop(state, "paused", reason)
+        return reason if self._save_tick_outcome(
+            s.ticks_fired, park, expected_phase=s.claim_phase, owns_turn=owns_turn,
+        ) else ""
 
     @staticmethod
     def _cap_stop(state: LoopState) -> Optional[Tuple[str, str, str]]:
