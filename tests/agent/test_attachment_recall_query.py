@@ -31,6 +31,60 @@ def enrich(monkeypatch):
         caption, paths or [PATH]))
 
 
+@pytest.mark.parametrize("platform", ["telegram", "discord"])
+@pytest.mark.parametrize("own_reply", [False, True])
+@pytest.mark.parametrize("caption", [REQUEST, "", "thanks!"])
+def test_gateway_reply_and_trigger_wrappers_do_not_hide_attachment_caption(
+    enrich, monkeypatch, platform, own_reply, caption,
+):
+    from gateway.config import Platform
+
+    monkeypatch.setattr("gateway.session._discord_tools_loaded", lambda: True)
+    event = SimpleNamespace(
+        message_id="42", reply_to_message_id="41",
+        reply_to_text='Previous message with [brackets] and "quotes".\n\nMore context.',
+        reply_to_is_own_message=own_reply,
+    )
+    source = SimpleNamespace(platform=Platform(platform))
+    prompt = GatewayInboundMixin._prepend_inbound_reply_context(event, source, enrich(caption))
+    if caption:
+        assert prompt.index(caption) > 800
+    expected = DESCRIPTION.strip() if not caption else "" if caption == "thanks!" else caption
+    assert auto_recall_query(prompt, platform=platform) == expected
+    assert human_prompt_text(prompt) == prompt
+    agent = _turn_agent()
+    _memory_turn_start_and_prefetch(agent, prompt)
+    if expected:
+        assert agent._memory_manager.prefetch_all.call_args.args[0] == expected
+    else:
+        agent._memory_manager.prefetch_all.assert_not_called()
+    queued = _post_turn_agent(display_kind=None)
+    queued._sync_external_memory_for_turn(
+        original_user_message=prompt, final_response="answer", interrupted=False,
+    )
+    if expected:
+        assert queued._memory_manager.queue_prefetch_all.call_args.args[0] == expected
+    else:
+        queued._memory_manager.queue_prefetch_all.assert_not_called()
+
+
+def test_discord_trigger_without_reply_does_not_hide_attachment_caption(enrich, monkeypatch):
+    from gateway.config import Platform
+
+    monkeypatch.setattr("gateway.session._discord_tools_loaded", lambda: True)
+    event = SimpleNamespace(message_id="42", reply_to_text=None, reply_to_message_id=None)
+    source = SimpleNamespace(platform=Platform.DISCORD)
+    prompt = GatewayInboundMixin._prepend_inbound_reply_context(event, source, enrich(REQUEST))
+    assert auto_recall_query(prompt, platform="discord") == REQUEST
+
+
+def test_reply_pointer_cannot_override_generated_turn_provenance(enrich):
+    event = SimpleNamespace(message_id="42", reply_to_message_id="41", reply_to_text="Previous")
+    prompt = GatewayInboundMixin._prepend_inbound_reply_context(event, None, enrich(REQUEST))
+    assert auto_recall_query(prompt, display_kind="internal_notification") == ""
+    assert auto_recall_query(prompt, platform="cron") == ""
+
+
 def test_long_gateway_image_prefix_recalls_the_actual_personal_request(enrich):
     prompt = enrich(REQUEST)
     assert prompt.index(REQUEST) > 800

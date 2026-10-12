@@ -306,6 +306,22 @@ _ATTACHMENT_RECALL_NOTE = re.compile(
 )
 
 
+# Reply/trigger context is added outside media enrichment by
+# GatewayInboundMixin._prepend_inbound_reply_context. It must be peeled before the
+# attachment notes, or a reply caption still lands beyond the provider's query cap.
+_REPLY_RECALL_PREFIX = re.compile(
+    r'\[Replying to(?: your previous message)?: ".*?"\]\n\n', re.DOTALL,
+)
+_TRIGGER_RECALL_PREFIX = re.compile(
+    r"\[Triggering message id: `[^\n]+` — use as `message_id` for reply/react/pin "
+    r"via the discord tools\.\]\n\n",
+)
+_RECALL_CONTEXT_PREFIXES = (
+    _TRIGGER_RECALL_PREFIX, _REPLY_RECALL_PREFIX, _IMAGE_RECALL_PREFIX,
+    _IMAGE_REFERENCE_RECALL_PREFIX, _ATTACHMENT_RECALL_NOTE,
+)
+
+
 def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None:
     """Prefer the request over prepended attachment context, with an image-only fallback.
 
@@ -320,12 +336,12 @@ def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None
             if not human:
                 return None
             text = human
-        image = _IMAGE_RECALL_PREFIX.match(text)
-        prefix = image or _IMAGE_REFERENCE_RECALL_PREFIX.match(text) or _ATTACHMENT_RECALL_NOTE.match(text)
+        prefix = next((match for pattern in _RECALL_CONTEXT_PREFIXES
+                       if (match := pattern.match(text))), None)
         if not prefix:
             return text
-        if image:
-            descriptions.append(image.group("description").strip())
+        if "description" in prefix.re.groupindex:
+            descriptions.append(prefix.group("description").strip())
         text = text[prefix.end():].strip()
     fallback = "\n\n".join(description for description in descriptions if description)
     return fallback if include_synthetic else human_prompt_text(fallback)
