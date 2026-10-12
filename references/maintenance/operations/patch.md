@@ -31,3 +31,37 @@
 - **Verification:** `scripts/run_tests.sh tests/hermes_state/test_compact_at_next_start.py` fails before (module absent) and passes after (11 tests); the related suites (held-store gate, auto-vacuum holder gate, startup lease, startup watchdog, runner startup, host lock, replace ownership) pass.
 - **Rollback:** Revert the commit carrying `Fork-Patch: state-db-compact-at-start`; a leftover request file is inert.
 - **Retirement:** Remove when upstream ships a supported way to compact a gateway-held store.
+
+## gateway-loop-statedb-guard: generation checkpoint durability
+
+- **Status:** Candidate for parent review; not installed, merged or promoted. Reuses the existing
+  `Fork-Patch: gateway-loop-statedb-guard` identity and [behavior record](../../../maintenance/gateway-loop-statedb-guard.md).
+- **Summary and placement:** Repair the core `SessionDB` generation fence after fork PR #494,
+  not an extension or seamless-restart change. The independent proposal checks the main-file
+  header through the existing lock-safe probe and retries PASSIVE until the WAL-visible
+  `application_id` is durable. Unknown probe results retry rather than declaring durability.
+  Preserve #494's settled warm-open fast path and deleted-sidecar descriptor rechecks.
+- **Source surfaces:** `hermes_state.py::_ensure_db_file_generation`;
+  `tests/hermes_state/test_generation_checkpoint_durability.py` and the existing warm-open,
+  generation, checkpoint, file-identity, deleted-WAL and process-registry coverage.
+- **Baseline and upstream findings:** Fork base `881af4c2805230cad2dc10e539393f798114edc4`
+  (#494); upstream inspected at `835c3dd038d903182a66ecc45e34bf5e0de65f00`. Governing guidance:
+  upstream `AGENTS.md`, `CONTRIBUTING.md`, `tests/AGENTS.md` and contributing/package-management
+  docs. Closed issue [#45383](https://github.com/NousResearch/hermes-agent/issues/45383) and merged
+  [#99753](https://github.com/NousResearch/hermes-agent/pull/99753) establish generation durability
+  and PASSIVE-only checkpointing. Closed [#101881](https://github.com/NousResearch/hermes-agent/pull/101881)
+  was adopted through merged [#108067](https://github.com/NousResearch/hermes-agent/pull/108067):
+  avoid no-op warm-open writes. Current upstream still checkpoints every generation open, so it
+  does not have this fork-only regression. Open [#135066](https://github.com/NousResearch/hermes-agent/issues/135066)
+  concerns broader maintenance-connection fencing, which this candidate does not change.
+- **Verification:** Red-first real-SQLite regression: after a blocked initial checkpoint and a
+  second warm open, the main-file header remained `0` and its generation row absent on the base.
+  Both become durable with the repair, verified by a main-file-only copy without the WAL. The
+  settled warm-open test still observes no checkpoint. Canonical `scripts/run_tests.sh` across
+  8 affected files: **469 passed, 37 skipped**. Ruff, Windows-footgun, temporary-path and
+  source-only fork-patch checks pass; parent review, exact-SHA gate and hosted checks remain pending.
+- **Stack fit:** Narrow core repair reusing the lock-safe header probe; no new plugin, sidecar,
+  persisted marker, timeout, periodic checkpoint, schema or config.
+- **Rollback and retirement:** Revert the durability commit to restore #494's opener-local gate.
+  Retire when upstream's warm-open implementation both retries blocked initial checkpoints and
+  skips settled checkpoints, verified by the same reader-held/main-file-only regression.
