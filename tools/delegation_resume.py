@@ -33,7 +33,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Boot-time automatic resume is a parent-facing trigger only. The gateway reads
 # ``gateway.auto_resume_on_boot`` from the active profile before queueing notices;
@@ -105,6 +105,100 @@ def _row_to_record(row) -> Dict[str, Any]:
     }
 
 
+def _batch_recovery_candidates(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return only fan-out children without a trustworthy recorded success."""
+    task = record.get("task") or {}
+    goals = list(task.get("goals") or [])
+    indexes = task.get("task_indexes") or list(range(len(goals)))
+    if not task.get("is_batch") and len(indexes) <= 1:
+        return []
+    result = record.get("result") or {}
+    recorded = {entry.get("task_index"): entry for entry in result.get("results") or []
+                if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)}
+    candidates = []
+    for index in indexes:
+        entry = recorded.get(index) or {}
+        status = str(entry.get("status") or "unknown").lower()
+        if status in {"completed", "success", "succeeded"}:
+            continue
+        candidates.append({
+            "task_index": index,
+            "goal": goals[index] if 0 <= index < len(goals) else task.get("goal", ""),
+            "result": entry,
+        })
+    return candidates
+
+
+def _claim_batch_children(conn, record: Dict[str, Any], claim: str) -> List[int]:
+    """Take one durable claim for each unfinished child in a fan-out."""
+    candidates = _batch_recovery_candidates(record)
+    claimed = []
+    now = time.time()
+    for child in candidates:
+        changed = conn.execute(
+            """INSERT OR IGNORE INTO async_delegation_child_recovery
+               (delegation_id, task_index, claim, claimed_at)
+               VALUES (?, ?, ?, ?)""",
+            (record["delegation_id"], child["task_index"], claim, now),
+        ).rowcount
+        if changed == 1:
+            claimed.append(child["task_index"])
+    return claimed
+
+
+def _batch_recovery_tasks(record: Dict[str, Any], indexes: Optional[List[int]] = None) -> List[Dict[str, str]]:
+    """Build normal delegate_task task payloads for claimed unfinished children."""
+    task = record.get("task") or {}
+    candidates = _batch_recovery_candidates(record)
+    wanted = set(indexes) if indexes is not None else None
+    result = record.get("result") or {}
+    recorded = {entry.get("task_index"): entry for entry in result.get("results") or []
+                if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)}
+    transcripts = task.get("task_transcripts") or {}
+    tails = result.get("transcript_tails") or {}
+    shared = str(task.get("context") or "").strip()
+    tasks = []
+    for child in candidates:
+        index = child["task_index"]
+        if wanted is not None and index not in wanted:
+            continue
+        child_task = dict(task)
+        child_task.update(goal=child["goal"], context=shared)
+        child_record = dict(record, task=child_task)
+        instruction = build_recovery_instruction(child_record)
+        lines = [instruction, "", f"RECOVERY CHILD INDEX: {index}"]
+        sibling_lines = []
+        for sibling_index, entry in sorted(recorded.items()):
+            sibling_lines.append(
+                f"- child {sibling_index}: status={entry.get('status', 'unknown')} "
+                f"summary={entry.get('summary') or entry.get('error') or '(none)'}"
+            )
+        if sibling_lines:
+            lines += ["", "RECORDED SIBLING RESULTS (do not repeat successful work):", *sibling_lines]
+        transcript = transcripts.get(str(index), transcripts.get(index)) if isinstance(transcripts, dict) else None
+        if transcript:
+            lines += ["", f"THIS CHILD'S PRIOR TRANSCRIPT: {transcript}"]
+        tail = tails.get(str(index), tails.get(index)) if isinstance(tails, dict) else None
+        if tail:
+            lines += ["", "THIS CHILD'S PRIOR TRANSCRIPT TAIL:", str(tail)]
+        if result.get("git_state_hint"):
+            lines += ["", f"OWNER GIT STATE AT CUT: {result['git_state_hint']}"]
+        tasks.append({"goal": str(child["goal"] or ""), "context": "\n".join(lines)})
+    return tasks
+
+
+def _batch_resume_eligibility(record: Dict[str, Any]) -> Optional[str]:
+    """Eligibility for a fan-out recovery, kept separate from legacy single-task rules."""
+    if record["state"] not in RESUMABLE_STATES:
+        return INELIGIBLE_STATE
+    if not (record["parent_session_id"] or record["origin_session_id"]):
+        return INELIGIBLE_STATELESS
+    if record["resume_state"] != RESUME_STATE_NONE or record["resume_attempts"] > 0:
+        return INELIGIBLE_CLAIMED
+    if not _batch_recovery_candidates(record):
+        return INELIGIBLE_PARTIAL
+    return None
+
 def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     """None when the record may be resumed, else a stable refusal token."""
     if record["state"] not in RESUMABLE_STATES:
@@ -121,19 +215,16 @@ def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     if task.get("task_indexes"):
         return INELIGIBLE_BATCH
     if record["result"].get("results"):
-        # A unit that recorded per-child results needs reconciliation, not a
-        # blind re-run: refuse rather than duplicate finished children's work.
         return INELIGIBLE_PARTIAL
     if not (record["origin_session_id"] or record["parent_session_id"]):
-        # Stateless origins (cron/one-shot CLI) have nowhere to deliver a
-        # resumed result and no conversation that can own the recovery.
         return INELIGIBLE_STATELESS
     if record["resume_state"] != RESUME_STATE_NONE or record["resume_attempts"] > 0:
         return INELIGIBLE_CLAIMED
     if not str(task.get("goal") or "").strip():
-        # Without the original goal there is nothing truthful to resume.
         return INELIGIBLE_STATE
     return None
+
+
 
 
 def inspect_resumable(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -312,6 +403,35 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
     record["resume_claim"] = claim_id
     record["resume_state"] = RESUME_STATE_CLAIMED
     record["resume_attempts"] = 1
+    return record, None
+def claim_batch_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Claim each unfinished child of a batch exactly once."""
+    ad = _ad()
+    if not delegation_id:
+        return None, INELIGIBLE_NO_ROW
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(_SELECT, (delegation_id,)).fetchone()
+        if row is None:
+            return None, INELIGIBLE_NO_ROW
+        record = _row_to_record(row)
+        reason = _batch_resume_eligibility(record)
+        if reason is not None:
+            return record, reason
+        changed = conn.execute(
+            """UPDATE async_delegations SET resume_state=?, resume_attempts=resume_attempts+1,
+                      resume_claim=?, resume_claimed_at=?, updated_at=?
+               WHERE delegation_id=? AND resume_state=? AND resume_attempts=0""",
+            (RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id, RESUME_STATE_NONE),
+        ).rowcount
+        if changed != 1:
+            return record, INELIGIBLE_CLAIMED
+        indexes = _claim_batch_children(conn, record, claim_id)
+    record["resume_state"] = RESUME_STATE_CLAIMED
+    record["resume_attempts"] = 1
+    record["resume_claim"] = claim_id
+    record["recovery_tasks"] = _batch_recovery_tasks(record, indexes)
     return record, None
 
 
@@ -819,7 +939,10 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
         claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
         if claim is None:
             return record, INELIGIBLE_CLAIMED
+        child_indexes = _claim_batch_children(conn, record, claim)
     record.update(retry_state=RETRY_DISPATCHING, retry_claim=claim, retry_claimed_at=now)
+    if child_indexes:
+        record["recovery_tasks"] = _batch_recovery_tasks(record, child_indexes)
     return record, None
 
 

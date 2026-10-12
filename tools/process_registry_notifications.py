@@ -227,6 +227,23 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
+def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
+    """Fixed parent-facing continuation block for gateway-cut work."""
+    if not evt.get("cut_reason"):
+        return []
+    unfinished = [str((r.get("task_index", i) + 1)) for i, r in enumerate(results)
+                  if r.get("status") not in _DONE]
+    if not unfinished:
+        unfinished = ["1"]
+    when = evt.get("completed_at") or time.time()
+    stamp = time.strftime("%H:%M", time.localtime(when))
+    return [
+        f"Cut by gateway restart at {stamp}. Unfinished children: {', '.join(unfinished)}.",
+        f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
+        "Do not rerun completed children.",
+    ]
+
+
 def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> str:
     """Consolidated block for a delegate_task fan-out that finished as one unit."""
     results, goals = evt.get("results") or [], evt.get("goals") or []
@@ -244,7 +261,12 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
-    if evt.get("status") == "interrupted" or any(r.get("status") == "interrupted" for r in results):
+    lines += _cut_recovery_lines(evt, results)
+    if evt.get("cut_reason"):
+        lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}",
+                  "This unit was cut by the gateway before its terminal result was trustworthy. "
+                  "Resume only the unfinished children after verifying recorded results and side effects."]
+    if evt.get("status") == "interrupted" or evt.get("cut_reason") or any(r.get("status") == "interrupted" for r in results):
         lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
@@ -320,7 +342,7 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
-    lines += _notice_lines([evt]) + [
+    lines += _notice_lines([evt]) + _cut_recovery_lines(evt, [evt]) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
         "--- RESULT ---"]
