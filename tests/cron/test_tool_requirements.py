@@ -133,6 +133,18 @@ def test_legacy_terminal_alias_satisfies_shell_step():
     assert job_tool_requirement_issues(job, cfg={}) == []
 
 
+def test_disabled_bundle_preserves_core_terminal():
+    job = {"enabled_toolsets": ["terminal"], "prompt": "Add with `loops finding add`."}
+    assert job_tool_requirement_issues(job, cfg={"agent": {"disabled_toolsets": ["coding"]}}) == []
+    assert job_tool_requirement_issues(job, cfg={"agent": {"disabled_toolsets": ["hermes-cli"]}}) == []
+
+
+def test_explicit_canonical_mcp_relay_satisfies_relay_step_with_no_mcp():
+    cfg = {"mcp_servers": {"relay": {"command": "relay"}}}
+    job = {"enabled_toolsets": ["file", "mcp-relay", "no_mcp"], "prompt": "Use Pick the Destination."}
+    assert job_tool_requirement_issues(job, cfg=cfg) == []
+
+
 def test_explicit_other_mcp_server_does_not_merge_relay():
     cfg = {"mcp_servers": {**_RELAY_MCP_CFG["mcp_servers"], "github": {"command": "gh-mcp"}}}
     job = {"enabled_toolsets": ["file", "github"], "prompt": "If needed, use Pick the Destination."}
