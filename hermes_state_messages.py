@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -62,6 +63,22 @@ _DISPLAY_META_ROW_SQL = "SELECT display_metadata FROM messages WHERE id = ? AND 
 _DISPLAY_INDEX_MISSING_SQL = ("SELECT 1 FROM messages WHERE session_id = ?" + _DISPLAY_ACTIVE_CLAUSE
                               + " AND (display_order IS NULL OR display_identity IS NULL) LIMIT 1")
 _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 ORDER BY id"
+_DISPLAY_FOLD_COLUMNS_SQL = ("SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
+                             "display_kind, display_metadata, display_order, display_identity FROM messages")
+_DISPLAY_FOLD_SCAN_SQL = (_DISPLAY_FOLD_COLUMNS_SQL + " INDEXED BY idx_messages_session_id "
+                          "WHERE session_id = ? AND id > ?" + _DISPLAY_ACTIVE_CLAUSE + " ORDER BY id LIMIT 1000")
+# The WHERE clauses repeat each partial index's own predicate so SQLite can serve them from the index.
+_DISPLAY_IDENTITY_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
+                               "INDEXED BY idx_messages_display_identity WHERE session_id = ? "
+                               "AND display_identity IS NOT NULL" + _DISPLAY_ACTIVE_CLAUSE)
+_DISPLAY_BACKFILL_INDEX_SQL = ("SELECT id, display_identity, display_order FROM messages "
+                               "INDEXED BY idx_messages_display_backfill WHERE session_id = ? "
+                               "AND (display_order IS NULL OR display_identity IS NULL)" + _DISPLAY_ACTIVE_CLAUSE)
+_SET_DISPLAY_FOLD_SQL = "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?"
+# Display-fold plan: row id -> (stored identity, recomputed identity, user display_metadata).
+# The third slot is _NOT_A_USER_ROW for every non-user row (only user rows key on metadata).
+_NOT_A_USER_ROW = object()
+_FoldPlan = Dict[int, Tuple[Optional[bytes], bytes, Any]]
 _LIVE_IDENTITY_SQL = ("SELECT id, role, content, tool_call_id, tool_calls, message_uid FROM messages "
                       "WHERE session_id = ? AND active = 1 ORDER BY id LIMIT ?")
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
@@ -935,6 +952,7 @@ class SessionMessagesMixin:
         self, conn, session_id: str, compacted_messages: List[Dict[str, Any]], covered: List[int], *,
         tail_count: int, carried_messages: Optional[List[Dict[str, Any]]], patched_model_config: Any,
         patch: bool, merged_away: Set[int],
+        fold_plan: Optional[_FoldPlan] = None,
     ) -> int:
         """Archive *covered* as summarized and clone every other active row after the new set.
 
@@ -976,7 +994,7 @@ class SessionMessagesMixin:
             tool_calls_total += unseen_tool_calls
         # A carried copy whose stored identity was computed differently lands in its own
         # display_order group and would project twice; re-fold before publishing (#122167).
-        self._reconcile_display_orders(conn, session_id)
+        self._reconcile_display_orders(conn, session_id, fold_plan)
         conn.execute(
             f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
             (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
@@ -1014,6 +1032,8 @@ class SessionMessagesMixin:
         rows fresh ids; consumers that reference durable row ids re-resolve by content (see 3e8ab0610).
         """
         from hermes_state import SessionCompressionInProgressError
+        # The display re-fold's history read happens here, before the writer lock (see _display_fold_plan).
+        fold_plan = self._display_fold_plan(session_id)
         def _do(conn):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
@@ -1029,7 +1049,7 @@ class SessionMessagesMixin:
                 return self._archive_named_rows(
                     conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
                     carried_messages=carried_messages, patched_model_config=patched_model_config, patch=patch,
-                    merged_away=proved[1])
+                    merged_away=proved[1], fold_plan=fold_plan)
             tail_ids, tail_tool_calls = ([], 0) if watermark is None else self._tail_rows_after_watermark(
                 conn, "SELECT id, tool_calls FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id",
                 (session_id, int(watermark)))
@@ -1064,7 +1084,7 @@ class SessionMessagesMixin:
                 tool_calls_total += tail_tool_calls
             # A carried copy whose stored identity was computed differently lands in its own
             # display_order group and would project twice; re-fold before publishing (#122167).
-            self._reconcile_display_orders(conn, session_id)
+            self._reconcile_display_orders(conn, session_id, fold_plan)
             conn.execute(f"{_SET_COUNTERS_SQL}{', model_config = ?' if patch else ''} WHERE id = ?",
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
@@ -1222,7 +1242,59 @@ class SessionMessagesMixin:
         # copy in a newer generation has a higher id than messages emitted after the original.
         return [seen[key] for key in sorted(seen, key=first_id.__getitem__)]
 
-    def _reconcile_display_orders(self, conn, session_id: str) -> None:
+    def _display_fold_plan(self, session_id: str) -> Optional[_FoldPlan]:
+        """``{row id: (stored identity, recomputed identity, user metadata)}`` for every display-visible row of
+        *session_id*, read from one pooled-reader snapshot WITHOUT the writer lock.
+
+        Recomputing the display key decodes every row the session ever compacted (thousands of
+        rows and megabytes of content for a long topic session). Under the writer lock that read
+        stalled every other writer on a loaded disk (2026-10-11 10:57: 21 turns queued behind an
+        ``archive_and_compact``). The plan is only a hint: :meth:`_reconcile_display_orders`
+        reuses a recomputed identity only while the row's stored identity still equals the one
+        this snapshot saw. A content, role, timestamp, tool or display_kind change in between
+        nulls the stored identity (``messages_display_identity_update``). ``display_metadata``
+        is the one key input that trigger does not watch, and only user rows key on it, so the
+        plan keeps each user row's metadata and the lock re-reads that column for user rows only.
+        Every changed row and every row the snapshot did not see is recomputed under the lock.
+        ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
+        if not session_id or getattr(self, "read_only", False) or not getattr(self, "_wal_active", False):
+            return None
+        plan: _FoldPlan = {}
+        try:
+            with self._read_ctx() as conn:
+                if conn is self._conn:  # degraded read path runs on the writer under its lock
+                    return None
+                conn.execute("BEGIN")
+                try:
+                    last_id = 0
+                    while True:
+                        rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id)).fetchall()
+                        if not rows:
+                            break
+                        for row in rows:
+                            plan[row["id"]] = (
+                                row["display_identity"], self._display_identity(self._display_dedupe_key(row)),
+                                row["display_metadata"] if row["role"] == "user" else _NOT_A_USER_ROW)
+                        last_id = rows[-1]["id"]
+                finally:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+        except sqlite3.Error as exc:
+            logger.debug("display fold plan for %s unavailable, folding under the lock: %s", session_id, exc)
+            return None
+        return plan
+
+    def _visible_display_index(self, conn, session_id: str) -> List[Tuple[int, Optional[bytes], Optional[int]]]:
+        """``(id, display_identity, display_order)`` of every display-visible row, id order, from the
+        two partial display indexes alone (no row payload is read)."""
+        rows: Dict[int, Tuple[int, Optional[bytes], Optional[int]]] = {}
+        for sql in (_DISPLAY_IDENTITY_INDEX_SQL, _DISPLAY_BACKFILL_INDEX_SQL):
+            for row in conn.execute(sql, (session_id,)):
+                rows[row[0]] = (row[0], row[1], row[2])
+        return [rows[row_id] for row_id in sorted(rows)]
+
+    def _reconcile_display_orders(self, conn, session_id: str,
+                                  plan: Optional[_FoldPlan] = None) -> None:
         """Re-fold split display generations by the recomputed display key.
 
         A compaction generation that computed the display identity differently (or cloned
@@ -1230,17 +1302,23 @@ class SessionMessagesMixin:
         and ``GROUP BY display_order`` then projects it twice (#122167). Folding by the same
         recomputed key :meth:`_dedupe_display_generations` uses keeps every display projection
         on one definition of a logical message; the live copy wins its group via the read
-        path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift."""
+        path's ``ORDER BY candidate.active DESC, candidate.id DESC``. Writes only on drift.
+
+        With a *plan* from :meth:`_display_fold_plan`, rows the snapshot already recomputed
+        are folded from the display indexes alone, and only new or changed rows are read and
+        recomputed here. The result is the same fold as the full scan below."""
+        if plan is not None:
+            try:
+                visible = self._visible_display_index(conn, session_id)
+            except sqlite3.OperationalError as exc:  # a display index is missing: full scan
+                logger.debug("display index read failed for %s, full fold: %s", session_id, exc)
+            else:
+                self._fold_display_orders(conn, visible, plan)
+                return
         first_id: Dict[bytes, int] = {}
         last_id = 0
         while True:
-            rows = conn.execute(
-                "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
-                "display_kind, display_metadata, display_order, display_identity "
-                "FROM messages INDEXED BY idx_messages_session_id "
-                "WHERE session_id = ? AND id > ? AND (active = 1 OR compacted = 1) "
-                "ORDER BY id LIMIT 1000",
-                (session_id, last_id))
+            rows = conn.execute(_DISPLAY_FOLD_SCAN_SQL, (session_id, last_id))
             batch_start = last_id
             updates = []
             for row in rows:
@@ -1252,8 +1330,37 @@ class SessionMessagesMixin:
             rows.close()
             if last_id == batch_start:
                 break
-            conn.executemany(
-                "UPDATE messages SET display_order = ?, display_identity = ? WHERE id = ?", updates)
+            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
+
+    def _fold_display_orders(self, conn, visible: List[Tuple[int, Optional[bytes], Optional[int]]],
+                             plan: _FoldPlan) -> None:
+        """The full scan's fold over *visible*, recomputing only rows *plan* cannot vouch for."""
+        stale = [row_id for row_id, stored, _order in visible
+                 if stored is None or plan.get(row_id, (None,))[0] != stored]
+        stale_set = set(stale)
+        # A role change nulls the stored identity, so an unchanged row keeps the snapshot's role.
+        users = [row_id for row_id, _stored, _order in visible
+                 if row_id not in stale_set and plan[row_id][2] is not _NOT_A_USER_ROW]
+        for start in range(0, len(users), 500):
+            chunk = users[start:start + 500]
+            for row_id, metadata in conn.execute(
+                    f"SELECT id, display_metadata FROM messages WHERE id IN ({_placeholders(chunk)})", chunk):
+                if metadata != plan[row_id][2]:
+                    stale.append(row_id)
+        fresh: Dict[int, bytes] = {}
+        for start in range(0, len(stale), 500):
+            chunk = stale[start:start + 500]
+            for row in conn.execute(f"{_DISPLAY_FOLD_COLUMNS_SQL} WHERE id IN ({_placeholders(chunk)})", chunk):
+                fresh[row["id"]] = self._display_identity(self._display_dedupe_key(row))
+        first_id: Dict[bytes, int] = {}
+        updates = []
+        for row_id, stored, order in visible:
+            identity = fresh[row_id] if row_id in fresh else plan[row_id][1]
+            folded = first_id.setdefault(identity, row_id)
+            if folded != order or identity != stored:
+                updates.append((folded, identity, row_id))
+        if updates:
+            conn.executemany(_SET_DISPLAY_FOLD_SQL, updates)
 
     def _ensure_display_order(self, session_id: str) -> bool:
         """Backfill one legacy session once, preserving the pre-index display identity exactly."""
