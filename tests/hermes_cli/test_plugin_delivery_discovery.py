@@ -219,6 +219,23 @@ def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkey
     assert first_result == {"value": ["ran"]}
 
 
+@pytest.mark.asyncio
+async def test_fail_open_ingress_does_not_wait_for_cold_discovery(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    started = []
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(
+        plugins, "start_background_plugin_discovery", lambda: started.append(True)
+    )
+
+    assert await plugins.ainvoke_hook(
+        "pre_gateway_dispatch", _wait_for_discovery=False
+    ) == []
+    assert started == [True]
+
+
 def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypatch):
     import asyncio
     import threading

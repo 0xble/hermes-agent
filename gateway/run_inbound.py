@@ -116,6 +116,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 "pre_gateway_dispatch", event=event, gateway=self,
                 # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
                 session_store=getattr(self, "session_store", None),
+                # This admission hook is fail-open by contract. A cold plugin scan must not delay
+                # ingress, claim/session fencing, or command dispatch; policy hooks retain the
+                # default fail-closed discovery barrier.
+                _wait_for_discovery=False,
             )
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)

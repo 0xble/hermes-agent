@@ -1868,9 +1868,28 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
-async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+async def ainvoke_hook(
+    hook_name: str, *, _wait_for_discovery: bool = True, **kwargs: Any
+) -> List[Any]:
     """:func:`invoke_hook` for callers on an event loop: discovery barriers run off-loop, while
-    callbacks are awaited on the caller's loop (see ``PluginManager.ainvoke_hook``)."""
+    callbacks are awaited on the caller's loop (see ``PluginManager.ainvoke_hook``).
+
+    ``_wait_for_discovery=False`` is reserved for fail-open ingress observers such as
+    ``pre_gateway_dispatch``. They must not hold an inbound message behind a cold plugin scan;
+    discovery continues in the background and a later message observes the completed registry.
+    Policy hooks keep the default fail-closed barrier.
+    """
+    if not _wait_for_discovery:
+        manager = get_plugin_manager()
+        worker = _background_discovery_thread
+        if worker is not None and worker.is_alive():
+            return []
+        if not getattr(manager, "_discovered", True):
+            start_background_plugin_discovery()
+            return []
+        if not getattr(manager, "_discovery_complete", True):
+            return []
+        return await manager.ainvoke_hook(hook_name, **kwargs)
     manager = await asyncio.to_thread(_delivery_manager)
     return await manager.ainvoke_hook(hook_name, **kwargs)
 
