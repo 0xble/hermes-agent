@@ -22,7 +22,8 @@ _SHELL_REQUIREMENT_PATTERNS = (
     (re.compile(r"\b(?:run|execute)\s*:?[ \t]+`[^`\n]+`", re.IGNORECASE),
      "explicit Run command step"),
     (re.compile(r"```(?:bash|sh|zsh|shell)\s*\n", re.IGNORECASE), "shell command block"),
-    (re.compile(r"\b(?:terminal|execute_code)\s*\(", re.IGNORECASE), "shell tool call"),
+    # execute_code alone can batch file/web tools; only an explicit terminal call needs a shell.
+    (re.compile(r"\bterminal\s*\(", re.IGNORECASE), "shell tool call"),
 )
 
 _RELAY_REQUIREMENT_PATTERNS = (
@@ -46,23 +47,40 @@ def _plugin_skill_path(name: str):
     return path if path is not None and path.exists() else None
 
 
-def _attached_skill_content(name: str) -> str:
-    """Read raw attached instructions; doctor must not run skill preprocessing/setup."""
-    from agent.skill_utils import normalize_skill_lookup_name
+def _single_skill_content(name: str) -> str:
+    """Raw SKILL.md text, resolved like ``skill_view`` but without preprocessing or persisted scans."""
+    from agent.skill_utils import normalize_skill_lookup_name, project_skill_scans_read_only
     from tools.skills_tool import _locate_skill, _skill_lookup_path_error, _skill_search_dirs
     name = normalize_skill_lookup_name(name)
     if _skill_lookup_path_error(name):
         return ""
     path = _plugin_skill_path(name)
     if path is None:
-        roots, _ = _skill_search_dirs()
-        error, _, path = _locate_skill(name, name.replace(":", "/") if ":" in name else None, roots)
+        with project_skill_scans_read_only():
+            roots, _ = _skill_search_dirs()
+            error, _, path = _locate_skill(name, name.replace(":", "/") if ":" in name else None, roots)
         if error or path is None:
             return ""
     try:
         return path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         return ""
+
+
+def _attached_skill_content(name: str) -> str:
+    """Raw attached instructions in scheduler order: a bundle shadows a same-slug skill."""
+    from agent.skill_bundles import get_skill_bundles, resolve_bundle_command_key
+    bundle_key = resolve_bundle_command_key(name.lstrip("/"))
+    if not bundle_key:
+        return _single_skill_content(name)
+    info = get_skill_bundles().get(bundle_key) or {}
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        disabled = get_disabled_skill_names()
+    except Exception:
+        disabled = set()
+    members = [m for m in info.get("skills", []) if m not in disabled]
+    return "\n".join([str(info.get("instruction") or ""), *(_single_skill_content(m) for m in members)])
 
 
 def _first_requirement(text: str, patterns: Iterable[tuple[re.Pattern[str], str]]) -> Optional[str]:

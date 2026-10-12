@@ -25,7 +25,11 @@ operational steps; no upstream contribution is published with this patch.
 `tests/cron/test_tool_requirements.py` creates a synthetic file-only finding job
 in an isolated HERMES_HOME and checks the real doctor's nonzero status and
 read-only behavior. It covers relay routing, terminal composites, unrestricted
-and script-only jobs, generic explicit shell steps, and raw attached skills.
+and script-only jobs, generic explicit shell steps, raw attached skills, and
+attached skill bundles (members plus bundle instruction, bundle-over-skill
+precedence like the scheduler). Project-tier quarantine still applies during
+diagnosis, but `agent.skill_utils.project_skill_scans_read_only()` makes those
+scans uncached so doctor writes no attestations under HERMES_HOME.
 
 This is an advisory static scan, not a complete natural-language verifier. It
 does not execute pre-run scripts or discover remote MCP capabilities, does not
