@@ -705,7 +705,7 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
 
 
-def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
+def _cron_doctor_issues_for_job(job: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     issues: List[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
@@ -732,7 +732,7 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
         if issue:
             issues.append(issue)
     from cron.tool_requirements import job_tool_requirement_issues
-    issues.extend(job_tool_requirement_issues(job))
+    issues.extend(job_tool_requirement_issues(job, cfg=cfg))
     script = str(job.get("script") or "").strip()
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
@@ -747,8 +747,13 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
 def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        cfg = {}
     jobs = list_jobs(include_disabled=False)
-    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
+    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job, cfg))]
     if not findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."

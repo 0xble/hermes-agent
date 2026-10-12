@@ -153,3 +153,19 @@ def test_registered_plugin_skill_is_read_from_its_plugin_path(tmp_path, monkeypa
     assert "custom-check" in tool_requirements._attached_skill_content("acme:ship")
     issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["acme:ship"]}, cfg={})
     assert len(issues) == 1 and "terminal" in issues[0]
+
+
+def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypatch, capsys):
+    from cron.jobs import create_job
+    from hermes_cli.cron import cron_doctor
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    create_job(
+        prompt="Add it with `loops finding add --job audit --text result`.",
+        name="synthetic-disabled-terminal", schedule="every 1h",
+        enabled_toolsets=["terminal"], deliver="local",
+    )
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"agent": {"disabled_toolsets": ["terminal"]}})
+    assert cron_doctor() == 1
+    assert "terminal access" in capsys.readouterr().out
