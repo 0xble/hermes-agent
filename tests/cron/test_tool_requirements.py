@@ -297,6 +297,26 @@ def test_attached_bundle_members_and_instruction_are_scanned(tmp_path, monkeypat
     assert "terminal access" in issues[0] and "relay" in issues[1]
 
 
+def test_relay_mcp_alias_not_registered_by_runtime_is_not_accepted():
+    cfg = {"mcp_servers": {"relay": {"command": "relay"}}}
+    job = {"enabled_toolsets": ["file", "relay-mcp", "no_mcp"], "prompt": "Use Pick the Destination."}
+    assert job_tool_requirement_issues(job, cfg=cfg)
+
+
+def test_missing_bundle_members_do_not_activate_bundle_instruction(tmp_path, monkeypatch):
+    from agent.skill_utils import TIER_LOCAL
+    from tools import skills_tool
+
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    bundles = tmp_path / "bundles"
+    bundles.mkdir()
+    (bundles / "daily.yaml").write_text("name: daily\nskills: [missing]\ninstruction: Use Pick the Destination.\n")
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
+    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    assert job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={}) == []
+
+
 def test_project_skill_diagnosis_persists_nothing_under_home(tmp_path, monkeypatch):
     import agent.skill_utils as su
 

@@ -80,7 +80,11 @@ def _attached_skill_content(name: str) -> str:
     except Exception:
         disabled = set()
     members = [m for m in info.get("skills", []) if m not in disabled]
-    return "\n".join([str(info.get("instruction") or ""), *(_single_skill_content(m) for m in members)])
+    loaded_members = [(member, _single_skill_content(member)) for member in members]
+    loaded_contents = [content for _member, content in loaded_members if content]
+    if not loaded_contents:
+        return ""
+    return "\n".join([str(info.get("instruction") or ""), *loaded_contents])
 
 
 def _first_requirement(text: str, patterns: Iterable[tuple[re.Pattern[str], str]]) -> Optional[str]:
@@ -203,7 +207,7 @@ def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
         lowered = name.lower()
         for server in enabled_mcp:
             server_lower = server.lower()
-            canonical_names = {server_lower, f"mcp-{server_lower}", f"{server_lower}-mcp"}
+            canonical_names = {server_lower, f"mcp-{server_lower}"}
             if lowered in canonical_names and "relay" in server_lower:
                 if not canonical_names & disabled:
                     return True
