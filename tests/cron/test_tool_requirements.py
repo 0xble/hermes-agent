@@ -126,6 +126,18 @@ def test_relay_mcp_server_does_not_satisfy_shell_step():
     assert len(issues) == 1 and "terminal access" in issues[0]
 
 
+def test_disabled_terminal_toolset_is_not_reported_as_available():
+    job = {"enabled_toolsets": ["terminal"], "prompt": "Add it with `loops finding add --job x`."}
+    cfg = {"agent": {"disabled_toolsets": ["terminal"]}}
+    assert job_tool_requirement_issues(job, cfg=cfg)
+
+
+def test_disabled_composite_toolset_is_not_reported_as_available():
+    job = {"enabled_toolsets": ["coding"], "prompt": "Add it with `loops finding add --job x`."}
+    cfg = {"agent": {"disabled_toolsets": ["terminal"]}}
+    assert job_tool_requirement_issues(job, cfg=cfg)
+
+
 def test_registered_plugin_skill_is_read_from_its_plugin_path(tmp_path, monkeypatch):
     from cron import tool_requirements
     skill = tmp_path / "SKILL.md"
