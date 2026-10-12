@@ -945,8 +945,11 @@ class SearchMixin:
         sort_arg = " --sortr=modified" if order == "modified" else ""
         root_args = " ".join(self._escape_native_tool_arg(root) for root in command_roots)
         cd_prefix = f"cd {self._escape_shell_arg(scoped_common)} && " if scoped_common else ""
+        # A silent no-match walk can otherwise fan out over every available CPU.
+        walker_threads = max(1, min(4, (os.cpu_count() or 1) // 4))
         # ``--`` terminates options so a dash-prefixed root is never parsed as a flag.
-        rg_cmd = (f"{rg} --files{sort_arg} -g {self._escape_shell_arg(glob_pattern)}"
+        rg_cmd = (f"{rg} --files{sort_arg} --threads {walker_threads}"
+                  f" -g {self._escape_shell_arg(glob_pattern)}"
                   f"{exclusion_args} -- {root_args}")
         result = self._run_rg_bounded([rg_cmd], fetch_limit, timeout=60, native_ok=not scoped_common,
                                       shell_prefix=f"set -o pipefail; {cd_prefix}")
