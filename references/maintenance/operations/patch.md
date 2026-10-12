@@ -34,8 +34,8 @@
 
 ## gateway-loop-statedb-guard: generation checkpoint durability
 
-- **Status:** Candidate for parent review; not installed, merged or promoted. Reuses the existing
-  `Fork-Patch: gateway-loop-statedb-guard` identity and [behavior record](../../../maintenance/gateway-loop-statedb-guard.md).
+- **Identity:** Reuses the existing `Fork-Patch: gateway-loop-statedb-guard` identity and
+  [behavior record](../../../maintenance/gateway-loop-statedb-guard.md).
 - **Summary and placement:** Repair the core `SessionDB` generation fence after fork PR #494,
   not an extension or seamless-restart change. The independent proposal checks the main-file
   header through the existing lock-safe probe and retries PASSIVE until the WAL-visible
@@ -59,7 +59,7 @@
   Both become durable with the repair, verified by a main-file-only copy without the WAL. The
   settled warm-open test still observes no checkpoint. Canonical `scripts/run_tests.sh` across
   8 affected files: **469 passed, 37 skipped**. Ruff, Windows-footgun, temporary-path and
-  source-only fork-patch checks pass; parent review, exact-SHA gate and hosted checks remain pending.
+  source-only fork-patch checks pass.
 - **Stack fit:** Narrow core repair reusing the lock-safe header probe; no new plugin, sidecar,
   persisted marker, timeout, periodic checkpoint, schema or config.
 - **Rollback and retirement:** Revert the durability commit to restore #494's opener-local gate.
