@@ -68,9 +68,13 @@ public replay with alternation repair 167.32 → 3.71 ms. A second archive-heavy
 The regression is red on the base (10x archives cost 10x VM steps) and green after the fix.
 Display/audit predicates and sorts, lineage, repair, prompt sidecars, and compaction tail
 watermarks are unchanged. Upstream `835c3dd038d903182a66ecc45e34bf5e0de65f00` has the same
-query; related PR/issue searches found no matching access-path fix. Revert this query
-change to roll back; retire it when an upstream release supplies archive-bounded
-id-ordered replay.
+query; related PR/issue searches found no matching access-path fix. Upstream contribution
+is deferred to the fork delivery owner. [PR #516](https://github.com/0xble/hermes-agent/pull/516)
+is the publication and integration record for this fork correction. Runtime activation is
+recorded separately by the native updater's `~/.hermes/logs/update_receipts/` and the
+`~/.hermes/current` release pointer, never inferred from this source file or PR publication.
+Revert this query change to roll back; retire it when an upstream release supplies
+archive-bounded id-ordered replay.
 
 ## 2026-10-10 and 2026-10-11 incidents
 
