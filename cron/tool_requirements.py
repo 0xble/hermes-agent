@@ -47,24 +47,30 @@ def _plugin_skill_path(name: str):
     return path if path is not None and path.exists() else None
 
 
-def _single_skill_content(name: str) -> str:
-    """Raw SKILL.md text, resolved like ``skill_view`` but without preprocessing or persisted scans."""
+def _single_skill_loaded(name: str) -> tuple[bool, str]:
+    """Return whether a SKILL.md resolved and its raw text, without preprocessing or persisted scans."""
     from agent.skill_utils import normalize_skill_lookup_name, project_skill_scans_read_only
     from tools.skills_tool import _locate_skill, _skill_lookup_path_error, _skill_search_dirs
     name = normalize_skill_lookup_name(name)
     if _skill_lookup_path_error(name):
-        return ""
+        return False, ""
     path = _plugin_skill_path(name)
     if path is None:
         with project_skill_scans_read_only():
             roots, _ = _skill_search_dirs()
             error, _, path = _locate_skill(name, name.replace(":", "/") if ":" in name else None, roots)
         if error or path is None:
-            return ""
+            return False, ""
     try:
-        return path.read_text(encoding="utf-8-sig")
+        return True, path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
-        return ""
+        return False, ""
+
+
+def _single_skill_content(name: str) -> str:
+    """Read raw SKILL.md text, preserving the existing string-based loader contract."""
+    _loaded, content = _single_skill_loaded(name)
+    return content
 
 
 def _attached_skill_content(name: str) -> str:
@@ -80,8 +86,8 @@ def _attached_skill_content(name: str) -> str:
     except Exception:
         disabled = set()
     members = [m for m in info.get("skills", []) if m not in disabled]
-    loaded_members = [(member, _single_skill_content(member)) for member in members]
-    loaded_contents = [content for _member, content in loaded_members if content]
+    loaded_members = [_single_skill_loaded(member) for member in members]
+    loaded_contents = [content for loaded, content in loaded_members if loaded]
     if not loaded_contents:
         return ""
     return "\n".join([str(info.get("instruction") or ""), *loaded_contents])
