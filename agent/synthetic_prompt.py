@@ -303,6 +303,8 @@ _ATTACHMENT_RECALL_NOTE = re.compile(
     r"|The user attached an image but (?:it couldn't be analyzed\. |analysis failed \()"
     r"|voice message could not be transcribed automatically; the audio is available at: )"
     r"[^\n]*\](?=\n|$)"
+    # Bare fallback the gateway emits when the transcription module itself is missing.
+    r"|\[voice message could not be transcribed\](?=\n|$)"
 )
 
 
@@ -372,7 +374,9 @@ def _attachment_recall_text(text: str, *, include_synthetic: bool) -> str | None
         if human and human != text:
             # Keep the generated text in the query, but put the actual human request first so
             # the provider's bounded input cannot discard it behind a long runtime notice.
-            return f"{human}\n\n{text}" if text else human
+            # The request already ends the text, so move it rather than repeat it.
+            rest = text[:-len(human)].rstrip() if text.endswith(human) else text
+            return f"{human}\n\n{rest}" if rest else human
     if text:
         return text
     fallback = "\n\n".join(descriptions)
