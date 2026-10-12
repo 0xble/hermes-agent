@@ -1757,10 +1757,10 @@ _DONE_CLAIM_RE = re.compile(
 
 
 def last_visible_done_claim(session_id: Optional[str], since: float = 0.0) -> str:
-    """Newest visible completion assertion during this goal, including archived rows.
+    """Completion assertion in this goal's newest visible report, including archived rows.
 
     Prose is only a standing claim, never evidence. Hidden rows, compression
-    summaries and tool-call commentary cannot supply a visible closeout.
+    summaries and tool-call commentary cannot supply or supersede a visible closeout.
     """
     db = _get_session_db()
     reader = getattr(db, "messages_by_role", None) if db is not None else None
@@ -1769,15 +1769,16 @@ def last_visible_done_claim(session_id: Optional[str], since: float = 0.0) -> st
     try:
         for row in reader(session_id, "assistant", since=since, limit=500):
             content = row.get("content")
-            if not isinstance(content, str) or row.get("compressed_summary") or row.get("display_kind") == "hidden":
+            if not isinstance(content, str) or not content.strip() or row.get("compressed_summary") or row.get("display_kind") == "hidden":
                 continue
-            if is_intentional_silence_response(content) or not _DONE_CLAIM_RE.search(content.replace("**", "")):
+            if is_intentional_silence_response(content):
                 continue
             # The role audit includes assistant tool-call rows. Only final prose
             # is a visible report; consult the original row, not a display summary.
             original = db.get_messages_around(session_id, row["id"], window=0).get("window") or []
             if original and not original[0].get("tool_calls"):
-                return content
+                # A newer non-completion report invalidates an older closeout.
+                return content if _DONE_CLAIM_RE.search(content.replace("**", "")) else ""
     except Exception as exc:
         logger.debug("goal standing claim: message read failed: %s", exc)
     return ""
@@ -3044,7 +3045,7 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
         disputed = verdict == "continue" and bool((wait_directive or {}).get("disputed"))
-        if (verdict == "continue" and silent and not turn_evidence
+        if (verdict == "continue" and silent_automatic and automatic_read_only
                 and not parse_failed and not transport_failed):
             state.consecutive_silent_no_progress += 1
         else:
@@ -3106,7 +3107,7 @@ class GoalManager:
             )
 
         # Stall breaker: repeated completion rechecks must converge. Silent stalls
-        # end without requiring user action; visible disputes retain their pause.
+        # end before read-only backoff can re-arm; visible disputes retain their pause.
         if state.consecutive_silent_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
             # Reuse the convergence breaker, but clear this silent stall instead
             # of pausing for user input. Inactive goals cannot wake or re-notify.

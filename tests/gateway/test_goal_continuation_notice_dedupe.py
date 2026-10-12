@@ -6,6 +6,7 @@ notice creation and durable reload use production code.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from unittest.mock import patch
@@ -78,13 +79,25 @@ async def test_silent_automatic_turn_rejudges_without_manufacturing_continuation
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("disputed", [False, True])
-async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(hermes_home, disputed):
+@pytest.mark.parametrize("read_only_tool", [None, "read_file", "terminal"])
+async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(hermes_home, disputed, read_only_tool):
     harness = _harness(hermes_home)
     _, adapter, entry, _, key = harness
     limit = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
     for i in range(limit):
         adapter._pending_messages.clear()  # consume the previously admitted turn
         _restart_db()
+        if read_only_tool:
+            db = goals._get_session_db()
+            assert db is not None
+            db.ensure_session(entry.session_id, source="telegram")
+            arguments = {"command": "git status --short"} if read_only_tool == "terminal" else {"path": "release.md"}
+            db.append_message(entry.session_id, "assistant", "", tool_calls=[{
+                "id": f"read-only-{i}", "type": "function",
+                "function": {"name": read_only_tool, "arguments": json.dumps(arguments)},
+            }])
+            db.append_message(entry.session_id, "tool", f"Unchanged release status {i}",
+                              tool_name=read_only_tool, tool_call_id=f"read-only-{i}")
         with patch.object(goals, "judge_goal", return_value=(
             "continue", f"Criterion still lacks proof ({i})", False,
             {"disputed": True} if disputed else None, False,
@@ -95,6 +108,8 @@ async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(herme
             assert adapter.sent == []
     assert not mgr.is_active() and not mgr.has_goal()
     assert mgr.state.status == "cleared", "a silent stall must not pause waiting for the user"
+    assert not mgr.is_parked() and mgr.state.waiting_until == 0
+    assert mgr.state.backoff_level == 0
     assert mgr.next_continuation_prompt() is None
     assert key not in adapter._pending_messages
     assert len(adapter.sent) == 1

@@ -216,6 +216,13 @@ def test_standing_claim_uses_latest_visible_final_prose_from_this_goal_only(herm
     db.append_message(sid, "assistant", goals.SILENCE_MARKER)
     assert goals.last_visible_done_claim(sid, since=state.created_at) == latest
     assert goals.last_visible_done_claim("another-session", since=state.created_at) == ""
+    db.append_message(sid, "assistant", "The verification failed; I need to fix it.")
+    db.append_message(sid, "assistant", goals.SILENCE_MARKER)
+    assert goals.last_visible_done_claim(sid, since=state.created_at) == ""
+    with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE) as judge:
+        mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
+    assert judge.call_args.kwargs["standing_claim"] == ""
+    assert judge.call_args.kwargs["citations"]["evidence_ids"] == []
 
 
 def test_silent_turn_without_current_goal_claim_keeps_original_judge_input(hermes_home):
@@ -231,7 +238,7 @@ def test_silent_turn_without_current_goal_claim_keeps_original_judge_input(herme
     assert judge.call_args.kwargs["citations"]["evidence_ids"] == []
 
 
-@pytest.mark.parametrize("interrupt", ["evidence", "visible", "judge-failure"])
+@pytest.mark.parametrize("interrupt", ["evidence", "visible", "judge-failure", "user-silent"])
 def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(hermes_home, interrupt):
     sid = "silent-stall-reset"
     db = _session_db(sid)
@@ -240,7 +247,7 @@ def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(herme
     limit = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
     with patch.object(goals, "judge_goal", return_value=PLAIN_CONTINUE):
         for _ in range(limit - 1):
-            mgr.evaluate_after_turn(goals.SILENCE_MARKER)
+            mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
     assert mgr.state.consecutive_silent_no_progress == limit - 1
     reply = goals.SILENCE_MARKER
     verdict = PLAIN_CONTINUE
@@ -248,18 +255,19 @@ def test_silent_stall_requires_consecutive_successful_no_evidence_rechecks(herme
         _record_tool_call(db, sid, "terminal", {"command": "wiki-check"}, "new result", call_id="fresh")
     elif interrupt == "visible":
         reply = "Still working; the verification step changed."
-    else:
+    elif interrupt == "judge-failure":
         verdict = ("continue", "judge unavailable", False, None, True)
     with patch.object(goals, "judge_goal", return_value=verdict):
-        mgr.evaluate_after_turn(reply)
+        mgr.evaluate_after_turn(reply, user_initiated=interrupt != "evidence")
     assert mgr.state.consecutive_silent_no_progress == 0
+    assert mgr.state.status == "active"
     # Existing visible dispute counts must not force silent turns to pause early.
     mgr.state.consecutive_disputes = goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES - 1
     mgr._save()
     for i in range(limit):
         mgr = GoalManager(sid)
         with patch.object(goals, "judge_goal", return_value=DISPUTED):
-            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER)
+            decision = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
         assert decision["should_continue"] == (i < limit - 1)
     assert mgr.state.status == "cleared"
     assert decision["verdict"] == "stalled"
