@@ -224,6 +224,96 @@ def test_iter_holders_ignores_descriptor_closed_during_scan(tmp_path, monkeypatc
     assert iter_deleted_sqlite_sidecar_holders(path) == []
 
 
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("change", ["close_during_path_stat", "reuse_after_readlink"])
+def test_iter_holders_rechecks_descriptor_after_close_or_reuse(tmp_path, monkeypatch, change):
+    """A checkpointed sidecar may close while the opener inspects its /proc entry."""
+    path = tmp_path / "state.db"
+    wal = Path(str(path) + "-wal")
+    wal.write_bytes(b"checkpointed sidecar")
+    replacement = tmp_path / "unrelated-file"
+    replacement.write_bytes(b"unrelated descriptor")
+    fd = os.open(wal, os.O_RDONLY)
+    fd_path = f"/proc/{os.getpid()}/fd/{fd}"
+    wal.unlink()
+    real_stat, real_readlink = os.stat, os.readlink
+    changed = False
+    owned_fd = fd
+    readlink_count = 0
+
+    def change_descriptor():
+        nonlocal changed, owned_fd
+        os.close(fd)
+        owned_fd = None
+        if change == "reuse_after_readlink":
+            other_fd = os.open(replacement, os.O_RDONLY)
+            if other_fd != fd:
+                os.dup2(other_fd, fd)
+                os.close(other_fd)
+            owned_fd = fd
+        changed = True
+
+    def stat_after_close(target, *args, **kwargs):
+        if os.path.realpath(os.fspath(target)) == os.path.realpath(wal) and not changed:
+            change_descriptor()
+        return real_stat(target, *args, **kwargs)
+
+    def readlink_before_reuse(target, *args, **kwargs):
+        nonlocal readlink_count
+        result = real_readlink(target, *args, **kwargs)
+        if os.fspath(target) == fd_path:
+            readlink_count += 1
+            if readlink_count == 2 and not changed:
+                change_descriptor()
+        return result
+
+    if change == "close_during_path_stat":
+        monkeypatch.setattr(hermes_state_dbfile.os, "stat", stat_after_close)
+    else:
+        monkeypatch.setattr(hermes_state_dbfile.os, "readlink", readlink_before_reuse)
+    try:
+        assert iter_deleted_sqlite_sidecar_holders(path) == []
+        assert changed, "the descriptor race was not exercised"
+    finally:
+        if owned_fd is not None:
+            os.close(owned_fd)
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("close_during_settle", [True, False])
+def test_open_guard_settles_closing_holder_but_refuses_persistent_holder(
+    tmp_path, monkeypatch, close_during_settle
+):
+    path = tmp_path / "state.db"
+    wal = Path(str(path) + "-wal")
+    wal.write_bytes(b"checkpointed sidecar")
+    fd = os.open(wal, os.O_RDONLY)
+    wal.unlink()
+    closed = False
+    waits = []
+
+    def settle(delay):
+        nonlocal closed
+        waits.append(delay)
+        if close_during_settle and not closed:
+            os.close(fd)
+            closed = True
+
+    monkeypatch.setattr(hermes_state_dbfile.time, "sleep", settle)
+    try:
+        if close_during_settle:
+            refuse_deleted_wal_generation(path)
+            assert waits == [0.01]
+        else:
+            with pytest.raises(DeletedWalGenerationError):
+                refuse_deleted_wal_generation(path)
+            assert waits == [0.01, 0.02, 0.04]
+        assert not wal.exists(), "the preconnect guard must not mint a replacement WAL"
+    finally:
+        if not closed:
+            os.close(fd)
+
+
 @pytest.mark.platforms("linux")  # deleted-WAL write halt uses Linux unlink semantics
 def test_write_path_ignores_live_unhashed_dentry(tmp_path, force_wal, monkeypatch):
     """Same OpenZFS artifact as above, but on the sticky in-process write-path
