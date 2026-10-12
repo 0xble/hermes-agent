@@ -55,9 +55,9 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
-    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
+    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginDiscoveryIncomplete, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
-    _await_foreground_discovery, _delivery_manager,
+    _async_delivery_snapshot, _await_foreground_discovery, _delivery_manager,
     format_system_prompt_sections, is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
@@ -1759,14 +1759,18 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
     return PluginManager().has_enabled_portable_mcp(raw_config)
 
 
-def discover_plugins(force: bool = False) -> None:
-    """Discover and load all plugins, degrading if a background scan is still stuck."""
+def discover_plugins(force: bool = False, *, require_complete: bool = False) -> None:
+    """Load plugins; only listing/completion callers may use an incomplete registry."""
     try:
         _join_background_discovery()
-    except RuntimeError as exc:
+    except PluginDiscoveryIncomplete as exc:
+        if require_complete:
+            raise
         logger.warning("background plugin discovery did not finish; using the available registry: %s", exc)
         return
     get_plugin_manager().discover_and_load(force=force)
+    if require_complete:
+        _delivery_manager()
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
@@ -1804,7 +1808,7 @@ def _join_background_discovery(timeout: float = 30.0) -> None:
         return
     t.join(timeout=timeout)
     if t.is_alive():
-        raise RuntimeError("Plugin discovery incomplete after timeout; refusing partial registry delivery")
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete after timeout; refusing partial registry delivery")
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1868,30 +1872,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
-async def ainvoke_hook(
-    hook_name: str, *, _wait_for_discovery: bool = True, **kwargs: Any
-) -> List[Any]:
-    """:func:`invoke_hook` for callers on an event loop: discovery barriers run off-loop, while
-    callbacks are awaited on the caller's loop (see ``PluginManager.ainvoke_hook``).
-
-    ``_wait_for_discovery=False`` is reserved for fail-open ingress observers such as
-    ``pre_gateway_dispatch``. They must not hold an inbound message behind a cold plugin scan;
-    discovery continues in the background and a later message observes the completed registry.
-    Policy hooks keep the default fail-closed barrier.
-    """
-    if not _wait_for_discovery:
-        manager = get_plugin_manager()
-        worker = _background_discovery_thread
-        if worker is not None and worker.is_alive():
-            return []
-        if not getattr(manager, "_discovered", True):
-            start_background_plugin_discovery()
-            return []
-        if not getattr(manager, "_discovery_complete", True):
-            return []
-        return await manager.ainvoke_hook(hook_name, **kwargs)
-    manager = await asyncio.to_thread(_delivery_manager)
-    return await manager.ainvoke_hook(hook_name, **kwargs)
+async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Await cold/reloading discovery off-loop, preserving inline ready-registry ordering."""
+    manager, callbacks = await _async_delivery_snapshot(hook_name)
+    return await manager.ainvoke_hook(hook_name, _callbacks=callbacks, **kwargs)
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:

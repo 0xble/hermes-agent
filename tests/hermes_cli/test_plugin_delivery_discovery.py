@@ -220,20 +220,27 @@ def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkey
 
 
 @pytest.mark.asyncio
-async def test_fail_open_ingress_does_not_wait_for_cold_discovery(monkeypatch):
+async def test_ready_async_delivery_preserves_inline_ingress_order(monkeypatch):
+    import asyncio
+
     import hermes_cli.plugins as plugins
+    from tests.plugin_helpers import mark_plugin_discovery_complete
 
     manager = plugins.PluginManager()
-    started = []
+    mark_plugin_discovery_complete(manager)
+    seen = []
+    manager._hooks["pre_gateway_dispatch"] = [lambda **_: seen.append("policy")]
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
-    monkeypatch.setattr(
-        plugins, "start_background_plugin_discovery", lambda: started.append(True)
-    )
+    monkeypatch.setattr(plugins, "_background_discovery_thread", None)
 
-    assert await plugins.ainvoke_hook(
-        "pre_gateway_dispatch", _wait_for_discovery=False
-    ) == []
-    assert started == [True]
+    async def unexpected_thread_hop(*_args, **_kwargs):
+        pytest.fail("a ready registry must not yield before session fencing")
+
+    monkeypatch.setattr(asyncio, "to_thread", unexpected_thread_hop)
+    asyncio.get_running_loop().call_soon(seen.append, "next-loop-turn")
+
+    await plugins.ainvoke_hook("pre_gateway_dispatch")
+    assert seen == ["policy"], "a ready registry must not yield before session fencing"
 
 
 def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypatch):
@@ -250,6 +257,8 @@ def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypa
 
     class ObservedLock:
         def acquire(self, **kwargs):
+            if kwargs.get("blocking") is False:
+                return lock.acquire(blocking=False)
             assert threading.get_ident() != loop_thread, "discovery lock blocked the event-loop thread"
             waiting.set()
             return lock.acquire(**kwargs)

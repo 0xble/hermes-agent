@@ -59,6 +59,10 @@ _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
+class PluginDiscoveryIncomplete(RuntimeError):
+    """The policy registry is not ready; callers must not authorize delivery."""
+
+
 def _delivery_manager():
     """Only deliver from a complete registry; synchronous loop callers refuse instead of blocking.
 
@@ -77,17 +81,41 @@ def _delivery_manager():
         if (not getattr(manager, "_discovery_complete", True)
                 or not getattr(manager, "_discovered", True)
                 or (worker is not None and worker.is_alive())):
-            raise RuntimeError("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
+            raise PluginDiscoveryIncomplete("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
         return manager
     plugins._join_background_discovery()
-    if not getattr(manager, "_discovered", True):
-        manager.discover_and_load()
-    if not getattr(manager, "_discovery_complete", True) and plugins._await_foreground_discovery(manager):
+    try:
         if not getattr(manager, "_discovered", True):
-            manager.discover_and_load()  # retry a failed sweep after its lock was released
+            manager.discover_and_load()
+        if not getattr(manager, "_discovery_complete", True) and plugins._await_foreground_discovery(manager):
+            if not getattr(manager, "_discovered", True):
+                manager.discover_and_load()  # retry a failed sweep after its lock was released
+    except Exception as exc:
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry loading failed") from exc
     if not getattr(manager, "_discovery_complete", True):
-        raise RuntimeError("Plugin discovery incomplete; defer hook delivery until loading finishes")
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete; defer hook delivery until loading finishes")
     return manager
+
+
+async def _async_delivery_snapshot(hook_name: str):
+    """Snapshot a ready registry under a nonblocking lock; wait for reloads off-loop."""
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    while True:
+        worker = plugins._background_discovery_thread
+        ready = (getattr(manager, "_discovered", True)
+                 and getattr(manager, "_discovery_complete", True)
+                 and not (worker is not None and worker.is_alive()))
+        lock = getattr(manager, "_discovery_lock", None)
+        if ready and (lock is None or lock.acquire(blocking=False)):
+            try:
+                # Recheck under the sweep lock: reload may have started after the fast probe.
+                if getattr(manager, "_discovered", True) and getattr(manager, "_discovery_complete", True):
+                    return manager, manager.iter_hook_callbacks(hook_name)
+            finally:
+                if lock is not None:
+                    lock.release()
+        manager = await asyncio.to_thread(_delivery_manager)
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
@@ -562,7 +590,9 @@ class PluginDispatchMixin:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
-    async def ainvoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    async def ainvoke_hook(
+        self, hook_name: str, *, _callbacks: Optional[tuple[Callable, ...]] = None, **kwargs: Any
+    ) -> List[Any]:
         """:meth:`invoke_hook` for callers that are already on an event loop.
 
         Same payload narrowing, per-callback isolation and result contract. The difference is
@@ -580,7 +610,8 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = self._hooks.get(hook_name, []) if _callbacks is None else _callbacks
+        for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))

@@ -32,13 +32,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
-    _wait_for_discovery = kwargs.pop("_wait_for_discovery", True)
     _observe(hook_name, **kwargs)
     from hermes_cli import plugins
 
-    return await plugins.ainvoke_hook(
-        hook_name, _wait_for_discovery=_wait_for_discovery, **kwargs
-    )
+    return await plugins.ainvoke_hook(hook_name, **kwargs)
 
 
 def has_hook(hook_name: str) -> bool:
