@@ -4,10 +4,12 @@ Only the model/transport are controlled. SessionStore, metadata stores, public
 /new handler, turn entry and the gateway's existing watcher are exercised.
 """
 import asyncio
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import hermes_loop_guard
 import pytest
 
 from evals.heartbeat_idle_wire import WireAdapter
@@ -294,7 +296,7 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
     executions = []
 
     async def model(**kwargs):
-        saved = loops.load_loop(entry.session_id)
+        saved = await asyncio.to_thread(loops.load_loop, entry.session_id)
         executions.append((saved.awaiting_response, saved.claim_phase, saved.ticks_fired))
         raise asyncio.CancelledError  # stop at the real model-entry fence
 
@@ -313,13 +315,118 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
             )
 
     adapter.set_message_handler(dispatch)
+    state = loops.load_loop(entry.session_id)
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
     try:
-        await scan(runner, entry.session_id)
+        await runner._loop_wakeup_fire_one(entry.session_id, state, time.time() + 86400, set())
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    try:
         assert executions == ([] if prompt == "/start" else [(True, "executing", 1)])
         saved = loops.load_loop(entry.session_id)
         assert not saved.awaiting_response and saved.ticks_fired == 1
         assert saved.status == "active"  # cancellation/silent command schedules the next tick
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["start_tick", "_exact_executing_tick"])
+async def test_command_loop_fence_rechecks_reset_after_start_tick(control_home, boundary):
+    runner, _adapter, source, entry = native_runner(control_home)
+    runner.config.quick_commands = {"effect": {"type": "exec", "command": "echo effect"}}
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set("/effect", interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    assert mgr.fire_tick()
+    saved = loops.load_loop(entry.session_id)
+    event = runner._synthetic_prompt_event(source, "/effect", internal=True, reply_expected=False)
+    event.metadata.update({
+        "hermes_loop_wakeup": True,
+        "gateway_session_id": entry.session_id,
+        "gateway_loop_tick": [saved.created_at, saved.ticks_fired],
+    })
+    effects = []
+
+    async def effect(command, exec_cmd):
+        effects.append((command, exec_cmd))
+        return "effect ran"
+
+    runner._hm_run_exec_quick_command = effect
+    runner._session_db = None
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = lambda source: ""
+    runner._telegram_topic_new_header = lambda source: ""
+    original_executor = runner._run_in_executor_with_context
+    reset = MessageEvent(text="/new", source=source)
+    reset_done = False
+
+    async def executor(func, *args, **kwargs):
+        nonlocal reset_done
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == boundary and not reset_done:
+            reset_done = True
+            await runner._handle_reset_command(reset)
+        return result
+
+    runner._run_in_executor_with_context = executor
+    try:
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        assert reset_done, "test did not reach the requested executor-return boundary"
+        assert (handled, result) == (True, None)
+        assert effects == [], "old loop command ran after public /new won the executor-return gap"
+        assert loops.load_loop(entry.session_id).status == "cleared"
+        assert runner.session_store.peek_session_id(entry.session_key) != entry.session_id
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["_start_owned_loop_tick", "_exact_executing_tick"])
+async def test_model_loop_fence_rechecks_reset_after_start_tick(control_home, boundary):
+    runner, adapter, source, entry = native_runner(control_home)
+    create_loop(entry, source)
+    executions = []
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(
+        runner._PreparedTurn([], "", "old work", "old work", None, None), {},
+    ))
+
+    async def model(**kwargs):
+        executions.append(kwargs["session_id"])
+        raise asyncio.CancelledError
+
+    runner._run_agent = model
+    runner._session_db = None
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = lambda source: ""
+    runner._telegram_topic_new_header = lambda source: ""
+    original_executor = runner._run_in_executor_with_context
+    reset = MessageEvent(text="/new", source=source)
+    reset_done = False
+
+    async def executor(func, *args, **kwargs):
+        nonlocal reset_done
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == boundary and not reset_done:
+            reset_done = True
+            await runner._handle_reset_command(reset)
+        return result
+
+    runner._run_in_executor_with_context = executor
+    generation = runner._begin_session_run_generation(entry.session_key)
+    adapter.set_message_handler(
+        lambda event: runner._handle_message_with_agent(event, source, entry.session_key, generation)
+    )
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+        assert reset_done, "test did not reach the start_tick executor-return boundary"
+        assert executions == [], "model work ran after public /new won the start_tick executor-return gap"
+        assert loops.load_loop(entry.session_id).status == "cleared"
+        assert runner.session_store.peek_session_id(entry.session_key) != entry.session_id
     finally:
         runner.session_store.close_all_db_handles()
 

@@ -2529,10 +2529,7 @@ class GatewayTurnMixin:
                 if not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2:
                     return
                 _loop_tick = (raw_tick[0], raw_tick[1])
-                try:
-                    current_entry = self.session_store.lookup_by_session_key(session_key)
-                except Exception:
-                    current_entry = None
+                current_entry = await self.async_session_store.lookup_by_session_key(session_key)
                 if (current_entry is None or current_entry.session_id != _run_start_session_id
                         or not self._is_session_run_current(_quick_key, run_generation)):
                     return
@@ -2540,6 +2537,10 @@ class GatewayTurnMixin:
                 def _start_owned_loop_tick():
                     return LoopManager(_run_start_session_id).start_tick(_loop_tick)
                 if not await self._run_in_executor_with_context(_start_owned_loop_tick):
+                    return
+                if not await self._loop_wake_execution_current(
+                    _run_start_session_id, _loop_tick, source, run_generation=run_generation,
+                ):
                     return
                 event._gateway_loop_tick = _loop_tick
             _turn_started_monotonic = time.monotonic()

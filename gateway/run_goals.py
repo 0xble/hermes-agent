@@ -815,6 +815,39 @@ class GatewayGoalsMixin:
         )
         return current if current is not None and current.session_id == sid else None
 
+    async def _loop_wake_execution_current(
+        self, sid: str, tick: tuple, source: Any, *, run_generation: Optional[int] = None,
+    ) -> bool:
+        """Revalidate the admitted wake after an executor hop and before its effects.
+
+        Session/control commands can win while a worker persists ``executing``.  The
+        post-hop check therefore proves the routing entry, run generation (when the
+        model-turn path owns one), and exact persisted tick phase all still match.
+        """
+        from hermes_cli.loops import LoopManager
+
+        session_key = self._session_key_for_source(source)
+
+        def _exact_executing_tick() -> bool:
+            current = self.session_store.lookup_by_session_key(session_key)
+            if current is None or current.session_id != sid:
+                return False
+            state = LoopManager(sid).state
+            return bool(
+                state is not None
+                and state.status == "active"
+                and state.awaiting_response
+                and state.claim_phase == "executing"
+                and (state.created_at, state.ticks_fired) == tick
+            )
+
+        current = await self._run_in_executor_with_context(_exact_executing_tick)
+        # No await after this check: /new or /stop may win even the validation
+        # worker's return gap. Their monotonic run generation is loop-side state.
+        return bool(current) and (
+            run_generation is None or self._is_session_run_current(session_key, run_generation)
+        )
+
     async def _begin_command_loop_tick(self, event: Any, source: Any) -> bool:
         """Persist execution before a /loop wake's command handler can perform effects.
 
@@ -828,12 +861,18 @@ class GatewayGoalsMixin:
         if identity is None:
             return True
         sid, tick = identity
+        session_key = self._session_key_for_source(source)
+        generation = self._current_session_run_generation(session_key)
         if await self._loop_wake_current_entry(sid, source) is None:
             return False
         from hermes_cli.loops import LoopManager
 
         mgr = await self._run_in_executor_with_context(LoopManager, sid)
-        return bool(await self._run_in_executor_with_context(mgr.start_tick, tick))
+        if not await self._run_in_executor_with_context(mgr.start_tick, tick):
+            return False
+        return await self._loop_wake_execution_current(
+            sid, tick, source, run_generation=generation,
+        )
 
     async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
         """Settle only a command dispatch that completed without falling through to model work."""
