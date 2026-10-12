@@ -2770,3 +2770,69 @@ def test_declared_client_validation_rejects_missing_or_outdated_sdk(monkeypatch,
 def test_declared_client_validation_accepts_prepared_sdk_without_install(monkeypatch):
     monkeypatch.setattr("importlib.metadata.version", lambda _name: "0.6.1")
     assert _REAL_ENSURE_CLIENT() is None
+
+
+# ---------------------------------------------------------------------------
+# Owner-subject recall: first-person auto-recall also searches with the owner named
+# ---------------------------------------------------------------------------
+
+
+def _recall_by_query(responses):
+    """arecall mock that answers per query text and records every call."""
+    calls = []
+
+    async def _arecall(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(results=[SimpleNamespace(id=i, text=t) for i, t in responses[kwargs["query"]]])
+
+    return AsyncMock(side_effect=_arecall), calls
+
+
+class TestOwnerSubjectRecall:
+    def test_disabled_by_default_keeps_a_single_recall(self, provider):
+        assert provider._recall_owner_subject == ""
+        text, count = provider._do_recall("what car do I drive")
+        assert provider._client.arecall.call_count == 1
+        assert count == 2
+
+    def test_first_person_query_also_recalls_with_the_owner_named(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._client.arecall, calls = _recall_by_query({
+            "what car do I drive": [("g1", "Generic car tips"), ("g2", "Shared fact")],
+            "what car do I drive (Brian Le)": [("o1", "Brian Le owns a 2025 Tesla Model Y"), ("g2", "Shared fact")],
+        })
+        text, count = p._do_recall("what car do I drive")
+        assert [c["query"] for c in calls] == ["what car do I drive", "what car do I drive (Brian Le)"]
+        assert all(c["types"] == ["observation"] and c["budget"] == "mid" for c in calls)
+        # Round-robin keeps the original head first, adds the owner fact, dedupes the shared one.
+        assert text.splitlines() == ["- Generic car tips", "- Brian Le owns a 2025 Tesla Model Y", "- Shared fact"]
+        assert count == 3
+
+    @pytest.mark.parametrize("query", ["What car does Brian Le drive", "how does the build cache work",
+                                       "Kafka timestamps in the US region"])
+    def test_queries_without_first_person_or_already_naming_the_owner_recall_once(self, provider_with_config, query):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._do_recall(query)
+        assert p._client.arecall.call_count == 1
+        assert p._client.arecall.call_args.kwargs["query"] == query
+
+    def test_merge_stays_within_one_recall_token_budget(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le", recall_max_tokens=30)
+        long = "x" * 80  # ~21 tokens each
+        p._client.arecall, _ = _recall_by_query({
+            "my plans": [("a", long + "a"), ("b", long + "b")],
+            "my plans (Brian Le)": [("c", long + "c"), ("d", long + "d")],
+        })
+        text, count = p._do_recall("my plans")
+        assert count == 1
+
+    def test_owner_recall_failure_is_an_empty_recall_not_a_crash(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        p._client.arecall = AsyncMock(side_effect=RuntimeError("boom"))
+        assert p._do_recall("where do we live") == ("", 0)
+
+    def test_reflect_prefetch_is_unchanged(self, provider_with_config):
+        p = provider_with_config(recall_owner_subject="Brian Le", recall_prefetch_method="reflect")
+        p._do_recall("when is my birthday")
+        p._client.arecall.assert_not_called()
+        assert p._client.areflect.call_args.kwargs["query"] == "when is my birthday"

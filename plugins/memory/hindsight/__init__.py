@@ -15,10 +15,12 @@ import atexit
 import collections
 import concurrent.futures
 import contextlib
+import itertools
 import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -314,6 +316,10 @@ def _mint_document_id(session_id: str) -> str:
     return f"{session_id}-{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 
 
+# First-person words that leave a recall query without a subject entity (see _owner_subject_query).
+# "us" is case-sensitive so the country abbreviation "US" does not count as a pronoun.
+_FIRST_PERSON = re.compile(r"\b(?:(?i:i|me|my|mine|we|our|ours)|us|Us)\b")
+
 # initialize() kwargs copied verbatim (str, stripped) onto ``self._<name>``.
 _SESSION_KWARGS = (
     "platform", "user_id", "user_name", "chat_id", "chat_name", "chat_type",
@@ -492,6 +498,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_owner_subject", "description": "Bank owner's name. When set, a first-person auto-recall query (I/my/we/our...) is also recalled with the name appended, and the two result lists are merged, so personal facts surface for \"my car\". Empty disables it."},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -954,6 +961,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
+        self._recall_owner_subject = str(cfg.get("recall_owner_subject") or "").strip()
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
         # recall_max_tokens budget); a comma-separated string is accepted for parity
@@ -1114,6 +1122,53 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return resp.text
 
+    def _owner_subject_query(self, query: str) -> str | None:
+        """The owner-anchored twin of a first-person query, or None when it doesn't apply.
+
+        "my car" carries no subject entity, so the owner's facts never enter Hindsight's
+        candidate pool; naming the owner does. The twin supplements the user's words, it
+        never replaces them (see ``_recall_with_owner_subject``).
+        """
+        owner = self._recall_owner_subject
+        if not owner or owner.lower() in query.lower() or not _FIRST_PERSON.search(query):
+            return None
+        return f"{query} ({owner})"
+
+    def _recall_with_owner_subject(self, query: str, owner_query: str) -> list:
+        """Recall the user's words and the owner-anchored twin, merged round-robin.
+
+        Interleaving keeps the original ranking's head (generic first-person questions such
+        as "how do I fix this build" stay answered) while the twin adds the owner's personal
+        facts. The merge is capped at roughly one recall's token budget so auto-recall does
+        not double the injected context.
+        """
+        def kwargs(q: str) -> dict:
+            kw: dict = {"bank_id": self._bank_id, "query": q, "budget": self._budget,
+                        "max_tokens": self._recall_max_tokens}
+            if self._recall_tags:
+                kw.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+            if self._recall_types:
+                kw["types"] = self._recall_types
+            return kw
+
+        async def _both(client):
+            return await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)))
+
+        original, owner = (resp.results or [] for resp in self._run_hindsight_operation(_both))
+        merged, seen, used = [], set(), 0
+        for pair in itertools.zip_longest(original, owner):
+            for result in pair:
+                key = getattr(result, "id", None) or getattr(result, "text", None)
+                if result is None or not getattr(result, "text", None) or key in seen:
+                    continue
+                cost = len(result.text) // 4 + 1
+                if merged and used + cost > self._recall_max_tokens:
+                    return merged
+                seen.add(key)
+                merged.append(result)
+                used += cost
+        return merged
+
     def _do_recall(self, query: str) -> tuple[str, int]:
         """One recall/reflect for *query* (background prefetch and ``recall_sync`` paths)
         -> (text, memory count); the count is 0 for reflect (synthesis) and on error."""
@@ -1125,7 +1180,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
+            owner_query = self._owner_subject_query(query)
+            results = self._recall_with_owner_subject(query, owner_query) if owner_query else self._recall(query)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
