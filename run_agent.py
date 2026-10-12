@@ -107,6 +107,7 @@ from tools.browser_tool_lifecycle import cleanup_browser
 from tools.connectors.turn import agent_connection_surface, scoped_connection_surface
 
 from agent.synthetic_prompt import auto_recall_query
+from agent.message_content import flatten_message_text
 from agent.client_lifecycle import ClientLifecycleMixin
 from agent.stream_delivery import StreamDeliveryMixin
 from agent.status_output import StatusOutputMixin
@@ -913,10 +914,10 @@ class AIAgent(
             display_kind, platform = getattr(self, "_turn_display_kind", None), getattr(self, "platform", None)
             self._memory_manager.sync_all(user_text, response_text, display_kind=display_kind,
                                           platform=platform, **sync_kwargs)
-            # Sibling of the build_turn_context() prefetch gate: don't key recall on zero-signal or
-            # Hermes-generated prompts.
+            # Sibling of the build_turn_context() prefetch gate: same caption-only text, so the image
+            # count marker used for retention and logs does not enter the recall query.
             recall_query = auto_recall_query(
-                user_text, display_kind=display_kind, platform=platform,
+                flatten_message_text(original_user_message), display_kind=display_kind, platform=platform,
                 include_synthetic=getattr(self._memory_manager, "recall_synthetic_turns", False) is True,
             )
             if recall_query:
