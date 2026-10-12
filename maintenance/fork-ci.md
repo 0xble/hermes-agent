@@ -307,6 +307,32 @@ each phase hook. `drain()` no longer starts a worker when none exists. Upstream
 main has the same worker and loop. Retire this when upstream drains or joins the
 worker in its suite, or when pytest copies `loggerDict` before iterating it.
 
+## Windows native installer harness
+
+The `fork-ci-reliability` identity keeps the native lane's uv-shim case after
+PM replaced PATH-shim salvage with a pinned artifact. Upstream added the old
+suite in `d0dbf2cbb697`; the qualified-checkpoint merge `f787eedef477` omitted it
+relative to its contributing parent while the fork lane still referenced it.
+The replacement tests real native exit codes, relocated launchers, pinned-store
+reuse/recovery, final staged validation, and digest rejection. The dispatch
+contract now also checks that every named suite exists.
+
+Both `portable.environment()` and `run_tests.sh` stripped `SystemDrive`.
+Windows Common AppData can resolve from `%SystemDrive%\ProgramData`; stripping
+that drive leaves shell caches under a literal relative directory in the
+checkout. Keep `SystemDrive`, `SystemRoot`, `ProgramData`, and `ALLUSERSPROFILE`
+through both allowlists, without forwarding credentials or relocating per-user
+AppData out of its disposable home. The shell boundary also forwards the
+explicit isolated `PSModuleAnalysisCachePath` that `portable.environment()`
+already supplies; otherwise pytest's PowerShell children lose that override
+and can create `Microsoft/Windows/PowerShell/ModuleAnalysisCache` in cwd.
+Portable tests cover the env mapping and the actual shell-to-pytest boundary.
+`source_unchanged` remains unchanged and rejects new files, including those
+cache paths. Native PS 5.1/pwsh execution and a clean
+Windows checkout after the full native lane remain separate proof requirements.
+Retire this adaptation only when the upstream-native harness carries these
+contracts and system-location variables through its isolation boundaries.
+
 ## Verification and retirement
 
 The host-installation tripwire also protects the captured account's `.local/bin`

@@ -36,6 +36,15 @@ class NativeOsLaneTests(unittest.TestCase):
                 tests.assert_not_called()
                 installer.assert_not_called()
 
+    def test_windows_installer_dispatch_names_existing_suites(self):
+        with patch.object(ci.sys, 'platform', 'win32'), patch.object(ci, 'python', return_value='checkout-python'), patch.object(ci.subprocess, 'check_output', return_value='tests/windows.py\n'), patch.object(ci, 'python_tests'), patch.object(ci, 'run') as installer:
+            ci.native_os({}, 2)
+        self.assertEqual(len(installer.call_args_list), 6)
+        for call in installer.call_args_list:
+            relative = call.args[0][-1]
+            with self.subTest(script=relative):
+                self.assertTrue((ci.ROOT / relative).is_file(), f'Native lane names missing suite: {relative}')
+
     def test_windows_runs_all_six_installer_checks_even_after_python_failure(self):
         env = {'HOME': 'isolated-home'}
         with patch.object(ci.sys, 'platform', 'win32'), patch.object(ci, 'python', return_value='checkout-python'), patch.object(ci.subprocess, 'check_output', return_value='tests/windows.py\n'), patch.object(ci, 'python_tests', side_effect=RuntimeError('test failure')) as tests, patch.object(ci, 'run') as installer:

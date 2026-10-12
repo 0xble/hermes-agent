@@ -269,7 +269,13 @@ def environment(home: Path) -> dict[str, str]:
     require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
-    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    # Common AppData's registry default is %SystemDrive%\ProgramData. Without
+    # SystemDrive, Windows shell components create that literal relative path
+    # in cwd (including Microsoft/Windows/Caches/cversions.*.db). Keep system
+    # locations, not credentials; per-user AppData remains isolated below.
+    locations = {'PATH', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC',
+                 'PATHEXT', 'PROGRAMDATA', 'ALLUSERSPROFILE'}
+    env = {key.upper(): value for key, value in os.environ.items() if key.upper() in locations}
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
         'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
