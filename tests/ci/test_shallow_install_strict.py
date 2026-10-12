@@ -10,6 +10,8 @@ import pytest
 from tests.e2e.core._pending_fixes import STRICT_ACCEPTANCE_ENV
 from tests.e2e.core.upgrade.git import test_shallow_install as cell
 
+_FETCH_CAP = "historical pre-swap plain fetch exceeded the byte bound and hit its 300s cap"
+
 
 def _historical_cap_run() -> dict:
     out = "Failed to fetch updates from origin\ngit fetch timed out after 300s\n"
@@ -34,9 +36,12 @@ def test_historical_fetch_cap_xfails_by_default(monkeypatch, strict):
 
 def test_strict_acceptance_refuses_the_historical_fetch_cap(monkeypatch):
     monkeypatch.setenv(STRICT_ACCEPTANCE_ENV, "1")
-    with pytest.raises(AssertionError, match=cell.HISTORICAL_FETCH_CAP) as caught:
-        cell._assert_first_n1_update(_historical_cap_run())
-    assert any("not excused" in note for note in getattr(caught.value, "__notes__", []))
+    try:
+        with pytest.raises(AssertionError, match=_FETCH_CAP) as caught:
+            cell._assert_first_n1_update(_historical_cap_run())
+        assert any("not excused" in note for note in getattr(caught.value, "__notes__", []))
+    except pytest.xfail.Exception:
+        pytest.fail("strict acceptance must fail the historical fetch cap, not xfail")
 
 
 def test_unproved_timeout_is_never_excused(monkeypatch):
@@ -45,4 +50,4 @@ def test_unproved_timeout_is_never_excused(monkeypatch):
     run["has_prefetch_heal"] = True  # current code timing out is a real failure
     with pytest.raises(AssertionError, match="N-1 -> HEAD update failed") as caught:
         cell._assert_first_n1_update(run)
-    assert cell.HISTORICAL_FETCH_CAP not in str(caught.value)
+    assert _FETCH_CAP not in str(caught.value)
