@@ -134,7 +134,7 @@ VALID_HOOKS: Set[str] = {
     "transform_api_error_classification", "on_session_start", "on_session_end",
     "on_session_finalize", "on_session_reset",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
-    "on_skill_lifecycle", "subagent_start", "subagent_stop",
+    "on_skill_lifecycle", "subagent_start", "subagent_stop", "post_steer_delivered",  # delivered-row observer; returns ignored
     # subagent_failure_notice: a child ended failed/error/timeout, BEFORE the user-facing failure notice
     # (gateway chat notice, CLI tree line). Kwargs: child_session_id, child_goal, child_status, error,
     # failure_reason. Return {"action": "suppress"} when the plugin recovers the failure itself; the

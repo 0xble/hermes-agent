@@ -1191,6 +1191,7 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | [`pre_llm_call`](../../user-guide/features/hooks.md#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](../../user-guide/features/hooks.md#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
 | `pre_api_request` | Before each raw provider API request (several per turn when the model calls tools) | `session_id: str, model: str, provider: str, base_url: str, api_mode: str, api_call_count: int, message_count: int, tool_count: int, approx_input_tokens: int, max_tokens: int, request: dict` | ignored |
+| `post_steer_delivered` | After a native mid-turn steer row is inserted (post-tool or pre-API drain) | `session_id: str, turn_id: str, platform: str, text: str, delivery_id: str, ordinal: int` | ignored; fail-open |
 | `post_api_request` | After each raw provider API request returns | `pre_api_request` fields plus `api_duration: float, finish_reason: str, response_model: str \| None, usage: dict, response: dict, assistant_content_chars: int, assistant_tool_call_count: int` | ignored |
 | `api_request_error` | A provider API call raised | correlation fields plus `status_code: int \| None, retry_count: int \| None, max_retries: int \| None, retryable: bool \| None, reason: str \| None, error: dict, request: dict` | ignored |
 | `pre_auxiliary_call` | Before each provider attempt of an auxiliary LLM call (titling, compression, MoA, vision, approval, ...); not a `pre_api_request` | `aux_task: str` plus the `pre_api_request` fields (`session_id`/`task_id`/`turn_id` are the parent turn's or empty, `api_request_id: str`, `retry_count: int`, `streaming: bool`, `request: dict`) | ignored |
@@ -1211,6 +1212,24 @@ All callbacks should accept `**kwargs` for forward compatibility. If a hook call
 The kanban lifecycle hooks fire **after** the board DB change commits, so a callback always sees durable state and can never hold the SQLite write lock. Because kanban workers run as separate `hermes -p <profile> chat -q` subprocesses, `kanban_task_claimed` fires in the **dispatcher** process while `kanban_task_completed` / `kanban_task_blocked` fire in the **worker** process — hook in the dispatcher to observe every transition centrally, or in the worker for per-task in-session context.
 
 The **API request hooks** are observers for the raw provider request, one level below the per-turn `pre_llm_call` / `post_llm_call` pair: a single turn that calls tools makes several API requests, and these hooks fire around each one. They exist for observability plugins (tracing, cost accounting, latency dashboards). The `request` and `response` kwargs are sanitized, size-capped JSON views of the provider payload (sensitive keys redacted, long strings truncated, SDK objects normalized), and `usage` is a plain token-summary dict. Every payload carries the correlation fields `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count`, so a plugin can stitch requests, tool calls, and turns together. `api_request_error` fires when a provider call raises and adds `status_code`, `retry_count` / `max_retries`, `retryable`, `reason`, and an `error` dict with `type` and `message`.
+
+### `post_steer_delivered` delivery observation
+
+Fires synchronously once after each completed native steer-row insertion, under the
+active turn/profile scope. `turn_id` is the same admitted identity supplied to
+`pre_llm_call` and `pre_api_request`; `session_id` is the current session (which can
+rotate during compression). `delivery_id` is a host-minted UUID4 per insertion,
+and `ordinal` starts at 1 in each turn and spans both drain sites. `text` is the
+exact drained text without the out-of-band marker frame. The existing `steer()`
+entry point strips each input and joins several pending inputs with `\n`; that
+joined batch is one delivery, not heuristically split into original messages.
+
+No event fires for a requeue, an empty drain, or next-turn fallback. Fallback is
+ordinary `user_message` on a new admitted turn. Retries and transcript replay
+do not emit deliveries. Callback returns cannot rewrite or veto the inserted row;
+failures are logged and do not break the turn. This is an insertion receipt, not
+a durable provider-acceptance or exactly-once persistence guarantee. Keep callbacks
+fast. Privacy: `text` contains the user’s raw drained steer.
 
 ### `pre_llm_call` context injection
 
