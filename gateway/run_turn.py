@@ -4720,8 +4720,14 @@ class GatewayTurnMixin:
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+            # A queued successor already supplies a fresh turn; drain it before considering recovery.
+            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            if pending_event or pending:
+                return await self._run_agent_queued_followup(
+                    turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                )
             if (
-                not _silence_retry and isinstance(response, dict)
+                not (_silence_retry or scheduled_heartbeat) and isinstance(response, dict)
                 and self._is_intentional_silence(response, response.get("final_response", ""))
                 and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
                 and turn_ctx._run_still_current()
@@ -4731,11 +4737,6 @@ class GatewayTurnMixin:
                     await self._await_stream_task(stream_task)
                 if turn_ctx._run_still_current():
                     return await self._run_agent_silence_followup(response, turn_ctx)
-            pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
-            if pending_event or pending:
-                return await self._run_agent_queued_followup(
-                    turn_ctx, adapter, pending, pending_event, response, result, stream_task,
-                )
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
