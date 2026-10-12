@@ -107,6 +107,14 @@ class StreamDeliveryMixin:
         # reverse (streamed longer) is NOT matched — it could suppress a needed resend.
         return bool(visible_content and streamed) and visible_content.startswith(streamed)
 
+    def _interim_content_fully_streamed(self, content: str) -> bool:
+        """Exact delivery match: a streamed prefix must not suppress the complete answer."""
+        normalize = self._normalize_interim_visible_text
+        visible = normalize(self._strip_think_blocks(content or ""))
+        streamed = normalize(self._strip_think_blocks(
+            getattr(self, "_current_streamed_assistant_text", "") or ""))
+        return bool(visible) and visible == streamed
+
     def _extract_codex_interim_visible_parts(self, assistant_msg: Dict[str, Any]) -> List[str]:
         """Visible Codex commentary (``phase=commentary`` items), one string per message item.
 

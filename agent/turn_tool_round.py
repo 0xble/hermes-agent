@@ -169,6 +169,9 @@ def run_tool_round(
             # any tool calls it emits are discarded, never dispatched into another round.
             _turn_exit_reason = "tool_cap_answer"
             try:
+                # This completion bypasses build_api_request. Prior commentary is not
+                # evidence that its final answer reached a stream consumer.
+                agent._reset_stream_delivery_tracking()
                 final_response = agent._handle_max_iterations(messages, api_call_count, tool_cap=decision)
             except InterruptedError:
                 interrupted = True
@@ -185,7 +188,13 @@ def run_tool_round(
             agent._safe_print(f"\n{final_response}\n")
             if agent.stream_delta_callback:
                 with suppress(Exception):
-                    agent.stream_delta_callback(final_response)
+                    # True halts have no completion stream (#30770). Soft caps may
+                    # already have delivered the answer through the shared stream path.
+                    if (
+                        _turn_exit_reason != "tool_cap_answer"
+                        or not agent._interim_content_fully_streamed(final_response)
+                    ):
+                        agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
         return _verdict("break")
 

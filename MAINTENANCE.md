@@ -26,7 +26,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
-| Loop-cap final answer | Refuse excess searches or subagents, then let the model answer once without executing more tools | Per-turn loop-cap handling, final-answer requests, or upstream guardrail changes | [Loop-cap final answer](maintenance/loop-cap-final-answer.md) |
+| Loop-cap final answer | Refuse excess searches or subagents, then answer once without executing more tools or replaying a fully streamed final answer | Per-turn loop-cap handling, final-answer requests, or upstream guardrail changes | [Loop-cap final answer](maintenance/loop-cap-final-answer.md) |
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
 
 ## Active patch record: shared primary cooldown
