@@ -1,34 +1,34 @@
 # Background delegation restart survival
 
 Load this unit when changing restart-cut lifecycle truth, async-delegation retention,
-per-child recovery, or parent-facing continuation notices.
+or completion and boot-notice claim ownership.
 
 ## Guarantee
 
-A gateway restart does not turn a live background unit into a completed or failed
-history row. The durable row records `interrupted` with the trusted `cut_reason`,
-keeps restart-cut rows outside the ordinary history cap, and retains enough
-per-child evidence for a parent to resume only unfinished work.
+A shutdown signal is not evidence that work stopped unfinished. A trustworthy
+completed result wins the shutdown race and is never made resumable. Unfinished
+work records `interrupted` with the trusted `cut_reason` and retains its existing
+result/transcript evidence for conservative recovery through the durable retry engine.
 
 ## Required behavior
 
-- `interrupt_all` marks a running unit `interrupted` before its aggregate result can
-  report `completed` or `error`; the event carries `cut_reason`.
-- Ordinary retention prunes superseded rows before delivered rows, logs each prune
-  with a bounded list of IDs, and never counts resumable/retry-owed rows against
-  the ordinary cap. A separate hard ceiling prevents unbounded protected history.
-- Batch recovery claims each unfinished child once in `async_delegation_child_recovery`.
-  Completed children are never included in the replacement `tasks` payload. Every
-  child context includes recorded sibling results and any transcript evidence.
-- A cut completion renders one fixed continuation block with the cut time, the
-  unfinished child indexes, and the exact `delegate_task(action='resume', ...)`
-  instruction. Delivery settlement marks the boot/continuation claim delivered.
-- The schema change is additive and lives in the canonical reconciliation path;
-  older releases may read the same `state.db` while ignoring the new table.
+- `interrupt_all` records a cut request, not a terminal outcome. Finalization marks
+  a non-successful scalar result or a batch with interrupted/missing children
+  `interrupted`; successful runners remain completed, including during CLI shutdown.
+- Ordinary retention prunes superseded rows before delivered rows, logs a bounded
+  list of IDs, and excludes resumable/retry-owed rows from the ordinary history cap.
+- The separate resumable ceiling evicts eligible settled history first. It must
+  never delete pending completion delivery or retry-owed rows to enforce the cap;
+  those obligations are settled by the existing bounded delivery/retry engine.
+- Completion delivery settles only its own claim. Boot-notice claims remain owned
+  by `claim_auto_resume_trigger`, `complete_auto_resume_trigger`, and
+  `release_auto_resume_trigger`; completion acceptance cannot steal their claim.
+- This unit adds no schema or child recovery table. Per-child resume payloads and
+  fixed parent continuation notices belong to the follow-on recovery change.
 
 ## Tests
 
-`tests/tools/test_async_delegation_restart_cut.py` and
-`tests/tools/test_delegation_resume_children.py`.
+`tests/tools/test_async_delegation_restart_cut.py` and the existing
+`tests/tools/test_async_delegation*.py` suites.
 
 Fork patch identity: `delegation-restart-survival`.
