@@ -59,4 +59,3 @@ def test_installer_machine_home_keeps_the_powershell_module_cache_shared():
     assert Path(observed["local"]).is_relative_to(home)
     assert Path(observed["profile"]) == home
     assert observed["process"] > 0
-    print(f"[windows-cache-boundary] {observed}", flush=True)

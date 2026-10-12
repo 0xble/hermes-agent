@@ -97,23 +97,15 @@ inherited-LOCALAPPDATA fallback. A behavioral shell canary was red when the
 allowlist dropped the explicit path and green after forwarding it. Installer
 destination isolation is unchanged.
 
-The earlier cache-placement diagnosis did **not** resolve the native regression:
-nightly [38226819827, Windows job 114768030470](https://github.com/0xble/hermes-agent/actions/runs/38226819827/job/114768030470)
+The earlier red result remains historical: nightly [38226819827, Windows job 114768030470](https://github.com/0xble/hermes-agent/actions/runs/38226819827/job/114768030470)
 at `d52d86d1eccda1f908e37fc6fe1cacab7f88e64f` killed lineage and marker at the
 300-second file cap and failed marker-lock's unpublished-child assertion.
-The same-image fast baseline ran these files in 16.9 s, 54.6 s and 22.5 s;
-current quiet-dot output cannot prove the timing of each remaining cell or
-exclude a hang. Therefore these files are not split and no deadline, timeout,
-selection, platform marker or assertion is relaxed.
 
-Native qualification retains verbose, uncaptured per-cell progress and pytest
-durations. The three failing protocol files also emit monotonic start/finish
-records, and the marker-lock failure includes the isolated hand-off log and
-finder output. The native cache boundary reads actual PowerShell-child values
-and records CIM lookup duration, rather than only examining Python's environment.
-These observations distinguish shell startup, child publication and aggregate
-cost before another repair is proposed; they do not themselves establish native
-green. Keep the PR draft until the original native reproduction passes.
+The native Windows nightly run [38244602340, job 114799117020](https://github.com/0xble/hermes-agent/actions/runs/38244602340/job/114799117020)
+at patch-equivalent ancestor `267599fd` showed `210 files, 659 tests passed,
+0 failed, 336 skipped`; handoff_lineage (10), marker (19), and marker_lock (3)
+all passed. The mechanism is inferred to be forwarding
+`PSModuleAnalysisCachePath`; that attribution is not separately isolated proof.
 
 The missing uv-shim-validation script and checkout-relative Windows cache
 artifacts are also present in the verified pre-sync baseline; they are separate
