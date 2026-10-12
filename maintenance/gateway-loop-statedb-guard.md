@@ -68,10 +68,9 @@ public replay with alternation repair 167.32 → 3.71 ms. A second archive-heavy
 The regression is red on the base (10x archives cost 10x VM steps) and green after the fix.
 Display/audit predicates and sorts, lineage, repair, prompt sidecars, and compaction tail
 watermarks are unchanged. Upstream `835c3dd038d903182a66ecc45e34bf5e0de65f00` has the same
-query; related PR/issue searches found no matching access-path fix. This is a narrow fork
-candidate for parent review, not installed or integrated; upstream contribution is deferred
-to the delivery owner. Revert this query change to roll back; retire it when an upstream
-release supplies archive-bounded id-ordered replay.
+query; related PR/issue searches found no matching access-path fix. Revert this query
+change to roll back; retire it when an upstream release supplies archive-bounded
+id-ordered replay.
 
 ## 2026-10-10 and 2026-10-11 incidents
 
