@@ -60,6 +60,14 @@ unreachable otherwise).
 
 ## Development Environment
 
+Provider HTTP diagnostics MUST use `.venv/bin/python scripts/probe_provider.py <key>`
+with an explicit, uniquely named `providers.<key>` entry. Never use `curl` with
+inline keys, put credentials in argv, or echo config secrets. The probe refuses
+implicit/legacy routes, env routing overrides, overlapping aliases and persisted
+pools; do not bypass refusals with an inline credentialed request. Add an
+unambiguous keyed entry or extend the guarded contract with tests. See
+`maintenance/io-safe-provider-probe.md` for the supported boundary.
+
 ```bash
 source ./activate   # provisions/syncs PM tools + dependencies, then activates
 ```
