@@ -181,62 +181,22 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
     return evidence
 
 
-# Startup-watchdog lease held while the unclean-exit integrity check runs (#115542):
-# ``PRAGMA quick_check(1)`` is one monolithic SQLite operation and per-call leases
-# clamp at 900s, so a single entry lease cannot cover a multi-thousand-second healthy
-# check on a huge store — without renewal the watchdog kills the attempt with exit 75
-# and the restart loop never reaches the cron ticker. The progress handler below renews
-# a phase-owned lease for as long as SQLite is making progress, and always returns 0
-# so it never aborts the check; the ok/absent/first-complaint verdicts stay fail-closed.
-_INTEGRITY_CHECK_LEASE_PHASE = "state_db_unclean_integrity_check"
-_INTEGRITY_CHECK_LEASE_S = 900.0
-# VM instructions between progress-handler invocations; each invocation is a
-# monotonic-clock compare, renewing at most every _INTEGRITY_CHECK_LEASE_RENEW_S.
-_INTEGRITY_CHECK_PROGRESS_OPS = 100_000
-_INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
-
-
-def _install_integrity_check_lease(conn: sqlite3.Connection) -> None:
-    """Claim the integrity-check lease and renew it from a SQLite progress handler.
-
-    ``report_startup_progress`` is a no-op when no watchdog is armed and never raises.
-    The handler always returns 0 -- it must never abort the verdict PRAGMA.  Synchronous
-    by design: no checker worker thread can outlive the check.
-    """
-    from hermes_startup_watchdog import report_startup_progress
-
-    report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
-    last_renew = time.monotonic()
-
-    def _on_progress() -> int:
-        nonlocal last_renew
-        now = time.monotonic()
-        if now - last_renew >= _INTEGRITY_CHECK_LEASE_RENEW_S:
-            last_renew = now
-            report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
-        return 0
-
-    conn.set_progress_handler(_on_progress, _INTEGRITY_CHECK_PROGRESS_OPS)
-
-
 def check_state_db_integrity(home: Optional[Path] = None) -> str:
     """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
 
     Only after an unclean death — SIGKILL mid-WAL-checkpoint can leave half-written
-    b-tree pages.  ``quick_check(1)`` stops at the first problem (~2s on a healthy
-    500MB store): cheap once per unclean boot, too costly every boot.  Opened
+    b-tree pages. ``quick_check(1)`` stops at the first problem but can take minutes
+    on a large healthy store, so startup runs it in a background thread. Opened
     normally: a WAL store needs its -shm sidecar for read-only, and the PRAGMA writes nothing.
 
-    Holds a phase-owned startup-watchdog lease for the check duration
-    (renewed from a SQLite progress handler, #115542) so a long healthy check
-    on a huge store is not mistaken for a parked deadlock.
+    This is no longer startup progress: a background check must not extend the
+    startup watchdog lease and hide a wedged startup path.
     """
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
     try:
         with closing(sqlite3.connect(str(path))) as conn:
-            _install_integrity_check_lease(conn)
             row = conn.execute("PRAGMA quick_check(1)").fetchone()
     except Exception as exc:
         return f"check-failed: {exc}"
@@ -244,7 +204,7 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
 
 
 def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None:
-    """Integrity-check the store, persist the exit-diag record, log at WARNING."""
+    """Background forensics: persist the verdict and report corruption loudly."""
     # The death may have torn the store; this is the only moment we know to look.
     verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
     if verdict not in ("ok", "absent"):
@@ -254,6 +214,9 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
             verdict,
         )
     _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
+
+
+def _warn_unclean_exit(evidence: Dict[str, Any]) -> None:
     logger.warning(
         "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
         "VM death, or a process kill issued by the agent or one of its descendants, e.g. a pkill/taskkill of "
@@ -264,19 +227,24 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
 
 
 def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Boot entry point: report any unclean previous exit (evidence dict, also persisted
-    to ``gateway-exit-diag.log`` and logged at WARNING) then claim the sentinel.  Never raises."""
+    """Detect and claim synchronously; check the store off the startup critical path.
+
+    Return the previous-life evidence immediately. The worker owns a copy and
+    appends its integrity verdict to ``gateway-exit-diag.log`` when finished.
+    It is a daemon: forensics must not hold up startup or shutdown. Never raises.
+    """
     evidence: Optional[Dict[str, Any]] = None
     try:
+        home = _process_hermes_home() if home is None else home
         evidence = detect_unclean_exit(home)
         if evidence is not None:
-            _report_unclean_exit(evidence, home)
+            _warn_unclean_exit(evidence)
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
         claim: Dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
-        # Process birth (psutil), distinct from ``start_time`` (the ledger claim, seconds later once
-        # imports finish): the Windows start attestation binds PIDs to birth time (#110020 review).
+        # Process birth is distinct from the ledger claim time; the Windows start
+        # attestation binds PIDs to birth time (#110020 review).
         from hermes_cli.process_identity import _process_create_time
 
         create_time = _process_create_time(os.getpid())
@@ -292,6 +260,16 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
+    if evidence is not None:
+        try:
+            from agent.memory_provider import spawn_context_thread
+
+            spawn_context_thread(
+                _report_unclean_exit, name="gateway-unclean-integrity-check",
+                daemon=True, args=(dict(evidence), home),
+            ).start()
+        except Exception:
+            logger.error("Failed to start unclean-exit state.db integrity check", exc_info=True)
     return evidence
 
 
