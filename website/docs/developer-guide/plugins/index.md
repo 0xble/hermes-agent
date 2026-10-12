@@ -1215,8 +1215,12 @@ The **API request hooks** are observers for the raw provider request, one level 
 
 ### `post_steer_delivered` delivery observation
 
-Fires synchronously once after each completed native steer-row insertion, under the
-active turn/profile scope. `turn_id` is the same admitted identity supplied to
+Dispatches once after each completed native steer-row insertion, under the
+active turn/profile scope. Python callbacks are bounded by
+`plugins.hook_callback_timeout` and fail open on timeout; the worker is abandoned
+without joining it, so delivery and later callbacks proceed. `0` disables the
+bound. A timed-out callback may continue running in the background.
+`turn_id` is the same admitted identity supplied to
 `pre_llm_call` and `pre_api_request`; `session_id` is the current session (which can
 rotate during compression). `delivery_id` is a host-minted UUID4 per insertion,
 and `ordinal` starts at 1 in each turn and spans both drain sites. `text` is the

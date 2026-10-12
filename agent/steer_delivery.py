@@ -34,8 +34,8 @@ def report_steer_delivered(agent, text: str) -> None:
         invoke_hook(
             "post_steer_delivered",
             session_id=getattr(agent, "session_id", None),
-            turn_id=getattr(agent, "_current_turn_id", None),
-            platform=getattr(agent, "platform", None),
+            turn_id=getattr(agent, "_current_turn_id", ""),
+            platform=getattr(agent, "platform", ""),
             text=text, delivery_id=delivery_id, ordinal=ordinal,
         )
     except Exception:
