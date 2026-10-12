@@ -590,10 +590,7 @@ def native_os(env: dict[str, str], workers: int) -> None:
     files = [line.strip() for line in selected.splitlines() if line.strip()]
     if not files:
         raise RuntimeError(f'No files selected for {marker}. Refusing an empty native OS lane.')
-    # Keep per-cell progress in a timed-out file's retained stdout. A killed
-    # file has no pytest duration summary, so quiet dots cannot locate its wait.
-    native_args = ['-m', 'platforms and not integration', '-vv', '-s', '--durations=0']
-    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=native_args))]
+    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
     if sys.platform == 'win32':
         for shell in ('powershell', 'pwsh'):
             for case in ('longpath', 'node-compatibility', 'uv-shim-validation'):
