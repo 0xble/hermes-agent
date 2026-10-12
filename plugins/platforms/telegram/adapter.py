@@ -476,13 +476,17 @@ from gateway.platforms.helpers import (
 
 # Rich-message regions whose internal newlines must stay bare (Telegram renders them natively):
 # fenced code blocks OR GFM pipe-table blocks (header row, delimiter row, data rows).
+_RICH_TABLE_BLOCK_PATTERN = (
+    r'(?:^[^\n]*\|[^\n]*\n'                             # table header row (has a pipe)
+    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
+    r'(?:\n[^\n]*\|[^\n]*)*)'                           # data rows (newline-led, trailing \n left for prose)
+)
+_RICH_TABLE_BLOCK_RE = re.compile(_RICH_TABLE_BLOCK_PATTERN, re.MULTILINE)
 _RICH_PROTECTED_REGION_RE = re.compile(
     # A fence opens only at line start (after indentation or list/quote markers) and, per CommonMark, its
     # info string has no backtick: an inline ```code `` span``` followed later by a fence is not a block.
     r'(?:^[ \t>*+\-\d.)]*```[^`\n]*\n[\s\S]*?```)'      # fenced code block
-    r'|(?:^[^\n]*\|[^\n]*\n'                            # table header row (has a pipe)
-    r'[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*'  # delimiter
-    r'(?:\n[^\n]*\|[^\n]*)*)',                          # data rows (newline-led, trailing \n left for prose)
+    r'|' + _RICH_TABLE_BLOCK_PATTERN,
     re.MULTILINE)
 
 
@@ -658,21 +662,40 @@ def _rich_normalize_linebreaks(text: str) -> str:
     ``\n\n`` is visually collapsed by Telegram Rich Message clients. Fenced
     code blocks and GFM pipe-table blocks stay untouched because hard breaks
     inside either would corrupt their syntax.
+
+    A pipe table also needs a blank line on each side, so the single newline
+    there becomes a paragraph break instead of a hard break: Telegram cannot
+    open a table inside the open paragraph of a caption written directly above
+    it, and GFM continues a table through prose written directly below it as
+    one more row. Fence boundaries keep their hard break, since a fence can
+    interrupt a paragraph.
     """
     if not text or '\n' not in text:
         return text
+
+    def _normalize_prose(prose: str) -> str:
+        prose = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(prose))
+        return _RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose)
+
     out: list[str] = []
     # Split off every structural region whose internal newlines are meaningful,
     # then normalize only the prose between them. Boundary newlines are handled
     # by the single-newline regex on each prose run.
     pos = 0
     for m in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text):
-        prose = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:m.start()]))
-        out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose))
-        out.append(m.group(0))  # protected region kept verbatim
+        region = m.group(0)
+        is_table = _RICH_TABLE_BLOCK_RE.fullmatch(region) is not None
+        prose = text[pos:m.start()]
+        if is_table and prose.endswith('\n') and not prose.endswith('\n\n'):
+            out.append(_normalize_prose(prose[:-1]) + '\n\n')
+        else:
+            out.append(_normalize_prose(prose))
+        out.append(region)  # protected region kept verbatim
         pos = m.end()
-    tail = _rich_materialize_prose_paragraphs(_rich_separate_ordered_lists(text[pos:]))
-    out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', tail))
+        if is_table and text.startswith('\n', pos) and len(text) > pos + 1 and text[pos + 1] != '\n':
+            out.append('\n\n')
+            pos += 1
+    out.append(_normalize_prose(text[pos:]))
     return ''.join(out)
 
 
