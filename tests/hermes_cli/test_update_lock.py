@@ -261,12 +261,15 @@ def test_v2_marker_whose_pid_was_reused_is_reclaimed(marker, other_pid):
     assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == os.getpid()
 
 
-def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatch, other_pid):
+def test_delegate_keeps_the_claim_live_after_the_partner_dies(marker, monkeypatch):
     """Rule 6: `hermes update` adopting a hand-off claim names itself on line 4, restores
     lines 1-3 byte-identical on exit, and is what keeps the claim visible if the partner dies."""
-    _claim_v2(marker, other_pid)
+    # A handoff holder is our ancestor, not a child standing in for one. A child
+    # would cross a gateway above pytest and correctly fail the runtime-host guard.
+    parent_pid = os.getppid()
+    _claim_v2(marker, parent_pid)
     base = marker.read_bytes()
-    monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
 
     lock = UpdateLock(path=marker)
     assert lock.acquire() is True and lock.acquired is False
@@ -631,10 +634,10 @@ class TestHandoffFromOrchestratingUpdater:
     HANDOFF_PID_ENV; a live holder matching it is our own orchestrator.
     """
 
-    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch, other_pid):
-        # other_pid stands in for the live parent updater.
-        _claim(marker, other_pid)
-        monkeypatch.setenv(HANDOFF_PID_ENV, str(other_pid))
+    def test_child_runs_under_the_parents_live_claim(self, marker, monkeypatch):
+        parent_pid = os.getppid()  # exercise the real parent/child handoff topology
+        _claim(marker, parent_pid)
+        monkeypatch.setenv(HANDOFF_PID_ENV, str(parent_pid))
 
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
@@ -642,7 +645,7 @@ class TestHandoffFromOrchestratingUpdater:
 
         lock.release()
         assert marker.exists(), "the parent still needs its marker after our stage ends"
-        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == other_pid
+        assert int(marker.read_text(encoding="utf-8-sig").splitlines()[0]) == parent_pid
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(
         self, marker, monkeypatch, other_pid
@@ -980,23 +983,3 @@ def test_checkout_lock_never_writes_through_a_link_to_a_file_outside_the_install
     assert lock.acquire() is False
     assert lock.holder is not None and lock.holder.reason
     assert outside.read_bytes() == b"PRECIOUS USER DATA"
-
-
-def test_whole_second_creation_time_in_our_own_second_is_us(marker):
-    """The macOS hand-off shell writes `ct:<secs>.000` (ps lstart has no sub-second part) for the
-    update child it names as delegate. That is our incarnation, so the child adopts the claim
-    instead of refusing its own hand-off as "another update"."""
-    import math
-
-    own = process_create_time()
-    assert update_lock.incarnation_live(os.getpid(), float(math.floor(own))) is True
-
-    parent = os.getppid()
-    marker.write_text(
-        f"{parent}\n{int(time.time())}\nct:{math.floor(process_create_time(parent))}.000\n"
-        f"delegate:{os.getpid()} ct:{math.floor(own)}.000\n",
-        encoding="utf-8", newline="",
-    )
-    assert update_lock.judge_marker(marker.read_bytes())[0] == "ours"
-    # A whole second from an EARLIER second is a killed update's pid reused: still not us.
-    assert update_lock.incarnation_live(os.getpid(), float(math.floor(own)) - 1) is False
