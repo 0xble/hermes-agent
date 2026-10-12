@@ -70,6 +70,14 @@ def _callback_identity(cb: Callable) -> str:
 _SHELL_HOOK_WRAPPER_MARGIN_SECS = 10.0
 
 
+@dataclass(frozen=True)
+class _PreToolCallDirective:
+    action: Optional[str] = None
+    message: Optional[str] = None
+    rule_key: Optional[str] = None
+    modified_args: Optional[Dict[str, Any]] = None
+
+
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> Dict[str, str]:
     """Block directive for a fail-closed hook whose callback raised: names the callback and the
     error (truncated — a hook that embeds tool args in its exception must not grow the tool

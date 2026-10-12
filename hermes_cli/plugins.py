@@ -56,8 +56,8 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
     _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
-    RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
-    is_valid_system_prompt_section_id,
+    RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
+    format_system_prompt_sections, is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_state import (
@@ -1865,9 +1865,23 @@ def _delivery_manager() -> PluginManager:
     _join_background_discovery()
     if not getattr(manager, "_discovered", True):
         manager.discover_and_load()
+    if not getattr(manager, "_discovery_complete", True) and _await_foreground_discovery(manager):
+        if not getattr(manager, "_discovered", True):
+            manager.discover_and_load()  # the sweep we waited on failed and reset; retry it here
     if not getattr(manager, "_discovery_complete", True):
         raise RuntimeError("Plugin discovery incomplete; defer hook delivery until loading finishes")
     return manager
+
+
+def _await_foreground_discovery(manager: PluginManager, timeout: float = 30.0) -> bool:
+    """Wait (bounded) for a sweep another thread holds, e.g. a sibling concurrent tool worker's lazy
+    discovery. Never waits from a plugin-load worker (its parent holds the lock), and the RLock admits
+    a same-thread re-entry immediately, so register()-time delivery still sees an incomplete registry."""
+    lock = getattr(manager, "_discovery_lock", None)
+    if lock is None or in_plugin_load_worker() or not lock.acquire(timeout=timeout):
+        return False
+    lock.release()
+    return True
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
@@ -1961,14 +1975,6 @@ def fire_pre_command_hook(
 _thread_tool_whitelist = threading.local()
 
 
-@dataclass(frozen=True)
-class _PreToolCallDirective:
-    action: Optional[str] = None
-    message: Optional[str] = None
-    rule_key: Optional[str] = None
-    modified_args: Optional[Dict[str, Any]] = None
-
-
 def set_thread_tool_whitelist(
     allowed: Optional[Set[str]],
     deny_msg_fmt: str = "Tool '{tool_name}' denied: not in this thread's tool whitelist",
@@ -1996,12 +2002,18 @@ def _get_pre_tool_call_directive_details(
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
         return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
-    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
-    hook_results = invoke_lifecycle_hook(
-        "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
-        task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
-    )
+    try:
+        from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
+
+        hook_results = invoke_lifecycle_hook(
+            "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
+            task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
+            api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
+        )
+    except Exception:
+        # Dispatchers may swallow hook exceptions; unavailable policy must be a veto.
+        logger.warning("pre_tool_call policy delivery failed for %s", tool_name, exc_info=True)
+        return _PreToolCallDirective(action="block", message="BLOCKED: plugin discovery or pre_tool_call policy unavailable")
     modified_args: Optional[Dict[str, Any]] = None
     first_approve: Optional[Tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
     for result in hook_results:

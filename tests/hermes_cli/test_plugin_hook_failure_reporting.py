@@ -9,6 +9,8 @@ import logging
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from hermes_cli.plugins import PluginManager
 
 
@@ -132,7 +134,7 @@ def test_stream_observer_hook_failure_warns_once(manager, caplog, monkeypatch):
 def test_event_subscriber_failure_warns_once(manager, caplog):
     """Plugin event subscribers deliver on the host worker; one that raises identically on every
     emit is reported once with the ``Event`` surface label."""
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
 
     def on_event(tool_data, **kwargs):  # the emitter sends its own payload, never tool_data
         return None

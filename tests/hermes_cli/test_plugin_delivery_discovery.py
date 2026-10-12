@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     """A discovered flag is published before loading finishes; hooks must wait for the worker."""
     import hermes_cli.plugins as plugins
 
     class Manager:
-        _discovered = True
+        _discovered = _discovery_complete = True
 
     manager = Manager()
     joined = []
@@ -23,21 +25,40 @@ def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     assert joined == [True]
 
 
-def test_delivery_refuses_partial_hooks_after_discovery_timeout(monkeypatch):
+def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypatch):
+    import json
     import threading
-    import pytest
+
     import hermes_cli.plugins as plugins
+    import model_tools
 
     manager = plugins.PluginManager()
     entered, release = threading.Event(), threading.Event()
-    dispatched = []
+    executions, veto_calls = [], []
+
+    def veto(**kwargs):
+        veto_calls.append(kwargs["tool_name"])
+        return {"action": "block", "message": "configured veto"}
+
     def load():
-        manager._hooks.setdefault("pre_tool_call", []).append(lambda **kw: dispatched.append(True))
         entered.set()
-        assert release.wait(5)
+        assert release.wait(10)
+        manager._hooks.setdefault("pre_tool_call", []).append(veto)
+
+    def execute(name, args, **kwargs):
+        executions.append(name)
+        return json.dumps({"ok": True})
+
+    def dispatch():
+        return model_tools.handle_function_call(
+            "discovery_probe", {}, skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        )
+
     monkeypatch.setattr(manager, "_discover_and_load_inner", load)
     monkeypatch.setattr(manager, "_refresh_secret_sources_after_discovery", lambda: None)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(model_tools.registry, "dispatch", execute)
     join = plugins._join_background_discovery
     monkeypatch.setattr(plugins, "_join_background_discovery", lambda: join(timeout=0))
     worker = threading.Thread(target=manager.discover_and_load, daemon=True)
@@ -45,14 +66,22 @@ def test_delivery_refuses_partial_hooks_after_discovery_timeout(monkeypatch):
     worker.start()
     try:
         assert entered.wait(5)
+        result = dispatch()
+        assert veto_calls == []
+        assert executions == [], "discovery timeout must not authorize tool execution"
+        assert "discovery" in json.loads(result)["error"].lower()
         with pytest.raises(RuntimeError, match="discovery"):
-            plugins.invoke_hook("pre_tool_call")
-        assert dispatched == []
+            plugins.invoke_hook("post_tool_call")
     finally:
         release.set()
         worker.join(5)
-    plugins.invoke_hook("pre_tool_call")
-    assert dispatched == [True]
+    assert not worker.is_alive()
+    assert "configured veto" in json.loads(dispatch())["error"]
+    assert veto_calls == ["discovery_probe"]
+    assert executions == []
+    manager._hooks["pre_tool_call"].clear()
+    assert json.loads(dispatch()) == {"ok": True}
+    assert executions == ["discovery_probe"]
 
 
 def _inflight_discovery(monkeypatch):
@@ -62,9 +91,10 @@ def _inflight_discovery(monkeypatch):
     import time
 
     import hermes_cli.plugins as plugins
+    from tests.plugin_helpers import mark_plugin_discovery_started
 
     manager = plugins.PluginManager()
-    manager._discovered = True
+    mark_plugin_discovery_started(manager)
 
     def callback(**_kwargs):
         return None
@@ -95,3 +125,64 @@ def test_streaming_hook_snapshot_sees_hook_registered_by_inflight_discovery(monk
     plugins, callback, worker = _inflight_discovery(monkeypatch)
     assert callback in plugins.iter_hook_callbacks("pre_llm_call")
     worker.join(5)
+
+
+def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkeypatch):
+    """Concurrent tool workers both lazily discover: the one that loses the sweep lock must wait
+    for completion instead of failing its tool, and still see hooks registered by that sweep."""
+    import threading
+
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    entered, release = threading.Event(), threading.Event()
+    seen = []
+
+    def load():
+        entered.set()
+        assert release.wait(10)
+        manager._hooks.setdefault("post_tool_call", []).append(lambda **kw: seen.append(kw) or "ran")
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", load)
+    monkeypatch.setattr(manager, "_refresh_secret_sources_after_discovery", lambda: None)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    first = threading.Thread(target=lambda: plugins.invoke_hook("post_tool_call", n=1), daemon=True)
+    first.start()
+    assert entered.wait(5)
+    result = {}
+
+    def sibling():
+        try:
+            result["value"] = plugins.invoke_hook("post_tool_call", n=2)
+        except Exception as exc:  # pragma: no cover - the regression
+            result["error"] = exc
+
+    worker = threading.Thread(target=sibling, daemon=True)
+    worker.start()
+    worker.join(0.3)
+    assert worker.is_alive(), "sibling must wait for the in-flight sweep, not deliver or fail early"
+    release.set()
+    worker.join(5)
+    first.join(5)
+    assert result == {"value": ["ran"]}
+
+
+def test_sweep_thread_reentry_still_refuses_partial_registry(monkeypatch):
+    """Re-entrant delivery from inside the sweep (register()-time hook) stays fail closed."""
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    outcome = {}
+
+    def load():
+        try:
+            plugins.invoke_hook("post_tool_call")
+        except RuntimeError as exc:
+            outcome["error"] = str(exc)
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", load)
+    monkeypatch.setattr(manager, "_refresh_secret_sources_after_discovery", lambda: None)
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    manager.discover_and_load()
+    assert "discovery incomplete" in outcome["error"].lower()
+    assert manager._discovery_complete is True
