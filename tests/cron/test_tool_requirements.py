@@ -114,6 +114,25 @@ def test_no_mcp_sentinel_keeps_relay_step_flagged():
     assert len(issues) == 1 and "relay" in issues[0]
 
 
+def test_disabled_relay_mcp_server_is_not_reported_as_available():
+    cfg = {"mcp_servers": {"relay": {"command": "relay", "enabled": False}}}
+    job = {"enabled_toolsets": ["file", "relay"], "prompt": "Use Pick the Destination."}
+    issues = job_tool_requirement_issues(job, cfg=cfg)
+    assert len(issues) == 1 and "relay" in issues[0]
+
+
+def test_no_mcp_does_not_get_readded_during_capability_check():
+    cfg = {"mcp_servers": {"terminal": {"command": "terminal"}}}
+    job = {"enabled_toolsets": ["file", "no_mcp"], "prompt": "Add with `loops finding add`."}
+    issues = job_tool_requirement_issues(job, cfg=cfg)
+    assert len(issues) == 1 and "terminal" in issues[0]
+
+
+def test_legacy_terminal_alias_satisfies_shell_step():
+    job = {"enabled_toolsets": ["terminal_tools"], "prompt": "Add with `loops finding add`."}
+    assert job_tool_requirement_issues(job, cfg={}) == []
+
+
 def test_explicit_other_mcp_server_does_not_merge_relay():
     cfg = {"mcp_servers": {**_RELAY_MCP_CFG["mcp_servers"], "github": {"command": "gh-mcp"}}}
     job = {"enabled_toolsets": ["file", "github"], "prompt": "If needed, use Pick the Destination."}
