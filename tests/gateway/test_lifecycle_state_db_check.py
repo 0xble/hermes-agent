@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -137,7 +137,7 @@ def test_unclean_exit_on_a_healthy_store_records_ok(tmp_path: Path, integrity_wo
     assert _exit_diag_records(tmp_path)[0]["state_db_integrity"] == "ok"
 
 
-def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> None:
+def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch, integrity_workers) -> None:
     """A clean boot must not scan the store — that is the whole cost gate."""
     _make_state_db(tmp_path, corrupt=True)
     _write_sentinel(tmp_path, phase="exited")
@@ -148,8 +148,8 @@ def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(
         ledger, "check_state_db_integrity", lambda **kw: called.append(1) or "ok"
     )
-    record_startup(home=tmp_path)
-
+    assert record_startup(home=tmp_path) is None
+    integrity_workers()
     assert not called, "integrity check ran on a clean boot"
 
 
