@@ -817,14 +817,13 @@ class GatewayGoalsMixin:
 
     async def _loop_wake_execution_current(
         self, sid: str, tick: tuple, source: Any, *, run_generation: Optional[int] = None,
-    ) -> bool:
-        """Revalidate the admitted wake after an executor hop and before its effects.
+    ) -> Optional[int]:
+        """Revalidate an admitted wake after an executor hop and return the stored control fence.
 
-        Session/control commands can win while a worker persists ``executing``.  The
-        post-hop check therefore proves the routing entry, run generation (when the
-        model-turn path owns one), and exact persisted tick phase all still match.
+        This is a pre-CAS snapshot only. The durable ``start_effect`` compare-and-set is the final
+        authority; the process-local control-generation cache is intentionally not consulted here.
         """
-        from hermes_cli.loops import LoopManager, loop_control_generation
+        from hermes_cli.loops import LoopManager
 
         session_key = self._session_key_for_source(source)
 
@@ -837,44 +836,39 @@ class GatewayGoalsMixin:
                 state is not None
                 and state.status == "active"
                 and state.awaiting_response
-                and state.claim_phase == "executing"
+                and state.claim_phase in {"executing", "started"}
                 and (state.created_at, state.ticks_fired) == tick
+                and (run_generation is None or int(getattr(state, "run_generation", 0) or 0) in {0, int(run_generation)})
             ):
                 return None
             return int(getattr(state, "control_generation", 0) or 0)
 
-        current = await self._run_in_executor_with_context(_exact_executing_tick)
-        # No await after this check: any loop control (set, replace, pause, resume, clear, /new)
-        # may win even the validation worker's return gap. ``save_loop`` is the single writer of
-        # the stored control generation and mirrors it into this process-local fence synchronously,
-        # so comparing it with the worker's stored snapshot catches every control path at once.
-        return bool(current is not None) and loop_control_generation(sid) == current and (
-            run_generation is None or self._is_session_run_current(session_key, run_generation)
-        )
+        return await self._run_in_executor_with_context(_exact_executing_tick)
 
     def _loop_wake_execution_fence_sync(self, event: Any, fence: Optional[tuple]) -> bool:
-        """Final synchronous authority immediately before a loop-wake effect starts.
+        """Durable linearization point immediately before a loop-wake effect starts.
 
-        All preparation may await. This helper is deliberately synchronous and callers must invoke it
-        in the same event-loop step as the handler/model call: control writes advance the process-local
-        ``control_generation`` at their persistence chokepoint, while the immutable event identity and
-        session run generation prevent a different tick or reset successor from borrowing the call.
+        The stored-row CAS checks the exact tick, active/awaiting state, executing-or-started phase,
+        stored control generation, and stored session run generation in one write transaction. A
+        successful CAS changes ``executing`` to ``started``; callers invoke the external effect with
+        no await between that return and the handler/model call. The process-local generation map is
+        not an authority.
         """
         if fence is None:
             return self._loop_wake_command_identity(event) is None
         try:
             sid, tick, run_generation, control_generation = fence
+            if control_generation is None:
+                return False
         except (TypeError, ValueError):
             return False
         if self._loop_wake_command_identity(event) != (sid, tick):
             return False
-        from hermes_cli.loops import loop_control_generation
-        return (
-            loop_control_generation(sid) == int(control_generation)
-            and (run_generation is None or self._is_session_run_current(
-                self._session_key_for_source(event.source), run_generation,
-            ))
+        from hermes_cli.loops import LoopManager
+        result = LoopManager(sid)._start_effect_cas(
+            tick, control_generation=int(control_generation), run_generation=int(run_generation or 0),
         )
+        return result
 
     async def _invoke_loop_wake_effect(self, event: Any, fence: Optional[tuple], handler, *args, **kwargs):
         """The sole async effect-entry step: no preparation or yield after the final fence.
@@ -913,11 +907,12 @@ class GatewayGoalsMixin:
         from hermes_cli.loops import LoopManager
 
         mgr = await self._run_in_executor_with_context(LoopManager, sid)
-        if not await self._run_in_executor_with_context(mgr.start_tick, tick):
+        if not await self._run_in_executor_with_context(mgr.start_tick, tick, generation):
             return False
-        return await self._loop_wake_execution_current(
+        result = await self._loop_wake_execution_current(
             sid, tick, source, run_generation=generation,
         )
+        return result is not None
 
     async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
         """Settle only a command dispatch that completed without falling through to model work."""

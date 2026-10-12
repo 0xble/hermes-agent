@@ -323,7 +323,7 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
     finally:
         hermes_loop_guard.set_loop_thread(None)
     try:
-        assert executions == ([] if prompt == "/start" else [(True, "executing", 1)])
+        assert executions == ([] if prompt == "/start" else [(True, "started", 1)])
         saved = loops.load_loop(entry.session_id)
         assert not saved.awaiting_response and saved.ticks_fired == 1
         assert saved.status == "active"  # cancellation/silent command schedules the next tick
@@ -508,7 +508,7 @@ def test_every_public_loop_control_has_fence_coverage():
 def _owns_executing_tick(state, tick):
     return (
         state is not None and state.status == "active" and state.awaiting_response
-        and state.claim_phase == "executing" and (state.created_at, state.ticks_fired) == tick
+        and state.claim_phase in {"executing", "started"} and (state.created_at, state.ticks_fired) == tick
     )
 
 
@@ -695,13 +695,13 @@ async def test_interrupted_effectful_loop_command_is_parked_not_refunded(control
     try:
         await scan(runner, entry.session_id)
         await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
-        assert effects == ["executing"], "effectful command ran while its tick was still refundable"
+        assert effects == ["started"], "effectful command did not cross the durable start CAS"
         await scan(runner, entry.session_id)  # ownerless recovery after the interruption
         saved = loops.load_loop(entry.session_id)
         assert saved.status == "paused" and "outcome unknown" in saved.paused_reason
         assert saved.ticks_fired == 1 and not saved.awaiting_response
         await scan(runner, entry.session_id)
-        assert effects == ["executing"]  # never replayed
+        assert effects == ["started"]  # never replayed
     finally:
         runner.session_store.close_all_db_handles()
 

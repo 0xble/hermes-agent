@@ -879,7 +879,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         return target.lstrip("/").split()[0]
 
     async def _hm_command_hooks(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str
+        self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str,
+        *, loop_fence: Optional[tuple] = None,
     ) -> Tuple[bool, Optional[str], Optional[str]]:
         """Fire ``pre_command`` (observer) and ``command:<canonical>`` (interceptor) hooks →
         ``(handled, result, new_command)`` (``new_command`` set when a handler rewrote the command).
@@ -887,26 +888,40 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         interfere with the operator's escape hatches for a live agent."""
         raw_args = event.get_command_args().strip()
         platform = source.platform.value if source.platform else ""
-        try:
-            from hermes_cli.plugins import fire_pre_command_hook
-            fire_pre_command_hook(
-                surface="gateway", command=str(canonical), alias_used=str(command),
-                args_raw=raw_args, session_key=_quick_key, platform=platform,
-            )
-        except Exception as _pre_cmd_err:
-            logger.debug("pre_command hook dispatch failed (non-fatal): %s", _pre_cmd_err)
+        async def _dispatch_hooks():
+            try:
+                from hermes_cli.plugins import fire_pre_command_hook
+                fire_pre_command_hook(
+                    surface="gateway", command=str(canonical), alias_used=str(command),
+                    args_raw=raw_args, session_key=_quick_key, platform=platform,
+                )
+            except Exception as _pre_cmd_err:
+                logger.debug("pre_command hook dispatch failed (non-fatal): %s", _pre_cmd_err)
 
-        # Handlers may return ``{"decision": "deny" | "handled" | "rewrite", ...}`` to intercept
-        # dispatch; handlers returning nothing behave as plain observers.
-        hook_ctx = {
-            "platform": platform, "user_id": source.user_id, "command": canonical,
-            "raw_command": command, "args": raw_args, "raw_args": raw_args,
-        }
-        try:
-            hook_results = await self.hooks.emit_collect(f"command:{canonical}", hook_ctx)
-        except Exception as _hook_err:
-            logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
+            # Handlers may return ``{"decision": "deny" | "handled" | "rewrite", ...}`` to intercept
+            # dispatch; handlers returning nothing behave as plain observers.
+            hook_ctx = {
+                "platform": platform, "user_id": source.user_id, "command": canonical,
+                "raw_command": command, "args": raw_args, "raw_args": raw_args,
+            }
+            try:
+                return await self.hooks.emit_collect(f"command:{canonical}", hook_ctx)
+            except Exception as _hook_err:
+                logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
+                return []
+
+        if loop_fence is not None and callable(getattr(self.hooks, "emit_collect", None)):
+            _started, hook_results = await self._invoke_loop_wake_effect(
+                event, loop_fence, _dispatch_hooks,
+            )
+            if not _started:
+                # A superseded loop wake is consumed; never accept a hook result from the old tick.
+                return True, None, None
+        elif loop_fence is not None:
+            # Test doubles and legacy hosts without command-hook support have no hook effect producer.
             hook_results = []
+        else:
+            hook_results = await _dispatch_hooks()
 
         for hook_result in hook_results:
             if not isinstance(hook_result, dict):
@@ -926,7 +941,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         return False, None, None
 
     async def _hm_resolve_command(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
+        self, event: "MessageEvent", source: SessionSource, _quick_key: str,
+        *, loop_fence: Optional[tuple] = None,
     ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """Resolve the slash command (aliases, access gate, hooks) → ``(handled, result, command,
         canonical)``; when ``handled`` the caller returns ``result`` as-is (may be None)."""
@@ -962,7 +978,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return True, _denied, command, canonical
 
         _handled, _result, new_command = await self._hm_command_hooks(
-            event, source, _quick_key, command, canonical
+            event, source, _quick_key, command, canonical, loop_fence=loop_fence,
         )
         if _handled:
             return True, _result, command, canonical
@@ -1387,6 +1403,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
         get_command = getattr(event, "get_command", None)
         loop_fence = None
+        original_command_text = event.text
         if callable(get_command) and get_command():
             loop_identity = self._loop_wake_command_identity(event)
             if loop_identity is not None:
@@ -1400,17 +1417,22 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             if loop_fence is None:
                 return True
             sid, tick, run_generation, _control_generation = loop_fence
-            if not await self._loop_wake_execution_current(
+            current_control_generation = await self._loop_wake_execution_current(
                 sid, tick, source, run_generation=run_generation,
-            ):
+            )
+            if current_control_generation is None:
                 return False
-            from hermes_cli.loops import loop_control_generation
-            loop_fence = (sid, tick, run_generation, loop_control_generation(sid))
+            loop_fence = (sid, tick, run_generation, current_control_generation)
             return True
 
-        _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
+        if not await _loop_command_current():
+            return True, None
+        _handled, _result, command, canonical = await self._hm_resolve_command(
+            event, source, _quick_key, loop_fence=loop_fence,
+        )
+        if canonical in {"learn", "plan"} and event.text != original_command_text:
+            return False, None
         if not _handled:
-            # Command hooks are asynchronous and may reset, stop, or replace the loop. Recheck
             # after resolution and immediately before entering an effectful handler.
             if not await _loop_command_current():
                 return True, None

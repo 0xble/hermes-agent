@@ -338,8 +338,12 @@ class LoopState:
     # double-firing mid-turn and tells the post-turn hook the turn that just ended was ours.
     awaiting_response: bool = False
     # Empty on legacy claims: execution may already have happened. New gateway
-    # claims are marked before admission, and executing is persisted before model work.
-    claim_phase: str = ""  # claimed | executing | empty (legacy/unknown)
+    # claims are marked before admission, executing is persisted before model work, and started is
+    # the durable linearization marker immediately before an external effect is invoked.
+    claim_phase: str = ""  # claimed | executing | started | empty (legacy/unknown)
+    # Gateway session run generation captured by the execution CAS. This is a JSON state field,
+    # not a database schema column, so independent processes compare the same durable row.
+    run_generation: int = 0
     # Definition version the in-flight tick fired with; completion judges against it, so a revise
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
@@ -1003,22 +1007,131 @@ class LoopManager(LoopRevisionsMixin):
 
         return self._save_tick_outcome(fired, settle, expected_phase="claimed", owns_turn=owns_turn)
 
-    def start_tick(self, tick: Tuple[Any, Any]) -> bool:
-        """Durably fence execution to the exact admitted loop instance/tick.
+    def start_tick(self, tick: Tuple[Any, Any], run_generation: Optional[int] = None) -> bool:
+        """Durably promote the exact admitted tick to ``executing``.
 
-        Idempotent for that exact tick: a /loop command wake is fenced before its handler runs,
-        and a prompt rewrite falling through to the model passes the model-turn fence again."""
+        ``run_generation`` is stored on the loop row in the same transaction. The later effect-start
+        CAS compares it with the caller's token, so a different session run cannot borrow this tick.
+        """
         s = self._state
         if s is None or (s.created_at, s.ticks_fired) != tick:
             return False
-        if s.claim_phase == "executing":
-            return self._save_tick_outcome(s.ticks_fired, lambda state: None, expected_phase="executing")
-        if s.claim_phase != "claimed":
+        expected_run_generation = int(run_generation or 0)
+        db = _get_session_db() if self._cursor is None else None
+        if db is None:
+            if s.claim_phase == "started":
+                return int(getattr(s, "run_generation", 0) or 0) == expected_run_generation
+            if s.claim_phase == "executing":
+                return int(getattr(s, "run_generation", 0) or 0) in {0, expected_run_generation}
+            if s.claim_phase != "claimed":
+                return False
+            s.claim_phase = "executing"
+            s.run_generation = expected_run_generation
+            if self._cursor is None:
+                save_loop(self.session_id, s, tick_lifecycle=True)
+            else:
+                save_loop(self.session_id, s, cursor=self._cursor, tick_lifecycle=True)
+            self._mark_synced()
+            return True
+
+        def write(conn) -> Optional[LoopState]:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
+            ).fetchone()
+            stored = _parse_state(row[0]) if row and row[0] else None
+            if (
+                stored is None or stored.status != "active" or not stored.awaiting_response
+                or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+                or stored.control_generation != s.control_generation
+            ):
+                return None
+            if stored.claim_phase == "started":
+                if int(getattr(stored, "run_generation", 0) or 0) == 0:
+                    stored.run_generation = expected_run_generation
+                    save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
+                    return stored
+                return stored
+            if stored.claim_phase == "executing":
+                if int(getattr(stored, "run_generation", 0) or 0) not in {0, expected_run_generation}:
+                    return None
+                if getattr(stored, "run_generation", 0) == 0:
+                    stored.run_generation = expected_run_generation
+                    save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
+                return stored
+            if stored.claim_phase != "claimed":
+                return None
+            stored.claim_phase = "executing"
+            stored.run_generation = expected_run_generation
+            save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
+            return stored
+
+        try:
+            started = db._execute_write(write)
+        except Exception as exc:
+            logger.debug("LoopManager: start tick write failed: %s", exc)
             return False
-        return self._save_tick_outcome(
-            s.ticks_fired, lambda state: setattr(state, "claim_phase", "executing"),
-            expected_phase="claimed",
-        )
+        if started is None:
+            self.refresh()
+            return False
+        self._state = started
+        self._mark_synced()
+        return True
+
+    def _start_effect_cas(self, tick: Tuple[Any, Any], *, control_generation: int,
+                          run_generation: int) -> bool:
+        """Linearize one loop-wake effect with a durable stored-row compare-and-set.
+
+        The successful transaction is the only point at which the effect counts as started. It
+        requires the exact tick, active/awaiting state, ``executing`` phase, stored control fence,
+        and stored session run generation. ``started`` is idempotent for later producers in the same
+        dispatch chain (for example an observer hook followed by its command handler); a changed
+        control generation makes those later calls fail. Callers invoke the external effect with no
+        await after this method returns True.
+        """
+        s = self._state
+        if s is None or (s.created_at, s.ticks_fired) != tick:
+            return False
+        expected_control = int(control_generation)
+        expected_run = int(run_generation)
+        db = _get_session_db() if self._cursor is None else None
+        if db is None:
+            return False
+
+        def write(conn) -> Optional[LoopState]:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
+            ).fetchone()
+            stored = _parse_state(row[0]) if row and row[0] else None
+            if (
+                stored is None or stored.status != "active" or not stored.awaiting_response
+                or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+                or stored.control_generation != expected_control
+                or (
+                    int(getattr(stored, "run_generation", 0) or 0) not in {0, expected_run}
+                )
+            ):
+                return None
+            if stored.claim_phase == "started":
+                return stored
+            if stored.claim_phase != "executing":
+                return None
+            stored.claim_phase = "started"
+            if int(getattr(stored, "run_generation", 0) or 0) == 0:
+                stored.run_generation = expected_run
+            save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
+            return stored
+
+        try:
+            started = db._execute_write(write)
+        except Exception as exc:
+            logger.debug("LoopManager: effect-start CAS failed: %s", exc)
+            return False
+        if started is None:
+            self.refresh()
+            return False
+        self._state = started
+        self._mark_synced()
+        return True
 
     def recover_tick(self, *, owns_turn=None) -> str:
         """Reconcile an ownerless claim without assuming external effects are replayable.

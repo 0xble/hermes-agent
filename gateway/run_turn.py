@@ -2535,17 +2535,16 @@ class GatewayTurnMixin:
                     return
                 from hermes_cli.loops import LoopManager
                 def _start_owned_loop_tick():
-                    return LoopManager(_run_start_session_id).start_tick(_loop_tick)
+                    return LoopManager(_run_start_session_id).start_tick(_loop_tick, run_generation)
                 if not await self._run_in_executor_with_context(_start_owned_loop_tick):
                     return
-                if not await self._loop_wake_execution_current(
+                _control_generation = await self._loop_wake_execution_current(
                     _run_start_session_id, _loop_tick, source, run_generation=run_generation,
-                ):
+                )
+                if _control_generation is None:
                     return
-                from hermes_cli.loops import loop_control_generation
                 event._gateway_loop_execution_fence = (
-                    _run_start_session_id, _loop_tick, run_generation,
-                    loop_control_generation(_run_start_session_id),
+                    _run_start_session_id, _loop_tick, run_generation, _control_generation,
                 )
                 event._gateway_loop_tick = _loop_tick
             _turn_started_monotonic = time.monotonic()
