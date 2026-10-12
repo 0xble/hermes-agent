@@ -89,6 +89,16 @@ def test_marker_op_withdraw(tmp_path: Path, sleeper: subprocess.Popen) -> None:
 
 # -- release / heartbeat (production functions in a real PowerShell process) ---
 
+def test_process_creation_prefers_a_direct_handle_before_cim_fallback() -> None:
+    """Hosted Windows can stall CIM/WMI for tens of seconds; the marker lock must
+    use the direct process handle for ordinary same-user children and reserve CIM
+    for access-denied system processes."""
+    source = MARKER_PS1.read_text(encoding='utf-8-sig')
+    direct = source.index('[Diagnostics.Process]::GetProcessById')
+    cim = source.index('Get-CimInstance -ClassName Win32_Process')
+    assert direct < cim, 'marker creation-time lookup regressed to CIM before the fast path'
+
+
 HARNESS = r"""
 param([string]$MarkerPs1, [string]$Marker, [string]$Body, [string]$Action, [string]$InstallRoot = '', [int]$Heartbeat = 300,
       [string]$StaleCt = '')

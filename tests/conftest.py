@@ -1264,9 +1264,16 @@ def pytest_runtest_call(item):
     ``_pytest/capture.py::snap``). The teardown join in
     ``_close_leaked_session_dbs`` runs after that snap, too late for this race.
     """
+    _diag_faulthandler = None
+    if os.environ.get("HERMES_WINDOWS_PROTOCOL_DIAGNOSTICS") == "1":
+        import faulthandler
+        faulthandler.dump_traceback_later(30, repeat=True)
+        _diag_faulthandler = faulthandler
     try:
         return (yield)
     finally:
+        if _diag_faulthandler is not None:
+            _diag_faulthandler.cancel_dump_traceback_later()
         wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
         if wait is not None:
             wait()

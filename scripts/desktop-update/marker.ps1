@@ -50,10 +50,17 @@ function Format-Ct([double]$Ct) { return $Ct.ToString('F3', [Globalization.Cultu
 function Get-UnixNow { return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 
 function Get-ProcessCreationCt([int]$ProcessId) {
-    # Win32_Process needs only limited query rights, so it reads SYSTEM,
-    # elevated and other-user processes; Get-Process .StartTime is access
-    # denied for those under Windows PowerShell 5.1.
+    # A same-user process handle is the fast path. CIM/WMI can take tens of
+    # seconds on a busy hosted runner; never make the marker lock wait on it
+    # when the normal process query already has the exact incarnation time.
     if ($ProcessId -eq $PID) { return ConvertTo-UnixCt ([Diagnostics.Process]::GetCurrentProcess().StartTime) }
+    try {
+        $process = [Diagnostics.Process]::GetProcessById($ProcessId)
+        try { return ConvertTo-UnixCt $process.StartTime } finally { $process.Dispose() }
+    } catch {}
+    # Win32_Process needs only limited query rights, so it reads SYSTEM,
+    # elevated and other-user processes; Get-Process .StartTime can be denied
+    # for those under Windows PowerShell 5.1.
     try {
         $row = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
         if ($row -and $row.CreationDate) { return ConvertTo-UnixCt $row.CreationDate }
