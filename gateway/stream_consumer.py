@@ -212,6 +212,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # ``_stream_ledger`` mirrors ``_accumulated`` but is NOT truncated when
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
+        # The marker-check offset indexes _accumulated, so it must reset with the buffer. A stale
+        # offset after a clarify/approval boundary would slice past the new text and let a bare
+        # silence marker stream out as a native frame.
+        self._segment_start = 0
         self._last_sent_text = ""    # skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
