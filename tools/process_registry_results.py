@@ -153,18 +153,19 @@ def save_cut_pending_result(
         from hermes_constants import assert_named_profile_home_live
         assert_named_profile_home_live(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Snapshot before taking the result lock: the two locks are never nested.
+        with session._lock:
+            record = {key: getattr(session, key) for key in _RESULT_FIELDS}
+            record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:] if include_output else ""
+        record["completion_reason"] = "cut_pending"
+        record["termination_source"] = source
+        record[_CUT_RECEIPT_FIELD] = True
+        record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
+        record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
         with _RESULT_WRITE_LOCK:
             existing = _read_existing_record(path)
             if existing and existing.get("completion_reason") not in _CUT_COMPLETION_REASONS:
                 return
-            with session._lock:
-                record = {key: getattr(session, key) for key in _RESULT_FIELDS}
-                record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:] if include_output else ""
-            record["completion_reason"] = "cut_pending"
-            record["termination_source"] = source
-            record[_CUT_RECEIPT_FIELD] = True
-            record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
-            record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
             atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:
                 _result_paths()

@@ -156,6 +156,44 @@ def test_bounded_sweep_final_receipt_keeps_cut_retention(registry, tmp_path, mon
         proc.wait(timeout=5)
 
 
+def test_cut_pending_write_never_nests_session_lock_inside_result_lock(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    session = _make_session(sid="proc_lock_order")
+    held = []
+
+    def _result_lock_held_elsewhere() -> bool:
+        # Probe from another thread: an RLock re-acquires for its owner, so only a
+        # foreign acquire observes that this thread already holds it.
+        got = []
+
+        def _try():
+            acquired = receipts._RESULT_WRITE_LOCK.acquire(timeout=0.2)
+            got.append(acquired)
+            if acquired:
+                receipts._RESULT_WRITE_LOCK.release()  # an RLock is released by its owner thread
+
+        probe = threading.Thread(target=_try)
+        probe.start()
+        probe.join()
+        return not got[0]
+
+    class _SessionLockProbe:
+        def __enter__(self):
+            held.append(_result_lock_held_elsewhere())
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    session._lock = _SessionLockProbe()  # type: ignore[assignment]
+    receipts.save_cut_pending_result(session, "gateway_shutdown", prune=False)
+
+    assert held == [False]
+
+
 def test_bounded_kill_all_skips_cut_receipts_past_deadline(registry, monkeypatch):
     session = _make_session(sid="proc_bounded_late")
     session.process = MagicMock(pid=12346)
