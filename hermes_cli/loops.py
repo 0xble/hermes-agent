@@ -1022,7 +1022,7 @@ class LoopManager(LoopRevisionsMixin):
             if s.claim_phase == "started":
                 return int(getattr(s, "run_generation", 0) or 0) == expected_run_generation
             if s.claim_phase == "executing":
-                return int(getattr(s, "run_generation", 0) or 0) in {0, expected_run_generation}
+                return int(getattr(s, "run_generation", 0) or 0) == expected_run_generation
             if s.claim_phase != "claimed":
                 return False
             s.claim_phase = "executing"
@@ -1045,18 +1045,9 @@ class LoopManager(LoopRevisionsMixin):
                 or stored.control_generation != s.control_generation
             ):
                 return None
-            if stored.claim_phase == "started":
-                if int(getattr(stored, "run_generation", 0) or 0) == 0:
-                    stored.run_generation = expected_run_generation
-                    save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
-                    return stored
-                return stored
-            if stored.claim_phase == "executing":
-                if int(getattr(stored, "run_generation", 0) or 0) not in {0, expected_run_generation}:
+            if stored.claim_phase in {"executing", "started"}:
+                if int(getattr(stored, "run_generation", 0) or 0) != expected_run_generation:
                     return None
-                if getattr(stored, "run_generation", 0) == 0:
-                    stored.run_generation = expected_run_generation
-                    save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
                 return stored
             if stored.claim_phase != "claimed":
                 return None
@@ -1077,22 +1068,25 @@ class LoopManager(LoopRevisionsMixin):
         self._mark_synced()
         return True
 
-    def _start_effect_cas(self, tick: Tuple[Any, Any], *, control_generation: int,
-                          run_generation: int) -> bool:
-        """Linearize one loop-wake effect with a durable stored-row compare-and-set.
+    def rebind_tick_run_generation(
+        self, tick: Tuple[Any, Any], *, control_generation: int,
+        from_run_generation: int, to_run_generation: int,
+    ) -> bool:
+        """Atomically hand an unstarted command fallthrough to the next model run.
 
-        The successful transaction is the only point at which the effect counts as started. It
-        requires the exact tick, active/awaiting state, ``executing`` phase, stored control fence,
-        and stored session run generation. ``started`` is idempotent for later producers in the same
-        dispatch chain (for example an observer hook followed by its command handler); a changed
-        control generation makes those later calls fail. Callers invoke the external effect with no
-        await after this method returns True.
+        A command dispatch may promote a wake to ``executing`` under generation ``G`` before
+        discovering that it rewrites the prompt for the model. This CAS transfers that exact,
+        still-unstarted tick to ``G+1``; it never accepts a started effect or a changed control
+        fence. The subsequent effect-start CAS remains the only external-effect linearization point.
         """
         s = self._state
         if s is None or (s.created_at, s.ticks_fired) != tick:
             return False
         expected_control = int(control_generation)
-        expected_run = int(run_generation)
+        expected_from = int(from_run_generation)
+        expected_to = int(to_run_generation)
+        if expected_to != expected_from + 1:
+            return False
         db = _get_session_db() if self._cursor is None else None
         if db is None:
             return False
@@ -1106,9 +1100,57 @@ class LoopManager(LoopRevisionsMixin):
                 stored is None or stored.status != "active" or not stored.awaiting_response
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
                 or stored.control_generation != expected_control
-                or (
-                    int(getattr(stored, "run_generation", 0) or 0) not in {0, expected_run}
-                )
+                or stored.claim_phase != "executing"
+                or int(getattr(stored, "run_generation", 0) or 0) not in {0, expected_from}
+            ):
+                return None
+            stored.run_generation = expected_to
+            save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
+            return stored
+
+        try:
+            rebound = db._execute_write(write)
+        except Exception as exc:
+            logger.debug("LoopManager: run-generation handoff failed: %s", exc)
+            return False
+        if rebound is None:
+            self.refresh()
+            return False
+        self._state = rebound
+        self._mark_synced()
+        return True
+
+    def _start_effect_cas(self, tick: Tuple[Any, Any], *, control_generation: int,
+                          run_generation: int) -> bool:
+        """Linearize one loop-wake effect with a durable stored-row compare-and-set.
+
+        The successful transaction is the only point at which the effect counts as started. It
+        requires the exact tick, active/awaiting state, ``executing`` phase, stored control fence,
+        and stored session run generation. ``started`` is idempotent for later producers in the same
+        dispatch chain (for example an observer hook followed by its command handler); a changed
+        control generation makes those later calls fail. Gateway async producers run the transaction
+        off-loop and make a final local supersede check after its return; worker-owned synchronous
+        producers invoke their handler immediately. A committed start is never refunded or replayed.
+        """
+        s = self._state
+        if s is None or (s.created_at, s.ticks_fired) != tick:
+            return False
+        expected_control = int(control_generation)
+        expected_run = int(run_generation)
+        db = _get_session_db() if self._cursor is None else None
+        if db is None:
+            return False  # gateway entry must never fall back to a process-local-only fence
+
+        def write(conn) -> Optional[LoopState]:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
+            ).fetchone()
+            stored = _parse_state(row[0]) if row and row[0] else None
+            if (
+                stored is None or stored.status != "active" or not stored.awaiting_response
+                or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+                or stored.control_generation != expected_control
+                or int(getattr(stored, "run_generation", 0) or 0) != expected_run
             ):
                 return None
             if stored.claim_phase == "started":
@@ -1116,8 +1158,6 @@ class LoopManager(LoopRevisionsMixin):
             if stored.claim_phase != "executing":
                 return None
             stored.claim_phase = "started"
-            if int(getattr(stored, "run_generation", 0) or 0) == 0:
-                stored.run_generation = expected_run
             save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
             return stored
 

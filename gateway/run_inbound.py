@@ -910,16 +910,30 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
                 return []
 
-        if loop_fence is not None and callable(getattr(self.hooks, "emit_collect", None)):
-            _started, hook_results = await self._invoke_loop_wake_effect(
-                event, loop_fence, _dispatch_hooks,
-            )
-            if not _started:
-                # A superseded loop wake is consumed; never accept a hook result from the old tick.
-                return True, None, None
-        elif loop_fence is not None:
-            # Test doubles and legacy hosts without command-hook support have no hook effect producer.
-            hook_results = []
+        if loop_fence is not None:
+            def _has_hook_producer():
+                from hermes_cli.plugins import has_hook
+                if has_hook("pre_command"):
+                    return True
+                registry = self.hooks
+                active = getattr(registry, "_active", None)
+                if callable(active):
+                    registry = active()
+                resolve = getattr(registry, "_resolve_handlers", None)
+                if callable(resolve):
+                    return bool(resolve(f"command:{canonical}"))
+                # Unknown hook hosts with a dispatcher are effectful until proven otherwise.
+                return callable(getattr(registry, "emit_collect", None))
+
+            if await self._run_in_executor_with_context(_has_hook_producer):
+                _started, hook_results = await self._invoke_loop_wake_effect(
+                    event, loop_fence, _dispatch_hooks,
+                )
+                if not _started:
+                    return True, None, None
+            else:
+                # An empty registry is not an observer effect and must leave the tick transferable.
+                hook_results = []
         else:
             hook_results = await _dispatch_hooks()
 
@@ -1013,7 +1027,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     async def _hm_rewrite_turn_to_prompt(self, event, source, name: str, ack: str, build) -> Tuple[bool, Optional[str]]:
         """Ack, then rewrite the turn to ``build()`` and fall through to the agent (keeps role
         alternation; works on any backend). A failing builder replies with a retry hint."""
-        await self._send_command_ack(source, ack, name)
+        if self._loop_wake_command_identity(event) is None:
+            await self._send_command_ack(source, ack, name)
         try:
             event.text = await asyncio.to_thread(build)
         except Exception:
@@ -1159,6 +1174,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 return True, result
         if canonical in self._HM_CANONICAL_COMMANDS:
             handler = getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")
+            if loop_fence is not None and canonical in {"learn", "plan"}:
+                # These handlers only build a model prompt for a wake: no transport ack, plugin,
+                # or user-visible effect starts here. An observer hook, if present, owns its CAS.
+                if not self._loop_wake_execution_fence_sync(event, loop_fence):
+                    return True, None
+                return await handler(event, source, _quick_key)
             started, result = await self._invoke_loop_wake_effect(
                 event, loop_fence, handler, event, source, _quick_key,
             )
@@ -1430,8 +1451,23 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _handled, _result, command, canonical = await self._hm_resolve_command(
             event, source, _quick_key, loop_fence=loop_fence,
         )
-        if canonical in {"learn", "plan"} and event.text != original_command_text:
+        async def _loop_command_fallthrough():
+            if loop_fence is not None:
+                if not await _loop_command_current():
+                    return True, None
+                sid, tick, run_generation, control_generation = loop_fence
+                if control_generation is None:
+                    return True, None
+                event.metadata["gateway_loop_run_handoff"] = {
+                    "session_id": sid,
+                    "tick": list(tick),
+                    "run_generation": int(run_generation),
+                    "control_generation": int(control_generation),
+                }
             return False, None
+
+        if canonical in {"learn", "plan"} and event.text != original_command_text:
+            return await _loop_command_fallthrough()
         if not _handled:
             # after resolution and immediately before entering an effectful handler.
             if not await _loop_command_current():
@@ -1453,6 +1489,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _result = await self._run_in_executor_with_context(
                 self._hm_skill_slash_rewrite, event, source, _quick_key, command)
             _handled = _result is not None
+        if not _handled:
+            return await _loop_command_fallthrough()
         if _handled:
             # A slash prefix is not completion: prompt/skill/plugin rewrites fall through
             # to the model and its own exact-identity loop lifecycle hooks.
@@ -1598,9 +1636,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        _run_generation = self._current_session_run_generation(_quick_key)
 
         try:
+            _run_generation, _run_generation_ready = await self._begin_model_run_generation_for_event(
+                event, _quick_key,
+            )
+            if not _run_generation_ready:
+                return None
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)

@@ -62,7 +62,7 @@ def create_loop(entry, source):
 
 
 async def scan(runner, sid):
-    state = loops.load_loop(sid)
+    state = await asyncio.to_thread(loops.load_loop, sid)
     await runner._loop_wakeup_fire_one(sid, state, time.time() + 86400, set())
 
 
@@ -282,8 +282,18 @@ async def test_due_loop_cannot_answer_live_human_clarification(control_home):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prompt", ["/learn reusable checking", "/plan disposable work", "/start"])
-async def test_native_loop_command_settles_only_after_its_dispatch_path(control_home, prompt):
+@pytest.mark.parametrize("observer", [False, True])
+async def test_native_loop_command_settles_only_after_its_dispatch_path(control_home, prompt, observer):
+    from gateway.hooks import HookRegistry
+
     runner, adapter, source, entry = native_runner(control_home)
+    runner.hooks = HookRegistry()  # exercise an actual empty registry, not a missing dispatcher
+    observer_runs = []
+    if observer:
+        async def observe(_name, _context):
+            saved = await asyncio.to_thread(loops.load_loop, entry.session_id)
+            observer_runs.append((saved.claim_phase, saved.run_generation))
+        runner.hooks._handlers["command:*"] = [observe]
     mgr = loops.LoopManager(entry.session_id)
     mgr.set(prompt, interval_seconds=60, times=2, route={
         "platform": "telegram", "chat_id": source.chat_id,
@@ -306,7 +316,11 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
         handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
         if handled:
             return result
-        generation = runner._begin_session_run_generation(entry.session_key)
+        generation, ready = await runner._begin_model_run_generation_for_event(
+            event, entry.session_key,
+        )
+        if not ready:
+            return None
         try:
             return await runner._handle_message_with_agent(event, source, entry.session_key, generation)
         finally:
@@ -324,6 +338,10 @@ async def test_native_loop_command_settles_only_after_its_dispatch_path(control_
         hermes_loop_guard.set_loop_thread(None)
     try:
         assert executions == ([] if prompt == "/start" else [(True, "started", 1)])
+        assert observer_runs == ([("started", 0)] if observer else [])
+        if prompt != "/start":
+            assert runner._current_session_run_generation(entry.session_key) == (0 if observer else 1)
+            runner._send_command_ack.assert_not_awaited()  # synthetic prompt builds have no ack effect
         saved = loops.load_loop(entry.session_id)
         assert not saved.awaiting_response and saved.ticks_fired == 1
         assert saved.status == "active"  # cancellation/silent command schedules the next tick
@@ -437,6 +455,7 @@ async def test_model_loop_fence_rechecks_reset_after_start_tick(control_home, bo
 _LOOP_NON_CONTROL_API = frozenset({
     "state", "refresh", "is_active", "has_loop", "status_line", "is_due",
     "fire_tick", "complete_tick", "abandon_tick", "start_tick", "recover_tick",
+    "rebind_tick_run_generation",
 })
 _REPLACE_REQUEST = "please replace the loop with replacement work now"
 
@@ -665,7 +684,9 @@ def loop_command_dispatch(runner, source, entry):
         handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
         if handled:
             return result
-        generation = runner._begin_session_run_generation(entry.session_key)
+        generation, ready = await runner._begin_model_run_generation_for_event(event, entry.session_key)
+        if not ready:
+            return None
         try:
             return await runner._handle_message_with_agent(event, source, entry.session_key, generation)
         finally:
@@ -872,3 +893,203 @@ def test_shared_loop_effect_entry_has_no_preparation_after_final_fence():
             assert awaits[0].value.func.id == "handler"
         else:
             assert not awaits
+
+
+
+
+@pytest.mark.asyncio
+async def test_native_loop_command_hook_supersede_after_effect_cas(control_home):
+    from gateway.hooks import HookRegistry
+
+    runner, adapter, source, entry = native_runner(control_home)
+    loops.LoopManager(entry.session_id).set(
+        "/learn reusable checking", interval_seconds=60, times=2, route=_route(source),
+    )
+    runner.hooks = HookRegistry()
+    hook_effect = AsyncMock()
+    runner.hooks._handlers["command:*"] = [hook_effect]
+    runner._run_agent = AsyncMock()
+    runner._send_command_ack = AsyncMock()
+    original_executor = runner._run_in_executor_with_context
+    superseded = False
+
+    async def executor(func, *args, **kwargs):
+        nonlocal superseded
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "_start_loop_effect" and not superseded:
+            assert result is True
+            started = await asyncio.to_thread(loops.load_loop, entry.session_id)
+            assert started.claim_phase == "started"
+            superseded = True
+            await _session_reset(runner, source, entry.session_id)
+        return result
+
+    runner._run_in_executor_with_context = executor
+    adapter.set_message_handler(loop_command_dispatch(runner, source, entry))
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    try:
+        assert superseded, "test did not reach the durable effect CAS return gap"
+        hook_effect.assert_not_awaited()
+        runner._run_agent.assert_not_awaited()
+        assert loops.load_loop(entry.session_id).status == "cleared"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["/learn reusable checking", "/plan disposable work"])
+async def test_native_loop_command_reset_between_fallthrough_and_model_entry(control_home, prompt):
+    runner, adapter, source, entry = native_runner(control_home)
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set(prompt, interval_seconds=60, times=2, route=_route(source))
+    runner._send_command_ack = AsyncMock()
+    runner._run_agent = AsyncMock()
+    original_dispatch = runner._hm_dispatch_idle_commands
+    handoffs = []
+
+    async def dispatch_then_reset(event, source, key):
+        handled, result = await original_dispatch(event, source, key)
+        if not handled:
+            handoffs.append(dict(event.metadata["gateway_loop_run_handoff"]))
+            saved = await asyncio.to_thread(loops.load_loop, entry.session_id)
+            assert saved.claim_phase == "executing" and saved.run_generation == 0
+            await _session_reset(runner, source, entry.session_id)  # the real public /new path
+        return handled, result
+
+    runner._hm_dispatch_idle_commands = dispatch_then_reset
+    adapter.set_message_handler(loop_command_dispatch(runner, source, entry))
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    try:
+        assert len(handoffs) == 1, "test did not reach the command-to-model handoff"
+        runner._run_agent.assert_not_awaited()
+        # /new bumps G to G+1; the stale wake must not bump it AGAIN and resurrect its ownership.
+        assert runner._current_session_run_generation(entry.session_key) == 1
+        assert runner.session_store.peek_session_id(entry.session_key) != entry.session_id
+        assert loops.load_loop(entry.session_id).status == "cleared"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+def test_loop_tick_explicit_handoff_does_not_loosen_effect_generation(control_home):
+    runner, _adapter, source, entry = native_runner(control_home)
+    mgr = create_loop(entry, source)
+    assert mgr.fire_tick()
+    tick = (mgr.state.created_at, mgr.state.ticks_fired)
+    assert mgr.start_tick(tick, 0)
+    control = mgr.state.control_generation
+    try:
+        # Zero is an actual command generation, not a wildcard at effect entry or start_tick.
+        assert not mgr.start_tick(tick, 1)
+        assert not mgr._start_effect_cas(tick, control_generation=control, run_generation=1)
+        assert not mgr.rebind_tick_run_generation(
+            tick, control_generation=control, from_run_generation=0, to_run_generation=2,
+        )
+        assert mgr.rebind_tick_run_generation(
+            tick, control_generation=control, from_run_generation=0, to_run_generation=1,
+        )
+        saved = loops.load_loop(entry.session_id)
+        assert (saved.claim_phase, saved.run_generation) == ("executing", 1)
+        assert not mgr._start_effect_cas(tick, control_generation=control, run_generation=0)
+        assert mgr._start_effect_cas(tick, control_generation=control, run_generation=1)
+        assert not mgr.start_tick(tick, 2)
+        assert not mgr.rebind_tick_run_generation(
+            tick, control_generation=control, from_run_generation=1, to_run_generation=2,
+        )
+        assert not mgr._start_effect_cas(tick, control_generation=control, run_generation=2)
+        saved = loops.load_loop(entry.session_id)
+        assert (saved.claim_phase, saved.run_generation) == ("started", 1)
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer", ["model", "quick_command", "command_hook"])
+@pytest.mark.parametrize("supersede", ["pause_resume", "generation"])
+async def test_loop_effect_cas_rejects_cross_process_control_without_local_cache_update(
+    control_home, producer, supersede,
+):
+    import os
+    import subprocess
+    import sys
+    from gateway.hooks import HookRegistry
+
+    runner, adapter, source, entry = native_runner(control_home)
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(
+        runner._PreparedTurn([], "", "old work", "old work", None, None), {},
+    ))
+    effects = []
+
+    async def effect(*args, **kwargs):
+        effects.append(producer)
+        return "LOOP_COMPLETE"
+
+    if producer == "model":
+        create_loop(entry, source)
+        runner._run_agent = effect
+        generation = runner._begin_session_run_generation(entry.session_key)
+        adapter.set_message_handler(
+            lambda event: runner._handle_message_with_agent(event, source, entry.session_key, generation)
+        )
+    else:
+        runner.hooks = HookRegistry()
+        if producer == "quick_command":
+            prompt = "/effect"
+            runner.config.quick_commands = {"effect": {"type": "exec", "command": "echo effect"}}
+            runner._hm_run_exec_quick_command = effect
+        else:
+            prompt = "/start"
+            runner.hooks._handlers["command:*"] = [effect]
+        loops.LoopManager(entry.session_id).set(prompt, interval_seconds=60, times=2, route=_route(source))
+        adapter.set_message_handler(loop_command_dispatch(runner, source, entry))
+
+    original_executor = runner._run_in_executor_with_context
+    controlled = False
+
+    async def executor(func, *args, **kwargs):
+        nonlocal controlled
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "_exact_executing_tick" and not controlled:
+            controlled = True
+            local_control = loops.loop_control_generation(entry.session_id)
+            if supersede == "pause_resume":
+                code = (
+                    "import sys; from hermes_cli.loops import LoopManager; "
+                    "LoopManager(sys.argv[1]).pause(); LoopManager(sys.argv[1]).resume()"
+                )
+            else:
+                code = (
+                    "import sys; from hermes_cli.loops import LoopManager, save_loop; "
+                    "mgr = LoopManager(sys.argv[1]); mgr.state.run_generation += 1; "
+                    "save_loop(sys.argv[1], mgr.state, tick_lifecycle=True)"
+                )
+            child = await asyncio.to_thread(
+                subprocess.run, [sys.executable, "-c", code, entry.session_id],
+                env={**os.environ, "HERMES_HOME": str(control_home)},
+                capture_output=True, text=True, timeout=60,
+            )
+            assert child.returncode == 0, child.stderr
+            assert loops.loop_control_generation(entry.session_id) == local_control
+        return result
+
+    runner._run_in_executor_with_context = executor
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    try:
+        assert controlled, "test did not land the separate-process control before effect CAS"
+        assert effects == [], "the durable effect fence trusted a stale local cache"
+    finally:
+        runner.session_store.close_all_db_handles()

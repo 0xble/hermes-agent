@@ -838,7 +838,7 @@ class GatewayGoalsMixin:
                 and state.awaiting_response
                 and state.claim_phase in {"executing", "started"}
                 and (state.created_at, state.ticks_fired) == tick
-                and (run_generation is None or int(getattr(state, "run_generation", 0) or 0) in {0, int(run_generation)})
+                and (run_generation is None or int(getattr(state, "run_generation", 0) or 0) == int(run_generation))
             ):
                 return None
             return int(getattr(state, "control_generation", 0) or 0)
@@ -846,13 +846,11 @@ class GatewayGoalsMixin:
         return await self._run_in_executor_with_context(_exact_executing_tick)
 
     def _loop_wake_execution_fence_sync(self, event: Any, fence: Optional[tuple]) -> bool:
-        """Durable linearization point immediately before a loop-wake effect starts.
+        """Final local supersede check, with no yield before effect invocation.
 
-        The stored-row CAS checks the exact tick, active/awaiting state, executing-or-started phase,
-        stored control generation, and stored session run generation in one write transaction. A
-        successful CAS changes ``executing`` to ``started``; callers invoke the external effect with
-        no await between that return and the handler/model call. The process-local generation map is
-        not an authority.
+        The durable start CAS remains the cross-process authority. This local check additionally
+        prevents reset, stop, or loop controls in its executor-return gap; it never substitutes for
+        that transaction and performs no blocking SessionDB work on the gateway loop thread.
         """
         if fence is None:
             return self._loop_wake_command_identity(event) is None
@@ -864,28 +862,121 @@ class GatewayGoalsMixin:
             return False
         if self._loop_wake_command_identity(event) != (sid, tick):
             return False
-        from hermes_cli.loops import LoopManager
-        result = LoopManager(sid)._start_effect_cas(
-            tick, control_generation=int(control_generation), run_generation=int(run_generation or 0),
+        from hermes_cli.loops import loop_control_generation
+        return (
+            loop_control_generation(sid) == int(control_generation)
+            and self._is_session_run_current(
+                self._session_key_for_source(event.source), int(run_generation or 0),
+            )
         )
-        return result
 
     async def _invoke_loop_wake_effect(self, event: Any, fence: Optional[tuple], handler, *args, **kwargs):
-        """The sole async effect-entry step: no preparation or yield after the final fence.
+        """Commit the durable start off-loop, then fence and enter the effect without yielding.
 
-        Return ``(started, result)`` so a superseded command is consumed silently rather than
-        falling through into another handler or model work. Awaiting a native async handler starts
-        its body in this same event-loop step; future dispatch preparation belongs outside here.
+        SessionDB locks cannot be acquired on the gateway loop thread. The transaction is the
+        durable start linearization point: controls that precede it reject the CAS; controls after
+        it see a started tick (never refundable). The final local fence additionally drops a /new,
+        /stop, or loop control that wins the executor-return gap.
         """
+        if fence is not None:
+            sid, tick, run_generation, control_generation = fence
+            if control_generation is None:
+                return False, None
+            from hermes_cli.loops import LoopManager
+            def _start_loop_effect():
+                return LoopManager(sid)._start_effect_cas(
+                    tick, control_generation=int(control_generation), run_generation=int(run_generation or 0),
+                )
+            if not await self._run_in_executor_with_context(_start_loop_effect):
+                return False, None
         if not self._loop_wake_execution_fence_sync(event, fence):
             return False, None
         return True, await handler(*args, **kwargs)
 
     def _invoke_loop_wake_sync_effect(self, event: Any, fence: Optional[tuple], handler, *args):
-        """Executor twin: fence in the worker that actually invokes a synchronous plugin."""
+        """Commit and fence a synchronous plugin in the worker that actually invokes it."""
+        if not self._loop_wake_execution_fence_sync(event, fence):
+            return False, None
+        if fence is not None:
+            sid, tick, run_generation, control_generation = fence
+            if control_generation is None:
+                return False, None
+            from hermes_cli.loops import LoopManager
+            if not LoopManager(sid)._start_effect_cas(
+                tick, control_generation=int(control_generation), run_generation=int(run_generation or 0),
+            ):
+                return False, None
         if not self._loop_wake_execution_fence_sync(event, fence):
             return False, None
         return True, handler(*args)
+
+    async def _begin_model_run_generation_for_event(
+        self, event: Any, session_key: str,
+    ) -> tuple[int, bool]:
+        """Begin a model run, atomically transferring an unstarted loop-command fallthrough.
+
+        The command path records its generation on the event because the model run is claimed only
+        after command resolution. For a rewrite fallthrough, the current-generation check is kept
+        synchronous immediately before the local bump; the durable row CAS then makes the handoff
+        explicit and rejects reset/stop/control races.
+        """
+        metadata = getattr(event, "metadata", None) or {}
+        handoff = metadata.get("gateway_loop_run_handoff")
+        if "gateway_loop_run_handoff" not in metadata:
+            return self._begin_session_run_generation(session_key), True
+        if not isinstance(handoff, dict):
+            return self._current_session_run_generation(session_key), False
+        try:
+            sid = str(handoff["session_id"])
+            raw_tick = handoff["tick"]
+            if not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2:
+                raise ValueError("invalid loop handoff tick")
+            tick = (raw_tick[0], raw_tick[1])
+            expected_run = int(handoff["run_generation"])
+            control_generation = int(handoff["control_generation"])
+        except (KeyError, TypeError, ValueError):
+            return self._current_session_run_generation(session_key), False
+        if self._loop_wake_command_identity(event) != (sid, tick):
+            return self._current_session_run_generation(session_key), False
+        from hermes_cli.loops import LoopManager
+
+        def _owned_handoff_phase():
+            state = LoopManager(sid).state
+            if (
+                state is None or state.status != "active" or not state.awaiting_response
+                or (state.created_at, state.ticks_fired) != tick
+                or state.control_generation != control_generation
+                or int(state.run_generation or 0) not in {0, expected_run}
+                or state.claim_phase not in {"executing", "started"}
+                or (state.claim_phase == "started" and int(state.run_generation or 0) != expected_run)
+            ):
+                return None
+            return state.claim_phase
+
+        phase = await self._run_in_executor_with_context(_owned_handoff_phase)
+        # No await is permitted between this check and the generation bump: /new or /stop that
+        # already won the boundary must prevent this turn from acquiring a successor generation.
+        current_run = self._current_session_run_generation(session_key)
+        if current_run != expected_run or phase is None:
+            return current_run, False
+        if phase == "started":
+            # An actual observer effect already started this tick. Continue the same run; never
+            # transfer a started tick to a new generation or replay its already-started producers.
+            metadata.pop("gateway_loop_run_handoff", None)
+            return expected_run, True
+        generation = self._begin_session_run_generation(session_key)
+        if generation != expected_run + 1:
+            return generation, False
+        rebound = await self._run_in_executor_with_context(
+            lambda: LoopManager(sid).rebind_tick_run_generation(
+                tick, control_generation=control_generation,
+                from_run_generation=expected_run, to_run_generation=generation,
+            )
+        )
+        if not rebound:
+            return generation, False
+        metadata.pop("gateway_loop_run_handoff", None)
+        return generation, True
 
     async def _begin_command_loop_tick(self, event: Any, source: Any) -> bool:
         """Persist execution before a /loop wake's command handler can perform effects.
