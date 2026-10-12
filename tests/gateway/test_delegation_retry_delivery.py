@@ -1,4 +1,7 @@
-"""Gateway side of durable delegation retry: terminal lines bypass the parent model."""
+"""Gateway side of durable delegation retry.
+
+Routine terminal stops settle quietly. Only a completed result whose parent session is gone is sent
+directly to the user, bypassing the parent model."""
 
 import json
 from contextlib import nullcontext
@@ -31,6 +34,24 @@ def _failed_row(did, failure_reason):
                                                "failure_reason": failure_reason, "error": "refused"}]}), did))
 
 
+def _undeliverable_row(did, parent="parent-1"):
+    """A completed result whose durable completion delivery was permanently dropped."""
+    _failed_row(did, "unknown")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET state='completed', delivery_state='dropped', parent_session_id=?, "
+                     "result_json=?, event_json=? WHERE delegation_id=?",
+                     (parent, json.dumps({"status": "completed", "results": [
+                         {"task_index": 0, "status": "completed", "summary": "done"}]}),
+                      json.dumps({"status": "completed"}), did))
+    assert dr.schedule_retry(did, now=1_800_000_070.0) is None
+
+
+def _gone_runner():
+    runner = _runner()
+    runner._classify_completion_target = AsyncMock(return_value="terminal")
+    return runner
+
+
 def _runner():
     runner = object.__new__(GatewayRunner)
     runner._completion_event_scope = lambda _evt: nullcontext()
@@ -54,12 +75,12 @@ async def test_terminal_report_scrubs_worker_errors_before_egress(monkeypatch, s
     import gateway.run as gr
 
     token = "synthetic-worker-token-abcdefghijklmnopqrstuvwxyz0123456789"
-    _failed_row("deleg_secret_error", "unknown")
+    _undeliverable_row("deleg_secret_error")
     with ad._DB_LOCK, ad._transaction() as conn:
-        conn.execute("UPDATE async_delegations SET result_json=? WHERE delegation_id=?",
-                     (json.dumps({"error": f"Authorization: Bearer {token}"}), "deleg_secret_error"))
+        conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?",
+                     (json.dumps({"goal": f"make the model Authorization: Bearer {token}"}), "deleg_secret_error"))
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     if scrub_failure:
         def broken_scrub(_text):
             raise RuntimeError("scrub unavailable")
@@ -72,7 +93,6 @@ async def test_terminal_report_scrubs_worker_errors_before_egress(monkeypatch, s
         runner._deliver_platform_notice.assert_awaited_once()
         line = runner._deliver_platform_notice.await_args.args[1]
         assert token not in line
-        assert "Authorization:" not in line  # categories, never raw exception text
         assert "make the model" in line and "\n" not in line
 
 
@@ -83,19 +103,19 @@ def test_terminal_goal_scrub_precedes_truncation(monkeypatch):
     monkeypatch.setattr(redact, "redact_for_egress", scrub)
     token = "synthetic-goal-token-abcdefghijklmnopqrstuvwxyz0123456789"
     goal = "x" * 80 + f" Authorization: Bearer {token} finish the task"
-    line = dr.build_terminal_line({"task": {"goal": goal}, "retry_reason": "billing",
+    line = dr.build_terminal_line({"task": {"goal": goal}, "retry_reason": dr.RESULT_UNDELIVERABLE,
                                    "delegation_id": "deleg_secret_goal"})
     assert "synthetic-goal" not in line  # a partial token must not survive the 120-char cut
     scrub.assert_called_once_with(goal)
-    assert "billing" not in line  # a readable fixed category, not an internal reason code
+    assert dr.RESULT_UNDELIVERABLE not in line  # fixed wording, not an internal reason code
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("auth_error", [False, True])
 async def test_revoked_terminal_target_is_settled_without_send(caplog, auth_error):
-    _failed_row("deleg_revoked", "billing")
+    _undeliverable_row("deleg_revoked")
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     runner._is_user_authorized_for_source = Mock(
         side_effect=RuntimeError("policy unavailable") if auth_error else None, return_value=False)
     await runner._deliver_delegation_retry_action(action)
@@ -113,9 +133,9 @@ async def test_revoked_terminal_target_is_settled_without_send(caplog, auth_erro
 
 @pytest.mark.asyncio
 async def test_disconnected_terminal_transport_remains_owed():
-    _failed_row("deleg_disconnected", "billing")
+    _undeliverable_row("deleg_disconnected")
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     runner._resolve_injection_adapter.return_value = None
     await runner._deliver_delegation_retry_action(action)
     runner._deliver_platform_notice.assert_not_awaited()
@@ -130,9 +150,9 @@ async def test_terminal_send_requires_real_adapter_receipt(receipt):
     from gateway.config import Platform
     from gateway.platforms.base import SendResult
 
-    _failed_row("deleg_adapter_receipt", "billing")
+    _undeliverable_row("deleg_adapter_receipt")
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="1", user_id="u")
     adapter = SimpleNamespace(config=None, send=AsyncMock(return_value={
         "failed": SendResult(success=False, error="chat offline"),
@@ -149,9 +169,9 @@ async def test_terminal_send_requires_real_adapter_receipt(receipt):
 
 @pytest.mark.asyncio
 async def test_skipped_terminal_send_remains_pending():
-    _failed_row("deleg_skipped_receipt", "billing")
+    _undeliverable_row("deleg_skipped_receipt")
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     runner._deliver_platform_notice = AsyncMock(return_value=False)
     await runner._deliver_delegation_retry_action(action)
     assert dr.retry_status("deleg_skipped_receipt")["retry_state"] == "terminal"
@@ -161,8 +181,8 @@ async def test_skipped_terminal_send_remains_pending():
 async def test_repeated_failed_reports_remain_owed_until_success(monkeypatch):
     clock = [1_800_000_100.0]
     monkeypatch.setattr(dr.time, "time", lambda: clock[0])
-    _failed_row("deleg_repeated_send", "billing")
-    runner = _runner()
+    _undeliverable_row("deleg_repeated_send")
+    runner = _gone_runner()
     runner._deliver_platform_notice = AsyncMock(return_value=False)
     for _ in range(12):
         (action,) = dr.sweep_retries(now=clock[0])
@@ -177,16 +197,143 @@ async def test_repeated_failed_reports_remain_owed_until_success(monkeypatch):
     assert dr.sweep_retries(now=clock[0] + 3601) == []
 
 
+def _budget_exhausted(did):
+    _failed_row(did, "rate_limit")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_attempt=? WHERE delegation_id=?", (dr.MAX_RETRY_ATTEMPTS, did))
+
+
+def _age_exhausted(did):
+    _failed_row(did, "rate_limit")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_root_started_at=? WHERE delegation_id=?",
+                     (1_800_000_000.0 - dr.MAX_LINEAGE_AGE_S, did))
+
+
+def _not_dispatched(did):
+    _failed_row(did, "rate_limit")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_reason=? WHERE delegation_id=?",
+                     ("the parent did not dispatch the retry (rate_limit)", did))
+
+
+def _conversation_ended(did):
+    _failed_row(did, "rate_limit")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_reason=? WHERE delegation_id=?",
+                     ("its conversation ended before the retry could run", did))
+
+
+ROUTINE_STOPS = {
+    **{reason: (lambda did, r=reason: _failed_row(did, r)) for reason in (
+        "content_policy_blocked", "billing", "auth_permanent", "format_error", "context_length_exceeded", "unknown")},
+    "attempt_budget": _budget_exhausted,
+    "age_budget": _age_exhausted,
+    "parent_skipped_retry": _not_dispatched,
+    "conversation_ended": _conversation_ended,
+}
+
+
 @pytest.mark.asyncio
-async def test_terminal_failure_is_sent_to_user_once_without_model_turn():
-    _failed_row("deleg_policy", "content_policy_blocked")
+@pytest.mark.parametrize("parent", ["deliver", "terminal", "retry"])
+@pytest.mark.parametrize("category", sorted(ROUTINE_STOPS))
+async def test_routine_terminal_stop_is_settled_without_notice_or_model_turn(category, parent):
+    did = f"deleg_quiet_{category}"
+    ROUTINE_STOPS[category](did)
+    dr.schedule_retry(did, now=1_800_000_070.0)
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    assert action["kind"] == "terminal" and action["text"] == ""
+    runner = _runner()
+    runner._classify_completion_target = AsyncMock(return_value=parent)
+    await runner._deliver_delegation_retry_action(action)
+    runner._deliver_platform_notice.assert_not_awaited()
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._is_user_authorized_for_source.assert_not_called()
+    record = dr.retry_status(did)
+    assert record["retry_state"] == "reported" and record["retry_reason"]  # durable cause retained
+    assert dr.sweep_retries(now=1_800_100_000.0) == []
+
+
+@pytest.mark.asyncio
+async def test_crashed_routine_report_claim_replays_quietly():
+    """A claim left in 'reporting' by an old build or crash is reclaimed and settled without a send."""
+    _failed_row("deleg_quiet_replay", "content_policy_blocked")
+    dr.schedule_retry("deleg_quiet_replay", now=1_800_000_070.0)
+    (lost,) = dr.sweep_retries(now=1_800_000_100.0)
+    assert dr.retry_status("deleg_quiet_replay")["retry_state"] == "reporting"
+    (action,) = dr.sweep_retries(now=1_800_000_100.0 + dr.RETRY_CLAIM_TTL_S + 1)
+    assert action["claim"] != lost["claim"] and action["text"] == ""
     runner = _runner()
     await runner._deliver_delegation_retry_action(action)
+    await runner._deliver_delegation_retry_action(lost)  # stale claim is a no-op
+    runner._deliver_platform_notice.assert_not_awaited()
+    assert dr.retry_status("deleg_quiet_replay")["retry_state"] == "reported"
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_result_with_live_parent_is_settled_quietly():
+    _undeliverable_row("deleg_undeliverable_live")
+    (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    assert action["kind"] == "terminal" and action["text"]
+    runner = _runner()
+    await runner._deliver_delegation_retry_action(action)
+    runner._classify_completion_target.assert_awaited_once_with("parent-1")
+    runner._deliver_platform_notice.assert_not_awaited()
+    runner._is_user_authorized_for_source.assert_not_called()
+    assert dr.retry_status("deleg_undeliverable_live")["retry_state"] == "reported"
+
+
+@pytest.mark.asyncio
+async def test_undeliverable_result_with_uncertain_parent_remains_owed(monkeypatch):
+    monkeypatch.setattr(dr.time, "time", lambda: 1_800_000_100.0)
+    _undeliverable_row("deleg_undeliverable_uncertain")
+    (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    runner = _runner()
+    runner._classify_completion_target = AsyncMock(return_value="retry")
+    await runner._deliver_delegation_retry_action(action)
+    runner._deliver_platform_notice.assert_not_awaited()
+    assert dr.retry_status("deleg_undeliverable_uncertain")["retry_state"] == "terminal"
+    assert dr.sweep_retries(now=1_800_000_101.0) == []  # bounded backoff, no spin
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end_reason", ["missing", "new_session", "user_exit"])
+async def test_undeliverable_result_with_gone_parent_is_sent_once_without_model_turn(end_reason):
+    """Exercise the real parent classifier: missing or user-closed parent sessions are gone."""
+    from types import SimpleNamespace
+
+    _undeliverable_row("deleg_undeliverable_gone")
+    (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    runner = _runner()
+    parent = None if end_reason == "missing" else {"id": "parent-1", "ended_at": 1.0, "end_reason": end_reason}
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(return_value=parent))
+    runner._classify_completion_target = GatewayRunner._classify_completion_target.__get__(runner)
+    await runner._deliver_delegation_retry_action(action)
+    runner._is_user_authorized_for_source.assert_called_once()
     runner._deliver_platform_notice.assert_awaited_once()
     line = runner._deliver_platform_notice.await_args.args[1]
-    assert line == "Background task stopped: make the model — provider rejected the request."
+    assert line == "Background task finished: make the model — its result could not be delivered."
+    assert dr.retry_status("deleg_undeliverable_gone")["retry_state"] == "reported"
     assert dr.sweep_retries(now=1_800_100_000.0) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end_reason", ["", "compression_live", "idle"])
+async def test_undeliverable_result_with_routable_parent_uses_real_classifier_quietly(end_reason):
+    from types import SimpleNamespace
+
+    _undeliverable_row("deleg_undeliverable_routable")
+    (action,) = dr.sweep_retries(now=1_800_000_100.0)
+    runner = _runner()
+    sessions = {"parent-1": {"id": "parent-1", "ended_at": None if not end_reason else 1.0,
+                             "end_reason": "compression" if end_reason == "compression_live" else end_reason},
+                "tip-1": {"id": "tip-1", "ended_at": None}}
+    runner._session_db = SimpleNamespace(get_session=AsyncMock(side_effect=lambda sid: sessions.get(sid)),
+                                         get_compression_tip=AsyncMock(return_value="tip-1"))
+    runner._classify_completion_target = GatewayRunner._classify_completion_target.__get__(runner)
+    await runner._deliver_delegation_retry_action(action)
+    runner._deliver_platform_notice.assert_not_awaited()
+    assert dr.retry_status("deleg_undeliverable_routable")["retry_state"] == "reported"
 
 
 @pytest.mark.asyncio
@@ -223,9 +370,9 @@ async def test_terminal_notice_is_interim_and_never_seals_an_open_stream(private
 
 @pytest.mark.asyncio
 async def test_failed_terminal_send_is_retried_later():
-    _failed_row("deleg_send_fail", "format_error")
+    _undeliverable_row("deleg_send_fail")
     (action,) = dr.sweep_retries(now=1_800_000_100.0)
-    runner = _runner()
+    runner = _gone_runner()
     runner._deliver_platform_notice = AsyncMock(side_effect=RuntimeError("chat offline"))
     await runner._deliver_delegation_retry_action(action)
     (again,) = dr.sweep_retries(now=1_800_000_200.0)
@@ -233,7 +380,7 @@ async def test_failed_terminal_send_is_retried_later():
 
 
 @pytest.mark.asyncio
-async def test_retry_notice_for_closed_parent_becomes_terminal_line():
+async def test_retry_notice_for_closed_parent_settles_terminal_quietly():
     _failed_row("deleg_closed", "rate_limit")
     plan = dr.retry_status("deleg_closed")
     dr.schedule_retry("deleg_closed", now=1_800_000_060.0)
@@ -244,11 +391,12 @@ async def test_retry_notice_for_closed_parent_becomes_terminal_line():
     runner._classify_completion_target = AsyncMock(return_value="terminal")
     await runner._deliver_delegation_retry_action(action)
     (terminal,) = dr.sweep_retries(now=plan["retry_due_at"] + 2)
-    assert terminal["kind"] == "terminal" and "conversation ended" in terminal["text"]
-    runner._completion_delivery_ready.return_value = False
+    assert terminal["kind"] == "terminal" and terminal["text"] == ""
     await runner._deliver_delegation_retry_action(terminal)
-    runner._deliver_platform_notice.assert_awaited_once()
-    assert dr.retry_status("deleg_closed")["retry_state"] == "reported"
+    runner._deliver_platform_notice.assert_not_awaited()
+    record = dr.retry_status("deleg_closed")
+    assert record["retry_state"] == "reported"
+    assert record["retry_reason"] == "its conversation ended before the retry could run"
 
 
 @pytest.mark.asyncio
@@ -338,7 +486,7 @@ async def test_retry_sweep_and_delivery_keep_secondary_profile_ledger_isolated(t
     runner._collect_delegation_retry_actions = lambda: actions
     await runner._drive_delegation_retries()
     runner._inject_watch_notification.assert_awaited_once()
-    runner._deliver_platform_notice.assert_awaited_once()
+    runner._deliver_platform_notice.assert_not_awaited()  # routine billing stop in profile b is quiet
     assert dr.retry_status("deleg_same_id")["retry_state"] == "notified"
     token = set_hermes_home_override(secondary)
     try:

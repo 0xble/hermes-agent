@@ -1,8 +1,8 @@
 """Durable, bounded automatic retry of background delegations.
 
-Guarantee under test: every background delegation ends either delivered as a
-completion or as ONE visible terminal line — never silently abandoned, whatever
-the parent model replies to a notice.
+Guarantee under test: every background delegation ends delivered as a completion,
+retried within budget, or durably settled terminal — never silently abandoned in an
+owed state, whatever the parent model replies to a notice.
 """
 
 import json
@@ -114,8 +114,8 @@ def test_retry_scheduled_at_one_hour_swept_after_48_hours_is_terminal():
     _rate_limited(did)
     assert dr.schedule_retry(did, now=T0 + 3600)["retry_state"] == "scheduled"
     (action,) = dr.sweep_retries(now=T0 + 48 * 3600)
-    assert action["kind"] == "terminal"
-    assert "24h" in action["text"]
+    assert action["kind"] == "terminal" and action["text"] == ""  # routine stop: no user notice
+    assert "24h" in dr.retry_status(did)["retry_reason"]
 
 
 def test_resume_claim_rechecks_lineage_deadline(monkeypatch):
@@ -509,7 +509,7 @@ def test_incident_replay_survives_restart_dispatches_once_and_ignores_no_reply()
     assert dr.sweep_retries(now=due + 10 * dr.NOTICE_GRACE_S) == []
 
 
-def test_unanswered_retry_notice_becomes_visible_terminal_line():
+def test_unanswered_retry_notice_becomes_quiet_terminal():
     did = _dispatch("deleg_ignored")
     _rate_limited(did)
     plan = dr.schedule_retry(did, now=T0 + 60)
@@ -521,7 +521,8 @@ def test_unanswered_retry_notice_becomes_visible_terminal_line():
         now += dr.NOTICE_GRACE_S + 1
     (action,) = dr.sweep_retries(now=now)
     assert action["kind"] == "terminal"
-    assert "build the model" in action["text"] and "\n" not in action["text"]
+    assert action["text"] == ""
+    assert dr.retry_status(did)["retry_reason"].startswith("the parent did not dispatch the retry")
     assert dr.mark_terminal_reported(did, action["claim"])
     assert dr.sweep_retries(now=now + 10_000) == []
 
@@ -554,7 +555,7 @@ def test_user_stop_is_not_retried_or_reported():
 
 
 # (3) budget exhausted --------------------------------------------------------------------------
-def test_attempt_budget_exhausted_is_terminal_and_visible_once():
+def test_attempt_budget_exhausted_is_terminal_and_settled_once():
     did = _dispatch("deleg_budget", lineage={"root": "deleg_root", "attempt": dr.MAX_RETRY_ATTEMPTS,
                                              "root_started_at": T0})
     _rate_limited(did)
@@ -577,18 +578,18 @@ def test_lineage_age_budget_exhausted_is_terminal():
 
 # (4) non-retryable -----------------------------------------------------------------------------
 @pytest.mark.parametrize("reason", ["content_policy_blocked", "auth_permanent", "format_error", "billing"])
-def test_non_retryable_failure_is_terminal_with_one_line(reason):
+def test_non_retryable_failure_is_terminal_without_user_line(reason):
     did = _dispatch(f"deleg_{reason}")
     _terminal(did, "error", results=[{"task_index": 0, "status": "failed", "failure_reason": reason,
                                       "error": "provider refused"}])
     plan = dr.schedule_retry(did, now=T0 + 60)
     assert plan["retry_state"] == "terminal"
     (action,) = dr.sweep_retries(now=T0 + 61)
-    assert action["kind"] == "terminal" and "build the model" in action["text"]
+    assert action["kind"] == "terminal" and action["text"] == ""
     assert dr.claim_retry_dispatch(did)[1] is not None
 
 
-def test_partial_fanout_is_terminal_visible():
+def test_partial_fanout_is_terminal():
     did = _dispatch("deleg_fan", goals=["a", "b"], goal="2 parallel subagents: a; b")
     _terminal(did, "completed", results=[{"task_index": 0, "status": "completed", "summary": "ok"},
                                          {"task_index": 1, "status": "failed", "failure_reason": "rate_limit"}])

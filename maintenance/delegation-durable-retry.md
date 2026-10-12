@@ -5,10 +5,14 @@ retried, reported to the user, or pruned from `async_delegations`.
 
 ## Guarantee
 
-Every still-authorized messaging-gateway background delegation ends in exactly one of: a completed result
-delivered to its parent, or one plain terminal line sent by the gateway to the origin chat/topic.
-No parent reply (including `NO_REPLY`) can suppress either outcome. Explicit user cancellation or
-revoked destination authorization settles the obligation without delivery.
+Every still-authorized messaging-gateway background delegation ends with a durable settled outcome: a
+completed result delivered to its parent, a bounded automatic retry, or a terminal `retry_state` and
+`retry_reason` retained in `async_delegations`. Routine stops are not user notifications: failures,
+exhausted budgets, retries the parent did not dispatch, and ended conversations settle quietly without a
+gateway line or model turn. The sole direct user notice is a completed result whose original delivery
+was permanently dropped (`result_undeliverable`) while its parent session is gone. No parent reply
+(including `NO_REPLY`) can suppress that notice. Explicit user cancellation or revoked destination
+authorization settles the obligation without delivery.
 
 ## Required behavior
 
@@ -40,21 +44,30 @@ revoked destination authorization settles the obligation without delivery.
     `delegate_task(action='resume')` and spawn with `recovery_context`. If the parent
     has not dispatched after `NOTICE_GRACE_S` (15 min), it is re-prompted once. If it
     still has not dispatched, the row turns terminal.
-  - A terminal action is sent straight to the user with `_deliver_platform_notice`
-    and never passes through the model. Only an affirmative adapter delivery receipt
-    settles it as `reported`; failed, missing, or privacy-skipped sends remain owed
-    with 5m-to-60m capped backoff, including after repeated transport failures.
-    Resolve the target and revalidate live authorization through the same helper as
-    boot auto-resume notices. Authorization denial or an authorization-check failure
-    settles it as `cancelled` with `authorization_revoked`, sends nothing, and logs
-    suppression. A disconnected transport is not an authorization denial.
-    Terminal text is `Background task stopped: <goal> — <reason category>.`: apply
-    the shared fail-closed egress scrub before truncating the goal, use only fixed
-    reason labels (never exception text), then scrub the final line again before sending.
+  - A routine terminal action has empty text. The gateway settles it `reported`
+    without resolving a transport, waking the parent, or sending a notice; the
+    durable `retry_reason` remains the record. A claim left `reporting` by a crash
+    or an older build is reclaimed after `RETRY_CLAIM_TTL_S` and settles quietly.
+  - A `result_undeliverable` action first classifies its parent with the shared
+    async-completion target classifier. A live, idle-ended, or live
+    compression-continued parent settles quietly. An unavailable session DB or
+    in-flight rotation stays owed with capped backoff. Only a missing parent or a
+    user-boundary end (`/new`, user exit, session switch) is gone. Then the line is
+    sent straight to the user with `_deliver_platform_notice` and never passes
+    through the model. Only an affirmative adapter delivery receipt settles it as
+    `reported`; failed, missing, or privacy-skipped sends remain owed with 5m-to-60m
+    capped backoff. Resolve the target and revalidate live authorization through the
+    same helper as boot auto-resume notices. Authorization denial or an
+    authorization-check failure settles it as `cancelled` with
+    `authorization_revoked`, sends nothing, and logs suppression. A disconnected
+    transport is not an authorization denial. The text is fixed:
+    `Background task finished: <goal> — its result could not be delivered.` Apply
+    the shared fail-closed egress scrub before truncating the goal and scrub the
+    final line again before sending.
 - Why not direct re-dispatch: rebuilding a child needs the live parent agent's
   credentials, toolsets and session context, which are not durable and must not be
-  serialized. The notice path reuses every spawn gate. The gateway-owned terminal line
-  closes the gap that model compliance leaves open.
+  serialized. The notice path reuses every spawn gate. Automatic retry due prompts
+  remain internal parent turns; ignoring both settles the retry quietly.
 - `action='resume'` on a retry-owned row takes `claim_retry_dispatch` (single winner).
   The recovery brief heading `RECOVERY OF ... DELEGATION <id>.` links the new spawn
   inside `_persist_dispatch` (`link_replacement`). That marks the old row `dispatched`
@@ -85,14 +98,16 @@ revoked destination authorization settles the obligation without delivery.
   lifecycle/outbox delivery settles, preserving its exactly-once replay rather than
   racing it with a retry notice or final report. Replayed owned events carry the
   durable retry note at consumer claim time.
-- Keep the gateway's final retry line: the failure-delivery outbox routes original
-  completions to the parent; it does not bypass the model for retry-budget or
-  non-dispatch reports to the user. These are distinct delivery obligations.
+- The failure-delivery outbox still routes original completions to the parent. Do not
+  add a direct user line for retry-budget, non-dispatch, ended-conversation, or
+  non-retryable failures: the user explicitly hid routine background-task-stopped
+  notices. Keep the gone-parent `result_undeliverable` notice as the narrow exception.
 - Queued shutdown keeps its `interrupt_all` owner when cancellation races the
   dispatch insert. Its durable outcome is `interrupted` and retryable, not user
   `cancelled`.
 - Visibility (R5): the completion event carries `retry_note` ("Hermes will retry this
-  automatically at HH:MM ... Do not re-dispatch it yourself"), and `action=list` shows
+  automatically at HH:MM ... Do not re-dispatch it yourself", or a plain no-retry note
+  without promising a user notice), and `action=list` shows
   retry-pending rows as `status=retry_<state>`.
 
 Fork patch identity: `delegation-durable-retry`.

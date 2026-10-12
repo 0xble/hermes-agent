@@ -2635,7 +2635,7 @@ class GatewayNotificationsMixin:
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
     def _collect_delegation_retry_actions(self) -> list:
-        """Claim due retry notices / terminal lines from every served profile's ledger (atomic claims)."""
+        """Claim due retry notices / terminal settlements from every served profile's ledger (atomic claims)."""
         from tools.delegation_resume import sweep_retries
         from hermes_cli.profiles import get_active_profile_name
         actions = []
@@ -2659,8 +2659,9 @@ class GatewayNotificationsMixin:
         return actions
 
     async def _deliver_delegation_retry_action(self, action: dict) -> None:
-        """Settle one claimed retry action. A notice wakes the parent to dispatch the retry; a terminal
-        action is sent straight to the user's chat, so no parent reply (NO_REPLY included) can hide it."""
+        """Settle one claimed retry action. A notice wakes the parent to dispatch the retry. Routine
+        terminal actions settle quietly; only a completed result whose parent session is gone is sent
+        straight to the user's chat, after the live authorization gate."""
         from tools import delegation_resume as dr
         delegation_id, claim = action["delegation_id"], action["claim"]
         async with self._completion_event_scope(action):
@@ -2669,6 +2670,17 @@ class GatewayNotificationsMixin:
             if action["kind"] == "terminal":
                 from gateway.run import _redact_gateway_user_facing_secrets
 
+                parent_session_id = str(action.get("parent_session_id") or "").strip()
+                if not action.get("text"):
+                    # Routine stops are durable ledger state, not user notifications.
+                    await asyncio.to_thread(dr.mark_terminal_reported, delegation_id, claim)
+                    return
+                # A completed result is user-visible only when no parent conversation can receive it.
+                verdict = await self._classify_completion_target(parent_session_id) if parent_session_id else "terminal"
+                if verdict != "terminal":
+                    settle = dr.mark_terminal_reported if verdict == "deliver" else dr.release_terminal_report
+                    await asyncio.to_thread(settle, delegation_id, claim)
+                    return
                 sent = suppressed = False
                 try:
                     source, authorized = await self._authorized_completion_notice_target(action)
@@ -2679,16 +2691,16 @@ class GatewayNotificationsMixin:
                         line = " ".join(line.split())[:360]
                         sent = await self._deliver_platform_notice(source, line)
                 except Exception:
-                    logger.warning("Delegation %s: terminal line send failed", delegation_id, exc_info=True)
+                    logger.warning("Delegation %s: undeliverable-result notice send failed", delegation_id, exc_info=True)
                 settle = (dr.suppress_terminal_report if suppressed else
                           dr.mark_terminal_reported if sent else dr.release_terminal_report)
                 await asyncio.to_thread(settle, delegation_id, claim)
                 if sent:
-                    logger.info("Delegation %s: reported terminal failure to the user", delegation_id)
+                    logger.info("Delegation %s: reported undeliverable result to the user", delegation_id)
                 return
             parent_session_id = str(action.get("parent_session_id") or "").strip()
             if parent_session_id and await self._classify_completion_target(parent_session_id) == "terminal":
-                # The owning conversation is gone (/new, closed): nobody can dispatch; tell the user instead.
+                # The owning conversation is gone (/new, closed): nobody can dispatch; settle it terminal.
                 await asyncio.to_thread(dr.mark_retry_terminal, delegation_id, claim,
                                         "its conversation ended before the retry could run")
                 return
@@ -2816,7 +2828,7 @@ class GatewayNotificationsMixin:
                     last_orphan_sweep = time.monotonic()
                     await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
                     # Durable delegation retries share the cadence: due notices, re-prompts and
-                    # terminal lines are claimed atomically from state.db, so restarts lose nothing.
+                    # terminal settlements are claimed atomically from state.db, so restarts lose nothing.
                     await self._drive_delegation_retries()
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
