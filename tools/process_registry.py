@@ -39,6 +39,7 @@ from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import (
     load_completed_results,
+    prune_completed_results,
     save_completed_result,
     save_cut_pending_result,
 )
@@ -2248,7 +2249,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             or (session.env_ref and session.pid)
             or (session.detached and session.pid_scope == "host" and session.pid)
         ):
-            save_cut_pending_result(session, source)
+            save_cut_pending_result(
+                session, source, include_output=deadline is None, prune=deadline is None,
+            )
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
         try:
@@ -2891,9 +2894,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 thread.start()
 
             if signalable:
-                if source == "gateway_shutdown" or bounded_sweep:
-                    for session in signalable:
-                        save_cut_pending_result(session, source)
                 # Signal every snapshotted root/descendant group in one parallel pass. A
                 # descendant may have called setsid(), so the root group alone is not an
                 # ownership boundary for the full psutil tree.
@@ -3042,8 +3042,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 for session in targets:
                     if _fallback_kill_one(session):
                         killed += 1
+            if source == "gateway_shutdown" or bounded_sweep:
+                for session in signalable:
+                    save_cut_pending_result(
+                        session, source, include_output=not bounded_sweep, prune=not bounded_sweep,
+                    )
             scope_retried = _retry_finished_scopes()
             _close_detached_nonrunning()
+            if bounded_sweep and (stop_event is None or not stop_event.is_set()) and (
+                deadline is None or time.monotonic() < deadline
+            ):
+                prune_completed_results()
             if (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):

@@ -79,7 +79,7 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
 
     home = tmp_path / "home"
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
-    session = _make_session(sid="proc_cut_pending")
+    session = _make_session(sid="proc_cut_pending", output="x" * 100_000)
     session.process = MagicMock(pid=12345)
     registry._running[session.id] = session
 
@@ -103,6 +103,101 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
     record = json.loads(receipt.read_text(encoding="utf-8"))
     assert record["completion_reason"] == "cut_pending"
     assert record["termination_source"] == "gateway_shutdown"
+    assert record["output"] == ""
+
+
+def test_bounded_kill_all_uses_small_cut_receipts_and_prunes_once(registry, monkeypatch):
+    session = _make_session(sid="proc_bounded_sweep", output="x" * 100_000)
+    session.process = MagicMock(pid=12345)
+    session.process.poll.return_value = 1
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: True)
+    save_cut = MagicMock()
+    prune = MagicMock()
+    monkeypatch.setattr("tools.process_registry.save_cut_pending_result", save_cut)
+    monkeypatch.setattr("tools.process_registry.prune_completed_results", prune)
+
+    assert registry.kill_all(
+        deadline=time.monotonic() + 1.0, source="gateway_shutdown", consume_output=True,
+    ) == 1
+
+    save_cut.assert_called_once_with(session, "gateway_shutdown", include_output=False, prune=False)
+    prune.assert_called_once_with()
+
+
+def test_cut_pending_write_does_not_overwrite_final_receipt(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    session = _make_session(sid="proc_final_wins", exited=True, exit_code=0)
+    session.completion_reason = "exited"
+    receipts.save_completed_result(session)
+
+    receipts.save_cut_pending_result(session, "gateway_shutdown")
+
+    record = json.loads((home / "logs" / "process-results" / f"{session.id}.json").read_text())
+    assert record["completion_reason"] == "exited"
+    assert record["cut_receipt"] is False
+
+    finalized = _make_session(sid="proc_cut_finalized")
+    receipts.save_cut_pending_result(finalized, "gateway_shutdown")
+    finalized.exited = True
+    finalized.exit_code = -15
+    finalized.completion_reason = "killed"
+    finalized.termination_source = "gateway_shutdown"
+    receipts.save_completed_result(finalized)
+    record = json.loads((home / "logs" / "process-results" / f"{finalized.id}.json").read_text())
+    assert record["completion_reason"] == "killed"
+    assert record["cut_receipt"] is True
+
+
+def test_cut_pending_receipts_are_not_loaded_as_completed(tmp_path, monkeypatch):
+    from gateway import session_context
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    directory = home / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(session_context, "get_session_env", lambda *_args: "owner")
+    monkeypatch.setattr(receipts, "_owns_result", lambda *_args: True)
+    record = {key: "" for key in receipts._RESULT_FIELDS}
+    record.update({
+        "id": "proc_pending_load",
+        "parent_session_id": "owner",
+        "output": "partial",
+        "completion_reason": "cut_pending",
+        "cut_receipt": True,
+    })
+    (directory / "proc_pending_load.json").write_text(json.dumps(record))
+
+    assert receipts.load_completed_results() == {}
+
+
+def test_explicit_process_kill_receipts_use_normal_retention(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    directory = home / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_CUT_RESULTS", 1)
+    now = time.time()
+    old = directory / "proc_explicit_old.json"
+    new = directory / "proc_explicit_new.json"
+    for index, path in enumerate((old, new)):
+        path.write_text(json.dumps({
+            "id": path.stem, "completion_reason": "killed", "termination_source": "process.kill",
+        }))
+        os.utime(path, (now + index, now + index))
+
+    retained = receipts._result_paths()
+
+    assert new in retained
+    assert not old.exists()
 
 
 def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
@@ -130,6 +225,7 @@ def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
     # Finalizing a pre-kill receipt must not return it to the normal 64-result budget.
     cut.write_text(json.dumps({
         "id": cut.stem, "completion_reason": "killed", "termination_source": "gateway_shutdown",
+        "cut_receipt": True,
     }), encoding="utf-8")
     os.utime(cut, (now - 60, now - 60))
     assert cut in receipts._result_paths()
