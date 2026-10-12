@@ -1,0 +1,147 @@
+"""Regression coverage for restart-cut async delegation ledger truth and retention."""
+
+from __future__ import annotations
+
+import json
+import queue
+import threading
+import time
+
+import pytest
+
+from tools import async_delegation as ad
+from tools.process_registry import process_registry
+
+
+@pytest.fixture(autouse=True)
+def _clean_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._reset_for_tests()
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            break
+    yield
+    deadline = time.monotonic() + 3.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    ad._reset_for_tests()
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def _event_for(delegation_id: str, timeout: float = 5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            event = process_registry.completion_queue.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if event.get("delegation_id") == delegation_id:
+            return event
+    pytest.fail(f"no completion event for {delegation_id}")
+
+
+def _cut_batch(results):
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        assert release.wait(5)
+        return {"results": results}
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["one", "two", "three"], context="ctx", toolsets=None,
+        role="leaf", model="m", session_key="session", parent_session_id="parent",
+        runner=runner, interrupt_fn=lambda reason=None: release.set(), max_async_children=1,
+    )
+    assert handle["status"] == "dispatched"
+    assert started.wait(5)
+    assert ad.interrupt_all("gateway shutdown (post-interrupt)") == 1
+    event = _event_for(handle["delegation_id"])
+    return handle["delegation_id"], event
+
+
+def test_shutdown_interrupt_persists_running_batch_as_interrupted():
+    delegation_id, event = _cut_batch([
+        {"task_index": 0, "status": "completed", "summary": "finished"},
+        {"task_index": 1, "status": "interrupted", "error": "cut"},
+        {"task_index": 2, "status": "interrupted", "error": "cut"},
+    ])
+    assert event["status"] == "completed"  # display status still reflects mixed child outcomes
+    with ad._DB_LOCK, ad._transaction() as conn:
+        state, event_json = conn.execute(
+            "SELECT state, event_json FROM async_delegations WHERE delegation_id=?", (delegation_id,)
+        ).fetchone()
+    assert state == "interrupted"
+    assert json.loads(event_json)["cut_reason"] == "gateway shutdown (post-interrupt)"
+
+
+def test_shutdown_interrupt_persists_all_interrupted_batch_as_interrupted():
+    delegation_id, event = _cut_batch([
+        {"task_index": 0, "status": "interrupted", "error": "cut"},
+        {"task_index": 1, "status": "interrupted", "error": "cut"},
+        {"task_index": 2, "status": "interrupted", "error": "cut"},
+    ])
+    assert event["status"] == "error"  # the batch aggregate remains its historical display status
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (delegation_id,)
+        ).fetchone() == ("interrupted",)
+
+
+def test_prune_cap_ignores_exempt_rows_and_evicts_superseded_first():
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        for i in range(29):
+            conn.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, state, delivery_state, "
+                "retry_state, retry_reason, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (f"superseded-{i}", "s", "p", "error", "superseded", "none", "completed", now, now + i),
+            )
+        for i in range(22):
+            conn.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, state, delivery_state, "
+                "dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"delivered-{i}", "s", "p", "completed", "delivered", now, now + i),
+            )
+        for i in range(18):
+            conn.execute(
+                "INSERT INTO async_delegations "
+                "(delegation_id, origin_session, parent_session_id, state, delivery_state, "
+                "dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"exempt-{i}", "s", "p", "unknown", "delivered", now, now + i),
+            )
+    ad._prune_durable_records()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        remaining = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert "superseded-0" not in remaining
+    assert all(f"delivered-{i}" in remaining for i in range(22))
+    assert all(f"exempt-{i}" in remaining for i in range(18))
+
+
+def test_restart_cut_row_survives_100_dispatches():
+    delegation_id, _event = _cut_batch([
+        {"task_index": 0, "status": "interrupted", "error": "cut"},
+        {"task_index": 1, "status": "interrupted", "error": "cut"},
+        {"task_index": 2, "status": "interrupted", "error": "cut"},
+    ])
+    for index in range(100):
+        handle = ad.dispatch_async_delegation(
+            goal=f"turnover-{index}", context=None, toolsets=None, role="leaf", model="m",
+            session_key="session", runner=lambda: {"status": "completed", "summary": "ok"},
+            max_async_children=1,
+        )
+        assert handle["status"] == "dispatched"
+        _event_for(handle["delegation_id"])
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert conn.execute(
+            "SELECT state FROM async_delegations WHERE delegation_id=?", (delegation_id,)
+        ).fetchone() == ("interrupted",)

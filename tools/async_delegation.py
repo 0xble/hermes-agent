@@ -78,6 +78,10 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _DEFAULT_MAX_QUEUED_DELEGATIONS = 0
 # Completed records retained (in memory and in the ledger) for status queries.
 _MAX_RETAINED_COMPLETED = 50
+# Restart-cut/retry rows are protected from the ordinary terminal-history cap, but
+# a pathological stream must still have a bounded footprint.
+_MAX_RETAINED_RESUMABLE = 500
+_PRUNE_ID_LOG_LIMIT = 8
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 # Rows delegation_resume would still accept for an explicit resume (owner present,
@@ -325,32 +329,73 @@ def _durable_state(delegation_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _log_pruned_ids(kind: str, ids: List[str]) -> None:
+    """Make retention decisions auditable without dumping a whole high-churn ledger."""
+    if ids:
+        shown = ids[:_PRUNE_ID_LOG_LIMIT]
+        suffix = "..." if len(ids) > len(shown) else ""
+        logger.info("Pruned async delegation %s rows: count=%d ids=%s%s",
+                    kind, len(ids), ",".join(shown), suffix)
+
+
 def _prune_durable_records() -> None:
     """Bound terminal history without deleting rows still eligible for recovery.
 
-    Delivered rows go first, then unsuccessful ones; an undelivered (pending)
-    completion is the parent's only copy of a child result, so it goes last.
+    Restart-cut/retry rows are exempt from the ordinary history cap and have a
+    separate hard ceiling; pending completions are bounded last.
     """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
-    # Classify finished-but-unclassified rows first so a plain success stops being "owed".
     from tools.delegation_resume import classify_armed
     classify_armed()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(f"""DELETE FROM async_delegations WHERE delivery_state IN ('delivered','superseded')
-                         AND updated_at < ? AND NOT {_RETRY_OWED_SQL}""", (cutoff,))
-        # Count only rows the cap may delete: protected retry/resume rows and undelivered results (bounded
-        # separately below) must never be displaced by history pruning.
-        terminal_count = conn.execute(
-            f"""SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)).fetchone()[0]
-        if terminal_count > _MAX_RETAINED_COMPLETED:
-            conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                       AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
-                   )""", (cutoff, terminal_count - _MAX_RETAINED_COMPLETED))
+        old_ids = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?
+                  AND NOT {_RETRY_OWED_SQL}""", (cutoff,))]
+        if old_ids:
+            marks = ",".join("?" for _ in old_ids)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", old_ids)
+            _log_pruned_ids("expired", old_ids)
+
+        ordinary_count = conn.execute(
+            f"""SELECT COUNT(*) FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+        ).fetchone()[0]
+        ordinary = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
+                ORDER BY CASE delivery_state
+                           WHEN 'superseded' THEN 0
+                           WHEN 'delivered' THEN 1
+                           ELSE 2
+                         END,
+                         updated_at ASC, delegation_id ASC
+                LIMIT ?""", (cutoff, max(0, ordinary_count - _MAX_RETAINED_COMPLETED))
+        )]
+        if ordinary:
+            marks = ",".join("?" for _ in ordinary)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", ordinary)
+            _log_pruned_ids("ordinary-cap", ordinary)
+
+        protected_count = conn.execute(
+            f"""SELECT COUNT(*) FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+        ).fetchone()[0]
+        protected = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND {_RESUMABLE_RETENTION_SQL}
+                ORDER BY updated_at ASC, delegation_id ASC
+                LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
+        )]
+        if protected:
+            marks = ",".join("?" for _ in protected)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", protected)
+            _log_pruned_ids("resumable-cap", protected)
+
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
@@ -358,18 +403,17 @@ def _prune_durable_records() -> None:
             evict = [r[0] for r in conn.execute(f"""SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'
                        AND NOT {_RESUMABLE_RETENTION_SQL}
-                     ORDER BY updated_at ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
+                     ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
             marks = ",".join("?" for _ in evict)
             if evict:
-                # A gateway success still owes the user one line: convert it to an owed terminal notice
-                # (kept by _RETRY_OWED_SQL) instead of deleting its only record.
                 conn.execute(f"""UPDATE async_delegations SET delivery_state='dropped', retry_state='terminal',
                                  retry_reason=?, retry_due_at=NULL, updated_at=?
                                  WHERE delegation_id IN ({marks}) AND retry_state='none'
-                                   AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})""",
+                                   AND retry_reason IN ({','.join('?' for _ in SUCCESS_REASONS)})""",
                              (RESULT_UNDELIVERABLE, time.time(), *evict, *SUCCESS_REASONS))
                 conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETRY_OWED_SQL}",
                              evict)
+                _log_pruned_ids("pending-cap", evict)
         conn.execute(
             """DELETE FROM async_delegation_events
                WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?""",
@@ -559,6 +603,13 @@ def _update_outbox_delivery(event_id: str, claim_id: str, action: str) -> bool:
                    WHERE event_id=? AND delivery_state='pending' AND delivery_claim=?""",
                 (now, now, event_id, claim_id),
             )
+            if cur.rowcount == 1:
+                conn.execute(
+                    """UPDATE async_delegations SET auto_resume_state='delivered', updated_at=?
+                       WHERE delegation_id=(SELECT delegation_id FROM async_delegation_events WHERE event_id=?)
+                         AND auto_resume_state='claimed'""",
+                    (now, event_id),
+                )
         elif action == "release":
             capped = conn.execute(
                 """UPDATE async_delegation_events SET delivery_state='dropped',
@@ -946,8 +997,9 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    return _update_delivery(
-        """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
+                   delivered_at=?, updated_at=?, auto_resume_state=CASE
+                     WHEN auto_resume_state='claimed' THEN 'delivered' ELSE auto_resume_state END
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
 
 
@@ -1139,8 +1191,9 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return _update_outbox_delivery(event_id, claim_id, "complete")
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
-                  delivered_at=?, updated_at=?, delivery_claim=NULL,
-                  delivery_claimed_at=NULL
+                  delivered_at=?, updated_at=?, auto_resume_state=CASE
+                    WHEN auto_resume_state='claimed' THEN 'delivered' ELSE auto_resume_state END,
+                  delivery_claim=NULL, delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
 
@@ -2034,6 +2087,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "context": record.get("context"), "toolsets": record.get("toolsets"), "role": record.get("role"),
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
+        **({"cut_reason": record["_cut_reason"]} if record.get("_cut_reason") else {}),
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
@@ -2503,6 +2557,11 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
                 interrupt_fn = None
             else:
                 interrupt_fn = live.get("interrupt_fn")
+                if caller == "interrupt_all":
+                    # Preserve the truthful lifecycle classification even when a
+                    # batch later returns a mixed/completed aggregate status.
+                    live["_terminal_state"] = "interrupted"
+                    live["_cut_reason"] = reason
         if persist_wait is not None:
             persist_wait.wait(30)
             count += _interrupt_records([record], caller, reason, msg, affected_ids)
