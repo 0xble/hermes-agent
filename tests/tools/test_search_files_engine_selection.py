@@ -1,7 +1,9 @@
 """Behavior tests for file-search ordering and ripgrep selection."""
 
 import json
+import os
 import re
+import shlex
 
 import pytest
 
@@ -37,6 +39,49 @@ class RecordingEnvironment:
         return [command for command in self.commands if "--files" in command]
 
 
+def test_filename_rg_command_has_bounded_walker_threads(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 28)
+    env = RecordingEnvironment()
+
+    ShellFileOperations(env).search("*.py", path="/repo", target="files")
+
+    assert len(env.rg_commands) == 1
+    assert "--threads 4" in env.rg_commands[0]
+
+
+@pytest.mark.parametrize("order", ["discovery", "modified"])
+@pytest.mark.parametrize(
+    ("cpu_count", "expected_threads"),
+    [(None, 1), (1, 1), (3, 1), (4, 1), (8, 2), (12, 3), (16, 4), (28, 4), (128, 4)],
+)
+def test_filename_thread_budget_scales_but_never_exceeds_four(
+    monkeypatch, order, cpu_count, expected_threads,
+):
+    monkeypatch.setattr(os, "cpu_count", lambda: cpu_count)
+    env = RecordingEnvironment()
+
+    result = ShellFileOperations(env)._search_files(
+        "*.py", ["/repo", "/other"], 50, 0, order,
+    )
+
+    assert result.error is None
+    assert len(env.rg_commands) == 1
+    command = shlex.split(env.rg_commands[0])
+    assert command[command.index("--threads") + 1] == str(expected_threads)
+    assert ("--sortr=modified" in command) == (order == "modified")
+
+
+def test_content_search_keeps_existing_rg_parallelism(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 28)
+    env = RecordingEnvironment()
+    ops = ShellFileOperations(env)
+
+    ops._search_with_rg("needle", "/repo", None, 50, 0, "content", 0)
+
+    commands = [command for command in env.commands if "--line-number" in command]
+    assert len(commands) == 1
+    assert "--threads" not in shlex.split(commands[0])
+    assert "--files" not in shlex.split(commands[0])
 
 
 def test_default_file_search_runs_one_bounded_unsorted_rg_command():
