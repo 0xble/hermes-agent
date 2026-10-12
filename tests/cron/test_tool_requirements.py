@@ -303,6 +303,22 @@ def test_relay_mcp_alias_not_registered_by_runtime_is_not_accepted():
     assert job_tool_requirement_issues(job, cfg=cfg)
 
 
+def test_empty_loaded_bundle_member_activates_bundle_instruction(tmp_path, monkeypatch):
+    from agent.skill_utils import TIER_LOCAL
+    from tools import skills_tool
+
+    skills = tmp_path / "skills"
+    (skills / "empty").mkdir(parents=True)
+    (skills / "empty" / "SKILL.md").write_text("")
+    bundles = tmp_path / "bundles"
+    bundles.mkdir()
+    (bundles / "daily.yaml").write_text("name: daily\nskills: [empty]\ninstruction: Use Pick the Destination.\n")
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
+    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={})
+    assert len(issues) == 1 and "relay" in issues[0]
+
+
 def test_missing_bundle_members_do_not_activate_bundle_instruction(tmp_path, monkeypatch):
     from agent.skill_utils import TIER_LOCAL
     from tools import skills_tool
