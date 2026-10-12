@@ -126,7 +126,18 @@ def _static_tool_names(names: list[str]) -> set[str]:
 
 def _static_disabled_tool_names(names: list[str]) -> set[str]:
     """Resolve the scheduler denylist without importing ``model_tools`` or plugin code."""
-    return _static_tool_names(names)
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+    tools: set[str] = set()
+    for name in names:
+        if name in _LEGACY_TOOLSET_MAP:
+            resolved = set(_LEGACY_TOOLSET_MAP[name])
+        else:
+            resolved = _static_tool_names([name])
+        definition = TOOLSETS.get(name) or {}
+        if name.startswith("hermes-") or definition.get("posture"):
+            resolved -= set(_HERMES_CORE_TOOLS)
+        tools.update(resolved)
+    return tools
 
 
 def _disabled_toolset_names(cfg: Optional[dict]) -> list[str]:
@@ -172,10 +183,12 @@ def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
     disabled = {name.lower() for name in _disabled_toolset_names(cfg)}
     for name in names:
         lowered = name.lower()
-        if name in enabled_mcp and "relay" in lowered:
-            aliases = {lowered, f"mcp-{lowered}", f"{lowered}-mcp"}
-            if not aliases & disabled:
-                return True
+        for server in enabled_mcp:
+            server_lower = server.lower()
+            canonical_names = {server_lower, f"mcp-{server_lower}", f"{server_lower}-mcp"}
+            if lowered in canonical_names and "relay" in server_lower:
+                if not canonical_names & disabled:
+                    return True
     return False
 
 
