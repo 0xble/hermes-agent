@@ -3,6 +3,19 @@ import pytest
 from tools.process_registry_notifications import _format_async_delegation
 
 
+@pytest.mark.parametrize("goals", [None, ["recover this task"]])
+def test_scalar_cut_notice_uses_task_wording(goals):
+    text = _format_async_delegation({
+        "type": "async_delegation", "delegation_id": "deleg_scalar_notice",
+        "goal": "recover this task", "status": "interrupted", "is_batch": bool(goals), "goals": goals,
+        "completed_at": 1_760_000_000.0, "cut_reason": "gateway shutdown (restart)",
+    })
+    assert "The task did not finish." in text
+    assert "Unfinished children:" not in text
+    assert "Do not rerun completed children." not in text
+    assert "delegate_task(action='resume', subagent_id='deleg_scalar_notice')" in text
+
+
 def test_cut_batch_notice_has_fixed_resume_block():
     text = _format_async_delegation({
         "type": "async_delegation",

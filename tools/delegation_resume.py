@@ -167,7 +167,7 @@ def _batch_recovery_tasks(record: Dict[str, Any], indexes: Optional[List[int]] =
         child_task.update(goal=child["goal"], context=shared)
         child_record = dict(record, task=child_task)
         instruction = build_recovery_instruction(child_record)
-        lines = [instruction, "", f"RECOVERY CHILD INDEX: {index}"]
+        lines = [instruction, "", f"RECOVERY CHILD INDEX: {record['delegation_id']}:{index}"]
         sibling_lines = []
         for sibling_index, entry in sorted(recorded.items()):
             sibling_lines.append(
@@ -200,6 +200,7 @@ def _batch_resume_eligibility(record: Dict[str, Any]) -> Optional[str]:
         return INELIGIBLE_PARTIAL
     return None
 
+
 def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     """None when the record may be resumed, else a stable refusal token."""
     if record["state"] not in RESUMABLE_STATES:
@@ -224,8 +225,6 @@ def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     if not str(task.get("goal") or "").strip():
         return INELIGIBLE_STATE
     return None
-
-
 
 
 def inspect_resumable(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -405,6 +404,8 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
     record["resume_state"] = RESUME_STATE_CLAIMED
     record["resume_attempts"] = 1
     return record, None
+
+
 def claim_batch_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Claim each unfinished child of a batch exactly once."""
     ad = _ad()
@@ -1056,7 +1057,10 @@ def _replacement_children(conn, prior: Dict[str, Any], new: Dict[str, Any]) -> O
             (prior["delegation_id"],)).fetchone()):
         return None
     import re
-    return sorted({int(index) for index in re.findall(r"RECOVERY CHILD INDEX: (\d+)", str(new.get("context") or ""))})
+    # Older-generation briefs remain verbatim inside ORIGINAL CONTEXT. Only the
+    # current delegation can authorize or consume its own child claims.
+    pattern = rf"RECOVERY CHILD INDEX: {re.escape(prior['delegation_id'])}:(\d+)\b"
+    return sorted({int(index) for index in re.findall(pattern, str(new.get("context") or ""))})
 
 
 def replacement_admission_error(conn, new: Dict[str, Any], task_text: str) -> Optional[str]:

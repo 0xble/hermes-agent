@@ -84,11 +84,71 @@ def test_each_claimed_child_admits_one_replacement_without_rerunning_success():
     assert replacements == [(1, "deleg_replacement_0"), (2, "deleg_replacement_1")]
 
 
+def test_second_cut_of_recovered_fanout_admits_only_current_generation():
+    did, _, now = cut_row("deleg_gen0")
+    dr.schedule_retry(did, now=now)
+    first = json.loads(_handle_control_action("resume", did, None, Parent()))
+    tasks = first["tasks"]
+    ad._persist_dispatch(dict(
+        delegation_id="deleg_gen1", goal="two parallel", goals=[task["goal"] for task in tasks],
+        is_batch=True, context="\n\n".join(dict.fromkeys(task["context"] for task in tasks)),
+        session_key="agent:main:telegram:dm:1", parent_session_id="owner", origin_session_id="owner",
+        retry_state="armed", dispatched_at=now,
+    ))
+    assert dr.retry_status(did)["retry_state"] == "dispatched"
+    event = dict(type="async_delegation", delegation_id="deleg_gen1", status="interrupted",
+                 cut_reason="gateway shutdown (restart)", completed_at=now)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET state='interrupted', result_json=?, event_json=?, "
+                     "completed_at=?, updated_at=? WHERE delegation_id=?",
+                     (json.dumps({"status": "interrupted", "results": [
+                         {"task_index": 0, "status": "interrupted"}], "partial": True}),
+                      json.dumps(event), now, now, "deleg_gen1"))
+    assert dr.schedule_retry("deleg_gen1", now=now)["retry_state"] == "scheduled"
+    second = json.loads(_handle_control_action("resume", "deleg_gen1", None, Parent()))
+    assert second["status"] == "retry_claimed"
+    assert [task["goal"] for task in second["tasks"]] == ["second", "third"]
+    for index, task in enumerate(second["tasks"]):
+        ad._persist_dispatch(dict(
+            delegation_id=f"deleg_gen2_{index}", goal=task["goal"], context=task["context"],
+            session_key="telegram:dm:1", parent_session_id="owner", origin_session_id="owner",
+            dispatched_at=now,
+        ))
+        with ad._DB_LOCK, ad._transaction() as conn:
+            receipts = conn.execute("SELECT task_index, replacement_delegation_id FROM "
+                                    "async_delegation_child_recovery WHERE delegation_id=? ORDER BY task_index",
+                                    ("deleg_gen1",)).fetchall()
+        assert receipts == [(0, "deleg_gen2_0"), (1, "deleg_gen2_1" if index == 1 else None)]
+    assert dr.retry_status("deleg_gen1")["retry_state"] == "dispatched"
+
+
+def test_nested_ancestor_markers_do_not_consume_sibling_claim():
+    did, _, now = cut_row("deleg_link_scope")
+    task = dr.retry_status(did)["task"]
+    task["context"] = "RECOVERY CHILD INDEX: deleg_ancestor:2\nRECOVERY CHILD INDEX: 2"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET task_json=? WHERE delegation_id=?", (json.dumps(task), did))
+    dr.schedule_retry(did, now=now)
+    payload = json.loads(_handle_control_action("resume", did, None, Parent()))
+    task = payload["tasks"][0]
+    ad._persist_dispatch(dict(
+        delegation_id="deleg_link_first", goal=task["goal"], context=task["context"],
+        session_key="telegram:dm:1", parent_session_id="owner", origin_session_id="owner",
+        dispatched_at=now,
+    ))
+    with ad._DB_LOCK, ad._transaction() as conn:
+        receipts = conn.execute("SELECT task_index, replacement_delegation_id FROM "
+                                "async_delegation_child_recovery WHERE delegation_id=? ORDER BY task_index",
+                                (did,)).fetchall()
+    assert receipts == [(1, "deleg_link_first"), (2, None)]
+    assert dr.retry_status(did)["retry_state"] == "dispatching"
+
+
 def test_unclaimed_child_marker_does_not_authorize_replacement():
     did, _, _ = cut_row()
     with pytest.raises(dr.RetryAdmissionError, match="claim"):
         ad._persist_dispatch(dict(delegation_id="deleg_forged", goal="first",
-                                  context=f"RECOVERY OF INTERRUPTED DELEGATION {did}.\nRECOVERY CHILD INDEX: 0",
+                                  context=f"RECOVERY OF INTERRUPTED DELEGATION {did}.\nRECOVERY CHILD INDEX: {did}:0",
                                   session_key="telegram:dm:1", parent_session_id="owner",
                                   origin_session_id="owner", dispatched_at=time.time()))
 

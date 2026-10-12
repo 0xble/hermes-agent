@@ -238,10 +238,11 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
                   if recorded.get(index, {}).get("status") not in _DONE]
     when = evt.get("completed_at") or time.time()
     stamp = time.strftime("%H:%M", time.localtime(when))
+    detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
     return [
-        f"Cut by gateway restart at {stamp}. Unfinished children: {', '.join(unfinished)}.",
+        f"Cut by gateway restart at {stamp}. {detail}",
         f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
-        "Do not rerun completed children.",
+        *(["Do not rerun completed children."] if len(goals) > 1 else []),
     ]
 
 
