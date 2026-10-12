@@ -126,6 +126,47 @@ def test_bounded_kill_all_uses_small_cut_receipts_and_prunes_once(registry, monk
     prune.assert_called_once_with()
 
 
+def test_bounded_kill_all_skips_cut_receipts_past_deadline(registry, monkeypatch):
+    session = _make_session(sid="proc_bounded_late")
+    session.process = MagicMock(pid=12346)
+    session.process.poll.return_value = 1
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: True)
+    save_cut = MagicMock()
+    monkeypatch.setattr("tools.process_registry.save_cut_pending_result", save_cut)
+    monkeypatch.setattr("tools.process_registry.prune_completed_results", MagicMock())
+
+    registry.kill_all(deadline=time.monotonic() - 1.0, source="gateway_shutdown", consume_output=True)
+
+    save_cut.assert_not_called()
+
+
+def test_legacy_cut_receipts_without_marker_keep_cut_retention(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    directory = tmp_path / "home" / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    legacy_pending = directory / "proc_legacy_pending.json"
+    legacy_pending.write_text(json.dumps({
+        "id": legacy_pending.stem, "command": "echo " + "z" * 4096, "output": "o" * 4096,
+        "completion_reason": "cut_pending", "termination_source": "gateway_shutdown",
+    }, indent=2))
+    legacy_final = directory / "proc_legacy_final.json"
+    legacy_final.write_text(json.dumps({
+        "id": legacy_final.stem, "command": "echo " + "z" * 4096, "output": "o" * 4096,
+        "completion_reason": "killed", "termination_source": "gateway_shutdown",
+    }, indent=2))
+    explicit = directory / "proc_explicit_kill.json"
+    explicit.write_text(json.dumps({
+        "id": explicit.stem, "completion_reason": "killed", "termination_source": "process.kill",
+    }, indent=2))
+
+    assert receipts._is_cut_receipt(legacy_pending)
+    assert receipts._is_cut_receipt(legacy_final)
+    assert not receipts._is_cut_receipt(explicit)
+
+
 def test_cut_pending_write_does_not_overwrite_final_receipt(tmp_path, monkeypatch):
     from tools import process_registry_results as receipts
 

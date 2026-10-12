@@ -41,9 +41,17 @@ def _receipt_header(path) -> bytes:
 
 def _is_cut_receipt(path) -> bool:
     header = _receipt_header(path)
-    return (
-        b'"cut_receipt": true' in header
-        or b'"completion_reason": "cut_pending"' in header
+    if b'"cut_receipt": true' in header or b'"completion_reason": "cut_pending"' in header:
+        return True
+    if b'"cut_receipt": false' in header:
+        return False
+    # Receipts written before the leading marker existed: classify from the full record.
+    record = _read_existing_record(path)
+    if _CUT_RECEIPT_FIELD in record:
+        return bool(record[_CUT_RECEIPT_FIELD])
+    reason = record.get("completion_reason")
+    return reason in _CUT_COMPLETION_REASONS or (
+        reason == "killed" and record.get("termination_source") == "gateway_shutdown"
     )
 
 

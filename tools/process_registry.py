@@ -3044,6 +3044,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         killed += 1
             if source == "gateway_shutdown" or bounded_sweep:
                 for session in signalable:
+                    # Receipts are evidence, not the stop itself: never let them spend the
+                    # restart's shared deadline once the signals have gone out.
+                    if bounded_sweep and (
+                        (stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)
+                    ):
+                        break
                     save_cut_pending_result(
                         session, source, include_output=not bounded_sweep, prune=not bounded_sweep,
                     )
