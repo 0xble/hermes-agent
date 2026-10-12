@@ -37,7 +37,11 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import format_process_notification
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
-from tools.process_registry_results import load_completed_results, save_completed_result
+from tools.process_registry_results import (
+    load_completed_results,
+    save_completed_result,
+    save_cut_pending_result,
+)
 from tools.process_registry_env_log import log_delta_command
 
 logger = logging.getLogger(__name__)
@@ -2236,6 +2240,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 self._completion_consumed.add(session_id)
             session._kill_deadline = previous_kill_deadline
             return result
+        # Keep an additive receipt before a restart/shutdown signal can outlive this
+        # gateway. The normal completion write below may be fenced by the shared deadline.
+        if (source == "gateway_shutdown" or deadline is not None) and (
+            session._pty
+            or session.process
+            or (session.env_ref and session.pid)
+            or (session.detached and session.pid_scope == "host" and session.pid)
+        ):
+            save_cut_pending_result(session, source)
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
         try:
@@ -2878,6 +2891,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 thread.start()
 
             if signalable:
+                if source == "gateway_shutdown" or bounded_sweep:
+                    for session in signalable:
+                        save_cut_pending_result(session, source)
                 # Signal every snapshotted root/descendant group in one parallel pass. A
                 # descendant may have called setsid(), so the root group alone is not an
                 # ownership boundary for the full psutil tree.
