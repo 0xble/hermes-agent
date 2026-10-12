@@ -1364,7 +1364,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
-        if event.get_command() and not await self._begin_command_loop_tick(event, source):
+        get_command = getattr(event, "get_command", None)
+        if callable(get_command) and get_command() and not await self._begin_command_loop_tick(event, source):
             return True, None  # superseded /loop tick: its command must not run
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
