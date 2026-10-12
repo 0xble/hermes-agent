@@ -20,6 +20,8 @@ N-1 user has. Three installs run concurrently over smart HTTP:
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from tests.e2e.core._pending_fixes import known_failure
@@ -29,6 +31,7 @@ from tests.e2e.core.upgrade.git import _git_world as G
 pytestmark = G.PYTESTMARK
 
 ORPHAN = "orphan divergence"
+HISTORICAL_FETCH_CAP = "historical pre-swap plain fetch exceeded the byte bound and hit its 300s cap"
 
 
 def _has_prefetch_heal(source: str) -> bool:
@@ -55,16 +58,19 @@ def _assert_first_n1_update(run: dict) -> None:
     # SAME old pre-swap transfer hits its 300s cap before reaching that assertion.
     # Gate only a proved historical, unfiltered overfetch with no checkout move;
     # current-code, transport, authentication and unmeasured timeouts stay red.
-    if (not run["has_prefetch_heal"] and cp.returncode == 1
-            and run["head1"] == run["base"]
-            and run["shape1"] == {"shallow": "true", "promisor": "-", "filter": "-"}
-            and "Failed to fetch updates from origin" in out
-            and "git fetch timed out after 300s" in out
-            and G.TRACEBACK not in out and G.SUCCESS not in out
-            and fetches and all(r.status == 200 and not r.fault for r in fetches)
-            and sum(r.body_bytes for r in fetches) > 2 * w.install_bytes):
-        pytest.xfail("#123254: historical pre-swap plain fetch exceeded the byte bound and hit its 300s cap; "
-                     "retire when N-1 carries pre-fetch healing")
+    # Strict acceptance (HERMES_E2E_STRICT_ACCEPTANCE) refuses the excuse.
+    historical = (not run["has_prefetch_heal"] and cp.returncode == 1
+                  and run["head1"] == run["base"]
+                  and run["shape1"] == {"shallow": "true", "promisor": "-", "filter": "-"}
+                  and "Failed to fetch updates from origin" in out
+                  and "git fetch timed out after 300s" in out
+                  and G.TRACEBACK not in out and G.SUCCESS not in out
+                  and fetches and all(r.status == 200 and not r.fault for r in fetches)
+                  and sum(r.body_bytes for r in fetches) > 2 * w.install_bytes)
+    with known_failure(re.escape(HISTORICAL_FETCH_CAP),
+                       "#123254: N-1's pre-swap plain fetch downloads ~the whole history and, on slower "
+                       "runners, hits its 300s cap; this flips once a release carrying pre-fetch healing is N-1"):
+        assert not historical, f"N-1 -> HEAD update failed: {HISTORICAL_FETCH_CAP}:\n{w.diag(cp)}"
     assert cp.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp)}"
 
 

@@ -13,6 +13,7 @@ from hermes_cli import gitlock
 
 def _repo(root: Path) -> Path:
     (root / ".git" / "objects" / "pack").mkdir(parents=True)
+    (root / ".git" / "refs").mkdir()
     (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     return root
 
@@ -197,6 +198,105 @@ def test_unrelated_repository_local_streams_do_not_veto_recovery(scope, name, ar
     _process(table, 123, other, name=name, argv=argv)
     debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
     assert gitlock.clear_stale_tmp_packs(ours) == [str(debris)]
+
+
+def _bare(root: Path) -> Path:
+    (root / "objects" / "pack").mkdir(parents=True)
+    (root / "refs").mkdir()
+    (root / "HEAD").write_text("ref: refs/heads/main\n")
+    return root
+
+
+def _server_argv(form: str, command: str, *operands: str) -> tuple[str, tuple[str, ...]]:
+    if form == "dashed":
+        return f"git-{command}", (f"git-{command}", *operands)
+    return "git", ("git", command, *operands)
+
+
+def _served(ours: Path, tmp_path: Path, operand: str) -> tuple[str, Path]:
+    """(operand, metadata directory Git's enter_repo() serves for it)."""
+    if operand.startswith("bare"):
+        store = _bare(tmp_path / "served.git")
+        return (str(store) if operand == "bare" else str(tmp_path / "served")), store
+    return {"checkout": str(ours), "checkout/": f"{ours}/", "dotgit": str(ours / ".git")}[operand], ours / ".git"
+
+
+def _assert_vetoed(store: Path) -> None:
+    lock = _aged(store / "index.lock")
+    debris = _aged(store / "objects" / "pack" / "tmp_pack_live")
+    root = store.parent if store.name == ".git" else store
+    assert gitlock.clear_stale_git_locks(root) == []
+    assert gitlock.clear_stale_tmp_packs(root) == []
+    assert lock.exists() and debris.exists()
+
+
+@pytest.mark.parametrize("form", ["git", "dashed"])
+@pytest.mark.parametrize("command", ["upload-pack", "receive-pack"])
+@pytest.mark.parametrize("options", [(), ("--quiet",), ("-q",), ("--stateless-rpc", "--advertise-refs"),
+                                     ("--timeout=5",), ("--timeout", "5"), ("--http-backend-info-refs",),
+                                     ("--skip-connectivity-check", "--reject-thin-pack-for-testing"), ("--",)])
+@pytest.mark.parametrize("operand", ["checkout", "checkout/", "dotgit", "bare", "bare-suffix"])
+def test_server_repository_operand_protects_that_repository(scope, tmp_path, form, command, options, operand):
+    # Git's enter_repo() accepts a checkout and enters its .git; cwd is the launch
+    # directory (here an unrelated repository), never evidence of the target.
+    table, ours, other = scope
+    target, store = _served(ours, tmp_path, operand)
+    name, argv = _server_argv(form, command, *options, target)
+    _process(table, 123, other, name=name, argv=argv)
+    _assert_vetoed(store)
+
+
+@pytest.mark.parametrize("operand", ["dotgit", "bare", "checkout", "bare-suffix"])
+def test_strict_upload_pack_enters_only_an_exact_repository(scope, tmp_path, operand):
+    # --strict tries no suffix: an exact metadata path is protected, and a path that is not
+    # itself a repository proves nothing, so the veto is retained either way.
+    table, ours, other = scope
+    target, store = _served(ours, tmp_path, operand)
+    _process(table, 123, other, argv=("git", "upload-pack", "--strict", target))
+    _assert_vetoed(store)
+
+
+@pytest.mark.parametrize("form", ["git", "dashed"])
+@pytest.mark.parametrize("command", ["upload-pack", "receive-pack"])
+def test_server_for_another_repository_does_not_veto(scope, form, command):
+    table, ours, other = scope
+    name, argv = _server_argv(form, command, "--quiet", "--timeout=5", str(other))
+    _process(table, 123, ours, name=name, argv=argv)
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == [str(debris)]
+
+
+@pytest.mark.parametrize("form", ["git", "dashed"])
+@pytest.mark.parametrize("operands", [
+    ("{ours}",), ("./ours",), (".",), ("--quiet", "{ours}"),  # relative: launch cwd unknown
+    ("--quiet",), (), ("{ours}", "{other}"),  # missing or ambiguous operand
+    ("--unknown-option", "/abs"), ("~/repo",),
+])
+def test_unprovable_server_ownership_keeps_the_veto(scope, form, operands):
+    # /proc cwd is where enter_repo() already chdir'd (or not yet): never replay against it.
+    table, ours, other = scope
+    rel = {"{ours}": "ours", "{other}": str(other)}
+    argv_ops = tuple(rel.get(op, op) for op in operands)
+    name, argv = _server_argv(form, "receive-pack", *argv_ops)
+    _process(table, 123, other, name=name, argv=argv)
+    lock = _aged(ours / ".git" / "index.lock")
+    assert gitlock.clear_stale_git_locks(ours) == []
+    assert lock.exists()
+
+
+def test_server_operand_through_a_gitfile_protects_the_linked_store(scope, tmp_path):
+    table, ours, other = scope
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    metadata = ours / ".git" / "worktrees" / "linked"
+    metadata.mkdir(parents=True)
+    (metadata / "HEAD").write_text("ref: refs/heads/topic\n")
+    (metadata / "commondir").write_text("../..\n")
+    (linked / ".git").write_text(f"gitdir: {metadata}\n")
+    _process(table, 123, other, argv=("git", "receive-pack", str(linked)))
+    debris = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert debris.exists()
 
 
 def test_empty_process_table_does_not_leave_dead_resources(scope):

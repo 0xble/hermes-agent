@@ -65,6 +65,58 @@ def _repository_dirs(cwd: Path, git_dir: Optional[str] = None) -> set[Path]:
     return directories
 
 
+# upload-pack/receive-pack parse their own options (parse-options, so they may follow the
+# operand) and take exactly one repository operand. Anything else is not provable.
+_SERVER_FLAGS = frozenset({
+    "-q", "--quiet", "--stateless-rpc", "--advertise-refs", "--http-backend-info-refs", "--strict",
+    "--no-strict", "--skip-connectivity-check", "--reject-thin-pack-for-testing",
+})
+
+
+def _is_git_directory(path: Path) -> bool:
+    # Git's is_git_directory(): HEAD plus objects/ and refs/, in the common dir when linked.
+    common = path / "commondir"
+    store = path / common.read_text(encoding="utf-8-sig").strip() if common.is_file() else path
+    return (path / "HEAD").is_file() and (store / "objects").is_dir() and (store / "refs").is_dir()
+
+
+def _server_repository(operands: list[str]) -> str:
+    """The metadata directory a server command enters, as Git's enter_repo() finds it."""
+    paths, strict, options = [], False, True
+    args = iter(operands)
+    for arg in args:
+        if options and arg == "--":
+            options = False
+        elif options and arg == "--timeout":
+            next(args)
+        elif options and arg.startswith("--timeout="):
+            continue
+        elif options and arg in _SERVER_FLAGS:
+            strict = arg == "--strict" or strict and arg != "--no-strict"
+        elif options and arg.startswith("-"):
+            raise ValueError("unrecognized server option")
+        else:
+            paths.append(arg)
+    if len(paths) != 1:
+        raise ValueError("server repository operand missing or ambiguous")
+    path = paths[0]
+    if not os.path.isabs(path):
+        # enter_repo() resolves it against the launch cwd and then chdirs, so /proc's cwd
+        # may already be the repository (or not yet): its owner cannot be reconstructed.
+        raise ValueError("launch cwd cannot be reconstructed")
+    base = path.rstrip("/") or "/"
+    for suffix in ("",) if strict else ("/.git", "", ".git/.git", ".git"):
+        candidate = Path(base + suffix)
+        if candidate.is_file():
+            prefix, separator, relative = candidate.read_text(encoding="utf-8-sig").strip().partition(":")
+            if prefix != "gitdir" or not separator or not relative.strip():
+                raise ValueError("unrecognized gitfile")
+            return str(candidate.parent / relative.strip())
+        if candidate.is_dir() and _is_git_directory(candidate):
+            return str(candidate)
+    raise ValueError("server repository unavailable")
+
+
 def _process_repository_dirs(proc: Path) -> set[Path]:
     cwd = proc.joinpath("cwd").resolve(strict=True)
     env = dict(item.split("=", 1) for item in os.fsdecode(proc.joinpath("environ").read_bytes()).split("\0")
@@ -88,6 +140,10 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
                     or command == "pack-objects" and "--stdout" not in operands
                     or command == "index-pack" and "--stdin" not in operands):
                 raise ValueError("explicit pack output ownership")
+    program = Path(argv[0]).name.removeprefix("git-")
+    if program in ("upload-pack", "receive-pack"):
+        # Dashed server helpers have no git-level options: every argument is the server's.
+        return _repository_dirs(cwd, _server_repository(argv[1:]))
     args = iter(argv[1:])
     for arg in args:
         if arg == "-C" or arg.startswith("-C"):
@@ -105,11 +161,10 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
         elif arg == "-c" or arg.startswith(("-c", "--config-env", "--work-tree", "--bare")):
             raise ValueError("explicit Git configuration")
         elif not arg.startswith("-"):
-            # upload-pack/receive-pack take a repository argument rather than cwd.
-            command = arg if Path(argv[0]).name == "git" else Path(argv[0]).name.removeprefix("git-")
-            if command in ("upload-pack", "receive-pack"):
-                git_dir = next(args) if Path(argv[0]).name == "git" else arg
-            elif command in ("clone", "init"):
+            if arg in ("upload-pack", "receive-pack"):
+                # The server enters its operand repository (enter_repo), not cwd or GIT_DIR.
+                return _repository_dirs(cwd, _server_repository(list(args)))
+            if arg in ("clone", "init"):
                 raise ValueError("Git may create a repository outside cwd")
             break
     return _repository_dirs(cwd, git_dir)
