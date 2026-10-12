@@ -77,18 +77,13 @@ def _toolset_names(job: dict[str, Any]) -> list[str]:
 
 
 def _available_tools(names: list[str], cfg: Optional[dict]) -> set[str]:
-    """Resolve static tools and apply the scheduler's final disabled-tool filter."""
-    from toolsets import resolve_toolset
-    from model_tools import _apply_toolset_selection
+    """Resolve the same native and legacy tool names the runtime selects, then apply its denylist."""
+    from model_tools import _select_tool_names
     from cron.scheduler import _resolve_cron_disabled_toolsets
 
-    tools: set[str] = set()
-    for name in _effective_toolsets(names, cfg):
-        tools.update(resolve_toolset(name))
-    _apply_toolset_selection(
-        tools, _resolve_cron_disabled_toolsets(cfg or {}), quiet_mode=True, disable=True
+    return _select_tool_names(
+        list(names), _resolve_cron_disabled_toolsets(cfg or {}), quiet_mode=True
     )
-    return tools
 
 
 def _allows_terminal(names: list[str], cfg: Optional[dict]) -> bool:
@@ -96,29 +91,20 @@ def _allows_terminal(names: list[str], cfg: Optional[dict]) -> bool:
 
 
 def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
-    """Relay is plugin/MCP-backed in some deployments, so name matching is intentional."""
-    from cron.scheduler import _resolve_cron_disabled_toolsets
-    disabled = {name.lower() for name in _resolve_cron_disabled_toolsets(cfg or {})}
-    return any("relay" in name.lower() and name.lower() not in disabled for name in names)
+    """Relay may be a native toolset or a configured MCP server."""
+    if any("relay" in tool.lower() for tool in _available_tools(names, cfg)):
+        return True
+    from hermes_cli.tools_config import enabled_mcp_server_names
+    enabled_mcp = enabled_mcp_server_names(cfg or {})
+    return any(name in enabled_mcp and "relay" in name.lower() for name in names)
 
 
 def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
     """The allowlist the scheduler actually runs with: enabled MCP servers are merged onto a
     non-empty per-job list (honoring ``no_mcp`` and explicit servers). Reads local config only."""
     from cron.scheduler import _merge_mcp_into_per_job_toolsets
-    if cfg is None:
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config()
-        except Exception:
-            cfg = {}
     try:
-        effective = _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
-        from hermes_cli.tools_config import _prune_toolsets_stripped_by_disabled
-        from cron.scheduler import _resolve_cron_disabled_toolsets
-        return sorted(_prune_toolsets_stripped_by_disabled(
-            set(effective), _resolve_cron_disabled_toolsets(cfg or {})
-        ))
+        return _merge_mcp_into_per_job_toolsets(list(names), cfg or {})
     except Exception:
         return [name for name in names if name != "no_mcp"]
 
@@ -137,6 +123,12 @@ def job_tool_requirement_issues(
     stored = _toolset_names(job)
     if not stored or job.get("no_agent"):
         return []
+    if cfg is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly()
+        except Exception:
+            cfg = {}
     names = _effective_toolsets(stored, cfg)
 
     texts = [("prompt", str(job.get("prompt") or ""))]
