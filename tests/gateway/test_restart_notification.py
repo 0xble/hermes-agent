@@ -378,7 +378,7 @@ async def test_survivor_notification_acknowledges_only_successful_gateway_admiss
     }), timeout=5)
     assert attempts == ["admit", "admit"]
     assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
-    assert registry.is_completion_consumed(session.id)
+    assert not registry.is_completion_consumed(session.id)
     await runner._run_process_watcher({
         "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
     })

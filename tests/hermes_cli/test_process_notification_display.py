@@ -1,5 +1,6 @@
 """Background-process completions paint a compact title while the model keeps the raw wall."""
 import queue
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,8 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 from cli import HermesCLI
+from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.process_registry_notifications import (
-    PROCESS_COMPLETE_DISPLAY_KIND, format_process_notification, process_completion_display_text)
+    PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, format_process_notification,
+    process_completion_display_text)
 from tui_gateway import server
 
 def _registry(events):
@@ -19,6 +22,32 @@ def _registry(events):
 def _event(sid, exit_code, command="cd /tmp && bash long-build.sh"):
     return {"type": "completion", "session_id": sid, "session_key": "display-session", "command": command,
             "exit_code": exit_code, "completion_reason": "exited", "output": "web tsc=0\nSECRET_OUTPUT_LINE"}
+
+def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr("tools.process_registry.get_hermes_home", lambda: home)
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_cli_survivor", command="make test", task_id="display-session",
+        session_key="display-session", survive_restart=True,
+        delivered_path=str(home / "process-runs" / "proc_cli_survivor" / "delivered"),
+    )
+    registry._running[session.id] = session
+    event = _event(session.id, 3, command="make test")
+    registry.completion_queue.put(event)
+
+    drained = registry.drain_notifications(session_key="display-session")
+    rendered = ProcessNotificationBatch(tuple(drained)).render(registry)
+
+    assert rendered is not None
+    assert "exit code 3" in rendered
+    assert not Path(session.delivered_path).exists()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    cli = HermesCLI.__new__(HermesCLI)
+    unwrapped, _is_voice, _is_seeded = cli._tui_unwrap_input(ProcessNotificationBatch(tuple(drained)))
+    assert unwrapped is not None
+    assert Path(session.delivered_path).exists()
+
 
 @pytest.mark.parametrize("mode,expect_injected", [("off", False), ("concise", True), ("all", True)])
 def test_drain_honors_background_process_notifications_off(monkeypatch, mode, expect_injected):

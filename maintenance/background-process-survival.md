@@ -18,8 +18,8 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   A gone process without an exit file emits a `lost`
   completion with `survivor_lost` provenance. Enqueueing is not delivery: pending
   completions stay checkpointed and replay after a crash. The delivered marker is
-  written only on CLI consumption or successful gateway notification admission;
-  delivered markers suppress restart replays. Shutdown fences survivor pollers
+  written only after a CLI/TUI consumer renders or admits the event; delivered
+  markers suppress restart replays. Shutdown fences survivor pollers
   before teardown. Run directories are pruned after acknowledged-result retention
   expires, and immediately on spawn failure. Log polls read only a bounded tail.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in

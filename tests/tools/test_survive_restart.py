@@ -96,7 +96,9 @@ def test_survivor_completed_but_undrained_checkpoint_replays_once(tmp_path, monk
     assert len(events) == 1
     assert events[0][0]["session_id"] == session.id
     assert successor.drain_notifications(session_key="session") == []
-    assert successor.is_completion_consumed(session.id)
+    assert not successor.is_completion_consumed(session.id)
+    successor.acknowledge_survivor_completion(session.id)
+    assert not successor.is_completion_consumed(session.id)
     assert json.loads((home / "processes.json").read_text()) == []
 
 
@@ -111,6 +113,7 @@ def test_survivor_concurrent_successor_drains_deduplicate_the_notice(tmp_path, m
         recovered = successor.get(session.id)
         assert recovered is not None and recovered._completion_event.wait(5)
     assert len(first.drain_notifications(session_key="session")) == 1
+    first.acknowledge_survivor_completion(session.id)
     assert second.drain_notifications(session_key="session") == []
 
 

@@ -3017,7 +3017,7 @@ class GatewayNotificationsMixin:
         the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
         if exit != 0) / off."""
         from tools.process_registry import process_registry
-        from tools.process_registry_notifications import format_process_notification
+        from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification
         session_id = watcher["session_id"]
         interval = watcher["check_interval"]
         platform_name = watcher.get("platform", "")
@@ -3047,6 +3047,9 @@ class GatewayNotificationsMixin:
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
+                # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
+                if getattr(session, "survive_restart", False) and not process_registry._claim_survivor_delivery(session):
+                    break
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
@@ -3076,7 +3079,7 @@ class GatewayNotificationsMixin:
                         # of suppressing the result.
                         continue
                     if admitted is True:
-                        process_registry.acknowledge_survivor_completion(session_id)
+                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).

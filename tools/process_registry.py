@@ -1756,11 +1756,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
-        if session_id in self._completion_consumed:
-            return True
-        session = self.get(session_id)
-        return bool(session is not None and session.survive_restart
-                    and self._survivor_delivery_state(session) == "delivered")
+        return session_id in self._completion_consumed
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop (``hermes_cli.goals`` wait barrier) should stay parked on
@@ -1982,9 +1978,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if text := format_process_notification(evt):
                 if evt.get("type") == "completion":
                     session = self.get(_evt_sid)
-                    if session is not None and session.survive_restart:
-                        if not self._mark_survivor_delivered(session):
-                            continue
+                    if session is not None and session.survive_restart and not self._claim_survivor_delivery(session):
+                        continue
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
