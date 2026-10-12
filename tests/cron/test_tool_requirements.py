@@ -191,13 +191,18 @@ def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypat
 
 
 def test_cron_doctor_config_read_does_not_create_config_backups(tmp_path, monkeypatch, capsys):
+    from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text("agent:\n  disabled_toolsets: [terminal]\n")
+    create_job(
+        prompt="Add it with `loops finding add`.", name="active-disabled-terminal",
+        schedule="every 1h", enabled_toolsets=["terminal"], deliver="local",
+    )
     assert not (tmp_path / "config").exists()
-    assert cron_doctor() == 0
-    capsys.readouterr()
+    assert cron_doctor() == 1
+    assert "terminal access" in capsys.readouterr().out
     assert not (tmp_path / "config").exists()
 
 
@@ -208,3 +213,11 @@ def test_attached_non_utf8_skill_does_not_abort_diagnostics(tmp_path, monkeypatc
     skill.write_bytes(b"---\nname: bad\n---\n\xff")
     monkeypatch.setattr(tool_requirements, "_plugin_skill_path", lambda _name: skill)
     assert tool_requirements._attached_skill_content("plugin:bad") == ""
+
+
+def test_capability_diagnostics_do_not_discover_plugins(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(plugins, "discover_plugins", lambda: (_ for _ in ()).throw(AssertionError("discovery")))
+    job = {"enabled_toolsets": ["terminal"], "prompt": "Add with `loops finding add`."}
+    assert job_tool_requirement_issues(job, cfg={}) == []
