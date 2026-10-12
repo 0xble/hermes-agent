@@ -29,6 +29,8 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 - Fork patch identities: `background-process-cut-receipts` (PR3) and
   `terminal-background-survival` (PR4). They are stacked draft PRs in the
   `0xble/hermes-agent` fork; do not push to `NousResearch`.
+- `tools/process_registry_survival.py` owns the file-backed wrapper and survivor
+  polling; the registry facade only routes the opt-in and lifecycle boundaries.
 - Compatibility is additive: new checkpoint and receipt keys have safe absence
   behavior so an older release can roll back without a destructive migration.
 - Do not touch `gateway/platforms/event.py`, `response_filters.py`, locales, or
