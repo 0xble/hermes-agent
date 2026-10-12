@@ -284,11 +284,18 @@ def test_rejects_aux_below_minimum_context(mock_get_client, mock_ctx_len):
 
 
 
-def test_feasibility_check_passes_live_main_runtime():
-    """Compression feasibility should probe using the live session runtime."""
+@pytest.mark.parametrize(
+    "provider,requested_provider",
+    [("openai-codex", None), ("custom", "custom:included")],
+    ids=["undeclared-identity", "named-custom-identity"],
+)
+def test_feasibility_check_passes_live_main_runtime(provider, requested_provider):
+    """Compression feasibility preserves live transport and selected billing identity."""
     agent = _make_agent(main_context=200_000, threshold_percent=0.50)
     agent.model = "gpt-5.4"
-    agent.provider = "openai-codex"
+    agent.provider = provider
+    if requested_provider is not None:
+        agent.requested_provider = requested_provider
     agent.base_url = "https://chatgpt.com/backend-api/codex"
     agent.api_key = "codex-token"
     agent.api_mode = "codex_responses"
@@ -306,7 +313,8 @@ def test_feasibility_check_passes_live_main_runtime():
         "compression",
         main_runtime={
             "model": "gpt-5.4",
-            "provider": "openai-codex",
+            "provider": provider,
+            "requested_provider": requested_provider or "",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": "codex-token",
             "api_mode": "codex_responses",
