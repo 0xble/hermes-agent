@@ -2853,3 +2853,19 @@ class TestOwnerSubjectRecall:
         p = provider_with_config(recall_owner_subject="Ann")
         assert p._owner_subject_query("when is my anniversary") == "when is my anniversary (Ann)"
         assert p._owner_subject_query("what did ann say to me") is None
+
+
+    def test_embedded_reconnect_still_recovers_owner_subject_recall(self, provider_with_config, monkeypatch):
+        p = provider_with_config(recall_owner_subject="Brian Le")
+        first_client = _make_mock_client()
+        first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
+        second_client = _make_mock_client()
+        second_client.arecall.return_value = SimpleNamespace(results=[SimpleNamespace(id="r", text="Recovered memory")])
+        clients = iter([first_client, second_client])
+        p._mode = "local_embedded"
+        p._client = first_client
+        monkeypatch.setattr(p, "_get_client", lambda: next(clients))
+
+        assert p._do_recall("where do we live") == ("- Recovered memory", 1)
+        assert p._client is second_client
+        assert second_client.arecall.call_count == 2

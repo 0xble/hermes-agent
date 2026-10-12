@@ -1153,14 +1153,16 @@ class HindsightMemoryProvider(MemoryProvider):
             return kw
 
         async def _both(client):
-            return await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)),
-                                        return_exceptions=True)
+            responses = await asyncio.gather(client.arecall(**kwargs(query)), client.arecall(**kwargs(owner_query)),
+                                             return_exceptions=True)
+            # Raise inside the operation so _run_hindsight_operation's reconnect retry still sees
+            # a dead embedded daemon; one failed request alone must not discard the other's results.
+            if all(isinstance(resp, BaseException) for resp in responses):
+                raise responses[0]
+            return responses
 
-        responses = self._run_hindsight_operation(_both)
-        if all(isinstance(resp, BaseException) for resp in responses):
-            raise responses[0]
-        # The twin only supplements: one failed request must not discard the other's results.
-        original, owner = ([] if isinstance(resp, BaseException) else resp.results or [] for resp in responses)
+        original, owner = ([] if isinstance(resp, BaseException) else resp.results or []
+                           for resp in self._run_hindsight_operation(_both))
         merged, seen, used = [], set(), 0
         for pair in itertools.zip_longest(original, owner):
             for result in pair:
