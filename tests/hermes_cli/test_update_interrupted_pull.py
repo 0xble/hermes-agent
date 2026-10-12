@@ -530,6 +530,19 @@ def test_a_dead_index_lock_is_released_even_when_git_cannot_run(tmp_path, monkey
     assert not lock.exists(), "a missing git stranded a dead index.lock"
 
 
+def test_dead_index_lock_scan_retries_an_unknown_holder(tmp_path, monkeypatch):
+    """A transiently unknowable Linux holder scan must not strand a dead lock."""
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    lock = git_dir / "index.lock"
+    lock.write_bytes(b"")
+    scans = iter([None, False])
+    monkeypatch.setattr(er, "_held_open", lambda *args, **kwargs: next(scans))
+
+    assert er._release_dead_index_lock(git_dir, tmp_path, any_git=True) is True
+    assert not lock.exists()
+
+
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux /proc holder scan")
 def test_a_reader_git_in_the_tree_is_not_an_index_lock_holder_and_a_holder_is_named(tmp_path, capsys):
     """A reader git whose cwd is the checkout (a paged ``git log``, ``cat-file --batch``) never takes
