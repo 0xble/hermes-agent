@@ -12,17 +12,16 @@ This preserves the one-shot boundary without making procedural skills invisible 
 
 ## Evidence And Disposition
 
-The loop-ownership trigger diagnosis at `/Users/brianle/.hermes/cache/scratch/loop-ownership-trace-diagnosis-3fc37cfa/diagnosis.md` identified the restrictive one-shot guidance in `agent/oneshot_footprint.py` and the interactive matching-skill requirement in `agent/prompt_builder.py`. The smallest adequate change is guidance-only. It does not force-load a named skill, change evaluator checks, or re-enable skill authoring.
+The one-shot guidance in `agent/oneshot_footprint.py` limited loading to knowledge the agent lacked, while `agent/prompt_builder.py` required relevant procedural skills in interactive sessions. The change is guidance-only. It does not force-load a named skill, change evaluator checks, or re-enable skill authoring.
 
 At the implementation preflight, the fork was based on `54f27baa0695c9b0f8bf57ba0184944130afb8ba` and upstream `main` resolved to `8a7a5a905fc66ed82b922587a8e3c011e819dbb5`. Upstream PR [#63814](https://github.com/NousResearch/hermes-agent/pull/63814) addresses a separate one-shot `--skills` forwarding defect. The upstream `agent/oneshot_footprint.py` still carries the restrictive knowledge-only wording, and no equivalent upstream change was found in the bounded prior-art search.
 
 ## Verification
 
 - `scripts/run_tests.sh tests/agent/test_oneshot_footprint.py tests/agent/test_prompt_builder.py`
-- The focused suite passed with `60 tests passed, 0 failed, 1 skipped`.
-- `git diff --check` passed.
+- `git diff --check`
 
-Behavioral evaluation lift remains unverified until the provider route is healthy and lifecycle receipts preserve `CaseResult.trace`.
+Rendered-prompt tests establish the guidance and tool-availability contract, not actual model skill discovery. Behavioral claims require a healthy provider route and preserved trial traces.
 
 ## Retirement And Rollback
 
