@@ -164,7 +164,7 @@ jobs:
           # processes for the hosted runner's two cores. Run Windows files
           # serially so a stalled launcher is not mistaken for a pipe leak or
           # a UI timeout; preserve the existing macOS file concurrency.
-          HERMES_NATIVE_ONLY_FILES='tests/scripts/desktop_update/test_desktop_update_windows_marker.py|tests/scripts/desktop_update/test_desktop_update_windows_marker_lock.py|tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py' HERMES_WINDOWS_PROTOCOL_DIAGNOSTICS=1 ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
+          ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
   desktop-core:
     # The deterministic Desktop core E2E suite (transcript integrity, backend
     # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.

@@ -285,9 +285,6 @@ def environment(home: Path) -> dict[str, str]:
         'TZ': 'UTC', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8', 'PYTHONHASHSEED': '0',
         'PYTHONUTF8': '1', 'CI': 'true',
     })
-    for key in ('HERMES_NATIVE_ONLY_FILES', 'HERMES_WINDOWS_PROTOCOL_DIAGNOSTICS'):
-        if key in os.environ:
-            env[key] = os.environ[key]
     for directory in ('tmp', 'config'):
         (home / directory).mkdir(parents=True, exist_ok=True)
     if os.name == 'nt':
@@ -586,15 +583,11 @@ def native_os(env: dict[str, str], workers: int) -> None:
     marker = {'darwin': 'macos', 'win32': 'windows'}.get(sys.platform)
     if marker is None:
         raise RuntimeError('native-os requires an actual macOS or Windows host.')
-    narrowed = os.environ.get('HERMES_NATIVE_ONLY_FILES', '').strip()
-    if narrowed:
-        files = [path.strip() for path in narrowed.split('|') if path.strip()]
-    else:
-        selected = subprocess.check_output(
-            [python(env), 'scripts/ci/list_os_marked_tests.py', marker],
-            cwd=ROOT, env=env, text=True, encoding='utf-8', errors='replace',
-        )
-        files = [line.strip() for line in selected.splitlines() if line.strip()]
+    selected = subprocess.check_output(
+        [python(env), 'scripts/ci/list_os_marked_tests.py', marker],
+        cwd=ROOT, env=env, text=True, encoding='utf-8', errors='replace',
+    )
+    files = [line.strip() for line in selected.splitlines() if line.strip()]
     if not files:
         raise RuntimeError(f'No files selected for {marker}. Refusing an empty native OS lane.')
     actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
