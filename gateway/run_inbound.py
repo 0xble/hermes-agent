@@ -1365,12 +1365,33 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     ) -> Tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
         get_command = getattr(event, "get_command", None)
-        if callable(get_command) and get_command() and not await self._begin_command_loop_tick(event, source):
-            return True, None  # superseded /loop tick: its command must not run
+        loop_fence = None
+        if callable(get_command) and get_command():
+            loop_identity = self._loop_wake_command_identity(event)
+            if loop_identity is not None:
+                sid, tick = loop_identity
+                loop_fence = (sid, tick, self._current_session_run_generation(_quick_key))
+            if not await self._begin_command_loop_tick(event, source):
+                return True, None  # superseded /loop tick: its command must not run
+
+        async def _loop_command_current() -> bool:
+            if loop_fence is None:
+                return True
+            sid, tick, run_generation = loop_fence
+            return await self._loop_wake_execution_current(
+                sid, tick, source, run_generation=run_generation,
+            )
+
         _handled, _result, command, canonical = await self._hm_resolve_command(event, source, _quick_key)
         if not _handled:
+            # Command hooks are asynchronous and may reset, stop, or replace the loop. Recheck
+            # after resolution and immediately before entering an effectful handler.
+            if not await _loop_command_current():
+                return True, None
             _handled, _result = await self._hm_dispatch_canonical_command(event, source, _quick_key, canonical)
         if not _handled:
+            if not await _loop_command_current():
+                return True, None
             _handled, _result, command = await self._hm_dispatch_quick_and_plugin_commands(event, source, command)
         if not _handled:
             # Skill-slash resolution is disk-bound (cold skill scan, skill file loads, the

@@ -432,6 +432,115 @@ async def test_model_loop_fence_rechecks_reset_after_start_tick(control_home, bo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["pause", "clear", "replace"])
+async def test_model_loop_fence_rechecks_loop_control_after_exact_tick(control_home, control):
+    runner, adapter, source, entry = native_runner(control_home)
+    create_loop(entry, source)
+    executions = []
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(
+        runner._PreparedTurn([], "", "old work", "old work", None, None), {},
+    ))
+
+    async def model(**kwargs):
+        executions.append(kwargs["session_id"])
+        raise asyncio.CancelledError
+
+    runner._run_agent = model
+    runner._session_db = None
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = lambda source: ""
+    runner._telegram_topic_new_header = lambda source: ""
+    original_executor = runner._run_in_executor_with_context
+    control_done = False
+
+    async def executor(func, *args, **kwargs):
+        nonlocal control_done
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "_exact_executing_tick" and not control_done:
+            control_done = True
+            mgr = loops.LoopManager(entry.session_id)
+            if control == "pause":
+                mgr.pause()
+            elif control == "clear":
+                mgr.clear()
+            else:
+                mgr.set("replacement work", interval_seconds=60, times=2, route={
+                    "platform": "telegram", "chat_id": source.chat_id,
+                    "chat_type": "dm", "user_id": source.user_id,
+                })
+        return result
+
+    runner._run_in_executor_with_context = executor
+    generation = runner._begin_session_run_generation(entry.session_key)
+    adapter.set_message_handler(
+        lambda event: runner._handle_message_with_agent(event, source, entry.session_key, generation)
+    )
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+        assert control_done, "test did not reach the exact execution return boundary"
+        assert executions == [], f"model work ran after /loop {control} won the exact execution gap"
+        saved = loops.load_loop(entry.session_id)
+        if control == "pause":
+            assert saved.status == "paused"
+        elif control == "clear":
+            assert saved.status == "cleared"
+        else:
+            assert saved.status == "active"
+            assert saved.prompt == "replacement work"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_command_loop_fence_rechecks_reset_after_command_resolution(control_home):
+    runner, _adapter, source, entry = native_runner(control_home)
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set("/model", interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    assert mgr.fire_tick()
+    saved = loops.load_loop(entry.session_id)
+    event = runner._synthetic_prompt_event(source, "/model", internal=True, reply_expected=False)
+    event.metadata.update({
+        "hermes_loop_wakeup": True,
+        "gateway_session_id": entry.session_id,
+        "gateway_loop_tick": [saved.created_at, saved.ticks_fired],
+    })
+    effects = []
+    reset = MessageEvent(text="/new", source=source)
+    reset_done = False
+
+    async def model_command(_event):
+        effects.append("model")
+        return "model ran"
+
+    async def emit_collect(name, _context):
+        nonlocal reset_done
+        if name == "command:model" and not reset_done:
+            reset_done = True
+            await runner._handle_reset_command(reset)
+        return []
+
+    runner._handle_model_command = model_command
+    runner.hooks.emit_collect = emit_collect
+    runner._session_db = None
+    runner._cleanup_old_agent_for_reset = AsyncMock()
+    runner._reset_notice_session_info = lambda source: ""
+    runner._telegram_topic_new_header = lambda source: ""
+    try:
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        assert reset_done, "test did not reach the command hook reset boundary"
+        assert (handled, result) == (True, None)
+        assert effects == [], "old loop command ran after public /new during command resolution"
+        assert loops.load_loop(entry.session_id).status == "cleared"
+        assert runner.session_store.peek_session_id(entry.session_key) != entry.session_id
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_reset_after_admission_does_not_execute_old_tick(control_home):
     runner, adapter, source, entry = native_runner(control_home)
     mgr = create_loop(entry, source)

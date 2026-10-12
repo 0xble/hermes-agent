@@ -327,6 +327,9 @@ class LoopState:
     max_ticks: int = DEFAULT_MAX_TICKS  # config backstop; 0 = unlimited
     ticks_fired: int = 0
     created_at: float = 0.0
+    # Monotonic in-process control fence. Pause/clear/resume/set bump it so an already admitted
+    # tick cannot cross a control boundary during the executor return gap.
+    control_generation: int = 0
     last_fired_at: float = 0.0
     next_due_at: float = 0.0
     # True between "wakeup injected" and "that turn's response evaluated": stops a tick from
@@ -396,10 +399,23 @@ class LoopState:
 
 
 _META_PREFIX = "loop:"
+_CONTROL_GENERATIONS: Dict[str, int] = {}
 
 
 def _meta_key(session_id: str) -> str:
     return f"{_META_PREFIX}{session_id}"
+
+
+def _remember_control_generation(session_id: str, state: Optional[LoopState]) -> None:
+    if not session_id or state is None:
+        return
+    current = _CONTROL_GENERATIONS.get(session_id, 0)
+    _CONTROL_GENERATIONS[session_id] = max(current, int(getattr(state, "control_generation", 0) or 0))
+
+
+def loop_control_generation(session_id: str) -> int:
+    """Return the process-local fence for synchronous gateway execution-entry checks."""
+    return _CONTROL_GENERATIONS.get(session_id, 0)
 
 
 def _get_session_db() -> Optional[Any]:
@@ -446,7 +462,9 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
         raw = row[0] if row else None
     else:
         raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
-    return _parse_state(raw, session_id) if raw else None
+    state = _parse_state(raw, session_id) if raw else None
+    _remember_control_generation(session_id, state)
+    return state
 
 
 def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
@@ -468,12 +486,14 @@ def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
         db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
     else:
         _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
+    _remember_control_generation(session_id, state)
 
 
 def clear_loop(session_id: str) -> None:
     """Mark a loop cleared in the DB (preserved for audit, status=cleared)."""
     state = load_loop(session_id)
     if state is not None:
+        state.control_generation = max(state.control_generation, loop_control_generation(session_id)) + 1
         state.status = "cleared"
         save_loop(session_id, state)
 
@@ -684,6 +704,11 @@ class LoopManager(LoopRevisionsMixin):
             until=(until or "").strip(),
             max_ticks=max_ticks_default(),
             created_at=now,
+            control_generation=max(
+                loop_control_generation(self.session_id),
+                int(getattr(self._state, "control_generation", 0) or 0),
+                int(getattr(stored, "control_generation", 0) or 0),
+            ) + 1,
             next_due_at=now,
             route=dict(route or {}),
         )
@@ -695,6 +720,7 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         if not s or s.status not in {"active", "paused"}:
             return None
+        s.control_generation = max(s.control_generation, loop_control_generation(self.session_id)) + 1
         s.status, s.paused_reason, s.awaiting_response = "paused", reason, False
         return self._save()
 
@@ -703,6 +729,7 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         if not s or s.status == "cleared":
             return None
+        s.control_generation = max(s.control_generation, loop_control_generation(self.session_id)) + 1
         s.status, s.paused_reason, s.awaiting_response = "active", None, False
         # Re-arm relative to now so a long pause doesn't fire instantly N times.
         delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
@@ -713,6 +740,9 @@ class LoopManager(LoopRevisionsMixin):
     def clear(self) -> bool:
         if self._state is None or self._state.status == "cleared":
             return False
+        self._state.control_generation = max(
+            self._state.control_generation, loop_control_generation(self.session_id)
+        ) + 1
         self._state.status = "cleared"
         self._state.awaiting_response = False
         self._save()
@@ -1250,7 +1280,8 @@ def dispatch_loop_command(
 __all__ = [
     "LoopState", "LoopManager", "parse_loop_args", "parse_interval_token", "format_interval",
     "response_signals_complete", "goal_blocks_loop_tick", "load_loop", "save_loop", "clear_loop",
-    "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "LOOP_COMPLETE_MARKER",
+    "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "loop_control_generation",
+    "LOOP_COMPLETE_MARKER",
     "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",
     "DEFAULT_MAX_TICKS", "is_quiet_wakeup_prompt",
 ]

@@ -824,27 +824,30 @@ class GatewayGoalsMixin:
         post-hop check therefore proves the routing entry, run generation (when the
         model-turn path owns one), and exact persisted tick phase all still match.
         """
-        from hermes_cli.loops import LoopManager
+        from hermes_cli.loops import LoopManager, loop_control_generation
 
         session_key = self._session_key_for_source(source)
 
-        def _exact_executing_tick() -> bool:
+        def _exact_executing_tick() -> Optional[int]:
             current = self.session_store.lookup_by_session_key(session_key)
             if current is None or current.session_id != sid:
-                return False
+                return None
             state = LoopManager(sid).state
-            return bool(
+            if not (
                 state is not None
                 and state.status == "active"
                 and state.awaiting_response
                 and state.claim_phase == "executing"
                 and (state.created_at, state.ticks_fired) == tick
-            )
+            ):
+                return None
+            return int(getattr(state, "control_generation", 0) or 0)
 
         current = await self._run_in_executor_with_context(_exact_executing_tick)
-        # No await after this check: /new or /stop may win even the validation
-        # worker's return gap. Their monotonic run generation is loop-side state.
-        return bool(current) and (
+        # No await after this check: /new, pause, clear, or re-set may win even the validation
+        # worker's return gap. The loop-control fence is process-local state updated synchronously
+        # by LoopManager writes, while the worker snapshot covers cross-process durable state.
+        return bool(current is not None) and loop_control_generation(sid) == current and (
             run_generation is None or self._is_session_run_current(session_key, run_generation)
         )
 
