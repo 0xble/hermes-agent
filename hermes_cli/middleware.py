@@ -163,6 +163,8 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
 
     payload_key = "request" if "request" in kwargs else "args"
     manager = _delivery_manager()
+    if manager is None:
+        return terminal_call(kwargs[payload_key])
     callbacks = list(manager._middleware.get(kind, []))
     if not callbacks:
         return terminal_call(kwargs[payload_key])
