@@ -921,13 +921,18 @@ class GatewayGoalsMixin:
         after command resolution. For a rewrite fallthrough, the current-generation check is kept
         synchronous immediately before the local bump; the durable row CAS then makes the handoff
         explicit and rejects reset/stop/control races.
+
+        The first generation read is this attempt's ownership token. Rejected handoffs must return
+        that token, not whatever generation a successor installed while the executor was awaited:
+        the caller's ``finally`` uses it to release only state this attempt could have acquired.
         """
+        owned_generation = self._current_session_run_generation(session_key)
         metadata = getattr(event, "metadata", None) or {}
         handoff = metadata.get("gateway_loop_run_handoff")
         if "gateway_loop_run_handoff" not in metadata:
             return self._begin_session_run_generation(session_key), True
         if not isinstance(handoff, dict):
-            return self._current_session_run_generation(session_key), False
+            return owned_generation, False
         try:
             sid = str(handoff["session_id"])
             raw_tick = handoff["tick"]
@@ -937,9 +942,9 @@ class GatewayGoalsMixin:
             expected_run = int(handoff["run_generation"])
             control_generation = int(handoff["control_generation"])
         except (KeyError, TypeError, ValueError):
-            return self._current_session_run_generation(session_key), False
+            return owned_generation, False
         if self._loop_wake_command_identity(event) != (sid, tick):
-            return self._current_session_run_generation(session_key), False
+            return owned_generation, False
         from hermes_cli.loops import LoopManager
 
         def _owned_handoff_phase():
@@ -960,15 +965,16 @@ class GatewayGoalsMixin:
         # already won the boundary must prevent this turn from acquiring a successor generation.
         current_run = self._current_session_run_generation(session_key)
         if current_run != expected_run or phase is None:
-            return current_run, False
+            return owned_generation, False
         if phase == "started":
             # An actual observer effect already started this tick. Continue the same run; never
             # transfer a started tick to a new generation or replay its already-started producers.
             metadata.pop("gateway_loop_run_handoff", None)
             return expected_run, True
         generation = self._begin_session_run_generation(session_key)
+        owned_generation = generation
         if generation != expected_run + 1:
-            return generation, False
+            return owned_generation, False
         rebound = await self._run_in_executor_with_context(
             lambda: LoopManager(sid).rebind_tick_run_generation(
                 tick, control_generation=control_generation,
@@ -976,7 +982,7 @@ class GatewayGoalsMixin:
             )
         )
         if not rebound:
-            return generation, False
+            return owned_generation, False
         metadata.pop("gateway_loop_run_handoff", None)
         return generation, True
 

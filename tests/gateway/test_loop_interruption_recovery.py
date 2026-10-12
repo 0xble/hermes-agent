@@ -17,6 +17,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
+from gateway.turn_lease import SessionTurnLeaseRegistry
 from hermes_cli import goals, loops
 
 
@@ -38,6 +39,7 @@ def native_runner(home):
     runner._running_agents = {}
     runner._run_in_executor_with_context = asyncio.to_thread
     runner._background_tasks = set()
+    runner._turn_leases = SessionTurnLeaseRegistry()
     runner._queued_events = {}
     runner._is_telegram_topic_lane = lambda source: False
     runner._cache_session_source = lambda *args: None
@@ -970,6 +972,60 @@ async def test_native_loop_command_hook_supersede_after_effect_cas(control_home)
         runner._run_agent.assert_not_awaited()
         assert loops.load_loop(entry.session_id).status == "cleared"
     finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_real_admission_rejected_handoff_cannot_release_successor(control_home):
+    """A successor admitted during the handoff executor gap keeps its run state and lease."""
+    runner, adapter, source, entry = native_runner(control_home)
+    loops.LoopManager(entry.session_id).set(
+        "/learn reusable checking", interval_seconds=60, times=2, route=_route(source),
+    )
+    runner._send_command_ack = AsyncMock()
+    runner._run_agent = AsyncMock()
+    original_executor = runner._run_in_executor_with_context
+    successor = object()
+    installed = False
+    successor_generation = None
+
+    async def executor(func, *args, **kwargs):
+        nonlocal installed, successor_generation
+        result = await original_executor(func, *args, **kwargs)
+        if getattr(func, "__name__", "") == "_owned_handoff_phase" and not installed:
+            installed = True
+            old_generation = runner._current_session_run_generation(entry.session_key)
+            runner._release_running_agent_state(entry.session_key, run_generation=old_generation)
+            runner._invalidate_session_run_generation(entry.session_key, reason="test successor")
+            successor_generation = runner._begin_session_run_generation(entry.session_key)
+            state = runner._session_state(entry.session_key)
+            state.turn.agent = successor
+            token = await runner._turn_leases.acquire(
+                entry.session_id, owner_key=entry.session_key,
+                generation=successor_generation, timeout=1.0,
+            )
+            state.turn.lease_tokens[successor_generation] = token
+        return result
+
+    runner._run_in_executor_with_context = executor
+    adapter.set_message_handler(runner._handle_admitted_message)
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await scan(runner, entry.session_id)
+        await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    try:
+        assert installed, "test did not reach the real handoff executor boundary"
+        assert successor_generation == 2
+        runner._run_agent.assert_not_awaited()
+        state = runner._session_state(entry.session_key)
+        assert state.turn.agent is successor
+        assert successor_generation in state.turn.lease_tokens
+        assert loops.load_loop(entry.session_id).awaiting_response is True
+    finally:
+        runner._release_turn_lease(entry.session_key, successor_generation)
+        runner._release_running_agent_state(entry.session_key, run_generation=successor_generation)
         runner.session_store.close_all_db_handles()
 
 
