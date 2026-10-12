@@ -259,6 +259,11 @@ def test_rollback_journal_scan_finishes_before_startup_lets_writers_in(
     caller, returned, result = _boot_in_thread(tmp_path)
     try:
         assert started.wait(timeout=2), "integrity check was not started"
+        # The old life must remain the sentinel owner while the synchronous scan is held;
+        # otherwise this process's watchdog exit could rewrite the prior-life evidence.
+        sentinel = json.loads(get_lifecycle_sentinel_path(tmp_path).read_text())
+        assert sentinel["phase"] == "running"
+        assert sentinel["pid"] == _DEAD_PID
         # Event-gated: the checker cannot finish until released, so a return here is a scan
         # left running beside the writers this boot is about to start.
         assert not returned.is_set(), "startup returned with the rollback-journal scan still running"

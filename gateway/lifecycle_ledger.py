@@ -275,19 +275,19 @@ def _warn_unclean_exit(evidence: Dict[str, Any]) -> None:
 
 
 def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Detect and claim synchronously, then integrity-check the store per its journal mode.
+    """Detect an unclean prior life, preserve the journal-mode startup ordering, and claim.
 
-    WAL (the default): a pending diagnostic record is written before a daemon worker owns a
-    copy of the evidence and runs the scan; the worker appends the completed verdict when
-    finished, so a minutes-long scan of a huge store stays off the readiness path. A WAL reader
-    never blocks writers; it only pins its snapshot, so checkpoints cannot reset
-    ``state.db-wal`` until it ends (``maintenance/gateway-loop-statedb-guard.md``). Anything
-    else (DELETE / unreadable header): a rollback
-    reader holds SHARED for the whole scan and would fail every writer with "database is
-    locked", so it runs here, before any SessionDB writer of ours exists, under a startup
-    lease, and the returned evidence carries ``state_db_integrity``. Never raises.
+    WAL (the default): the sentinel is claimed, then a pending diagnostic record is written before
+    a daemon worker owns a copy of the evidence and runs the scan; the worker appends the
+    completed verdict when finished, so a minutes-long scan of a huge store stays off the
+    readiness path. A WAL reader never blocks writers; it only pins its snapshot, so checkpoints
+    cannot reset ``state.db-wal`` until it ends (``maintenance/gateway-loop-statedb-guard.md``).
+    Anything else (DELETE / unreadable header): the scan runs synchronously before this process
+    claims the sentinel or opens any SessionDB writer, under a startup lease, and the returned
+    evidence carries ``state_db_integrity``. Never raises.
     """
     evidence: Optional[Dict[str, Any]] = None
+    wal_mode: Optional[bool] = None
     try:
         home = _process_hermes_home() if home is None else home
         evidence = detect_unclean_exit(home)
@@ -295,6 +295,15 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
             _warn_unclean_exit(evidence)
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
+    if evidence is not None:
+        try:
+            # DELETE/unreadable-header stores must complete the synchronous scan before
+            # this process claims the sentinel, preserving the base startup ordering.
+            wal_mode = _state_db_is_wal(home)
+            if not wal_mode:
+                _report_unclean_exit(evidence, home, renew_startup_lease=True)
+        except Exception:
+            logger.error("Unclean-exit state.db integrity check could not run", exc_info=True)
     try:
         claim: Dict[str, Any] = {"phase": "running", "pid": os.getpid(), "start_time": time.time(), "started_at": _now_iso()}
         # Process birth is distinct from the ledger claim time; the Windows start
@@ -314,9 +323,11 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
-    if evidence is not None:
+    if evidence is not None and wal_mode is not False:
         try:
-            if not _state_db_is_wal(home):
+            if wal_mode is None:
+                wal_mode = _state_db_is_wal(home)
+            if not wal_mode:
                 _report_unclean_exit(evidence, home, renew_startup_lease=True)
                 return evidence
             _append_exit_diag(

@@ -78,10 +78,12 @@ archive-bounded id-ordered replay.
 
 ## Crash-recovery integrity scan
 
-After an unclean prior life, `gateway/lifecycle_ledger.py::record_startup` claims
-the new sentinel, logs the WARNING and sets `prior_unclean_exit` /
-`prior_suspected_oom` synchronously. Where `PRAGMA quick_check(1)` runs depends on
-the on-disk journal mode, read lock-free from header bytes 18/19:
+After an unclean prior life, `gateway/lifecycle_ledger.py::record_startup` logs
+that WARNING and sets `prior_unclean_exit` / `prior_suspected_oom` on the new
+sentinel. In WAL mode it claims that sentinel before the asynchronous scan; in
+DELETE/unreadable-header mode it completes the synchronous scan before claiming
+it. Where `PRAGMA quick_check(1)` runs depends on the on-disk journal mode, read
+lock-free from header bytes 18/19:
 
 - **WAL (default):** `record_startup` first appends a
   `gateway.previous_unclean_exit` record with `state_db_integrity: "pending"`, then
@@ -93,9 +95,13 @@ the on-disk journal mode, read lock-free from header bytes 18/19:
   the prior-life evidence after the sentinel has been claimed. It is not an
   integrity verdict; the later record for the same prior life carries that result.
 - **Anything else (DELETE / unreadable header):** the scan runs synchronously
-  inside `record_startup`, before `runner.start()` opens any SessionDB writer of
-  this process, under the renewed `state_db_unclean_integrity_check` lease
-  (#115542), exactly as before this patch. A rollback-journal reader holds SHARED
+  inside `record_startup`, before this process claims the new sentinel and before
+  `runner.start()` opens any SessionDB writer, under the renewed
+  `state_db_unclean_integrity_check` lease
+  (#115542), exactly as before this patch. Keeping the prior life as sentinel
+  owner until the scan ends means a watchdog exit during a stalled scan cannot
+  mark that prior life clean and suppress the next boot's check.
+  A rollback-journal reader holds SHARED
   for the whole scan, so a background scan would fail every writer with
   `database is locked` (review repro: `SessionDB.create_session` failed after
   60.1 s). Stores on `database.journal_mode: delete` (virtiofs/NFS/SMB) or forced
