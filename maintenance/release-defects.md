@@ -842,3 +842,26 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   (`test_cleanup_inactive_env_keeps_container_with_owner_spawned_process`).
 - Retire when upstream's process liveness query matches both the container key
   and raw spawning owner, with equivalent idle-reaper coverage.
+
+## Shared-metrics install receipt aging clock
+
+- Fork patch identity: `install-run-clock`.
+- `hermes_cli/observability/shared_metrics_install_run.py::_stale` aged receipts
+  against wall time while consent-day selection and recording used
+  `shared_metrics._utc_now`. The consent-day regression pinned the store to
+  2026-10-06, so it began deleting a still-pending receipt after wall time crossed
+  the seven-day cutoff on 2026-10-13. Use the store clock throughout; preserve
+  the seven-day cap, consent gate, opt-out purge and unreadable-receipt deletion.
+- Upstream already carries the same production fix in
+  [`10a877bc9e5f6ecd1c32da0fa93af25b1dd1e60e`](https://github.com/NousResearch/hermes-agent/commit/10a877bc9e5f6ecd1c32da0fa93af25b1dd1e60e).
+  Adapt only that fix to the accepted fork baseline, not moving upstream main.
+  Its test-date-only predecessor PR #137741 does not protect clock consistency.
+  Fork #549 pinned the module's `time` attribute in the consent-day test; that
+  test now relies on the single store clock instead, since `time` is gone.
+- Guard: `tests/hermes_cli/test_shared_metrics_install_run.py`, especially
+  `test_receipt_age_uses_the_store_clock_when_wall_time_disagrees`: pin the store
+  years before and after wall time, keep a six-day-old pending receipt, then
+  delete it unreported at eight days. Keep
+  `test_unreadable_and_week_old_receipts_are_deleted_unreported` unchanged.
+- Retire the production patch when an accepted upstream release contains the
+  clock fix. Preserve equivalent past/future-clock coverage during that sync.
