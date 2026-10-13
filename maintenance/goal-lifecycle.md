@@ -177,6 +177,25 @@ the blocker. This adopts upstream's conversational recovery policy, not semantic
 proof that the blocker is solved. The next judge may block again. Explicit user
 pauses remain authoritative.
 
+## Successful empty turn admission
+
+Fork patch identity: `goal-turn-outcome`. No upstream implementation of this shared
+admission boundary was found. Gateway, CLI, TUI and Desktop admit successful turns
+to the goal evaluator even when the response is empty or whitespace. Failure
+notices, interrupted replies and incomplete turns are not progress. Explicit
+outcomes are authoritative; only legacy callers without an outcome retain the
+nonempty-text fallback. Existing non-failed iteration-summary handoffs remain
+resumable boundaries. The CLI uses the current result's response, never an earlier
+assistant message, when that result is available. Loop cleanup remains independent
+of goal admission. This changes no user-authority, provenance, display/silence or
+revision semantics; the full revision history contract above remains binding.
+
+Proof: the `test_goal_empty_turn.py` suites in gateway and tui_gateway plus
+`tests/hermes_cli/test_cli_goal_empty_turn.py` cover successful empty/tool-only and
+silent replies, legacy fallback, and failed/interrupted/incomplete rejection.
+Rollback reverts this boundary; there is no schema migration or configuration.
+Retire when upstream provides the same outcome-based admission on all surfaces.
+
 ## Verification
 
 Run scripts/run_tests.sh for tests/hermes_cli/test_goal_criteria_completeness.py,

@@ -596,9 +596,11 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
-        # Error notices and interrupted partial replies are not goal progress.
-        # Events from legacy/direct callers without an outcome retain text fallback.
-        if getattr(event, "_agent_turn_succeeded", None) is False:
+        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        successful = is_successful_goal_turn(
+            agent_result, final_text, succeeded=getattr(event, "_agent_turn_succeeded", None),
+        )
+        if not successful:
             final_text = ""
         try:
             session_entry = await self.async_session_store.get_or_create_session(
@@ -607,10 +609,10 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        # Unsuccessful or empty responses must not drive /goal, but an in-flight /loop tick
-        # still needs to be released and rescheduled.
+        # Failed/interrupted turns stay out of /goal. Successful empty turns still carry
+        # tool evidence; an in-flight /loop tick always needs release/rescheduling.
         hooks = [("loop completion", self._post_turn_loop_completion, {})]
-        if final_text.strip():
+        if successful:
             # A process or delegation result injected by the completion path is new evidence and
             # may pierce the continuation gap, including one drained behind a goal continuation
             # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
