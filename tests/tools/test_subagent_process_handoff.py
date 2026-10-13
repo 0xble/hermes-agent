@@ -7,6 +7,7 @@ named on the child's result as orphaned before teardown kills it.
 """
 
 import json
+import threading
 import time
 import weakref
 
@@ -86,6 +87,48 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     finally:
         process_registry.kill_all(source="test")
         _unregister_subagent(sid)
+
+
+def test_unread_child_completion_waits_for_publication(monkeypatch):
+    """Force the exited-but-unpublished interval instead of relying on hosted load."""
+    import tools.process_registry as _pr
+
+    sid = "sa-0-handoff-publication"
+    registry = ProcessRegistry()
+    persisting = threading.Event()
+    release = threading.Event()
+    save_result = _pr.save_completed_result
+
+    def blocked_save(session, **kwargs):
+        if session.owner_task_id == sid:
+            persisting.set()
+            if not release.wait(10):
+                raise TimeoutError("Test did not release completion persistence")
+        return save_result(session, **kwargs)
+
+    monkeypatch.setattr(_pr, "save_completed_result", blocked_save)
+    unread = registry.spawn_local("echo UNREAD_RESULT", task_id=sid, owner_task_id=sid)
+    unread.notify_on_complete = True
+    try:
+        assert persisting.wait(10)
+        assert unread.exited
+        assert not unread._completion_event.is_set()
+        # Exit is observed before receipt IO finishes; the result is not yet published.
+        assert registry.unread_completions_owned_by(sid) == []
+        release.set()
+        # Unlike wait()/poll()/read_log(), this barrier does not consume the child's result.
+        assert unread._completion_event.wait(10)
+        assert [s.id for s in registry.unread_completions_owned_by(sid)] == [unread.id]
+        assert "UNREAD_RESULT" in unread.output_buffer
+        notice = registry.completion_queue.get(timeout=10)
+        assert notice["session_id"] == unread.id
+        assert notice["owner_task_id"] == sid
+        assert "UNREAD_RESULT" in notice["output"]
+    finally:
+        release.set()
+        if unread._reader_thread is not None:
+            unread._reader_thread.join(timeout=10)
+        registry.kill_all(source="test")
 
 
 def test_handoff_refuses_exited_foreign_or_non_child_callers(clean_queue):
