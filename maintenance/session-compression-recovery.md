@@ -41,7 +41,9 @@ session-id lookup, at exactly one of these points:
   or a follow-up merged into the head's refreshed checkpoint;
 - expired: `QUEUE_CHECKPOINT_MAX_AGE_SECONDS` (7 days) bounds any crash window
   between admission and retirement;
-- unauthorized owner at recovery: quarantined to `*.bad`, never replayed.
+- unauthorized owner at recovery: quarantined to `*.bad`, never replayed. Any
+  declined accepted-queue claim stops recovery for that checkpoint; it never
+  falls through to a naked transcript row.
 
 Goal continuations and heartbeat ticks are not checkpointed: goal state and the
 heartbeat poller re-derive them. Older goal-continuation checkpoints are dropped
@@ -59,7 +61,13 @@ use `session_search(session_id=..., around_message_id=...)` to locate it. Full
 content remains in SessionDB and the native session exporter. Do not replay
 completed effects, grant a summary authority, or silently clip giant mandatory
 user/system instructions. Requests include system/tools/media estimates,
-selected output cap and estimator/transport safety headroom. A one-shot ephemeral
+the transport's effective output cap and estimator/transport safety headroom.
+The effective cap is resolved by the builders' own helpers (Anthropic native
+ceiling, window clamp and thinking floor; profile default and Gemini thinking
+raise), so an unset cap is never priced as zero. It is reserved where the
+endpoint rejects input + cap over the window; Claude 4.5+ stops generation at
+the window instead, so only an explicitly selected cap is reserved there. A
+one-shot ephemeral
 cap replaces the configured cap, including when lower; fit estimation peeks
 without consuming it and shares selection with request builders. The auxiliary
 summarizer cap is not a main-request cap. Native Responses fit uses the same
@@ -120,7 +128,9 @@ Ordinary FIFO acceptance writes the native private pending spool with file and
 directory fsync before memory acknowledgement. Such a spool is not expired or
 consumed by restart replay as a naked transcript row; it transfers to the native
 transcript only after the matching platform id is durably admitted. A platform id
-is admission dedupe, never proof of a completed reply or effect.
+is admission dedupe, never proof of a completed reply or effect. A turn reuses a
+historical trigger row only for an identical retry (same id and content); new
+content under a reused id is new input.
 Also exercise native preflight, in-place/commit rollback, tail watermark,
 compression fallback/attempt lifecycle, pending-input dedupe and isolated
 loopback-provider/kill9 compaction suites. Local recording fake-provider traffic
