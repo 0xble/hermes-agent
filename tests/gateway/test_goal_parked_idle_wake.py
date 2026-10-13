@@ -193,7 +193,7 @@ async def test_watcher_resumes_goal_parked_on_restart_killed_process(hermes_home
         assert cause not in event.text.lower()
     assert event.metadata["gateway_session_key"] == KEY
     assert event.source.message_id is None
-    assert adapter.sent == ["▶ Goal wait ended — resuming."]
+    assert adapter.sent == []  # resuming is silent; the continuation turn is the signal
     state = goals.load_goal(SID)
     assert state.status == "active" and state.waiting_on_session is None
 
@@ -244,7 +244,7 @@ async def test_stale_resume_pending_does_not_block_lifted_barrier(hermes_home, m
     for cause in ("gateway_shutdown", "shutdown", "restart", "gateway"):
         assert cause not in adapter.handled[0].text.lower()
     assert entry.resume_pending is False
-    assert adapter.sent == ["▶ Goal wait ended — resuming."]
+    assert adapter.sent == []  # resuming is silent; the continuation turn is the signal
     assert goals.load_goal(SID).waiting_on_session is None
 
 
@@ -258,7 +258,7 @@ async def test_silent_adapter_refusal_keeps_the_barrier(hermes_home, monkeypatch
 
     await _one_scan(runner, monkeypatch)
 
-    assert adapter.sent == []  # no "resuming" notice for a turn that never started
+    assert adapter.sent == []
     assert goals.load_goal(SID).waiting_on_session == PROC
 
 
