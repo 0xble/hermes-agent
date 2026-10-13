@@ -324,3 +324,20 @@ def test_late_summarizer_after_recovery_commit_is_discarded(tmp_path):
     assert all(retained[rid] == content for rid, content in originals.items())
     assert [m["content"] for m in late["result"][0]] == [m["content"] for m in rows]
     assert agent.session_id == "recovery"
+
+
+# ── P1: a reused platform id with different content is new input, not a retry ──
+
+def test_same_id_different_content_is_new_input_not_replaced_by_history(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _chat_agent(db)
+    db.append_message(agent.session_id, "user", "first version", platform_message_id="telegram:101")
+    db.append_message(agent.session_id, "assistant", "first answer")
+    history = db.get_messages_as_conversation(agent.session_id)
+    with patch.object(agent, "_save_trajectory"), patch.object(agent, "_cleanup_task_resources"):
+        agent.run_conversation("different accepted instruction", conversation_history=history,
+                               persist_user_platform_id="telegram:101")
+    sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert [m["content"] for m in sent if m["role"] == "user"][-1] == "different accepted instruction"
+    durable = [r["content"] for r in db.get_messages(agent.session_id, include_inactive=True) if r["role"] == "user"]
+    assert durable == ["first version", "different accepted instruction"]

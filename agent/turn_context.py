@@ -707,6 +707,16 @@ def _stage_turn_user_message(
     return user_msg, pending_cli_message
 
 
+def _same_trigger_content(row_content: Any, user_message: Any, persist_user_message: Any) -> bool:
+    """True when a historical user row carries this turn's input (API or persisted variant),
+    compared after surrounding-whitespace normalization for text."""
+    def norm(value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+    row = norm(row_content)
+    return any(row == norm(candidate) for candidate in (user_message, persist_user_message)
+               if candidate is not None)
+
+
 def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]]) -> None:
     """Hydrate process-local state from persisted history on the first resumed turn."""
     if not conversation_history:
@@ -1136,10 +1146,13 @@ def build_turn_context(
     # (including completed tool receipts), rather than appending a second trigger.
     # SessionDB replays expose the id as ``message_id`` (JSONL compat) as well as
     # ``platform_message_id``; match either so a DB-replayed trigger is not re-appended.
+    # Reuse only an identical retry: a row sharing the id but carrying different content is
+    # distinct input (FIFO admission treats it so) and must not be replaced by the older text.
     accepted_idx = next((i for i, row in enumerate(messages)
         if persist_user_platform_id is not None and isinstance(row, dict) and row.get("role") == "user"
         and str(persist_user_platform_id) in (
-            str(row.get("platform_message_id") or ""), str(row.get("message_id") or ""))), None)
+            str(row.get("platform_message_id") or ""), str(row.get("message_id") or ""))
+        and _same_trigger_content(row.get("content"), user_message, persist_user_message)), None)
     if accepted_idx is None:
         append_message(messages, user_msg)
         current_turn_user_idx = len(messages) - 1
