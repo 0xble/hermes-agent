@@ -118,8 +118,19 @@ class ProcessCheckpointMixin:
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
             recorded_exit = None
-            if survivor and (not pid or fate == "reused"):
+            recorded_termination = {}
+            if survivor:
+                # A survivor's durable exit marker is authoritative even when the
+                # wrapper PID still looks alive during the restart probe. The
+                # operator-kill receipt is written before the local process tree is
+                # fully reaped, so recovery must not start a poller that downgrades
+                # that receipt to a normal exit or survivor_lost result.
                 recorded_exit = self._recorded_survivor_exit(fields.get("exit_path"))
+                recorded_termination = self._recorded_survivor_termination(fields.get("exit_path"))
+                if recorded_exit is None and recorded_termination.get("completion_reason") == "killed":
+                    recorded_exit = recorded_termination.get("exit_code", -15)
+                    if not isinstance(recorded_exit, int):
+                        recorded_exit = -15
                 if fate == "reused" and recorded_exit is None:
                     logger.info(
                         "Not recovering survivor %s: pid %d was recycled onto an unrelated "
@@ -153,8 +164,8 @@ class ProcessCheckpointMixin:
             if not pid or recorded_exit is not None:
                 self._finish_survivor(
                     session, recorded_exit,
-                    "exited" if recorded_exit is not None else "lost",
-                    "" if recorded_exit is not None else "survivor_lost",
+                    recorded_termination.get("completion_reason", "exited") if recorded_exit is not None else "lost",
+                    recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
                 )
                 continue
             if session.survive_restart:

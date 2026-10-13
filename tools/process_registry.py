@@ -2362,6 +2362,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
+            if session.survive_restart:
+                self._write_survivor_termination(session, session.completion_reason, source)
             refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()

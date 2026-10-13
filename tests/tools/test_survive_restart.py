@@ -257,7 +257,7 @@ def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeyp
     home = _home(monkeypatch, tmp_path)
     registry = ProcessRegistry()
     session = registry.spawn_local(
-        "sleep 5", cwd=str(tmp_path), task_id="task", survive_restart=True,
+        "exec sleep 5", cwd=str(tmp_path), task_id="task", survive_restart=True,
     )
     assert session.survive_restart is True
     assert registry.kill_all(source="gateway_shutdown") == 0
@@ -266,6 +266,28 @@ def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeyp
     assert registry.kill_all(source="cli.stop") == 1
     session.process.wait(timeout=3)
     assert (home / "process-runs" / session.id).exists()
+
+
+def test_killed_survivor_replays_as_killed_after_restart(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = producer.spawn_local(
+        "exec sleep 30", cwd=str(tmp_path), task_id="task", survive_restart=True,
+    )
+    session.notify_on_complete = True
+    producer._write_checkpoint()
+
+    assert producer.kill_all(source="cli.stop") == 1
+    session.process.wait(timeout=3)
+
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 1
+    event = successor.completion_queue.get(timeout=5)
+    assert event["session_id"] == session.id
+    assert event["completion_reason"] == "killed"
+    assert event["termination_source"] == "cli.stop"
+    assert event["exit_code"] == -15
+    assert (home / "process-runs" / session.id / "exit").exists()
 
 
 def test_scoped_survivor_spawn_gets_user_bus_env(monkeypatch, tmp_path):

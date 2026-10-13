@@ -401,6 +401,43 @@ class ProcessSurvivalMixin:
         except ValueError:
             return -1
 
+    @staticmethod
+    def _survivor_termination_path(exit_path: str | None) -> Path | None:
+        return Path(exit_path).with_name("termination") if exit_path else None
+
+    @classmethod
+    def _recorded_survivor_termination(cls, exit_path: str | None) -> dict:
+        path = cls._survivor_termination_path(exit_path)
+        if path is None:
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _write_survivor_termination(cls, session: ProcessSession, reason: str, source: str) -> None:
+        path = cls._survivor_termination_path(session.exit_path)
+        if path is None:
+            return
+        try:
+            from utils import atomic_json_write, atomic_write_text
+            payload = {
+                "completion_reason": reason,
+                "termination_source": source,
+                "exit_code": session.exit_code,
+            }
+            atomic_json_write(path, payload, mode=0o600, fsync_dir=True)
+            # A killed wrapper may be SIGKILLed before it can write its own exit marker.
+            # Persist the operator's result as the durable fallback for recovery too.
+            if session.exit_path:
+                atomic_write_text(
+                    session.exit_path, f"{session.exit_code}\n", mode=0o600, fsync_dir=True,
+                )
+        except OSError:
+            logger.warning("Could not persist survivor termination for %s", session.id, exc_info=True)
+
     def _finish_survivor(self, session: ProcessSession, exit_code, reason: str, source: str) -> None:
         self._read_survivor_log(session)
         self._finish_exited(session, exit_code, reason=reason, source=source)
