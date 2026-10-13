@@ -1,10 +1,10 @@
 # Terminal heavy-slot
 
-Load when changing `tools/terminal_tool_heavy_slot.py`, how `terminal_tool` hands the execution command to `_run_foreground` or `spawn_background_process`, or local spawn and kill paths that a wrapped command passes through.
+Load when changing `tools/terminal_tool_heavy_slot.py`, how `terminal_tool` hands the execution command to `_run_foreground` or `spawn_background_process`, local spawn and kill paths that a wrapped command passes through, or the narrow installed-helper peel in `cron/lifecycle_guard.py`.
 
 ## Required behavior and provenance
 
-Fork patch identity: `terminal-heavy-slot`.
+Fork patch identities: `terminal-heavy-slot`; lifecycle-guard addition: `lifecycle-guard-heavy-slot-walk`.
 
 On the Mac Studio, agents started test suites and gates from the Hermes terminal tool directly. A 10-minute load probe on 2026-10-05 found an average of 9.5 suites or gates running outside the host's `heavy-slot` semaphore at once (12 at peak), on 28 cores at load 60-120. The shell-function wrappers in `~/.config/shell/heavy-slot.sh` only cover `./bin/ci` and `scripts/run_tests.sh` typed literally, and miss `pytest`, `uv run pytest`, `pnpm test` and `vitest`.
 
@@ -13,6 +13,12 @@ For the local backend only, `wrap_heavy_command` parses the command with the exi
 Never wrapped: non-local backends (Docker, SSH, Modal, Singularity, Daytona, Vercel), commands whose environment already has `HEAVY_SLOT_HELD` (nested runs share the outer slot), the opt-out `HERMES_HEAVY_SLOT=off` (also `0`, `false`, `no`) in the process or terminal environment, hosts without the helper, mentions of a runner in arguments, quotes, comments or heredoc bodies (`grep pytest`, `git commit -m 'pytest'`), targeted runs of 1-10 explicit test files whose options are all on a small single-run allowlist (`-q`, `-x`, `-k`, `--tb` and similar; any other option, such as `-n`, `--maxWorkers` or `--pool`, keeps the slot), and git-guard's `ci-gate`, which already takes its own slot around the repository gate. Any classifier error runs the command unwrapped.
 
 The helper runs the heavy command in its own process group under the shell's group and stops its whole tree when signalled. Foreground timeouts, background kills and PTY kills therefore still tear everything down and release the slot. A wait for a slot counts against the command's foreground timeout. Long gates should run in the background, as they already must.
+
+## Lifecycle guard contract
+
+The guard sees through `heavy-slot` only when an explicit absolute command path resolves by realpath to the installed helper at `~/.local/bin/heavy-slot` and the argv is exactly `heavy-slot [--label VALUE | --label=VALUE | --gate-fd N | --gate-fd=N]* -- CMD...`. An absolute symlink alias is trusted by identity, not basename. It never reads the trusted helper's Python source for that shape; it strictly scans `CMD...` and its executed scripts. Missing `--`, abbreviated or unknown options, malformed gate descriptors, relative and bare names, and every other file named `heavy-slot` stay on the strict walk. Bare names are resolved through the existing passive resolver only for that strict fallback; they never earn the peel, even on an unchanged PATH. The LPG caller already uses an absolute path, so no shell PATH-state model is needed. Remote text callbacks cannot attest the local helper's identity and never earn the exception.
+
+Generic interpreter/shebang leniency is retired. Every other directly executed script, including Python and `env` shebang forms, remains on the base strict walk; a shebang is not an attestation that its source is safe to tokenize as shell. The lifecycle guard does not model arbitrary interpreter dispatch, shell fallback, or command-specific PATH changes.
 
 Upstream: `heavy-slot` is a host-local tool, so this has no upstream equivalent and is not proposed upstream.
 
