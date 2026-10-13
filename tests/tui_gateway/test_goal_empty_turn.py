@@ -87,3 +87,34 @@ def test_tui_turn_evaluates_success_without_a_reply_and_releases_loop(server, tu
         assert completes[0]["status"] == "interrupted"
     else:
         assert completes[0]["status"] == "complete"
+
+
+def test_tui_exception_releases_inflight_loop_claim(server, turn_env, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import loops
+    from tests.tui_gateway.test_goal_command import _turn_session
+
+    session_key = "tui-exception-loop-claim"
+    loop = loops.LoopManager(session_key)
+    loop.set("Check the deployment", interval_seconds=300)
+    assert loop.fire_tick()
+
+    def run_conversation(*args, **kwargs):
+        raise RuntimeError("dispatcher failure")
+
+    agent = SimpleNamespace(session_id="tui-exception-transcript", run_conversation=run_conversation,
+                            clear_interrupt=lambda: None)
+    session = _turn_session(agent, session_key)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    server._run_prompt_submit("rid", "sid", session, "verify the work")
+
+    after = loops.load_loop(session_key)
+    assert after is not None
+    assert after.awaiting_response is False
+    assert after.next_due_at > 0
+    next_due_at = after.next_due_at
+    monkeypatch.setattr(loops.time, "time", lambda: next_due_at + 1)
+    next_loop = loops.LoopManager(session_key)
+    assert next_loop.fire_tick()
+    assert next_loop.state is not None
+    assert next_loop.state.ticks_fired == after.ticks_fired + 1

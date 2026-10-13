@@ -87,6 +87,41 @@ def test_cli_settlement_uses_raw_result_not_rendered_failure_notice(hermes_home,
     assert after_loop.status == "active"
 
 
+def test_cli_started_turn_without_result_cannot_reuse_stale_success(hermes_home, monkeypatch):
+    cli, manager = _make_cli_with_goal("cli-started-empty")
+    cli._last_turn_started = True
+    cli._last_turn_result = None
+    cli.conversation_history = [{"role": "assistant", "content": "prior work [LOOP_COMPLETE]"}]
+    judged = []
+
+    def judge(*args, **kwargs):
+        judged.append(args)
+        return "done", "stale prior work", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    cli._maybe_continue_goal_after_turn()
+    assert judged == []
+    assert manager.state.turns_used == 0
+    assert manager.state.status == "active"
+
+
+def test_cli_started_turn_without_result_cannot_reuse_stale_loop_marker(hermes_home):
+    from hermes_cli import loops
+
+    cli, _ = _make_cli_with_goal("cli-started-loop-empty")
+    loop = loops.LoopManager(cli.session_id)
+    loop.set("watch the deploy", interval_seconds=300)
+    assert loop.fire_tick()
+    cli._loop_manager = loop
+    cli._last_turn_started = True
+    cli._last_turn_result = None
+    cli.conversation_history = [{"role": "assistant", "content": "prior work [LOOP_COMPLETE]"}]
+    cli._maybe_complete_loop_tick_after_turn()
+    after = loops.load_loop(cli.session_id)
+    assert after.status == "active"
+    assert after.awaiting_response is False
+
+
 def test_cli_early_failure_cannot_reuse_previous_success(hermes_home, monkeypatch):
     cli, manager = _make_cli_with_goal("cli-setup-failure")
     cli._last_turn_result = {"completed": True, "final_response": "earlier successful response"}

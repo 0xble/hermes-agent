@@ -186,6 +186,7 @@ def test_cli_completion_refresh_preserves_mid_wakeup_revision(tmp_path, monkeypa
 
     fake = SimpleNamespace(
         session_id="cli-cache", _loop_manager=mgr, _last_turn_interrupted=False,
+        _last_turn_started=True, _last_turn_result={"completed": True, "final_response": "still working"},
         conversation_history=[{"role": "assistant", "content": "still working"}],
     )
     fake._get_loop_manager = lambda: mgr

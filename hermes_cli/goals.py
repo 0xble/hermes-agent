@@ -2441,6 +2441,7 @@ class GoalManager(GoalRevisionsMixin):
             waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
         )
 
+    @snapshot_control
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
@@ -2450,6 +2451,7 @@ class GoalManager(GoalRevisionsMixin):
         self._save()
         return True
 
+    @snapshot_control
     def clear_lifted_wait(self, waiting_since: float) -> bool:
         """Clear the barrier an idle surface just resumed, only if it is still that same wait
         (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
@@ -2485,6 +2487,7 @@ class GoalManager(GoalRevisionsMixin):
             return False
         return still
 
+    @snapshot_control
     def rearm_live_barrier(self) -> Optional[str]:
         """Refresh a due live barrier with a CAS write and return a new user notice, if any.
 

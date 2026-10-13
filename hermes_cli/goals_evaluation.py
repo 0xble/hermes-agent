@@ -103,8 +103,7 @@ def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: A
         if not published:
             return _decision(
                 manager.state.status if manager.state else None, False, None, "interrupted",
-                "goal changed after evaluation committed",
-                "Goal state changed during evaluation; the current goal was preserved.",
+                "goal changed after evaluation committed", "",
             )
         return decision
     except GoalEvaluationConflict:

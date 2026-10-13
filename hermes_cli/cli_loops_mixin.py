@@ -738,15 +738,14 @@ class CLILoopsMixin:
             _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
 
     def _post_turn_response(self) -> tuple[str, bool]:
-        """Read the current result before falling back to legacy transcript-only callers."""
+        """Read only the current turn result; a started turn without one is unsuccessful."""
         from hermes_cli.goal_turn_outcome import is_successful_goal_turn
         if getattr(self, "_last_turn_started", True) is False:
             return "", False  # chat() returned before the model ran (credentials/setup)
         result = getattr(self, "_last_turn_result", None)
-        response = (
-            str(result.get("final_response") or "") if isinstance(result, dict)
-            else self._last_assistant_response_text()
-        )
+        if not isinstance(result, dict):
+            return "", False  # a started turn with no result cannot reuse transcript text
+        response = str(result.get("final_response") or "")
         return response, is_successful_goal_turn(result, response)
 
     def _maybe_continue_goal_after_turn(self) -> None:

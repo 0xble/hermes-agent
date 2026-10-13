@@ -141,3 +141,57 @@ def test_revision_persistence_failure_is_not_ephemeral_success(tmp_path, monkeyp
             assert "could not read or commit" in caplog.text
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("operation", ["stop_waiting", "clear_lifted_wait", "rearm_live_barrier"])
+def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch, operation):
+    from contextlib import contextmanager
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    try:
+        manager = goals.GoalManager("wait-control-lock")
+        manager.set("original task")
+        monkeypatch.setattr(goals, "_pid_alive", lambda _pid: True)
+        manager.wait_on(12345)
+        entered = []
+
+        @contextmanager
+        def control_lock():
+            entered.append(True)
+            try:
+                yield
+            finally:
+                entered.pop()
+
+        manager._snapshot_lock = control_lock()
+        if operation == "stop_waiting":
+            save = manager._save
+
+            def checked_save():
+                assert entered, "wait control must serialize with snapshot publication"
+                save()
+
+            monkeypatch.setattr(manager, "_save", checked_save)
+            assert manager.stop_waiting()
+        else:
+            target = ("clear_goal_wait_if_since" if operation == "clear_lifted_wait"
+                      else "rearm_goal_barrier_if_since")
+            write = getattr(goals, target)
+
+            def checked_write(*args, **kwargs):
+                assert entered, "wait control must serialize with snapshot publication"
+                return write(*args, **kwargs)
+
+            monkeypatch.setattr(goals, target, checked_write)
+            if operation == "clear_lifted_wait":
+                assert manager.clear_lifted_wait(manager.state.waiting_since)
+            else:
+                monkeypatch.setattr(goals, "_pid_alive", lambda _pid: True)
+                monkeypatch.setattr(goals.time, "time", lambda: manager.state.waiting_since + goals._MAX_BARRIER_WAIT_S + 1)
+                manager.rearm_live_barrier()
+                assert manager.state.barrier_rearms == 1
+        assert not entered
+        assert manager.state.to_json() == goals.load_goal(manager.session_id).to_json()
+    finally:
+        db.close()

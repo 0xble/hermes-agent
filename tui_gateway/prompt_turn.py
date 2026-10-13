@@ -1343,6 +1343,7 @@ def _run_prompt_submit(
             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
             _publish_session_control_snapshot(sid, session, only_if_present=True)
         except Exception as e:
+            _settle_loop_after_turn(sid, session, "")
             _recover_turn_exception(sid, session, st, e)
         finally:
             _release_turn_scopes(sid, session, st)

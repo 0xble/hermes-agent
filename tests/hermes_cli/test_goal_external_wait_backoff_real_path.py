@@ -80,6 +80,7 @@ def _cli(manager, *, user_initiated: bool):
     cli._pending_input = queue.Queue()
     cli.conversation_history = []
     cli._last_turn_interrupted = False
+    cli._last_turn_started = True
     cli._goal_turn_user_initiated = user_initiated
     return cli
 
@@ -310,6 +311,7 @@ def test_real_session_evidence_drives_three_status_continuations_to_backoff(
         time.sleep(0.01)
         _record_terminal_turn(db, sid, "gh run view 1", output, index)
         cli.conversation_history = [{"role": "assistant", "content": "I checked CI status."}]
+        cli._last_turn_result = {"completed": True, "final_response": "I checked CI status."}
         cli._maybe_continue_goal_after_turn()
         if index < 3:
             _discard_continuation(cli)
@@ -427,6 +429,7 @@ def test_real_evidence_classifier_rejects_shell_operators(hermes_home, monkeypat
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "keep working"})
     _record_terminal_turn(db, sid, command, "command output", 1)
     cli.conversation_history = [{"role": "assistant", "content": "I ran the command."}]
+    cli._last_turn_result = {"completed": True, "final_response": "I ran the command."}
     cli._maybe_continue_goal_after_turn()
 
     state = goals.GoalManager(sid).state
@@ -447,6 +450,7 @@ def test_real_truncated_terminal_arguments_fail_closed_as_actionable(hermes_home
         arguments='{"command": "git status"',
     )
     cli.conversation_history = [{"role": "assistant", "content": "I ran the command."}]
+    cli._last_turn_result = {"completed": True, "final_response": "I ran the command."}
     cli._maybe_continue_goal_after_turn()
 
     state = goals.GoalManager(sid).state
@@ -464,6 +468,7 @@ def test_real_passing_quality_gate_rows_do_not_reset_no_progress(hermes_home, mo
     cli = _cli(manager, user_initiated=False)
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "still working"})
     cli.conversation_history = [{"role": "assistant", "content": "No new action."}]
+    cli._last_turn_result = {"completed": True, "final_response": "No new action."}
     cli._maybe_continue_goal_after_turn()
 
     state = goals.GoalManager(sid).state
@@ -589,8 +594,12 @@ def test_real_cli_tui_input_provenance_reaches_goal_evaluator_as_automatic(herme
     tui._print_user_message_preview = lambda _value: None
     tui._turn_summary_begin = lambda: None
     tui._tui_after_turn = lambda: tui._maybe_continue_goal_after_turn()
-    tui.chat = lambda *_args, **_kwargs: setattr(
-        tui, "conversation_history", [{"role": "assistant", "content": "automatic result"}])
+    def chat(*_args, **_kwargs):
+        tui.conversation_history = [{"role": "assistant", "content": "automatic result"}]
+        tui._last_turn_started = True
+        tui._last_turn_result = {"completed": True, "final_response": "automatic result"}
+
+    tui.chat = chat
     tui.conversation_history = []
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "still working"})
     seen: list[bool] = []
@@ -803,6 +812,7 @@ def test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early(
         assert goals.count_active_delegations(sid) == 1
         cli = _cli(manager, user_initiated=False)
         cli.conversation_history = [{"role": "assistant", "content": "I checked the pending review."}]
+        cli._last_turn_result = {"completed": True, "final_response": "I checked the pending review."}
         _stub_judge(monkeypatch, {"verdict": "continue", "reason": "waiting on delegated review"})
         cli._maybe_continue_goal_after_turn()
         state = goals.GoalManager(sid).state
@@ -841,6 +851,7 @@ def test_real_judge_wait_then_evaluator_age_recheck_stays_silent(
     monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: True)
 
     cli.conversation_history = [{"role": "assistant", "content": "Waiting on the watcher."}]
+    cli._last_turn_result = {"completed": True, "final_response": "Waiting on the watcher."}
     cli._maybe_continue_goal_after_turn()
     parked = manager.state
     assert parked is not None and parked.waiting_on_session == "watcher-age"
@@ -849,6 +860,7 @@ def test_real_judge_wait_then_evaluator_age_recheck_stays_silent(
     parked.barrier_recheck_at = 0.0
     manager._save()
     cli.conversation_history = [{"role": "assistant", "content": "The user asked for a status update."}]
+    cli._last_turn_result = {"completed": True, "final_response": "The user asked for a status update."}
     cli._maybe_continue_goal_after_turn()
 
     output = capsys.readouterr().out

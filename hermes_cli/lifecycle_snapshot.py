@@ -35,6 +35,7 @@ def commit_and_publish_snapshot(
         if manager.state is not original or (
             original is not None and original.to_json() != expected_memory
         ):
+            manager._state = winner
             return False
         if winner is not None and winner.to_json() == staged.to_json():
             if preserve_reference and original is not None:
