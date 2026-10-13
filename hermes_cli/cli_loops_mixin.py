@@ -721,7 +721,8 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        decision = mgr.complete_tick(self._last_assistant_response_text())
+        response, successful = self._post_turn_response()
+        decision = mgr.complete_tick(response if successful else "")
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None):
             _cprint(f"  {_DIM}{t('cli.loop.remaining', label=mgr.state.remaining_label())}{_RST}")
@@ -735,6 +736,16 @@ class CLILoopsMixin:
         mgr = self._get_goal_manager()
         if mgr is not None and mgr.resume_for_user_input():
             _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
+
+    def _post_turn_response(self) -> tuple[str, bool]:
+        """Read the current result before falling back to legacy transcript-only callers."""
+        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        result = getattr(self, "_last_turn_result", None)
+        response = (
+            str(result.get("final_response") or "") if isinstance(result, dict)
+            else self._last_assistant_response_text()
+        )
+        return response, is_successful_goal_turn(result, response)
 
     def _maybe_continue_goal_after_turn(self) -> None:
         """Post-turn hook: judge the goal and maybe re-queue a continuation. A real user
@@ -775,10 +786,8 @@ class CLILoopsMixin:
             _cprint(f"  {_DIM}{t('cli.goal.paused_interrupted')}{_RST}")
             return
 
-        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
-        result = getattr(self, "_last_turn_result", None)
-        last_response = str(result.get("final_response") or "") if isinstance(result, dict) else self._last_assistant_response_text()
-        if not is_successful_goal_turn(result, last_response):
+        last_response, successful = self._post_turn_response()
+        if not successful:
             return
         _active_deleg = 0
         try:

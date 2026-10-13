@@ -76,7 +76,10 @@ class LoopRevisionsMixin:
         user_quote: str = "",
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Apply a revise only if this manager still owns the durable version."""
+        """Apply a versioned, authority-checked edit to the existing loop.
+
+        Commit only against the durable snapshot this revision read.
+        """
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
         return mutate_loop_snapshot(self, "_revise", reason=reason, actor=actor, prompt=prompt, interval_seconds=interval_seconds, self_paced=self_paced, times=times, until=until, user_quote=user_quote, user_messages=user_messages)
 
@@ -225,7 +228,10 @@ class LoopRevisionsMixin:
         user_quote: str,
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Apply a replace only if this manager still owns the durable version."""
+        """Replace the loop definition while preserving its revision history and route.
+
+        Commit only against the durable snapshot this replacement read.
+        """
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
         return mutate_loop_snapshot(self, "_replace", prompt=prompt, interval_seconds=interval_seconds, times=times, until=until, route=route, reason=reason, user_quote=user_quote, user_messages=user_messages)
 

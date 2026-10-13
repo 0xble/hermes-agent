@@ -339,6 +339,7 @@ class LoopState:
     # Versioned agent-authored changes; old rows omit this field and load as an empty list.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
+    tick_id: str = ""  # survives revisions, changes on every new claim
 
     @property
     def version(self) -> int:
@@ -684,6 +685,7 @@ class LoopManager(LoopRevisionsMixin):
         if s is None or not self.is_due():
             return None
         s.ticks_fired += 1
+        s.tick_id = uuid.uuid4().hex
         s.last_fired_at = time.time()
         s.awaiting_response = True
         # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
@@ -718,7 +720,12 @@ class LoopManager(LoopRevisionsMixin):
         return {"status": status, "stopped": True, "reason": reason, "message": message}
 
     def complete_tick(self, last_response: str) -> Dict[str, Any]:
-        """Discard a tick verdict when a newer durable state supersedes its snapshot."""
+        """Evaluate the finished wakeup turn and schedule what's next.
+
+        Returns ``{"status": "active|done|paused", "stopped": bool, "reason": str, "message": str}``;
+        ``message`` is a user-visible one-liner, "" in the common still-looping case.
+        A superseded verdict cannot overwrite a newer durable state.
+        """
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
         return mutate_loop_snapshot(self, "_complete_tick", last_response)
 

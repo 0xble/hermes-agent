@@ -83,3 +83,193 @@ def test_stale_revision_is_rejected_without_erasing_the_winner(hermes_home, monk
     assert after.interval_seconds == 600
     assert after.times == 3
     assert after.version == 3
+
+
+@pytest.mark.parametrize("operation", ["revise", "replace", "settle", "settle_noop", "noop"])
+@pytest.mark.parametrize("timing", ["legacy_entry", "load", "commit", "pause_resume"])
+def test_loop_cas_validates_entry_and_noop_commit(hermes_home, monkeypatch, operation, timing):
+    manager = loops.LoopManager("loop-boundary")
+    original = manager.set("Check the deployment", interval_seconds=300)
+    if operation == "settle":
+        assert manager.fire_tick()
+    db = loops._get_session_db()
+    if timing == "legacy_entry":
+        original.mutation_id = ""
+        db.set_meta("loop:loop-boundary", original.to_json())
+    before = original.to_json()
+    saved = []
+
+    def publish():
+        writer = loops.LoopManager(manager.session_id)
+        if timing == "pause_resume":
+            writer.pause()
+            writer.resume()
+        else:
+            assert writer.revise(reason="Less polling", interval_seconds=600)["ok"]
+            if timing == "legacy_entry":
+                writer.state.mutation_id = ""
+                db.set_meta("loop:loop-boundary", writer.state.to_json())
+        saved.append(loops.load_loop(manager.session_id))
+
+    if timing == "legacy_entry":
+        publish()
+    elif timing == "load":
+        read = db.get_meta
+        def interleave_read(*args, **kwargs):
+            monkeypatch.setattr(db, "get_meta", read)
+            publish()
+            return read(*args, **kwargs)
+        monkeypatch.setattr(db, "get_meta", interleave_read)
+    else:
+        execute = db._execute_write
+        def interleave(write, *args, **kwargs):
+            monkeypatch.setattr(db, "_execute_write", execute)
+            publish()
+            return execute(write, *args, **kwargs)
+        monkeypatch.setattr(db, "_execute_write", interleave)
+    if operation in {"settle", "settle_noop"}:
+        result = manager.complete_tick("[LOOP_COMPLETE]")
+    elif operation == "replace":
+        source = "Watch the new deployment instead"
+        result = manager.replace(prompt=source, reason="New task", user_quote=source, user_messages=[source])
+    else:
+        result = manager.revise(reason="Fewer checks", times=0 if operation == "noop" else 3)
+    assert result["error_code"] == "state_changed"
+    after = loops.load_loop(manager.session_id)
+    assert original.to_json() == before
+    if operation == "settle" and timing != "pause_resume":
+        assert after.interval_seconds == 600
+        assert after.awaiting_response is False
+        assert after.revisions == saved[0].revisions
+    else:
+        assert after.to_json() == saved[0].to_json()
+    assert manager.state.to_json() == after.to_json()
+
+
+@pytest.mark.parametrize("second_change", ["new_tick", "pause", "clear", "replacement"])
+def test_conflict_cleanup_cannot_release_another_claim(hermes_home, monkeypatch, second_change):
+    manager = loops.LoopManager("loop-claim")
+    manager.set("Check the deployment", interval_seconds=300, until="healthy")
+    assert manager.fire_tick()
+    original = loops.load_loop(manager.session_id)
+    db = loops._get_session_db()
+    saved = []
+
+    def judge(*args, **kwargs):
+        writer = loops.LoopManager(manager.session_id)
+        assert writer.revise(reason="Less polling", interval_seconds=600)["ok"]
+        execute = db._execute_write
+        def change_at_cleanup(write, *args, **kwargs):
+            monkeypatch.setattr(db, "_execute_write", execute)
+            control = loops.LoopManager(manager.session_id)
+            if second_change == "new_tick":
+                control.abandon_tick()
+                # Re-use every legacy claim field. Only the new claim ID distinguishes it.
+                monkeypatch.setattr(loops.time, "time", lambda: original.last_fired_at)
+                control.state.next_due_at = original.last_fired_at
+                assert control.fire_tick()
+                assert control.state.ticks_fired == original.ticks_fired
+                assert control.state.last_fired_at == original.last_fired_at
+                assert control.state.tick_id != original.tick_id
+            elif second_change == "pause":
+                control.pause()
+            elif second_change == "clear":
+                control.clear()
+            else:
+                control.set("Different task", interval_seconds=600)
+                assert control.fire_tick()
+            saved.append(db.get_meta("loop:loop-claim"))
+            return execute(write, *args, **kwargs)
+        monkeypatch.setattr(db, "_execute_write", change_at_cleanup)
+        return "done", "obsolete verdict", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = manager.complete_tick("old answer")
+    assert result["stopped"] is False
+    assert result["message"] == ""
+    assert saved and db.get_meta("loop:loop-claim") == saved[-1]
+    assert manager.state.to_json() == saved[-1]
+
+
+@pytest.mark.parametrize("operation", ["revise", "settle"])
+@pytest.mark.parametrize("failure", ["read", "write", "unavailable", "ephemeral"])
+def test_loop_persistence_failure_preserves_state(hermes_home, monkeypatch, caplog, operation, failure):
+    manager = loops.LoopManager("" if failure == "ephemeral" else "loop-failure")
+    manager.set("Check the deployment", interval_seconds=300)
+    if operation == "settle":
+        assert manager.fire_tick()
+    original = manager.state
+    before = original.to_json()
+    db = loops._get_session_db()
+    read = db.get_meta
+    def fail(*args, **kwargs):
+        raise OSError("disk unavailable")
+    if failure == "read":
+        monkeypatch.setattr(db, "get_meta", fail)
+    elif failure == "write":
+        monkeypatch.setattr(db, "_execute_write", fail)
+    else:
+        monkeypatch.setattr(loops, "_get_session_db", lambda: None)
+    result = (manager.revise(reason="Less polling", interval_seconds=600) if operation == "revise"
+              else manager.complete_tick("LOOP_COMPLETE"))
+    if failure == "ephemeral":
+        assert result.get("ok", result.get("stopped")) is True
+        if operation == "settle":
+            assert manager.state is not None
+            assert manager.state.status == "done"
+            assert manager.state.awaiting_response is False
+            assert manager.state.ticks_fired == 1
+        assert read("loop:") is None
+    else:
+        assert result["error_code"] == "persistence_failed"
+        assert original.to_json() == before
+        assert manager.state.to_json() == before
+        assert read("loop:loop-failure") == before
+        assert "could not read or commit" in caplog.text
+
+
+@pytest.mark.parametrize("verdict", ["continue", "done", "blocked"])
+@pytest.mark.parametrize("change", ["pause_resume", "pause_resume_refire", "abandon_refire"])
+def test_same_manager_controls_cannot_mutate_the_settled_claim(hermes_home, monkeypatch, verdict, change):
+    manager = loops.LoopManager("loop-shared-manager")
+    manager.set("Check the deployment", interval_seconds=300, until="deployment healthy")
+    assert manager.fire_tick()
+    live_reference = manager.state
+    initial = loops.LoopState.from_json(live_reference.to_json())
+    # A new claim may re-use the old timestamp/count after abandon/refire.
+    monkeypatch.setattr(loops.time, "time", lambda: initial.last_fired_at)
+    saved = []
+
+    def pause_resume():
+        manager.pause()
+        manager.resume()
+
+    def refire():
+        manager.state.next_due_at = initial.last_fired_at
+        assert manager.fire_tick()
+
+    def pause_resume_refire():
+        pause_resume()
+        refire()
+
+    def abandon_refire():
+        manager.abandon_tick()
+        refire()
+
+    def judge(*args, **kwargs):
+        {"pause_resume": pause_resume, "pause_resume_refire": pause_resume_refire,
+         "abandon_refire": abandon_refire}[change]()
+        assert manager.state is live_reference
+        if manager.state.awaiting_response:
+            assert live_reference.tick_id != initial.tick_id
+        saved.append(loops.load_loop(manager.session_id).to_json())
+        return verdict, "old judgment", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = manager.complete_tick("old answer")
+    assert result["stopped"] is False
+    assert result["error_code"] == "state_changed"
+    assert result["message"] == ""
+    assert saved and loops.load_loop(manager.session_id).to_json() == saved[-1]
+    assert manager.state.to_json() == saved[-1]
+    assert manager.state.awaiting_response is (change != "pause_resume")
