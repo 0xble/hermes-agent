@@ -4,14 +4,29 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import immutable_releases as releases
+
+
+def _await_ready(process: subprocess.Popen, expected: str) -> None:
+    """Wait for the child's pipe acknowledgement, not a guessed startup delay."""
+    ready = queue.Queue()
+    stdout = process.stdout
+    assert stdout is not None
+    threading.Thread(target=lambda: ready.put(stdout.readline()), daemon=True).start()
+    try:
+        line = ready.get(timeout=20)
+    except queue.Empty as exc:
+        raise AssertionError(f"child {process.pid} did not acknowledge readiness") from exc
+    assert line.strip() == expected, f"child exited {process.poll()} before {expected}"
 
 
 def test_archive_fallback_rejects_unsafe_members(tmp_path, monkeypatch):
@@ -797,17 +812,19 @@ def test_unreadable_process_identity_scopes_retention(tmp_path, monkeypatch, own
 
 def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypatch):
     home = tmp_path / "profile"
-    paths = [home / "releases" / str(i) for i in range(7)]
+    paths = [home / "releases" / str(i) for i in range(9)]
     for i, path in enumerate(paths):
         _fake_release(path, str(i))
         os.utime(path, (i, i))
     releases.promote(home, paths[-1])
     releases.promote(home, paths[-2])
+    receipts = home / "logs" / "update_receipts"
+    receipts.mkdir(parents=True)
+    (receipts / "recovery.json").write_text(json.dumps({"release_path": str(paths[1])}))
     monkeypatch.setattr(releases, "_live_process_pins", lambda _: {paths[0].resolve()})
     removed = releases.retain(home)
-    assert paths[0].exists()
-    assert len(removed) == 1
-    assert removed == [paths[1]]
+    assert {path.name for path in paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
+    assert {path.name for path in removed} == {"2", "3"}
 
 
 def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
@@ -822,28 +839,25 @@ def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
     _fake_release(a, "A")
     releases.promote(home, a)
     script = """
-import os, pathlib, signal, sys, time
+import pathlib, sys
 from hermes_cli import immutable_releases as r
-source, home, checkpoint, boundary = map(pathlib.Path, sys.argv[1:])
+source, home = map(pathlib.Path, sys.argv[1:3])
+boundary = sys.argv[3]
 r._build_venv = lambda *args, **kwargs: None
 r.smoke_plugins = lambda *args, **kwargs: None
 candidate, _ = r.stage_release(source, home, sha='B')
 def pause():
-    checkpoint.write_text(str(os.getpid()), encoding='utf-8')
-    while True: time.sleep(.1)
-if boundary.name == 'stage': pause()
+    print(boundary, flush=True)
+    sys.stdin.read()
+if boundary == 'stage': pause()
 r.promote(home, candidate, before_flip=pause)
 """
     for boundary in ("stage", "flip"):
-        checkpoint = tmp_path / f"{boundary}.ready"
-        child = subprocess.Popen([sys.executable, "-c", script, str(source), str(home),
-                                  str(checkpoint), boundary], cwd=Path(__file__).resolve().parents[2])
+        child = subprocess.Popen([sys.executable, "-c", script, str(source), str(home), boundary],
+                                 cwd=Path(__file__).resolve().parents[2],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
-            import time
-            deadline = time.monotonic() + 20
-            while not checkpoint.exists() and child.poll() is None and time.monotonic() < deadline:
-                time.sleep(.05)
-            assert checkpoint.exists(), f"updater exited {child.poll()} before {boundary}"
+            _await_ready(child, boundary)
             child.kill()  # SIGKILL, no Python finally or cleanup handlers
             assert child.wait(timeout=5) < 0
             assert (home / "current").resolve() == a
@@ -864,6 +878,9 @@ r.promote(home, candidate, before_flip=pause)
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=5)
+            for pipe in (child.stdin, child.stdout):
+                if pipe is not None:
+                    pipe.close()
 
 @pytest.mark.platforms("macos")
 def test_existing_pointer_stale_plist_failure_restores_and_retry_repairs(tmp_path, monkeypatch):
@@ -974,29 +991,24 @@ def test_retention_protects_real_process_cwd_and_receipt(tmp_path):
     receipts = home / "logs" / "update_receipts"
     receipts.mkdir(parents=True)
     (receipts / "recovery.json").write_text(json.dumps({"release_path": str(release_paths[1])}))
-    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=release_paths[0])
+    worker = subprocess.Popen([sys.executable, "-c",
+                               "import os,sys; print(os.getcwd(), flush=True); sys.stdin.read()"],
+                              cwd=release_paths[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
-        import psutil
-        import time
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                if Path(psutil.Process(worker.pid).cwd()).resolve() == release_paths[0].resolve():
-                    break
-            except psutil.Error:
-                pass
-            time.sleep(.02)
-        else:
-            pytest.fail("worker did not publish its release cwd before retention")
+        _await_ready(worker, str(release_paths[0].resolve()))
         assert release_paths[0].resolve() in releases._live_process_pins(home)
         removed = releases.retain(home)
-        assert release_paths[0].exists() and release_paths[1].exists()
-        assert release_paths[8].exists() and release_paths[7].exists()
-        assert {path.name for path in release_paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
-        assert {path.name for path in removed} == {"2", "3"}
+        # Unreadable host process metadata intentionally pins every release.
+        # Exact pruning belongs to the controlled-process test above.
+        protected = {"0", "1", "4", "5", "6", "7", "8"}
+        assert protected <= {path.name for path in release_paths if path.exists()}
+        assert protected.isdisjoint(path.name for path in removed)
     finally:
         worker.terminate()
         worker.wait(timeout=5)
+        for pipe in (worker.stdin, worker.stdout):
+            if pipe is not None:
+                pipe.close()
 
 
 def test_successful_receipt_history_does_not_pin_every_old_release(tmp_path):
@@ -1051,9 +1063,11 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
         os.utime(release, (i, i))
     releases.promote(home, releases_for_test[-1])
     releases.promote(home, releases_for_test[-2])
-    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                              cwd=releases_for_test[0])
+    worker = subprocess.Popen([sys.executable, "-c",
+                               "import os,sys; print(os.getcwd(), flush=True); sys.stdin.read()"],
+                              cwd=releases_for_test[0], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     try:
+        _await_ready(worker, str(releases_for_test[0].resolve()))
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setattr(update_cmd_fleet_verify, "_print_legacy_units_warning", lambda: None)
         monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
@@ -1076,11 +1090,16 @@ def test_verified_update_retains_real_process_pinned_old_release(tmp_path, monke
     finally:
         worker.terminate()
         worker.wait(timeout=5)
+        for pipe in (worker.stdin, worker.stdout):
+            if pipe is not None:
+                pipe.close()
 
 
 @pytest.mark.platforms("macos")
 def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(tmp_path, monkeypatch):
-    """Build one real checkout candidate; each plugin kind must fail its import probe before promotion."""
+    """Probe real archived code and Python; dependency/web builds have separate coverage."""
+    import sysconfig
+    import venv
     from hermes_cli import update_cmd, update_receipt
 
     remote = Path(__file__).resolve().parents[2]
@@ -1089,16 +1108,29 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
                     str(remote), str(source)], check=True)
     sha = subprocess.check_output(["git", "-C", str(remote), "rev-parse", "HEAD"], text=True).strip()
     subprocess.run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], check=True)
-    # This fixture validates plugin import failure, not dependency synchronization.
-    monkeypatch.setattr(releases, "restore_active_distributions", lambda *a, **kw: None)
+    # Keep real candidate Python and archived imports, but reuse installed test
+    # dependencies without running PM or provisioning Node/npm over the network.
+    def prepare_test_venv(release, *args, **kwargs):
+        environment = release / ".venv"
+        venv.EnvBuilder(with_pip=False).create(environment)
+        site_packages = Path(subprocess.check_output(
+            [str(releases._release_python(release)), "-c",
+             "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+        (site_packages / "test-dependencies.pth").write_text(
+            sysconfig.get_path("purelib") + "\n", encoding="utf-8")
+        return environment, "built"
+
+    monkeypatch.setattr(releases, "prepare_venv", prepare_test_venv)
+    # Real archived-revision web packaging remains covered in
+    # test_immutable_candidate_web_real.py.
+    monkeypatch.setattr(releases, "_build_candidate_web", lambda _staging: None)
     home = tmp_path / "profile"
     home.mkdir()
     a = home / "releases" / "A"
     _fake_release(a, "A")
     releases.promote(home, a)
-    # Stage the complete checkout and real candidate venv once. Reusing this
-    # immutable candidate exercises the production 'existing' smoke path for
-    # each kind without rebuilding npm and uv five times in one test file.
+    # Archive and stage once, then exercise the production 'existing' smoke
+    # subprocess for every plugin kind before any pointer can advance.
     candidate, action = releases.stage_release(source, home)
     assert action == "staged" and candidate == home / "releases" / sha
     plugin = home / "plugins" / "candidate-test"
