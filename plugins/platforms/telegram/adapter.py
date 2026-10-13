@@ -3405,8 +3405,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if handler is None:
             return
         try:
-            from hermes_cli.lifecycle import has_hook
-            if not has_hook("gateway_platform_event"):
+            from hermes_cli.lifecycle import has_hook_nowait
+            if not has_hook_nowait("gateway_platform_event"):
                 return
             event = self._normalize_platform_event(update)
         except Exception:

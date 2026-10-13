@@ -1762,7 +1762,7 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
 def discover_plugins(force: bool = False, *, require_complete: bool = False) -> None:
     """Load plugins; only listing/completion callers may use an incomplete registry."""
     try:
-        _join_background_discovery()
+        _join_background_discovery(timeout=None if require_complete else 30.0)
     except PluginDiscoveryIncomplete as exc:
         if require_complete:
             raise
@@ -1774,6 +1774,7 @@ def discover_plugins(force: bool = False, *, require_complete: bool = False) -> 
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
+_background_discovery_error: Optional[BaseException] = None
 _background_discovery_lock = threading.Lock()
 
 
@@ -1781,7 +1782,7 @@ def start_background_plugin_discovery() -> None:
     """Run discovery in a daemon thread to overlap the rest of CLI startup (~150ms). Every
     synchronous consumer joins it via :func:`discover_plugins`, so no one sees a half-loaded
     registry. No-op when already done or in flight."""
-    global _background_discovery_thread
+    global _background_discovery_error, _background_discovery_thread
     manager = get_plugin_manager()
     if manager._discovered:
         return
@@ -1789,26 +1790,51 @@ def start_background_plugin_discovery() -> None:
         if _background_discovery_thread is not None and _background_discovery_thread.is_alive():
             return
 
+        _background_discovery_error = None
+
         def _run() -> None:
+            global _background_discovery_error
             try:
                 manager.discover_and_load()
                 _persist_plugin_toolset_keys()
-            except Exception:
+            except BaseException as exc:
+                _background_discovery_error = exc
                 logger.warning("background plugin discovery failed", exc_info=True)
 
         _background_discovery_thread = threading.Thread(target=_run, name="plugin-discovery", daemon=True)
         _background_discovery_thread.start()
 
 
-def _join_background_discovery(timeout: float = 30.0) -> None:
-    """Wait for an in-flight background discovery (no-op from its own thread or a plugin-load worker it
-    spawned — that worker's parent is blocked waiting on it)."""
+def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
+    """Wait for an in-flight background discovery.
+
+    ``timeout=None`` is reserved for strict startup: each plugin load already
+    has its own deadline, so the sweep itself is the availability boundary.
+    Listing callers keep the short barrier and may use the available registry.
+    """
     t = _background_discovery_thread
-    if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
+    if t is None or t is threading.current_thread() or in_plugin_load_worker():
         return
-    t.join(timeout=timeout)
+    if not t.is_alive():
+        if timeout is None and (_background_discovery_error is not None
+                                or not getattr(get_plugin_manager(), "_discovery_complete", False)):
+            error = _background_discovery_error
+            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+        return
+    if timeout is None:
+        while t.is_alive():
+            t.join(timeout=10.0)
+            if t.is_alive():
+                logger.info("Waiting for background plugin discovery to finish")
+    else:
+        t.join(timeout=timeout)
     if t.is_alive():
         raise PluginDiscoveryIncomplete("Plugin discovery incomplete after timeout; refusing partial registry delivery")
+    if _background_discovery_error is not None:
+        error = _background_discovery_error
+        raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if timeout is None and not getattr(get_plugin_manager(), "_discovery_complete", False):
+        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1923,6 +1949,23 @@ def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
     return _delivery_manager().iter_hook_callbacks(hook_name)
 
 
+def has_hook_nowait(hook_name: str) -> bool:
+    """Probe the current callback snapshot without discovery or lock waits."""
+    return bool(get_plugin_manager().iter_hook_callbacks(hook_name))
+
+
+def snapshot_hook_callbacks_nowait(hook_name: str) -> tuple[Callable, ...]:
+    """Return current callback callbacks without discovery or lock waits."""
+    return get_plugin_manager().iter_hook_callbacks(hook_name)
+
+
+def invoke_hook_nowait(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke the current callback snapshot without waiting for discovery or its lock."""
+    manager = get_plugin_manager()
+    callbacks = manager.iter_hook_callbacks(hook_name)
+    return manager.invoke_hook(hook_name, _callbacks=callbacks, **kwargs)
+
+
 def fire_pre_command_hook(
     *, surface: str, command: str, alias_used: str, args_raw: str,
     session_key: Optional[str] = None, platform: Optional[str] = None,
@@ -1931,10 +1974,11 @@ def fire_pre_command_hook(
     logged at debug so future block/rewrite adopters are discoverable."""
     try:
         manager = get_plugin_manager()
-        if not manager.has_hook("pre_command"):
+        callbacks = snapshot_hook_callbacks_nowait("pre_command")
+        if not callbacks:
             return
         results = manager.invoke_hook(
-            "pre_command", surface=surface, command=command, alias_used=alias_used,
+            "pre_command", _callbacks=callbacks, surface=surface, command=command, alias_used=alias_used,
             args_raw=args_raw, session_key=session_key, platform=platform,
         )
         for result in results:

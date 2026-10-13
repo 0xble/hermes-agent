@@ -309,7 +309,9 @@ class PluginDispatchMixin:
         from hermes_cli.plugins import resolve_plugin_command_result
         return resolve_plugin_command_result(callback(**cls._hook_callback_kwargs(callback, payload)))
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, _callbacks: Optional[tuple[Callable, ...]] = None, **kwargs: Any
+    ) -> List[Any]:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
 
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
@@ -327,7 +329,7 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
             cb_timeout, cb_fail_closed = timeout, fail_closed
             try:
                 spec = getattr(cb, "hermes_shell_hook_spec", None)

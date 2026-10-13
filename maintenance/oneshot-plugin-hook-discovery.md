@@ -50,6 +50,17 @@ available registry on a background join timeout, without starting a second sweep
 strict timeout exception remains in hook delivery, not in skill command completion.
 Gateway startup explicitly requests `require_complete=True` off-loop and lets a
 not-ready error abort startup before relay registration or adapter connection.
+Strict startup waits for the in-flight sweep to finish, logging progress every ten
+seconds; per-plugin load deadlines remain the upper bound. A worker failure or
+premature exit still raises rather than serving a partial registry.
+
+Synchronous hook calls on an event-loop thread must not wait on discovery.
+Observer-only hooks (`on_session_reset`, `agent_loop_stopped`, `pre_command`) use
+the current callback snapshot, while policy hooks remain fail-closed and are
+delivered through `ainvoke_hook` or an off-loop handoff. Discord and Telegram
+`gateway_platform_event` probes use the same non-waiting snapshot, so reloads do
+not drop an update or fail its preparation.
+
 Bare-runner dispatch harnesses complete actual discovery during setup to mirror
 this startup prerequisite; their short settle/spin windows do not stand in for
 plugin readiness.

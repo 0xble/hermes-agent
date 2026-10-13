@@ -210,10 +210,10 @@ class GatewaySessionCommandsMixin:
         _new_sid = new_entry.session_id if new_entry else None
         # Plugin on_session_reset hook (new session guaranteed to exist); best-effort.
         try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _invoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
-                         platform=source.platform.value if source.platform else "",
-                         old_session_id=_old_sid, new_session_id=_new_sid)
+            from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
+            await _ainvoke_hook("on_session_reset", session_id=_new_sid, reason="new_session",
+                                platform=source.platform.value if source.platform else "",
+                                old_session_id=_old_sid, new_session_id=_new_sid)
         except Exception:
             pass
         try:
