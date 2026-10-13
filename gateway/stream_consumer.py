@@ -758,9 +758,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _with_cumulative_prefix(self, final_text: str) -> str:
         """Keep earlier tool segments when the final carries only the last answer."""
-        if final_text and not self._turn_split_delivery and self._cumulative_transport():
-            prefix = self._accumulated[:self._segment_start]
-            if prefix and not final_text.startswith(prefix):
+        prefix = self._accumulated[:self._segment_start] if final_text else ""
+        if prefix and not self._turn_split_delivery and self._cumulative_transport():
+            if not final_text.startswith(prefix):
                 return prefix + final_text
         return final_text
 
