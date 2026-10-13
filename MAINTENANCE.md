@@ -404,6 +404,16 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 - **Retirement:** Remove when released upstream provides equivalent neutral resume instructions, preserves all replay/reconciliation safety clauses, and uses a transport-neutral duplicate marker for ambiguous redelivery.
 - **Rollback:** Revert the commit carrying `Fork-Patch: routine-restart-resume-note`.
 
+## Active patch record: child-parent relay guard
+
+- **Patch identity:** `child-parent-relay-guard`.
+- **Behavior:** The Relay MCP tool refuses a delegated child's send to its own parent using in-process delegation context, before the call server is acquired. For the `relay send` CLI, Hermes carries `RELAY_PARENT_ADDRESS=hermes:<profile>/<immediate parent session>` through delegated subprocess setup, including foreground/background terminal, execute_code and other `delegated_child_subprocess_env` spawns. The shared `BaseEnvironment._wrap_command` exports it after sourcing the snapshot for local and remote backends; Managed Modal prefixes the same export on its separate exec path. Relay compares parsed addresses before reading the body or using transport (C27, 0xble/relay#45). This is a cooperative CLI guard: nested environment cleaning, unsetting or overriding the variable bypasses it, and arbitrary-shell enforcement is not provided. Both it and `HERMES_DELEGATED_PARENT_SESSION_ID` are excluded from shared shell snapshots to prevent later top-level commands inheriting a child's parent identity. Top-level sends and child sends to other sessions are unchanged.
+- **Source surfaces:** `agent/relay_guard.py`, `agent/delegation_context.py`, `tools/code_execution_env.py`, `tools/environments/base_session_env.py`, `tools/environments/base.py`, `tools/environments/managed_modal.py`, `tools/mcp_tool_handlers.py`, `tools/delegate_tool_child_run.py`, and `tests/agent/test_relay_guard.py`.
+- **Upstream status:** Fork-only guard carried by PR #541. Requires a relay release containing 0xble/relay#45; until then the CLI path is unguarded and the MCP path still holds.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_relay_guard.py tests/tools/test_snapshot_session_id_leak.py -q`.
+- **Retirement:** Remove when upstream provides the same child-parent relay boundary for MCP and CLI.
+- **Rollback:** Revert the commits carrying `Fork-Patch: child-parent-relay-guard`.
+
 ## Eager plugin tools
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
