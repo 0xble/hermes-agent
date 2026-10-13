@@ -142,7 +142,7 @@ def save_completed_result(
 
 def save_cut_pending_result(
     session, source: str, *, include_output: bool = True, prune: bool = True,
-) -> None:
+) -> bool:
     """Persist a pre-cut snapshot without replacing a final receipt."""
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
@@ -165,12 +165,17 @@ def save_cut_pending_result(
         with _RESULT_WRITE_LOCK:
             existing = _read_existing_record(path)
             if existing and existing.get("completion_reason") not in _CUT_COMPLETION_REASONS:
-                return
+                return bool(
+                    existing.get(_CUT_RECEIPT_FIELD)
+                    or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
+                )
             atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:
                 _result_paths()
+            return True
     except OSError:
         logger.warning("Could not retain cut process result %s", session.id, exc_info=True)
+        return False
 
 
 def prune_completed_results() -> None:

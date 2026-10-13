@@ -2256,10 +2256,12 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             or (session.env_ref and session.pid)
             or (session.detached and session.pid_scope == "host" and session.pid)
         ):
+            # Set the marker before the snapshot/write so a reader that wins the race
+            # still persists the final receipt in the cut-retention budget.
+            session._cut_receipt = True
             save_cut_pending_result(
                 session, source, include_output=deadline is None, prune=deadline is None,
             )
-            session._cut_receipt = True
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
         try:
@@ -2320,7 +2322,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # so the durable record matches what the caller was told.
             if not self._move_to_finished(session):
                 if deadline is None or time.monotonic() < deadline:
-                    save_completed_result(session)
+                    if deadline is None:
+                        save_completed_result(session)
+                    else:
+                        save_completed_result(session, prune=False)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()
             return {
@@ -2879,8 +2884,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         receipt_cutoff is not None and time.monotonic() >= receipt_cutoff
                     ):
                         break
-                    save_cut_pending_result(session, source, include_output=False, prune=False)
-                    pre_signal_receipts.add(session.id)
+                    if save_cut_pending_result(
+                        session, source, include_output=False, prune=False,
+                    ):
+                        pre_signal_receipts.add(session.id)
             escalated_ids: set[str] = set()
             systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
