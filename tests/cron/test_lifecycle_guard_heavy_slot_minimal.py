@@ -138,12 +138,18 @@ def test_heavy_slot_device_path_predicate_is_exact():
 
 
 @pytest.mark.parametrize("wrapper", ["heavy-slot", "{trusted}"])
-@pytest.mark.parametrize("tail", ["env -S {payload}", "su -c {payload}", "runuser -c {payload}"])
-def test_opaque_heavy_slot_keeps_option_carried_commands(tmp_path, trusted_slot, monkeypatch, wrapper, tail):
+@pytest.mark.parametrize("prefix", ["--bogus --", "--label t"])
+@pytest.mark.parametrize("tail", [
+    "env -S {payload}", "su -c {payload}", "runuser -c {payload}",
+    "env -S {payload} -- true",
+])
+def test_opaque_heavy_slot_keeps_option_carried_commands(
+    tmp_path, trusted_slot, monkeypatch, wrapper, prefix, tail,
+):
     child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
     payload = shlex.quote(f"bash {child}")
-    command = f"{wrapper.format(trusted=trusted_slot)} --bogus -- {tail.format(payload=payload)}"
+    command = f"{wrapper.format(trusted=trusted_slot)} {prefix} {tail.format(payload=payload)}"
     assert scan_gateway_lifecycle(command) == (True, None)
 
 

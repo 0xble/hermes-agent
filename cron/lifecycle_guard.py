@@ -715,26 +715,34 @@ def _heavy_slot_fallback_command_index(
     arguments = segment[index + 1:]
     if not arguments or arguments == ["--help"]:
         return None, None
-    if "--" in arguments:
-        delimiter = arguments.index("--")
-        if delimiter + 1 >= len(arguments):
-            return None, "heavy-slot wrapper has `--` but no wrapped command"
-        return index + delimiter + 2, None
-
-    position = 0
-    while position < len(arguments):
-        option = arguments[position]
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            if position + 1 >= len(segment):
+                return None, "heavy-slot wrapper has `--` but no wrapped command"
+            return position + 1, None
         if option in {"--label", "--gate-fd"}:
-            if position + 1 >= len(arguments) or arguments[position + 1].startswith("-"):
-                return None, "heavy-slot wrapper has an option without a value or command delimiter"
+            if position + 1 >= len(segment) or segment[position + 1].startswith("-"):
+                break
             position += 2
             continue
         if option.startswith("--label=") or option.startswith("--gate-fd="):
             position += 1
             continue
         if option.startswith("-"):
-            return None, "heavy-slot wrapper has an unknown option without a command delimiter"
-        return index + position + 1, None
+            break
+        # The delimiter may belong to the wrapped command itself. Once a command operand
+        # starts, scan from here rather than skipping ahead to a later `--` in its argv.
+        return position, None
+
+    if "--" in segment[index + 1:]:
+        delimiter = segment.index("--", index + 1)
+        if delimiter + 1 < len(segment):
+            return delimiter + 1, None
+        return None, "heavy-slot wrapper has `--` but no wrapped command"
+    if position < len(segment):
+        return None, "heavy-slot wrapper has an unknown or incomplete option without a command delimiter"
     return None, None
 
 
