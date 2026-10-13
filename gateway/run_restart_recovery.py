@@ -5,6 +5,7 @@ import logging
 import time
 from contextlib import suppress
 
+from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger("gateway.run")
@@ -27,6 +28,22 @@ class RestartRecoveryMixin:
             recorded.add(session_key)
             logger.info("Restart recovery outcome: session=%s outcome=%s", session_key, outcome)
 
+    def _release_restart_followup_key(self, session_key: str) -> None:
+        """Allow a later reconnect scan to handle a recovered follow-up after it settles."""
+        keys = getattr(self, "_restart_followup_keys", None)
+        if isinstance(keys, set):
+            keys.discard(session_key)
+
+    @staticmethod
+    def _retire_recovered_followup_spool(event, *, task=None) -> None:
+        """Retire the replay copy once admission handed work to a real turn."""
+        started = task is not None or getattr(event, "_agent_turn_succeeded", None) is False
+        if not started:
+            return
+        spool = getattr(event, "_hermes_recovery_spool", None)
+        if spool is not None:
+            spool.unlink(missing_ok=True)
+
     def _interruption_note_delivered(self, session_key: str) -> bool:
         return session_key in getattr(self, "_s2_note_delivered_keys", ())
 
@@ -37,6 +54,7 @@ class RestartRecoveryMixin:
                 [session_key], reclaim_pending=True, cancel_on_timeout=True,
             )
         outcome = "noted" if self._interruption_note_delivered(session_key) else f"skipped:{reason}"
+        self._release_restart_followup_key(session_key)
         self._record_restart_resume_outcome(session_key, outcome)
 
     async def _run_startup_resume_event(self, adapter, event: MessageEvent, session_key: str) -> None:
@@ -63,7 +81,10 @@ class RestartRecoveryMixin:
             store = getattr(self, "session_store", None)
             entry = getattr(store, "_entries", {}).get(session_key)
             completed_inline = entry is not None and not entry.resume_pending
-            if event._gateway_accepted is True or completed_inline:
+            turn_completed = getattr(event, "_agent_turn_succeeded", None) is True
+            if not turn_completed:
+                turn_completed = completed_inline
+            if turn_completed:
                 outcome = "resumed"
             else:
                 outcome = "skipped:not-admitted"
@@ -78,11 +99,13 @@ class RestartRecoveryMixin:
             if state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
             if outcome == "resumed":
+                self._release_restart_followup_key(session_key)
                 self._record_restart_resume_outcome(session_key, outcome)
             elif outcome == "skipped:cancelled":
                 # Shutdown will retain the marker for the next boot. Do not attempt network I/O
                 # while cancellation is unwinding a gateway that may already have disconnected.
                 decided = "noted" if self._interruption_note_delivered(session_key) else outcome
+                self._release_restart_followup_key(session_key)
                 self._record_restart_resume_outcome(session_key, decided)
             else:
                 await self._finish_restart_recovery(session_key, outcome.removeprefix("skipped:"))
@@ -96,24 +119,26 @@ class RestartRecoveryMixin:
             try:
                 send = self._deliver_platform_notice(
                     event.source,
-                    "A follow-up saved during the restart could not start or finish its turn. "
-                    "It is still preserved; please send a message to resume it.",
+                    t("gateway.restart.followup_recovery_notice"),
                 )
                 timeout = _startup_restore_drain_timeout_secs()
                 noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
             except Exception:
                 logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
         suffix = ":noted" if noted else ":note-unavailable"
+        self._release_restart_followup_key(session_key)
         self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
 
     async def _observe_recovered_followup(self, adapter, event, session_key: str, *, task=None) -> None:
         """Observe the actual turn, following a busy adapter's successor rather than its receipt."""
         reason = "not-admitted" if event._gateway_accepted is not True else "accepted-without-turn"
         try:
+            self._retire_recovered_followup_spool(event, task=task)
             seen = set()
             while isinstance(task, asyncio.Task) and task not in seen:
                 seen.add(task)
                 await asyncio.shield(task)
+                self._retire_recovered_followup_spool(event, task=task)
                 if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
                     break
                 task = getattr(adapter, "_session_tasks", {}).get(session_key)
@@ -125,10 +150,12 @@ class RestartRecoveryMixin:
                 if spool is not None:
                     spool.unlink(missing_ok=True)
                 if succeeded:
+                    self._release_restart_followup_key(session_key)
                     self._record_restart_resume_outcome(session_key, "resumed")
                     return
                 reason = "turn-failed"
         except asyncio.CancelledError:
+            self._release_restart_followup_key(session_key)
             self._record_restart_resume_outcome(session_key, "skipped:cancelled")
             raise
         except Exception:
@@ -201,6 +228,7 @@ class RestartRecoveryMixin:
             await adapter.handle_message(event)
             if recovered:
                 owner = getattr(adapter, "_session_tasks", {}).get(recovery_key)
+                self._retire_recovered_followup_spool(event, task=owner)
                 self._retain_background_task(asyncio.create_task(
                     self._observe_recovered_followup(adapter, event, recovery_key, task=owner)))
             if getattr(event, "_gateway_accepted", False) is not True:

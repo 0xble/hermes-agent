@@ -102,6 +102,21 @@ async def test_nonadmitted_resume_gets_a_visible_note_not_a_false_resumed_log(tm
 
 
 @pytest.mark.asyncio
+async def test_accepted_resume_without_session_task_is_not_reported_as_resumed(tmp_path, monkeypatch, caplog):
+    runner, adapter, entry = _runner(tmp_path, monkeypatch)
+
+    async def handle(event):
+        event._gateway_accepted = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
+        await asyncio.gather(*runner._startup_restore_tasks)
+    assert _outcomes(caplog) == [_line(entry, "noted")]
+    assert entry.resume_pending
+
+
+@pytest.mark.asyncio
 async def test_visible_note_receipt_is_retained_without_shutdown_initialized_sets(tmp_path, monkeypatch):
     runner, adapter, entry = _runner(tmp_path, monkeypatch)
     assert await runner._send_interrupted_turn_notes([entry.session_key]) == 1

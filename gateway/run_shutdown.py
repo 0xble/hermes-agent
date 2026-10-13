@@ -7,8 +7,6 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 
 from __future__ import annotations
 
-from gateway.run_interrupted_notes import InterruptionNotesMixin
-
 import asyncio
 import dataclasses
 import inspect
@@ -26,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from agent.i18n import t
+from gateway.run_interrupted_notes import InterruptionNotesMixin
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.restart import (

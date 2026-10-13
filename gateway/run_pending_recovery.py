@@ -38,7 +38,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
                     breaker_tripped=False, reconnect_recovery=False, recovered_events=None):
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
-    if platform is not None and key in eligible and eligible[key].origin.platform != platform:
+    origin = getattr(eligible.get(key), "origin", None) if key in eligible else None
+    if platform is not None and origin is not None and origin.platform != platform:
         return OTHER_PLATFORM_PENDING
     drain_deferred = data.get("drain_deferred") is True
     if reconnect_recovery and drain_deferred and getattr(runner, "_draining", False):
