@@ -35,16 +35,23 @@ result/transcript evidence for conservative recovery through the durable retry e
   children. Recorded successes are never re-dispatched. Contexts carry sibling
   outcomes, transcript evidence, and an instruction to verify external/workspace
   state before continuing non-idempotent work.
-- Child claims are spent atomically with replacement persistence. Failed persists
-  and expired unspent dispatch claims re-arm only unspent children together with
-  the row claim. Consumed children remain one-shot evidence, and a stale release
-  cannot erase a newer claim.
+- Child claims are spent atomically with replacement persistence. Gateway retry
+  persistence failures re-arm only unspent children together with the row claim;
+  legacy/CLI/TUI claims remain available for a fresh durable admission attempt.
+  Recovery never executes inline on storage failure, unsupported async delivery,
+  or `background=false`. Consumed children remain one-shot evidence, and a stale
+  release cannot erase a newer claim. Cancellation is rechecked in the replacement
+  INSERT transaction, not just when the parent claims a brief.
 - Non-cut retries use the existing bounded retry notices and grace windows.
   Fan-out notices instruct the parent to spawn the returned `tasks` list.
-- A cut completion lists unfinished indexes from goals/task_indexes, including
-  children whose result is missing, and gives the exact `action='resume'` command.
-  The accepted cut completion/continuation owns the one parent notice: cut work
-  requires explicit resume, not an automatic rerun or a second continuation wake.
+- A trusted restart-cut completion lists unfinished indexes from goals/task_indexes,
+  including children whose result is missing, and gives the exact `action='resume'`
+  command. `is_trusted_restart_cut` is the shared authority for the formatter,
+  retry notes, recovery eligibility, and sweep (including its SQL filter).
+  `/stop`, cancellation, and non-restart shutdowns do not offer or admit recovery.
+  The accepted restart-cut completion/continuation owns the one parent notice:
+  restart-cut work requires explicit resume, not an automatic rerun or a second
+  continuation wake.
 - An unspent cut dispatch claim re-arms quietly after the normal grace window.
   Unresumed cuts expire at the existing 24h lineage deadline and settle `reported`
   without another parent wake; normal retention then prunes the row and orphaned
@@ -57,7 +64,7 @@ result/transcript evidence for conservative recovery through the durable retry e
 `tests/tools/test_async_delegation_restart_cut.py`, the existing
 `tests/tools/test_async_delegation*.py`, `test_delegation_retry.py`,
 `test_delegation_retry_controls.py`, `test_delegation_resume*.py`,
-`test_delegation_restart_resume_flow.py`, `test_restart_cut_notice.py`,
-and canonical state reconciliation tests.
+`test_delegation_restart_resume_flow.py`, `test_delegation_recovery_admission.py`,
+`test_restart_cut_notice.py`, and canonical state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.
