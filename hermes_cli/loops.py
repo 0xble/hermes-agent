@@ -716,6 +716,7 @@ class LoopManager(LoopRevisionsMixin):
             return
         s.awaiting_response = False
         s.ticks_fired = max(0, s.ticks_fired - 1)
+        enforce_loop_run_cap(s)
         self._save()
 
     def _stop(self, status: str, reason: str, message: str) -> Dict[str, Any]:
@@ -765,6 +766,7 @@ class LoopManager(LoopRevisionsMixin):
 
                 verdict, reason, _pf, _wait, _tf = judge_goal(s.until, last_response)
             except Exception as exc:
+                logger.warning("Loop stop-condition judge unavailable", exc_info=True)
                 verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
             if verdict == "done":
                 return self._stop("done", f"stop condition met: {reason}",
@@ -775,18 +777,10 @@ class LoopManager(LoopRevisionsMixin):
                 return self._stop("paused", why,
                                   f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.")
 
-        # 3. --times user cap.
-        if s.times and s.ticks_fired >= s.times:
-            return self._stop("done", f"completed the requested {s.times} runs",
-                              f"✓ Loop finished — ran {s.times}/{s.times} times.")
-
-        # 4. Config backstop budget → pause (recoverable), not done.
-        if s.max_ticks and s.ticks_fired >= s.max_ticks:
-            return self._stop(
-                "paused", f"tick budget exhausted ({s.ticks_fired}/{s.max_ticks})",
-                f"⏸ Loop paused — {s.ticks_fired}/{s.max_ticks} ticks used "
-                "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.",
-            )
+        # Deterministic caps also govern cleanup and failed injection rollback.
+        if cap_stop := enforce_loop_run_cap(s):
+            self._save()
+            return cap_stop
 
         # 5. Still looping — schedule the next tick from turn end.
         if s.mode == "self_paced":
@@ -802,6 +796,27 @@ class LoopManager(LoopRevisionsMixin):
         s.next_due_at = now + s.current_delay
         self._save()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
+
+
+def enforce_loop_run_cap(state: LoopState) -> Optional[Dict[str, Any]]:
+    """Apply deterministic budgets without judging an obsolete or absent reply."""
+    if state.status != "active":
+        return None
+    if state.times and state.ticks_fired >= state.times:
+        state.status = "done"
+        reason = f"completed the requested {state.times} runs"
+        state.last_stop_reason = reason
+        message = f"✓ Loop finished — ran {state.times}/{state.times} times."
+    elif state.max_ticks and state.ticks_fired >= state.max_ticks:
+        state.status = "paused"
+        reason = f"tick budget exhausted ({state.ticks_fired}/{state.max_ticks})"
+        state.paused_reason = reason
+        message = (f"⏸ Loop paused — {state.ticks_fired}/{state.max_ticks} ticks used "
+                   "(loops.max_ticks). /loop resume to keep going, /loop stop to end it.")
+    else:
+        return None
+    state.awaiting_response = False
+    return {"status": state.status, "stopped": True, "reason": reason, "message": message}
 
 
 def goal_blocks_loop_tick(session_id: str) -> bool:

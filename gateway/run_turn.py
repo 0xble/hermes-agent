@@ -1963,13 +1963,14 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
-        if diagnostic_wake_muted(event):
-            return None
         # Evaluation needs the model's raw output, including explicit emptiness and control
         # markers, not a normalized display notice. The non-streamed return value is display
         # text; post-turn hooks prefer the model copy (see _final_text_for_post_turn_hooks).
         with suppress(Exception):
-            event._agent_final_response = str(agent_result.get("final_response") or "")
+            from hermes_cli.goal_turn_outcome import model_final_response
+            event._agent_final_response = model_final_response(agent_result)
+        if diagnostic_wake_muted(event):
+            return None
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).

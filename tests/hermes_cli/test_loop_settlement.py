@@ -49,6 +49,84 @@ def test_judge_cannot_settle_over_a_newer_loop(hermes_home, monkeypatch, verdict
         assert after.next_due_at == winner.next_due_at
 
 
+@pytest.mark.parametrize("cap", ["times", "max_ticks"])
+@pytest.mark.parametrize("verdict", ["continue", "done", "blocked"])
+def test_superseded_tick_cleanup_enforces_winners_run_cap(hermes_home, monkeypatch, cap, verdict):
+    manager = loops.LoopManager("loop-revised-cap")
+    manager.set("Check the deployment", interval_seconds=300, times=10, until="deployment healthy")
+    assert manager.fire_tick()
+    saved = []
+
+    def judge(*args, **kwargs):
+        writer = loops.LoopManager(manager.session_id)
+        # The config budget is persisted state, not a user-facing revision field.
+        if cap == "max_ticks":
+            writer.state.max_ticks = 1
+            writer._save()
+        else:
+            assert writer.revise(reason="One check is enough", times=1)["ok"]
+        saved.append(loops.load_loop(manager.session_id))
+        return verdict, "obsolete judgment", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = manager.complete_tick("The old deployment report")
+    after = loops.load_loop(manager.session_id)
+    assert result["error_code"] == "state_changed"
+    assert result["message"] == ""  # never publish the superseded judge verdict
+    assert after.status == ("done" if cap == "times" else "paused")
+    assert after.awaiting_response is False
+    assert after.ticks_fired == 1
+    assert after.revisions == saved[0].revisions
+    assert after.times == saved[0].times
+    assert after.max_ticks == saved[0].max_ticks
+    assert "obsolete judgment" not in str(after.last_stop_reason or after.paused_reason)
+    assert manager.state.to_json() == after.to_json()
+    monkeypatch.setattr(loops.time, "time", lambda: after.next_due_at + 1)
+    assert loops.LoopManager(manager.session_id).fire_tick() is None
+
+
+def test_superseded_tick_cleanup_enforces_winners_run_cap_after_judge_exception(hermes_home, monkeypatch):
+    manager = loops.LoopManager("loop-revised-cap-exception")
+    manager.set("Check the deployment", interval_seconds=300, times=10, until="deployment healthy")
+    assert manager.fire_tick()
+
+    def judge(*args, **kwargs):
+        loops.LoopManager(manager.session_id).revise(reason="One check is enough", times=1)
+        raise RuntimeError("judge transport failed")
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    result = manager.complete_tick("The old deployment report")
+    assert result["error_code"] == "state_changed"
+    assert result["message"] == ""
+    after = loops.load_loop(manager.session_id)
+    assert after is not None
+    assert after.status == "done"
+    assert after.awaiting_response is False
+    assert after.ticks_fired == after.times == 1
+    assert manager.state is not None
+    assert manager.state.to_json() == after.to_json()
+
+
+@pytest.mark.parametrize("cap", ["times", "max_ticks"])
+def test_abandon_tick_preserves_exhausted_cap_after_rollback(hermes_home, cap):
+    manager = loops.LoopManager("loop-abandon-cap")
+    manager.set("Check the deployment", interval_seconds=300, times=10)
+    assert manager.fire_tick()
+    # An older completed run has already spent the revised budget; this failed
+    # injection can roll back only its own claim, not restore another run.
+    assert manager.state is not None
+    manager.state.ticks_fired = 2
+    setattr(manager.state, cap, 1)
+    manager._save()
+    manager.abandon_tick()
+    after = loops.load_loop(manager.session_id)
+    assert after is not None
+    assert after.ticks_fired == 1
+    assert after.awaiting_response is False
+    assert after.status == ("done" if cap == "times" else "paused")
+    assert manager.state.to_json() == after.to_json()
+
+
 @pytest.mark.parametrize("timing", ["before", "commit"])
 def test_stale_revision_is_rejected_without_erasing_the_winner(hermes_home, monkeypatch, timing):
     creator = loops.LoopManager("loop-revision-race")

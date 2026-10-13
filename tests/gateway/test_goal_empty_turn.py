@@ -125,3 +125,63 @@ def test_post_turn_text_prefers_model_output_over_display_notice(model_text):
         _streamed_final_response="Display streamed warning",
     )
     assert GatewayGoalsMixin._final_text_for_post_turn_hooks("Display warning", event) == model_text
+
+
+@pytest.mark.parametrize("model_text", ["", "   ", "[SILENT]", "Verified.\nLOOP_COMPLETE"])
+def test_post_turn_dict_is_authoritative_over_legacy_display_stashes(model_text):
+    event = SimpleNamespace(_raw_final_response="Display warning", _streamed_final_response="Stream warning")
+    assert GatewayGoalsMixin._final_text_for_post_turn_hooks({"final_response": model_text}, event) == model_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_text", ["", "[SILENT]", "Verified.\nLOOP_COMPLETE"])
+async def test_muted_diagnostic_turn_still_captures_model_text(monkeypatch, model_text):
+    from gateway import run_turn
+    from gateway.run_turn import GatewayTurnMixin
+
+    monkeypatch.setattr(run_turn, "diagnostic_wake_muted", lambda event: True)
+    event = SimpleNamespace()
+    result = {"final_response": model_text, "completed": True}
+    delivered = await GatewayTurnMixin()._hmwa_deliver_turn_response(
+        event, None, None, "sid", 1, result, [], "Display warning", "", False)
+    assert delivered is None
+    assert GatewayGoalsMixin._final_text_for_post_turn_hooks(delivered, event) == model_text
+
+
+@pytest.mark.parametrize("model_text", ["", "   ", "[SILENT]"])
+def test_run_sync_keeps_model_text_until_delivery(monkeypatch, model_text):
+    from unittest.mock import MagicMock
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.session import Platform, SessionSource
+    from gateway.turn_context import TurnContext
+
+    runner = MagicMock()
+    runner._resolve_session_agent_runtime.return_value = ("fixture-model", {})
+    ctx = TurnContext(source=SessionSource(platform=Platform.LOCAL, chat_id="c", user_id="u"),
+                      message="verify", history=[], session_id="sid", session_key="sk", user_config={})
+    turn = TurnRunner(runner, ctx)
+    agent = SimpleNamespace(model="fixture-model")
+    ctx.agent_holder[0] = agent
+    monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: "")
+    monkeypatch.setattr(turn, "_setup_stream_consumer", lambda *a: (None, None, None, False))
+    monkeypatch.setattr(turn, "_resolve_turn_agent", lambda *a: (agent, False))
+    monkeypatch.setattr(turn, "_wire_turn_agent_callbacks", lambda *a: None)
+    monkeypatch.setattr(turn, "_load_turn_history", lambda *a: ([], None, []))
+    monkeypatch.setattr(turn, "_prepare_turn_message", lambda *a: ("verify", None))
+    monkeypatch.setattr(turn, "_run_conversation_with_approval", lambda *a: {
+        "final_response": model_text, "completed": True, "messages": []})
+    monkeypatch.setattr(turn, "_finish_stream_consumer", lambda *a: None)
+    monkeypatch.setattr(turn, "_sync_session_after_run", lambda *a: (False, "sid", 0))
+    result = turn.run_sync()
+    assert result["completed"] is True
+    assert result["final_response"] == model_text
+    assert result["_model_final_response"] == model_text
+
+    if model_text:
+        # Gateway media decoration remains a delivery feature, not judge evidence.
+        monkeypatch.setattr(turn, "_finish_stream_consumer", lambda result, *a:
+                            result.update(final_response="Repaired media copy"))
+        monkeypatch.setattr(turn, "_append_auto_media_tags", lambda *a: "Display MEDIA:/fixture.png")
+        decorated = turn.run_sync()
+        assert decorated["final_response"] == "Display MEDIA:/fixture.png"
+        assert GatewayGoalsMixin._final_text_for_post_turn_hooks(decorated) == model_text

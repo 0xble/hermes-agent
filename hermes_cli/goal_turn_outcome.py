@@ -3,6 +3,16 @@
 from typing import Any, Optional
 
 
+def model_final_response(result: Any, fallback: str = "") -> str:
+    """Explicit model text wins over delivery copy, including empty output."""
+    if isinstance(result, dict) and "final_response" in result:
+        # Gateway media repair can decorate final_response before delivery. Its
+        # immutable pre-decoration copy carries the same model boundary.
+        text = result.get("_model_final_response", result["final_response"])
+        return text if isinstance(text, str) else ""
+    return fallback if isinstance(fallback, str) else ""
+
+
 def is_successful_goal_turn(result: Any, response: str, *, succeeded: Optional[bool] = None) -> bool:
     """Prefer an explicit outcome; retain text fallback only for legacy callers.
 
@@ -12,6 +22,7 @@ def is_successful_goal_turn(result: Any, response: str, *, succeeded: Optional[b
     """
     from agent.turn_failure_copy import is_max_iteration_handoff
 
+    response = model_final_response(result, response)
     if succeeded is False:
         return False
     if isinstance(result, dict):

@@ -82,7 +82,7 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None
     wedge the loop. Pauses, clears, replacements and newer ticks are untouched.
     Cleanup uses another CAS so it cannot overwrite a second concurrent edit.
     """
-    from hermes_cli.loops import LoopState, self_paced_floor_seconds
+    from hermes_cli.loops import LoopState, enforce_loop_run_cap, self_paced_floor_seconds
     winner = _read_loop(manager.session_id, db)
     manager._state = winner
     if winner is None or winner.status != "active" or not _same_tick(original, winner):
@@ -90,7 +90,8 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None
     expected = winner.to_json()
     updated = LoopState.from_json(expected)
     updated.awaiting_response = False
-    updated.next_due_at = time.time() + (updated.current_delay or updated.interval_seconds or self_paced_floor_seconds())
+    if not enforce_loop_run_cap(updated):
+        updated.next_due_at = time.time() + (updated.current_delay or updated.interval_seconds or self_paced_floor_seconds())
     try:
         commit_and_publish_snapshot(
             manager, updated, lambda: _commit(manager.session_id, expected, updated, db),

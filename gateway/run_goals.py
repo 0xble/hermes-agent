@@ -643,6 +643,9 @@ class GatewayGoalsMixin:
         model_text = getattr(event, "_agent_final_response", None)
         if isinstance(model_text, str):
             return model_text
+        from hermes_cli.goal_turn_outcome import model_final_response
+        if isinstance(agent_result, dict) and "final_response" in agent_result:
+            return model_final_response(agent_result)
         # Older callers stash only the pre-marker-stripping delivery text.
         raw = getattr(event, "_raw_final_response", None)
         if isinstance(raw, str) and raw.strip():

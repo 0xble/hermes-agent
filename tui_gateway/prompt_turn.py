@@ -366,6 +366,8 @@ def _goal_followup_after_turn(
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
+    from hermes_cli.goal_turn_outcome import model_final_response
+    raw = model_final_response(result, raw)
     goal_followup = None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
     try:
@@ -424,8 +426,10 @@ def _settle_loop_after_turn(sid: str, session: dict, raw: Any) -> None:
 
 def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
     """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
-    successful = _is_successful_goal_turn(getattr(st, "result", None), "complete", raw)
-    _settle_loop_after_turn(sid, session, raw if successful else "")
+    from hermes_cli.goal_turn_outcome import model_final_response
+    model_text = model_final_response(getattr(st, "result", None), raw)
+    successful = _is_successful_goal_turn(getattr(st, "result", None), "complete", model_text)
+    _settle_loop_after_turn(sid, session, model_text if successful else "")
     # Apply pending_title now that the DB row exists — in the session-owned profile store.
     if _pending := session.get("pending_title"):
         _session_key = session.get("session_key") or sid
@@ -1069,10 +1073,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     delivered = raw
     if _silence_hidden_turn(session, st.prompt_text):
         delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
-    if _is_bot_mode_session(session):
-        raw = delivered
-    # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
-    # only the rendered text is emptied.
+    # Every surface keeps model text for bookkeeping; only delivery hides markers.
     from gateway.copy_blocks import render_copy_blocks_inline
     from gateway.response_filters import strip_trailing_loop_complete_marker
     # The TUI shows one message per turn, so copy blocks render inline without markers.
@@ -1132,7 +1133,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.receipt_attempted = True
         st.terminal_callback({
             "status": {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
-            "text": raw if isinstance(raw, str) else str(raw),
+            "text": visible_raw if isinstance(visible_raw, str) else str(visible_raw),
             **({"error": str(error_value or raw)} if status == "error" else {})})
         st.receipt_committed = True
     if st.receipt_committed:

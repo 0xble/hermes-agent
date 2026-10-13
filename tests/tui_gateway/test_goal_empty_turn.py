@@ -89,6 +89,50 @@ def test_tui_turn_evaluates_success_without_a_reply_and_releases_loop(server, tu
         assert completes[0]["status"] == "complete"
 
 
+@pytest.mark.parametrize("marker", ["[SILENT]", "NO_REPLY"])
+def test_bot_chat_silence_reaches_real_goal_judge_and_loop_bookkeeping(server, turn_env, monkeypatch, marker):
+    from types import SimpleNamespace
+    from hermes_cli import goals, loops
+    from tests.hermes_cli.test_goal_external_wait_backoff_real_path import _stub_judge
+    from tests.tui_gateway.test_goal_command import _turn_session
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+    session_key = "bot-chat-silent-goal"
+    goals.GoalManager(session_key).set("Wait for deployment health")
+    loop = loops.LoopManager(session_key)
+    loop.set("Check the deployment", until="deployment healthy")
+    assert loop.fire_tick()
+    # A second identical quiet tick must back off without invoking the loop's until judge.
+    loop.state.last_response_digest = loops._digest_response(marker)
+    loop._save()
+    initial_delay = loop.state.current_delay
+    calls, followups, receipts = [], [], []
+    _stub_judge(monkeypatch, {"verdict": "continue", "reason": "still waiting"}, calls)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *args: followups.append(args[-1]))
+    result = {"completed": True, "final_response": marker}
+    agent = SimpleNamespace(session_id=session_key, _session_title_hint=BOT_CHAT_TITLE,
+                            run_conversation=lambda *a, **k: result, clear_interrupt=lambda: None)
+    session = _turn_session(agent, session_key)
+    server._run_prompt_submit("rid", "sid", session, "Check the deployment",
+                              terminal_callback=receipts.append)
+
+    after = goals.load_goal(session_key)
+    assert len(calls) == 1  # real judge parses a stubbed auxiliary response, not an empty-text shortcut
+    assert marker in str(calls[0]["messages"])
+    assert after.turns_used == 1
+    assert after.last_reason == "still waiting"
+    assert after.consecutive_silent_no_progress == 1
+    assert followups and followups[0]
+    loop_after = loops.load_loop(session_key)
+    assert loop_after.awaiting_response is False
+    assert loop_after.last_response_digest == loops._digest_response(marker)
+    assert loop_after.current_delay == min(initial_delay * 2, loops.self_paced_ceiling_seconds())
+    completes = [payload for name, sid, payload in turn_env if name == "message.complete"]
+    assert len(completes) == 1 and completes[0]["text"] == ""
+    assert receipts[0]["text"] == ""  # hosted-room delivery must not leak the preserved marker
+    assert result["final_response"] == marker
+
+
 def test_tui_exception_releases_inflight_loop_claim(server, turn_env, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import loops
