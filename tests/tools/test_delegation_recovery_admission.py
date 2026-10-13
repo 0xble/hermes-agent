@@ -1,4 +1,4 @@
-"""Recovery must use trusted restart cuts and durable admission on every route."""
+"""Recovery must use explicit user-stop evidence and durable admission on every route."""
 
 import json
 import queue
@@ -66,8 +66,19 @@ def test_gateway_cut_notice_and_recovery_follow_restart_authority(reason):
         assert event["cut_reason"] == reason
         assert dr.retry_status(did)["state"] == "interrupted"
         text = format_process_notification(event)
+        if reason == "/stop":
+            assert "no continuation was requested" in text
+            assert "action='resume'" not in text
+            assert "retry this automatically" not in text
+            assert dr.retry_status(did)["retry_state"] not in dr.RETRY_PENDING_STATES
+            assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S * 3) == []
+            payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+            assert "error" in payload
+            assert "tasks" not in payload and "recovery_context" not in payload
+            return
+        assert "action='resume'" in text
+        assert "no continuation was requested" not in text
         if reason == "gateway shutdown (restart)":
-            assert "action='resume'" in text
             claim = ad.claim_event_delivery(event, "test")
             assert ad.complete_completion_delivery(did, claim)
             assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S * 3) == []
@@ -76,26 +87,20 @@ def test_gateway_cut_notice_and_recovery_follow_restart_authority(reason):
             assert [task["goal"] for task in payload["tasks"]] == ["second"]
             assert "verify current state" in payload["tasks"][0]["context"]
             return
-        assert "no continuation was requested" in text
-        assert "action='resume'" not in text
-        assert "retry this automatically" not in text
-        assert dr.retry_status(did)["retry_state"] not in dr.RETRY_PENDING_STATES
-        assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S * 3) == []
-        payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
-        assert "error" in payload
-        assert "tasks" not in payload and "recovery_context" not in payload
+        assert dr.retry_status(did)["retry_state"] in dr.RETRY_PENDING_STATES
     finally:
         release.set()
 
 
 @pytest.mark.parametrize("metadata", ["event", "result"])
-@pytest.mark.parametrize("reason", ["gateway shutdown", "gateway shutdown (final-cleanup)"])
-def test_nonrestart_cut_classification_is_terminal(metadata, reason):
+@pytest.mark.parametrize("reason", ["gateway shutdown", "gateway shutdown (final-cleanup)",
+                                    "gateway shutdown (post-interrupt)"])
+def test_nonrestart_cut_classification_is_recoverable(metadata, reason):
     record = dict(state="interrupted", task={"goals": ["first", "second"]},
                   result={"results": [{"task_index": 0, "status": "completed"}]},
                   event={}, parent_session_id="owner", origin_session_id="")
     record[metadata]["cut_reason"] = reason
-    assert dr.classify_outcome(record)[0] == dr.RETRY_NONE
+    assert dr.classify_outcome(record)[0] == "retry"
 
 
 def _legacy_batch(monkeypatch, *, shape="tasks"):
@@ -157,22 +162,39 @@ def test_legacy_child_persist_failure_never_runs_inline_or_consumes_claim(monkey
 
 
 @pytest.mark.parametrize("metadata", ["event", "result"])
-def test_nonrestart_rows_from_older_scheduler_are_cancelled_without_a_notice(metadata):
+def test_nonrestart_rows_from_older_scheduler_remain_retryable(metadata):
     did = _batch_row("deleg_old_shutdown_plan")
     record = dr.retry_status(did)
-    value = dict(record[metadata], cut_reason="gateway shutdown")
+    value = dict(record[metadata], cut_reason="gateway shutdown (post-interrupt)")
     with ad._DB_LOCK, ad._transaction() as conn:
         conn.execute(f"UPDATE async_delegations SET {metadata}_json=?, retry_state='scheduled', "
                      "retry_due_at=?, delivery_state='delivered' WHERE delegation_id=?",
                      (json.dumps(value), time.time() - 1, did))
-    assert dr.claim_retry_dispatch(did)[1] is not None
-    assert dr.retry_note(dict(delegation_id=did, retry_state="scheduled", cut_reason="gateway shutdown")) == ""
+    assert dr.claim_retry_dispatch(did)[1] is None
+    note = dr.retry_note(dict(delegation_id=did, retry_state="scheduled",
+                              cut_reason="gateway shutdown (post-interrupt)",
+                              due_at=time.time(), attempt=1, reason="interrupted"))
+    assert "retry this automatically" in note
+    actions = dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S)
+    assert len(actions) == 1 and actions[0]["kind"] == "notice"
+    assert dr.retry_status(did)["retry_state"] == "noticing"
+
+
+def test_sweep_records_user_stop_reason_when_revoking_owed_retry():
+    did = _batch_row("deleg_sweep_user_stop")
+    record = dr.retry_status(did)
+    event = dict(record["event"], cut_reason="/stop")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET state='interrupted', event_json=?, retry_state='scheduled', "
+                     "retry_due_at=?, delivery_state='delivered' WHERE delegation_id=?",
+                     (json.dumps(event), time.time() - 1, did))
     assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S) == []
-    assert dr.retry_status(did)["retry_state"] == "cancelled"
-    assert "error" in json.loads(_handle_control_action("resume", did, None, _Parent()))
+    row = dr.retry_status(did)
+    assert row["retry_state"] == "cancelled"
+    assert row["retry_reason"] == "stopped by user"
 
 
-@pytest.mark.parametrize("reason", ["/stop", "gateway shutdown"])
+@pytest.mark.parametrize("reason", ["/stop"])
 def test_stop_after_legacy_claim_cannot_admit_a_replacement(monkeypatch, reason):
     did, batch, task = _legacy_batch(monkeypatch)
     with ad._DB_LOCK, ad._transaction() as conn:

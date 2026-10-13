@@ -636,10 +636,15 @@ def _cut_reason(record: Dict[str, Any]) -> Any:
 
 
 def _recovery_stopped(record: Dict[str, Any]) -> bool:
-    """Cancellation and non-restart cuts cannot become recovery via another route."""
+    """Only positive user-stop evidence revokes recovery authority.
+
+    Gateway lifecycle cuts are recoverable even when their producer did not emit
+    the canonical restart token: older builds persisted phase-specific reasons,
+    and an unplanned shutdown may still be followed by a service-manager boot.
+    """
     metadata = [record.get("event") or {}, record.get("result") or {}, *_child_results(record)]
     return record.get("retry_state") == RETRY_CANCELLED or any(
-        (item.get("cut_reason") and not is_trusted_restart_cut(item["cut_reason"]))
+        is_user_cancel_reason(item.get("cut_reason") or "")
         or is_user_cancel_reason(item.get("interrupt_reason") or "") for item in metadata
     )
 
@@ -861,16 +866,31 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
             (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
         for row in rows:
             record = _retry_record(row)
-            if _recovery_stopped(record):
-                conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_claim=NULL, "
-                             "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
-                             (now, record["delegation_id"]))
-                continue
             dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
+            stopped = _recovery_stopped(record)
+            if stopped:
+                # A user stop revokes recovery, but an already-owed terminal
+                # report still gets one settlement pass. Pending retry notices
+                # are cancelled with an explicit reason and no stale claim.
+                if record["retry_state"] in (RETRY_TERMINAL, RETRY_REPORTING):
+                    if record["retry_state"] == RETRY_REPORTING:
+                        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_claim=NULL, "
+                                     "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
+                                     (now, record["delegation_id"]))
+                        record.update(retry_state=RETRY_TERMINAL, retry_claim="", retry_claimed_at=None)
+                else:
+                    conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_reason=?, "
+                                 "retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? "
+                                 "WHERE delegation_id=?",
+                                 ("stopped by user", now, record["delegation_id"]))
+                    if dispatch_claim is not None:
+                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                    continue
             if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
                 _expire_retry(conn, record, now)
             state = record["retry_state"]
-            if is_trusted_restart_cut(_cut_reason(record)) and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0):
+            if (not stopped and is_trusted_restart_cut(_cut_reason(record))
+                    and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0)):
                 # The cut completion/accepted continuation notice owns the one
                 # parent wake. Recovery is explicit, not an automatic rerun.
                 if state == RETRY_TERMINAL:
@@ -1218,9 +1238,10 @@ def retry_note(plan: Optional[Dict[str, Any]]) -> str:
     """One line for the completion notice so the parent does not dispatch a duplicate (R5)."""
     if not plan:
         return ""
-    if plan.get("cut_reason") and not is_trusted_restart_cut(plan["cut_reason"]):
+    cut_reason = plan.get("cut_reason")
+    if cut_reason and is_user_cancel_reason(cut_reason):
         return ""
-    if plan["retry_state"] == RETRY_SCHEDULED and is_trusted_restart_cut(plan.get("cut_reason")):
+    if plan["retry_state"] == RETRY_SCHEDULED and is_trusted_restart_cut(cut_reason):
         return (f"Work was cut before finishing. To continue call delegate_task(action='resume', "
                 f"subagent_id='{plan['delegation_id']}') and use its state-verification brief. "
                 "Do not rerun completed children. This recovery window expires after the 24h lineage budget; "

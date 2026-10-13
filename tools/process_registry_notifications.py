@@ -7,8 +7,6 @@ import time
 from dataclasses import dataclass
 from contextlib import suppress
 
-from tools.delegation_resume import is_trusted_restart_cut
-
 # Shared with retention consumers: every process/delegation notice is framed by
 # PROCESS_NOTIFICATION_END, including the gateway's coalesced completion variant.
 PROCESS_NOTICE_OPEN = "[IMPORTANT: "
@@ -18,6 +16,24 @@ PROCESS_NOTICE_OPENERS = (PROCESS_NOTICE_OPEN, HEARTBEAT_NOTICE_OPEN, DELEGATION
 WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_overflow_released")
 GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
+
+
+def _cut_is_user_stop(reason) -> bool:
+    """Load stop classification lazily to avoid the delegation notification cycle."""
+    from tools.delegation_resume import is_user_cancel_reason
+    return is_user_cancel_reason(reason or "")
+
+
+def _cut_is_trusted_restart(reason) -> bool:
+    """Keep the canonical producer token useful for wording, not authority."""
+    from tools.delegation_resume import is_trusted_restart_cut
+    return is_trusted_restart_cut(reason)
+
+
+def _cut_is_recoverable(reason) -> bool:
+    """Every lifecycle cut remains recoverable unless it proves a user stop."""
+    return bool(reason) and not _cut_is_user_stop(reason)
+
 
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
@@ -230,26 +246,24 @@ def _recovery_lines(evt: dict) -> "list[str]":
 
 
 def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
-    """Render restart recovery guidance only for trusted gateway restart cuts."""
+    """Render recovery guidance for every lifecycle cut except an explicit user stop."""
     cut_reason = evt.get("cut_reason")
     if not cut_reason:
         return []
     reason = str(cut_reason).strip()
-    # User cancellation and non-restart shutdowns are terminal notifications, not
-    # recovery offers. In particular, never turn a /stop cut into a resume action.
-    restart_cut = is_trusted_restart_cut(reason)
     goals = evt.get("goals") or []
     indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
     recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
     unfinished = [str(index + 1) for index in indexes
                   if recorded.get(index, {}).get("status") not in _DONE]
+    detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
+    if _cut_is_user_stop(reason):
+        return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
     when = evt.get("completed_at") or time.time()
     stamp = time.strftime("%H:%M", time.localtime(when))
-    detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
-    if not restart_cut:
-        return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
+    label = "gateway restart" if _cut_is_trusted_restart(reason) else "gateway shutdown/lifecycle"
     return [
-        f"Cut by gateway restart at {stamp}. {detail}",
+        f"Cut by {label} at {stamp}. {detail}",
         f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
         *(["Do not rerun completed children."] if len(goals) > 1 else []),
     ]
@@ -273,10 +287,9 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
     lines += _cut_recovery_lines(evt, results)
-    restart_cut = False
+    restart_cut = _cut_is_recoverable(evt.get("cut_reason"))
     if evt.get("cut_reason"):
         lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
-        restart_cut = is_trusted_restart_cut(evt["cut_reason"])
         lines.append(
             "This unit was cut by the gateway before its terminal result was trustworthy. "
             "Resume only the unfinished children after verifying recorded results and side effects."
@@ -371,7 +384,7 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         if status == "interrupted":
             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
-            if not evt.get("cut_reason") or is_trusted_restart_cut(evt["cut_reason"]):
+            if not evt.get("cut_reason") or _cut_is_recoverable(evt.get("cut_reason")):
                 lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(

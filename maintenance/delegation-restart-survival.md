@@ -58,14 +58,16 @@ result/transcript evidence for conservative recovery through the durable retry e
   INSERT transaction, not just when the parent claims a brief.
 - Non-cut retries use the existing bounded retry notices and grace windows.
   Fan-out notices instruct the parent to spawn the returned `tasks` list.
-- A trusted restart-cut completion lists unfinished indexes from goals/task_indexes,
-  including children whose result is missing, and gives the exact `action='resume'`
-  command. `is_trusted_restart_cut` is the shared authority for the formatter,
-  retry notes, recovery eligibility, and sweep (including its SQL filter).
-  `/stop`, cancellation, and non-restart shutdowns do not offer or admit recovery.
-  The accepted restart-cut completion/continuation owns the one parent notice:
-  restart-cut work requires explicit resume, not an automatic rerun or a second
-  continuation wake.
+- A gateway lifecycle cut lists unfinished indexes from goals/task_indexes, including
+  children whose result is missing, and gives the exact `action='resume'` command.
+  `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
+  continuation path, but recovery authority is based on positive evidence of a user
+  stop, not on a restart token. Legacy phase-specific gateway-shutdown reasons and
+  unplanned shutdowns therefore remain recoverable. `/stop`, `stop_command`,
+  cancellation, and session end do not offer or admit recovery; a sweep that revokes
+  one records `retry_reason='stopped by user'` and settles any already-owed terminal
+  report once. The accepted restart-cut completion/continuation owns the one parent
+  notice and requires explicit resume, not an automatic rerun or a second wake.
 - An unspent cut dispatch claim re-arms quietly after the normal grace window.
   Unresumed cuts expire at the existing 24h lineage deadline and settle `reported`
   without another parent wake; normal retention then prunes the row and orphaned

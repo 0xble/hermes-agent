@@ -19,30 +19,38 @@ def test_scalar_cut_notice_uses_task_wording(goals):
 @pytest.mark.parametrize("cut_reason, expected_detail", [
     ("/stop", "/stop"), ("user_stop", "user_stop"), ("session_reset", "session_reset"),
     ("gateway shutdown (/stop)", "stopped before finishing"),
-    ("shutdown", "stopped before finishing"), ("cli shutdown", "stopped before finishing"),
-    ("oneshot shutdown", "oneshot shutdown"), ("stopped before finishing", "stopped before finishing"),
-    ("gateway shutdown", "stopped before finishing"),
-    ("gateway shutdown (post-interrupt)", "stopped before finishing"),
-    ("gateway shutdown (final-cleanup)", "stopped before finishing"),
 ])
 @pytest.mark.parametrize("batch", [False, True])
-def test_user_stop_and_non_restart_shutdown_cut_notice_has_no_resume_or_gateway_restart(cut_reason, expected_detail, batch):
+def test_explicit_user_stop_cut_notice_has_no_resume_or_gateway_restart(cut_reason, expected_detail, batch):
     text = _format_async_delegation({
-        "type": "async_delegation",
-        "delegation_id": "deleg_user_stop_notice",
-        "is_batch": batch,
-        "goal": "2 parallel subagents" if batch else "first",
+        "type": "async_delegation", "delegation_id": "deleg_user_stop_notice",
+        "is_batch": batch, "goal": "2 parallel subagents" if batch else "first",
         "goals": ["first", "second"] if batch else [],
         **({"results": [{"task_index": 0, "status": "interrupted", "error": "cut"}]} if batch else {}),
-        "status": "interrupted",
-        "cut_reason": cut_reason,
-        "completed_at": 1_760_000_000.0,
+        "status": "interrupted", "cut_reason": cut_reason, "completed_at": 1_760_000_000.0,
     })
     assert "resume" not in text.lower()
     assert "gateway restart" not in text.lower()
     assert f"Stopped ({expected_detail})." in text
     if expected_detail != cut_reason:
         assert cut_reason not in text
+
+
+@pytest.mark.parametrize("cut_reason", ["shutdown", "cli shutdown", "oneshot shutdown",
+                                        "stopped before finishing", "gateway shutdown",
+                                        "gateway shutdown (post-interrupt)",
+                                        "gateway shutdown (final-cleanup)"])
+@pytest.mark.parametrize("batch", [False, True])
+def test_gateway_lifecycle_cut_notice_remains_recoverable(cut_reason, batch):
+    text = _format_async_delegation({
+        "type": "async_delegation", "delegation_id": "deleg_lifecycle_notice",
+        "is_batch": batch, "goal": "2 parallel subagents" if batch else "first",
+        "goals": ["first", "second"] if batch else [],
+        **({"results": [{"task_index": 0, "status": "interrupted", "error": "cut"}]} if batch else {}),
+        "status": "interrupted", "cut_reason": cut_reason, "completed_at": 1_760_000_000.0,
+    })
+    assert "action='resume'" in text
+    assert "gateway shutdown/lifecycle" in text or "gateway restart" in text
 
 
 def test_cut_batch_notice_has_fixed_resume_block():
@@ -114,7 +122,7 @@ def test_live_cut_completion_preserves_unit_indexes_for_notice_and_resume(tmp_pa
         assert event["task_indexes"] == [0, 2]
         text = _format_async_delegation(event)
         assert "Unfinished children: 3." in text
-        if cut_reason != "gateway shutdown (restart)":
+        if cut_reason == "/stop":
             assert "resume" not in text.lower()
             assert "gateway restart" not in text.lower()
             parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()

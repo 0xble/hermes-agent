@@ -30,7 +30,7 @@ def test_only_the_shared_producer_restart_token_is_trusted(reason):
 @pytest.mark.parametrize("phase", ["post-interrupt", "final-cleanup"])
 @pytest.mark.parametrize("restart", [False, True])
 @pytest.mark.parametrize("batch", [False, True])
-async def test_real_shutdown_offers_resume_only_for_restart(monkeypatch, tmp_path, phase, restart, batch):
+async def test_real_shutdown_offers_resume_for_every_lifecycle_cut_except_user_stop(monkeypatch, tmp_path, phase, restart, batch):
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
     monkeypatch.setattr(process_registry, "kill_all", lambda **_kwargs: 0)
@@ -70,18 +70,14 @@ async def test_real_shutdown_offers_resume_only_for_restart(monkeypatch, tmp_pat
         event = process_registry.completion_queue.get(timeout=5)
         assert event["cut_reason"] == ("gateway shutdown (restart)" if restart else f"gateway shutdown ({phase})")
         text = _format_async_delegation(event)
-        assert ("delegate_task(action='resume'" in text) is restart
+        assert "delegate_task(action='resume'" in text
         parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()
         payload = json.loads(_handle_control_action("resume", handle["delegation_id"], None, parent))
-        if restart:
-            assert payload["status"] == "retry_claimed"
-            if batch:
-                assert [task["goal"] for task in payload["tasks"]] == ["second"]
-            else:
-                assert payload["goal"] == "first"
+        assert payload["status"] == "retry_claimed"
+        if batch:
+            assert [task["goal"] for task in payload["tasks"]] == ["second"]
         else:
-            assert payload.get("error")
-            assert "nothing to resume" in payload["error"].lower()
+            assert payload["goal"] == "first"
     finally:
         release.set()
         ad._reset_for_tests()
