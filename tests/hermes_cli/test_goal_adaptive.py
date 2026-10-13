@@ -64,6 +64,51 @@ CLAIM = ("Done. Evidence: the gate `exact_sha=94d6cf5891ffe6f42ba720d4966a2b6a46
 # ── cited evidence ─────────────────────────────────────────────────────
 
 
+def test_extract_citations_keeps_backticked_identifiers_inside_details():
+    response = (
+        "Done.\n<details><summary>Evidence</summary>\n"
+        "- `abc1234def` is the shipped commit.\n"
+        "- `run_id=run_0123456789` passed.\n</details>"
+    )
+
+    citations = goals.extract_citations(response)
+
+    assert "abc1234def" in citations
+    assert "run_id=run_0123456789" in citations
+
+
+def test_details_evidence_outside_recent_window_reaches_judge(hermes_home, monkeypatch):
+    sid = "cite-details"
+    db = _db(sid)
+    mgr = GoalManager(session_id=sid)
+    mgr.set("Ship it", contract=GoalContract(verification="commit shipped; run passed"))
+    proof = "shipped abc1234def; run_id=run_0123456789 passed"
+    _tool(db, sid, "terminal", {"command": "verify-release"}, proof, "release")
+    for i in range(goals._EVIDENCE_MAX_ENTRIES + 1):
+        _tool(db, sid, "read_file", {"path": f"f{i}"}, f"content {i}", f"r{i}")
+    response = (
+        "Done.\n<details><summary>Evidence</summary>\n"
+        "- `abc1234def` is the shipped commit.\n"
+        "- `run_id=run_0123456789` passed.\n</details>"
+    )
+    prompts = _capture(monkeypatch, ['{"verdict":"done","reason":"cited proof located"}'])
+
+    assert mgr.state is not None
+    citations = goals.resolve_cited_evidence(sid, response, since=mgr.state.created_at)
+    decision = mgr.evaluate_after_turn(response)
+
+    assert citations["unresolved"] == []
+    assert {"abc1234def", "run_id=run_0123456789"} <= {c["needle"] for c in citations["cited"]}
+    assert any(proof in c["excerpt"] for c in citations["cited"])
+    assert len(citations["evidence_ids"]) == 1
+    assert {str(c["message_id"]) for c in citations["cited"]} == set(citations["evidence_ids"])
+    assert decision["verdict"] == "done"
+    assert response in prompts[0]
+    cited = prompts[0].split("Evidence the response cites")[1]
+    assert proof in cited
+    assert proof not in prompts[0].split("Tool results recorded")[1]
+
+
 def test_cited_evidence_outside_the_recent_window_reaches_the_judge(hermes_home, monkeypatch):
     sid = "cite-old"
     db = _db(sid)
