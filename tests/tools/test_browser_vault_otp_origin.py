@@ -91,6 +91,16 @@ def test_otp_alias_origin_skips_consent_when_confirmation_disabled(otp, monkeypa
     assert write.call_count == 1
 
 
+def test_otp_disabled_confirmation_logs_cross_domain_warning(otp, monkeypatch, caplog):
+    backend, write = otp
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "vault": {"confirm_alias_fills": False, "origin_aliases": {"op:otp-origin": ["https://evil.test"]}},
+    })
+    with caplog.at_level("INFO", logger="tools.browser_vault_tool"):
+        assert _enter()["success"]
+    assert "registrable domain differs" in caplog.text
+
+
 def test_otp_disabled_confirmation_still_refuses_unlisted_origin(otp, monkeypatch):
     backend, write = otp
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
@@ -99,6 +109,36 @@ def test_otp_disabled_confirmation_still_refuses_unlisted_origin(otp, monkeypatc
     assert _enter()["error_type"] == "origin_mismatch"
     backend.resolve_otp.assert_not_called()
     write.assert_not_called()
+
+
+@pytest.mark.parametrize("setting,prompted", [("false", False), (None, True), ('"no"', True)])
+def test_confirm_alias_fills_from_real_profile_config(otp, monkeypatch, tmp_path, setting, prompted):
+    """Invariant: vault.confirm_alias_fills is read from the profile config.yaml by the real loader."""
+    backend, write = otp
+    monkeypatch.undo()  # drop the patched loader; re-apply only the page/backend fakes below
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("agent.vault_backends.backend_for_handle", lambda _: backend)
+    monkeypatch.setattr(vault, "_browser_key", lambda t: t)
+    monkeypatch.setattr(vault, "_focus_bound_origin", lambda *_: None)
+    monkeypatch.setattr(vault, "_current_page_origin", lambda _: "https://evil.test")
+    monkeypatch.setattr(vault, "_eval_js", lambda *_: {"success": True, "result": json.dumps([
+        {"index": 0, "type": "text", "autocomplete": "one-time-code"},
+    ])})
+    monkeypatch.setattr(vault, "_eval_js_secret", write)
+    lines = ["vault:", "  origin_aliases:", "    op:otp-origin:", "      - https://evil.test"]
+    if setting is not None:
+        lines.insert(1, f"  confirm_alias_fills: {setting}")
+    (tmp_path / "config.yaml").write_text("\n".join(lines) + "\n")
+    consent = Mock(return_value="unanswered")
+    monkeypatch.setattr(vault, "_confirm_alias_fill", consent)
+    vault._alias_fill_decisions.clear()
+    vault._alias_fill_refused.clear()
+    result = _enter()
+    assert consent.called is prompted
+    assert result["success"] is (not prompted)
+    assert write.called is (not prompted)
+    monkeypatch.setattr(vault, "_current_page_origin", lambda _: "https://unlisted.test")
+    assert _enter()["error_type"] == "origin_mismatch"
 
 
 @pytest.mark.parametrize("decision,error", [("decline", "origin_alias_declined"),
