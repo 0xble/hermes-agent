@@ -500,6 +500,20 @@ def recover_abandoned() -> int:
     return changed
 
 
+def _send_claimed(row, send):
+    try:
+        try:
+            error = send(row["job"], row["content"], bool(row["for_failure"]))
+        except BaseException as exc:
+            logger.exception("Cron delivery failed for %s", row["execution_id"])
+            error = f"{type(exc).__name__}: {exc}"
+        _finish(row["execution_id"], error=error,
+                suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+    finally:
+        with _lock:
+            _ACTIVE_DELIVERIES.discard(row["execution_id"])
+
+
 def drain(
     send: Callable[[dict, str, bool], Optional[str]], *, limit: int = 20
 ) -> int:
@@ -513,18 +527,15 @@ def drain(
             break
         with _lock:
             _ACTIVE_DELIVERIES.add(row["execution_id"])
-        try:
-            try:
-                error = send(
-                    row["job"], row["content"], bool(row["for_failure"])
-                )
-            except BaseException as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
-        finally:
-            with _lock:
-                _ACTIVE_DELIVERIES.discard(row["execution_id"])
+        if row["job"].get("review") and not row["for_failure"]:
+            # A held report uses delivery capacity, never one of the four cron run slots,
+            # and never blocks the drain of unrelated notices. Profile context follows it.
+            import contextvars
+            context = contextvars.copy_context()
+            threading.Thread(target=context.run, args=(_send_claimed, row, send),
+                             name="cron-review-delivery", daemon=True).start()
+        else:
+            _send_claimed(row, send)
         processed += 1
     return processed
 

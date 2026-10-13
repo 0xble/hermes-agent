@@ -606,6 +606,32 @@ Credential-named URL query parameters are not stripped (magic links and pre-sign
 legitimate cron output), and user-chosen secrets with no recognisable shape are not detected.
 The run document under `cron/output/<job_id>/` keeps the agent's response as written.
 
+### Reviewed Telegram Reports
+
+Reports can opt into an invisible review by the agent in their destination topic. The job must use `deliver: local`. Jobs without `review` retain their existing delivery behavior.
+
+```yaml
+review:
+  contract: reports/stripe-brief.yaml
+  subject: "139328"
+  deadline_minutes: 10
+  rerun_deadline_minutes: 20
+  max_reruns: 1
+output_local_only: true
+```
+
+`contract` and `subject` are required. The subject must exactly match a Telegram topic thread ID or session title and resolve to exactly 1 live, unarchived, visible session. Inbox and Ops Log are excluded. If lookup fails or is ambiguous, nothing is sent and a cron incident records the error.
+
+Set or replace the declaration with `hermes cron create/edit --review-json '{"contract":"reports/stripe-brief.yaml","subject":"139328"}'`. Clear it with `hermes cron edit <job_id> --clear-review`. Unrelated edits preserve the declaration. Setting review also sets `output_local_only: true`, and clearing it sets that flag to false. The cron tool exposes the same `review_json` and `clear_review` arguments.
+
+The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
+
+The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries.
+
+Final delivery uses the normal bot lane and appends the report as an assistant message to the resolved session. It omits the optional generic cron wrapper so the contract's envelope survives. Review decisions, candidate checks, selected text, message ID, delivery errors, and elapsed time are recorded in `<HERMES_HOME>/cron/review-receipts.jsonl`.
+
+Relative contract paths resolve first under `<HERMES_HOME>/cron/contracts/`, then under the bundled `cron/contracts/`, then under the profile home. Absolute paths are supported. Contracts declare `title`, `required_lines`, `required_sections`, `optional_sections`, `word_cap`, and `silence_markers`. Sections are Markdown `##` headings, ordered as required sections followed by optional sections. Undeclared and duplicate sections fail. The bundled Stripe contract requires `# Stripe Priorities`, a `**Focus:**` line, `## Priorities`, and at most 400 words. Its optional sections are Upcoming, Waiting / Blocked, Changes, and Standup, in that order.
+
 ### Delivery failures are a distinct status
 
 Execution and delivery are tracked separately. When the agent run succeeds but

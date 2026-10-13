@@ -5150,6 +5150,8 @@ class BasePlatformAdapter(ABC):
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
         delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
+        from gateway.cron_review import ReviewCapture
+        review_capture = ReviewCapture(event)
 
         def _record_delivery(result, *, required: bool = False):
             nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
@@ -5162,7 +5164,7 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _thread_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5185,6 +5187,7 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            response = review_capture.capture_reply(response)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -5242,15 +5245,12 @@ class BasePlatformAdapter(ABC):
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
-            # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
                 event=event) or "")
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
-            # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
-            # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
             # Deferred control mutations own the committed boundary before prompt text.
             delay = 0.0
@@ -5269,6 +5269,7 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -5278,7 +5279,7 @@ class BasePlatformAdapter(ABC):
             bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e, session_key)) or _thread_metadata
+            _thread_metadata = (await review_capture.notify_error(self, event, e, session_key)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
@@ -5293,7 +5294,6 @@ class BasePlatformAdapter(ABC):
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
-            # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
 

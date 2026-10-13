@@ -3081,6 +3081,8 @@ class _RunDelivery:
 
 def _run_delivery_outcome(d: _RunDelivery) -> str:
     job = d.job
+    if job.get("_review_pending"):
+        return "queued"
     return _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -3147,6 +3149,8 @@ def _save_compose_deliver(
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
 
     if not d.should_deliver:
+        from cron.scheduler_review import record_review_suppression
+        record_review_suppression(job, deliver_content, d.success)
         if commit_result is not None:
             commit_result()
         return
@@ -3159,6 +3163,12 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
+            if d.success and isinstance(job.get("review"), dict):
+                from cron.scheduler_review import enqueue_review
+                if enqueue_review(job, deliver_content):
+                    if commit_result is not None:
+                        commit_result()
+                    return
             # Queue before committing terminal: a worker killed between those
             # writes cannot lose the notice. The gateway claims only after the
             # ledger is terminal (delivery_queue.claim_next).

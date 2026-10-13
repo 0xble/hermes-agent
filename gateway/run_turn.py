@@ -23,6 +23,7 @@ from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
+from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
@@ -2140,13 +2141,12 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
-        if diagnostic_wake_muted(event):
-            return None
+        from gateway.cron_review import private_turn_response
+        private, captured_response = private_turn_response(event, agent_result)
+        if private:
+            return captured_response
         raw_response = response if raw_response is None else raw_response
-        # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
-        # raw response available to post-turn hooks and strip only at this final display boundary.
-        # The non-streamed return value is the stripped display text, so the hooks read the raw
-        # copy stashed here instead (see _final_text_for_post_turn_hooks).
+        # Hooks keep the raw LOOP_COMPLETE marker, which is stripped only for display.
         with suppress(Exception):
             event._raw_final_response = str(raw_response or "")
         from gateway.response_filters import strip_trailing_loop_complete_marker
@@ -4798,10 +4798,9 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
-        if scheduled_heartbeat:
-            # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
-            # liveness notices would create a user-visible ping before its final result is known.
-            # Keep status callbacks intact for approvals and actionable failures.
+        cron_review = (event_metadata or {}).get("_cron_review_capture") is not None
+        if scheduled_heartbeat or cron_review:
+            # Proactive turns stay invisible until their result is presented.
             disp = dataclasses.replace(
                 disp,
                 tool_progress_enabled=False,
@@ -4827,10 +4826,10 @@ class GatewayTurnMixin:
             _post_delivery_adapter=_post_delivery_adapter,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
+        turn_ctx.mute_notification_reply |= cron_review
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
@@ -4861,13 +4860,13 @@ class GatewayTurnMixin:
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
 
-            # Interrupted OR queued message (/queue)?
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

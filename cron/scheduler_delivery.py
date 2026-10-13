@@ -236,16 +236,14 @@ def _maybe_mirror_cron_delivery(
         return
     try:
         from gateway.mirror import mirror_to_session
-        # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
-        # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
-        # The brief is not the agent speaking; an assistant-role mirror lands as assistant→assistant after
-        # the agent's last turn and breaks strict alternation (issue #2221, the exact failure #2313
-        # removed). A user-role turn collapses safely via repair_message_sequence's consecutive-user merge
-        # on every provider, and the prefix preserves the "this came from cron" context that the dropped
-        # SQLite mirror metadata would otherwise lose on replay.
+        # Ordinary briefs remain labelled user turns, preserving replay alternation (#2221, #2313).
+        # A reviewed presentation belongs to the subject agent, so it appends as its own assistant text.
+        review_session = job.get("_review_mirror_session")
         ok = mirror_to_session(
-            platform_name, str(chat_id), _cron_mirror_message(job, text),
-            source_label="cron", thread_id=thread_id, user_id=user_id, role="user")
+            platform_name, str(chat_id), text if review_session else _cron_mirror_message(job, text),
+            source_label="cron", thread_id=thread_id, user_id=user_id,
+            role="assistant" if review_session else "user",
+            **({"session_id": review_session} if review_session else {}))
         if ok:
             logger.info(
                 "Job '%s': mirrored delivery into %s:%s session transcript",
@@ -1795,6 +1793,8 @@ def _deliver_via_live_adapter(
                 route_thread_id if route_thread_id is not None else "-",
                 delivered_message_id if delivered_message_id is not None else "-")
             delivered = True
+            if delivered_message_id is not None:
+                job.setdefault("_last_delivery_message_ids", []).append(str(delivered_message_id))
             _seed_live_delivery_sessions(t, delivered_message_id)
     except Exception as e:
         err_msg = f"live adapter delivery to {t.where} failed: {e}"
@@ -1947,6 +1947,8 @@ def _deliver_standalone(
             delivered_copy_count += 1
         elif payload_content:
             delivered_text = True
+        if isinstance(result, dict) and result.get("message_id") is not None:
+            job.setdefault("_last_delivery_message_ids", []).append(str(result["message_id"]))
         combined_warnings.extend((result.get("warnings") if isinstance(result, dict) else None) or [])
     if err is None and result is None:
         err = f"standalone send skipped (empty text and no media) for {t.where}"
@@ -2099,29 +2101,6 @@ def _prepare_target_delivery(
         opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
 
 
-def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
-    """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
-    origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
-    an error string."""
-    deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
-    if deliver_value == "local":
-        return None
-    if deliver_value == "origin":
-        logger.info(
-            # deliver=origin with no resolvable origin and no configured home channels: treat as local
-            # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
-            # so failing here would make every CLI `deliver=origin` (or auto-detect) job emit a spurious "no
-            # delivery target resolved" error on every run (#43014). The output is still persisted in
-            # last_output for `cron list`/resume.
-            "Job '%s': deliver=origin but no origin or home channels — "
-            "skipping delivery (output saved in last_output)",
-            job.get("name", job.get("id", "?")))
-        return None
-    msg = f"no delivery target resolved for deliver={deliver_value}"
-    logger.warning("Job '%s': %s", job["id"], msg)
-    return msg
-
-
 def _uses_external_delivery_queue(job: dict, adapters, targets: list, external_execution: str) -> bool:
     """Keep pre-commit admission and the actual send lane on the same routing decision."""
     return bool(
@@ -2138,13 +2117,19 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    if (not for_failure and isinstance(job.get("review"), dict)
+            and str(job.get("deliver", "local")).strip().lower() == "local"):
+        from cron.scheduler_review import _deliver_reviewed_result
+
+        return _deliver_reviewed_result(job, content, adapters, loop)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     job.pop("_formatting_degraded_targets", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
     if not targets:
         _record_delivery_verification(job, [])
-        return _unresolved_delivery_outcome(job, for_failure)
+        from cron.scheduler_delivery_origin import unresolved_delivery_outcome
+        return unresolved_delivery_outcome(job, for_failure)
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
@@ -2179,7 +2164,7 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
+    if wrap_response and not job.get("_review_mirror_session"):
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"

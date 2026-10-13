@@ -5717,12 +5717,8 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
-        # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
-        # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
-        # cleanly — releasing every venv file handle — instead of being tree-killed mid-turn. Same drain
-        # path as SIGUSR1/service restarts (request_restart(via_service=True)); the updater (or the service
-        # manager) relaunches after the code swap.
+        # cleanly, releasing venv handles. Marshal the executor request onto the main loop.
         _main_loop = asyncio.get_running_loop()
 
         def _pause_for_update_handler() -> dict:
@@ -5768,9 +5764,13 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
+        from gateway.cron_review import CronReviewControl
+        _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
-            verb_handlers={"pause-for-update": _pause_for_update_handler,
+            verb_handlers={"cron-review": _cron_review_control.submit,
+                           "cron-review-result": _cron_review_control.result,
+                           "pause-for-update": _pause_for_update_handler,
                            "agent-update": _agent_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "unserve-profile": unserve_profile_verb(runner),

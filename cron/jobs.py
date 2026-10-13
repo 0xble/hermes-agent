@@ -16,6 +16,8 @@ import os
 import re
 import uuid
 
+from cron.review import normalize_review, validate_review_delivery
+
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
 # absent, _jobs_lock() degrades to in-process locking rather than failing.
 try:
@@ -1830,6 +1832,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
+    "review": normalize_review,
     "interpreter": _normalize_job_optional_text,
     "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
 }
@@ -1842,6 +1845,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "review": normalize_review,
     "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
 }
 
@@ -1911,6 +1915,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
+    review: Optional[Dict[str, Any]] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     job_timezone: Optional[str] = None,
@@ -1949,6 +1954,7 @@ def create_job(
 
     raw = locals()
     f = {key: norm(raw[key]) for key, norm in _CREATE_FIELD_NORMALIZERS.items()}
+    validate_review_delivery(f["review"], deliver)
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
@@ -2017,6 +2023,8 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
+        ("review", f["review"]),
+        ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
     ):
@@ -2223,6 +2231,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if "review" in updates:
+            updated["output_local_only"] = bool(updated.get("review"))
+        if {"review", "deliver"}.intersection(updates):
+            validate_review_delivery(updated.get("review"), updated.get("deliver", "local"))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
