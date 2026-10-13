@@ -45,7 +45,7 @@ def _planned_exit_path():
 
 
 def record_planned_exit() -> None:
-    """Carry consumed service/update signal intent across the process boundary."""
+    """Carry planned shutdown intent across the process boundary, stamped at exit."""
     with contextlib.suppress(OSError):
         path = _planned_exit_path()
         path.parent.mkdir(parents=True, exist_ok=True)

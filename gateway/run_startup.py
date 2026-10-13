@@ -791,19 +791,18 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
-        # Only boots with restart-interrupted sessions count. Every planned predecessor needs recent
-        # intent: chat/home notification markers can outlive later crashes, and the update/service
-        # signal marker is consumed at shutdown, so that handler persists a separate one-shot marker.
+        # Only boots with restart-interrupted sessions count. Shutdown stamps one-shot planned
+        # intent after draining; recent chat/home notification markers remain a fallback.
         # The guard gives the first planned boot one chain-local allowance; repeated planned boots count.
         if record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
                 from gateway.run import _hermes_home, _planned_restart_notification_path
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                _signal_restart = _rlg.consume_planned_exit(_window, max_gap_seconds=_max_gap)
+                _planned_exit = _rlg.consume_planned_exit(_window, max_gap_seconds=_max_gap)
                 if not candidates:
                     return candidates
-                _planned_restart = _signal_restart or _rlg.planned_marker_is_recent(
+                _planned_restart = _planned_exit or _rlg.planned_marker_is_recent(
                     _hermes_home / ".restart_notify.json", window_seconds=_window,
                     max_gap_seconds=_max_gap, use_mtime=True,
                 ) or _rlg.planned_marker_is_recent(

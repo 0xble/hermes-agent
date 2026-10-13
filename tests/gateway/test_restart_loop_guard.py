@@ -6,7 +6,7 @@ import signal
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -63,7 +63,52 @@ async def test_planned_signal_exit_exempts_next_boot_once(tmp_path, monkeypatch)
     assert guard._load_state() == ([now + 10], [now])
 
 
-def test_stale_restart_notification_does_not_exempt_boot(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_chat_restart_after_long_drain_exempts_next_boot(tmp_path, monkeypatch):
+    from gateway import run, status
+    from gateway.platforms.base import MessageEvent
+    from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+    from gateway.run_shutdown import GatewayShutdownMixin
+    from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+    monkeypatch.setattr(run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(guard, "_state_path", lambda: tmp_path / "gateway" / "restart_loop.json")
+    clock = [1000.0]
+    monkeypatch.setattr(guard.time, "time", lambda: clock[0])
+    monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: True)
+    monkeypatch.setattr(status, "remove_pid_file", lambda: None)
+    monkeypatch.setattr(status, "release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr(status, "flush_runtime_status_async", AsyncMock(return_value=True))
+    monkeypatch.setattr(run, "_shutdown_gateway_health_export", lambda *_: None)
+    predecessor, _ = make_restart_runner()
+    predecessor._is_stale_restart_redelivery = lambda _: False
+    predecessor._running_agent_count = lambda: 1
+    predecessor._mark_api_runs_shutdown_requested = lambda: None
+
+    async def long_drain():
+        # /restart can wait up to 1800s before stop(), longer than the 300s chain gap.
+        clock[0] += 601
+        return False
+
+    async def finish_shutdown(**kwargs):
+        assert kwargs == {"restart": True, "detached_restart": False, "service_restart": True}
+        ctx = SimpleNamespace(timed_out=True, active_agents={}, elapsed=lambda: 0)
+        await GatewayShutdownMixin._stop_persist_exit_state(predecessor, ctx)
+
+    predecessor._await_active_work_before_restart = long_drain
+    predecessor.stop = finish_shutdown
+    await predecessor._handle_restart_command(MessageEvent(text="/restart", source=make_restart_source()))
+    marker = tmp_path / ".restart_notify.json"
+    os.utime(marker, (clock[0], clock[0]))
+    await predecessor._restart_task
+    assert clock[0] - marker.stat().st_mtime > guard.DEFAULT_MAX_GAP_SECONDS
+    assert predecessor._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert _resume_runner()._resume_pending_candidates()
+    assert guard._load_state() == ([], [clock[0]])
+
+
+@pytest.mark.parametrize("age, planned", [(0, True), (301, False)])
+def test_restart_notification_fallback_requires_recent_marker(tmp_path, monkeypatch, age, planned):
     from gateway import run
 
     monkeypatch.setattr(run, "_hermes_home", tmp_path)
@@ -72,10 +117,10 @@ def test_stale_restart_notification_does_not_exempt_boot(tmp_path, monkeypatch):
     monkeypatch.setattr(guard.time, "time", lambda: now)
     marker = tmp_path / ".restart_notify.json"
     marker.write_text('{"platform": "telegram", "chat_id": "123"}', encoding="utf-8")
-    os.utime(marker, (now - 301, now - 301))
+    os.utime(marker, (now - age, now - age))
 
     assert _resume_runner()._resume_pending_candidates()
-    assert guard._load_state() == ([now], [])
+    assert guard._load_state() == (([], [now]) if planned else ([now], []))
 
 
 def test_planned_exit_is_consumed_on_a_boot_without_pending_sessions(tmp_path, monkeypatch):
@@ -94,7 +139,7 @@ def test_planned_exit_is_consumed_on_a_boot_without_pending_sessions(tmp_path, m
     assert not guard._load_state()[1]
 
 
-@pytest.mark.parametrize("contents", ['{"requested_at": 699}', '{"requested_at": true}', '[]', '{broken'])
+@pytest.mark.parametrize("contents", ['{"requested_at": 699}', '{"requested_at": true}', '{}', '[]', '{broken'])
 def test_stale_or_malformed_planned_exit_is_consumed_without_exemption(tmp_path, monkeypatch, contents):
     monkeypatch.setattr(guard, "_state_path", lambda: tmp_path / "restart_loop.json")
     monkeypatch.setattr(guard.time, "time", lambda: 1000)
@@ -113,24 +158,6 @@ def test_unwritable_planned_exit_does_not_block_restart(tmp_path, monkeypatch):
     guard.record_planned_exit()
     assert guard.consume_planned_exit() is False
     assert guard.check_and_record(now=1000) is False
-
-
-@pytest.mark.parametrize("age, expected", [(300, True), (301, False), (600, True)])
-def test_restart_marker_mtime_uses_configured_chain_gap(tmp_path, monkeypatch, age, expected):
-    marker = tmp_path / ".restart_notify.json"
-    marker.write_text('{}', encoding="utf-8")
-    os.utime(marker, (1000 - age, 1000 - age))
-    gap = 600 if age == 600 else 300
-    assert guard.planned_marker_is_recent(marker, now=1000, max_gap_seconds=gap, use_mtime=True) is expected
-
-
-def test_planned_restart_does_not_spend_boot_budget(tmp_path, monkeypatch):
-    state = tmp_path / "restart_loop.json"
-    monkeypatch.setattr(guard, "_state_path", lambda: state)
-
-    assert guard.check_and_record(max_restarts=3, now=100.0) is False
-    assert guard.check_and_record(max_restarts=3, now=110.0, planned_restart=True) is False
-    assert guard._load_boots() == [100.0]
 
 
 def test_alternating_planned_and_crash_boots_trip_within_one_chain(tmp_path, monkeypatch):
@@ -169,15 +196,18 @@ def test_legacy_boots_only_state_is_still_counted(tmp_path, monkeypatch):
     assert guard.check_and_record(max_restarts=3, now=120.0) is True
 
 
-def test_planned_marker_must_be_recent_relative_to_boot(tmp_path):
+@pytest.mark.parametrize("use_mtime", [False, True])
+def test_planned_marker_uses_configured_chain_gap(tmp_path, use_mtime):
     marker = tmp_path / ".restart_pending.json"
     marker.write_text('{"requested_at": 1000.0}', encoding="utf-8")
+    os.utime(marker, (1000, 1000))
 
-    assert guard.planned_marker_is_recent(marker, now=1100.0, max_gap_seconds=300) is True
-    assert guard.planned_marker_is_recent(marker, now=1301.0, max_gap_seconds=300) is False
-    marker.write_text('{"via_service": true}', encoding="utf-8")
-    assert guard.planned_marker_is_recent(marker, now=1000.0) is False
-    assert guard.planned_marker_is_recent(tmp_path / "missing.json", now=1000.0) is False
+    assert guard.planned_marker_is_recent(marker, now=1300, use_mtime=use_mtime) is True
+    assert guard.planned_marker_is_recent(marker, now=1301, use_mtime=use_mtime) is False
+    assert guard.planned_marker_is_recent(
+        marker, now=1600, max_gap_seconds=600, use_mtime=use_mtime,
+    ) is True
+    assert guard.planned_marker_is_recent(tmp_path / "missing.json", now=1000, use_mtime=use_mtime) is False
 
 
 def test_repeated_planned_restart_loop_still_trips(tmp_path, monkeypatch):
@@ -186,46 +216,6 @@ def test_repeated_planned_restart_loop_still_trips(tmp_path, monkeypatch):
 
     assert guard.check_and_record(max_restarts=3, now=100.0) is False
     assert guard.check_and_record(max_restarts=3, now=110.0, planned_restart=True) is False
+    assert guard._load_state() == ([100.0], [110.0])
     assert guard.check_and_record(max_restarts=3, now=120.0, planned_restart=True) is False
     assert guard.check_and_record(max_restarts=3, now=130.0, planned_restart=True) is True
-
-
-def test_startup_marks_pending_planned_restart_for_breaker(tmp_path, monkeypatch):
-    class _Store:
-        _entries = {}
-
-        def _ensure_loaded_locked(self):
-            return None
-
-        class _Lock:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        _lock = _Lock()
-
-    runner = object.__new__(GatewayStartupMixin)
-    runner.session_store = _Store()
-    runner._restart_loop_guard_config = lambda: (3, 60, 300)
-    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
-    monkeypatch.setattr(guard, "_state_path", lambda: tmp_path / "gateway" / "restart_loop.json")
-    (tmp_path / ".restart_notify.json").write_text('{}', encoding="utf-8")
-    guard_call = Mock(return_value=False)
-    monkeypatch.setattr(guard, "check_and_record", guard_call)
-
-    assert runner._resume_pending_candidates() == []
-    guard_call.assert_not_called()
-
-    class _Entry:
-        resume_pending = True
-        suspended = False
-        origin = object()
-        resume_reason = "gateway_restart"
-
-    _Store._entries = {"session": _Entry()}
-    runner._AUTO_RESUME_REASONS = {"gateway_restart"}
-    runner._restart_loop_guard_config = lambda: (3, 60, 300)
-    assert runner._resume_pending_candidates() == [_Store._entries["session"]]
-    guard_call.assert_called_once_with(3, 60, max_gap_seconds=300, planned_restart=True)
