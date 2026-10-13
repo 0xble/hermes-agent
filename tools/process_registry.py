@@ -3179,8 +3179,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         prunable = {
             sid: s for sid, s in self._finished.items()
             if not getattr(s, "_scope_stop_pending", False)
-            and not (getattr(s, "survive_restart", False) and s.notify_on_complete
-                     and self._survivor_delivery_state(s) != "delivered")
+            and not self._retain_survivor_completion(s)
         }
         expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]
         over_cap = len(self._running) + len(self._finished) - len(expired) >= MAX_PROCESSES

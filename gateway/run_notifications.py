@@ -3035,6 +3035,8 @@ class GatewayNotificationsMixin:
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
         busy_receipt_sent = False
+        text_send_failures = 0
+        text_retry_base = min(max(interval, 1.0), 30.0)
         while True:
             await asyncio.sleep(interval)
             # A finished process falls back to retained results, whose ownership check reads state.db.
@@ -3119,6 +3121,11 @@ class GatewayNotificationsMixin:
                                                    diagnostic=session.exit_code not in {0, None})
                     if sent is False and getattr(session, "survive_restart", False):
                         process_registry.release_survivor_completion(session_id)
+                        text_send_failures += 1
+                        if text_send_failures >= 5:
+                            logger.warning("Process watcher send retries exhausted; completion pending: %s", session_id)
+                            break
+                        interval = min(text_retry_base * (2 ** (text_send_failures - 1)), 30.0)
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the
                 # claimed survivor completion is settled and must not replay on a successor.

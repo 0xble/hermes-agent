@@ -538,6 +538,15 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     return True
 
 
+def _notif_retry_survivor(evt, registry, emitted):
+    """A refused turn is not delivery: return only our lease and reset UI dedup."""
+    if (evt.get("type", "completion") == "completion"
+            and registry.release_survivor_completion(evt.get("session_id", ""))):
+        if emitted is not None:
+            emitted.discard(_notification_event_dedup_key(evt))
+        registry.completion_queue.put(evt)
+
+
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
     """Route one dequeued event: foreign (another live session owns it) → requeued, or onto ``deferred`` during the
     shutdown drain; unowned (addressed but unprovable — never adopt an orphan) → dropped, except delegation payloads
@@ -585,19 +594,19 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
     from tools.process_registry_notifications import acknowledge_survivor_notifications
+    claim_survivor = getattr(registry, "claim_survivor_completion", None)
+    if evt_type == "completion" and claim_survivor is not None and not claim_survivor(evt.get("session_id", "")):
+        # UI dedup is not admission: fence every attempt, including stale queued offers.
+        process = registry.get(evt.get("session_id", ""))
+        if process is not None and registry._survivor_delivery_pending(process):
+            (deferred.append if deferred is not None else queue.put)(evt)
+            if deferred is None:
+                attempts = session.setdefault("_notification_peer_backoff", {})
+                attempt = int(attempts.get(dedup_key, 0)) + 1
+                attempts[dedup_key] = attempt
+                time.sleep(min(0.1 * (2 ** min(attempt - 1, 5)), 2.0))
+        return True
     if dedup_key not in emitted:
-        claim_survivor = getattr(registry, "claim_survivor_completion", None)
-        if evt_type == "completion" and claim_survivor is not None and not claim_survivor(evt.get("session_id", "")):
-            # A live peer owns delivery: retain our offer without rendering or starting a turn.
-            process = registry.get(evt.get("session_id", ""))
-            if process is not None and registry._survivor_delivery_pending(process):
-                (deferred.append if deferred is not None else queue.put)(evt)
-                if deferred is None:
-                    attempts = session.setdefault("_notification_peer_backoff", {})
-                    attempt = int(attempts.get(dedup_key, 0)) + 1
-                    attempts[dedup_key] = attempt
-                    time.sleep(min(0.1 * (2 ** (attempt - 1)), 2.0))
-            return True
         peer_backoff = session.get("_notification_peer_backoff")
         if peer_backoff is not None:
             peer_backoff.pop(dedup_key, None)
@@ -631,10 +640,12 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if _notif_dispatch_event(sid, session, evt, text):
         acknowledge_survivor_notifications(registry, ((evt, text),))
+    else:
+        _notif_retry_survivor(evt, registry, emitted)
     return True
 
 
-def _notif_dispatch_completions(sid, session, notifications, registry, deferred):
+def _notif_dispatch_completions(sid, session, notifications, registry, deferred, *, emitted=None):
     from tools.process_registry_notifications import PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, acknowledge_survivor_notifications
     from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
 
@@ -669,6 +680,7 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
+            _notif_retry_survivor(event, registry, emitted)
         return
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
@@ -680,13 +692,13 @@ def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, 
     completions = []
     for index, event in enumerate(events):
         if event.get("type", "completion") != "completion":
-            _notif_dispatch_completions(sid, session, completions, registry, deferred)
+            _notif_dispatch_completions(sid, session, completions, registry, deferred, emitted=emitted)
             completions = []
         if not _notif_handle_event(sid, session, event, emitted, registry, fmt, deferred, completions, owned=owned):
             for remaining in events[index + 1:]:
                 (deferred.append if deferred is not None else registry.completion_queue.put)(remaining)
             break
-    _notif_dispatch_completions(sid, session, completions, registry, deferred)
+    _notif_dispatch_completions(sid, session, completions, registry, deferred, emitted=emitted)
 
 
 def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:

@@ -29,7 +29,13 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   A consumer (CLI/TUI drain, quiet one-shot follow-up, gateway watcher) takes the
   exclusive claim BEFORE render/admission; only that owner may settle or release
   it. A known failed send/admission releases the claim and keeps the completion
-  retryable. A peer
+  retryable. TUI admission failures also re-queue the original completion and
+  clear its UI dedup key; UI dedup never bypasses the survivor lease on later
+  attempts. Text-only watcher sends make at most five attempts, with exponential
+  retry delays (at least one second, capped at 30 seconds); exhaustion leaves the
+  claim released and the completion checkpointed for a successor. Both agent-
+  notify and watcher-routed survivors remain checkpointed and exempt from result
+  pruning until delivered. A peer
   facing a live owner's claim retains its offer; a claim whose owner is gone,
   recycled, or an exec'd predecessor (same PID, unknown nonce) is reclaimed.
   This is an owner-lifetime lease: slow live owners are never overtaken by a
@@ -38,7 +44,9 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   replay (the transport and marker are not one transaction). Delivered markers
   suppress restart replays. Shutdown fences survivor pollers before teardown.
   Run directories are pruned after acknowledged-result retention
-  expires, and immediately on spawn failure. Log polls read only a bounded tail.
+  expires, and immediately on spawn failure. Directory sweeps are throttled to
+  at most once per minute per profile to bound registry-lock IO; in-memory result
+  expiry still runs normally. Log polls read only a bounded tail.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
   processes running. Explicit operator stop paths (`process.kill`, `cli.stop`,
   `slash.stop`, and `process.stop`) still terminate them. This is the D3 operator-stop decision.

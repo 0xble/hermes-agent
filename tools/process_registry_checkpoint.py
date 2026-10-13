@@ -27,8 +27,7 @@ class ProcessCheckpointMixin:
                 entries = []
                 pending_survivors = [
                     s for s in self._finished.values()
-                    if s.survive_restart and s.notify_on_complete
-                    and self._survivor_delivery_state(s) != "delivered"
+                    if self._retain_survivor_completion(s)
                 ]
                 for s in (*self._running.values(), *pending_survivors):
                     if s.exited and not s.survive_restart:

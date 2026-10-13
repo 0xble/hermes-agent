@@ -223,19 +223,73 @@ def test_survivor_delivered_artifacts_are_pruned_on_boot_after_ttl(tmp_path, mon
     assert not marker.parent.exists()
 
 
-def test_survivor_pending_artifacts_and_results_are_not_pruned(tmp_path, monkeypatch):
+@pytest.mark.parametrize("notify", [True, False], ids=["agent", "text-watcher"])
+def test_survivor_pending_artifacts_and_results_are_not_pruned(tmp_path, monkeypatch, notify):
     from pathlib import Path
     from tools.process_registry import FINISHED_TTL_SECONDS
 
     home = _home(monkeypatch, tmp_path)
     registry = ProcessRegistry()
     session = _checkpoint_survivor(registry, home, pid=999999, exit_code=0)
+    session.notify_on_complete = notify
+    session.watcher_interval = 1
+    session.watcher_platform = "telegram"
+    session.watcher_chat_id = "123"
     session.started_at = time.time() - FINISHED_TTL_SECONDS - 1
     registry._survivor_poller_loop(session)
     registry._prune_if_needed()
     assert Path(session.log_path).parent.exists()
     assert session.id in registry._finished
     assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))[0]["session_id"] == session.id
+
+
+def test_survivor_artifact_sweeps_are_throttled_per_home(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    from tools.process_registry import FINISHED_TTL_SECONDS
+
+    home = _home(monkeypatch, tmp_path)
+    run_dir = home / "process-runs" / "proc_aged"
+    run_dir.mkdir(parents=True)
+    marker = run_dir / "delivered"
+    marker.write_text('{"state": "delivered", "delivered": true}', encoding="utf-8")
+    registry = ProcessRegistry()
+    clock = [100.0]
+    monkeypatch.setattr("tools.process_registry_survival.time.monotonic", lambda: clock[0])
+    registry._prune_if_needed()
+    assert run_dir.exists()  # Not old enough on the first sweep.
+    expired = time.time() - FINISHED_TTL_SECONDS - 1
+    os.utime(marker, (expired, expired))
+
+    scans = []
+    original_iterdir = Path.iterdir
+
+    def iterdir(path):
+        if path == run_dir.parent:
+            scans.append(path)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    clock[0] += 59
+    registry._prune_if_needed()
+    assert run_dir.exists()
+    assert not scans
+    # A different profile still gets its first sweep immediately.
+    second_home = tmp_path / "second-home"
+    second_run = second_home / "process-runs" / "proc_second"
+    second_run.mkdir(parents=True)
+    second_marker = second_run / "delivered"
+    delivered_text = marker.read_text(encoding="utf-8-sig")
+    second_marker.write_text(delivered_text, encoding="utf-8")
+    os.utime(second_marker, (expired, expired))
+    monkeypatch.setattr("tools.process_registry.get_hermes_home", lambda: second_home)
+    registry._prune_if_needed()
+    assert not second_run.exists()
+    monkeypatch.setattr("tools.process_registry.get_hermes_home", lambda: home)
+    clock[0] += 1
+    registry._prune_if_needed()
+    assert scans == [run_dir.parent]
+    assert not run_dir.exists()
 
 
 def test_survivor_spawn_failure_prunes_run_dir(tmp_path, monkeypatch):

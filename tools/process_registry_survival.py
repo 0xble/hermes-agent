@@ -166,6 +166,12 @@ class ProcessSurvivalMixin:
                 yield path
         return held()
 
+    def _retain_survivor_completion(self, session: ProcessSession) -> bool:
+        """Keep both agent and text-watcher results until their delivery is settled."""
+        return (session.survive_restart
+                and (session.notify_on_complete or session.watcher_interval > 0)
+                and self._survivor_delivery_pending(session))
+
     def _survivor_delivery_pending(self, session: ProcessSession) -> bool:
         """Read-only producer check: a queued event is not delivered and may replay after a crash."""
         return self._survivor_delivery_state(session) != "delivered"
@@ -292,6 +298,16 @@ class ProcessSurvivalMixin:
         """Bound delivered artifacts even if their registry died before TTL pruning."""
         from tools import process_registry as registry
         run_root = registry.get_hermes_home() / "process-runs"
+        # This sweep also runs under the registry lock during spawn/drain. Bound its
+        # directory IO per profile, not per session, without delaying another profile.
+        sweep_times = getattr(self, "_survivor_sweep_times", None)
+        if sweep_times is None:
+            sweep_times = self._survivor_sweep_times = {}
+        sweep_now = time.monotonic()
+        last = sweep_times.get(run_root)
+        if last is not None and sweep_now - last < 60.0:
+            return
+        sweep_times[run_root] = sweep_now
         now = time.time()
         tracked = self._running.keys() | self._finished.keys()
         try:

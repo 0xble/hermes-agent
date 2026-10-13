@@ -2,7 +2,10 @@
 
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.process_registry_notifications import format_process_notification
@@ -26,6 +29,66 @@ def _survivor_registry(tmp_path, monkeypatch, session_key="tui-session"):
         "output": "test output",
     }
     return registry, session, event
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
+def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, batch):
+    registry, process, event = _survivor_registry(tmp_path, monkeypatch)
+    processes, events = [process], [event]
+    if batch:
+        sibling = replace(process, id="proc_tui_sibling", command="make lint",
+                          delivered_path=str(Path(process.delivered_path).parent.parent / "proc_tui_sibling" / "delivered"))
+        registry._finished[sibling.id] = sibling
+        processes.append(sibling)
+        events.append(dict(event, session_id=sibling.id, command=sibling.command))
+    session = {"history_lock": threading.RLock(), "running": False, "history": [], "session_key": "tui-session"}
+    emitted = set()
+    attempts = []
+    accepted = []
+    statuses = []
+    monkeypatch.setattr(server, "_emit", lambda method, sid, payload=None: statuses.append((method, payload)))
+    monkeypatch.setattr(server, "_background_notifications_off", lambda _: False)
+
+    def submit(*args, **kwargs):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise RuntimeError("turn admission failed")
+        accepted.append(args)
+        server._notif_release_turn(session)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+
+    def handle(events):
+        if batch:
+            server._notif_handle_ready(
+                "tui-sid", session, events, emitted, registry,
+                format_process_notification, None, owned=True,
+            )
+        else:
+            for evt in events:
+                server._notif_handle_event(
+                    "tui-sid", session, evt, emitted, registry,
+                    format_process_notification, None, owned=True,
+                )
+
+    handle(events)
+    assert len(attempts) == 1 and not accepted
+    assert not session["running"]
+    assert all(registry._survivor_delivery_state(proc) is None for proc in processes)
+    assert all(registry._survivor_delivery_pending(proc) for proc in processes)
+    assert registry.completion_queue.qsize() == len(events)
+    assert not emitted
+
+    retry = [registry.completion_queue.get_nowait() for _ in events]
+    assert retry == events
+    handle(retry)
+    assert len(attempts) == 2 and len(accepted) == 1
+    assert all(registry._survivor_delivery_state(proc) == "delivered" for proc in processes)
+    assert registry.completion_queue.empty()
+    # Stale duplicates cannot start a second successful turn.
+    handle(events)
+    assert len(accepted) == 1
+    assert sum(method == "status.update" for method, _payload in statuses) == 2 * len(events)
 
 
 def test_busy_poller_keeps_survivor_for_post_turn_drain(tmp_path, monkeypatch):
