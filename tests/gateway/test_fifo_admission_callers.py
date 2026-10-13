@@ -333,6 +333,7 @@ def test_yuanbao_recall_replacement_requires_checkpoint(tmp_path, monkeypatch, r
     key = build_session_key(source)
     original = _event("already queued", "original")
     assert shutdown_flush.checkpoint_queued_event(key, original)
+    original_path = original._hermes_recovery_spool
     adapter = SimpleNamespace(
         name="yuanbao", _pending_messages={key: original},
         _active_sessions={key: asyncio.Event()}, _processing_msg_texts={},
@@ -352,7 +353,7 @@ def test_yuanbao_recall_replacement_requires_checkpoint(tmp_path, monkeypatch, r
         assert "MESSAGE RECALLED" in recalled.text
         assert json.loads(recalled._hermes_recovery_spool.read_text())["data"]["text"] == recalled.text
         assert adapter._active_sessions[key].is_set()
-        assert not original._hermes_recovery_spool.exists()
+        assert not original_path.exists()
 
 
 @pytest.mark.asyncio
