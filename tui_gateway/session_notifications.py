@@ -288,7 +288,6 @@ def _maybe_resume_tui_parked_goal(sid: str, session: dict) -> None:
         return  # busy: the running turn's judge re-evaluates the barrier
     started = False
     try:
-        _emit("status.update", sid, {"kind": "goal", "text": "▶ Goal wait ended — resuming."})
         started = bool(_run_prompt_submit(f"__goal__{int(time.time() * 1000)}", sid, session, prompt))
     except Exception as exc:
         _notif_log_failure("goal resume dispatch failed", exc)
