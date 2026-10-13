@@ -410,7 +410,7 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
 JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "Revision history (the goal and criteria above are the CURRENT version). "
     "Requirements marked superseded (no longer binding) are audit history only: "
-    "a user-authorized replacement resets the outcome scope, so do not judge the current "
+    "a replacement the user approved or quoted resets the outcome scope, so do not judge the current "
     "goal against any requirement at or before that replacement. For the remaining history, "
     "a revision may clarify or restructure, but only the user can lower the "
     "bar. For each earlier requirement a revision dropped or weakened: it is "
