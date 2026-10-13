@@ -12,9 +12,22 @@ result/transcript evidence for conservative recovery through the durable retry e
 
 ## Required behavior
 
-- `interrupt_all` records a cut request, not a terminal outcome. Finalization marks
-  a non-successful scalar result or a batch with interrupted/missing children
-  `interrupted`; successful runners remain completed, including during CLI shutdown.
+- `interrupt_all` records a cut request, not a terminal outcome. The lifecycle and
+  terminal-fallback transactions reconcile runner output with `record_unit_child`
+  evidence on the existing `result_json` row before serialization or ownership CAS.
+  SQLite write ownership starts before the checkpoint read, including on checkpoint
+  writers; a process-local mutex cannot prevent a cross-connection lost update.
+- `tools/async_delegation_completion.py` owns checkpoint merging, task-index-based
+  classification, and producer-payload synchronization. Successful runner entries
+  keep their postprocessing; durable children replace missing/downgraded entries.
+  A fully successful unit stays completed even when aggregation raises. Mixed units
+  retain completed children and mark only absent/unfinished owned indexes unknown
+  or interrupted. Grouped indexes must not be inferred from call-wide goal counts.
+  Recovered summaries reuse the ordinary static budget and transcript pointers.
+- Live completion payloads and deferred/ambiguous ownership resolution use that
+  same reconciled truth without acquiring a second delivery identity. Display
+  status changes only when checkpoints prove the whole unit completed; a mixed
+  unit keeps its historical display status while its durable row records the cut.
 - Ordinary retention prunes superseded rows before delivered rows, logs a bounded
   list of IDs, and excludes resumable/retry-owed rows from the ordinary history cap.
 - The separate resumable ceiling evicts eligible settled history first. Retention
@@ -62,10 +75,17 @@ result/transcript evidence for conservative recovery through the durable retry e
 
 ## Tests
 
-`tests/tools/test_async_delegation_restart_cut.py`, the existing
-`tests/tools/test_async_delegation*.py`, `test_delegation_retry.py`,
-`test_delegation_retry_controls.py`, `test_delegation_resume*.py`,
-`test_delegation_restart_resume_flow.py`, `test_delegation_recovery_admission.py`,
-`test_restart_cut_notice.py`, and canonical state reconciliation tests.
+`tests/tools/test_async_delegation_checkpoint_completion.py` exercises public
+batch/scalar runner exceptions with and without shutdown, grouped/mixed indexes,
+late checkpoint writes, lifecycle/fallback commit-then-raise paths, deferred
+ownership, writer fencing, and single completion settlement. Retention and boot
+claim release/reclaim invariants remain covered by
+`tests/tools/test_async_delegation_restart_cut.py`. Run both alongside the existing
+`tests/tools/test_async_delegation*.py`, terminal fallback, outbox, and recovery
+suites, plus `test_delegation_retry.py`, `test_delegation_retry_controls.py`,
+`test_delegation_resume*.py`, `test_delegation_restart_resume_flow.py`
+(including the checkpoint-reconciled restart cut that must resume only unfinished
+children), `test_delegation_recovery_admission.py`, `test_restart_cut_notice.py`,
+and canonical state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.

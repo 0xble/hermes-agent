@@ -173,6 +173,50 @@ def test_unresumed_cut_has_explicit_contract_then_expires_and_prunes(batch, monk
     assert dr.retry_status(did) is None
 
 
+def test_restart_runner_crash_resumes_only_children_unfinished_by_checkpoint(monkeypatch):
+    """A checkpoint-completed child survives a shutdown-time aggregation crash and is never resumed."""
+    import queue
+    import threading
+
+    from tools.process_registry import process_registry
+
+    ad._reset_for_tests()
+    monkeypatch.setattr(process_registry, "completion_queue", queue.Queue())
+    did, checkpointed, release = "deleg_restart_crash", threading.Event(), threading.Event()
+
+    def runner():
+        ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "durable first"})
+        checkpointed.set()
+        assert release.wait(5)
+        raise RuntimeError("shutdown aggregation failed")
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["first", "second", "third"], delegation_id=did, context="shared", toolsets=None,
+        role="leaf", model="m", session_key="agent:main:telegram:dm:1", parent_session_id="owner",
+        runner=runner, interrupt_fn=lambda reason=None: release.set(), max_async_children=1)
+    assert handle["accepted"] and checkpointed.wait(5)
+    assert ad.interrupt_all("gateway shutdown (restart)") == 1
+    event = process_registry.completion_queue.get(timeout=5)
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert event["cut_reason"] == "gateway shutdown (restart)"
+    assert [child["status"] for child in event["results"]] == ["completed", "unknown", "unknown"]
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim and ad.complete_completion_delivery(did, claim)
+    assert process_registry.completion_queue.empty()
+    assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S * 3) == []
+    payload = json.loads(_handle_control_action("resume", did, None, Parent()))
+    assert payload["status"] == "retry_claimed"
+    assert [task["goal"] for task in payload["tasks"]] == ["second", "third"]
+    with ad._DB_LOCK, ad._transaction() as conn:
+        claimed = [row[0] for row in conn.execute(
+            "SELECT task_index FROM async_delegation_child_recovery WHERE delegation_id=? ORDER BY task_index",
+            (did,))]
+    assert claimed == [1, 2]
+    ad._reset_for_tests()
+
+
 def test_unspent_cut_claim_rearms_quietly_for_explicit_resume():
     did, event, now = cut_row()
     dr.schedule_retry(did, now=now)

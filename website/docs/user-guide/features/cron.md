@@ -232,6 +232,7 @@ Notes:
 - `--add-skill` appends to the existing list without replacing it
 - `--remove-skill` removes specific attached skills
 - `--clear-skills` removes all attached skills
+- `--prompt` replaces the whole prompt. An edit is refused, and nothing is saved, when the new prompt looks like an unexpanded placeholder (`__FILE__`, `<prompt>`, `...`, `TODO`, `$(cat file)`, `@file`) or is under 10% of an existing prompt of 500+ characters. The error names both lengths. Pass `--allow-shrink` (`allow_shrink=true` in the `cronjob_manage` tool) when the short or literal prompt is intended. To load a long prompt from a file, let the shell expand it: `hermes cron edit <job_id> --prompt "$(cat prompt.md)"`.
 
 ## Lifecycle actions
 

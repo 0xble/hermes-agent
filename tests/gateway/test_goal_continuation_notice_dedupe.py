@@ -16,7 +16,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from hermes_cli import goals
 from hermes_cli.goals import GoalManager
 from tests.gateway.test_goal_continuation_silence import _runner_with_goal
-from tests.gateway.test_goal_continuation_drain import hermes_home  # noqa: F401
+from tests.gateway.test_goal_continuation_drain import hermes_home as hermes_home
 
 REASON = "The release still needs live validation"
 
@@ -160,3 +160,48 @@ async def test_explicit_goal_controls_still_confirm_and_reset_notice_identity(he
         assert GoalManager(entry.session_id).state.last_continuation_notice_key is None
         await _turn(harness, "A newly requested retry.", user=True)
     assert len(adapter.sent) == 2 and all(REASON in notice for notice in adapter.sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_delegations", [0, 1])
+async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(hermes_home, active_delegations):
+    """Synthetic NO_REPLY preserves the existing parked condition through backoff."""
+    harness = _harness(hermes_home)
+    _, adapter, entry, _, _ = harness
+    with patch.object(goals, "count_active_delegations", return_value=active_delegations), patch.object(
+        goals, "collect_goal_evidence", return_value=[]
+    ), patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)):
+        for _ in range(1 if active_delegations else goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS):
+            mgr = await _turn(harness, "Waiting for the external review.")
+        first = [m for m in adapter.sent if m.startswith("⏳")]
+        assert len(first) == 1
+        original_key = mgr.state.last_wait_notice_key
+        original_turns = mgr.state.turns_used
+        original_level = mgr.state.backoff_level
+        for _ in range(2):
+            mgr.state.waiting_until = 1.0
+            mgr._save()
+            _restart_db()
+            with patch.object(goals, "judge_goal") as judge:
+                mgr = await _turn(harness, "NO_REPLY")
+                judge.assert_not_called()
+            assert mgr.state.last_wait_notice_key == original_key
+            assert mgr.state.status == "active" and mgr.is_parked()
+        assert [m for m in adapter.sent if m.startswith("⏳")] == first
+        assert mgr.state.turns_used == original_turns + 2
+        assert mgr.state.backoff_level >= original_level
+        # Prove the durable identity in an actual fresh interpreter too.
+        subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from hermes_cli.goals import GoalManager; "
+             "m=GoalManager(sys.argv[1]); assert m.is_parked(); "
+             "assert m.state.last_wait_notice_key == sys.argv[2]",
+             entry.session_id, original_key], check=True, capture_output=True, text=True,
+        )
+        mgr.state.waiting_until = 1.0
+        mgr._save()
+        new_reason = "review returned a new blocker"
+        with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
+            await _turn(harness, "The review returned a new blocker.")
+        parked = [m for m in adapter.sent if m.startswith("⏳")]
+        assert len(parked) == 2 and "new blocker" in parked[-1]

@@ -3801,23 +3801,6 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     return context
 
 
-def _requeue_pending_steer(agent, steer_text: str) -> None:
-    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
-    # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
-    # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
-    # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-
-
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
     """Persist any pending /steer text as a standalone user message.
 
@@ -3840,6 +3823,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
+    from agent.steer_delivery import _requeue_pending_steer, report_steer_delivered
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
@@ -3853,6 +3837,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
+    report_steer_delivered(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
