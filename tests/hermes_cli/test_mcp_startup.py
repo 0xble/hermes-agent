@@ -55,7 +55,7 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -122,7 +122,7 @@ def test_prepare_agent_startup_skips_discovery_when_chat_resolves_to_tui(
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -164,7 +164,7 @@ def test_prepare_agent_startup_keeps_discovery_for_non_chat_commands(
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -433,7 +433,7 @@ def test_prepare_agent_startup_installs_server_filter(monkeypatch, _reset_mcp_se
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
     monkeypatch.setattr(main_mod, "_should_background_mcp_startup", lambda args: False)
     monkeypatch.setattr(main_mod, "_command_has_dedicated_mcp_startup", lambda args: True)

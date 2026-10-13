@@ -1,5 +1,25 @@
 # Maintained fork patch register
 
+## background-review-memory-delete: durable observer requirement
+
+- **Status:** Candidate; not landed or activated.
+- **Contract:** Owner opt-in may bypass staging only with a durable transaction observer registered for the current profile. Missing, old, or other-profile observers stage all destructive single/batch operations. Commit-time durability: a durable-path admission commits only if the observer snapshot used by that commit (`observe_memory_transaction`, under the registry lock, before writing) still contains a durable current-profile observer; otherwise `DurableMemoryObserverUnavailable` aborts before any write and the tool stages the op. Undo semantics stay unchanged.
+- **Source surfaces:** `tools/memory_tool.py`, `tools/memory_transactions.py`; unit `maintenance/background-review-memory-delete.md`. The companion agents plugin declares `durable=True` on its existing registration.
+- **Upstream findings:** Fork-only opt-in to upstream #105921; no matching durable-observer opt-in repair found.
+- **Verification:** Red regression: 6 failed for remove/replace/batch with absent/non-durable observers; 6 failed for remove/replace/batch when the durable observer is unregistered or non-durably replaced between admission and commit. `scripts/run_tests.sh tests/tools/test_memory_tool.py tests/tools/test_memory_transactions.py tests/agent/test_background_review_memory_scope.py`.
+- **Rollback:** Revert the observer declaration/check changes and their tests only; retain the existing opt-in/staging implementation. Reverting only the plugin declaration safely returns unattended destructive operations to staging.
+- **Retirement:** Remove when upstream provides the complete opt-in plus profile-scoped durable rollback contract. Land Hermes before the plugin to avoid an unjournaled gap.
+
+## memory-context-note-stripping
+
+- **Status:** Candidate; not landed or activated.
+- **Contract:** Strip exact current/legacy notes only; preserve unrelated same-prefix recalled facts and adjacent whitespace. Fence suppression is unchanged.
+- **Source surfaces:** `agent/memory_manager.py::_INTERNAL_NOTE_RE`, `tests/agent/test_memory_provider.py`; unit `maintenance/memory-context-note-stripping.md`.
+- **Upstream findings:** Adapted exact-note matching from yingliang-zhang's open NousResearch/hermes-agent#64421 at `7e16b919d113a870af7302e2e513f77f46f54298`, not its other provider/prefetch changes.
+- **Verification:** Red regression: 2 failed on synthetic same-prefix passport/lease facts. `scripts/run_tests.sh tests/agent/test_memory_provider.py`.
+- **Rollback:** Revert the exact-note matcher and its tests only; retain the separate background-delete gate repair.
+- **Retirement:** Remove when a released upstream sanitizer satisfies the same preservation and exact-wrapper contract.
+
 ## auto-recovery-ladder-notice
 
 - **Status:** Active; published candidate pending protected landing.
@@ -31,3 +51,37 @@
 - **Verification:** `scripts/run_tests.sh tests/hermes_state/test_compact_at_next_start.py` fails before (module absent) and passes after (11 tests); the related suites (held-store gate, auto-vacuum holder gate, startup lease, startup watchdog, runner startup, host lock, replace ownership) pass.
 - **Rollback:** Revert the commit carrying `Fork-Patch: state-db-compact-at-start`; a leftover request file is inert.
 - **Retirement:** Remove when upstream ships a supported way to compact a gateway-held store.
+
+## gateway-loop-statedb-guard: generation checkpoint durability
+
+- **Identity:** Reuses the existing `Fork-Patch: gateway-loop-statedb-guard` identity and
+  [behavior record](../../../maintenance/gateway-loop-statedb-guard.md).
+- **Summary and placement:** Repair the core `SessionDB` generation fence after fork PR #494,
+  not an extension or seamless-restart change. The independent proposal checks the main-file
+  header through the existing lock-safe probe and retries PASSIVE until the WAL-visible
+  `application_id` is durable. Unknown probe results retry rather than declaring durability.
+  Preserve #494's settled warm-open fast path and deleted-sidecar descriptor rechecks.
+- **Source surfaces:** `hermes_state.py::_ensure_db_file_generation`;
+  `tests/hermes_state/test_generation_checkpoint_durability.py` and the existing warm-open,
+  generation, checkpoint, file-identity, deleted-WAL and process-registry coverage.
+- **Baseline and upstream findings:** Fork base `881af4c2805230cad2dc10e539393f798114edc4`
+  (#494); upstream inspected at `835c3dd038d903182a66ecc45e34bf5e0de65f00`. Governing guidance:
+  upstream `AGENTS.md`, `CONTRIBUTING.md`, `tests/AGENTS.md` and contributing/package-management
+  docs. Closed issue [#45383](https://github.com/NousResearch/hermes-agent/issues/45383) and merged
+  [#99753](https://github.com/NousResearch/hermes-agent/pull/99753) establish generation durability
+  and PASSIVE-only checkpointing. Closed [#101881](https://github.com/NousResearch/hermes-agent/pull/101881)
+  was adopted through merged [#108067](https://github.com/NousResearch/hermes-agent/pull/108067):
+  avoid no-op warm-open writes. Current upstream still checkpoints every generation open, so it
+  does not have this fork-only regression. Open [#135066](https://github.com/NousResearch/hermes-agent/issues/135066)
+  concerns broader maintenance-connection fencing, which this candidate does not change.
+- **Verification:** Red-first real-SQLite regression: after a blocked initial checkpoint and a
+  second warm open, the main-file header remained `0` and its generation row absent on the base.
+  Both become durable with the repair, verified by a main-file-only copy without the WAL. The
+  settled warm-open test still observes no checkpoint. Canonical `scripts/run_tests.sh` across
+  8 affected files: **469 passed, 37 skipped**. Ruff, Windows-footgun, temporary-path and
+  source-only fork-patch checks pass.
+- **Stack fit:** Narrow core repair reusing the lock-safe header probe; no new plugin, sidecar,
+  persisted marker, timeout, periodic checkpoint, schema or config.
+- **Rollback and retirement:** Revert the durability commit to restore #494's opener-local gate.
+  Retire when upstream's warm-open implementation both retries blocked initial checkpoints and
+  skips settled checkpoints, verified by the same reader-held/main-file-only regression.

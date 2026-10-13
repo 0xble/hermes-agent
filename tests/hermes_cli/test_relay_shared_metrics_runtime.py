@@ -227,7 +227,7 @@ def _join_export_workers() -> None:
 
 
 @pytest.fixture
-def direct_runtime(tmp_path, monkeypatch):
+def direct_runtime(tmp_path, monkeypatch, completed_plugin_registry):
     fake = _Relay()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     monkeypatch.setattr(relay_runtime, "_load_nemo_relay", lambda: fake)
@@ -240,7 +240,7 @@ def direct_runtime(tmp_path, monkeypatch):
     _mgr = PluginManager()
     # Pin as discovered: hook queries lazy-discover plugins (#64178), and
     # this test's contract is a runtime with ZERO plugins loaded.
-    _mgr._discovered = True
+    completed_plugin_registry(_mgr)
     monkeypatch.setattr(plugins, "_plugin_manager", _mgr)
     yield fake
     relay_shared_metrics._reset_for_tests()
@@ -248,7 +248,7 @@ def direct_runtime(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def real_binding_runtime(tmp_path, monkeypatch):
+def real_binding_runtime(tmp_path, monkeypatch, completed_plugin_registry):
     relay = pytest.importorskip("nemo_relay")
     if getattr(relay, "_native", None) is None:
         pytest.skip("NeMo Relay native binding is unavailable on this platform")
@@ -260,7 +260,7 @@ def real_binding_runtime(tmp_path, monkeypatch):
     relay_shared_metrics._reset_for_tests()
     relay_runtime._reset_for_tests()
     _mgr = PluginManager()
-    _mgr._discovered = True  # see direct_runtime fixture (#64178)
+    completed_plugin_registry(_mgr)  # see direct_runtime fixture (#64178)
     monkeypatch.setattr(plugins, "_plugin_manager", _mgr)
     yield relay
     relay_shared_metrics._reset_for_tests()

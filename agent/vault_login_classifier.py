@@ -48,6 +48,9 @@ _CHECKOUT_HEURISTICS = (
     (re.compile(r"\b(?:country)\b"), "country-name"),
 )
 
+# An MM/YY placeholder does not make issue/start dates expiry targets.
+_CHECKOUT_NON_EXPIRY_DATE = re.compile(r"\b(?:issue\s*date|valid\s*from|start\s*date)\b")
+
 _EXCLUDED_AUTOCOMPLETE = {"new-password", "one-time-code"}
 
 _RE_EXCLUDED_PASSWORD = re.compile(r"\b(?:new|confirm|create|repeat)\s*password\b")
@@ -246,17 +249,23 @@ def select_password_fill(
 
 
 def classify_checkout_control(control: LoginControl) -> Optional[ClassifiedLoginControl]:
-    """Classify one control as a payment/address fill target (autocomplete token exact match 100,
-    label/name heuristic 70), or None. Password/email inputs are never checkout targets."""
+    """Classify payment/address targets; masked passwords qualify only as CVC."""
     tokens = [t for t in control.autocomplete.lower().split() if t]
     for token in PAYMENT_AUTOFILL_TOKENS + ADDRESS_AUTOFILL_TOKENS:
         if token in tokens:
+            if control.type == "password" and token != "cc-csc":
+                return None
             return ClassifiedLoginControl(control, 100, "country-name" if token == "country" else token)
-    if control.type in ("password", "email"):
+    if control.type == "email":
         return None
     searchable = _normalize_text(" ".join(part for part in (control.name, control.label) if part))
     for pattern, token in _CHECKOUT_HEURISTICS:
         if pattern.search(searchable):
+            # Narrow guards adapted from upstream PRs 136639 and 134723.
+            if token.startswith("cc-exp") and _CHECKOUT_NON_EXPIRY_DATE.search(searchable):
+                continue
+            if control.type == "password" and token != "cc-csc":
+                continue
             return ClassifiedLoginControl(control, 70, token)
     return None
 

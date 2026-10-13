@@ -1207,8 +1207,8 @@ class SessionDB(
 
     def _ensure_db_file_generation(self) -> None:
         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
-        OR IGNORE); application_id is written only while 0 so racers converge. Checkpoint only when the
-        stamp or header is first established.
+        OR IGNORE); application_id is written only while 0 so racers converge. Skip the checkpoint only
+        when the generation's application_id is already visible in the main file.
 
         See #45383.
         """
@@ -1243,12 +1243,12 @@ class SessionDB(
                     self._conn.execute(f"PRAGMA application_id={current}")
                     generation_needs_checkpoint = True
                 self._db_file_application_id = current
-                if generation_needs_checkpoint:
+                if generation_needs_checkpoint or _read_sqlite_application_id(self.db_path) != current:
                     try:
-                        # The header application_id and the state_meta row must be
-                        # durable before identity is recorded. Once both already
-                        # exist, a checkpoint here only makes every opener contend
-                        # with the live writer and can stall startup on a large WAL.
+                        # A reader can block the first PASSIVE checkpoint; WAL-visible
+                        # values alone do not prove durability. The header is written
+                        # after the row, so retry until it reaches the main DB. Use the
+                        # lock-safe probe; a settled warm open still skips the write.
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except sqlite3.Error:
                         pass

@@ -4136,7 +4136,8 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+            if self._is_goal_continuation_event(pending_event) and not await asyncio.to_thread(
+                    self._goal_still_active_for_session, session_id):  # goal state lives in state.db
                 logger.info(
                     "Discarding stale goal continuation for session %s — goal is no longer active",
                     session_key or "?",

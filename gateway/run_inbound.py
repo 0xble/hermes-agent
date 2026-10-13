@@ -107,16 +107,16 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     async def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
-        """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
-        Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
+        """Gate ingress before auth: skip drops; rewrite replaces text; allow/None dispatches."""
+        from hermes_cli.plugins import PluginDiscoveryIncomplete
         try:
             from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
             _hook_results = await _ainvoke_hook(
                 "pre_gateway_dispatch", event=event, gateway=self,
-                # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
-                session_store=getattr(self, "session_store", None),
+                session_store=getattr(self, "session_store", None),  # bare runners omit __init__
             )
+        except PluginDiscoveryIncomplete:
+            raise  # A discovery timeout is not an allow decision; leave dispatch unadmitted.
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []
@@ -1773,9 +1773,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # it's disambiguation (*which* prior message), not deduplication.
             # Adapters resolve the original message (or the user's native partial quote).
             # A preview here silently loses later list items and code; keep that context intact.
-            reply_text = event.reply_to_text
+            # JSON quoting preserves the complete resolved text without allowing its quotes or
+            # paragraph breaks to collide with the pointer's closing delimiter.
+            reply_text = json.dumps(event.reply_to_text, ensure_ascii=False)
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: "{reply_text}"]\n\n{message_text}'
+            message_text = f'[Replying to{_who}: {reply_text}]\n\n{message_text}'
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is

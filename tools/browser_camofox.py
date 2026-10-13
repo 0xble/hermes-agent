@@ -731,18 +731,22 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
     protection across turns; ephemeral sessions return ``False`` for dedicated-session cleanup.
     """
     camofox_cfg = _get_camofox_config()
-    if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
-        key = task_id or "default"
-        with _sessions_lock:
-            session = _sessions.get(key)
-            if session is not None and session.get("superseded"):
-                _drop_session_locked(key)
-            elif session is not None:
-                session["carried"] = True
-        _delete_owned_tabs(key)
-        logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
-        return True
-    return False
+    key = task_id or "default"
+    with _sessions_lock:
+        session = _sessions.get(key)
+        # Named accounts are managed even when persistence is off for unnamed sessions.
+        persistent = (bool(session and session.get("managed"))
+                      or _managed_persistence_enabled(camofox_cfg)
+                      or _camofox_identity_override(task_id, camofox_cfg))
+        if not persistent:
+            return False
+        if session is not None and session.get("superseded"):
+            _drop_session_locked(key)
+        elif session is not None:
+            session["carried"] = True
+    _delete_owned_tabs(key)
+    logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
+    return True
 
 
 def carry_task_binding(old_task_id: str, new_task_id: str, *, move: bool = False) -> None:
@@ -1257,7 +1261,7 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
         if ref or selector:
             # Camofox attaches to the first top-level input[type=file] before it consults the
             # trigger, so a named trigger in a frame would be bypassed and the file would land on
-            # an unrelated field. Refuse instead of guessing; the evaluate route is optional.
+            # an unrelated field. A named trigger requires a verified zero count.
             try:
                 count = _post(_tab_path(session, "evaluate"), {
                     "userId": session["user_id"],
@@ -1266,7 +1270,14 @@ def camofox_upload(paths: list, ref: Optional[str] = None, selector: Optional[st
                 if classify_camofox_http_error(exc, endpoint="evaluate") != "capability":
                     raise
                 count = None
-            if isinstance(count, int) and count > 0:
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                return tool_error(
+                    "Cannot verify the top-level page's file-input count; Camofox may attach to "
+                    "the first top-level input instead of the named trigger. No upload was sent. "
+                    "Use a server with a working /evaluate route, omit ref/selector only if the "
+                    "first top-level input is the intended target, or use another upload route.",
+                    success=False)
+            if count > 0:
                 return tool_error(
                     f"The top-level page has {count} file input(s); Camofox would attach to the first "
                     "one instead of the named trigger. Omit ref/selector if that input is the target; "

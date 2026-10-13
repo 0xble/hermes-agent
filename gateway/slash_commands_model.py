@@ -434,7 +434,7 @@ class GatewayModelCommandsMixin:
             # `/model X --reasoning <level>`: same applier as /reasoning, same scope as the pick.
             # The record step already evicted the cached agent, so the pin lands on the rebuild.
             from gateway.run import _platform_config_key
-            reply += "\n" + self._apply_reasoning_selection(
+            reply += "\n" + await self._apply_reasoning_selection_off_loop(
                 ctx.session_key, _platform_config_key(source.platform), ctx.reasoning_effort,
                 persist_global=ctx.persist_global and global_error is None)
         return reply
@@ -771,6 +771,14 @@ class GatewayModelCommandsMixin:
         else:
             self._evict_idle_agent_after_session_control(session_key)
 
+    async def _apply_reasoning_selection_off_loop(self, session_key: str, *args, **kwargs) -> str:
+        """``_apply_reasoning_selection`` off the loop: it persists through the session store, whose
+        lock is held across a state.db write. The session state is created here, on the loop, so the
+        worker never races the loop's get-or-create for the same key."""
+        if session_key:
+            self._session_state(session_key)
+        return await asyncio.to_thread(self._apply_reasoning_selection, session_key, *args, **kwargs)
+
     def _apply_reasoning_selection(
         self, session_key: str, platform_key: str, value: str, persist_global: bool = False,
     ) -> str:
@@ -843,7 +851,8 @@ class GatewayModelCommandsMixin:
         )
         platform_key = _platform_config_key(event.source.platform)
         if raw_args:  # typed path — same applier the picker uses
-            return self._apply_reasoning_selection(session_key, platform_key, args, persist_global=persist_global)
+            return await self._apply_reasoning_selection_off_loop(
+                session_key, platform_key, args, persist_global=persist_global)
         rc = self._reasoning_config
         # Labels tell the truth about the route: a Hermes-internal step (``ultra``) that the wire
         # clamps is shown as "ultra (sends max on this route)" instead of a distinct level (#61634).
@@ -871,7 +880,7 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            return self._apply_reasoning_selection(session_key, platform_key, value)
+            return await self._apply_reasoning_selection_off_loop(session_key, platform_key, value)
 
         picker_sent = await self._try_send_choice_picker(
             event,

@@ -141,8 +141,23 @@ class GatewayStartupMixin:
         """Replay ready inbound, leaving sessions owned by another restore in order."""
         drained = 0
         queue = getattr(self, "_startup_restore_queue", None) or []
+        # Topic recovery behind the session key reads state.db: resolve keys off the loop, once per
+        # event (by identity; the queue keeps each event alive while it is listed).
+        resolved: dict[int, tuple] = {}
+
+        def session_keys(events):
+            return [self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in events]
+
+        async def resolve_keys():
+            # Repeat until no await is left between resolution and the scan: inbound queued while a
+            # batch resolved is resolved too, so ``ready`` below always has every key.
+            while pending := [event for event in queue if resolved.get(id(event), (None,))[0] is not event]:
+                for event, key in zip(pending, await asyncio.to_thread(session_keys, pending)):
+                    resolved[id(event)] = (event, key)
+
         def ready(event):
-            key = self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+            key = resolved[id(event)][1]
             if keys is not None and key not in keys:
                 return False
             # Our own gate permits one claimant; every other owner's gate must be fully open.
@@ -150,6 +165,7 @@ class GatewayStartupMixin:
             return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
 
         while True:
+            await resolve_keys()
             index = next((i for i, event in enumerate(queue) if ready(event)), None)
             if index is None:
                 break
@@ -1460,14 +1476,14 @@ class GatewayStartupMixin:
 
     @staticmethod
     def _start_register_plugins_relay_hooks() -> None:
-        """Plugin discovery, relay registration and shell-hook/webhook registration. Never raises."""
+        """Require complete plugin policy before registering relay and config hooks."""
         # Discover plugins before shell hooks (plugin block decisions win ties). Explicit: the gateway
         # lazily imports run_agent, so model_tools' discover_plugins() side-effect may not have run.
-        with _log_suppressed(logging.WARNING, "plugin discovery failed at gateway startup", exc_info=True):
-            from hermes_cli.plugins import discover_plugins
+        from hermes_cli.plugins import discover_plugins
+        with _log_suppressed(logging.WARNING, "pending plugin deletion failed at gateway startup", exc_info=True):
             from hermes_cli.plugins_cmd_remove import sweep_pending_plugin_deletes
             sweep_pending_plugin_deletes()  # trees a previous life still held when they were uninstalled
-            discover_plugins()
+        discover_plugins(require_complete=True)
         # Relay entrypoints share the effective profile opt-out, including when a
         # deployment injects a URL. No URL or explicitly disabled -> no side effects.
         try:
@@ -1554,6 +1570,33 @@ class GatewayStartupMixin:
             # First-use async callers retain the existing recoverable fallback/backoff behavior.
             logger.warning("SQLite session store not available after adapter readiness: %s", exc)
             self._session_db_init_error = str(exc)
+        await self._prime_profile_session_dbs((getattr(self, "_served_profile_homes", None) or {}).items())
+
+    async def _prime_profile_session_dbs(self, profile_homes) -> None:
+        """Open each served secondary profile's state.db handles off the loop. Both caches open per
+        profile scope on first access, and that first access is otherwise a loop-thread SessionDB open
+        (holder scan, schema check) the first time a served profile's chat touches the store."""
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+        store = getattr(self, "session_store", None)
+        open_store = getattr(store, "_open_session_db_for_active_scope", None)
+        open_runner = getattr(self, "_open_session_db_for_active_scope", None)
+        if not callable(open_store) or not callable(open_runner):
+            return
+        launch_home = get_hermes_home().resolve()
+        homes = [(name, Path(home)) for name, home in profile_homes if Path(home).resolve() != launch_home]
+
+        def _prime(home: Path) -> None:
+            with _profile_runtime_scope(home, {}):
+                open_store()
+                open_runner()
+
+        for name, home in homes:
+            try:
+                await asyncio.to_thread(_prime, home)
+            except Exception:
+                # Best-effort: an unprimed profile keeps the first-use open and its backoff.
+                logger.warning("Priming state.db for served profile %r failed", name, exc_info=True)
 
     async def _start_recover_previous_run(self) -> None:
         """Recover prior processes and sessions after adapters are ready."""
@@ -2060,7 +2103,7 @@ class GatewayStartupMixin:
         # Claim delivery-ledger obligations before snapshotting resume-pending sessions. Claiming an
         # answered turn clears its live resume flag; taking this snapshot first replays the turn (#91969).
         claimed = await self._claim_pending_obligations()
-        candidates = self._resume_pending_candidates()
+        candidates = await self._resume_pending_candidates_async()
         # Only this version's durable turn markers may create a startup interruption note. Legacy
         # resume_pending rows have no resume_turn_id; apply the same freshness/authorization/adapter
         # admission as auto-resume before routing note sends through the bounded boot-send task.
@@ -2201,7 +2244,7 @@ class GatewayStartupMixin:
             return True
         # Register plugins, the relay adapter, and hooks before creating platform adapters. Relay
         # self-provisioning may disable direct platforms, leaving Platform.RELAY as the only ingress.
-        self._start_register_plugins_relay_hooks()
+        await asyncio.to_thread(self._start_register_plugins_relay_hooks)
         # Plugins that load later (force re-discovery, install/enable nudge) re-wire live adapters (#87770).
         with _log_suppressed(logging.WARNING, "plugin re-wire subscription failed", exc_info=True):
             from hermes_cli.plugins import get_plugin_manager

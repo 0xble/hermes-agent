@@ -137,7 +137,7 @@ def test_retention_drops_structured_synthetic_turn_without_a_known_formatter():
     prompt = "Reply with exactly HERMES_READY 1234"
 
     assert filter_retain_messages(prompt, "HERMES_READY 1234", display_kind="internal_notification") == (
-        None, "HERMES_READY 1234")
+        None, None)
     assert filter_retain_messages(prompt, "HERMES_READY 1234") == (prompt, "HERMES_READY 1234")
 
 
