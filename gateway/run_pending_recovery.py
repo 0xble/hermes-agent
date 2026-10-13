@@ -140,8 +140,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     setattr(event, "_hermes_recovery_spool", path)
     setattr(event, "_hermes_queue_checkpoint", data.get("queue_accepted") is True)
     event._outbox_admission_id = data.get("_outbox_admission_id")
-    if data.get("session_id"):
-        event.session_id = data["session_id"]
+    event.session_id = data.get("session_id")
     if recovered_events is not None:
         recovered_events.append(event)
     else:
