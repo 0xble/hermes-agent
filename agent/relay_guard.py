@@ -1,9 +1,10 @@
 """Shared guard for relay sends made from delegated child execution.
 
-The Relay MCP call is checked here, in process. The ``relay`` CLI is checked by
-relay itself: delegated children's subprocess environments carry
-:data:`RELAY_PARENT_ADDRESS_ENV`, and relay refuses a send whose parsed target
-equals it. Shell text is never parsed, so no shell spelling can reach around it.
+The Relay MCP call is checked here using in-process delegation context. The
+``relay`` CLI checks its parsed target against :data:`RELAY_PARENT_ADDRESS_ENV`
+carried by delegated children's subprocess environments. This cooperative CLI
+guard does not parse shell text. A nested command that clears or overrides the
+variable loses the CLI guard, so it is not an arbitrary-shell security boundary.
 """
 
 from __future__ import annotations
