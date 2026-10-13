@@ -142,6 +142,9 @@ def test_child_terminal_relay_to_parent_is_refused_for_every_shell_spelling(tmp_
     tokens = _bind("parent-session")
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
     env.init_session()
+    # A login shell may reset PATH from /etc/profile (Debian/Ubuntu CI), so put
+    # the stub on the session's own PATH, which the snapshot persists.
+    env.execute(f'export PATH="{bin_dir}:$PATH"')
     try:
         with delegated_child_context("child-session"):
             for command in SHELL_SPELLINGS:
