@@ -373,7 +373,7 @@ class TestTickLifecycle:
         from hermes_cli.loops import WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE
 
         silence = _AUTONOMOUS_REPLY_RULES.split("\n", 1)[0]
-        assert "Claiming done (with an Evidence section)" in CONTINUATION_PROMPT_TEMPLATE
+        assert "The FIRST time you claim the goal is done, include an Evidence section" in CONTINUATION_PROMPT_TEMPLATE
         for template in (WAKEUP_PROMPT_TEMPLATE, WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE):
             assert silence + "\n" in template
             assert "Evidence section)" not in template
