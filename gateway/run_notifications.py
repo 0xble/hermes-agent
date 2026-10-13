@@ -3089,8 +3089,7 @@ class GatewayNotificationsMixin:
                         if getattr(session, "survive_restart", False):
                             process_registry.release_survivor_completion(session_id)
                         continue
-                    if admitted is not False:
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                    acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).

@@ -28,6 +28,31 @@ def _survivor_registry(tmp_path, monkeypatch, session_key="tui-session"):
     return registry, session, event
 
 
+def test_busy_poller_keeps_survivor_for_post_turn_drain(tmp_path, monkeypatch):
+    registry, process, event = _survivor_registry(tmp_path, monkeypatch)
+    session = {"history_lock": threading.RLock(), "running": True, "history": [], "session_key": "tui-session"}
+    status = []
+    submitted = []
+    monkeypatch.setattr(server, "_emit", lambda method, sid, payload: status.append((method, sid, payload)))
+    monkeypatch.setattr(server, "_notif_claim_turn", lambda current: False)
+    monkeypatch.setattr(server, "_notif_submit", lambda *args, **kwargs: submitted.append((args, kwargs)))
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda evt, consumer: "claim")
+    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda evt, claim: None)
+
+    server._notif_handle_ready(
+        "tui-sid", session, [event], set(), registry,
+        format_process_notification, None,
+    )
+
+    assert status
+    assert json.loads(Path(process.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "claimed"
+    session["running"] = False
+    drained = registry.drain_notifications(session_key="tui-session", skip_poll_observed=False)
+
+    assert [drained_event for drained_event, _text in drained] == [event]
+    assert not submitted
+
+
 def test_owned_post_turn_drain_emits_and_acks_survivor(tmp_path, monkeypatch):
     registry, process, event = _survivor_registry(tmp_path, monkeypatch)
     session = {"history_lock": threading.RLock(), "running": False, "history": [], "session_key": "tui-session"}
