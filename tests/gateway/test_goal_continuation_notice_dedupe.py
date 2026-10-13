@@ -185,7 +185,11 @@ async def test_default_gap_silent_judgments_converge_across_nonjudging_waits(her
         assert mgr.state.waiting_until == 0 and not mgr.is_parked()
         assert mgr.state.backoff_level == 0 and mgr.state.consecutive_no_progress == 0
         assert key not in adapter._pending_messages and mgr.next_continuation_prompt() is None
-        assert len(adapter.sent) == 1 and adapter.sent[0].startswith("Goal stopped:")
+        assert len(adapter.sent) == 1 and adapter.sent[0].startswith("✗ Goal stopped:")
+        # The real stop notice must classify as a protected outcome, or daily-quota shedding drops it.
+        from gateway.platforms.base import OUTBOUND_FINAL
+        from gateway.run_goals import _goal_notice_outbound_class
+        assert _goal_notice_outbound_class(adapter.sent[0]) == OUTBOUND_FINAL
         notice = list(adapter.sent)
         for _ in range(2):
             clock[0] += gap + 1

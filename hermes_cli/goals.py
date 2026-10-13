@@ -3116,7 +3116,7 @@ class GoalManager:
             state.backoff_level = 0
             self._save()
             return _decision("cleared", False, None, "stalled", state.paused_reason,
-                             f"Goal stopped: {DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS} silent rechecks "
+                             f"✗ Goal stopped: {DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS} silent rechecks "
                              "returned continue with no new evidence.")
         if state.consecutive_disputes >= DEFAULT_MAX_CONSECUTIVE_DISPUTES and not silent:
             return self._pause_decision(
