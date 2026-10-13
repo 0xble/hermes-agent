@@ -19,6 +19,7 @@ import time
 from typing import List, Optional
 
 from hermes_constants import get_hermes_home
+from utils import atomic_json_write
 
 logger = logging.getLogger("gateway.run")
 
@@ -37,6 +38,40 @@ _MAX_STORED_BOOTS = 50
 
 def _state_path():
     return get_hermes_home() / "gateway" / "restart_loop.json"
+
+
+def _planned_exit_path():
+    return _state_path().with_name("restart_loop_planned_exit.json")
+
+
+def record_planned_exit() -> None:
+    """Carry consumed service/update signal intent across the process boundary."""
+    with contextlib.suppress(OSError):
+        path = _planned_exit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, {"requested_at": time.time()}, fsync_dir=True)
+
+
+def consume_planned_restart_signal() -> bool:
+    """Consume this PID's service-restart intent and hand it off to the next boot."""
+    from gateway.status import consume_planned_restart_marker_for_self
+    if not consume_planned_restart_marker_for_self():
+        return False
+    record_planned_exit()
+    return True
+
+
+def consume_planned_exit(
+    window_seconds: int = DEFAULT_WINDOW_SECONDS, *, max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
+) -> bool:
+    """Take the predecessor's one-shot intent, even when this boot has no sessions to resume."""
+    path = _planned_exit_path()
+    try:
+        recent = planned_marker_is_recent(path, window_seconds=window_seconds, max_gap_seconds=max_gap_seconds)
+        path.unlink(missing_ok=True)
+        return recent
+    except OSError:
+        return False
 
 
 def _load_state() -> tuple[List[float], List[float]]:
@@ -107,13 +142,16 @@ def _current_chain(ts: float, gap: float) -> tuple[List[float], List[float]]:
 
 def planned_marker_is_recent(
     path, *, now: Optional[float] = None, window_seconds: int = DEFAULT_WINDOW_SECONDS,
-    max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
+    max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS, use_mtime: bool = False,
 ) -> bool:
     """True when the planned-restart marker at ``path`` was requested within one chain gap of
-    ``now``.  The marker can outlive later crashes while a home channel stays unreachable, so an
-    old one does not make this boot's predecessor planned.  Unreadable or undated → False."""
+    ``now``. The chat /restart routing marker has no timestamp, so its caller uses file mtime.
+    A marker can outlive later crashes while a channel stays unreachable; old intent proves nothing.
+    Unreadable or undated → False."""
     try:
-        requested_at = json.loads(path.read_text(encoding="utf-8-sig")).get("requested_at")
+        requested_at = path.stat().st_mtime if use_mtime else json.loads(
+            path.read_text(encoding="utf-8-sig")
+        ).get("requested_at")
     except (OSError, ValueError, TypeError, AttributeError):
         return False
     if isinstance(requested_at, bool) or not isinstance(requested_at, (int, float)):

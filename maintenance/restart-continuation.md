@@ -39,6 +39,14 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   Existing transcript rows are never rewritten, preserving prompt-cache prefixes.
   Delegated-child summaries skip this synthetic row and retain earlier real output.
 - All remaining adapter slots, runner pending slots, and FIFO overflow tails are spooled under the session key's owning served profile (including a secondary reached via the primary bot). Startup recovery walks the launch home and every served home in that home's runtime scope; a failed profile replay retains its spool without stopping other profiles.
+- The auto-resume restart-loop breaker keeps one gap-bounded chain over counted and
+  planned boots, exempting only the first planned boot in that chain. The update/service
+  SIGTERM handler persists its consumed signal intent atomically in
+  `gateway/restart_loop_planned_exit.json`; boot consumes it once even with no pending
+  sessions. Signal/home marker timestamps and the chat `/restart` marker's mtime must
+  be within the configured chain gap. Unreadable intent grants no exemption; I/O failure
+  never blocks shutdown or startup. Regressions: `tests/gateway/test_restart_loop_guard.py`
+  and `tests/hermes_cli/test_gateway_restart_loop.py`.
 
 The `routine-restart-resume-note` patch also covers background process completion
 notices and delegation interruption/recovery text in
