@@ -13,11 +13,13 @@ from contextvars import ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
+_DELEGATED_PARENT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_parent_session_id", default="")
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+DELEGATED_PARENT_SESSION_ENV = "HERMES_DELEGATED_PARENT_SESSION_ID"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -26,18 +28,33 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
-    """Mark child execution and isolate its task-local session identity. Even a context
-    entered without an id must restore the parent's session ContextVar (child
-    construction calls ``set_current_session_id``)."""
-    token = _DELEGATED_CHILD_CONTEXT.set(True)
-    try:
-        from gateway.session_context import scoped_current_session_id  # lazy: it calls is_delegated_child_context()
+def delegated_child_context(
+    session_id: str | None = None, parent_session_id: str | None = None,
+) -> Iterator[None]:
+    """Mark child execution and isolate its task-local session identity.
 
+    Capture the parent before binding the child id so relay callers and spawned
+    CLI processes can distinguish a child's completion from a message addressed
+    to the parent. Nested children naturally capture the immediate parent.
+    """
+    from gateway.session_context import get_session_env, scoped_current_session_id
+
+    parent = str(parent_session_id or get_session_env("HERMES_SESSION_ID", "") or "").strip()
+    if parent == str(session_id or "").strip():
+        parent = ""
+    token = _DELEGATED_CHILD_CONTEXT.set(True)
+    parent_token = _DELEGATED_PARENT_SESSION_ID.set(parent)
+    try:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_PARENT_SESSION_ID.reset(parent_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+def delegated_child_parent_session_id() -> str:
+    """Return the immediate parent session for the current child, if known."""
+    return _DELEGATED_PARENT_SESSION_ID.get() or os.environ.get(DELEGATED_PARENT_SESSION_ENV, "") or ""
 
 
 def is_delegated_child_context() -> bool:
@@ -135,7 +152,27 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
     cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    parent_session_id = delegated_child_parent_session_id()
+    if parent_session_id:
+        cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
+    # relay's CLI refuses a send to this address (relay C27), so a child's
+    # `relay send` to its parent fails however the shell spells it. Inherited
+    # values pass through untouched; an in-process child names its own parent.
+    from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
+    if parent_address := in_process_child_relay_parent_address():
+        cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
     return cleaned
+
+
+def in_process_child_relay_parent_address() -> str:
+    """The parent relay address an in-process delegated child stamps on what it spawns, else ``""``.
+
+    Subprocess env builders and the terminal command wrapper (which reaches remote
+    backends whose process env is not inherited) share this one decision."""
+    if not _DELEGATED_CHILD_CONTEXT.get():
+        return ""
+    from agent.relay_guard import child_parent_relay_address
+    return child_parent_relay_address()
 
 
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:

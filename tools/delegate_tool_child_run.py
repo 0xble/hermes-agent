@@ -508,7 +508,10 @@ def _validate_child_output_schema(
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
-        with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        with delegated_child_context(
+            str(getattr(child, "session_id", "") or ""),
+            parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
+        ):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
                 stream_callback=relay_child_text,
@@ -871,7 +874,10 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
+            ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
