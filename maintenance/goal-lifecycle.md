@@ -182,11 +182,17 @@ pauses remain authoritative.
   authoritative block that keeps each reply-quote header for context (newest 20,
   8,000 characters). When a relay from another session in the same profile reaches
   the goal session, the typed messages of that sender session are included and
-  attributed, so a cross-session approval counts only through its original. Relay
+  attributed, so a cross-session approval counts only through its original and
+  only messages typed before that delivery are imported. Packing keeps the newest
+  messages and stops at the first one that does not fit, marking it omitted rather
+  than excerpting it, so a newer refusal can never be dropped while an older
+  approval stays. Relay
   deliveries, identified by the trailing `[relay from=… receipt=…]` header, are
   never user-typed, so they cannot satisfy a revision `user_quote`. An explicit
-  `/goal resume` over a judge block records a user revision naming the reason; the
-  judge does not re-block on it but still blocks new breaches. Reviving on an
+  `/goal resume` over a judge block records a user-command revision that renders
+  as user authority with a waiver rule in every judge prompt; the judge does not
+  re-block on that reason but still blocks new breaches. An agent revision cannot
+  imitate it. Reviving on an
   ordinary reply records no override, since the reply may refuse. Goals with no
   typed user input render a byte-identical prompt. Regression:
   `scripts/run_tests.sh tests/hermes_cli/test_goal_user_authority.py
