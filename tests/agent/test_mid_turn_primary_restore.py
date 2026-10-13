@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import httpx
 import pytest
-from openai import RateLimitError
+from openai import InternalServerError, RateLimitError
 
 from agent import conversation_loop, turn_iteration_prep
 from agent.error_classifier import FailoverReason
@@ -26,7 +26,7 @@ def recovery_runtime():
 def test_restores_primary_prompt_identity_when_runtime_recovers(recovery_runtime):
     restore = Mock(return_value=True)
     agent = SimpleNamespace(
-        _fallback_activated=True,
+        _fallback_activated=True, _provider_fallback_active=True, _rate_limited_until=1,
         _cached_system_prompt="Model: primary\nProvider: primary-provider",
         _restore_primary_runtime=restore,
     )
@@ -40,7 +40,7 @@ def test_restores_primary_prompt_identity_when_runtime_recovers(recovery_runtime
 def test_keeps_fallback_prompt_when_cooldown_has_not_expired(recovery_runtime):
     restore = Mock(return_value=False)
     agent = SimpleNamespace(
-        _fallback_activated=True,
+        _fallback_activated=True, _provider_fallback_active=True, _rate_limited_until=1,
         _cached_system_prompt="Model: primary",
         _restore_primary_runtime=restore,
     )
@@ -252,6 +252,7 @@ def test_failed_reevaluation_keeps_route_and_resets_timer(failure, recovery_runt
 def test_unset_or_invalid_stay_limit_does_not_rewalk_chain(value, recovery_runtime):
     agent = SimpleNamespace(
         _fallback_activated=True, _fallback_index=1,
+        _provider_fallback_active=True, _rate_limited_until=1,
         _fallback_chain=[{"provider": "backup", "model": "last", "max_stay_seconds": value}],
         _fallback_stay_started_at=time.monotonic() - 100,
         _restore_primary_runtime=Mock(return_value=False),
@@ -260,3 +261,153 @@ def test_unset_or_invalid_stay_limit_does_not_rewalk_chain(value, recovery_runti
     assert recovery_runtime._maybe_recheck_fallback_route_for_iteration(agent, "old prompt") == "old prompt"
     agent._restore_primary_runtime.assert_called_once()
     agent._try_activate_fallback.assert_not_called()
+
+
+@pytest.fixture
+def tool_loop_agent(tmp_path, monkeypatch):
+    """Keep API/tool I/O fake while exercising the real conversation loop."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tool_defs = [{"type": "function", "function": {
+        "name": "web_search", "description": "x", "parameters": {"type": "object", "properties": {}}}}]
+    with (
+        patch("model_tools.get_tool_definitions", return_value=tool_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="fixture", base_url="https://primary.invalid/v1", provider="custom",
+            model="primary-model", api_mode="chat_completions", quiet_mode=True,
+            skip_context_files=True, skip_memory=True,
+            fallback_model=[{"provider": "openai", "model": "backup", "base_url": "https://backup.invalid/v1"}],
+        )
+    agent._cached_system_prompt = "Model: primary-model\nProvider: custom"
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.valid_tool_names = {"web_search"}
+    agent._api_max_retries = 1
+    agent._disable_streaming = True
+    try:
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.auxiliary_client.resolve_provider_client", side_effect=lambda provider, model=None, **kw: (
+                MagicMock(api_key="fixture", base_url=kw.get("explicit_base_url") or "https://backup.invalid/v1"), model)),
+        ):
+            yield agent
+    finally:
+        agent.close()
+
+
+def _tool_loop_response(call_id=None):
+    calls = None if call_id is None else [SimpleNamespace(
+        id=call_id, type="function", function=SimpleNamespace(name="web_search", arguments="{}"))]
+    msg = SimpleNamespace(content="finished" if call_id is None else "", tool_calls=calls)
+    return SimpleNamespace(choices=[SimpleNamespace(
+        message=msg, finish_reason="stop" if call_id is None else "tool_calls")], usage=None)
+
+
+def test_voice_turn_keeps_voice_model_across_tool_call(tool_loop_agent):
+    agent = tool_loop_agent
+    agent._voice_turn_pending = True
+    requested = []
+
+    def request(kwargs):
+        requested.append(agent.model)
+        if len(requested) == 1:
+            return _tool_loop_response("voice_call")
+        assert any(m.get("tool_call_id") == "voice_call" for m in kwargs["messages"])
+        return _tool_loop_response()
+
+    with (
+        patch("agent.auxiliary_task_config._get_auxiliary_task_config", return_value={
+            "provider": "openai", "model": "voice-model", "base_url": "https://voice.invalid/v1"}),
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", return_value="tool result"),
+    ):
+        result = agent.run_conversation("voice task")
+
+    assert result["final_response"] == "finished"
+    assert requested == ["voice-model", "voice-model"]
+    assert agent.model == "primary-model"
+
+
+def test_uncooled_500_primary_is_not_retried_on_tool_iterations(tool_loop_agent, tmp_path):
+    agent = tool_loop_agent
+    requested = []
+    backup_calls = 0
+
+    def request(kwargs):
+        nonlocal backup_calls
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            response = httpx.Response(500, request=httpx.Request("POST", "https://primary.invalid/v1"))
+            raise InternalServerError("internal server error", response=response, body={})
+        backup_calls += 1
+        return _tool_loop_response(f"call_{backup_calls}" if backup_calls < 5 else None)
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", return_value="tool result"),
+    ):
+        result = agent.run_conversation("complete several tool steps")
+
+    assert result["final_response"] == "finished"
+    assert requested == ["primary-model"] + ["backup"] * 5
+    assert getattr(agent, "_rate_limited_until", 0) == 0
+    assert getattr(agent, "_shared_primary_cooldown_record", None) is None
+    assert not (tmp_path / "state" / "model_cooldowns.json").exists()
+
+
+def test_uncooled_primary_stay_limit_rewalks_only_fallbacks(tool_loop_agent):
+    agent = tool_loop_agent
+    agent._api_max_retries = 2  # permits two fallback activations in one logical iteration
+    agent._fallback_chain = [
+        {"provider": "openai", "model": "better-backup", "base_url": "https://better.invalid/v1"},
+        {"provider": "openai", "model": "last-resort", "base_url": "https://last.invalid/v1", "max_stay_seconds": 1},
+    ]
+    requested = []
+
+    def request(kwargs):
+        requested.append(agent.model)
+        if agent.model in {"primary-model", "better-backup"} and not any(
+            m.get("tool_call_id") == "stay_call" for m in kwargs["messages"]
+        ):
+            response = httpx.Response(500, request=httpx.Request("POST", agent.base_url))
+            raise InternalServerError("internal server error", response=response, body={})
+        return _tool_loop_response("stay_call" if agent.model == "last-resort" else None)
+
+    def tool(*args, **kwargs):
+        agent._fallback_stay_started_at = time.monotonic() - 2
+        return "tool result"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", side_effect=tool),
+    ):
+        result = agent.run_conversation("find a better backup")
+
+    assert result["final_response"] == "finished"
+    assert requested == ["primary-model"] * 2 + ["better-backup"] * 2 + ["last-resort", "better-backup"]
+    assert getattr(agent, "_rate_limited_until", 0) == 0
+    assert getattr(agent, "_shared_primary_cooldown_record", None) is None
+
+
+def test_primary_restore_clears_stay_bookkeeping(tool_loop_agent):
+    agent = tool_loop_agent
+    assert agent._try_activate_fallback(reason=FailoverReason.server_error)
+    assert agent._active_fallback_entry is not None
+    assert agent._fallback_stay_started_at is not None
+    assert agent._restore_primary_runtime()
+    assert agent._active_fallback_entry is None
+    assert agent._fallback_stay_started_at is None
+
+
+def test_explicit_switch_clears_stay_bookkeeping(tool_loop_agent):
+    agent = tool_loop_agent
+    assert agent._try_activate_fallback(reason=FailoverReason.server_error)
+    from agent.agent_runtime_helpers import _finish_switch
+    _finish_switch(agent, "custom", "custom", "custom")
+    assert agent._active_fallback_entry is None
+    assert agent._fallback_stay_started_at is None

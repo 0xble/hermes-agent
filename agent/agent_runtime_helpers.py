@@ -2484,6 +2484,8 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
 def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     """Post-switch bookkeeping: fallback reset/prune, request_overrides, billing route."""
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
+    agent._fallback_stay_started_at = None
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0

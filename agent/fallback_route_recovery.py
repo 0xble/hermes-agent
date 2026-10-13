@@ -12,6 +12,17 @@ import time
 logger = logging.getLogger(__name__)
 
 
+def _mid_turn_recovery_allowed(agent):
+    """Return whether this route has a real provider-fallback recovery signal."""
+    return bool(
+        getattr(agent, "_provider_fallback_active", False)
+        and (
+            getattr(agent, "_rate_limited_until", 0)
+            or isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict)
+        )
+    )
+
+
 def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
     """Restore an expired primary fallback during a long-running turn.
 
@@ -23,6 +34,11 @@ def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
     request would call the primary model with the fallback identity.
     """
     if not getattr(agent, "_fallback_activated", False):
+        return active_system_prompt
+    # Explicit route bindings (voice turns, /model --once, etc.) also use
+    # _fallback_activated, but must remain pinned until their route ends.
+    # Uncooled 5xx/transport fallbacks have no mid-turn primary recovery signal.
+    if not _mid_turn_recovery_allowed(agent):
         return active_system_prompt
     try:
         if not agent._restore_primary_runtime():
@@ -62,6 +78,8 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
     """Re-evaluate an aged fallback only at the next model-request boundary."""
     if not getattr(agent, "_fallback_activated", False):
         return active_system_prompt
+    if not getattr(agent, "_provider_fallback_active", False):
+        return active_system_prompt
     max_stay = _fallback_max_stay_seconds(agent)
     if max_stay is None:
         return _restore_primary_runtime_for_iteration(agent, active_system_prompt)
@@ -88,14 +106,14 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     committed = False
     try:
-        if agent._restore_primary_runtime():
+        if _mid_turn_recovery_allowed(agent) and agent._restore_primary_runtime():
             committed = True
             restored = getattr(agent, "_cached_system_prompt", None)
             return restored if isinstance(restored, str) else active_system_prompt
 
-        # The shared primary cooldown is still active. Re-walk from the first
-        # chain entry using the normal candidate-skip rules; this may land on
-        # the same entry when earlier candidates remain unavailable.
+        # An active primary cooldown still blocks restoration; an uncooled
+        # failure has no mid-turn recovery signal. In either case retry only
+        # fallback entries, never the primary, using normal candidate skips.
         agent._fallback_index = 0
         if agent._try_activate_fallback(reason=None):
             from agent.conversation_loop import _sync_failover_system_message
@@ -112,6 +130,6 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
             agent._fallback_index = previous_index
             if compressor_state is not None:
                 vars(compressor).update(compressor_state)
-        agent._fallback_stay_started_at = time.monotonic()
-
+        if getattr(agent, "_provider_fallback_active", False):
+            agent._fallback_stay_started_at = time.monotonic()
 

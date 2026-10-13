@@ -18,11 +18,16 @@ for the next tool-loop request even though the first fallback was available;
 primary recovery alone cannot cover this case. Unset limits retain the normal
 cooldown-gated primary restoration without an extra fallback-chain walk.
 
-The check skips a request rebuild that is still retrying a just-activated
-fallback, so an uncooled generic-500 primary cannot starve that fallback before
-it makes its first request. The existing shared-cooldown regression exercises
-this integration rule. Runtime re-evaluation failures roll back the route and
-reset the per-entry timer instead of disrupting the turn.
+The check runs only for real provider fallbacks, never for temporary voice or
+explicit model routes. It skips a request rebuild that is still retrying a
+just-activated fallback. Mid-turn primary probes require a local cooldown
+deadline or a held shared cooldown record: the normal restore path reads the
+cross-process record and honors an active outage, expiry, or clearance elsewhere.
+A generic-500/transport primary that never armed a cooldown stays benched until
+the next user turn, not merely until the fallback's first request. An expired
+`max_stay_seconds` may still retry earlier fallback entries from index zero,
+but cannot retry that uncooled primary. Runtime re-evaluation failures roll back
+the route and reset the per-entry timer instead of disrupting the turn.
 
 ## Proof and retirement
 
@@ -30,6 +35,9 @@ The proof surface is `tests/agent/test_mid_turn_primary_restore.py`, including
 prompt provenance, active shared-cooldown blocking, cross-session shared-record
 clearance, ordered-chain recovery after a failed primary retry, stay-limit
 re-evaluation, unchanged behavior for unset limits, and rollback on errors.
+Real conversation-loop regressions also cover voice routing across a tool call,
+uncooled generic-500 failures across several tool iterations, an uncooled
+stay-limit fallback re-walk, and bookkeeping reset on restore or explicit switch.
 Retire this patch when the selected upstream release contains equivalent
 mid-turn restore and optional stay-limit behavior and the regressions pass
 without the local implementation.

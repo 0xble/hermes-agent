@@ -54,6 +54,10 @@ fallback:
 Long turns check the primary's shared cooldown before each new model request,
 not just between user turns. A successful primary response in another session
 clears the shared outage so this session can restore at its next request.
+This applies only to provider fallbacks with a cooldown or a held shared outage
+record. Voice turns and explicit model routes are not rechecked. A generic
+server/transport failure that never armed a cooldown keeps the primary benched
+until the next user turn; a stay-limit re-walk retries only fallback entries.
 Neither check interrupts a stream or separates a tool call from its result.
 The optional stay limit also lets an earlier fallback recover while the primary
 is still benched; it does not shorten or clear the primary's shared cooldown.

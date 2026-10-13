@@ -366,9 +366,9 @@ def begin_iteration(
     )
 
     # A retry rebuild is still the same logical iteration: give a freshly
-    # activated fallback its pending request before probing recovery. Otherwise
-    # an uncooled generic-500 primary would starve the fallback indefinitely.
-    if restart_count == 0:
+    # activated provider fallback its pending request before probing recovery.
+    # Voice turns and explicit route bindings must remain pinned for the turn.
+    if restart_count == 0 and getattr(agent, "_provider_fallback_active", False):
         active_system_prompt = _maybe_recheck_fallback_route_for_iteration(
             agent, active_system_prompt
         )

@@ -173,5 +173,7 @@ def reinstall_primary_runtime(
             agent.reasoning_override = None
     agent._pre_fallback_reasoning_override = None
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
+    agent._fallback_stay_started_at = None
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
