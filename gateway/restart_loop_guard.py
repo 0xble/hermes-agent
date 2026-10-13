@@ -4,10 +4,10 @@ Defenses 1-2 (``_HERMES_GATEWAY`` guard on ``hermes gateway stop|restart`` /
 ``terminal_tool``, cron lifecycle filter) stop the agent scheduling its own restart
 but not every SIGTERM source: the supervisor respawns, the gateway auto-resumes the
 restart-interrupted session, whose next turn re-runs the offending logic. Boots are persisted to
-``<HERMES_HOME>/gateway/restart_loop.json``. The first boot whose predecessor left a planned-restart
-marker is recorded separately from the crash chain; a second planned restart in the same
-gap-bounded chain is counted, preserving the breaker against an auto-resumed agent that repeatedly
-requests restart. Tripped → caller SKIPS auto-resume. Any I/O failure fails OPEN, never wedging.
+``<HERMES_HOME>/gateway/restart_loop.json``. One gap-bounded chain spans every boot; the first boot
+in it whose predecessor left a recent planned-restart marker is exempt (stored under ``planned``),
+and any later planned restart in that chain is counted, preserving the breaker against an
+auto-resumed agent that repeatedly requests restart. Tripped → caller SKIPS auto-resume. Any I/O failure fails OPEN, never wedging.
 """
 
 from __future__ import annotations
@@ -40,17 +40,20 @@ def _state_path():
 
 
 def _load_state() -> tuple[List[float], List[float]]:
+    """``(counted boots, exempt planned boots)``; a file without ``planned`` is all counted."""
     try:
         # utf-8-sig: our BOM-tolerant read fix for the persisted boot log.
         raw = _state_path().read_text(encoding="utf-8-sig")
         data = json.loads(raw)
-        boots = data.get("boots", [])
-        planned = data.get("planned", [])
-        return (
-            [float(t) for t in boots if isinstance(t, (int, float))],
-            [float(t) for t in planned if isinstance(t, (int, float))],
-        )
-    except (OSError, ValueError, TypeError):
+        boots = [float(t) for t in data.get("boots", []) if isinstance(t, (int, float))]
+        counted = set(boots)
+        # A timestamp in both lists is counted (older writers also listed counted planned boots).
+        planned = [
+            float(t) for t in data.get("planned", [])
+            if isinstance(t, (int, float)) and float(t) not in counted
+        ]
+        return boots, planned
+    except (OSError, ValueError, TypeError, AttributeError):
         return [], []
 
 
@@ -62,11 +65,10 @@ def _save_state(boots: List[float], planned: List[float]) -> None:
     with contextlib.suppress(OSError):
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"boots": boots, "planned": planned}), encoding="utf-8")
-
-
-def _save_boots(boots: List[float]) -> None:
-    _save_state(boots, _load_state()[1])
+        path.write_text(
+            json.dumps({"boots": boots[-_MAX_STORED_BOOTS:], "planned": planned[-_MAX_STORED_BOOTS:]}),
+            encoding="utf-8",
+        )
 
 
 def _chain_gap(window_seconds: int, max_gap_seconds: int) -> float:
@@ -93,15 +95,43 @@ def _chain_ending_at(boots: List[float], ts: float, gap: float) -> List[float]:
     return chain[::-1]
 
 
+def _current_chain(ts: float, gap: float) -> tuple[List[float], List[float]]:
+    """Split the ONE chain over every recorded boot (counted and exempt) into its counted and
+    exempt parts.  Chaining each kind separately would double the apparent gap whenever planned
+    and unplanned boots alternate, letting a loop slower than ``gap / 2`` evade the breaker."""
+    boots, planned = _load_state()
+    exempt = set(planned)
+    chain = _chain_ending_at(boots + planned, ts, gap)
+    return [t for t in chain if t not in exempt], [t for t in chain if t in exempt]
+
+
+def planned_marker_is_recent(
+    path, *, now: Optional[float] = None, window_seconds: int = DEFAULT_WINDOW_SECONDS,
+    max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
+) -> bool:
+    """True when the planned-restart marker at ``path`` was requested within one chain gap of
+    ``now``.  The marker can outlive later crashes while a home channel stays unreachable, so an
+    old one does not make this boot's predecessor planned.  Unreadable or undated → False."""
+    try:
+        requested_at = json.loads(path.read_text(encoding="utf-8-sig")).get("requested_at")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+    if isinstance(requested_at, bool) or not isinstance(requested_at, (int, float)):
+        return False
+    ts = time.time() if now is None else now
+    return abs(ts - float(requested_at)) <= _chain_gap(window_seconds, max_gap_seconds)
+
+
 def record_restart_interrupted_boot(
     window_seconds: int = DEFAULT_WINDOW_SECONDS, *, now: Optional[float] = None,
     max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
 ) -> List[float]:
-    """Record a restart-interrupted boot; return the pruned chain + now (most recent
-    last).  A persistence failure returns the in-memory list without raising."""
+    """Record a counted restart-interrupted boot; return the chain's counted boots + now (most
+    recent last).  A persistence failure returns the in-memory list without raising."""
     ts = time.time() if now is None else now
-    boots = _chain_ending_at(_load_boots(), ts, _chain_gap(window_seconds, max_gap_seconds)) + [ts]
-    _save_boots(boots[-_MAX_STORED_BOOTS:])
+    boots, planned = _current_chain(ts, _chain_gap(window_seconds, max_gap_seconds))
+    boots = boots + [ts]
+    _save_state(boots, planned)
     return boots
 
 
@@ -118,23 +148,21 @@ def check_and_record(
 ) -> bool:
     """Record this boot and return True when auto-resume should be skipped.
 
-    The first planned restart in a contiguous chain is kept as a separate marker instead of
-    spending breaker budget. A second planned restart in that same chain is counted, so an
-    auto-resumed agent that repeatedly asks the gateway to restart still trips the breaker.
+    Only the first planned restart in a gap-bounded chain (over all boots, planned or not) is
+    exempt and does not spend breaker budget.  Every later planned restart in that chain counts,
+    so an auto-resumed agent that repeatedly asks the gateway to restart still trips the breaker.
     """
     ts = time.time() if now is None else now
     gap = _chain_gap(window_seconds, max_gap_seconds)
-    boots, planned = _load_state()
-    boots = _chain_ending_at(boots, ts, gap)
-    planned = _chain_ending_at(planned, ts, gap)
-    if planned_restart and not planned:
-        planned = [ts]
-        _save_state(boots[-_MAX_STORED_BOOTS:], planned[-_MAX_STORED_BOOTS:])
-        return False
-    boots = boots + [ts]
     if planned_restart:
-        planned = planned + [ts]
-    _save_state(boots[-_MAX_STORED_BOOTS:], planned[-_MAX_STORED_BOOTS:])
+        boots, planned = _current_chain(ts, gap)
+        if not planned:
+            _save_state(boots, [ts])
+            return False
+        boots = boots + [ts]
+        _save_state(boots, planned)
+    else:
+        boots = record_restart_interrupted_boot(window_seconds, now=ts, max_gap_seconds=max_gap_seconds)
     tripped = max_restarts > 0 and len(boots) >= max_restarts
     if tripped:
         logger.warning(
