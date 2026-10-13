@@ -344,10 +344,21 @@ async def test_flood_wait_retries_once_without_a_second_final(tmp_path):
     try:
         result = await adapter.send("chat", "final")
         assert result.success and result.deferred
-        await asyncio.sleep(0.1)
+        store = Outbox(tmp_path)
+
+        async def wait_for_delivery():
+            # The retry and its SQLite receipt run asynchronously; elapsed wall
+            # time alone does not prove that either has completed.
+            while True:
+                rows = await asyncio.to_thread(store.all_rows)
+                if rows and rows[0].state == "delivered":
+                    return rows
+                await asyncio.sleep(0.01)
+
+        rows = await asyncio.wait_for(wait_for_delivery(), timeout=10)
         assert sends == ["final", "final"]
-        assert [r.state for r in Outbox(tmp_path).all_rows()] == ["delivered"]
-        assert await recover(Outbox(tmp_path), adapter) == (0, 0)
+        assert [r.state for r in rows] == ["delivered"]
+        assert await recover(store, adapter) == (0, 0)
         assert len(sends) == 2
     finally:
         clear_turn()
