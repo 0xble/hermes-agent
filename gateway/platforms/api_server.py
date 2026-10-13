@@ -1194,7 +1194,10 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+from gateway.platforms.api_server_model_routes import SessionModelRoutesMixin
+
+
+class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -2182,51 +2185,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if text not in allowed:
             return "api_server"
         return "hermes_browser" if text == "browser" else text
-
-    def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The gateway's per-session ``/model`` override for *session_key*, if any — a
-        user-issued ``/model`` always wins over static route config."""
-        if not session_key:
-            return None
-        try:
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            if runner is None:
-                return None
-            try:
-                rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
-                if callable(rehydrate):
-                    rehydrate(session_key)
-            except Exception:
-                logger.debug(
-                    "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
-            override = runner._session_model_overrides.get(session_key)
-            return dict(override) if isinstance(override, dict) else None
-        except Exception:
-            return None
-
-    def _request_route_conflict_error(
-        self, *, session_id: Optional[str], gateway_session_key: Optional[str], requested_model: Optional[str],
-        requested_provider: Optional[str], route: Optional[Dict[str, Any]]) -> Optional[str]:
-        """Return a 400-worthy conflict string for ambiguous route/provider mixes."""
-        request_provider = _clean_request_string(requested_provider)
-        if not request_provider or not isinstance(route, dict):
-            return None
-        if self._session_model_override_for(gateway_session_key or session_id):
-            return None  # session /model wins over both, so nothing is ambiguous
-        route_provider = _clean_request_string(route.get("provider"))
-        route_api_key = _clean_request_string(route.get("api_key"))
-        route_base_url = _clean_request_string(route.get("base_url"))
-        route_alias = _clean_request_string(requested_model) or "requested model"
-        if route_provider and request_provider != route_provider:
-            return (
-                f"Model route '{route_alias}' is pinned to provider '{route_provider}'. "
-                f"Remove 'provider' or use '{route_provider}'.")
-        if not route_provider and (route_api_key or route_base_url):
-            return (
-                f"Model route '{route_alias}' pins route credentials/base_url. "
-                "Do not combine it with an explicit 'provider'.")
-        return None
 
     @staticmethod
     def _resolve_provider_runtime(
@@ -3419,6 +3377,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
+            await self._prepare_request_route_validation(gateway_session_key or session_id)
             selection_error = await asyncio.to_thread(
                 self._request_route_conflict_error,
                 session_id=session_id, gateway_session_key=gateway_session_key,

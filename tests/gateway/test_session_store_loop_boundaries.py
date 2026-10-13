@@ -28,7 +28,7 @@ def reset_loop_guard():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("site", ["status", "model", "selection", "fast"])
+@pytest.mark.parametrize("site", ["status", "model", "selection", "fast", "fast_picker"])
 @pytest.mark.parametrize("persisted", [False, True])
 async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path, monkeypatch):
     import gateway.run as gateway_run
@@ -55,6 +55,22 @@ async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path,
     monkeypatch.setattr(runner, "_perform_model_switch", AsyncMock(return_value=(None, "stop-before-switch")))
     monkeypatch.setattr(model_commands, "_fast_route_supports", lambda *args, **kwargs: True)
     loop_thread = threading.get_ident()
+    original_state = runner._session_state
+    original_commit = runner._commit_session_model_override
+    ownership_errors = []
+
+    def state(session_key):
+        if runner._peek_session_state(session_key) is None and threading.get_ident() != loop_thread:
+            ownership_errors.append("session state created off-loop")
+        return original_state(session_key)
+
+    def commit(*args):
+        if threading.get_ident() != loop_thread:
+            ownership_errors.append("model override committed off-loop")
+        return original_commit(*args)
+
+    monkeypatch.setattr(runner, "_session_state", state)
+    monkeypatch.setattr(runner, "_commit_session_model_override", commit)
     hermes_loop_guard.set_loop_thread(loop_thread)
     try:
         if site == "status":
@@ -63,9 +79,7 @@ async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path,
             await runner._handle_model_command(MessageEvent(text="/model next-model", source=source))
         elif site == "selection":
             await runner.resolve_session_model_selection(source, "next-model", session_key=key)
-        elif site == "fast":
-            # The eligibility read is already off-loop on the baseline; clear its hydrated
-            # snapshot before the route note so this tests the *second*, sync resolution too.
+        elif site.startswith("fast"):
             real_apply = runner._apply_fast_selection
 
             def apply(*args, **kwargs):
@@ -73,9 +87,21 @@ async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path,
                 return real_apply(*args, **kwargs)
 
             monkeypatch.setattr(runner, "_apply_fast_selection", apply)
-            await runner._handle_fast_command(MessageEvent(text="/fast normal", source=source))
+            if site == "fast_picker":
+                async def picker(*args, **kwargs):
+                    # A session boundary may evict state while the picker is visible.
+                    runner._sessions_map().pop(key, None)
+                    await kwargs["on_choice_selected"]("123", "normal")
+                    return True
+
+                monkeypatch.setattr(runner, "_try_send_choice_picker", picker)
+                command = "/fast"
+            else:
+                command = "/fast normal"
+            await runner._handle_fast_command(MessageEvent(text=command, source=source))
         assert reads and loop_thread not in reads, f"{site} store read on loop: {reads}"
-        if site != "fast" and persisted:
+        assert not ownership_errors, ownership_errors
+        if not site.startswith("fast") and persisted:
             assert runner._session_model_override(key)["model"] == "persisted-model"
     finally:
         hermes_loop_guard.set_loop_thread(None)
@@ -133,6 +159,72 @@ async def test_heartbeat_owner_lookup_runs_off_loop(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_webhook_completion_peeks_session_off_loop(tmp_path, monkeypatch):
+    pytest.importorskip("aiohttp")
+    from gateway.platforms.webhook import WebhookAdapter
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.WEBHOOK, chat_id="delivery", user_id="hook")
+    entry = runner.session_store.get_or_create_session(source)
+    original = runner.session_store.peek_session_id
+    peeks = []
+
+    def peek(key):
+        peeks.append(threading.get_ident())
+        return original(key)
+
+    monkeypatch.setattr(runner.session_store, "peek_session_id", peek)
+    end_session = AsyncMock()
+    adapter = SimpleNamespace(gateway_runner=SimpleNamespace(
+        session_store=runner.session_store,
+        _session_db=SimpleNamespace(end_session=end_session),
+        _session_key_for_source=runner._session_key_for_source,
+    ))
+    loop_thread = threading.get_ident()
+    hermes_loop_guard.set_loop_thread(loop_thread)
+    try:
+        await WebhookAdapter._end_webhook_session(adapter, MessageEvent(text="done", source=source), "delivery")
+        assert peeks and loop_thread not in peeks
+        end_session.assert_awaited_once_with(entry.session_id, "webhook_complete")
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_checks_heartbeat_owner_off_loop(tmp_path, monkeypatch):
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    entry = runner.session_store.get_or_create_session(source)
+    key = entry.session_key
+    event = MessageEvent(text="heartbeat", source=source)
+    event._heartbeat_resolved_session_id = "stale-owner"
+    reads = []
+    original = runner.session_store.lookup_by_session_key
+
+    def lookup(session_key):
+        reads.append(threading.get_ident())
+        return original(session_key)
+
+    monkeypatch.setattr(runner.session_store, "lookup_by_session_key", lookup)
+    monkeypatch.setattr(runner, "_hmwa_resolve_session", AsyncMock(return_value=(source, entry, key)))
+    prepared = runner._PreparedTurn(
+        history=[], context_prompt="", message_text="heartbeat",
+        persist_user_message=None, persist_user_timestamp=None, persist_user_display_kind=None)
+    monkeypatch.setattr(runner, "_hmwa_prepare_turn", AsyncMock(return_value=(prepared, [])))
+    monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
+    monkeypatch.setattr(runner, "_clear_session_env", lambda _tokens: None)
+    loop_thread = threading.get_ident()
+    hermes_loop_guard.set_loop_thread(loop_thread)
+    try:
+        result = await runner._handle_message_with_agent(event, source, key, 1)
+        assert result is None  # obsolete heartbeat cannot enter the agent runner
+        assert reads and loop_thread not in reads
+        assert not getattr(event, "_heartbeat_execution_started", False)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+
+
+@pytest.mark.asyncio
 async def test_async_hydration_rejects_stale_read_after_edit(tmp_path, monkeypatch):
     """Off-loop reads must retain the synchronous hydration's epoch/edit-pending fence."""
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
@@ -164,7 +256,8 @@ async def test_async_hydration_rejects_stale_read_after_edit(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("site", ["chat", "completions", "responses", "runs"])
-async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeypatch):
+@pytest.mark.parametrize("persisted", [False, True])
+async def test_api_route_validation_reads_store_off_loop(site, persisted, tmp_path, monkeypatch):
     pytest.importorskip("aiohttp")
     from unittest.mock import AsyncMock, MagicMock
     import gateway.run as gateway_run
@@ -175,6 +268,8 @@ async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeyp
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
     key = runner._session_key_for_source(source)
     runner.session_store.get_or_create_session(source)
+    if persisted:
+        runner.session_store.set_model_override(key, {"model": "persisted-model"})
     reads = []
     original = runner.session_store.get_model_override
     monkeypatch.setattr(runner.session_store, "get_model_override", lambda k: (reads.append(threading.get_ident()), original(k))[1])
@@ -200,6 +295,22 @@ async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeyp
     request.match_info = {"session_id": "test-session"}
     request.json = AsyncMock(return_value=body)
     loop_thread = threading.get_ident()
+    original_state = runner._session_state
+    original_commit = runner._commit_session_model_override
+    ownership_errors = []
+
+    def state(session_key):
+        if runner._peek_session_state(session_key) is None and threading.get_ident() != loop_thread:
+            ownership_errors.append("session state created off-loop")
+        return original_state(session_key)
+
+    def commit(*args):
+        if threading.get_ident() != loop_thread:
+            ownership_errors.append("model override committed off-loop")
+        return original_commit(*args)
+
+    monkeypatch.setattr(runner, "_session_state", state)
+    monkeypatch.setattr(runner, "_commit_session_model_override", commit)
     hermes_loop_guard.set_loop_thread(loop_thread)
     try:
         if site == "chat":
@@ -212,6 +323,10 @@ async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeyp
             response = await adapter._handle_runs(request)
         assert response.status == 400
         assert reads and loop_thread not in reads, f"{site} store read on loop: {reads}"
+        assert not ownership_errors, ownership_errors
+        assert runner._peek_session_state(key) is not None
+        if persisted:
+            assert runner._session_model_override(key)["model"] == "persisted-model"
     finally:
         hermes_loop_guard.set_loop_thread(None)
         if adapter._session_db is not None:

@@ -747,6 +747,7 @@ class OpenAICompatRoutesMixin:
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        await self._prepare_request_route_validation(gateway_session_key or session_id)
         route, agent_overrides, selection_error = await asyncio.to_thread(
             self._select_request_route,
             body, session_id=session_id, gateway_session_key=gateway_session_key,
@@ -1171,6 +1172,7 @@ class OpenAICompatRoutesMixin:
             or await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
             or str(uuid.uuid4()))
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        await self._prepare_request_route_validation(gateway_session_key or session_id)
         route, agent_overrides, selection_error = await asyncio.to_thread(
             self._select_request_route,
             body, session_id=session_id, gateway_session_key=gateway_session_key,

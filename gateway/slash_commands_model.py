@@ -976,6 +976,7 @@ class GatewayModelCommandsMixin:
         # the next turn reads, and the eligibility check must see that turn's route.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        self._session_state(session_key)  # worker appliers must not create loop-owned state
         transition = self._resolve_session_service_tier(
             session_key=session_key, report_transition=True,
         )
@@ -986,8 +987,8 @@ class GatewayModelCommandsMixin:
         user_config = _load_gateway_config()
         try:
             # Off the loop: credential resolution can refresh an OAuth token, as the turn does.
-            model, runtime = await asyncio.to_thread(
-                self._resolve_session_agent_runtime, source=source, session_key=session_key, user_config=user_config)
+            model, runtime = await self._resolve_session_agent_runtime_async(
+                source=source, session_key=session_key, user_config=user_config)
         except Exception:
             # No usable route at all (the turn fails too): judge the configured model alone.
             model, runtime = _resolve_gateway_model(user_config), {}
@@ -999,6 +1000,7 @@ class GatewayModelCommandsMixin:
             reply = t("gateway.fast.ultrafast_not_supported", model=model)
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
+            self._session_state(session_key)
             reply = await asyncio.to_thread(
                 self._apply_fast_selection, session_key, args, persist=persist_global)
             return (expiry_notice + "\n\n" + reply) if expiry_notice else reply
@@ -1015,6 +1017,7 @@ class GatewayModelCommandsMixin:
             status += "\n\n" + expiry_notice
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
+            self._session_state(session_key)
             return await asyncio.to_thread(
                 self._apply_fast_selection, session_key, value, persist=persist_global)
 
