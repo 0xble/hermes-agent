@@ -226,6 +226,14 @@ async def _execute_continuation(runner, state, tmp_path, event, path):
 
     runner._MAX_INTERRUPT_DEPTH = 5
     runner._session_key_for_source = lambda source: runner.target.session_key
+    # Approved control continuations are strict: the drain re-checks the pin against the key's owner.
+    if event.metadata.get("gateway_session_strict"):
+        event.metadata["gateway_session_key"] = runner.target.session_key
+
+    async def lookup_by_session_key(key):
+        return runner.target if key == runner.target.session_key else None
+
+    runner.async_session_store = SimpleNamespace(lookup_by_session_key=lookup_by_session_key)
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
         side_effect=lambda **kw: kw["event"].text,
     )
