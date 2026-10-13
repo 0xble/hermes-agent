@@ -10,10 +10,17 @@ from hermes_cli.goals import _evidence_only_read_only_status
     [
         ("{}", True),
         ('{"clear": false}', True),
+        ('{"clear": true}', False),
+        ('{"clear": 0}', False),
+        ('{"clear": null}', False),
+        ('{"expression": ""}', False),
+        ('{"expression": null}', False),
         ('{"expression": "document.title"}', False),
         ('{"expression": "document.querySelector(\\"button\\").click()"}', False),
         ("{truncated", False),
         ('"not an object"', False),
+        ('{"unknown": false}', False),
+        ('[]', False),
         ("", False),
     ],
 )

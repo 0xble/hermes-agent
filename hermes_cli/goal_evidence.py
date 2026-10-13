@@ -30,13 +30,18 @@ _READ_ONLY_STATUS_CALL_RE = re.compile(
     re.I,
 )
 _READ_ONLY_STATUS_TOOLS = frozenset({
-    "browser_console", "browser_get_images", "browser_snapshot", "read_file", "search_files",
+    "browser_get_images", "browser_snapshot", "read_file", "search_files",
     "web_extract", "web_search", "skill_view", "skills_list", "tool_search", "tool_describe",
 })
 
 
 def _goal_progress_fingerprint(evidence: Optional[List[dict[str, Any]]]) -> Optional[str]:
-    """Return a stable identity for recorded tool progress, or ``None`` when there is no signal."""
+    """Return a stable identity for recorded tool progress, or ``None`` when there is no signal.
+
+    Tool-result timestamps and content are runtime-owned, unlike the agent's prose. Hashing the
+    bounded evidence ledger keeps the durable state small while distinguishing a new result from a
+    repeated no-op evaluation.
+    """
     rows = []
     for item in evidence or []:
         if not isinstance(item, dict) or str(item.get("tool") or "").strip().lower() == "quality gate":
@@ -49,7 +54,12 @@ def _goal_progress_fingerprint(evidence: Optional[List[dict[str, Any]]]) -> Opti
 
 
 def _evidence_scan_truncated_for_turn(evidence: Optional[List[dict[str, Any]]], previous_turn_at: float) -> bool:
-    """Whether the bounded evidence scan may have omitted rows from this turn."""
+    """Whether the bounded evidence scan may have omitted rows from this turn.
+
+    A long transcript alone is not enough: older rows can fill the scan while the current
+    turn remains fully visible. If every returned row is newer than the previous-turn boundary,
+    the current turn may itself exceed the scan bound, so classify it as actionable.
+    """
     if not bool(getattr(evidence, "truncated", False)):
         return False
     rows = [item for item in (evidence or []) if isinstance(item, dict)]
@@ -79,7 +89,12 @@ def _browser_console_read_only_call(call: Any) -> bool:
 
 
 def _read_only_status_call(call: Any) -> str:
-    """Extract a shell command from the collector's bounded JSON argument representation."""
+    """Extract a shell command from the collector's bounded JSON argument representation.
+
+    The collector stores shell arguments as bounded JSON. A bare, truncated, or redacted call is
+    deliberately not accepted: the classifier must fail closed rather than turn an allowed prefix
+    into an actionable-command bypass.
+    """
     text = str(call or "").strip()
     if not text.startswith("{"):
         return ""
@@ -97,6 +112,7 @@ def _read_only_status_call(call: Any) -> str:
 
 def _evidence_only_read_only_status(evidence: Optional[List[dict[str, Any]]]) -> bool:
     """Whether current-turn evidence consists only of bounded status/read operations."""
+    from hermes_cli.goals import _READ_ONLY_STATUS_CALL_RE, _READ_ONLY_STATUS_TOOLS, _read_only_status_call
     rows = [item for item in (evidence or []) if isinstance(item, dict)]
     if not rows:
         return True
@@ -117,6 +133,7 @@ def _evidence_only_read_only_status(evidence: Optional[List[dict[str, Any]]]) ->
 
 def _render_evidence_block(evidence: Optional[List[dict[str, Any]]], now: Optional[float] = None) -> str:
     """Judge prompt block for the evidence ledger; empty when there is none."""
+    from hermes_cli.goals import JUDGE_EVIDENCE_BLOCK_TEMPLATE
     lines: list[str] = []
     now = time.time() if now is None else now
     for item in evidence or []:

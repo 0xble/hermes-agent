@@ -142,13 +142,28 @@ The `call` field is intentionally the bounded, one-line JSON argument string
 written by the collector; it is not a bare shell command. The classifier must
 parse JSON arguments first (for terminal/shell calls), extract the `command`
 field, and only then apply its command grammar. Non-shell read-only tools are
-accepted by their explicit tool-name allowlist. The judge-facing evidence ledger
+accepted by their explicit tool-name allowlist, except browser-console calls,
+which require argument inspection. The judge-facing evidence ledger
 remains capped at `_EVIDENCE_MAX_ENTRIES`, but no-progress classification reads a
 separate complete per-turn slice before that cap, filtered by `timestamp >
 previous_turn_at`. The per-turn scan is bounded; if it may have omitted rows from
 the current turn, classification fails closed as actionable rather than treating
 an incomplete read-only suffix as proof of no progress. Quality-gate rows are
 excluded from the progress fingerprint, while still being shown to the judge.
+
+Browser-console inspection is read-only only when its arguments are a valid
+no-expression object with no keys beyond an optional boolean `clear: false`.
+Any expression key (including empty or null), clearing, unknown keys, malformed,
+truncated, or non-object arguments are conservatively actionable. The classifier
+lives in `hermes_cli/goal_evidence.py`, retaining the original goal-module exports
+and explanatory docstrings. This fixes action classification without changing
+no-progress thresholds, wait duration, cadence, or user-authority rules.
+`tests/hermes_cli/test_goal_readonly_evidence.py` covers the argument contract.
+
+Success admission is independent of this classifier: an empty successful boundary
+may carry actionable tool evidence. No-progress accounting controls the existing
+backoff and waits. It does not implement the separate terminal judged-silent-stall
+work in PR #531, which remains outside this patch.
 
 For an automatic CONTINUE, empty evidence or evidence consisting only of
 approved read-only/status operations increments the shared no-progress streak. A
