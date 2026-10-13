@@ -90,6 +90,10 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
     _update_fallback_context_compressor(agent)
     _reresolve_fallback_reasoning_config(agent, entry)
     _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+    # Start the optional stay clock only after the route was successfully bound.
+    from time import monotonic
+    agent._active_fallback_entry = entry
+    agent._fallback_stay_started_at = monotonic()
     return old_model, old_provider
 
 

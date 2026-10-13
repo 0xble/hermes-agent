@@ -49,6 +49,28 @@ fallback:
 | Key | Default | Effect |
 |-----|---------|--------|
 | `fallback.min_switch_reset_seconds` | `0` (off) | A rate-limited primary whose declared reset is sooner than this many seconds is not swapped for a fallback; the retry backoff waits out the window instead. |
+| `fallback_providers[].max_stay_seconds` | unset (off) | After this entry has been active longer than a positive number of seconds, re-evaluate at the next model-call boundary: restore the primary if its shared cooldown permits it, otherwise retry the chain from its first entry. Unavailable candidates are skipped normally, so the same entry can be selected again. |
+
+Long turns check the primary's shared cooldown before each new model request,
+not just between user turns. A successful primary response in another session
+clears the shared outage so this session can restore at its next request.
+Neither check interrupts a stream or separates a tool call from its result.
+The optional stay limit also lets an earlier fallback recover while the primary
+is still benched; it does not shorten or clear the primary's shared cooldown.
+
+```yaml
+fallback_providers:
+  - provider: openrouter
+    model: anthropic/claude-sonnet-4
+  - provider: openai
+    model: gpt-4.1
+    max_stay_seconds: 60
+```
+
+`max_stay_seconds` is provider-independent and travels with each normalized
+entry into the agent's fallback chain. Omitted, non-positive, or invalid values
+disable the extra chain re-check. Each selection (including the same entry)
+resets the timer; a re-evaluation failure leaves the current route active.
 
 Gemini fallback entries accept `gemini`, `google`, `google-gemini`, and
 `google-ai-studio`. On Google's native API endpoint, all use the native Gemini
