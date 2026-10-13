@@ -115,9 +115,12 @@ def run_if_not_interrupted(callback: Callable[[], None]) -> bool:
 
 
 def get_interrupt_reason() -> str | None:
-    """User-safe interrupt cause for the current thread, if known."""
+    """User-safe cause for this thread or the tool thread its deadline worker acts for."""
     with _lock:
-        return _interrupt_reasons.get(threading.current_thread().ident)
+        for tid in (threading.get_ident(), acting_for_tid.get()):
+            if tid is not None and (reason := _interrupt_reasons.get(tid)):
+                return reason
+    return None
 
 
 def clear_current_thread_interrupt() -> None:

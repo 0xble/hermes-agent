@@ -887,13 +887,15 @@ def _leader_is_ours(pgid, expected_start) -> bool:
         return True
 
 
-def _kill_process_group_posix(proc) -> None:
+def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> None:
     """TERM the group, wait, KILL, then sweep setsid escapees. Descendants are
     snapshotted BEFORE the first signal — once the wrapper dies they reparent to
     init — and we wait on the group, not the wrapper, which can exit before
     grandchildren under load. POSIX-only (_IS_WINDOWS handled by the caller).
     PID-reuse guard (#43044): the group is only signalled while its leader's start
-    time still matches the spawn-time baseline — a recycled PGID is never killed."""
+    time still matches the spawn-time baseline — a recycled PGID is never killed.
+    ``snapshot_descendants=False`` is the shutdown path: no host-wide psutil scan,
+    but the same group guards, bounded TERM→KILL waits and wrapper reaping remain."""
     expected_start = getattr(proc, "_hermes_pgid_start", None)
     try:
         pgid = os.getpgid(proc.pid)
@@ -906,6 +908,8 @@ def _kill_process_group_posix(proc) -> None:
         # orphaned grandchild may leak, which is strictly preferable to killing a
         # stranger. Sweep the snapshotted descendants by PID (identity-checked)
         # so we still reach escapees that are verifiably ours.
+        if not snapshot_descendants:
+            return
         descendants = []
         try:
             import psutil
@@ -914,11 +918,13 @@ def _kill_process_group_posix(proc) -> None:
             pass
         _sweep_escaped_descendants(descendants, pgid)
         return
-    try:  # psutil children snapshot; empty on any failure (must never break the kill)
-        import psutil
-        descendants = psutil.Process(proc.pid).children(recursive=True)
-    except Exception:
-        descendants = []
+    descendants = []
+    if snapshot_descendants:
+        try:  # empty on any failure (must never break the kill)
+            import psutil
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except Exception:
+            descendants = []
     if pgid == os.getpgrp():
         # The child shares OUR group (a spawner that skipped setsid — the Darwin gateway's
         # posix_spawn shim, #107029): killpg would signal the caller itself. Tear down by PID.
@@ -1086,9 +1092,21 @@ class LocalEnvironment(BaseEnvironment):
         return proc
 
     def _kill_process(self, proc):
-        """Kill the entire process group (all children)."""
+        """Kill the owned group; ordinary cancellation also sweeps setsid escapees."""
+        from tools.environments.base import foreground_cleanup_in_progress
+        from tools.interrupt import get_interrupt_reason
+
+        shutdown = not _IS_WINDOWS and (foreground_cleanup_in_progress()
+                                         or get_interrupt_reason() == "gateway shutdown")
         try:
-            (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
+            if shutdown:
+                # macOS children(recursive=True) scans every host PID's ppid. Repeating
+                # it on concurrent interrupted tool workers can consume the watchdog
+                # before ANY signal is sent. Keep bounded group teardown and all PGID
+                # guards, but omit the best-effort escapee snapshot during shutdown.
+                _kill_process_group_posix(proc, snapshot_descendants=False)
+            else:
+                (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()

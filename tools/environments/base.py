@@ -93,6 +93,15 @@ def _quiet_kill(kill: Callable, proc) -> None:
         logger.debug("exit-time kill of a foreground command failed", exc_info=True)
 
 
+def foreground_cleanup_in_progress() -> bool:
+    """Non-blocking teardown hint for local kill paths, including late spawn callbacks.
+
+    The admission fence is already owned by cleanup; do not acquire a lock the exiting
+    thread might hold just to decide whether to avoid a host-wide descendant scan.
+    """
+    return _exit_fenced or _cleanup_fences > 0
+
+
 def kill_live_foreground_processes(*, now: bool = False) -> int:
     """Kill every in-flight foreground command's process tree; returns how many were signalled.
 
