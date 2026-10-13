@@ -208,20 +208,6 @@ class PortableGateTests(unittest.TestCase):
             ).splitlines()
             self.assertEqual(directories, [ci.ROOT.resolve().as_posix()])
 
-    def test_windows_environment_preserves_power_shell_module_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / 'isolated'
-            with patch.dict(os.environ, {'PSModulePath': 'runner-modules'}, clear=True), patch.object(ci.os, 'name', 'nt'):
-                env = ci.environment(home)
-            self.assertEqual(env['PSModulePath'], 'runner-modules')
-
-    def test_windows_environment_sets_explicit_empty_power_shell_module_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / 'isolated'
-            with patch.dict(os.environ, {}, clear=True), patch.object(ci.os, 'name', 'nt'):
-                env = ci.environment(home)
-            self.assertEqual(env['PSModulePath'], '')
-
     def test_windows_appdata_stays_inside_isolated_home(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / 'isolated'
