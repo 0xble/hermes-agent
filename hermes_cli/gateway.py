@@ -32,6 +32,13 @@ if os.name == "posix":
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
+
+def _run_gateway_until_teardown(coro):
+    """Run graceful teardown without ``asyncio.run`` joining the default executor."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config  # noqa: F401 — resolved lazily by siblings through the facade
 from gateway.status import terminate_pid
 from gateway.restart import (  # noqa: F401 — resolved lazily by siblings through the facade
@@ -4892,8 +4899,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
 
     success = False
     try:
-        success = asyncio.run(_run_with_release_ack())
-        _exit_diag("asyncio.run.returned", success=success)
+        success = _run_gateway_until_teardown(_run_with_release_ack())
+        _exit_diag("gateway.loop.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
         _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())

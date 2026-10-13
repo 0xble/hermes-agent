@@ -3378,6 +3378,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return None, key_err
+        if gateway_session_key:
+            runner = getattr(self, "gateway_runner", None)
+            rehydrate = getattr(runner, "_rehydrate_session_model_override_async", None)
+            if callable(rehydrate):
+                await rehydrate(gateway_session_key)
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:

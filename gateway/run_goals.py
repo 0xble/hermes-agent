@@ -209,7 +209,7 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db("heartbeat poll")
         store = getattr(self, "session_store", None)
         if store is not None:
-            current = store.peek_session_id(quick_key)
+            current = await asyncio.to_thread(store.peek_session_id, quick_key)
             if not current:
                 watch.pop(quick_key, None)
                 return

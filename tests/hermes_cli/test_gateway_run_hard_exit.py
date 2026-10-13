@@ -8,6 +8,7 @@ in-flight cron ThreadPoolExecutor jobs) and delay service-managed restarts.
 
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
@@ -43,14 +44,35 @@ def _prepare(monkeypatch):
     return gateway_cli
 
 
-def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
-    gateway_cli = _prepare(monkeypatch)
+def test_gateway_loop_returns_without_joining_default_executor():
+    import threading
+    import time
+    import hermes_cli.gateway as gateway_cli
 
-    def _fake_run(coro):
-        coro.close()
+    release = threading.Event()
+    started = threading.Event()
+
+    def stuck():
+        started.set()
+        release.wait(5)
+
+    async def teardown():
+        asyncio.get_running_loop().run_in_executor(None, stuck)
+        while not started.is_set():
+            await asyncio.sleep(0)
         return True
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    began = time.monotonic()
+    assert gateway_cli._run_gateway_until_teardown(teardown()) is True
+    assert time.monotonic() - began < 1.0
+    release.set()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(loop.shutdown_default_executor())
+    loop.close()
+
+
+def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
+    gateway_cli = _prepare(monkeypatch)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()

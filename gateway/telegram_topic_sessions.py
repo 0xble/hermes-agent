@@ -237,7 +237,9 @@ async def _topic_exists(runner, dest: SessionSource, thread_id: str) -> bool:
             profile_name=runner._telegram_topic_profile_name(dest))
         if binding:
             return True
-    return runner.session_store.peek_session_id(runner._session_key_for_source(dest)) is not None
+    return await asyncio.to_thread(
+        runner.session_store.peek_session_id, runner._session_key_for_source(dest)
+    ) is not None
 
 
 async def create_topic_session(runner, source: SessionSource, spec: TopicSpec) -> dict:

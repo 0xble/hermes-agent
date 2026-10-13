@@ -1,6 +1,7 @@
 """Recover heartbeat watches from the gateway's canonical persisted routing index."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -73,7 +74,7 @@ async def restore_heartbeat_watches(runner) -> None:
         candidates = await runner._run_in_executor_with_context(scan)
         for key, source, session_id in candidates:
             # A reset/compression may have published a new owner during the executor hop.
-            if store.peek_session_id(key) == session_id:
+            if await asyncio.to_thread(store.peek_session_id, key) == session_id:
                 runner._register_heartbeat_watch(key, source, session_id)
     except Exception:
         logger.debug("heartbeat restore scan failed; retrying on next poll", exc_info=True)

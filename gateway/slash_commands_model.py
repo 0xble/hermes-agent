@@ -472,6 +472,7 @@ class GatewayModelCommandsMixin:
         profile_home = None
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             profile_home = self._resolve_profile_home_for_source(source)
+        await self._rehydrate_session_model_override_async(session_key)
         ctx = self._model_switch_context(source, session_key, profile_home=profile_home, persist_global=False)
         result, error = await self._perform_model_switch(ctx, model, provider, source)
         if error is not None:
@@ -641,6 +642,7 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        await self._rehydrate_session_model_override_async(session_key)
         ctx = self._model_switch_context(
             source, session_key, profile_home=profile_home,
             persist_global=resolve_persist_behavior(
@@ -958,6 +960,10 @@ class GatewayModelCommandsMixin:
         from hermes_cli.models import fast_mode_route_ignored
 
         try:
+            # This helper is also called by the async /fast handler. Do not lazily hydrate here:
+            # a synchronous fallback must never take the session-store lock on the event loop.
+            if self._session_model_override(session_key) is None:
+                return ""
             model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
         except Exception:
             return ""

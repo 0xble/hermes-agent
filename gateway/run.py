@@ -6186,18 +6186,14 @@ def main():
 
     # start_gateway() completes teardown before returning/raising SystemExit; force-exit after so a
     # wedged non-daemon worker can't block Py_FinalizeEx's join. SystemExit caught so EVERY path exits.
+    def _run_until_teardown(coro):
+        """Avoid asyncio.run's default-executor join before the hard exit."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+
     try:
-        # start_gateway() performs the full graceful teardown (adapters disconnected, sessions saved +
-        # flushed, SQLite closed, cron/MCP stopped, PID file + runtime lock released) before it returns OR
-        # raises SystemExit with an explicit code. Force-exit afterwards so a wedged non-daemon worker
-        # thread (e.g. a ThreadPoolExecutor tool/LLM call blocked with no timeout) cannot block interpreter
-        # finalization (Py_FinalizeEx joins all non-daemon threads, incl. concurrent.futures' _python_exit)
-        # and strand the gateway half-shut down with the supervisor unable to restart it (#53107).
-        # SystemExit is caught explicitly: start_gateway raises it on the clean-fatal-config (#51228),
-        # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
-        # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
-        # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        success = _run_until_teardown(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

@@ -4,6 +4,7 @@ Execution means entering the gateway's agent runner after turn preparation,
 not reserving an adapter slot, successful model completion, or outbound delivery.
 The done callback retains the watch's profile ContextVars and manager claim.
 """
+import asyncio
 import logging
 
 logger = logging.getLogger("gateway.run")
@@ -25,7 +26,7 @@ async def resolve_heartbeat_owner(runner, event, entry):
     # Keep a value, not the mutable routing entry: preparation and hooks can yield
     # to /new or /stop before the agent runner starts.
     event._heartbeat_resolved_session_id = resolved
-    return heartbeat_owner_is_current(runner, event, entry.session_key)
+    return await asyncio.to_thread(heartbeat_owner_is_current, runner, event, entry.session_key)
 
 
 def heartbeat_owner_is_current(runner, event, session_key):
