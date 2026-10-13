@@ -446,6 +446,12 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
+    async def _journal_preview(self, text: str, message_id=None) -> None:
+        if self._on_preview is not None and not self._turn_split_delivery:
+            if self.cfg.cursor:
+                text = text.removesuffix(self.cfg.cursor).rstrip()
+            await self._on_preview(text, message_id)
+
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
@@ -457,12 +463,15 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
+        await self._journal_preview(text)
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:
+            await self._journal_preview("")
             self._edit_supported = False
             return False
+        await self._journal_preview(text, result.message_id)
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:
@@ -494,9 +503,11 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
+        await self._journal_preview(text, self._message_id)
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
         if not result.success:
+            await self._journal_preview(self._last_sent_text, self._message_id)
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
         raw_response = getattr(result, "raw_response", None)
@@ -504,6 +515,7 @@ class StreamTransportMixin:
             # Adapter deferred the edit (Telegram's shared send+edit slot was busy): nothing
             # changed on screen, so the visible prefix and flood state stay as they were and the
             # next tick retries with the newer text.
+            await self._journal_preview(self._last_sent_text, self._message_id)
             return True
         self._already_sent = True
         self._track_preview_ids_from_result(result)

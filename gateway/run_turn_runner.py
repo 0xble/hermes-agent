@@ -1019,6 +1019,7 @@ class TurnRunner:
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
     def _setup_stream_consumer(self, platform_key):
+        from gateway.stream_recovery import preview_recorder, restore_preview
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
@@ -1059,7 +1060,9 @@ class TurnRunner:
                         ),
                         on_before_finalize=pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
+                        on_preview=preview_recorder(self._runner, ctx),
                     )
+                    restore_preview(self._runner, ctx, stream_consumer)
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk

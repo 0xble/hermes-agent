@@ -420,6 +420,8 @@ CRASH_POINTS = {
     # streaming: the platform accepted a preview edit that already shows the complete answer, while
     # the provider stream (so the turn) is still open -> nothing persisted when the process dies
     "stream_accepted_unpersisted": ("any", "hold_after"),
+    # Same crash after a real preview EDIT: the initial send ACK supplied its ID.
+    "stream_accepted_edit_unpersisted": ("edit", "hold_after"),
 }
 
 # completed_not_ledgered: the turn is persisted and the handler returned, but the final text never
@@ -448,7 +450,8 @@ def _replies(gw: GatewayProcess, platform: str, chat: str, token: str, aid: str)
 CRASH_MATRIX = [("completed_not_ledgered", "fk_ne"),  # streaming finals are sent before the handler returns
                 ("send_in_flight", "fk_ne"), ("send_in_flight", "fk_tg"),
                 ("sent_ack_lost", "fk_ne"), ("sent_ack_lost", "fk_tg"),
-                ("stream_accepted_unpersisted", "fk_tg")]
+                ("stream_accepted_unpersisted", "fk_tg"),
+                ("stream_accepted_edit_unpersisted", "fk_tg")]
 
 
 @pytest.fixture
@@ -477,8 +480,12 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
     chat = f"k-{platform}-{point}"
     aid = f"A-{token}"
     answer = Director.answer(aid, "answer computed before the crash.")
-    if point == "stream_accepted_unpersisted":  # the whole answer streams, then the stream stays open
-        answer = StallMidStream(text=answer.text, after_chars=len(answer.text), seconds=60)
+    if point in {"stream_accepted_unpersisted", "stream_accepted_edit_unpersisted"}:
+        # The legacy case emits all text at once and holds the FIRST SEND, not an
+        # edit. The edit case first gets an acknowledged partial preview ID.
+        answer = StallMidStream(text=answer.text, after_chars=len(answer.text), seconds=60,
+                                prefix_chars=32 if point == "stream_accepted_edit_unpersisted" else 0,
+                                prefix_delay=0.5 if point == "stream_accepted_edit_unpersisted" else 0)
     director.script(token, answer)
     gw.fault(platform=platform, op=op, kind=kind, contains=footer(aid), chat_id=chat)
     gw.inject(platform, f"[in:{token}] question", message_id=f"in-{token}", chat_id=chat)
