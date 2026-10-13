@@ -4614,11 +4614,16 @@ class GatewayTurnMixin:
         )
         merged = _preserve_queued_followup_history_offset(response, followup)
         # A real queued successor owns its own verdict. Otherwise the synthetic continuation must
-        # not launder a second marker into permitted machinery silence or invent a ledger anchor.
+        # not launder a second marker into permitted machinery silence. Its execution may have
+        # been redirected onto a newer human message, so preserve that live terminal identity
+        # separately from the original turn's silence contract.
         if isinstance(merged, dict) and "queued_terminal_display_kind" not in merged:
             merged = {**merged, "queued_terminal_display_kind": turn_ctx.persist_user_display_kind,
                       "queued_terminal_reply_expected": turn_ctx.reply_expected,
-                      "queued_terminal_inbound_id": turn_ctx.inbound_message_id}
+                      "queued_terminal_inbound_id": (
+                          followup.get("_terminal_inbound_id") or turn_ctx.inbound_message_id
+                          if isinstance(followup, dict) else turn_ctx.inbound_message_id
+                      )}
         return merged
 
     async def _run_agent_inner(
@@ -4745,4 +4750,8 @@ class GatewayTurnMixin:
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+        if isinstance(response, dict):
+            # Recovery may be redirected after it starts. The outer silence contract is separate
+            # from the inbound message that owns this execution's terminal delivery.
+            response["_terminal_inbound_id"] = turn_ctx.inbound_message_id
         return response

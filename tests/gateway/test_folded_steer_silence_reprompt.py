@@ -240,6 +240,32 @@ async def test_folded_human_gets_one_gateway_retry(harness, marker):
 
 
 @pytest.mark.asyncio
+async def test_retry_preserves_redirected_terminal_ledger_identity(harness):
+    h = harness
+    redirect_event = MessageEvent(
+        text="the newer typed question", source=h.event.source, message_id="typed-2",
+    )
+    h.agent.redirect = MagicMock(return_value=True)
+    redirected = False
+
+    def redirect_during_retry(_response):
+        nonlocal redirected
+        if len(h.calls) == 2 and not redirected:
+            redirected = True
+            assert h.runner._redirect_active_turn(
+                h.agent, redirect_event.text, SESSION_KEY, redirect_event,
+            )
+
+    h.model_hook = redirect_during_retry
+    result = await _run(h, ["NO_REPLY", ANSWER])
+
+    assert redirected
+    assert result["final_response"] == ANSWER
+    assert result["queued_terminal_inbound_id"] == "typed-2"
+    assert result["_terminal_inbound_id"] == "typed-2"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
 async def test_proxy_silence_keeps_fallback_without_retry(harness, monkeypatch, marker):
     """Real proxy route needs a new non-empty conversation row; a system note is not one."""
