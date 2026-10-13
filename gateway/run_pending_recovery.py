@@ -124,6 +124,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
+    if data.get("shutdown_follow_up") is True:
+        setattr(event, "_hermes_recovery_session_key", key)
     if recovered_events is not None:
         recovered_events.append(event)
     else:

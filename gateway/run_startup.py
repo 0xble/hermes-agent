@@ -104,6 +104,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             queue.insert(0, event)
         else:
             queue.append(event)
+        key = getattr(event, "_hermes_recovery_session_key", None)
+        if key is not None:
+            claimed = getattr(self, "_restart_followup_keys", None)
+            if claimed is None:
+                claimed = self._restart_followup_keys = set()
+            claimed.add(key)
         with suppress(Exception):
             source = event.source
             logger.info(
@@ -111,73 +117,6 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 source.platform.value if source and source.platform else "unknown",
                 source.chat_id if source else "unknown",
             )
-
-    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
-        """Replay ready inbound, leaving sessions owned by another restore in order."""
-        drained = 0
-        queue = getattr(self, "_startup_restore_queue", None) or []
-        # Topic recovery behind the session key reads state.db: resolve keys off the loop, once per
-        # event (by identity; the queue keeps each event alive while it is listed).
-        resolved: dict[int, tuple] = {}
-
-        def session_keys(events):
-            return [self._session_key_for_source(self._normalize_source_for_session_key(event.source))
-                    for event in events]
-
-        async def resolve_keys():
-            # Repeat until no await is left between resolution and the scan: inbound queued while a
-            # batch resolved is resolved too, so ``ready`` below always has every key.
-            while pending := [event for event in queue if resolved.get(id(event), (None,))[0] is not event]:
-                for event, key in zip(pending, await asyncio.to_thread(session_keys, pending)):
-                    resolved[id(event)] = (event, key)
-
-        def ready(event):
-            key = resolved[id(event)][1]
-            if keys is not None and key not in keys:
-                return False
-            # Our own gate permits one claimant; every other owner's gate must be fully open.
-            limit = 1 if owned_keys and key in owned_keys else 0
-            return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
-
-        while True:
-            await resolve_keys()
-            index = next((i for i, event in enumerate(queue) if ready(event)), None)
-            if index is None:
-                break
-            event = queue.pop(index)
-            try:
-                source = getattr(event, "source", None)
-                adapter = self._intake_adapter_for(source)
-                if adapter is None and getattr(event, "_hermes_recovered_followup", False):
-                    adapter = self._delivery_adapter_for(source)
-                if adapter is None:
-                    logger.debug(
-                        "Dropping startup-restore queued message: adapter unavailable for %s",
-                        getattr(getattr(source, "platform", None), "value", None),
-                    )
-                    continue
-                # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
-                with suppress(Exception):
-                    setattr(event, "_hermes_startup_restore_replay", True)
-                # A normal return can be an admission refusal. Retire the only
-                # durable copy only after this replay acquires an explicit receipt.
-                event._gateway_accepted = False
-                await adapter.handle_message(event)
-                if getattr(event, "_gateway_accepted", False) is not True:
-                    continue
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None:
-                    spool.unlink(missing_ok=True)
-            except Exception:
-                # One bad replay must not abort the drain: the remaining queued
-                # events still deserve their turn, and a raise here used to skip
-                # the gate release in _finish_startup_restore entirely.
-                logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
-                continue
-            drained += 1
-        if queue and keys is None:
-            logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
-        return drained
 
     @staticmethod
     def _start_free_tier_bootstrap() -> None:

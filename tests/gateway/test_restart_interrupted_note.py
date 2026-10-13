@@ -757,6 +757,7 @@ async def test_resume_scheduler_admits_each_interruption_marker_once(tmp_path):
 
         async def handle_message(self, event):
             await _admit_outbox_event(runner, event, event.source)
+            event._gateway_accepted = True
 
     adapter = _Adapter()
     scheduled = runner._schedule_resume_pending_sessions()

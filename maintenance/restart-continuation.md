@@ -95,6 +95,21 @@ explicitly `skipped:restart-loop-breaker:ambiguous-note`, not a fabricated
 `noted`/`resumed` result. Network unavailability and authorization revocation also
 remain real constraints; this unit does not promise unconditional visibility.
 
+`reason=shutdown_follow_up` is a future turn even if the predecessor's resume
+marker has been cleared. At read time, including for old spools, it uses the
+existing drain-deferred admission path instead of becoming a user row with no
+turn. A restored prompt owns recovery ahead of a synthetic empty resume. Its
+spool survives admission until an actual turn result is observed; failed real
+turns are not automatically replayed because they may have tool effects.
+
+Restored follow-ups use the same per-session outcome record. Refusal/no-task
+outcomes retain the spool, attempt a bounded platform notice, and log
+`skipped:<reason>:noted` or `skipped:<reason>:note-unavailable`; adapter admission
+without a real turn is explicitly `skipped:accepted-without-turn:<note-status>`.
+Run `tests/gateway/test_shutdown_followup_restart.py` as well as the recovery
+corpus. The queue drain now lives beside those decisions in
+`gateway/run_restart_recovery.py`.
+
 Run `tests/gateway/test_restart_recovery_outcomes.py` in addition to the corpus
 below. Planned update classification is separately owned by `fix/breaker-update-planned`
 (PR #557); this unit does not duplicate it. Per-session admission identity was

@@ -517,6 +517,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             raise
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    # Shutdown follow-ups are independent future turns even when the answered predecessor's
+    # resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
+    # False from the deferral callback otherwise appends them to history and deletes the spool.
+    if payload.get("reason") == "shutdown_follow_up":
+        data = {**data, "drain_deferred": True, "shutdown_follow_up": True}
     text = data.get("text", "")
     if data.get("drain_deferred") is True:
         if time.time() - path.stat().st_mtime > 24 * 60 * 60:

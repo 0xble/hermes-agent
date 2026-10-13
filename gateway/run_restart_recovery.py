@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from contextlib import suppress
 
 from gateway.platforms.event import MessageEvent, MessageType
 
@@ -59,7 +60,8 @@ class RestartRecoveryMixin:
                 await asyncio.shield(task)
             # An adapter may decline admission without raising (no handler, wrong identity,
             # plugin veto). Inline adapters can demonstrate completion by clearing the marker.
-            entry = self.session_store._entries.get(session_key)
+            store = getattr(self, "session_store", None)
+            entry = getattr(store, "_entries", {}).get(session_key)
             completed_inline = entry is not None and not entry.resume_pending
             if event._gateway_accepted is True or completed_inline:
                 outcome = "resumed"
@@ -84,6 +86,137 @@ class RestartRecoveryMixin:
                 self._record_restart_resume_outcome(session_key, decided)
             else:
                 await self._finish_restart_recovery(session_key, outcome.removeprefix("skipped:"))
+
+    async def _finish_recovered_followup(self, event, session_key: str, reason: str) -> None:
+        """A future turn can outlive its predecessor's marker; its refusal still needs a note."""
+        from gateway.run import _startup_restore_drain_timeout_secs
+
+        noted = self._interruption_note_delivered(session_key)
+        if not noted:
+            try:
+                send = self._deliver_platform_notice(
+                    event.source,
+                    "A follow-up saved during the restart could not start or finish its turn. "
+                    "It is still preserved; please send a message to resume it.",
+                )
+                timeout = _startup_restore_drain_timeout_secs()
+                noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
+            except Exception:
+                logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
+        suffix = ":noted" if noted else ":note-unavailable"
+        self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
+
+    async def _observe_recovered_followup(self, adapter, event, session_key: str, *, task=None) -> None:
+        """Observe the actual turn, following a busy adapter's successor rather than its receipt."""
+        reason = "not-admitted" if event._gateway_accepted is not True else "accepted-without-turn"
+        try:
+            seen = set()
+            while isinstance(task, asyncio.Task) and task not in seen:
+                seen.add(task)
+                await asyncio.shield(task)
+                if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
+                    break
+                task = getattr(adapter, "_session_tasks", {}).get(session_key)
+            succeeded = getattr(event, "_agent_turn_succeeded", None)
+            if isinstance(succeeded, bool):
+                # A failed real turn may have tool effects; never replay it just because it did
+                # not produce a successful final. Its request remains in the durable transcript.
+                spool = getattr(event, "_hermes_recovery_spool", None)
+                if spool is not None:
+                    spool.unlink(missing_ok=True)
+                if succeeded:
+                    self._record_restart_resume_outcome(session_key, "resumed")
+                    return
+                reason = "turn-failed"
+        except asyncio.CancelledError:
+            self._record_restart_resume_outcome(session_key, "skipped:cancelled")
+            raise
+        except Exception:
+            reason = "turn-failed"
+            logger.warning("Restored follow-up failed for %s", session_key, exc_info=True)
+        await self._finish_recovered_followup(event, session_key, reason)
+
+    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
+        """Replay ready inbound, leaving sessions owned by another restore in order."""
+        drained = 0
+        queue = getattr(self, "_startup_restore_queue", None) or []
+        # Topic recovery behind the session key reads state.db: resolve keys off the loop, once per
+        # event (by identity; the queue keeps each event alive while it is listed).
+        resolved: dict[int, tuple] = {}
+
+        def session_keys(events):
+            return [self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in events]
+
+        async def resolve_keys():
+            # Repeat until no await is left between resolution and the scan: inbound queued while a
+            # batch resolved is resolved too, so ``ready`` below always has every key.
+            while pending := [event for event in queue if resolved.get(id(event), (None,))[0] is not event]:
+                for event, key in zip(pending, await asyncio.to_thread(session_keys, pending)):
+                    resolved[id(event)] = (event, key)
+
+        def ready(event):
+            key = resolved[id(event)][1]
+            if keys is not None and key not in keys:
+                return False
+            # Our own gate permits one claimant; every other owner's gate must be fully open.
+            limit = 1 if owned_keys and key in owned_keys else 0
+            return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
+
+        while True:
+            await resolve_keys()
+            index = next((i for i, event in enumerate(queue) if ready(event)), None)
+            if index is None:
+                break
+            event = queue.pop(index)
+            recovery_key = resolved[id(event)][1]
+            if await self._dispatch_startup_restore_event(event, recovery_key):
+                drained += 1
+        if queue and keys is None:
+            logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
+        return drained
+
+    async def _dispatch_startup_restore_event(self, event, recovery_key: str) -> bool:
+        """Separate adapter admission from a recovered follow-up's actual turn completion."""
+        recovered = getattr(event, "_hermes_recovery_session_key", None) is not None
+        try:
+            source = getattr(event, "source", None)
+            adapter = self._intake_adapter_for(source)
+            if adapter is None and getattr(event, "_hermes_recovered_followup", False):
+                adapter = self._delivery_adapter_for(source)
+            if adapter is None:
+                logger.debug(
+                    "Dropping startup-restore queued message: adapter unavailable for %s",
+                    getattr(getattr(source, "platform", None), "value", None),
+                )
+                if recovered:
+                    await self._finish_recovered_followup(event, recovery_key, "adapter-offline")
+                return False
+            # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
+            with suppress(Exception):
+                setattr(event, "_hermes_startup_restore_replay", True)
+            # A normal return can be an admission refusal. Retire the only
+            # durable copy only after this replay acquires an explicit receipt.
+            event._gateway_accepted = False
+            await adapter.handle_message(event)
+            if recovered:
+                owner = getattr(adapter, "_session_tasks", {}).get(recovery_key)
+                self._retain_background_task(asyncio.create_task(
+                    self._observe_recovered_followup(adapter, event, recovery_key, task=owner)))
+            if getattr(event, "_gateway_accepted", False) is not True:
+                return False
+            spool = getattr(event, "_hermes_recovery_spool", None)
+            if spool is not None and not recovered:
+                spool.unlink(missing_ok=True)
+        except Exception:
+            # One bad replay must not abort the drain: the remaining queued
+            # events still deserve their turn, and a raise here used to skip
+            # the gate release in _finish_startup_restore entirely.
+            logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
+            if recovered:
+                await self._finish_recovered_followup(event, recovery_key, "dispatch-failed")
+            return False
+        return True
 
     def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
         """True for an authorized owner, False for denial, None when checking failed."""
@@ -147,6 +280,10 @@ class RestartRecoveryMixin:
         allow_resume = (allow_resume and not getattr(candidates, "breaker_tripped", False)
                         and not getattr(self, "_restart_resume_breaker_tripped", False))
         for entry in candidates:
+            if entry.session_key in getattr(self, "_restart_followup_keys", ()):
+                # The restored prompt owns this recovery. Do not admit an empty synthetic turn
+                # against it or log the predecessor's decision before its real follow-up finishes.
+                continue
             if platform is not None and getattr(entry.origin, "platform", None) != platform:
                 continue
             if not allow_resume:
