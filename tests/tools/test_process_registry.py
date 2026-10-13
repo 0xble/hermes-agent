@@ -13,7 +13,7 @@ import threading
 import time
 import psutil
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
@@ -122,8 +122,10 @@ def test_bounded_kill_all_uses_small_cut_receipts_and_prunes_once(registry, monk
         deadline=time.monotonic() + 1.0, source="gateway_shutdown", consume_output=True,
     ) == 1
 
-    save_cut.assert_called_once_with(session, "gateway_shutdown", include_output=False, prune=False)
-    prune.assert_called_once_with()
+    save_cut.assert_called_once_with(
+        session, "gateway_shutdown", include_output=False, prune=False, lock_timeout=ANY,
+    )
+    prune.assert_called_once_with(deadline=ANY)
 
 
 def test_bounded_sweep_final_receipt_keeps_cut_retention(registry, tmp_path, monkeypatch):
@@ -257,6 +259,45 @@ def test_bounded_sweep_writes_cut_receipt_before_signals(registry, tmp_path, mon
 
         assert seen_at_signal and seen_at_signal[0] is True
     finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_bounded_kill_all_receipt_lock_contention_does_not_block_signals(registry, tmp_path, monkeypatch):
+    """An unrelated result writer holding the lock must not spend the shutdown budget."""
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    proc = _spawn_python_sleep(30)
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold_result_lock():
+        with receipts._RESULT_WRITE_LOCK:
+            held.set()
+            release.wait(2.0)
+
+    holder = threading.Thread(target=_hold_result_lock, daemon=True)
+    holder.start()
+    assert held.wait(2.0)
+    try:
+        session = _make_session(sid="proc_receipt_lock_contention")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+
+        started = time.monotonic()
+        registry.kill_all(deadline=started + 0.4, source="gateway_shutdown")
+        elapsed = time.monotonic() - started
+
+        proc.wait(timeout=2.0)
+        assert proc.returncode is not None
+        assert elapsed < 2.0
+    finally:
+        release.set()
+        holder.join(timeout=5)
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=5)

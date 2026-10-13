@@ -2259,8 +2259,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
             # Set the marker before the snapshot/write so a reader that wins the race
             # still persists the final receipt in the cut-retention budget.
             session._cut_receipt = True
+            # Bounded kills keep half the remaining budget for the signals themselves.
             save_cut_pending_result(
                 session, source, include_output=deadline is None, prune=deadline is None,
+                lock_timeout=(
+                    None if deadline is None
+                    else max(0.0, deadline - time.monotonic()) / 2
+                ),
             )
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
@@ -2886,6 +2891,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         break
                     if save_cut_pending_result(
                         session, source, include_output=False, prune=False,
+                        lock_timeout=(
+                            None if receipt_cutoff is None
+                            else receipt_cutoff - time.monotonic()
+                        ),
                     ):
                         pre_signal_receipts.add(session.id)
             escalated_ids: set[str] = set()
@@ -3090,13 +3099,14 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         break
                     save_cut_pending_result(
                         session, source, include_output=not bounded_sweep, prune=not bounded_sweep,
+                        lock_timeout=None if deadline is None else deadline - time.monotonic(),
                     )
             scope_retried = _retry_finished_scopes()
             _close_detached_nonrunning()
             if bounded_sweep and (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):
-                prune_completed_results()
+                prune_completed_results(deadline=deadline)
             if (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):

@@ -24,6 +24,19 @@ MAX_RETAINED_CUT_RESULTS = 256
 _CUT_COMPLETION_REASONS = frozenset({"cut_pending"})
 _CUT_RECEIPT_FIELD = "cut_receipt"
 _RESULT_WRITE_LOCK = threading.RLock()
+
+
+def _acquire_result_lock(deadline: float | None) -> bool:
+    """Take the result-write lock, giving up at a bounded stop's deadline.
+
+    Receipts are evidence, not the stop itself: an unrelated writer holding the
+    lock must never spend a shutdown budget that the signals and reaping need.
+    """
+    if deadline is None:
+        return _RESULT_WRITE_LOCK.acquire()
+    return _RESULT_WRITE_LOCK.acquire(timeout=max(0.0, deadline - time.monotonic()))
+
+
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
@@ -125,7 +138,10 @@ def save_completed_result(
         from hermes_constants import assert_named_profile_home_live
         assert_named_profile_home_live(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with _RESULT_WRITE_LOCK:
+        if not _acquire_result_lock(getattr(session, "_kill_deadline", None)):
+            logger.info("Skipped final receipt %s: result lock busy past the stop deadline", session.id)
+            return
+        try:
             existing = _read_existing_record(path)
             record[_CUT_RECEIPT_FIELD] = bool(
                 getattr(session, "_cut_receipt", False)
@@ -135,6 +151,8 @@ def save_completed_result(
             atomic_json_write(path, _header_first(record), mode=0o600)
             if prune:
                 _result_paths()
+        finally:
+            _RESULT_WRITE_LOCK.release()
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
@@ -142,8 +160,14 @@ def save_completed_result(
 
 def save_cut_pending_result(
     session, source: str, *, include_output: bool = True, prune: bool = True,
+    lock_timeout: float | None = None,
 ) -> bool:
-    """Persist a pre-cut snapshot without replacing a final receipt."""
+    """Persist a pre-cut snapshot without replacing a final receipt.
+
+    ``lock_timeout`` bounds the wait for the shared result-write lock. A shutdown
+    sweep passes its remaining budget so an unrelated writer holding the lock can
+    never delay the stop signals; a skipped write returns False and stays retryable.
+    """
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
@@ -162,7 +186,12 @@ def save_cut_pending_result(
         record[_CUT_RECEIPT_FIELD] = True
         record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
         record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
-        with _RESULT_WRITE_LOCK:
+        if not _acquire_result_lock(
+            None if lock_timeout is None else time.monotonic() + max(0.0, lock_timeout),
+        ):
+            logger.info("Skipped cut receipt %s: result lock busy past the shutdown budget", session.id)
+            return False
+        try:
             existing = _read_existing_record(path)
             if existing and existing.get("completion_reason") not in _CUT_COMPLETION_REASONS:
                 return bool(
@@ -173,14 +202,20 @@ def save_cut_pending_result(
             if prune:
                 _result_paths()
             return True
+        finally:
+            _RESULT_WRITE_LOCK.release()
     except OSError:
         logger.warning("Could not retain cut process result %s", session.id, exc_info=True)
         return False
 
 
-def prune_completed_results() -> None:
-    with _RESULT_WRITE_LOCK:
+def prune_completed_results(*, deadline: float | None = None) -> None:
+    if not _acquire_result_lock(deadline):
+        return
+    try:
         _result_paths()
+    finally:
+        _RESULT_WRITE_LOCK.release()
 
 
 def _owns_result(owner: str, parent: str | None) -> bool:
