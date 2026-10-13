@@ -96,9 +96,24 @@ def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False,
     output = max((v for v in caps if isinstance(v, int) and not isinstance(v, bool) and v > 0), default=0)
     reserve = max(1024, int(window * 0.05))
     effective_prompt = (prompt or "") + ("" if wire else (getattr(agent, "ephemeral_system_prompt", "") or ""))
-    return estimate_request_tokens_rough(
-        messages, system_prompt=effective_prompt, tools=tools if wire else getattr(agent, "tools", None),
-    ) + output + reserve < window
+    request_tools = tools if wire else getattr(agent, "tools", None)
+    # Native Responses sends a checkpoint-pruned projection, not the durable
+    # transcript. Reuse the route-aware estimator without a stale usage anchor.
+    from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
+    from agent.message_content import flatten_message_text
+    native_prompt = effective_prompt
+    if wire and not native_prompt:
+        native_prompt = "\n".join(
+            flatten_message_text(row.get("content"))
+            for row in messages if row.get("role") == "system"
+        )
+    native = estimate_native_responses_preflight_tokens(
+        agent, messages, system_prompt=native_prompt, tools=request_tools,
+    )
+    tokens = native if native is not None else estimate_request_tokens_rough(
+        messages, system_prompt=effective_prompt, tools=request_tools,
+    )
+    return tokens + output + reserve < window
 
 
 def recovery_projection(agent: Any, messages: list) -> list:
