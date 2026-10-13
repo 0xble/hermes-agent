@@ -655,21 +655,67 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
-def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
-    """Index of the command a wrapper chain actually executes. Unchanged if not a wrapper; may be
-    ``len(segment)`` when a wrapper has no operand — callers must bounds-check."""
+def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
+    """Peel only an explicit absolute path to the installed helper and its exact grammar.
+
+    Bare names never earn this exception: modelling shell PATH mutations is unnecessary for the
+    LPG caller, which uses the installed absolute path. Other scripts keep the strict walk.
+    """
+    token = segment[index]
+    path = Path(token)
+    if not path.is_absolute() or _on_cloud_path(path):
+        return None
+    try:
+        installed = Path.home() / ".local" / "bin" / "heavy-slot"
+        if path.resolve(strict=True) != installed.resolve(strict=True):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    position = index + 1
+    while position < len(segment):
+        option = segment[position]
+        if option == "--":
+            return position + 1 if position + 1 < len(segment) else None
+        name, equals, value = option.partition("=")
+        if name not in {"--label", "--gate-fd"}:
+            return None
+        if not equals:
+            position += 1
+            if position >= len(segment) or segment[position].startswith("-"):
+                return None
+            value = segment[position]
+        if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+            return None
+        position += 1
+    return None
+
+
+def _prefix_positions(
+    segment: list[str], index: int, *, allow_heavy_slot: bool = True,
+) -> tuple[list[int], bool]:
+    """Return every peeled position and whether the chain ended before the peel budget.
+
+    ``complete`` is the sole authority for the heavy-slot exception: only a natural stop at a
+    non-wrapper command may omit the installed helper's own source. A loop that reaches
+    ``_MAX_PREFIX_PEELS`` is incomplete even when its last position happens to be a command.
+    """
+    positions = [index]
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return index
+            return positions, False
+        heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
+        if heavy_target is not None:
+            index = heavy_target
+            positions.append(index)
+            continue
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
-            return index
+            return positions, True
         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         while index < len(segment):
             token = segment[index]
             if token == "--":
-                # POSIX end-of-options: the command starts at the next token.
                 index += 1
                 break
             if token in value_options:
@@ -682,7 +728,14 @@ def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
-    return index
+        positions.append(index)
+    return positions, False
+
+
+def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+    """Index of the wrapper chain's final command; callers must bounds-check."""
+    positions, _ = _prefix_positions(segment, index)
+    return positions[-1]
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -912,22 +965,41 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
+    if executable == "heavy-slot":
+        # A bare name does NOT earn the exception. Resolve it only to keep the fallback strict,
+        # including a different script on PATH; use the existing passive resolver, never execute it.
+        from hermes_platform.resolver import locate_command
+
+        resolution = locate_command(executable)
+        if resolution.command:
+            yield from _resolved_or_nothing(resolution.command[0], cwd)
+        return
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
         yield from _resolved_or_nothing(executable, cwd)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
-    original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
-    a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
+def _iter_referenced_shell_scripts(
+    command: str, *, cwd: Optional[str] = None, allow_heavy_slot: bool = True,
+) -> Iterator[Path]:
+    """Scan every wrapper reference, except the identity-trusted, exact-grammar heavy-slot helper.
+
+    Remote callbacks cannot attest the installed local helper's identity, so keep them strict.
+    """
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
-        peeled = _peel_transparent_prefixes(segment, index)
-        if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+        positions, complete = _prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot)
+        if allow_heavy_slot and not complete:
+            # An exhausted chain gets exactly the pre-heavy-slot walk: the helper is a normal
+            # executable, so its source stays in the strict scan set and earns no peel benefit.
+            positions, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if allow_heavy_slot and complete and _heavy_slot_command_index(segment, position) is not None:
+                continue
+            yield from _references_at(segment, position, cwd)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -937,9 +1009,12 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
-        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
-            yield from _iter_option_values(segment, index, option)
+        positions, _ = _prefix_positions(segment, index)
+        for position in positions:
+            if position >= len(segment):
+                continue
+            for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
+                yield from _iter_option_values(segment, position, option)
         index = _executed_command_index(segment)
         if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
@@ -1124,9 +1199,14 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    allow_heavy_slot = read_remote_script is None
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
+        walk_command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+    )]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(
+            command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
+        )]
 
     for script_path, candidate_executed in candidates:
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
