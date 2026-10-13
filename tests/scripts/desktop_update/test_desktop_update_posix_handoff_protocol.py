@@ -40,6 +40,43 @@ pytestmark = pytest.mark.platforms("linux")  # /proc ancestry and creation times
 MARKER_SH = POSIX.with_name("marker.sh")
 
 
+def _proc_is_live(stat_path: Path) -> bool:
+    # /proc can disappear between checking existence and reading the state.
+    try:
+        state = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[1][:1]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
+
+
+def test_proc_is_live_preserves_states_and_handles_disappearance(tmp_path, monkeypatch):
+    stat = tmp_path / "stat"
+    for state, live in [("S", True), ("R", True), ("Z", False)]:
+        stat.write_text(f"123 (delegate with ) spaces) {state} 1 2 3\n", encoding="utf-8")
+        assert _proc_is_live(stat) is live
+    stat.write_text("123 (delegate) S 1 2 3\n", encoding="utf-8")
+    read_text = Path.read_text
+
+    def disappearing_read(path, **kwargs):
+        path.unlink()
+        return read_text(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", disappearing_read)
+        assert _proc_is_live(stat) is False
+    assert _proc_is_live(stat) is False
+
+
+@pytest.mark.parametrize("error", [PermissionError, OSError])
+def test_proc_is_live_does_not_hide_unrelated_read_errors(tmp_path, monkeypatch, error):
+    def failing_read(path, **kwargs):
+        raise error("stat read control")
+
+    monkeypatch.setattr(Path, "read_text", failing_read)
+    with pytest.raises(error, match="stat read control"):
+        _proc_is_live(tmp_path / "stat")
+
+
 def _env(tmp_path: Path, home: Path, **extra: str) -> dict:
     env = {**os.environ, "HOME": str(tmp_path), "TMPDIR": str(tmp_path), "HERMES_HOME": str(home),
            "HANDOFF_CAPTURE": str(tmp_path / "calls.txt"), "HERMES_RUNTIME_DIR": str(tmp_path / "store"),
@@ -495,8 +532,7 @@ def test_script_killed_before_the_delegate_line_appears_runs_no_update(tmp_path)
         script.kill(); script.wait()
         time.sleep(1.0)
         assert _calls(tmp_path) == [] or not any(c.startswith("update") for c in _calls(tmp_path))
-        assert all(not Path(f"/proc/{pid}").exists() or "Z" in Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split(") ")[1][:1]
-                   for pid in gate)
+        assert all(not _proc_is_live(Path(f"/proc/{pid}/stat")) for pid in gate)
         assert "delegate:" not in marker.read_text(encoding="utf-8-sig")
     finally:
         if lock_fd is not None:
@@ -532,7 +568,7 @@ def test_timed_out_probe_is_killed_with_its_whole_process_tree(tmp_path, perl):
     assert "rc=124" in out.stdout, out
     grandchild = int(pidfile.read_text(encoding="utf-8-sig"))
     time.sleep(0.2)
-    assert not Path(f"/proc/{grandchild}").exists() or Path(f"/proc/{grandchild}/stat").read_text(encoding="utf-8").split(") ")[1].startswith("Z")
+    assert not _proc_is_live(Path(f"/proc/{grandchild}/stat"))
 
 
 @pytest.mark.parametrize("locale", ["C", "C.UTF-8"])
@@ -607,7 +643,7 @@ def test_old_desktop_stays_parked_after_the_orchestrator_is_killed_while_the_upd
             if phase == "delegate":
                 hold.touch()
                 deadline = time.monotonic() + 30
-                while Path(f"/proc/{delegate}").exists() and "Z" not in Path(f"/proc/{delegate}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1][:1]:
+                while _proc_is_live(Path(f"/proc/{delegate}/stat")):
                     assert time.monotonic() < deadline
                     time.sleep(0.05)
         probe = subprocess.run([bash, "-c", f"log() {{ :; }}; MARKER=/dev/null INSTALL_ROOT={shlex.quote(str(install))}; "
