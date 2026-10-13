@@ -2337,7 +2337,7 @@ class GatewayShutdownMixin:
 
     @staticmethod
     def _stop_kill_tool_subprocesses(
-        phase: str, *, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
+        phase: str, *, restart: bool = False, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
     ) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
@@ -2393,9 +2393,10 @@ class GatewayShutdownMixin:
 
         def _interrupt_delegations() -> None:
             from tools.async_delegation import interrupt_all as _interrupt_async
+            from tools.delegation_resume import GATEWAY_RESTART_CUT_REASON
             _count_step(
                 "Shutdown (%s): interrupted %d background delegation(s)",
-                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
+                lambda: _interrupt_async(reason=GATEWAY_RESTART_CUT_REASON if restart else f"gateway shutdown ({phase})"),
             )
 
         def _kill_foreground_processes() -> None:
@@ -2430,17 +2431,16 @@ class GatewayShutdownMixin:
 
     @staticmethod
     async def _stop_kill_tool_subprocesses_off_loop(
-        phase: str, *, timeout: Optional[float] = None,
+        phase: str, *, timeout: Optional[float] = None, restart: bool = False,
     ) -> list:
         """Run the shutdown kill sweep off-loop with a cooperative deadline.
 
-        The worker receives the same deadline used by the awaiter. If one target blocks past it,
-        cancellation only detaches the thread after its registry hooks have stopped issuing kills and
-        checkpoint writes; it is therefore safe for the successor gateway to proceed.
+        The shared deadline prevents detached cleanup from issuing later kills or checkpoint writes.
+        Explicit restart intent (including planned signal restarts) travels with the worker.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
         stop_event = threading.Event() if timeout is not None else None
-        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline}
+        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline, "restart": restart}
         if stop_event is not None:
             kill_kwargs["stop_event"] = stop_event
         task = asyncio.create_task(asyncio.to_thread(
@@ -2674,7 +2674,7 @@ class GatewayShutdownMixin:
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
         else:
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
-                "post-interrupt", timeout=_sweep_timeout,
+                "post-interrupt", timeout=_sweep_timeout, restart=self._restart_requested,
             )
         if _swept_cron_jobs:
             _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + _swept_cron_jobs))
@@ -2990,7 +2990,7 @@ class GatewayShutdownMixin:
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
-            "final-cleanup",
+            "final-cleanup", restart=self._restart_requested,
             timeout=min(2.0, self._restart_shutdown_bound()) if self._restart_requested else None,
         )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())

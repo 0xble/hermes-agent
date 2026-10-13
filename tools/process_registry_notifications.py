@@ -247,7 +247,7 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
     stamp = time.strftime("%H:%M", time.localtime(when))
     detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
     if not restart_cut:
-        return [f"Stopped ({reason}). {detail}"]
+        return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
     return [
         f"Cut by gateway restart at {stamp}. {detail}",
         f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",

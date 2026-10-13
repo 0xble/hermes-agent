@@ -37,6 +37,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Boot-time automatic resume is a parent-facing trigger only. The gateway reads
 # ``gateway.auto_resume_on_boot`` from the active profile before queueing notices;
 # the explicit one-shot resume action is independent of that setting.
+# Persisted producer token: only this shutdown cause authorizes restart-cut recovery.
+GATEWAY_RESTART_CUT_REASON = "gateway shutdown (restart)"
 AUTO_RESUME_CLAIM_TTL_SECONDS = 300.0
 AUTO_RESUME_STATE_NONE = "none"
 AUTO_RESUME_STATE_CLAIMED = "claimed"
@@ -626,9 +628,7 @@ def is_user_cancel_reason(reason: str) -> bool:
 
 def is_trusted_restart_cut(reason: Any) -> bool:
     """Only fixed gateway restart-producer reasons authorize cut recovery."""
-    return str(reason).strip().casefold() in {
-        "gateway restart", "gateway_restart", "gateway restarting", "gateway shutdown (restart)",
-    }
+    return str(reason).strip().casefold() == GATEWAY_RESTART_CUT_REASON
 
 
 def _cut_reason(record: Dict[str, Any]) -> Any:

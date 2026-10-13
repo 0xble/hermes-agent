@@ -16,13 +16,17 @@ def test_scalar_cut_notice_uses_task_wording(goals):
     assert "delegate_task(action='resume', subagent_id='deleg_scalar_notice')" in text
 
 
-@pytest.mark.parametrize("cut_reason", [
-    "/stop", "user_stop", "session_reset", "gateway shutdown (/stop)",
-    "shutdown", "cli shutdown", "oneshot shutdown", "stopped before finishing",
-    "gateway shutdown", "gateway shutdown (post-interrupt)", "gateway shutdown (final-cleanup)",
+@pytest.mark.parametrize("cut_reason, expected_detail", [
+    ("/stop", "/stop"), ("user_stop", "user_stop"), ("session_reset", "session_reset"),
+    ("gateway shutdown (/stop)", "stopped before finishing"),
+    ("shutdown", "stopped before finishing"), ("cli shutdown", "stopped before finishing"),
+    ("oneshot shutdown", "oneshot shutdown"), ("stopped before finishing", "stopped before finishing"),
+    ("gateway shutdown", "stopped before finishing"),
+    ("gateway shutdown (post-interrupt)", "stopped before finishing"),
+    ("gateway shutdown (final-cleanup)", "stopped before finishing"),
 ])
 @pytest.mark.parametrize("batch", [False, True])
-def test_user_stop_and_non_restart_shutdown_cut_notice_has_no_resume_or_gateway_restart(cut_reason, batch):
+def test_user_stop_and_non_restart_shutdown_cut_notice_has_no_resume_or_gateway_restart(cut_reason, expected_detail, batch):
     text = _format_async_delegation({
         "type": "async_delegation",
         "delegation_id": "deleg_user_stop_notice",
@@ -36,7 +40,9 @@ def test_user_stop_and_non_restart_shutdown_cut_notice_has_no_resume_or_gateway_
     })
     assert "resume" not in text.lower()
     assert "gateway restart" not in text.lower()
-    assert f"Stopped ({cut_reason})." in text
+    assert f"Stopped ({expected_detail})." in text
+    if expected_detail != cut_reason:
+        assert cut_reason not in text
 
 
 def test_cut_batch_notice_has_fixed_resume_block():
@@ -111,6 +117,10 @@ def test_live_cut_completion_preserves_unit_indexes_for_notice_and_resume(tmp_pa
         if cut_reason != "gateway shutdown (restart)":
             assert "resume" not in text.lower()
             assert "gateway restart" not in text.lower()
+            parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()
+            resume = json.loads(_handle_control_action("resume", handle["delegation_id"], None, parent))
+            assert resume.get("error")
+            assert "nothing to resume" in resume["error"].lower()
             return
         parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()
         resume = json.loads(_handle_control_action("resume", handle["delegation_id"], None, parent))
