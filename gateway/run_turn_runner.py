@@ -26,7 +26,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
-from gateway.turn_context import TurnContext
+from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
@@ -1841,7 +1841,7 @@ class TurnRunner:
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             from agent.notification_presentation import notification_turn
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
@@ -1962,9 +1962,6 @@ class TurnRunner:
         ephemeral) + the gateway ephemeral prompt."""
         ctx = self._ctx
         combined = ctx.context_prompt or ""
-        if ctx.silence_retry:
-            from gateway.run_turn import _GATEWAY_SILENCE_RETRY_NOTE
-            combined = (combined + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
         for extra in (
             (ctx.channel_prompt or "").strip(),
             self._runner._get_system_prompt_for_channel(

@@ -198,10 +198,10 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: gateway human-turn silence re-prompt
 
 - **Patch identity:** `gateway-silence-reprompt`.
-- **Behavior:** Before a gateway turn closes, an exact `NO_REPLY`/`[SILENT]` final visible response on a user-typed turn receives one bounded gateway recovery execution for a short visible status. The recovery guidance and discarded marker are ephemeral. Internal notification turns, `reply_expected=False` turns, non-gateway lanes, and a second marker are not re-prompted. A recovery redirect preserves the newer human inbound ledger identity without changing the original silence contract.
+- **Behavior:** Before a gateway turn closes, an exact `NO_REPLY`/`[SILENT]` final visible response on a user-typed turn receives one bounded gateway recovery execution for a short visible status. Only the retry guidance is ephemeral (API-only, applied to the cached agent for the recovery execution and restored afterwards); the first execution's messages, including its marker, continue as history. Internal notification turns, `reply_expected=False` turns, non-gateway lanes, and a second marker are not re-prompted. A recovery redirect preserves the newer human inbound ledger identity without changing the original silence contract.
 - **Source surfaces:** `gateway/run_turn.py`, `gateway/run_turn_runner.py`, `gateway/turn_context.py`, `gateway/stream_consumer.py`, `gateway/stream_consumer_fallback.py`, and gateway silence regression tests.
 - **Upstream status:** related merged PR [NousResearch/hermes-agent#111624](https://github.com/NousResearch/hermes-agent/pull/111624) adds the downstream fallback for a human silence marker; no upstream gateway re-prompt equivalent found.
-- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_folded_steer_silence_reprompt.py tests/gateway/test_stream_consumer_wecom_native.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_folded_steer_silence_reprompt.py tests/gateway/test_silence_retry_lifecycle.py tests/gateway/test_stream_consumer_wecom_native.py`.
 - **Retirement:** Remove when released upstream re-prompts a user-typed gateway silence marker once before applying its fallback.
 - **Rollback:** Revert commits carrying `Fork-Patch: gateway-silence-reprompt`.
 

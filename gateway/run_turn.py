@@ -35,7 +35,7 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -84,15 +84,6 @@ _CONTEXT_OVERFLOW_ERROR_PHRASES = (
     "request entity too large", "prompt is too long",
     "payload too large", "input is too long",
 )
-
-_GATEWAY_SILENCE_RETRY_NOTE = (
-    "[System note: the previous execution ended with an intentional-silence marker, but this turn "
-    "contains a human message addressed to you. Answer the latest genuine user request from the "
-    "conversation history now. A typed or out-of-band user message overrides any earlier relay "
-    "or notification 'no reply needed' framing. Do not repeat work or tool calls already completed; "
-    "continue from their results. Write a visible answer or a concise blocker, not NO_REPLY or [SILENT].]"
-)
-
 
 def _unexpected_silence_reply() -> str:
     """Reply when the model returned only a silence marker for a message that needed an answer."""

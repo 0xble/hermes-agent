@@ -7,8 +7,34 @@ single-element lists so mutation stays visible to the outer body.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
+
+_GATEWAY_SILENCE_RETRY_NOTE = (
+    "[System note: the previous execution ended with an intentional-silence marker, but this turn "
+    "contains a human message addressed to you. Answer the latest genuine user request from the "
+    "conversation history now. A typed or out-of-band user message overrides any earlier relay "
+    "or notification 'no reply needed' framing. Do not repeat work or tool calls already completed; "
+    "continue from their results. Write a visible answer or a concise blocker, not NO_REPLY or [SILENT].]"
+)
+
+
+@contextmanager
+def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
+    """Scope the recovery note to one execution of the already-resolved (cached) agent.
+
+    The note never enters the stable ephemeral prompt that keys the agent cache, so
+    normal -> recovery -> normal reuses one AIAgent. Restored on every exit path."""
+    if not ctx.silence_retry:
+        yield
+        return
+    stable = agent.ephemeral_system_prompt
+    agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
+    try:
+        yield
+    finally:
+        agent.ephemeral_system_prompt = stable
 
 
 @dataclass

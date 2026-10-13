@@ -358,7 +358,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
         final_text = copy_free_text_for(self.adapter, final_text or "")  # buffers never hold copy blocks
-        target = self._display_payload(final_text)
+        target = self._display_payload(self._with_cumulative_prefix(final_text))
         if not target:
             return None
         if self._delivered_final_text is not None:
@@ -590,7 +590,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if tick.got_segment_break and _is_intentional_silence_response(
                     self._clean_for_display(self._accumulated[self._segment_start:])
                 ):
-                    await self._suppress_silence_marker()
+                    await self._suppress_silence_marker(terminal=False)
                     self._copy_filter.message_boundary()
                     await self._end_segment(tick)
                     self._signal_flush(tick.flush_event)
@@ -756,6 +756,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._accumulated = self._strip_final_loop_complete_marker(self._accumulated)
         self._stream_ledger = self._strip_final_loop_complete_marker(self._stream_ledger)
 
+    def _with_cumulative_prefix(self, final_text: str) -> str:
+        """Keep earlier tool segments when the final carries only the last answer."""
+        if final_text and not self._turn_split_delivery and self._cumulative_transport():
+            prefix = self._accumulated[:self._segment_start]
+            if prefix and not final_text.startswith(prefix):
+                return prefix + final_text
+        return final_text
+
     def _adopt_final_text(self, final_raw: str) -> None:
         """Adopt the authoritative final (see finish()) as the finalize content — only if this
         consumer streamed something (a no-stream turn keeps the gateway's final-send
@@ -771,6 +779,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:
+            final_raw = self._with_cumulative_prefix(final_raw)
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
                 self._accumulated = final_raw
