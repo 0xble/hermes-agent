@@ -188,12 +188,15 @@ pauses remain authoritative.
   than excerpting it, so a newer refusal can never be dropped while an older
   approval stays. Relay
   deliveries, identified by a `[relay from=… receipt=…]` header on the first or last
-  line (the gateway agent-origin rule, any sender kind), are
+  line (the gateway agent-origin rule, any sender kind, also inside a /steer
+  wrapper), are
   never user-typed, so they cannot satisfy a revision `user_quote`. An explicit
   `/goal resume` over a judge block records a user-command revision that renders
   as user authority with a waiver rule in every judge prompt; the judge does not
-  re-block on that reason but still blocks new breaches. An agent revision cannot
-  imitate it. Reviving on an
+  re-block on that reason but still blocks new breaches. The waiver comes from the
+  structured `user_command` field only `/goal resume` writes, never from rendered
+  text, so an agent revision cannot imitate it. Profile matching uses the bound
+  session profile first, as relay addresses do. Reviving on an
   ordinary reply records no override, since the reply may refuse. Goals with no
   typed user input render a byte-identical prompt. Regression:
   `scripts/run_tests.sh tests/hermes_cli/test_goal_user_authority.py

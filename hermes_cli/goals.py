@@ -825,6 +825,11 @@ class GoalState:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
+    def has_resume_override(self) -> bool:
+        """Whether a /goal resume over a judge block is recorded. Only GoalManager.resume writes
+        ``user_command``; revise() never does, so an agent revision cannot set it."""
+        return any(rev.get("user_command") == "/goal resume" for rev in self.revisions)
+
     def render_revisions_block(self) -> str:
         """Every revision with every requirement it replaced, in full; empty without revisions.
 
@@ -1990,6 +1995,7 @@ def judge_goal(
     revisions_block: str = "",
     last_visible_report: str = "",
     user_messages_block: str = "",
+    resume_override: bool = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -2027,8 +2033,7 @@ def judge_goal(
         evidence_block=_render_evidence_block(evidence),
         cited_block=_render_cited_block(citations),
         revisions_block=(JUDGE_REVISIONS_BLOCK_TEMPLATE.format(revision_lines=revisions_block)
-                         + (JUDGE_RESUME_OVERRIDE_RULE
-                            if "(user, user command /goal resume, user authority)" in revisions_block else "")
+                         + (JUDGE_RESUME_OVERRIDE_RULE if resume_override else "")
                          if revisions_block.strip() else ""),
         user_messages_block=user_messages_block,
         background_block=_render_background_block(background_processes)
@@ -2200,7 +2205,7 @@ def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
     """Return ``(profile, session_id)`` from a Hermes relay header on the first or last non-empty line."""
     if not isinstance(content, str):
         return None
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    lines = [line.strip() for line in _unwrap_steer(content).splitlines() if line.strip()]
     for line in (lines[-1:] + lines[:1]) if lines else []:
         match = _RELAY_HEADER_RE.fullmatch(line)
         if match:
@@ -2208,18 +2213,44 @@ def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _unwrap_steer(content: str) -> str:
+    """The steer payload without the OUT-OF-BAND markers, so its own edge lines can be inspected."""
+    text = content.strip()
+    try:
+        from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+    except Exception:  # pragma: no cover - prompt builder ships with the runtime
+        return text
+    if text.startswith(STEER_MARKER_OPEN):
+        text = text[len(STEER_MARKER_OPEN):]
+        if text.rstrip().endswith(STEER_MARKER_CLOSE):
+            text = text.rstrip()[: -len(STEER_MARKER_CLOSE)]
+    return text.strip()
+
+
 def _is_agent_origin(content: str) -> bool:
-    """Any complete relay header on an edge line (any sender kind), matching the gateway's rule."""
+    """Any complete relay header on an edge line (any sender kind), matching the gateway's rule.
+    A relay delivered via /steer is checked inside its steer markers too."""
+    candidates = [content, _unwrap_steer(str(content or ""))]
     try:
         from gateway.response_filters import is_agent_origin_text
-        return bool(is_agent_origin_text(content))
+        return any(bool(is_agent_origin_text(text)) for text in candidates)
     except Exception:  # pragma: no cover - gateway ships with the runtime
-        lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
-        return any(re.fullmatch(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]", line)
-                   for line in (lines[:1] + lines[-1:]))
+        for text in candidates:
+            lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+            if any(re.fullmatch(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]", line)
+                   for line in (lines[:1] + lines[-1:])):
+                return True
+        return False
 
 
 def _active_profile_name() -> str:
+    """The turn's profile as relay addresses name it: the bound session profile, else HERMES_HOME's."""
+    try:
+        from gateway.session_context import bound_session_env
+        if profile := bound_session_env("HERMES_SESSION_PROFILE"):
+            return str(profile)
+    except Exception:
+        pass
     try:
         from hermes_cli.profiles import get_active_profile_name
         return str(get_active_profile_name() or "")
@@ -3348,6 +3379,7 @@ class GoalManager:
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
             evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
+            resume_override=state.has_resume_override(),
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
             last_visible_report=visible_report,
         )
