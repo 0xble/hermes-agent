@@ -318,3 +318,46 @@ def test_unauthorized_accepted_spool_is_quarantined(home):
     assert not path.exists()
     assert path.with_name(path.name + shutdown_flush.QUARANTINE_SUFFIX).exists()
     assert _spools(home) == []
+
+
+def test_declined_accepted_checkpoint_is_quarantined_without_transcript_row(home):
+    """Recovery must stop at a declined claim: no naked user row for rejected input."""
+    from functools import partial
+
+    from gateway import run_pending_recovery
+    from gateway.session import SessionSource
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", user_id="u")
+    entry = SimpleNamespace(origin=SimpleNamespace(platform=Platform.TELEGRAM), resume_pending=False,
+                            session_id="sid", suspended=False)
+
+    class Store:
+        _lock = threading.Lock()
+        _entries = {"k": entry}
+
+        def _ensure_loaded_locked(self):
+            return None
+
+    class Runner:
+        session_store = Store()
+        _startup_restore_queue = []
+        _draining = False
+
+        def _is_session_running(self, _key): return False
+        def _restored_source(self, _entry): return source
+        def _resume_owner_authorized(self, _key, _source): return False
+
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("sid", "telegram")
+    event = _event("accepted queued input", "u1")
+    assert shutdown_flush.checkpoint_queued_event("k", event)
+    path = event._hermes_recovery_spool
+    recovered, _held = shutdown_flush.recover_pending_spool(
+        session_db=db, session_resolver=lambda *a, **k: ("sid", db),
+        deferred_followup=partial(run_pending_recovery._defer_followup, Runner(), {}, None,
+                                  recovered_events=[]))
+    assert recovered == 0
+    assert not path.exists()
+    assert path.with_name(path.name + shutdown_flush.QUARANTINE_SUFFIX).exists()
+    assert [m for m in db.get_messages("sid") if m.get("role") == "user"] == []
+    db.close()

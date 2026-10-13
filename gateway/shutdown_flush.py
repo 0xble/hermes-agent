@@ -672,6 +672,13 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             return False
         if claim:
             return CLAIMED_FOLLOWUP
+        if data.get("queue_accepted") is True:
+            # A declined accepted-queue claim (e.g. unauthorized owner, already quarantined by the
+            # callback) must never fall through to a naked transcript row: the checkpoint is a
+            # future turn, not history. Whatever the callback left on disk is preserved.
+            logger.warning("Accepted queue checkpoint for %s declined by its follow-up owner; "
+                           "not appended to the transcript", session_key)
+            return False
     # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
     # reply judgement, display filters) does not treat it as a human prompt.
     row_display: Dict[str, Any] = {}
