@@ -2213,6 +2213,79 @@ def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _relay_receipt_id(content: str) -> str:
+    lines = [line.strip() for line in _unwrap_steer(str(content or "")).splitlines() if line.strip()]
+    for line in (lines[-1:] + lines[:1]) if lines else []:
+        match = re.search(r"\breceipt=([^\s\]]+)", line) if _RELAY_HEADER_RE.fullmatch(line) else None
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _relay_ledger_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
+    """The newest receipt row for ``receipt_id`` in relay's own ledger, or None.
+
+    The header in a transcript is plain text any agent can write; the ledger is written by the relay
+    transport at send time and records sender, target and the delivered transcript row."""
+    if not receipt_id:
+        return None
+    state_dir = os.environ.get("RELAY_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".local/state/relay")
+    path = os.path.join(state_dir, "receipts.jsonl")
+    found: Optional[Dict[str, Any]] = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if receipt_id not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("id") == receipt_id:
+                    found = row
+    except OSError:
+        return None
+    return found
+
+
+# Sessions whose user rows are written by agents or schedulers, never typed by a person.
+_NON_HUMAN_SESSION_SOURCES = frozenset({"subagent", "cron", "tool", "kanban", "oneshot", "dryrun"})
+
+
+def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id: str,
+                                profile: str) -> Optional[str]:
+    """The sender session of a relay row when relay's ledger proves this exact delivery, else None.
+
+    Requires a typed-shaped row (no runtime display_kind, not a synthetic/continuation prompt), a
+    Hermes header naming this profile, a ledger receipt with the same sender delivered to this goal
+    session (and this row when recorded), and a sender that is a human topic session."""
+    content = str(relay.get("content") or "")
+    if str(relay.get("display_kind") or "") not in _USER_TYPED_KINDS or relay.get("compressed_summary"):
+        return None
+    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
+        return None
+    sender = _relay_sender(content)
+    if sender is None or not profile or sender[0] != profile or sender[1] == goal_session_id:
+        return None
+    receipt = _relay_ledger_receipt(_relay_receipt_id(content))
+    if not receipt or str(receipt.get("status") or "") not in ("delivered", "replied"):
+        return None
+    if receipt.get("sender") != f"hermes:{profile}/{sender[1]}":
+        return None
+    if receipt.get("target") != f"hermes:{profile}/{goal_session_id}":
+        return None
+    row_id = receipt.get("target_user_row")
+    if row_id is not None and str(row_id) != str(relay.get("id")):
+        return None
+    try:
+        info = db.get_session(sender[1]) or {}
+    except Exception:
+        return None
+    if not info or str(info.get("source") or "") in _NON_HUMAN_SESSION_SOURCES:
+        return None
+    return sender[1]
+
+
 def _unwrap_steer(content: str) -> str:
     """The steer payload without the OUT-OF-BAND markers, so its own edge lines can be inspected."""
     text = content.strip()
@@ -2296,13 +2369,12 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
     except Exception:
         relay_rows = []
     for relay in relay_rows:
-        sender = _relay_sender(str(relay.get("content") or ""))
-        if sender is None or not active_profile or sender[0] != active_profile:
+        sender_session = _authenticated_relay_sender(db, relay, session_id, active_profile)
+        if sender_session is None:
             continue
         # Only what the user typed in the sender session before this delivery can be what it carries.
         relay_at = float(relay.get("timestamp") or 0)
-        sender_session = sender[1]
-        if sender_session == session_id or relay_at <= 0:
+        if relay_at <= 0:
             continue
         title = None
         try:

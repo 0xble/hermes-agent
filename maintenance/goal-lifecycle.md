@@ -183,7 +183,12 @@ pauses remain authoritative.
   8,000 characters). When a relay from another session in the same profile reaches
   the goal session, the typed messages of that sender session are included and
   attributed, so a cross-session approval counts only through its original and
-  only messages typed before that delivery are imported. Packing keeps the newest
+  only messages typed before that delivery are imported. A relay row is trusted
+  only when relay's own receipt ledger records that receipt as delivered from the
+  named sender to this goal session (and this transcript row), the row is not a
+  runtime or continuation prompt, and the sender is a human topic session (not a
+  subagent, cron, tool, kanban or one-shot session); header text alone never
+  imports anything. Packing keeps the newest
   messages and stops at the first one that does not fit, marking it omitted rather
   than excerpting it, so a newer refusal can never be dropped while an older
   approval stays. Relay
