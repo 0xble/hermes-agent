@@ -25,7 +25,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
-from gateway.run_loop_wake import GatewayLoopWakeMixin
+from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_inbound_unauthorized import (
     UnauthorizedOwnerNotifier, pairing_code_reply, pairing_profile_arg, pairing_rate_limited_reply,
@@ -880,7 +880,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     async def _hm_command_hooks(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str,
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+    ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Fire ``pre_command`` (observer) and ``command:<canonical>`` (interceptor) hooks →
         ``(handled, result, new_command)`` (``new_command`` set when a handler rewrote the command).
         The running-agent path deliberately does NOT fire these — a slow or hostile plugin must not
@@ -911,7 +911,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
         _started, hook_results = await self._invoke_loop_wake_effect(event, _dispatch_hooks)
         if not _started:
-            return True, None, command
+            return _CommandDispatch.SUPPRESSED, None, command
 
         for hook_result in hook_results:
             if not isinstance(hook_result, dict):
@@ -932,7 +932,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     async def _hm_resolve_command(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str,
-    ) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    ) -> Tuple[_CommandHandled, Optional[str], Optional[str], Optional[str]]:
         """Resolve the slash command (aliases, access gate, hooks) → ``(handled, result, command,
         canonical)``; when ``handled`` the caller returns ``result`` as-is (may be None)."""
         from hermes_cli.commands import is_gateway_known_command, resolve_command as _resolve_cmd
@@ -970,7 +970,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             event, source, _quick_key, command, canonical,
         )
         if _handled:
-            return True, _result, command, canonical
+            return _handled, _result, command, canonical
         if new_command is not None:
             command = new_command
             _cmd_def, canonical = _canon(command)
@@ -1136,7 +1136,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     async def _hm_dispatch_canonical_command(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str,
         canonical: Optional[str],
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> Tuple[_CommandHandled, Optional[str]]:
         """Dispatch built-in idle-path commands → ``(handled, result)``; prompt-rewriting commands
         mutate ``event.text`` and return ``(False, None)`` to fall through to the agent."""
         plain_handler = (
@@ -1146,13 +1146,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if plain_handler is not None:
             async with self._async_profile_scope_for_source(source):
                 _started, result = await self._invoke_loop_wake_effect(event, plain_handler, event)
-                return True, result
+                return (True, result) if _started else (_CommandDispatch.SUPPRESSED, None)
         if canonical in self._HM_CANONICAL_COMMANDS:
             handler = getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")
             started, result = await self._invoke_loop_wake_effect(
                 event, handler, event, source, _quick_key,
             )
-            return result if started else (True, None)
+            return result if started else (_CommandDispatch.SUPPRESSED, None)
         return False, None
 
     async def _hm_run_exec_quick_command(self, command: str, exec_cmd: str) -> str:
@@ -1185,7 +1185,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     async def _hm_dispatch_quick_and_plugin_commands(
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+    ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining and not self._hm_is_registered_command(event):
@@ -1211,7 +1211,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 _started, result = await self._invoke_loop_wake_effect(
                     event, self._hm_run_exec_quick_command, command, exec_cmd,
                 )
-                return True, result, command
+                return (True, result, command) if _started else (_CommandDispatch.SUPPRESSED, None, command)
             if qtype != "alias":
                 return True, t("gateway.quick_command.unsupported_type", command=command), command
             new_command = self._hm_expand_alias_quick_command(event, qcmd)
@@ -1254,7 +1254,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                                 if not started:
                                     pending_result.close()
                         if not started:
-                            return True, None, command
+                            return _CommandDispatch.SUPPRESSED, None, command
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -1430,10 +1430,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             _handled = _result is not None
         if not _handled:
             return await _loop_command_fallthrough()
-        if _handled:
-            # A slash prefix is not completion: prompt/skill/plugin rewrites fall through
-            # to the model and its own exact-identity loop lifecycle hooks.
-            await self._post_command_loop_completion(event, source)
+        if _handled is _CommandDispatch.SUPPRESSED:
+            return True, None
+        # Only an effectful handled command settles here; rewrites settle after model work.
+        await self._post_command_loop_completion(event, source)
         if _handled and canonical != "retry":  # /retry returns the re-run agent turn's own reply
             _result = as_command_reply(_result)
         return _handled, _result

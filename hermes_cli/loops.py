@@ -583,11 +583,31 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared" or load_loop(new_session_id) is not None:
+        db = _get_session_db()
+        if db is None:
             return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
+        state = load_loop(old_session_id)
+        if state is None or state.status == "cleared":
+            return False
+        expected = state.to_json()
+
+        def migrate(conn):
+            # A control or settlement after discovery wins; never copy stale active state onto
+            # the child or clear a newer parent. Both writes share this stored-row transaction.
+            current = load_loop(old_session_id, cursor=conn)
+            if (current is None or current.to_json() != expected
+                    or conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                    (_meta_key(new_session_id),)).fetchone() is not None):
+                return False
+            save_loop(new_session_id, current, cursor=conn)
+            retired = LoopState.from_json(expected)
+            retired.status = "cleared"
+            retired.awaiting_response = False
+            save_loop(old_session_id, retired, cursor=conn)
+            return True
+
+        if not db._execute_write(migrate):
+            return False
         logger.debug(
             "LoopManager: migrated loop %s -> %s (%s)",
             old_session_id, new_session_id, reason or "rotation",

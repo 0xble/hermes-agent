@@ -811,6 +811,19 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 session_entry=current, source=source, final_response="", loop_tick=tick,
             )
 
+    async def _migrate_compressed_loop(self, sid: str, tip: str) -> None:
+        """Retry a stranded parent's migration without orphan-clearing it on failure."""
+        from hermes_cli.loops import migrate_loop_to_session
+
+        migrated = await self._run_in_executor_with_context(
+            migrate_loop_to_session, sid, tip, reason="compression",
+        )
+        if not migrated:
+            logger.warning(
+                "loop wakeup: compression migration failed for %s -> %s; leaving parent row",
+                sid, tip,
+            )
+
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
@@ -883,6 +896,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 logger.debug("loop wakeup: compression lineage lookup failed", exc_info=True)
                 return
             if tip == current.session_id:
+                await self._migrate_compressed_loop(sid, tip)
                 return
             try:
                 await self._run_in_executor_with_context(

@@ -6,7 +6,17 @@ goal hosts share this owner so those paths also work on standalone mixins.
 
 from __future__ import annotations
 
+from enum import Enum, auto
 from typing import Any, Optional
+
+
+class _CommandDispatch(Enum):
+    """Truthy terminal dispatch without an effect: stop fallthrough, never settle a tick."""
+
+    SUPPRESSED = auto()
+
+
+_CommandHandled = bool | _CommandDispatch
 
 
 class GatewayLoopWakeMixin:

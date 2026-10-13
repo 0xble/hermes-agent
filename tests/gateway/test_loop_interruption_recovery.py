@@ -7,7 +7,7 @@ import asyncio
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import hermes_loop_guard
 import pytest
@@ -1030,9 +1030,12 @@ async def test_real_admission_superseded_command_cannot_release_successor(contro
         state = runner._session_state(entry.session_key)
         assert state.turn.agent is successor
         assert successor_generation in state.turn.lease_tokens
-        # The stale wake owned this admitted tick: it settles as skipped, never refunded or replayed.
+        # No command effect ran: preserve the admitted claim for later skip-only recovery.
         saved = loops.load_loop(entry.session_id)
-        assert saved.status == "active" and not saved.awaiting_response and saved.ticks_fired == 1
+        assert saved is not None
+        assert saved.status == "active" and saved.awaiting_response and saved.ticks_fired == 1
+        assert saved.claim_phase == "started"
+        assert adapter.wire == []
     finally:
         runner._release_turn_lease(entry.session_key, successor_generation)
         runner._release_running_agent_state(entry.session_key, run_generation=successor_generation)
@@ -1309,3 +1312,205 @@ async def test_learn_final_command_check_reset_preserves_successor_agent_and_lea
         runner._release_turn_lease(entry.session_key, generation)
         runner._release_running_agent_state(entry.session_key, run_generation=generation)
         runner.session_store.close_all_db_handles()
+
+
+async def _prepare_loop_command_dispatch(runner, source, entry, prompt):
+    mgr = loops.LoopManager(entry.session_id)
+    mgr.set(prompt, interval_seconds=60, times=1, route=_route(source))
+    generation = runner._begin_session_run_generation(entry.session_key)
+    assert mgr.fire_tick(generation)
+    assert mgr.state is not None
+    event = runner._synthetic_prompt_event(source, prompt, internal=True, reply_expected=False)
+    event.metadata.update({
+        "hermes_loop_wakeup": True,
+        "gateway_session_id": entry.session_id,
+        "gateway_loop_tick": [mgr.state.created_at, mgr.state.ticks_fired],
+    })
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_kind", [
+    "hook", "plain", "canonical", "exec", "plugin", "sync_plugin", "coroutine_plugin", "learn", "plan",
+])
+@pytest.mark.parametrize("suppress", [True, False], ids=["suppressed", "ran"])
+async def test_fence_suppressed_command_dispatch_keeps_started_tick(
+    control_home, monkeypatch, command_kind, suppress,
+):
+    """Invalidate inside the effect-entry await, not an earlier dispatch preparation check."""
+    from gateway.hooks import HookRegistry
+
+    runner, _adapter, source, entry = native_runner(control_home)
+    runner.hooks = HookRegistry()
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._run_agent = AsyncMock()
+    # Keep the actual manager bound and execute the real stored-row settlement.
+    original_complete = loops.LoopManager.complete_tick
+    decisions = []
+
+    def track_complete(manager, *args, **kwargs):
+        decisions.append((args, kwargs))
+        return original_complete(manager, *args, **kwargs)
+
+    monkeypatch.setattr(loops.LoopManager, "complete_tick", track_complete)
+    prompt = {
+        "hook": "/start", "plain": "/help", "canonical": "/start", "exec": "/effect",
+        "plugin": "/plugin-effect", "sync_plugin": "/plugin-effect", "coroutine_plugin": "/plugin-effect",
+        "learn": "/learn inspect work", "plan": "/plan inspect work",
+    }[command_kind]
+    event = await _prepare_loop_command_dispatch(runner, source, entry, prompt)
+    effect = AsyncMock(return_value="effect ran")
+    sync_calls = []
+
+    if command_kind == "hook":
+        runner.hooks._handlers["command:*"] = [AsyncMock(return_value={"decision": "handle"})]
+    elif command_kind == "plain":
+        runner._gateway_plain_command_handlers = lambda: {"help": effect}
+    elif command_kind == "canonical":
+        runner._hm_cmd_start = AsyncMock(wraps=runner._hm_cmd_start)
+        effect = runner._hm_cmd_start
+    elif command_kind == "exec":
+        runner._hm_quick_commands = lambda: {"effect": {"type": "exec", "command": "not executed"}}
+        runner._hm_run_exec_quick_command = effect
+    elif "plugin" in command_kind:
+        def sync_plugin(_args):
+            sync_calls.append(_args)
+            return effect() if command_kind == "coroutine_plugin" else "effect ran"
+        plugin = effect if command_kind == "plugin" else sync_plugin
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_command_handler", lambda name: plugin)
+
+    original_effect = runner._invoke_loop_wake_effect
+    original_executor = runner._run_in_executor_with_context
+    armed = False
+    invalidated = False
+
+    async def invoke(event, handler, *args, **kwargs):
+        nonlocal armed
+        is_hook = getattr(handler, "__name__", "") == "_dispatch_hooks"
+        armed = (is_hook if command_kind == "hook" else not is_hook)
+        return await original_effect(event, handler, *args, **kwargs)
+
+    async def executor(func, *args, **kwargs):
+        nonlocal invalidated
+        name = getattr(func, "__name__", "")
+        if command_kind == "sync_plugin" and name == "_invoke_loop_wake_sync_effect" and suppress:
+            await asyncio.sleep(0)
+            runner._begin_session_run_generation(entry.session_key)
+            invalidated = True
+        result = await original_executor(func, *args, **kwargs)
+        if armed and name == "_check_loop_execution" and suppress and not invalidated:
+            runner._begin_session_run_generation(entry.session_key)
+            invalidated = True
+        return result
+
+    runner._invoke_loop_wake_effect = invoke
+    runner._run_in_executor_with_context = executor
+    try:
+        handled, result = await runner._hm_dispatch_idle_commands(event, source, entry.session_key)
+        saved = loops.load_loop(entry.session_id)
+        assert saved is not None
+        if suppress:
+            assert invalidated, "test failed to reach the effect-entry await"
+            assert handled and result is None
+            assert decisions == []
+            runner._defer_goal_status_notice_after_delivery.assert_not_awaited()
+            runner._run_agent.assert_not_awaited()
+            effect.assert_not_awaited()
+            assert saved.awaiting_response and saved.claim_phase == "started"
+            assert saved.status == "active" and saved.ticks_fired == 1
+        elif command_kind in {"learn", "plan"}:
+            assert not handled and result is None
+            assert decisions == []  # rewriting is not completion: the model settles this wake
+            assert event.text != prompt
+            await runner._post_turn_loop_completion(
+                session_entry=entry, source=source, final_response="model ran",
+                loop_tick=tuple(event.metadata["gateway_loop_tick"]),
+            )
+            assert len(decisions) == 1
+        else:
+            assert handled
+            assert len(decisions) == 1
+            assert not saved.awaiting_response and saved.status == "done"
+            runner._defer_goal_status_notice_after_delivery.assert_awaited_once()
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("migration_fails", [False, True])
+async def test_matching_compression_tip_rehomes_loop_without_losing_claim(control_home, monkeypatch, migration_fails):
+    runner, adapter, source, entry = native_runner(control_home)
+    mgr = create_loop(entry, source)
+    assert mgr.fire_tick(7)
+    before = loops.load_loop(entry.session_id)
+    assert before is not None
+    old_sid = entry.session_id
+    tip = "compressed-child"
+    current = SimpleNamespace(session_id=tip)
+    runner.session_store.lookup_by_session_key = lambda key: current
+    runner.session_store._db_for_key = lambda key: SimpleNamespace(get_compression_tip=lambda sid: tip)
+    if migration_fails:
+        monkeypatch.setattr(loops, "migrate_loop_to_session", Mock(return_value=False))
+    try:
+        await runner._loop_wakeup_fire_one(old_sid, before, time.time() + 86400, set())
+        parent = loops.load_loop(old_sid)
+        assert parent is not None
+        child = loops.load_loop(tip)
+        if migration_fails:
+            assert parent.to_json() == before.to_json()
+            assert child is None
+            loops.migrate_loop_to_session.assert_called_once_with(old_sid, tip, reason="compression")
+        else:
+            assert parent.status == "cleared"
+            assert child is not None
+            assert child.to_json() == before.to_json()
+        assert not adapter._background_tasks  # migration never replays the in-flight tick
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.parametrize("control", ["pause", "clear", "revise"])
+def test_compression_loop_migration_cas_keeps_concurrent_parent_control(control_home, monkeypatch, control):
+    mgr = loops.LoopManager("parent")
+    mgr.set("check work", interval_seconds=60)
+    assert mgr.fire_tick(7)
+    load = loops.load_loop
+    changed = False
+    controlled = None
+
+    def load_and_control(sid, **kwargs):
+        nonlocal changed, controlled
+        result = load(sid, **kwargs)
+        if sid == "parent" and not kwargs and not changed:
+            changed = True
+            fresh = loops.LoopManager(sid)
+            if control == "revise":
+                assert fresh.revise(reason="slow down", interval_seconds=120)["ok"]
+            else:
+                getattr(fresh, control)()
+            controlled = load(sid).to_json()
+        return result
+
+    monkeypatch.setattr(loops, "load_loop", load_and_control)
+    assert loops.migrate_loop_to_session("parent", "child", reason="compression") is False
+    assert load("child") is None
+    assert load("parent").to_json() == controlled
+
+
+def test_compression_loop_migration_rolls_back_child_when_parent_retirement_fails(control_home, monkeypatch):
+    mgr = loops.LoopManager("parent")
+    mgr.set("check work", interval_seconds=60)
+    assert mgr.fire_tick(7)
+    before = loops.load_loop("parent").to_json()
+    db = loops._get_session_db()
+    set_meta = db.set_meta
+
+    def fail_retirement(key, value, **kwargs):
+        if key == "loop:parent":
+            raise RuntimeError("retirement write unavailable")
+        return set_meta(key, value, **kwargs)
+
+    monkeypatch.setattr(db, "set_meta", fail_retirement)
+    assert loops.migrate_loop_to_session("parent", "child", reason="compression") is False
+    assert loops.load_loop("child") is None
+    assert loops.load_loop("parent").to_json() == before
