@@ -27,6 +27,32 @@ def helper(monkeypatch):
 
 @pytest.mark.parametrize(("command", "label"), [
     ("pytest -q tests", "pytest"),
+    ("node scripts/run-workspace-checks.mjs", "workspace-checks"),
+    ("npx eslint .", "eslint"),
+    ("npx tsc --noEmit", "tsc"),
+    ("npm ci", "install"),
+    ("pip install -r requirements.txt", "pip-install"),
+    ("uv sync --compile-bytecode", "uv-sync"),
+    ("python -m unittest discover", "unittest"),
+    ("agentkit evals admit --trials 12", "evals-admit"),
+    ("agentkit evals run --trials 12", "evals-run"),
+    ("./bin/check --fast", "check"),
+    ("node viewer/check.js", "check"),
+    ("python pm/launch.py install --test-environment", "pm-install"),
+    ("go test ./...", "go-test"),
+    ("scripts/run_tests.sh tests/agent/test_foo.py -k test_x", "run_tests"),
+    ("python scripts/run_tests_parallel.py tests/test_a.py", "run_tests"),
+    ("python -m compileall -j 4 .", "compileall"),
+    ("python -m pip install pytest", "pip-install"),
+    ("uv pip install pytest", "uv-install"),
+    ("pnpm build", "build"),
+    ("turbo run build", "build"),
+    ("pnpm --filter test build", "build"),
+    ("npm install test", "install"),
+    ("pnpm add -D vitest", "install"),
+    ("yarn workspace app add -D test", "install"),
+    ("npm run check", "check"),
+    ("npx playwright test", "playwright"),
     ("python -m pytest tests/", "pytest"),
     (".venv/bin/python -m pytest -n 8 tests/tools/test_a.py", "pytest"),
     ("cd repo && uv run pytest -q", "pytest"),
@@ -59,12 +85,22 @@ def helper(monkeypatch):
     ("vitest run --maxWorkers 4 src/a.test.ts", "vitest"),
     ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
 ])
-def test_recognizes_heavy_commands(command, label):
+def test_recognizes_heavy_commands(command, label, helper):
     assert classify_command(command) == label
+    assert f"hermes {label}" in wrap_heavy_command(command, env_type="local")
 
 
 @pytest.mark.parametrize("command", [
     "git status",
+    "ls",
+    "cat scripts/run-workspace-checks.mjs",
+    "rg eslint .",
+    "node viewer/serve.js",
+    "agentkit evals list",
+    "go version",
+    "python pm/launch.py status",
+    "uv --version",
+    "uv run --frozen python -c 'print(1)'",
     "grep -rn pytest .",
     "rg 'pytest -q' tools",
     "echo 'a; pytest b'",
@@ -74,17 +110,9 @@ def test_recognizes_heavy_commands(command, label):
     "ls # pytest",
     "python - <<'PY'\nprint('pytest -q tests')\nPY",
     "cat <<EOF > notes.md\npytest -q tests\nEOF",
-    "uv pip install pytest",
-    "pnpm add -D vitest",
-    "pnpm build",
-    "npm install test",
-    "yarn workspace app add -D test",
-    "turbo run build",
-    "pnpm --filter test build",
     "./bin/ci preflight",
     "~/.hermes/plugins/git-guard/bin/ci-gate deadbeef",  # ci-gate takes its own slot
     "pytest tests/tools/test_a.py tests/tools/test_b.py -q",  # targeted
-    "scripts/run_tests.sh tests/agent/test_foo.py -k test_x",  # targeted
     "vitest run src/a.test.ts",  # targeted
     "pytest -q -x --tb=short -k smoke tests/tools/test_a.py::test_b",  # targeted with single-run options
     "command pytest tests",  # `command` deliberately bypasses shell functions: left alone

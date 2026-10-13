@@ -42,11 +42,14 @@ _KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "ti
 # External prefix utilities: they exec their argument, so the dispatcher goes before them.
 _EXEC_PREFIXES = {"env", "nice", "timeout", "gtimeout", "nohup"}
 # Cheap prefilter: every heavy form contains one of these, so most commands skip parsing.
-_CANDIDATE = re.compile(r"test|jest|bin/ci|tox|nox")
+_CANDIDATE = re.compile(
+    r"test|jest|bin/ci|tox|nox|check|lint|sync|install|evals|compileall|build|tsc|"
+    r"npm|pnpm|yarn|bun|turbo|nx|lerna|uv|poetry|pipenv|hatch|pdm|rye"
+)
 _SHELLS = {"bash", "sh", "zsh"}
 _PY_RUNNERS = {"pytest", "py.test"}
 _JS_RUNNERS = {"vitest", "jest"}
-# Package-script runners: `test` / `test:*` scripts are heavy, package management is not.
+# Package scripts and dependency installation can both fan out expensive work.
 _PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 _PACKAGE_VALUE_OPTIONS = {"--filter", "-F", "--dir", "-C", "--prefix", "--cwd", "--workspace", "-w"}
 # Subcommands whose positional words are package names, never script names.
@@ -129,21 +132,87 @@ def _first_positional(args: list[str], value_options: Collection[str] = ()) -> t
     return None, []
 
 
-def _is_test_script(word: Optional[str]) -> bool:
-    return word is not None and (word == "test" or word.startswith("test:"))
+def _script_label(word: str) -> Optional[str]:
+    prefix = word.split(":", 1)[0]
+    return prefix if prefix in {"test", "build", "check", "lint", "typecheck"} else None
 
 
-def _has_test_script(args: list[str]) -> bool:
-    """Whether any positional word (not an option or its value) is a `test` / `test:*` script."""
+def _heavy_script(args: list[str]) -> Optional[str]:
+    """Ignore option values such as the package named by --filter."""
     skip = False
     for arg in args:
         if skip:
             skip = False
         elif arg in _PACKAGE_VALUE_OPTIONS:
             skip = True  # `pnpm --filter test build`: `test` names a package
-        elif not arg.startswith("-") and _is_test_script(arg):
-            return True
-    return False
+        elif not arg.startswith("-") and (label := _script_label(arg)):
+            return label
+    return None
+
+
+def _classify_python(args: list[str]) -> Optional[str]:
+    if args[:1] == ["-m"] and len(args) > 1:
+        module, rest = args[1], args[2:]
+        if module in _PY_RUNNERS:
+            return None if _is_targeted(rest) else "pytest"
+        if module in {"unittest", "compileall", "build"}:
+            return module
+        if module == "pip" and rest[:1] == ["install"]:
+            return "pip-install"
+    if args and _basename(args[0]) == "run_tests_parallel.py":
+        return "run_tests"
+    if args and args[0].endswith("pm/launch.py") and args[1:2] == ["install"]:
+        return "pm-install"
+    return None
+
+
+def _classify_launchers(executable: str, args: list[str]) -> Optional[str]:
+    name = _basename(executable)
+    if name.startswith("python"):
+        return _classify_python(args)
+    if name in {"node", "nodejs"} and args:
+        return {"run-workspace-checks.mjs": "workspace-checks", "check.js": "check",
+                "check.mjs": "check"}.get(_basename(args[0]))
+    if name == "agentkit" and args[:1] == ["evals"] and args[1:2] in (["run"], ["admit"]):
+        return f"evals-{args[1]}"
+    if name == "go" and args[:1] in (["test"], ["build"]):
+        return f"go-{args[0]}"
+    if name == "check" and executable.endswith("bin/check"):
+        return None if args[:1] in (["--help"], ["-h"], ["--list"]) else "check"
+    if name in {"eslint", "tsc"}:
+        return name
+    if name in {"pip", "pip3"} and args[:1] == ["install"]:
+        return "pip-install"
+    if name == "playwright" and args[:1] in (["test"], ["install"]):
+        return "playwright"
+    return None
+
+
+def _classify_package(args: list[str]) -> Optional[str]:
+    sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
+    management = next((word for word in [sub, *rest][:3] if word in _PACKAGE_MANAGEMENT), None)
+    if management:
+        return "install" if management in {"add", "install", "i", "update", "up", "upgrade"} else None
+    if sub == "ci":
+        return "install"
+    if sub in {"exec", "dlx"}:
+        inner, inner_rest = _first_positional(rest)
+        return classify_words([inner, *inner_rest]) if inner else None
+    return _heavy_script(args)
+
+
+def _classify_environment(name: str, args: list[str]) -> Optional[str]:
+    sub, rest = _first_positional(args, {"--project", "--directory", "--python", "-p", "--with", "--group",
+                                        "--extra", "--package", "--env", "-e"})
+    if sub == "run":
+        inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
+                                                   "-p", "--env", "-e", "--directory", "--project"})
+        return classify_words([inner, *inner_rest]) if inner else None
+    if sub in {"sync", "install", "add"}:
+        return f"{name}-{sub}"
+    if name == "uv" and sub == "pip" and rest[:1] in (["install"], ["sync"]):
+        return "uv-install"
+    return None
 
 
 def classify_words(words: list[str]) -> Optional[str]:
@@ -161,38 +230,25 @@ def classify_words(words: list[str]) -> Optional[str]:
         return None
     if name in _PY_RUNNERS:
         return None if _is_targeted(args) else "pytest"
-    if name.startswith("python") and len(args) >= 2 and args[0] == "-m" and args[1] in _PY_RUNNERS:
-        return None if _is_targeted(args[2:]) else "pytest"
+    launcher = _classify_launchers(executable, args)
+    if launcher:
+        return launcher
     if name in _JS_RUNNERS:
         rest = args[1:] if args[:1] in (["run"], ["related"]) else args
         return None if _is_targeted(rest) else name
     if name == "run_tests.sh":
-        return None if _is_targeted(args) else "run_tests"
+        return "run_tests"  # always compiles the whole checkout, even with one test file
     if name in _SUITE_RUNNERS:
         return name
     if name in _ENV_RUNNERS:
-        sub, rest = _first_positional(args, {"--project", "--directory", "--python", "-p", "--with", "--group",
-                                              "--extra", "--package", "--env", "-e"})
-        if sub == "run":
-            inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
-                                                         "-p", "--env", "-e", "--directory", "--project"})
-            return classify_words([inner, *inner_rest]) if inner else None
-        return None
+        return _classify_environment(name, args)
     if name in _EXEC_RUNNERS:
         inner, rest = _first_positional(args, {"--package", "-p", "--from", "--with"})
         return classify_words([inner, *rest]) if inner else None
     if name in _PACKAGE_MANAGERS:
-        sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
-        if any(word in _PACKAGE_MANAGEMENT for word in [sub, *rest][:3] if word):
-            return None  # `pnpm add -D vitest`, `yarn workspace app add test`: the words name packages
-        if sub in {"exec", "dlx"}:
-            inner, inner_rest = _first_positional(rest)
-            return classify_words([inner, *inner_rest]) if inner else None
-        # Script runs in every spelling (`pnpm test`, `npm run test`, `yarn workspace app test`,
-        # `yarn workspaces foreach run test`, `pnpm -r test:unit`): any positional test script.
-        return "test" if _has_test_script(args) else None
+        return _classify_package(args)
     if name in _MONOREPO_RUNNERS:
-        return "test" if _has_test_script(args) else None
+        return _heavy_script(args)
     if executable.endswith("bin/ci") and _basename(executable) == "ci":
         profile = args[0] if args else "full"
         return None if profile in _LIGHT_CI_PROFILES else f"ci-{profile}"
