@@ -99,11 +99,16 @@ def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
 
 
 def is_intentional_silence_response(response: Any) -> bool:
-    """True only when ``response`` is exactly a silence marker.
+    """True when the display text is exactly a silence marker.
 
+    ``LOOP_COMPLETE`` is a control marker, not assistant content. Strip a trailing
+    top-level completion line before judging silence so every delivery lane uses the
+    same display-text verdict while loop detection retains the raw response.
     Prose that merely mentions ``NO_REPLY`` must be delivered normally. A blank
     response is not silence either — that is the empty-response failure path.
     """
+    if isinstance(response, str):
+        response = strip_trailing_loop_complete_marker(response)
     return any(c in LIVE_GATEWAY_SILENT_MARKERS for c in _canonical_silence_candidates(response))
 
 

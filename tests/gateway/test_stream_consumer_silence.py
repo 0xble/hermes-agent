@@ -100,6 +100,22 @@ class TestStreamedSilenceSuppression:
         assert consumer.already_sent is False
 
     @pytest.mark.asyncio
+    async def test_silence_marker_followed_by_loop_complete_never_flashes(self):
+        """Both control lines are hidden, including when the stream arrives as one delta."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("[SILENT]" + chr(10) + "LOOP_COMPLETE")
+        consumer.finish()
+        await consumer.run()
+
+        assert all("[SILENT]" not in text and "LOOP_COMPLETE" not in text for text in _sent_and_edited(adapter))
+        assert consumer.final_content_delivered is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
     async def test_partial_marker_preview_is_retracted(self):
         """A marker flushed mid-stream as a preview is deleted on completion."""
         adapter = _make_adapter()
