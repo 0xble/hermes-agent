@@ -143,9 +143,32 @@ def test_fallback_neither_exposes_nor_signals_another_fixture(tmp_path, monkeypa
             rows = host.procs()
             assert owned in {row["pid"] for row in rows}
             assert sibling.pid not in {row["pid"] for row in rows}
-            assert not host.kill(sibling.pid, signal.SIGKILL)
+            assert not host.kill(sibling.pid, signal.SIGKILL)  # windows-footgun: ok - linux-only fallback cell
             assert sibling.poll() is None
-            assert host.kill(owned, signal.SIGKILL)
+            assert host.kill(owned, signal.SIGKILL)  # windows-footgun: ok - linux-only fallback cell
+        assert sibling.poll() is None
+    finally:
+        sibling.terminate()
+        sibling.wait(timeout=10)
+
+
+@pytest.mark.platforms("linux")
+def test_fallback_born_after_kill_cannot_signal_foreign_same_uid_process(tmp_path, monkeypatch):
+    from tests.e2e.core.upgrade.git._hostile_post import _kill_born_after
+
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        env={**os.environ, "HOME": str(tmp_path / "machine" / "home-other")},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        with _host(tmp_path, monkeypatch) as host:
+            before = {row["pid"] for row in host.procs()}
+            owned = host.spawn([sys.executable, "-c", "import time; time.sleep(300)"],
+                               log=host.root / "born-after.log")
+            killed = _kill_born_after(host, before)
+            assert owned in killed
+            assert sibling.poll() is None
         assert sibling.poll() is None
     finally:
         sibling.terminate()
