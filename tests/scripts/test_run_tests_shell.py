@@ -51,3 +51,25 @@ def test_shell_runner_preserves_explicit_power_shell_module_path(tmp_path, modul
         cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.platforms("posix")
+def test_shell_runner_preserves_powershell_analysis_cache_path(tmp_path):
+    """The isolated runner must retain the parent's explicit PS cache location."""
+    case = tmp_path / "test_analysis_cache_path.py"
+    cache_path = str(tmp_path / "powershell-cache")
+    case.write_text(
+        "import os\n"
+        "def test_analysis_cache_path():\n"
+        f"    assert os.environ['PSModuleAnalysisCachePath'] == {cache_path!r}\n",
+        encoding="utf-8",
+    )
+    root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "HERMES_PYTHON": sys.executable,
+           "HERMES_TEST_FILE_RETRIES": "0", "PSModuleAnalysisCachePath": cache_path}
+    env.pop("__HERMES_ACTIVATED", None)
+    result = subprocess.run(
+        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=180, env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
