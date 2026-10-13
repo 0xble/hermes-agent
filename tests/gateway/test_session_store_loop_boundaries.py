@@ -165,6 +165,7 @@ async def test_async_hydration_rejects_stale_read_after_edit(tmp_path, monkeypat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("site", ["chat", "completions", "responses", "runs"])
 async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeypatch):
+    pytest.importorskip("aiohttp")
     from unittest.mock import AsyncMock, MagicMock
     import gateway.run as gateway_run
     from gateway.config import PlatformConfig
