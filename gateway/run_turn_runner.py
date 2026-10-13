@@ -2071,9 +2071,6 @@ class TurnRunner:
         from hermes_cli.goal_turn_outcome import model_final_response
         model_response = model_final_response(result)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
-        # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
-        # returns, so early run_sync returns are also finalised.
-        # See the outer finally/completion section below. See #60671.
         final_response = result.get("final_response")
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
@@ -2087,10 +2084,6 @@ class TurnRunner:
             "context_length": (getattr(comp, "context_length", 0) or 0) if has_comp else 0,
         }
         compacted_in_place, effective_session_id, history_offset = self._sync_session_after_run(agent_history)
-        # failure_reason must survive the empty-response path too (TUI billing, transient-failure
-        # persistence). compression_deferred (soft lock-contention defer) is distinct from
-        # compression_exhausted so the gateway never auto-resets a session a concurrent compressor is
-        # about to shrink.
         common = {
             "_model_final_response": model_response,
             "messages": result.get("messages", []), "api_calls": result.get("api_calls", 0),
@@ -2116,12 +2109,10 @@ class TurnRunner:
                 display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": display_response, **common}
+            return {"final_response": final_response or "", "delivery_text": display_response, **common}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
-        # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
-        # failed/interrupted turn is still titled.
         return {
-            "final_response": final_response, "last_reasoning": result.get("last_reasoning"), **common,
+            "final_response": final_response, "delivery_text": final_response, "last_reasoning": result.get("last_reasoning"), **common,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
             # Lets the persistence block tell whether the codex app-server path self-persisted (it

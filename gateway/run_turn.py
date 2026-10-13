@@ -4647,6 +4647,7 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if isinstance(response, dict) and "delivery_text" in response: response = {**response, "final_response": response["delivery_text"]}
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
