@@ -58,6 +58,7 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginDiscoveryIncomplete, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
     _async_delivery_snapshot, _await_foreground_discovery, _delivery_manager,
+    _join_background_discovery, _loop_observer_snapshot,
     format_system_prompt_sections, is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
@@ -1762,7 +1763,10 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
 def discover_plugins(force: bool = False, *, require_complete: bool = False) -> None:
     """Load plugins; only listing/completion callers may use an incomplete registry."""
     try:
-        _join_background_discovery(timeout=None if require_complete else 30.0)
+        if require_complete:
+            _join_background_discovery(timeout=None)
+        else:
+            _join_background_discovery()
     except PluginDiscoveryIncomplete as exc:
         if require_complete:
             raise
@@ -1803,38 +1807,6 @@ def start_background_plugin_discovery() -> None:
 
         _background_discovery_thread = threading.Thread(target=_run, name="plugin-discovery", daemon=True)
         _background_discovery_thread.start()
-
-
-def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
-    """Wait for an in-flight background discovery.
-
-    ``timeout=None`` is reserved for strict startup: each plugin load already
-    has its own deadline, so the sweep itself is the availability boundary.
-    Listing callers keep the short barrier and may use the available registry.
-    """
-    t = _background_discovery_thread
-    if t is None or t is threading.current_thread() or in_plugin_load_worker():
-        return
-    if not t.is_alive():
-        if timeout is None and (_background_discovery_error is not None
-                                or not getattr(get_plugin_manager(), "_discovery_complete", False)):
-            error = _background_discovery_error
-            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
-        return
-    if timeout is None:
-        while t.is_alive():
-            t.join(timeout=10.0)
-            if t.is_alive():
-                logger.info("Waiting for background plugin discovery to finish")
-    else:
-        t.join(timeout=timeout)
-    if t.is_alive():
-        raise PluginDiscoveryIncomplete("Plugin discovery incomplete after timeout; refusing partial registry delivery")
-    if _background_discovery_error is not None:
-        error = _background_discovery_error
-        raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
-    if timeout is None and not getattr(get_plugin_manager(), "_discovery_complete", False):
-        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1885,16 +1857,16 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
+    """Invoke hooks, waiting for policy discovery; loop observers snapshot current callbacks.
 
-    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
-    bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
-    fail closed with a block directive; other bounded hooks fail open (skip).
-    Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
-    ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
-    callbacks registered by user plugins (tracking #64178).
+    Bounded hooks use ``plugins.hook_callback_timeout``; timed-out or still-running
+    ``pre_tool_call`` callbacks fail closed with a block directive. Unknown/policy
+    hooks never use a partial registry. Observer returns cannot authorize work.
     """
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        manager, callbacks = snapshot
+        return manager.invoke_hook(hook_name, _callbacks=callbacks, **kwargs)
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
@@ -1933,37 +1905,24 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """True when a loaded plugin handles a hook (lazy-discovers first, like :func:`has_middleware`).
-
-    Lazy-discovers first — same gate-before-invoke rationale as :func:`has_middleware` (tracking #64178).
-    """
+    """Probe hooks; loop observers snapshot, policy/worker callers await discovery."""
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        return bool(snapshot[1])
     return _delivery_manager().has_hook(hook_name)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Return a stable snapshot of callbacks registered for a hook.
-
-    Goes through :func:`_delivery_manager` so streaming hook consumers wait for an in-flight
-    background discovery, like :func:`invoke_hook` and :func:`has_hook`.
-    """
+    """Snapshot hooks; loop observers do not wait, policy callers require readiness."""
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        return snapshot[1]
     return _delivery_manager().iter_hook_callbacks(hook_name)
 
 
-def has_hook_nowait(hook_name: str) -> bool:
-    """Probe the current callback snapshot without discovery or lock waits."""
-    return bool(get_plugin_manager().iter_hook_callbacks(hook_name))
-
-
 def snapshot_hook_callbacks_nowait(hook_name: str) -> tuple[Callable, ...]:
-    """Return current callback callbacks without discovery or lock waits."""
+    """Return current callbacks without discovery or lock waits."""
     return get_plugin_manager().iter_hook_callbacks(hook_name)
-
-
-def invoke_hook_nowait(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke the current callback snapshot without waiting for discovery or its lock."""
-    manager = get_plugin_manager()
-    callbacks = manager.iter_hook_callbacks(hook_name)
-    return manager.invoke_hook(hook_name, _callbacks=callbacks, **kwargs)
 
 
 def fire_pre_command_hook(

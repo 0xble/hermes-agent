@@ -14,14 +14,13 @@ from hermes_cli import lifecycle, plugins
 async def test_sync_loop_observers_snapshot_reload_without_waiting(monkeypatch, hook):
     manager = plugins.PluginManager()
     manager._discovered = True
-    manager._discovery_complete = True
     seen = []
     manager._hooks[hook] = [lambda **kwargs: seen.append(kwargs["session_id"])]
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr(plugins, "_background_discovery_thread", None)
     monkeypatch.setattr(plugins, "_join_background_discovery", lambda: pytest.fail("joined on loop"))
     monkeypatch.setattr(plugins, "_await_foreground_discovery", lambda _: pytest.fail("locked on loop"))
-    lifecycle.invoke_hook_nowait(hook, session_id="reload-session")
+    lifecycle.invoke_hook(hook, session_id="reload-session")
     assert seen == ["reload-session"]
 
 
@@ -31,7 +30,6 @@ async def test_pre_command_is_reload_snapshot_observer_not_a_policy_gate(monkeyp
     from gateway.config import Platform
     manager = plugins.PluginManager()
     manager._discovered = True
-    manager._discovery_complete = True
     seen = []
     manager._hooks["pre_command"] = [lambda **kwargs: seen.append(kwargs) or {"action": "block"}]
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
@@ -57,6 +55,8 @@ async def test_telegram_reload_probe_does_not_fail_update_claim(monkeypatch):
     monkeypatch.setattr("hermes_cli.observability.handles_hook", lambda _: False)
     monkeypatch.setattr(plugins, "_join_background_discovery", lambda: pytest.fail("joined on loop"))
     adapter = object.__new__(TelegramAdapter)
+    from gateway.config import Platform
+    adapter.platform = Platform.TELEGRAM
     adapter._platform_event_handler = AsyncMock()
     adapter._normalize_platform_event = Mock(return_value={"event_type": "message_edited"})
     adapter._source_for_platform_event_auth = Mock(return_value="source")

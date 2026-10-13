@@ -305,7 +305,7 @@ def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypa
     assert seen == ["ready"]
 
 
-def test_sync_event_loop_probe_and_policy_refuse_unready_discovery(monkeypatch):
+def test_sync_event_loop_observer_probe_snapshots_but_policy_refuses_unready_discovery(monkeypatch):
     import asyncio
     import hermes_cli.plugins as plugins
 
@@ -316,8 +316,9 @@ def test_sync_event_loop_probe_and_policy_refuse_unready_discovery(monkeypatch):
     monkeypatch.setattr(plugins, "_await_foreground_discovery", lambda _: pytest.fail("locked on loop"))
 
     async def exercise():
+        assert not plugins.has_hook("gateway_platform_event")
         with pytest.raises(RuntimeError, match="discovery incomplete"):
-            plugins.has_hook("gateway_platform_event")
+            plugins.has_hook("pre_gateway_dispatch")
         directive = plugins._get_pre_tool_call_directive_details("terminal", {})
         assert directive.action == "block"
         assert "unavailable" in (directive.message or "")

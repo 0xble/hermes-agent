@@ -20,11 +20,13 @@ completed but the plugin marker and injected canary were absent.
 
 `_delivery_manager()` joins the background worker before checking readiness. The
 recursion guard (`_discovered`) is not readiness (`_discovery_complete`): a timeout
-or re-entry during the sweep refuses partial delivery. A sibling foreground
+or re-entry during the sweep refuses partial policy delivery. A sibling foreground
 sweep is also awaited through the existing discovery lock. The barrier helpers live in
-`hermes_cli/plugins_dispatch.py` and are re-exported by the facade. Every registry reader
-on the delivery path goes through this barrier: `invoke_hook`, `has_hook`,
-middleware, and the streaming snapshot `iter_hook_callbacks`.
+`hermes_cli/plugins_dispatch.py` and are re-exported by the facade. Policy readers
+(`invoke_hook`, `has_hook`, middleware and `iter_hook_callbacks`) use this barrier.
+Synchronous observer readers on a running loop instead take a current callback
+snapshot without discovery or sweep-lock acquisition; a closed allowlist in the
+dispatch owner keeps unknown hooks and all policy/transform hooks strict.
 
 Async hook delivery snapshots a complete registry under a nonblocking sweep-lock
 probe, then releases the lock before callbacks. This gives ready registries a no-yield
@@ -41,9 +43,10 @@ gate, not a fail-open observer: the first message waits for its skip/rewrite pol
 and discovery timeout raises `PluginDiscoveryIncomplete` rather than authorizing
 uninspected text. Callback exception handling is unchanged. Gateway post-admission and platform-event probes
 also run off-loop; platform-event sync delivery runs there too. Synchronous delivery
-called directly on a running loop refuses unready discovery without joining or acquiring
-the lock. The `pre_tool_call` directive path turns that refusal into a block, never an
-empty policy decision. No hook is delivered against a half-loaded registry.
+called directly on a running loop refuses unready **policy** discovery without joining
+or acquiring the lock. The `pre_tool_call` directive path turns that refusal into a
+block, never an empty policy decision. Observer delivery uses the available
+callback snapshot instead; observer returns cannot authorize or rewrite work.
 
 Plain `discover_plugins()` listing/completion callers log a warning and return the
 available registry on a background join timeout, without starting a second sweep. The
@@ -70,6 +73,27 @@ tool deliveries carry distinct `tool_call_id` values so this readiness proof doe
 not collide with the bounded callback gate. A same-call variant deliberately
 reuses the identity and verifies that in-flight duplicate suppression remains in
 place; production deduplication is unchanged.
+
+## Synchronous call-site inventory
+
+The production AST inventory of `invoke_hook`, `has_hook`, `iter_hook_callbacks`
+and `fire_pre_command_hook` has these dispositions:
+
+| Owner / sites | Decision |
+| --- | --- |
+| `gateway/slash_commands_session.py` reset; `gateway/run_agent_cache.py` interrupt | On-loop observer snapshot; never delay `/new` or `/stop` for a reload. |
+| `gateway/run_inbound.py`; `cli.py` command dispatch | `pre_command` is explicitly observer-only in the hook guide and facade; snapshot current callbacks, ignore block/rewrite-shaped returns. `command:<name>` interceptors are a different API. |
+| Discord `_platform_events_subscribed`; Telegram `_on_platform_update` | `gateway_platform_event` observer probe snapshots on-loop; a reload alone cannot fail Telegram update preparation. |
+| `tui_gateway/session_lifecycle.py` boundary, finalize, interrupt; `hermes_cli/cli_session_mixin.py`, `cli_shutdown.py` | Session observers snapshot if reached on-loop; worker-thread callers retain complete-discovery delivery. |
+| `hermes_cli/kanban_db.py` lifecycle, consumed probes, dispatch tick | Every registered Kanban observer name is in the on-loop snapshot allowlist. |
+| `agent/api_request_hooks.py`, `turn_response_intake.py`, `auxiliary_hooks.py`, `conversation_loop.py`, `turn_finalizer.py`, `plugin_stream_hooks.py` | API-error/post-request, auxiliary, session, finalization and stream observers snapshot on-loop, including callback iteration; normal agent worker delivery stays strict. |
+| `tools/approval_context.py`, `human_input_hooks.py`, `skill_usage.py`, `delegate_tool.py`, `delegate_tool_results.py`; `model_tools.py` post-tool | Approval/input/skill/subagent/post-tool observers snapshot if called from an event loop. |
+| `agent/turn_api_request.py`, `turn_context.py`, `turn_stop_gates.py`; `hermes_cli/plugins.py` directive/verification/error-classification helpers | Rewrite/gating hooks remain strict. These are synchronous agent-worker paths, not gateway-loop handoffs. `pre_tool_call` converts discovery failure into a block. |
+| `model_tools.py` transform; `tools/terminal_tool_result.py`, `transcription_command.py`, `delegate_tool_progress.py` | Transform/transcription/suppression hooks are not observers and remain strict on their existing synchronous tool/agent worker paths. |
+| `hermes_cli/lifecycle.py`, facade and dispatch mixin internals | Shared observer allowlist enforces the distinction. Unknown hooks remain strict; the callback tuple is passed explicitly so a reload cannot alter iteration after selection. |
+
+`pre_gateway_dispatch` already uses async delivery and awaits discovery off-loop.
+No policy hook is added to the observer allowlist.
 
 ## Verification and retirement
 

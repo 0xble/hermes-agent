@@ -38,24 +38,6 @@ async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return await plugins.ainvoke_hook(hook_name, **kwargs)
 
 
-def invoke_hook_nowait(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke the current callback snapshot without waiting for discovery or its lock."""
-    from hermes_cli import plugins
-    return plugins.invoke_hook_nowait(hook_name, **kwargs)
-
-
-def has_hook_nowait(hook_name: str) -> bool:
-    """Observer-only probe; never wait for discovery or its registry lock."""
-    try:
-        from hermes_cli.observability import handles_hook
-        if handles_hook(hook_name):
-            return True
-    except Exception:
-        logger.debug("Unable to inspect built-in observability hooks", exc_info=True)
-    from hermes_cli import plugins
-    return plugins.has_hook_nowait(hook_name)
-
-
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     try:

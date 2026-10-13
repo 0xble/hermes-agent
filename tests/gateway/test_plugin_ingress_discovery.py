@@ -147,29 +147,31 @@ async def test_incomplete_discovery_does_not_authorize_ingress(monkeypatch, fail
         await GatewayInboundMixin()._hm_pre_gateway_dispatch_hook(event, source)
 
 
-def test_startup_refuses_incomplete_registry_after_join_timeout(monkeypatch):
+def test_startup_refuses_worker_that_exits_incomplete(monkeypatch):
     import hermes_cli.plugins as plugins
     import gateway.relay as relay
 
-    class SlowThread:
+    class FailedThread:
+        alive = True
+
         def is_alive(self):
-            return True
+            return self.alive
 
         def join(self, timeout):
-            pass
+            self.alive = False
 
     manager = plugins.PluginManager()
     manager._discovered = True
     relay_registration = Mock()
     config_hooks = Mock()
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
-    monkeypatch.setattr(plugins, "_background_discovery_thread", SlowThread())
+    monkeypatch.setattr(plugins, "_background_discovery_thread", FailedThread())
     monkeypatch.setattr("hermes_cli.plugins_cmd_remove.sweep_pending_plugin_deletes", lambda: None)
     monkeypatch.setattr(relay, "self_provision_relay", lambda: None)
     monkeypatch.setattr(relay, "register_relay_adapter", relay_registration)
     monkeypatch.setattr(GatewayStartupMixin, "_register_launch_profile_config_hooks", config_hooks)
 
-    with pytest.raises(RuntimeError, match="discovery incomplete"):
+    with pytest.raises(RuntimeError, match="discovery"):
         GatewayStartupMixin._start_register_plugins_relay_hooks()
     relay_registration.assert_not_called()
     config_hooks.assert_not_called()

@@ -97,6 +97,35 @@ def _delivery_manager():
     return manager
 
 
+# Only hooks whose return values do not authorize, rewrite or suppress work may
+# use a partial snapshot on a running loop. Unknown/new hooks stay strict.
+_LOOP_OBSERVER_HOOKS = frozenset({
+    "post_tool_call", "post_llm_call", "post_api_request", "api_request_error",
+    "pre_auxiliary_call", "post_auxiliary_call", "on_session_start", "on_session_end",
+    "on_session_finalize", "on_session_reset", "on_skill_lifecycle", "subagent_start",
+    "subagent_stop", "agent_loop_stopped", "pre_approval_request",
+    "post_approval_response", "on_human_input_request", "on_human_input_resolved",
+    "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
+    "on_room_member_activity", "kanban_task_claimed", "kanban_task_completed",
+    "kanban_task_blocked", "on_kanban_worker_spawned", "on_kanban_worker_exited",
+    "on_kanban_worker_stale_claim", "on_kanban_task_updated", "on_kanban_dispatch_tick",
+    "gateway_platform_event", "pre_command",
+})
+
+
+def _loop_observer_snapshot(hook_name: str):
+    """Snapshot observer callbacks on-loop without discovery or registry lock waits."""
+    if hook_name not in _LOOP_OBSERVER_HOOKS:
+        return None
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    return manager, manager.iter_hook_callbacks(hook_name)
+
+
 async def _async_delivery_snapshot(hook_name: str):
     """Snapshot a ready registry under a nonblocking lock; wait for reloads off-loop."""
     from hermes_cli import plugins
@@ -127,6 +156,39 @@ async def _async_delivery_snapshot(hook_name: str):
                 raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry lock wait timed out")
         else:
             manager = await asyncio.to_thread(_delivery_manager)
+
+
+def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
+    """Wait for an in-flight background discovery.
+
+    ``timeout=None`` is reserved for strict startup: each plugin load already
+    has its own deadline, so the sweep itself is the availability boundary.
+    Listing callers keep the short barrier and may use the available registry.
+    """
+    from hermes_cli import plugins
+    t = plugins._background_discovery_thread
+    if t is None or t is threading.current_thread() or plugins.in_plugin_load_worker():
+        return
+    if not t.is_alive():
+        if timeout is None and (plugins._background_discovery_error is not None
+                                or not getattr(plugins.get_plugin_manager(), "_discovery_complete", False)):
+            error = plugins._background_discovery_error
+            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+        return
+    if timeout is None:
+        while t.is_alive():
+            t.join(timeout=10.0)
+            if t.is_alive():
+                logger.info("Waiting for background plugin discovery to finish")
+    else:
+        t.join(timeout=timeout)
+    if t.is_alive():
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete after timeout; refusing partial registry delivery")
+    if plugins._background_discovery_error is not None:
+        error = plugins._background_discovery_error
+        raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if timeout is None and not getattr(plugins.get_plugin_manager(), "_discovery_complete", False):
+        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:

@@ -1845,8 +1845,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     def _platform_events_subscribed() -> bool:
         """has_hook fast-path shared by every Discord fire-site."""
         try:
-            from hermes_cli.lifecycle import has_hook_nowait
-            return has_hook_nowait("gateway_platform_event")
+            from hermes_cli.lifecycle import has_hook
+            return has_hook("gateway_platform_event")
         except Exception:
             return False
 
