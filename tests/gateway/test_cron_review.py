@@ -111,3 +111,18 @@ def test_human_followup_is_preserved_outside_review_capture():
     assert "_cron_review_capture" not in human.metadata
     ctx.event_metadata = {}
     assert defer_review_followup(runner, ctx, adapter, human, human.text) == (human, human.text)
+
+
+def test_bare_human_interrupt_is_rebuilt_as_a_reply_expected_human_event():
+    from gateway.cron_review import defer_review_followup
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    ctx = SimpleNamespace(event_metadata={"_cron_review_capture": Future()}, session_key="key",
+                          source=source, internal=True, reply_expected=False)
+    adapter = SimpleNamespace(_pending_messages={})
+    assert defer_review_followup(SimpleNamespace(), ctx, adapter, None, "human follow-up") == (None, None)
+    event = adapter._pending_messages["key"]
+    assert event.text == "human follow-up"
+    assert event.source is source
+    assert event.internal is False
+    assert event.reply_expected is True
+    assert "_cron_review_capture" not in event.metadata

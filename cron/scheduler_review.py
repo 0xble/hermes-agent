@@ -5,10 +5,32 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+_shutdown = threading.Event()
+_rerun_lock = threading.Lock()
+_rerun_children: set[subprocess.Popen] = set()
+
+
+class ReviewAbandoned(BaseException):
+    """A held report must remain replayable when the gateway stops reviewing it."""
+
+
+def _check_review_active():
+    if _shutdown.is_set():
+        raise ReviewAbandoned("gateway stopped reviewing reports")
+
+
+def stop_reviews():
+    """Stop admission and kill every tracked rerun process group on gateway shutdown."""
+    from cron.scheduler_script import _terminate_cron_script_tree
+    with _rerun_lock:
+        _shutdown.set()
+        for process in tuple(_rerun_children):
+            _terminate_cron_script_tree(process)
 
 
 def _resolve_review_subject(review: dict) -> dict:
@@ -21,6 +43,11 @@ def _resolve_review_subject(review: dict) -> dict:
     path = get_hermes_home().resolve() / "state.db"
     if not path.is_file():
         raise ValueError(f"review subject lookup state.db missing: {path}")
+    from hermes_cli.config import cfg_get, load_config
+    excluded = cfg_get(load_config(), "cron", "review", "excluded_threads", default=[]) or []
+    if not isinstance(excluded, list):
+        raise ValueError("cron.review.excluded_threads must be a list")
+    excluded = {str(thread) for thread in excluded}
     conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
@@ -32,7 +59,6 @@ def _resolve_review_subject(review: dict) -> dict:
                 WHERE s.ended_at IS NULL AND s.end_reason IS NULL
                   AND COALESCE(s.archived, 0) = 0
                   AND COALESCE(s.hidden, 0) = 0
-                  AND CAST(b.thread_id AS TEXT) NOT IN ('255600', '258219')
                   AND (CAST(b.thread_id AS TEXT) = ? OR s.title = ?)""",
             (subject, subject),
         ).fetchall()
@@ -40,6 +66,7 @@ def _resolve_review_subject(review: dict) -> dict:
         raise ValueError(f"review subject lookup failed: {exc}") from exc
     finally:
         conn.close()
+    rows = [row for row in rows if str(row["thread_id"]) not in excluded]
     if len(rows) != 1:
         raise ValueError(f"review subject {subject!r} resolved to {len(rows)} live topics; refusing to guess")
     return dict(rows[0])
@@ -83,12 +110,14 @@ def _run_review_hop(subject: dict, prompt: str, adapters, loop, deadline: float)
     control_home = (owner.home if owner is not None and not launched_by_other_tenant(owner.home, home)
                     else home)
     end = time.monotonic() + deadline
+    _check_review_active()
     submitted = query_gateway_control(control_home, "cron-review", payload={
         "session_key": subject["session_key"], "session_id": subject["session_id"],
         "text": prompt, "timeout_seconds": deadline}, timeout=min(5, deadline))
     if not isinstance(submitted, dict) or not submitted.get("token"):
         raise RuntimeError("gateway unavailable for invisible review")
     while time.monotonic() < end:
+        _check_review_active()
         response = query_gateway_control(control_home, "cron-review-result",
             params={"token": submitted["token"]}, timeout=min(5, max(.01, end-time.monotonic())))
         if not isinstance(response, dict):
@@ -117,16 +146,25 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
     payload = {k: v for k, v in job.items() if not k.startswith("_")}
     from hermes_cli._subprocess_compat import windows_hide_flags
     from cron.scheduler_script import _terminate_cron_script_tree, _drain_script_pipes
-    process = subprocess.Popen([sys.executable, "-m", "cron.review_rerun"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, env=env, cwd=str(Path(__file__).resolve().parents[1]),
-        start_new_session=True, creationflags=windows_hide_flags())
+    with _rerun_lock:
+        _check_review_active()
+        process = subprocess.Popen([sys.executable, "-m", "cron.review_rerun"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, cwd=str(Path(__file__).resolve().parents[1]),
+            start_new_session=True, creationflags=windows_hide_flags())
+        _rerun_children.add(process)
     try:
         stdout, stderr = process.communicate(json.dumps(payload), timeout=remaining - 10)
+        _check_review_active()
     except subprocess.TimeoutExpired:
-        _terminate_cron_script_tree(process)
-        _drain_script_pipes(process)
         raise TimeoutError("review rerun deadline expired") from None
+    finally:
+        # Also runs if this review thread exits for a reason other than its deadline.
+        with _rerun_lock:
+            if process.poll() is None:
+                _terminate_cron_script_tree(process)
+                _drain_script_pipes(process)
+            _rerun_children.discard(process)
     for line in reversed(stdout.splitlines()):
         if line.startswith("HERMES_REVIEW_RESULT="):
             success, text, error = json.loads(line.split("=", 1)[1])
@@ -194,6 +232,7 @@ def _deliver_reviewed_result(job: dict, content: str, adapters, loop) -> Optiona
     from cron.scheduler import _is_cron_silence_response
     from cron.scheduler_delivery import _deliver_result
 
+    _check_review_active()
     review = job["review"]
     started = time.monotonic()
     deadline_epoch = float(job.get("_review_deadline_epoch") or (
@@ -249,6 +288,12 @@ def _deliver_reviewed_result(job: dict, content: str, adapters, loop) -> Optiona
     delivery_job["_review_mirror_session"] = subject["session_id"]
     delivery_job["attach_to_session"] = True
     receipt["selected_candidate"] = receipt["decision"] if selected != content else "original"
+    _check_review_active()
+    claim = job.get("_review_queue_claim")
+    if claim:
+        from cron.delivery_queue import begin_final_delivery
+        if not begin_final_delivery(*claim):
+            raise ReviewAbandoned("review delivery claim was abandoned")
     try:
         error = _deliver_result(delivery_job, selected, adapters=adapters, loop=loop, for_failure=False)
         receipt["delivery_error"] = error

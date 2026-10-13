@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -18,6 +19,9 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 RECEIPT_NAME = "review-receipts.jsonl"
+MAX_RECEIPT_BYTES = 2 * 1024 * 1024
+_receipt_lock = threading.RLock()
+_receipt_lock_holder = threading.local()
 _DEFAULT_SILENCE_MARKERS = ("[SILENT]", "SILENT", "NO_REPLY", "NO REPLY", "[CRON_FAILURE]")
 
 
@@ -137,11 +141,18 @@ def parse_decision(reply: str) -> tuple[str, str]:
 
 
 def append_receipt(record: dict[str, Any]) -> None:
+    from hermes_cli.auth import _file_lock
+
     payload = dict(record)
     payload.setdefault("recorded_at", time.time())
     path = receipt_path()
-    with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    with _receipt_lock, _file_lock(path.with_suffix(".lock"), _receipt_lock_holder, 10,
+                                   "Timed out waiting for cron review receipts"):
+        if path.exists() and path.stat().st_size + len(line) > MAX_RECEIPT_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+        with path.open("ab") as stream:
+            stream.write(line)
 
 
 def normalize_review(value: Any) -> Optional[dict[str, Any]]:

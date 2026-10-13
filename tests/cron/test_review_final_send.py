@@ -8,12 +8,14 @@ from gateway.platforms.base import SendResult
 from hermes_state import SessionDB
 
 
-def test_final_send_preserves_contract_envelope_and_mirrors_as_assistant(tmp_path, monkeypatch):
+def test_final_send_preserves_envelope_and_separates_report_from_assistant_decision(tmp_path, monkeypatch):
     from cron.scheduler_delivery import _deliver_result
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("hermes_state.DEFAULT_DB_PATH", tmp_path / "state.db")
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("subject-session", source="telegram")
+    db.append_message("subject-session", "user", "invisible review prompt")
+    db.append_message("subject-session", "assistant", "PRESENT")
     subject = {"chat_id": "42", "thread_id": "139328", "user_id": "42",
                "session_id": "subject-session", "session_key": "subject-key"}
     monkeypatch.setattr("cron.scheduler_review._resolve_review_subject", lambda review: subject)
@@ -45,8 +47,8 @@ def test_final_send_preserves_contract_envelope_and_mirrors_as_assistant(tmp_pat
     assert sent[0][0] == text
     assert str(sent[0][1]["thread_id"]) == "139328"
     messages = db.get_messages("subject-session")
-    assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == text
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[-1]["content"] == "[Cron delivery: Daily Report]\n" + text
     db.close()
 
 

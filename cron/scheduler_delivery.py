@@ -236,13 +236,13 @@ def _maybe_mirror_cron_delivery(
         return
     try:
         from gateway.mirror import mirror_to_session
-        # Ordinary briefs remain labelled user turns, preserving replay alternation (#2221, #2313).
-        # A reviewed presentation belongs to the subject agent, so it appends as its own assistant text.
+        # The invisible review already ends with an assistant decision. A labelled user
+        # mirror keeps that protocol reply separate from the report on transcript replay.
         review_session = job.get("_review_mirror_session")
         ok = mirror_to_session(
-            platform_name, str(chat_id), text if review_session else _cron_mirror_message(job, text),
+            platform_name, str(chat_id), _cron_mirror_message(job, text),
             source_label="cron", thread_id=thread_id, user_id=user_id,
-            role="assistant" if review_session else "user",
+            role="user",
             **({"session_id": review_session} if review_session else {}))
         if ok:
             logger.info(

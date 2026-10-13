@@ -158,6 +158,21 @@ def test_receipt_is_persisted_under_profile_cron(tmp_path, monkeypatch):
     assert json.loads(receipt_path().read_text())["decision"] == "PRESENT"
 
 
+def test_receipts_rotate_and_keep_only_one_complete_backup(tmp_path, monkeypatch):
+    import json
+    from cron import review
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(review, "MAX_RECEIPT_BYTES", 200)
+    for index in range(4):
+        review.append_receipt({"job_id": str(index), "text_sent": "report " * 10})
+    path = review.receipt_path()
+    assert json.loads(path.read_text())["job_id"] == "3"
+    assert json.loads(path.with_name(path.name + ".1").read_text())["job_id"] == "2"
+    assert not path.with_name(path.name + ".2").exists()
+    assert path.stat().st_size <= 200
+    assert path.with_name(path.name + ".1").stat().st_size <= 200
+
+
 @pytest.mark.parametrize("changed", [False, True])
 def test_subject_must_still_be_live_and_same_at_final_send(delivery, monkeypatch, changed):
     sr, sent, receipts, incidents, _ = delivery

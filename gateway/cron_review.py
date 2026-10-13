@@ -28,8 +28,8 @@ def defer_review_followup(runner, ctx, adapter, event, text):
     if not (ctx.event_metadata or {}).get("_cron_review_capture") or not (event or text):
         return event, text
     from gateway.platforms.event import MessageEvent
-    event = event or MessageEvent(text=text, source=ctx.source, internal=ctx.internal,
-                                 reply_expected=ctx.reply_expected)
+    event = event or MessageEvent(text=text, source=ctx.source, internal=False,
+                                 reply_expected=True)
     existing = adapter._pending_messages.get(ctx.session_key)
     if existing is not None:
         runner._session_state(ctx.session_key).conversation.queued_events.insert(0, existing)

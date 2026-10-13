@@ -41,11 +41,20 @@ def test_ambiguous_thread_or_title_is_refused(subjects):
 
 
 @pytest.mark.parametrize("thread, flags", [
-    ("255600", {}), ("258219", {}), ("3", {"ended_at": 1}),
+    ("3", {"ended_at": 1}),
     ("4", {"end_reason": "merged"}), ("5", {"archived": 1}), ("6", {"hidden": 1}),
 ])
 def test_ineligible_topics_are_excluded(subjects, thread, flags):
     subjects("excluded", thread, "Excluded", **flags)
     for subject in (thread, "Excluded"):
+        with pytest.raises(ValueError, match="0 live topics"):
+            _resolve_review_subject({"subject": subject})
+
+
+def test_excluded_threads_are_loaded_from_profile_config_and_default_empty(subjects, tmp_path):
+    subjects("topic", "255600", "Report Topic")
+    assert _resolve_review_subject({"subject": "255600"})["session_id"] == "topic"
+    (tmp_path / "config.yaml").write_text("cron:\n  review:\n    excluded_threads: [255600]\n")
+    for subject in ("255600", "Report Topic"):
         with pytest.raises(ValueError, match="0 live topics"):
             _resolve_review_subject({"subject": subject})

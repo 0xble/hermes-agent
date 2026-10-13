@@ -1854,10 +1854,10 @@ DEFAULT_CONFIG = {
 
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
-        # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
-        # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
-        # created this way are user-owned in the same flat jobs table. Interactive toolsets
-        # (messaging/clarify) stay denied in cron regardless.
+        # Topic thread IDs that cannot receive opted-in reviewed reports.
+        "review": {"excluded_threads": []},
+        # Opt-in cronjob access prevents unattended scheduling loops. Created jobs remain user-owned.
+        # Interactive toolsets (messaging/clarify) stay denied in cron regardless.
         "allow_agent_scheduling": False,
         # Pre-dispatch validation: before building any agent machinery, verify the provider API key
         # resolves (unless a fallback chain exists), attached skills are ready, and delivery

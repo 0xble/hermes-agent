@@ -2438,7 +2438,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         return []
 
     async def _stop_begin_teardown(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
-        """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
@@ -2452,7 +2451,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         except Exception:
             logger.debug("Could not fence survivor pollers during shutdown", exc_info=True)
         self._mark_api_runs_shutdown_requested()
-        # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
+        from cron.scheduler_review import stop_reviews
+        await asyncio.to_thread(stop_reviews)
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
             try:
