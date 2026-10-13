@@ -2321,16 +2321,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
-            # The reader thread can finalise the session while the signal path
-            # blocks in the SIGKILL grace window: its ``save_completed_result``
-            # then persists this kill as a plain ``exited``. Re-write the receipt
-            # so the durable record matches what the caller was told.
-            if not self._move_to_finished(session):
-                if deadline is None or time.monotonic() < deadline:
-                    if deadline is None:
-                        save_completed_result(session)
-                    else:
-                        save_completed_result(session, prune=False)
+            # The finalization owner writes the completed receipt. A kill that loses the
+            # finalization claim must not perform a second, racing receipt write.
+            self._move_to_finished(session)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()
             return {
@@ -3067,10 +3060,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         session.termination_source = source
                         if consume_output:
                             self._completion_consumed.add(session.id)
-                    moved = self._move_to_finished(session)
-                    if not moved and (deadline is None or time.monotonic() < deadline):
-                        # The sweep prunes once at the end; a per-session scan here would not.
-                        save_completed_result(session, prune=False)
+                    self._move_to_finished(session)
                     killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]

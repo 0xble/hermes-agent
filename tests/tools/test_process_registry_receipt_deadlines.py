@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -74,7 +75,7 @@ def test_reader_receipt_contention_does_not_block_bounded_shutdown(tmp_path, mon
         assert reader._reader_thread is not None
         reader._reader_thread.join(timeout=5.0)
         assert reader._completion_event.is_set()
-        record = json.loads((home / "logs" / "process-results" / f"{reader.id}.json").read_text())
+        record = json.loads((home / "logs" / "process-results" / f"{reader.id}.json").read_text(encoding="utf-8-sig"))
         assert record["completion_reason"] == "exited"
         assert record["output"] == "reader terminal tail\n"
         notices = []
@@ -90,6 +91,107 @@ def test_reader_receipt_contention_does_not_block_bounded_shutdown(tmp_path, mon
             if proc.poll() is None:
                 proc.kill()
             proc.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize("kill", ["all", "one"])
+@pytest.mark.parametrize("pause", ["before_lock", "during_write"])
+@pytest.mark.platforms("posix")
+def test_final_receipt_owner_cannot_be_overwritten_by_kill_race(tmp_path, monkeypatch, kill, pause):
+    """A real child's reader and kill path share one final receipt owner."""
+    from tools import process_registry_results as receipts
+
+    registry = ProcessRegistry()
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.readline(); print('final tail')"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    killer = None
+    release_reader = threading.Event()
+    reader_waiting = threading.Event()
+    session = None
+    try:
+        session = registry.adopt_local(child, command="reader-kill-race", cwd=None)
+        session.notify_on_complete = True
+        assert session._reader_thread is not None
+        reader_ident = session._reader_thread.ident
+        assert reader_ident is not None
+        real_acquire = receipts._acquire_result_lock
+        real_signal = os.kill
+        real_write = receipts.atomic_json_write
+        completed_writes = []
+
+        def acquire(deadline):
+            if pause == "before_lock" and threading.current_thread().ident == reader_ident:
+                reader_waiting.set()
+                assert release_reader.wait(10.0)
+            return real_acquire(deadline)
+
+        def signal_child(pid, sig):
+            if pid == child.pid and sig == signal.SIGTERM:
+                # The kill already selected a live target. Let its real reader observe exit 0
+                # and claim finalization, then park it before the result-write lock.
+                assert child.stdin is not None
+                child.stdin.write("exit\n")
+                child.stdin.flush()
+                assert reader_waiting.wait(5.0)
+                assert session.exit_code == 0
+            return real_signal(pid, sig)
+
+        def record_write(path, record, **kwargs):
+            if record.get("completion_reason") != "cut_pending":
+                completed_writes.append((threading.current_thread().ident, record.copy()))
+            if pause == "during_write" and threading.current_thread().ident == reader_ident:
+                reader_waiting.set()
+                assert release_reader.wait(10.0)
+            return real_write(path, record, **kwargs)
+
+        monkeypatch.setattr(receipts, "_acquire_result_lock", acquire)
+        monkeypatch.setattr(os, "kill", signal_child)
+        monkeypatch.setattr(receipts, "atomic_json_write", record_write)
+        if kill == "all":
+            killer = threading.Thread(
+                target=lambda: registry.kill_all(
+                    deadline=time.monotonic() + 2.0, source="gateway_shutdown",
+                ),
+                daemon=True,
+            )
+        else:
+            killer = threading.Thread(
+                target=lambda: registry.kill_process(session.id, consume_output=False), daemon=True,
+            )
+        killer.start()
+        assert reader_waiting.wait(5.0), "reader did not claim finalization before the kill"
+        killer.join(timeout=5.0)
+        assert not killer.is_alive(), "kill path waited for the reader's receipt write"
+        assert session.completion_reason == "killed"
+        assert not session._completion_event.is_set()
+        release_reader.set()
+        session._reader_thread.join(timeout=5.0)
+        assert session._completion_event.is_set()
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        record = json.loads(receipt.read_text(encoding="utf-8-sig"))
+        assert record["completion_reason"] == "killed"
+        assert record["exit_code"] == -15
+        assert record["termination_source"] == ("gateway_shutdown" if kill == "all" else "process.kill")
+        assert record["output"] == "final tail\n"
+        assert completed_writes
+        assert all(writer == reader_ident for writer, _ in completed_writes)
+        if pause == "before_lock":
+            assert len(completed_writes) == 1
+        notice = registry.completion_queue.get_nowait()
+        assert (notice["completion_reason"], notice["exit_code"]) == ("killed", -15)
+        assert registry.completion_queue.empty()
+    finally:
+        release_reader.set()
+        if killer is not None:
+            killer.join(timeout=5.0)
+        if session is not None and session._reader_thread is not None:
+            session._reader_thread.join(timeout=5.0)
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5.0)
 
 
 @pytest.mark.parametrize("phase", ["classify", "age_delete", "cap_delete"])

@@ -127,23 +127,23 @@ def _result_paths(*, deadline: float | None = None):
     ]
 
 
+def _completed_result_snapshot(session) -> dict:
+    from tools.process_registry import MAX_OUTPUT_CHARS
+
+    with session._lock:
+        return {
+            **{key: getattr(session, key) for key in _RESULT_FIELDS},
+            "output": session.output_buffer[-MAX_OUTPUT_CHARS:],
+            _CUT_RECEIPT_FIELD: bool(getattr(session, "_cut_receipt", False)),
+        }
+
+
 def save_completed_result(
     session, *, completion_reason: str | None = None, termination_source: str | None = None,
     prune: bool = True,
 ) -> None:
     from agent.redact import redact_sensitive_text, redact_terminal_output
-    from tools.process_registry import MAX_OUTPUT_CHARS
 
-    with session._lock:
-        record = {key: getattr(session, key) for key in _RESULT_FIELDS}
-        record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
-    if completion_reason is not None:
-        record["completion_reason"] = completion_reason
-    if termination_source is not None:
-        record["termination_source"] = termination_source
-    # Live-output opt-out must not persist raw credentials in durable receipts.
-    record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
-    record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
     directory = get_hermes_home() / "logs" / "process-results"
     path = directory / f"{session.id}.json"
     try:
@@ -155,12 +155,28 @@ def save_completed_result(
             return
         try:
             existing = _read_existing_record(path)
-            record[_CUT_RECEIPT_FIELD] = bool(
-                getattr(session, "_cut_receipt", False)
-                or existing.get(_CUT_RECEIPT_FIELD)
+            retained_cut = bool(
+                existing.get(_CUT_RECEIPT_FIELD)
                 or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
             )
-            atomic_json_write(path, _header_first(record), mode=0o600)
+            # Only the finalization owner writes. Snapshot after taking the result lock, but
+            # never hold the session lock across IO: stop signals/reaping need that lock too.
+            # If a kill reconciles during the write, the same owner refreshes its receipt
+            # before publishing completion instead of racing a second producer.
+            while True:
+                snapshot = _completed_result_snapshot(session)
+                record = snapshot.copy()
+                if completion_reason is not None:
+                    record["completion_reason"] = completion_reason
+                if termination_source is not None:
+                    record["termination_source"] = termination_source
+                # Live-output opt-out must not persist raw credentials in durable receipts.
+                record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
+                record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
+                record[_CUT_RECEIPT_FIELD] |= retained_cut
+                atomic_json_write(path, _header_first(record), mode=0o600)
+                if _completed_result_snapshot(session) == snapshot:
+                    break
             if prune:
                 _result_paths()
         finally:
