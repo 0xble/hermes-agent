@@ -18,6 +18,7 @@ import pytest
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from tools.process_registry import ProcessRegistry, ProcessSession
+from tests.waiting import async_wait_until
 
 
 class AdmittingHandler(AsyncMock):
@@ -996,8 +997,7 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     durable claim and settle on the delivery path must run off the loop, so the loop keeps
     answering liveness probes while the ledger is slow."""
     import contextlib
-    import time
-    from itertools import pairwise
+    import threading
 
     from hermes_cli import sqlite_util
     from tools import async_delegation
@@ -1006,43 +1006,45 @@ def test_slow_ledger_transaction_does_not_block_the_event_loop(monkeypatch, isol
     for event in events:
         _persist_pending_completion(event)
 
-    stall_s = 1.2
     real_transaction = sqlite_util.transaction
+    running_loop: list[asyncio.AbstractEventLoop] = []
+    stalls: list[bool] = []  # one per stalled transaction: did the event loop release it?
 
     @contextlib.contextmanager
     def _slow_transaction(conn, **kwargs):
         with real_transaction(conn, **kwargs) as inner:
             yield inner
-        time.sleep(stall_s)  # the blocking close/checkpoint seen in the gateway freeze
+        if not running_loop:
+            return
+        # The blocking close/checkpoint seen in the gateway freeze, held until the event loop
+        # itself runs a callback. On the loop thread that callback cannot run, so the stall
+        # times out and is recorded as a blocked loop.
+        released = threading.Event()
+        try:
+            running_loop[0].call_soon_threadsafe(released.set)
+        except RuntimeError:
+            return  # Loop already closed: not on the delivery path.
+        stalls.append(released.wait(timeout=5))
 
     monkeypatch.setattr(sqlite_util, "transaction", _slow_transaction)
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
 
     async def _exercise():
-        ticks = [time.monotonic()]
-        delivery_done = asyncio.Event()
-
-        async def _heartbeat():
-            while not delivery_done.is_set():
-                await asyncio.sleep(0.05)
-                ticks.append(time.monotonic())
-
-        heartbeat = asyncio.create_task(_heartbeat())
+        running_loop.append(asyncio.get_running_loop())
         try:
-            result = await runner._deliver_async_delegation_group([dict(e) for e in events])
+            return await runner._deliver_async_delegation_group([dict(e) for e in events])
         finally:
-            delivery_done.set()
-            await heartbeat
-        return result, max(b - a for a, b in pairwise(ticks))
+            running_loop.clear()
 
-    result, worst_gap = asyncio.run(_exercise())
+    result = asyncio.run(_exercise())
 
     assert result is True
     adapter.handle_message.assert_awaited_once()
     for event in events:
         assert async_delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
-    assert worst_gap < 1.0, f"event loop stalled {worst_gap:.2f}s behind a slow ledger transaction"
+    assert stalls, "the delivery path never reached a ledger transaction"
+    assert all(stalls), f"event loop blocked behind a slow ledger transaction ({stalls.count(False)} of {len(stalls)})"
 
 
 @pytest.mark.parametrize("siblings", [False, True])
@@ -1176,17 +1178,15 @@ def test_cancelled_sibling_claim_releases_its_lease(monkeypatch, isolated_regist
 
     async def _exercise():
         task = asyncio.create_task(runner._deliver_async_delegation_group([dict(e) for e in events]))
-        while not entered.is_set():
-            await asyncio.sleep(0.01)
+        await async_wait_until(entered.is_set, timeout=5, what="sibling claim entered")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         proceed.set()
-        for _ in range(300):
-            await asyncio.sleep(0.01)
-            if async_delegation.claim_completion_delivery(events[1]["delegation_id"], "next-consumer"):
-                return True
-        return False
+        return await async_wait_until(
+            lambda: async_delegation.claim_completion_delivery(events[1]["delegation_id"], "next-consumer"),
+            timeout=3, what="cancelled sibling claim refunded",
+        )
 
     assert asyncio.run(_exercise()), "cancelled sibling claim stranded its lease"
 
@@ -1214,17 +1214,15 @@ def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_
 
     async def _exercise():
         task = asyncio.create_task(runner._deliver_async_delegation_group([dict(event)]))
-        while not committed.is_set():
-            await asyncio.sleep(0.01)
+        await async_wait_until(committed.is_set, timeout=5, what="primary claim committed")
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         proceed.set()
-        for _ in range(300):
-            await asyncio.sleep(0.01)
-            if real_claim(event["delegation_id"], "next-consumer"):
-                return True
-        return False
+        return await async_wait_until(
+            lambda: real_claim(event["delegation_id"], "next-consumer"),
+            timeout=3, what="cancelled primary claim refunded",
+        )
 
     assert asyncio.run(_exercise()), "cancelled primary claim stranded its lease"
     row = async_delegation.get_durable_delegation(event["delegation_id"])

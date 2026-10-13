@@ -13,6 +13,8 @@ import logging
 import threading
 from typing import Callable, Iterable, TypeVar
 
+from agent.memory_provider import spawn_context_thread
+
 logger = logging.getLogger("gateway.run")
 _T = TypeVar("_T")
 
@@ -114,8 +116,9 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
             abandoned = True
         if handed_over:
             # The worker finished before cancellation, but its result was never consumed.
-            threading.Thread(
-                target=release_ctx.run, args=(release, handed_over[0]), daemon=False,
+            # ``release_ctx`` (the claim's context) stays the effective scope inside the wrapper.
+            spawn_context_thread(
+                release_ctx.run, args=(release, handed_over[0]), name="completion-claim-refund", daemon=False,
             ).start()
         raise
 
