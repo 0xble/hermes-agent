@@ -16,6 +16,14 @@ resolution has its separate invariant test. These corrections remain within
 The native Telegram cancel-before-entry test awaits its task callback rendezvous
 before asserting admission release. PTB stop and an already completed Task do not
 by themselves drain registered callbacks. The production admission code is unchanged.
+Native Windows desktop-update commit-outcome and Unicode runtime fixtures launch
+PowerShell with `-NoProfile -NonInteractive` and stdin at EOF. Hosted evidence
+showed about 22 seconds before the hand-off's first marker event with inherited
+stdin, while explicitly noninteractive native cmdlet probes
+took 0.19–0.51 seconds. That startup cost exhausted the 300-second commit-outcome
+file budget and could expire the R6 lock before the hand-off reached its release
+wait. Keep the actual native subprocesses, console-code-page coverage, assertions,
+and timeout bounds; do not emulate Windows or relax the wait proof.
 
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
