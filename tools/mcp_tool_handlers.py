@@ -574,6 +574,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
     op = f"tools/call {tool_name}"
 
     def _handler(args: dict, **kwargs) -> Any:
+        from agent.relay_guard import mcp_child_parent_relay_error
+        if relay_error := mcp_child_parent_relay_error(server_name, tool_name, args):
+            return tool_error(relay_error)
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
