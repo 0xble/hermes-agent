@@ -12,6 +12,41 @@ outbox: the existing durable outbox owns final turn responses and explicitly
 excludes unrelated background notifications, so the bounded retry and terminal
 warning are the documented recovery boundary for notices.
 
+## Protected meaningful outcome classification
+
+The shared goal notice boundary classifies achieved, blocked, genuine pause,
+failure/exhaustion and resumed-control receipts as existing `OUTBOUND_FINAL`;
+routine parked, continuing, wait-ended, wait-age and generic status remain
+`OUTBOUND_NOTICE`. Initial send, deferred post-delivery send and background retry
+use the same existing goal-kind inference. The actual message outcome wins over
+an incidental caller hint: a six-hour blocker pause arrives on the idle
+`wait-age` path but is a meaningful paused outcome. User slash-control replies
+continue through their ordinary protected reply path.
+
+This protects meaningful notices from local daily-quota shedding without
+changing the Telegram adapter, quota ceiling, ledger, limiter, retry count,
+cumulative flood-wait budget, route metadata or task cleanup. Protection is not
+a guarantee of external delivery: transport failures retain the same bounded
+retry and warning boundary, not a new durable goal-notice outbox.
+
+On fork base `3b2751ca843540885e157dc918877c4a3a841100`, seven meaningful
+message kinds and two deferred outcome cases were shed before the mocked Bot API
+under real isolated `DailyQuota` pressure (11 message-creation attempts versus
+a soft ceiling of 10). The same cases pass with protection; routine notices
+remain shed. Real GoalManager/CAS-produced achieved, blocked and six-hour paused
+outcomes also reach the real Telegram send path at that pressure. Deferred
+achieved/blocked retries retain protection and thread metadata after a real
+short flood refusal. Only the judge result and network transport are controlled;
+this is local integration coverage, not live Telegram E2E.
+
+The companion [quiet unchanged-wait repair](goal-external-wait-backoff.md)
+records pinned upstream guidance, prior-art disposition and the focused RED/GREEN
+proof. Implementer: Hermes subagent, `gpt-6.1-sol` through
+`custom:codex-proxy`. Parent owns independent exact-candidate review, exact-head
+portable/hosted qualification, integration and live activation. Existing patch
+identity, rollback and retirement remain in force; retire classification only
+when upstream passes the same meaningful-versus-routine quota tests.
+
 ## Independent hypothesis
 
 The loss occurs in `gateway/run_goals.py`: `_send_goal_status_notice` logs a
