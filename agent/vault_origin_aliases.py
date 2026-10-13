@@ -125,6 +125,25 @@ def _configured_aliases() -> Dict[str, tuple[str, ...]]:
     return aliases
 
 
+def alias_fill_confirmation_enabled() -> bool:
+    """Read whether alias-only login fills require confirmation from the active profile config."""
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        config = load_config_readonly() or {}
+    except Exception as exc:  # A malformed config must not weaken an origin binding.
+        logger.warning("Keeping alias-origin login confirmation enabled because config could not be read: %s", exc)
+        return True
+    vault_config = config.get("vault") if isinstance(config, dict) else None
+    value = vault_config.get("confirm_alias_fills") if isinstance(vault_config, dict) else None
+    if isinstance(value, bool):
+        return value
+    if value is not None and ("confirm_alias_fills", repr(value)) not in _invalid_alias_warnings:
+        _invalid_alias_warnings.add(("confirm_alias_fills", repr(value)))
+        logger.warning("Ignoring invalid vault.confirm_alias_fills value %r; keeping confirmation enabled", value)
+    return True
+
+
 def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
     """Return exact handle keys plus raw IDs supported by 1Password handles."""
     keys = [meta.id]
