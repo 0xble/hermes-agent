@@ -56,6 +56,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, or proof-surface changes | [Fork CI](maintenance/fork-ci.md) |
 | CI toolchain pinning | Resolve local gate uv and Node binaries from the exact repository pins without changing hosted runner semantics | `scripts/ci/toolchain.json`, `scripts/ci/portable.py`, or local gate tool resolution changes | [CI toolchain pinning](maintenance/ci-toolchain-pin.md) |
 | Launchd account home | Keep service labels and plist placement on the same real account identity even when process HOME changes | Service naming, sandbox gateway startup or launchd profile ownership | [Launchd account home](maintenance/launchd-account-home.md) |
