@@ -337,6 +337,12 @@ class ChatBudgetRateLimiter:
                 return True  # sendChatAction and draft endpoints return a bare boolean
         else:
             await self.budget.take(key)
+            # A penalty can be recorded while this request waits for the chat slot.
+            # Recheck after the wait so it cannot reach Telegram during that window.
+            if self._penalty_remaining is not None:
+                remaining = self._penalty_remaining(key)
+                if remaining:
+                    raise _penalty_refusal(float(remaining))
         if self.daily is not None:
             self.daily.record(key, endpoint, data)
         try:

@@ -65,7 +65,7 @@ def _deliver_through_router(monkeypatch, loop, *, live_error: str):
 def test_reconnect_only_rejection_survives_a_failed_standalone_for_the_sweep(monkeypatch, gateway_loop):
     standalone_calls, errors = _deliver_through_router(monkeypatch, gateway_loop, live_error="send_path_degraded")
     assert standalone_calls == ["the report"]  # standalone still gets its chance first
-    assert any("queued text for telegram:-100:42" in e for e in errors)
+    assert any("queued 1 delivery row for telegram:-100:42" in e for e in errors)
     claimed = dl.sweep_failed_for_runtime("telegram", profile="satellite")
     assert [(row["chat_id"], row["thread_id"], row["content"]) for row in claimed] == [("-100", "42", "the report")]
 
@@ -114,7 +114,9 @@ def test_reconnect_queue_preserves_copy_block_markers_and_order(monkeypatch):
                   target_adapters={}, mirror_text="", origin={}, live_error="send_path_degraded")
     t = sd._TargetDelivery(**fields)
     errors = []
-    sd._queue_for_live_reconnect(t, "reply", [], errors, copy_blocks=["first", "second"])
+    from cron.scheduler_delivery_reconnect import queue_for_live_reconnect
+
+    queue_for_live_reconnect(t, "reply", [], errors, copy_blocks=["first", "second"])
     claimed = dl.sweep_failed_for_runtime("telegram", profile=None)
     # One row per logical message: a replay that fails one part retries only that part.
     assert sorted(row["content"] for row in claimed) == sorted([
