@@ -169,6 +169,33 @@ async def test_known_server_penalty_is_refused_without_a_request(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_penalty_recorded_while_queued_is_rechecked_before_egress(monkeypatch):
+    from telegram.error import RetryAfter
+    from plugins.platforms.telegram import chat_budget as cb
+
+    budget = cb.ChatOutboundBudget()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_take(_key):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(budget, "take", blocked_take)
+    penalty = {}
+    limiter = cb.ChatBudgetRateLimiter(budget, penalty_remaining=penalty.get)
+    callback = AsyncMock(return_value=True)
+    task = asyncio.create_task(
+        limiter.process_request(callback, (), {}, "sendMessage", {"chat_id": 7}, None)
+    )
+    await entered.wait()
+    penalty["7"] = 900.0
+    release.set()
+    with pytest.raises(RetryAfter):
+        await task
+    callback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_deliveries_share_the_slot_and_are_never_dropped():
     from plugins.platforms.telegram import chat_budget as cb
 
