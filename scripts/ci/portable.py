@@ -270,6 +270,12 @@ def environment(home: Path) -> dict[str, str]:
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
     env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    if os.name == 'nt':
+        # Unset and explicitly empty differ: Windows PowerShell reconstructs
+        # the hosted machine's module search path only when this is absent.
+        # That discovery can cost ~18 s per child. An empty value still loads
+        # PowerShell's built-in modules; preserve a caller's explicit value.
+        env['PSModulePath'] = os.environ.get('PSModulePath', '')
     env.update({
         'HOME': str(home), 'USERPROFILE': str(home),
         'PATH': os.pathsep.join((str(ROOT / '.venv' / ('Scripts' if os.name == 'nt' else 'bin')),
