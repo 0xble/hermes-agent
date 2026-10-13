@@ -1102,12 +1102,10 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
     import venv
     from hermes_cli import update_cmd, update_receipt
 
-    remote = Path(__file__).resolve().parents[2]
-    source = tmp_path / "hermes-agent"
-    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout",
-                    str(remote), str(source)], check=True)
-    sha = subprocess.check_output(["git", "-C", str(remote), "rev-parse", "HEAD"], text=True).strip()
-    subprocess.run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], check=True)
+    # Archive the owned checkout directly: no second working-tree checkout is
+    # needed to exercise candidate staging or its real import subprocesses.
+    source = Path(__file__).resolve().parents[2]
+    sha = releases.release_sha(source)
     # Keep real candidate Python and archived imports, but reuse installed test
     # dependencies without running PM or provisioning Node/npm over the network.
     def prepare_test_venv(release, *args, **kwargs):
