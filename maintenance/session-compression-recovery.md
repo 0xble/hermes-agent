@@ -40,10 +40,12 @@ session-id lookup, at exactly one of these points:
   between admission and retirement;
 - unauthorized owner at recovery: quarantined to `*.bad`, never replayed.
 
-Gateway-authored wakes (internal events, goal/heartbeat continuations) are not
-checkpointed: their own durable owners re-derive them. Older checkpoints of such
-wakes are dropped at recovery. Human input without a platform id (leftover
-`/steer`) is still checkpointed, because retirement does not need the id.
+Goal continuations and heartbeat ticks are not checkpointed: goal state and the
+heartbeat poller re-derive them. Older goal-continuation checkpoints are dropped
+at recovery. Internal completions (delegation/watch notifications) are
+claim-settled at admission, so their checkpoint is their only durable copy and
+stays until consumed. The same holds for human input without a platform id
+(leftover `/steer`): retirement is by path and does not need an id.
 
 After the configured native auxiliary summarizer/fallback route cannot fit a
 hard-window request, a no-network mechanical candidate may excerpt oversized

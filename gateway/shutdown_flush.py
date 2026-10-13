@@ -126,14 +126,15 @@ QUEUE_CHECKPOINT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 def queue_checkpoint_exempt(event: Any) -> bool:
-    """Gateway-authored wakes are not durably checkpointed.
+    """Re-derivable gateway wakes are not durably checkpointed.
 
-    Goal/heartbeat continuations and other internal wakes are re-derived from their own durable
-    owners (goal/heartbeat state, the delegation completion queue); a checkpoint for them could
-    only replay a stale wake. Human input without a platform id (leftover ``/steer`` text) is
-    still checkpointed: consumption retires it by path, not by id lookup."""
+    Goal continuations and heartbeat ticks are re-derived from their own durable owners (goal
+    state, the heartbeat poller); a checkpoint for them could only replay a stale wake. Internal
+    completions (delegation/watch notifications) are claim-settled at admission, so their
+    checkpoint is the only durable copy and stays; like id-less human input (leftover
+    ``/steer``), consumption retires it by path, not by platform-id lookup."""
     from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
-    if getattr(event, "internal", False):
+    if getattr(event, "_heartbeat_session_id", None):
         return True
     return bool((getattr(event, "metadata", None) or {}).get(GOAL_CONTINUATION_METADATA_KEY))
 
@@ -646,9 +647,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return False
     if data.get("queue_accepted") is True:
         from types import SimpleNamespace as _NS
-        if queue_checkpoint_exempt(_NS(internal=data.get("internal") is True, metadata=data.get("metadata") or {})):
-            # Gateway-authored wakes are re-derived by their own owners; an older build's
-            # checkpoint of one cannot be deduped by id and would otherwise replay every boot.
+        if queue_checkpoint_exempt(_NS(metadata=data.get("metadata") or {})):
+            # Goal continuations are re-derived by their own owner; an older build's checkpoint
+            # of one cannot be deduped by id and would otherwise replay every boot.
             logger.info("Dropping stale gateway-authored queue checkpoint %s", path)
             return DROP_PENDING
         # Admission dedupe is not a completed reply/effect receipt. Once admitted,

@@ -53,14 +53,15 @@ def home(tmp_path, monkeypatch):
 
 # ── P1 (a): gateway-authored wakes are not durably checkpointed ──
 
-def test_goal_and_internal_wakes_are_accepted_without_a_replayable_checkpoint(home):
+def test_goal_and_heartbeat_wakes_are_accepted_without_a_replayable_checkpoint(home):
     runner, adapter = _make_runner(_session_entry())
     key = build_session_key(_make_source())
     goal = MessageEvent(text="[Continuing toward your standing goal]", source=_make_source(),
                         metadata={GOAL_CONTINUATION_METADATA_KEY: True}, reply_expected=False)
-    wake = MessageEvent(text="background job finished", source=_make_source(), internal=True)
+    tick = MessageEvent(text="heartbeat tick", source=_make_source())
+    tick._heartbeat_session_id = "sid"
     assert runner._enqueue_fifo(key, goal, adapter)
-    assert runner._enqueue_fifo(key, wake, adapter)
+    assert runner._enqueue_fifo(key, tick, adapter)
     assert _spools(home) == []
     db = SessionDB(db_path=home / "state.db")
     db.create_session("successor", "telegram")
@@ -68,9 +69,27 @@ def test_goal_and_internal_wakes_are_accepted_without_a_replayable_checkpoint(ho
     db.close()
 
 
-def test_legacy_id_less_wake_checkpoint_is_dropped_not_replayed_every_boot(home):
-    # A checkpoint written by the previous build for an id-less internal wake.
-    wake = MessageEvent(text="internal wake", source=_make_source(), internal=True)
+def test_id_less_internal_completion_is_retired_on_consumption_not_replayed(home):
+    """The checkpoint is the completion's only copy, so it stays until consumed; then it is
+    retired by path (it has no platform id the old session lookup could ever match)."""
+    from agent.compression_recovery import notify_input_admitted
+    from gateway.shutdown_flush import retire_queue_checkpoint
+
+    wake = MessageEvent(text="background job finished", source=_make_source(), internal=True)
+    assert shutdown_flush.checkpoint_queued_event("k", wake)
+    assert len(_spools(home)) == 1
+    agent = SimpleNamespace(_input_admitted_callback=lambda: retire_queue_checkpoint(wake, reason="turn_admitted"))
+    notify_input_admitted(agent, {"role": "user", "content": wake.text, "_db_persisted": True})
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("successor", "telegram")
+    assert _boot(db, home) == [] and _boot(db, home) == []
+    db.close()
+
+
+def test_legacy_goal_continuation_checkpoint_is_dropped_not_replayed_every_boot(home):
+    # A checkpoint written by the previous build for an id-less goal continuation.
+    wake = MessageEvent(text="[Continuing toward your standing goal]", source=_make_source(),
+                        metadata={GOAL_CONTINUATION_METADATA_KEY: True})
     data = shutdown_flush._serialise_value(wake)
     data.update(drain_deferred=True, queue_accepted=True)
     shutdown_flush._write_payload(shutdown_flush._get_flush_dir(), {
