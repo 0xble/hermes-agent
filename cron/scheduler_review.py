@@ -76,11 +76,12 @@ def _review_subject_or_incident(job, receipt, expected=None):
 def _run_review_hop(subject: dict, prompt: str, adapters, loop, deadline: float) -> str:
     # One hand-in path, including detached workers: the gateway's private control socket.
     from gateway.control_socket import query_gateway_control
-    from gateway.host_attach import host_gateway_serving, profile_name_for_home
+    from gateway.host_attach import host_gateway_serving, profile_name_for_home, launched_by_other_tenant
     from hermes_constants import get_hermes_home
     home = get_hermes_home()
     owner = host_gateway_serving(profile_name_for_home(home))
-    control_home = owner.home if owner is not None else home
+    control_home = (owner.home if owner is not None and not launched_by_other_tenant(owner.home, home)
+                    else home)
     end = time.monotonic() + deadline
     submitted = query_gateway_control(control_home, "cron-review", payload={
         "session_key": subject["session_key"], "session_id": subject["session_id"],

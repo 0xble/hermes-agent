@@ -36,6 +36,15 @@ def test_silence_marker_is_a_contract_pass():
     assert result["passed"] and result["silent"]
 
 
+@pytest.mark.parametrize("text, passed", [
+    ("# Stripe Priorities\n**Focus:** billing\n```text\n## Priorities\n```", False),
+    ("# Stripe Priorities\n```text\n**Focus:** billing\n```\n## Priorities", False),
+    ("# Stripe Priorities\n**Focus:** billing\n## Priorities\n```text\n## Unknown\n```", True),
+])
+def test_contract_checks_rendered_lines_outside_code_fences(text, passed):
+    assert check_contract(text, CONTRACT)["passed"] is passed
+
+
 @pytest.mark.parametrize(
     "reply, expected",
     [("PRESENT", ("PRESENT", "")),

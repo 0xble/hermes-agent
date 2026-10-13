@@ -50,9 +50,21 @@ def load_contract(contract_ref: str) -> dict[str, Any]:
     return parsed
 
 
+def _contract_lines(text: str):
+    """Quoted Markdown examples cannot satisfy the report's envelope."""
+    from gateway.copy_blocks import _next_fence
+
+    fence = None
+    for line in text.splitlines():
+        previous = fence
+        fence = _next_fence(fence, line)
+        if previous is None and fence is None and not re.match(r"^(?: {4}| {0,3}\t)", line):
+            yield line
+
+
 def _sections(text: str) -> list[str]:
     sections = []
-    for line in text.splitlines():
+    for line in _contract_lines(text):
         match = re.match(r"^ {0,3}(##)\s+(.+?)\s*#*\s*$", line)
         if match:
             sections.append(match.group(2).strip())
@@ -87,7 +99,7 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
 
     required_lines = contract.get("required_lines") or []
     for required in required_lines:
-        if not any(line.strip().startswith(str(required)) for line in text.splitlines()):
+        if not any(line.strip().startswith(str(required)) for line in _contract_lines(text)):
             violations.append(f"missing required line {required!r}")
 
     sections = _sections(text)
