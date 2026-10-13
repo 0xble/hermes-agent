@@ -177,6 +177,23 @@ the blocker. This adopts upstream's conversational recovery policy, not semantic
 proof that the blocker is solved. The next judge may block again. Explicit user
 pauses remain authoritative.
 
+- Fork patch identity: `goal-user-authority`. Own fork patch, no upstream PR yet.
+  The judge sees what the user actually typed since the goal was set, in an
+  authoritative block that keeps each reply-quote header for context (newest 20,
+  8,000 characters). When a relay from another session in the same profile reaches
+  the goal session, the typed messages of that sender session are included and
+  attributed, so a cross-session approval counts only through its original. Relay
+  deliveries, identified by the trailing `[relay from=… receipt=…]` header, are
+  never user-typed, so they cannot satisfy a revision `user_quote`. An explicit
+  `/goal resume` over a judge block records a user revision naming the reason; the
+  judge does not re-block on it but still blocks new breaches. Reviving on an
+  ordinary reply records no override, since the reply may refuse. Goals with no
+  typed user input render a byte-identical prompt. Regression:
+  `scripts/run_tests.sh tests/hermes_cli/test_goal_user_authority.py
+  tests/hermes_cli/test_goals.py`. Retire when upstream judges see user input and
+  exclude relays; rollback reverts this identity's block, relay check, resume
+  revision and tests.
+
 ## Verification
 
 Run scripts/run_tests.sh for tests/hermes_cli/test_goal_criteria_completeness.py,
