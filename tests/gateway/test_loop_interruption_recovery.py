@@ -71,7 +71,7 @@ async def scan(runner, sid):
 @pytest.mark.asyncio
 async def test_refused_adapter_admission_consumes_tick_until_recovery(control_home):
     runner, adapter, source, entry = native_runner(control_home)
-    mgr = create_loop(entry, source)
+    create_loop(entry, source)
     # Real BasePlatformAdapter: with no message handler admission is refused.
     await scan(runner, entry.session_id)
     saved = loops.load_loop(entry.session_id)
@@ -722,7 +722,7 @@ async def test_command_loop_fence_rechecks_reset_after_command_resolution(contro
 @pytest.mark.asyncio
 async def test_reset_after_admission_does_not_execute_old_tick(control_home):
     runner, adapter, source, entry = native_runner(control_home)
-    mgr = create_loop(entry, source)
+    create_loop(entry, source)
     executions = []
     runner._hmwa_prepare_turn = AsyncMock(return_value=(runner._PreparedTurn([], "", "old work", "old work", None, None), {}))
     async def model(**kwargs):

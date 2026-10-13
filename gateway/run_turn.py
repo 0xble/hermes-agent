@@ -28,6 +28,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
+from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_trailing_silence_marker,
@@ -78,7 +79,6 @@ def _tool_call_logger() -> logging.Logger:
             tool_logger.propagate = False
             tool_logger.addHandler(handler)
     return tool_logger
-
 
 
 _CONTEXT_OVERFLOW_ERROR_PHRASES = (
@@ -151,7 +151,7 @@ def bound_model_input_without_hygiene(history: List[Any], limit: int) -> List[An
     return history[:head_end] + history[tail_start:]
 
 
-class GatewayTurnMixin:
+class GatewayTurnMixin(GatewayLoopWakeMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(

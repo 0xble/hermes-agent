@@ -875,7 +875,7 @@ class LoopManager(LoopRevisionsMixin):
         try:
             claimed = db._execute_write(write)
         except Exception as exc:
-            logger.debug("LoopManager: tick claim write failed: %s", exc)
+            logger.debug("LoopManager: tick claim write failed: %s", exc, exc_info=True)
             return False
         if claimed is None:
             self.refresh()
@@ -930,7 +930,7 @@ class LoopManager(LoopRevisionsMixin):
         try:
             settled = db._execute_write(write)
         except Exception as exc:
-            logger.debug("LoopManager: tick outcome write failed: %s", exc)
+            logger.debug("LoopManager: tick outcome write failed: %s", exc, exc_info=True)
             return False
         if settled is None and self._follow_compression():
             # Compression migrated the loop (verbatim, same instance and tick) after this manager
