@@ -166,7 +166,10 @@ def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform
                 count, held_back = recover_pending_spool(
                     session_resolver=resolve_here,
                     deferred_followup=partial(_defer_followup, runner, eligible, platform,
-                                              breaker_tripped=candidates is None,
+                                              breaker_tripped=(
+                                                  getattr(candidates, "breaker_tripped", False)
+                                                  or candidates is None
+                                              ),
                                               reconnect_recovery=platform is not None,
                                               recovered_events=recovered_events))
                 recovered += count

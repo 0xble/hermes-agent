@@ -72,6 +72,35 @@ translated, and the retired cause-based keys were removed.
   `build_resume_recovery_note`, `_prepare_resume_pending_message`),
   `gateway/run_turn_runner.py` (`_resume_restart_policy`, `_prepare_turn_message`).
 
+## Observable restart recovery
+
+The shared recovery decision lives in `gateway/run_restart_recovery.py`; note
+receipts and persisted destinations live in `gateway/run_interrupted_notes.py`.
+Startup must retain the pending-session snapshot when the restart-loop breaker
+trips, so eligible human turns can still receive a bounded interruption note.
+The breaker decision must survive the asynchronous refresh and reconnect scans,
+including the pending-follow-up spool path. Do not bypass the breaker when note
+visibility is ambiguous: that can recreate the model-driven restart loop.
+
+Each candidate emits one `Restart recovery outcome: session=<key> outcome=<value>`
+record per boot. Values are `resumed` after the admitted adapter task completes,
+`noted` for an acknowledged/persisted visible interruption note, or
+`skipped:<reason>` for a policy, transport, or admission refusal. A merely
+scheduled task, unaccepted internal event, pending note token, or `sending:`
+claim is not proof of successful recovery. A dispatch failure releases the
+pre-claim and tries the existing bounded note path; it never replays user work.
+A `sending:` note is not retried, and ordinary eligible turn recovery remains
+available. If both breaker and ambiguous note block recovery, the outcome is
+explicitly `skipped:restart-loop-breaker:ambiguous-note`, not a fabricated
+`noted`/`resumed` result. Network unavailability and authorization revocation also
+remain real constraints; this unit does not promise unconditional visibility.
+
+Run `tests/gateway/test_restart_recovery_outcomes.py` in addition to the corpus
+below. Planned update classification is separately owned by `fix/breaker-update-planned`
+(PR #557); this unit does not duplicate it. Per-session admission identity was
+already present at the base. No new dependency, configuration, or persistence
+schema is introduced.
+
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py
