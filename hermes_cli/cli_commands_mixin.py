@@ -81,7 +81,7 @@ def _ellipsize(text: str, limit: int) -> str:
 
 # /cron flag tables: flag -> opts key. Order-sensitive in _parse_cron_flags: bool flags never
 # consume a value; --repeat is int-validated separately.
-_CRON_BOOL_FLAGS = {"--clear-skills": "clear_skills", "--all": "all"}
+_CRON_BOOL_FLAGS = {"--clear-skills": "clear_skills", "--all": "all", "--allow-shrink": "allow_shrink"}
 _CRON_LIST_FLAGS = {"--skill": "skills", "--add-skill": "add_skills", "--remove-skill": "remove_skills"}
 _CRON_VALUE_FLAGS = {"--name": "name", "--deliver": "deliver", "--prompt": "prompt", "--schedule": "schedule"}
 # /cron subcommand -> CLICommandsMixin method name.
@@ -199,7 +199,7 @@ def _parse_cron_flags(tokens):
     opts = {
         "name": None, "deliver": None, "repeat": None, "prompt": None, "schedule": None,
         "skills": [], "add_skills": [], "remove_skills": [],
-        "clear_skills": False, "all": False, "positionals": []}
+        "clear_skills": False, "all": False, "allow_shrink": False, "positionals": []}
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -1471,8 +1471,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             final_skills = [skill for skill in existing_skills if skill not in remove_skills]
             final_skills += [skill for skill in add_skills if skill not in final_skills]
         result = _cron_api(
-            action="update", job_id=job_id, schedule=opts["schedule"], prompt=opts["prompt"],
-            name=opts["name"], deliver=opts["deliver"], repeat=opts["repeat"], skills=final_skills)
+            action="update", job_id=job_id, schedule=opts["schedule"], prompt=opts["prompt"], name=opts["name"],
+            deliver=opts["deliver"], repeat=opts["repeat"], skills=final_skills, allow_shrink=opts["allow_shrink"])
         if not result.get("success"):
             return print(_t("cron.update_failed", error=result.get("error")))
         job = result["job"]
