@@ -248,6 +248,10 @@ def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = Fal
     if checkpoint is None and queue_checkpoint_exempt(event):
         return True
     try:
+        # Id-less notifications need an occurrence receipt even if spool retirement fails.
+        # Reuse the native admission identity without inventing a transport/reply anchor.
+        if not getattr(event, "message_id", None) and not getattr(event, "_outbox_admission_id", None):
+            event._outbox_admission_id = f"queue:{uuid.uuid4().hex}"
         data = _serialise_value(event)
         if data is None or not has_user_content(data):
             return False
@@ -264,6 +268,23 @@ def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = Fal
     except Exception:
         logger.warning("Queue admission checkpoint failed for %s", session_key, exc_info=True)
         return False
+
+
+def prepare_queued_turn_checkpoint(agent, event, session_key: str, session_id: str, inbound_id):
+    """Bind the accepted spool to the actual transcript before provider work.
+
+    Routing can rotate after admission. An original-session receipt must still suppress
+    replay when retirement fails, without changing the event's transport or reply anchor.
+    """
+    platform_id = str(inbound_id) if inbound_id is not None else None
+    if not getattr(event, "_hermes_queue_checkpoint", False):
+        return platform_id
+    event.session_id = session_id
+    if not session_id or not checkpoint_queued_event(session_key, event, refresh=True):
+        raise RuntimeError("Queued input checkpoint could not bind to its session. "
+                           "The provider call was not sent; the input is retained.")
+    agent._input_admitted_callback = lambda: retire_queue_checkpoint(event, reason="turn_admitted")
+    return platform_id or getattr(event, "_outbox_admission_id", None)
 
 
 def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -395,6 +416,9 @@ def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        admission_id = getattr(value, "_outbox_admission_id", None)
+        if isinstance(admission_id, str) and admission_id:
+            result["_outbox_admission_id"] = admission_id
         for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
@@ -720,11 +744,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             return DROP_PENDING
         # Admission dedupe is not a completed reply/effect receipt. Once admitted,
         # the native transcript/resume owner retains continuation.
-        message_id = data.get("message_id")
+        message_id = data.get("message_id") or data.get("_outbox_admission_id")
         if target_db is not None and message_id:
             from agent.turn_context import _same_trigger_content
             prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
-            if any(_same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
+            if any(not data.get("message_id") or
+                   _same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
                    for row in prior_rows):
                 return True
         if deferred_followup is None:

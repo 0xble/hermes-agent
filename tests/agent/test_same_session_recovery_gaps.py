@@ -82,6 +82,20 @@ def test_presend_gate_lets_fitting_request_through_without_recovery(tmp_path):
     assert v.api_call_count == 1
 
 
+def test_assembled_system_prompt_is_counted_once_with_compression_disabled(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "chat_completions"
+    agent.compression_enabled = False
+    agent.context_compressor.context_length = 8000
+    rows = [{"role": "user", "content": "inspect only"}]
+    wire = [{"role": "system", "content": "authority binding instruction " * 600}, *rows]
+    with patch.object(agent, "_compress_context") as compress:
+        verdict = _gate(agent, wire, messages=rows)
+    compress.assert_not_called()
+    assert verdict.action == "fallthrough" and not verdict.failed
+
+
 def test_disabled_compression_pauses_unfittable_request_without_compacting(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     agent = _agent(db)

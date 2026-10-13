@@ -133,6 +133,128 @@ def test_admission_callback_waits_for_durable_ack_and_fires_once(home):
     assert fired == [1]
 
 
+@pytest.mark.parametrize("raises", [False, True])
+def test_failed_retirement_callback_remains_retryable(home, raises):
+    from agent.compression_recovery import notify_input_admitted
+
+    outcomes = iter([False, True])
+    def callback():
+        result = next(outcomes)
+        if raises and not result:
+            raise OSError("checkpoint temporarily unavailable")
+        return result
+    agent = SimpleNamespace(_input_admitted_callback=callback)
+    user = {"role": "user", "content": "accepted", "_db_persisted": True}
+    notify_input_admitted(agent, user)
+    assert agent._input_admitted_callback is callback
+    notify_input_admitted(agent, user)
+    assert agent._input_admitted_callback is None
+
+
+def test_failed_session_binding_retains_input_without_starting_provider(home, monkeypatch):
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    event = _event("accepted queued input", None, internal=True)
+    assert shutdown_flush.checkpoint_queued_event("k", event)
+    spool = event._hermes_recovery_spool
+    before = spool.read_bytes()
+    monkeypatch.setattr(shutdown_flush, "checkpoint_queued_event", lambda *a, **kw: False)
+    calls = []
+    agent = SimpleNamespace(run_conversation=lambda *a, **kw: calls.append(kw))
+    ctx = TurnContext(source=_make_source(), session_key="k", session_id="original",
+                      message=event.text, queued_event=event)
+    runner = SimpleNamespace(_consume_pending_native_image_paths=lambda key: [],
+                             _delivery_adapter_for=lambda source: None)
+    with pytest.raises(RuntimeError, match="provider call was not sent"):
+        TurnRunner(runner, ctx)._run_conversation_with_approval(agent, [], None, None, None)
+    assert calls == [] and spool.read_bytes() == before
+    assert agent._input_admitted_callback is None
+
+
+def test_identical_idless_queue_occurrences_keep_distinct_admission_receipts(home):
+    first, second = _event("background job finished", None), _event("background job finished", None)
+    assert shutdown_flush.checkpoint_queued_event("k", first)
+    assert shutdown_flush.checkpoint_queued_event("k", second)
+    assert first._outbox_admission_id != second._outbox_admission_id
+    assert first.message_id is None and second.message_id is None
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    agent = SimpleNamespace()
+    mid = shutdown_flush.prepare_queued_turn_checkpoint(agent, first, "k", "original", None)
+    db.append_message("original", "user", first.text, platform_message_id=mid)
+    assert _boot(db, home, sid="original") == [second.text]
+    db.close()
+
+
+def test_recovered_idless_checkpoint_restores_occurrence_identity(home):
+    from gateway.run_pending_recovery import _defer_followup
+
+    event = _event("background job finished", None, internal=True)
+    assert shutdown_flush.checkpoint_queued_event("k", event)
+    admission_id = shutdown_flush.prepare_queued_turn_checkpoint(SimpleNamespace(), event, "k", "sid", None)
+    data = json.loads(event._hermes_recovery_spool.read_text())["data"]
+    entry = SimpleNamespace(origin=event.source, session_id="sid", suspended=False, resume_pending=False)
+    store = SimpleNamespace(_lock=threading.Lock(), _entries={"k": entry}, _ensure_loaded_locked=lambda: None)
+    runner = SimpleNamespace(session_store=store, _startup_restore_queue=[], _draining=False,
+                             _is_session_running=lambda key: False, _restored_source=lambda e: event.source,
+                             _resume_owner_authorized=lambda key, source: True,
+                             _delivery_adapter_for=lambda source: _Adapter())
+    restored = []
+    assert _defer_followup(runner, {}, None, "k", "sid", data, event._hermes_recovery_spool,
+                           recovered_events=restored) is True
+    assert restored[0]._outbox_admission_id == admission_id
+    assert restored[0].session_id == "sid" and restored[0].message_id is None
+
+
+def test_idless_admitted_input_does_not_replay_when_unlink_fails_and_owner_rotates(home, monkeypatch):
+    from pathlib import Path
+
+    from agent.compression_recovery import notify_input_admitted
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    event = _event("background job finished", None, internal=True)
+    assert shutdown_flush.checkpoint_queued_event("k", event)
+    spool = event._hermes_recovery_spool
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.create_session("successor", "telegram")
+    effects = []
+
+    class Agent:
+        _input_admitted_callback = None
+
+        def run_conversation(self, message, **kwargs):
+            db.append_message("original", "user", message,
+                              platform_message_id=kwargs.get("persist_user_platform_id"))
+            unlink = Path.unlink
+
+            def refuse_checkpoint_unlink(path, *args, **kw):
+                if path == spool:
+                    raise PermissionError("checkpoint file temporarily held open")
+                return unlink(path, *args, **kw)
+
+            with monkeypatch.context() as fault:
+                fault.setattr(Path, "unlink", refuse_checkpoint_unlink)
+                notify_input_admitted(self, {"role": "user", "content": message, "_db_persisted": True})
+                assert spool.exists()
+            effects.append("effect completed")
+            return {"final_response": "effect completed", "messages": []}
+
+    ctx = TurnContext(source=_make_source(), session_key="k", session_id="original",
+                      message=event.text, queued_event=event)
+    runner = SimpleNamespace(_consume_pending_native_image_paths=lambda key: [],
+                             _delivery_adapter_for=lambda source: None)
+    TurnRunner(runner, ctx)._run_conversation_with_approval(Agent(), [], None, None, None)
+    assert _boot(db, home, sid="successor") == []
+    assert _boot(db, home, sid="successor") == []
+    assert effects == ["effect completed"]
+    assert len(db.get_messages("original")) == 1
+    assert db.get_messages("successor") == []
+    db.close()
+
+
 def test_turn_runner_retires_consumed_checkpoint_at_turn_admission(home, monkeypatch):
     """End-to-end through the gateway's turn worker: run_conversation's turn-start flush
     fires the callback the runner installed for the consumed queued event."""

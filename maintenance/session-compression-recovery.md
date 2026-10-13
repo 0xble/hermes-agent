@@ -88,7 +88,14 @@ including accepted-queue checkpoints; they must not remain eligible and warn
 again on every restart. Internal completions (delegation/watch notifications) are
 claim-settled at admission, so their checkpoint is their only durable copy and
 stays until consumed. The same holds for human input without a platform id
-(leftover `/steer`): retirement is by path and does not need an id.
+(leftover `/steer`): retirement is by path and does not need a transport id.
+Before provider work, refresh the accepted spool with the actual original session
+id. Id-less queued input reuses `_outbox_admission_id` as a private occurrence
+receipt, persisted through the native user-row platform-id field and restored
+on spool recovery. Failed unlink cannot replay an admitted occurrence into a
+rotated successor. Real transport ids still require matching content. A failed
+binding refresh retains input and starts no provider work. Retirement callbacks
+remain retryable on `False` or exception, but are cleared at the turn boundary.
 
 After the configured native auxiliary summarizer/fallback route cannot fit a
 hard-window request, a no-network mechanical candidate may excerpt oversized

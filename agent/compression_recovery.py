@@ -50,12 +50,14 @@ def notify_input_admitted(agent: Any, user: Any) -> None:
     callback = getattr(agent, "_input_admitted_callback", None)
     if not callable(callback) or not (isinstance(user, dict) and user.get("_db_persisted")):
         return
-    agent._input_admitted_callback = None
     try:
-        callback()
+        retired = callback()
     except Exception:
         import logging
         logging.getLogger(__name__).warning("input-admitted callback failed", exc_info=True)
+    else:
+        if retired is not False and getattr(agent, "_input_admitted_callback", None) is callback:
+            agent._input_admitted_callback = None
 
 
 def admit_before_compaction(agent: Any, messages: list, history: list, user: dict) -> None:
