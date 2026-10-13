@@ -5,6 +5,7 @@ from pathlib import Path
 from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
+from agent.turn_context import _same_trigger_content
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
     DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
@@ -51,7 +52,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
     if data.get("queue_accepted") is True and data.get("message_id") and any(
-        event.message_id == data["message_id"] and event.text == data.get("text", "")
+        str(event.message_id) == str(data["message_id"])
+        and _same_trigger_content(event.text, data.get("text", ""), data.get("text", ""))
         and runner._session_key_for_source(event.source) == key
         for event in getattr(runner, "_startup_restore_queue", ())
     ):

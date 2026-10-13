@@ -509,19 +509,22 @@ class SessionTranscriptMixin:
             self._dirty_transcripts.pop(session_id, None)
             self._transcript_append_failures.pop(session_id, None)
 
-    def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
-        """Whether a message with this platform_message_id is persisted (False without a DB).
-
-        Thin wrapper over SessionDB.has_platform_message_id(). Returns False when no DB is available
-        (in-memory sessions). Used by the gateway's transient-failure dedupe guard (#47237).
-        """
+    def has_platform_message_id(self, session_id: str, platform_message_id: str,
+                                user_message: Any = None, persist_user_message: Any = None) -> bool:
+        """Whether a persisted user row carries this id, optionally matching logical content."""
         db = self._db_for_session_id(session_id)
         if not db:
             return False
         try:
-            return db.has_platform_message_id(session_id, platform_message_id)
+            if user_message is None and persist_user_message is None:
+                return db.has_platform_message_id(session_id, platform_message_id)
+            from agent.turn_context import _same_trigger_content
+            return any(
+                _same_trigger_content(row.get("content"), user_message, persist_user_message)
+                for row in db.get_messages_by_platform_message_id(session_id, platform_message_id)
+            )
         except Exception:
-            logger.debug("has_platform_message_id lookup failed", exc_info=True)
+            logger.debug("platform message lookup failed", exc_info=True)
             return False
 
     def transcript_tail_role(self, session_id: str) -> Optional[str]:

@@ -1871,8 +1871,13 @@ class GatewayTurnMixin:
             if agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
-                # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                # message_id + logical content (Telegram retries after transient failures).
+                if (
+                    event.message_id
+                    and store.has_platform_message_id(
+                        sid, str(event.message_id), _user_row.get("content"), _user_row.get("content")
+                    )
+                ):
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
