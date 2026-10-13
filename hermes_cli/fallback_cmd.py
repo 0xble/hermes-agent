@@ -239,7 +239,11 @@ def cmd_fallback_status(args) -> None:  # noqa: ARG001
     """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
     from datetime import datetime
     from agent.shared_primary_cooldown import list_cooldowns
-    records = list_cooldowns()
+    try:
+        records = list_cooldowns(strict=True)
+    except OSError as exc:
+        print(f"\n  Primary-model cooldown state is unreadable: {exc}\n")
+        return
     print()
     if not records:
         print("  No primary-model cooldowns active.\n")
@@ -282,7 +286,10 @@ def cmd_fallback_cooldowns_clear(args) -> None:
         print(f"  No shared primary cooldown matches {target!r}.\n" if target else "  No shared primary cooldowns to clear.\n")
         return
     for record in removed:
-        print(f"  Cleared: {record.get('model', '?')} via {record.get('provider', '?')}")
+        if record.get("quarantined"):
+            print(f"  Quarantined unreadable cooldown state: {record['quarantined']}")
+        else:
+            print(f"  Cleared: {record.get('model', '?')} via {record.get('provider', '?')}")
     print("\n  Running agents retry the primary at their next turn start.\n")
 
 

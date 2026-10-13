@@ -93,10 +93,14 @@ _MAX_DURABLE_PENDING = 1000
 # A row the retry engine still owes an outcome (pending retry, claimed dispatch,
 # unreported terminal line) is exempt regardless of age; budgets bound how long
 # that lasts. A legacy explicit-resume claim no longer drops protection either:
-# that is how a claimed row was pruned mid-recovery (deleg_a11d4b48).
-_RETRY_OWED_SQL = "(retry_state IN ('armed','scheduled','noticing','notified','dispatching','terminal','reporting'))"
+# that is how a claimed row was pruned mid-recovery (deleg_a11d4b48). Boot-notice
+# claims likewise belong to their owner until completed or released, not retention.
+_RETENTION_OWED_SQL = """(
+    retry_state IN ('armed','scheduled','noticing','notified','dispatching','terminal','reporting')
+    OR auto_resume_state='claimed'
+)"""
 _RESUMABLE_RETENTION_SQL = """(
-    """ + _RETRY_OWED_SQL + """
+    """ + _RETENTION_OWED_SQL + """
     OR (state IN ('unknown','interrupted','stalled')
         AND (COALESCE(parent_session_id, '') != '' OR COALESCE(origin_session_id, '') != '')
         AND updated_at >= ?)
@@ -351,7 +355,7 @@ def _prune_durable_records() -> None:
         old_ids = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?
-                  AND NOT {_RETRY_OWED_SQL}""", (cutoff,))]
+                  AND NOT {_RETENTION_OWED_SQL}""", (cutoff,))]
         if old_ids:
             marks = ",".join("?" for _ in old_ids)
             conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", old_ids)
@@ -388,7 +392,7 @@ def _prune_durable_records() -> None:
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
                   AND {_RESUMABLE_RETENTION_SQL}
-                  AND delivery_state != 'pending' AND NOT {_RETRY_OWED_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}
                 ORDER BY updated_at ASC, delegation_id ASC
                 LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
         )]
@@ -412,7 +416,7 @@ def _prune_durable_records() -> None:
                                  WHERE delegation_id IN ({marks}) AND retry_state='none'
                                    AND retry_reason IN ({','.join('?' for _ in SUCCESS_REASONS)})""",
                              (RESULT_UNDELIVERABLE, time.time(), *evict, *SUCCESS_REASONS))
-                conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETRY_OWED_SQL}",
+                conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETENTION_OWED_SQL}",
                              evict)
                 _log_pruned_ids("pending-cap", evict)
         conn.execute("DELETE FROM async_delegation_child_recovery WHERE NOT EXISTS "

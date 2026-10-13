@@ -10,6 +10,8 @@ import time
 import pytest
 import hermes_yaml as yaml
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from tools import approval_context, approval_prompt
 
@@ -69,7 +71,7 @@ def test_transport_names_are_unique_and_builtin_is_reserved():
 def test_force_reload_clears_transport_registry(monkeypatch):
     manager = PluginManager()
     _context(manager).register_approval_transport("phone", lambda request: None)
-    manager._discovered = True
+    mark_plugin_discovery_complete(manager)
     monkeypatch.setattr(manager, "_discover_and_load_inner", lambda: None)
 
     manager.discover_and_load(force=True)
