@@ -609,3 +609,60 @@ def test_reused_pid_survivor_with_exit_file_reports_real_result_without_supervis
     event = successor.completion_queue.get(timeout=1)
     assert event["exit_code"] == 4 and event["completion_reason"] == "exited"
     assert successor.completion_queue.empty()
+
+
+def test_reused_pid_pending_result_survives_a_second_restart(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=4, log_text="finished\n")
+    first = ProcessRegistry()
+    monkeypatch.setattr(first, "_detached_host_fate", lambda *_args: "reused")
+    assert first.recover_from_checkpoint() == 1
+    assert json.loads((home / "processes.json").read_text())[0]["pid"] is None
+    # Crash before any consumer claimed the result. The detached PID is not its identity.
+    second = ProcessRegistry()
+    assert second.recover_from_checkpoint() == 1
+    recovered = second.get(session.id)
+    assert recovered.exited and recovered.pid is None and recovered._reader_thread is None
+    events = second.drain_notifications(session_key="session")
+    assert len(events) == 1 and events[0][0]["exit_code"] == 4
+    assert events[0][0]["output"] == "finished\n"
+    second.acknowledge_survivor_completion(session.id)
+    assert json.loads((home / "processes.json").read_text()) == []
+    third = ProcessRegistry()
+    assert third.recover_from_checkpoint() == 0
+    assert third.drain_notifications(session_key="session") == []
+
+
+@pytest.mark.parametrize("survive_restart", [False, True])
+def test_file_backed_survivor_ready_uses_normal_output_hooks(tmp_path, monkeypatch, survive_restart):
+    import queue
+    import shlex
+
+    _home(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    gate = tmp_path / "release-ready"
+    session = registry.spawn_local(
+        command=f"while [ ! -e {shlex.quote(str(gate))} ]; do sleep 0.02; done; printf 'READY\\n'",
+        cwd=str(tmp_path), task_id="task", session_key="session", survive_restart=survive_restart,
+    )
+    session.watch_patterns = ["READY"]
+    streamed = []
+    monkeypatch.setattr(registry, "_emit_output", lambda _session, text: streamed.append(text))
+    gate.touch()
+    try:
+        assert session._completion_event.wait(5)
+        events = []
+        while True:
+            try:
+                events.append(registry.completion_queue.get_nowait())
+            except queue.Empty:
+                break
+        assert [event["output"] for event in events if event.get("type") == "watch_match"] == ["READY"]
+        assert "READY\n" in "".join(streamed)
+        # Polling the same durable log must not emit the chunk twice.
+        if survive_restart:
+            registry._read_survivor_log(session)
+        assert "".join(streamed) == "READY\n"
+    finally:
+        registry.kill_all(source="test_cleanup")

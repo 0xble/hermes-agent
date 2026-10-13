@@ -21,11 +21,15 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   signalled: a recorded exit file is reported once; otherwise the stale entry and
   its run directory are discarded without a `lost` notice.
   Enqueueing is not delivery: pending completions stay checkpointed and replay
-  after a crash. Delivery is one flock-guarded marker transition,
+  after a crash. Recorded-result recovery is independent of a signalable PID and
+  restores the gateway watcher before reporting. New log bytes use the ordinary
+  watch-pattern and live-output ingestion hooks. Delivery is one flock-guarded
+  marker transition,
   pending -> `claimed` (owner PID, start time, per-registry nonce) -> `delivered`.
-  A consumer (CLI/TUI drain, gateway watcher) takes the exclusive claim BEFORE
-  render/admission and only that owner may settle or release it. A known failed
-  send/admission releases the claim and keeps the completion retryable. A peer
+  A consumer (CLI/TUI drain, quiet one-shot follow-up, gateway watcher) takes the
+  exclusive claim BEFORE render/admission; only that owner may settle or release
+  it. A known failed send/admission releases the claim and keeps the completion
+  retryable. A peer
   facing a live owner's claim retains its offer; a claim whose owner is gone,
   recycled, or an exec'd predecessor (same PID, unknown nonce) is reclaimed.
   This is an owner-lifetime lease: slow live owners are never overtaken by a

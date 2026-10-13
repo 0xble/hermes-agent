@@ -279,11 +279,7 @@ class ProcessSurvivalMixin:
                 chunk = log_file.read(session.max_output_chars)
             session._survivor_log_offset = offset + len(chunk)
             text = chunk.decode("utf-8", errors="replace")
-            with session._lock:
-                session.output_buffer += text
-                session.total_output_chars += len(text)
-                if len(session.output_buffer) > session.max_output_chars:
-                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._ingest_output(session, text)
         except OSError:
             return
 

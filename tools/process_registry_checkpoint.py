@@ -76,7 +76,8 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            if not pid:
+            survivor = bool(entry.get("survive_restart"))
+            if not pid and not survivor:
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -95,8 +96,7 @@ class ProcessCheckpointMixin:
             # a live child unsupervised, and marking it exited would invent a
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
-            fate = self._detached_host_fate(pid, entry.get("host_start_time"))
-            survivor = bool(entry.get("survive_restart"))
+            fate = self._detached_host_fate(pid, entry.get("host_start_time")) if pid else "gone"
             # A survivor whose PID was recycled is never adopted, supervised, or signalled
             # either. Only a result its wrapper already recorded is reported (once, via the
             # delivery claim); without one the stale entry is discarded like any other.
@@ -117,10 +117,10 @@ class ProcessCheckpointMixin:
                     unresolved_scope_entries.append(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
-            recycled_exit = None
-            if fate == "reused":
-                recycled_exit = self._recorded_survivor_exit(fields.get("exit_path"))
-                if recycled_exit is None:
+            recorded_exit = None
+            if survivor and (not pid or fate == "reused"):
+                recorded_exit = self._recorded_survivor_exit(fields.get("exit_path"))
+                if fate == "reused" and recorded_exit is None:
                     logger.info(
                         "Not recovering survivor %s: pid %d was recycled onto an unrelated "
                         "process and no exit was recorded; discarding the stale entry.",
@@ -134,14 +134,28 @@ class ProcessCheckpointMixin:
                 started_at=entry.get("started_at", time.time()))
             # detached: can't read output, but can report status + kill
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
-            if recycled_exit is not None:
-                session.pid = None  # never signal or probe the recycled PID
+            if recorded_exit is not None:
+                session.pid = None  # a file-backed result has no signalable PID
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
-            logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
-            if recycled_exit is not None:
-                self._finish_survivor(session, recycled_exit, "exited", "")
+            logger.info("Recovered detached process: %s (pid=%s)", session.command[:60], pid)
+            # Restore the delivery route even when only the recorded result remains.
+            if session.watcher_interval > 0:
+                self.pending_watchers.append({
+                    "session_id": session.id,
+                    "check_interval": session.watcher_interval,
+                    "session_key": session.session_key,
+                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+                    "notify_on_complete": session.notify_on_complete,
+                    "parent_session_id": session.parent_session_id,
+                })
+            if not pid or recorded_exit is not None:
+                self._finish_survivor(
+                    session, recorded_exit,
+                    "exited" if recorded_exit is not None else "lost",
+                    "" if recorded_exit is not None else "survivor_lost",
+                )
                 continue
             if session.survive_restart:
                 from contextvars import copy_context
@@ -153,15 +167,5 @@ class ProcessCheckpointMixin:
                 )
                 session._reader_thread = poller
                 poller.start()
-            # Re-enqueue watcher so gateway can resume notifications
-            if session.watcher_interval > 0:
-                self.pending_watchers.append({
-                    "session_id": session.id,
-                    "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
-                    **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
-                    "notify_on_complete": session.notify_on_complete,
-                    "parent_session_id": session.parent_session_id,
-                })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
