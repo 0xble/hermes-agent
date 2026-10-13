@@ -6,6 +6,14 @@ import pytest
 
 
 @pytest.fixture
+def completed_plugin_registry():
+    """Callable setup for a fully seeded registry, without filesystem discovery."""
+    from tests.plugin_helpers import mark_plugin_discovery_complete
+
+    return mark_plugin_discovery_complete
+
+
+@pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
 

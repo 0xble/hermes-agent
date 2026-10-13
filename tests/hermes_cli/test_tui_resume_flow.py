@@ -98,7 +98,7 @@ def _stub_plugin_discovery(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.plugins",
-        types.SimpleNamespace(discover_plugins=lambda: None),
+        types.SimpleNamespace(discover_plugins=lambda *a, **k: None),
     )
 
 
