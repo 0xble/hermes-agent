@@ -306,6 +306,14 @@ def test_relay_from_delegation_child_imports_nothing(hermes_home):
     assert goals._render_user_messages_block(target, state.created_at) == ""
 
 
+def test_relay_from_delegate_child_with_inherited_source_imports_nothing(hermes_home):
+    _db("parent-topic")
+    sender, target, target_db, _mgr, state = _forge_setup(
+        parent_session_id="parent-topic", model_config={"_delegate_from": "parent-topic"})
+    _deliver(target_db, sender, target, receipt="inherited-source-child")
+    assert goals._render_user_messages_block(target, state.created_at) == ""
+
+
 def test_relay_from_rotated_topic_session_still_imports(hermes_home):
     # Topic sessions rotate (compression/continuation) and keep a parent; they are still human.
     _db("parent-topic")

@@ -187,7 +187,8 @@ pauses remain authoritative.
   only when relay's own receipt ledger records that receipt as delivered from the
   named sender to this goal session (and this transcript row), the row is not a
   runtime or continuation prompt, and the sender is a human topic session (not a
-  subagent, cron, tool, kanban or one-shot session); header text alone never
+  subagent, cron, tool, kanban or one-shot session, and not a delegate child that
+  inherited a human source, recognised by its `_delegate_from` marker); header text alone never
   imports anything. Packing keeps the newest
   messages and stops at the first one that does not fit, marking it omitted rather
   than excerpting it, so a newer refusal can never be dropped while an older

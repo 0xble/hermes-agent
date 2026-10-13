@@ -2283,6 +2283,17 @@ def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id:
         return None
     if not info or str(info.get("source") or "") in _NON_HUMAN_SESSION_SOURCES:
         return None
+    # Delegate children inherit the gateway source (e.g. telegram); the creation marker is the proof.
+    # Continuations copy model_config verbatim, so a delegate child's continuation carries it too.
+    raw_config = info.get("model_config")
+    config: Any = raw_config
+    if isinstance(raw_config, str) and raw_config:
+        try:
+            config = json.loads(raw_config)
+        except ValueError:
+            return None
+    if isinstance(config, dict) and config.get("_delegate_from"):
+        return None
     return sender[1]
 
 
