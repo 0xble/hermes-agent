@@ -155,24 +155,25 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
-    # relay's CLI refuses a send to this address (relay C27), so a child's
-    # `relay send` to its parent fails however the shell spells it. Inherited
-    # values pass through untouched; an in-process child names its own parent.
+    # Relay accepts one guarded CLI address: prefer the reachable topic ancestor.
+    # Preserve an inherited address across later spawns.
     from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
-    if parent_address := in_process_child_relay_parent_address():
-        cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
+    if RELAY_PARENT_ADDRESS_ENV not in cleaned:
+        if parent_address := in_process_child_relay_parent_address():
+            cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
     return cleaned
 
 
 def in_process_child_relay_parent_address() -> str:
-    """The parent relay address an in-process delegated child stamps on what it spawns, else ``""``.
+    """The topic (or immediate parent) address an in-process child stamps, else ``""``.
 
-    Subprocess env builders and the terminal command wrapper (which reaches remote
-    backends whose process env is not inherited) share this one decision."""
+    Relay accepts one address, so prefer the reachable topic ancestor for nested
+    children. Subprocess env builders and remote terminal wrappers share this decision.
+    """
     if not _DELEGATED_CHILD_CONTEXT.get():
         return ""
-    from agent.relay_guard import child_parent_relay_address
-    return child_parent_relay_address()
+    from agent.relay_guard import child_parent_relay_address, child_topic_relay_address
+    return child_topic_relay_address() or child_parent_relay_address()
 
 
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:

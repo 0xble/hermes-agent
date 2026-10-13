@@ -58,6 +58,62 @@ def test_mcp_parent_relay_is_blocked_before_call_server_acquisition(tmp_path, mo
     assert other_result == "other target reached"
 
 
+@pytest.mark.parametrize("depth", [2, 3])
+def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, depth):
+    from contextlib import ExitStack
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    children = [f"child-{i}" for i in range(depth)]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="old-topic", source="telegram")
+        db.create_session(session_id="parent-session", source="telegram", parent_session_id="old-topic")
+        parent = "parent-session"
+        for child in children:
+            db.create_session(session_id=child, source="subagent", parent_session_id=parent)
+            parent = child
+    finally:
+        db.close()
+    tokens = _bind("parent-session")
+    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
+    try:
+        with ExitStack() as stack:
+            for child in children:
+                stack.enter_context(delegated_child_context(child))
+            with patch("tools.mcp_tool_handlers._acquire_call_server", side_effect=AssertionError("transport reached")):
+                for target in (PARENT_ADDRESS, f"hermes:default/{children[-2]}"):
+                    assert CHILD_PARENT_RELAY_ERROR in send({"address": target, "body": "do not send", "fyi": True})
+            with patch("tools.mcp_tool_handlers._acquire_call_server", return_value=(None, "peer reached")):
+                for target in ("hermes:default/peer", "hermes:default/old-topic", "hermes:other/parent-session"):
+                    assert send({"address": target, "body": "allowed"}) == "peer reached"
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+            inherited = {RELAY_PARENT_ADDRESS_ENV: "hermes:default/inherited"}
+            assert delegated_child_subprocess_env(inherited)[RELAY_PARENT_ADDRESS_ENV] == inherited[RELAY_PARENT_ADDRESS_ENV]
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize("lookup", [{"return_value": None}, {"side_effect": OSError("lineage unavailable")}])
+def test_lineage_lookup_failure_keeps_immediate_parent_guard(tmp_path, monkeypatch, lookup):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    tokens = _bind("parent-session")
+    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
+    try:
+        with delegated_child_context("child-session"), delegated_child_context("grandchild-session"), patch(
+            "tools.mcp_tool_caller._topic_session_id", **lookup
+        ), patch("tools.mcp_tool_handlers._acquire_call_server", return_value=(None, "transport reached")) as transport:
+            immediate = "hermes:default/child-session"
+            assert CHILD_PARENT_RELAY_ERROR in send({"address": immediate, "body": "do not send"})
+            transport.assert_not_called()
+            assert send({"address": "hermes:default/peer", "body": "allowed"}) == "transport reached"
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == immediate
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
 PARENT_ADDRESS = "hermes:default/parent-session"
 
 # Stands in for relay's CLI check (relay C27): refuse a send whose target is

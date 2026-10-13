@@ -1,8 +1,9 @@
 """Shared guard for relay sends made from delegated child execution.
 
-The Relay MCP call is checked here using in-process delegation context. The
-``relay`` CLI checks its parsed target against :data:`RELAY_PARENT_ADDRESS_ENV`
-carried by delegated children's subprocess environments. This cooperative CLI
+The Relay MCP call refuses the immediate parent and lineage topic session using
+in-process delegation context. The ``relay`` CLI checks its parsed target against
+:data:`RELAY_PARENT_ADDRESS_ENV`, carrying the topic address when resolved or the
+immediate parent otherwise. This cooperative CLI
 guard does not parse shell text. A nested command that clears or overrides the
 variable loses the CLI guard, so it is not an arbitrary-shell security boundary.
 """
@@ -51,12 +52,39 @@ def child_parent_relay_address() -> str:
     return f"hermes:{profile}/{parent_session_id}"
 
 
+def child_topic_relay_address() -> str:
+    """Reuse MCP caller lineage resolution without weakening the immediate-parent guard."""
+    from agent.delegation_context import is_delegated_child_process_context
+
+    if not is_delegated_child_process_context():
+        return ""
+    try:
+        from gateway.session_context import bound_session_env
+        from hermes_constants import get_hermes_home
+        from tools.mcp_tool_caller import _topic_session_id
+
+        session_id = bound_session_env("HERMES_SESSION_ID")
+        profile = _profile_name().strip()
+        if session_id and profile:
+            topic = _topic_session_id(session_id, get_hermes_home() / "state.db")
+            if topic:
+                return f"hermes:{profile}/{topic}"
+    except Exception:
+        # Persistence/thread startup may fail; the context-local parent still holds.
+        return ""
+    return ""
+
+
 def child_parent_relay_error(target: Any) -> str | None:
-    """Return actionable denial text when a delegated child targets its own parent."""
+    """Deny a delegated child's send to its immediate parent or lineage topic."""
     if not isinstance(target, str):
         return None
+    target = target.strip()
     expected = child_parent_relay_address()
-    return CHILD_PARENT_RELAY_ERROR if expected and target.strip() == expected else None
+    if expected and target == expected:
+        return CHILD_PARENT_RELAY_ERROR
+    topic = child_topic_relay_address()
+    return CHILD_PARENT_RELAY_ERROR if topic and target == topic else None
 
 
 def mcp_child_parent_relay_error(server_name: str, tool_name: str, args: Any) -> str | None:
