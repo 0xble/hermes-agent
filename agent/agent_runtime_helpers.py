@@ -31,6 +31,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
+from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.message_metadata import MERGED_TURN_PREFIX
 from agent.turn_context import drop_stale_api_content
@@ -1425,31 +1426,6 @@ def _primary_quota_reopened_early(agent, primary_provider, primary_model, matche
         return False
 
 
-def _adopt_shared_primary_cooldown(agent) -> bool:
-    """Start a fresh agent on the configured fallback when another process armed the primary route."""
-    if not getattr(agent, "_fallback_chain", None):
-        return False  # nothing to adopt onto; skip the state-file lock on every turn
-    try:
-        from agent.shared_primary_cooldown import get_cooldown, is_active, route_from_agent
-        record = get_cooldown(route_from_agent(agent))
-        if not is_active(record):
-            # Keep an expired record as a recovery probe: the first successful primary request
-            # clears it atomically and owns the sole recovery notice. None drops a record that
-            # was cleared elsewhere (another process recovered, or `hermes fallback cooldowns clear`).
-            agent._shared_primary_cooldown_record = record
-            return False
-        from agent.error_classifier import FailoverReason
-        try:
-            reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
-        except ValueError:
-            reason = FailoverReason.rate_limit
-        from agent.chat_completion_helpers import try_activate_fallback
-        return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
-    except Exception:
-        logger.debug("Shared primary cooldown adoption failed; using normal runtime", exc_info=True)
-        return False
-
-
 def _refresh_from_shared_cooldown(agent) -> str:
     """Sync an agent already on a provider fallback with the shared primary record.
 
@@ -1500,6 +1476,8 @@ def restore_primary_runtime(agent) -> bool:
     shared_state = "unavailable"
     if getattr(agent, "_provider_fallback_active", False):  # not `/model --once`
         shared_state = _refresh_from_shared_cooldown(agent)
+        if shared_state == "unavailable":
+            return False  # no verified reset/clear: stay on fallback even without a cached deadline
     cleared_elsewhere = held_shared_record and shared_state == "absent"
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
@@ -1673,11 +1651,11 @@ def dump_api_request_debug(
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
         # Redact secrets first: this fires unconditionally on API errors and captures the full
         # request body, so context-embedded secrets would otherwise land in cleartext on disk.
-        from agent.redact import redact_sensitive_text
-        _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
+        from agent.redact import redact_sensitive_json
+        _plain = json.loads(json.dumps(dump_payload, ensure_ascii=False, default=str))
         from agent.request_debug import bounded_request_dump, prune_request_dumps
-        _redacted_payload = bounded_request_dump(json.loads(redact_sensitive_text(_serialized, force=True)))
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        _redacted_payload = bounded_request_dump(redact_sensitive_json(_plain, force=True))
+        atomic_json_write(dump_file, _redacted_payload, mode=0o600, default=str)
         prune_request_dumps(dump_file)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
@@ -3823,23 +3801,6 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     return context
 
 
-def _requeue_pending_steer(agent, steer_text: str) -> None:
-    """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
-    # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
-    # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
-    # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-
-
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
     """Persist any pending /steer text as a standalone user message.
 
@@ -3862,6 +3823,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
+    from agent.steer_delivery import _requeue_pending_steer, report_steer_delivered
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
@@ -3875,6 +3837,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         _requeue_pending_steer(agent, steer_text)
         return
     messages.append(steer_user_row(steer_text))
+    report_steer_delivered(agent, steer_text)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars) as new user message: %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

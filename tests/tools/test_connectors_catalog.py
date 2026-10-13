@@ -132,7 +132,7 @@ def test_a_session_off_the_desktop_never_hears_of_the_tool_even_through_tool_sea
     import model_tools
     from agent.agent_init import _load_tools
 
-    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
     enabled, disabled = _desktop_child_toolsets() if platform == "subagent" else (["catalog", "web"], None)
     assert "catalog" in enabled
     agent = SimpleNamespace(quiet_mode=True, platform=platform, enabled_toolsets=enabled, disabled_toolsets=disabled)

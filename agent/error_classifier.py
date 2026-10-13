@@ -63,6 +63,7 @@ class FailoverReason(enum.Enum):
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth rejects 1M beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp grammar rejects regex `pattern`/`format` — strip from tools and retry
+    cooldown_state_unreadable = "cooldown_state_unreadable"  # Durable breaker state unavailable — do not probe
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 

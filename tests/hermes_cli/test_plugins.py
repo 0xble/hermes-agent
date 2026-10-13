@@ -481,7 +481,7 @@ class TestPluginDiscovery:
         assert len(register_calls) == 1
         assert entry.module is fake_module
 
-    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch):
+    def test_force_rediscover_clears_all_plugin_registries(self, monkeypatch, completed_plugin_registry):
         """force=True must clear every plugin-populated registry.
 
         Regression: ``_plugin_platform_names`` was populated by
@@ -507,7 +507,7 @@ class TestPluginDiscovery:
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
-        mgr._discovered = True
+        completed_plugin_registry(mgr)
 
         monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
         mgr.discover_and_load(force=True)
@@ -1133,7 +1133,7 @@ class TestForceReloadSymmetry:
         mgr.discover_and_load(force=True)
         assert mgr._discovered is True
 
-    def test_unload_all_sweeps_preledger_tool_names(self, monkeypatch):
+    def test_unload_all_sweeps_preledger_tool_names(self, monkeypatch, completed_plugin_registry):
         """Tool names without ledger entries are deregistered globally (#60050)."""
         deregistered = []
         import tools.registry as tools_registry_mod
@@ -1147,7 +1147,7 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         # Pre-ledger state: name tracked manager-locally, no ledger handle.
         mgr._plugin_tool_names.add("zombie_tool")
-        mgr._discovered = True
+        completed_plugin_registry(mgr)
 
         mgr.unload()
         assert deregistered == ["zombie_tool"]

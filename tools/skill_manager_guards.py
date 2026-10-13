@@ -233,8 +233,10 @@ def _background_review_external_write_guard(name: str, skill_dir: Path) -> Optio
         if not is_external_skill_path(skill_dir):
             return None
     except Exception:
-        logger.debug("external skill guard lookup failed for %s", name, exc_info=True)
-        return None
+        logger.warning("external skill guard lookup failed for %s", name, exc_info=True)
+        return _refusal(
+            f"Refusing background curator write for skill '{name}': external ownership could "
+            f"not be verified because the ownership lookup is unavailable or unreadable.")
     return _refusal(
         f"Refusing background curator write for skill '{name}': the skill lives in "
         f"skills.external_dirs, which are externally owned and read-only to autonomous "

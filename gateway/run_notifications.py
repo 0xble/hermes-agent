@@ -1580,7 +1580,7 @@ class GatewayNotificationsMixin:
         # releases it. The cache's opener clears ``_session_db_init_error`` on recovery, so a stale
         # startup failure must not be broadcast as current (#108031).
         if getattr(self, "_session_db_handle_cache", None) is not None:
-            self._open_session_db_for_active_scope()
+            await asyncio.to_thread(self._open_session_db_for_active_scope)
             error = self._session_db_init_error
             if not error:
                 logger.info("state.db recovered before the home-channel warning went out; not broadcasting")
@@ -3037,7 +3037,8 @@ class GatewayNotificationsMixin:
         busy_receipt_sent = False
         while True:
             await asyncio.sleep(interval)
-            session = process_registry.get(session_id)
+            # A finished process falls back to retained results, whose ownership check reads state.db.
+            session = await asyncio.to_thread(process_registry.get, session_id)
             if session is None:
                 break
             if silent:

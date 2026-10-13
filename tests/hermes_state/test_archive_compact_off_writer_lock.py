@@ -71,10 +71,11 @@ def test_writers_proceed_while_compaction_rereads_history(db, monkeypatch):
     compactor.start()
     try:
         assert entered.wait(10), "compaction never read its history"
-        writer = threading.Thread(target=db.set_meta, args=("probe", "1"))
-        writer.start()
-        writer.join(3)
-        assert not writer.is_alive(), "a write waited on the compaction's history read"
+        # The compactor is event-gated inside historical decoding, so lock availability is
+        # deterministic rather than inferred from whether a writer beats a timing deadline.
+        assert db._lock.acquire(blocking=False), "history decoding holds the compaction writer lock"
+        db._lock.release()
+        db.set_meta("probe", "1")
     finally:
         release.set()
         compactor.join(10)

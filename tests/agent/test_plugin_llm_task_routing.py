@@ -19,6 +19,8 @@ from typing import Any, Dict, List
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from agent.plugin_llm import (
     PluginLlmTrustError,
     PluginLlmTextInput,
@@ -379,7 +381,7 @@ class TestOwnershipIntegration:
         from hermes_cli.plugins import PluginManager
 
         manager = PluginManager()
-        manager._discovered = True
+        mark_plugin_discovery_complete(manager)
         return manager
 
     def _register(self, manager, *, name: str, key: str, task_key: str):

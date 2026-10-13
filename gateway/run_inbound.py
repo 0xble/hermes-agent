@@ -107,16 +107,16 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     async def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
-        """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
-        Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
+        """Gate ingress before auth: skip drops; rewrite replaces text; allow/None dispatches."""
+        from hermes_cli.plugins import PluginDiscoveryIncomplete
         try:
             from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
             _hook_results = await _ainvoke_hook(
                 "pre_gateway_dispatch", event=event, gateway=self,
-                # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
-                session_store=getattr(self, "session_store", None),
+                session_store=getattr(self, "session_store", None),  # bare runners omit __init__
             )
+        except PluginDiscoveryIncomplete:
+            raise  # A discovery timeout is not an allow decision; leave dispatch unadmitted.
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []

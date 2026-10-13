@@ -38,7 +38,7 @@ async def run_post_admission_hook(
     try:
         async with _routed_scope(runner, source):
             from hermes_cli.lifecycle import ainvoke_hook, has_hook
-            if not has_hook(POST_ADMISSION_HOOK):
+            if not await asyncio.to_thread(has_hook, POST_ADMISSION_HOOK):
                 return False, None
             results = await ainvoke_hook(
                 POST_ADMISSION_HOOK, session_key=session_key,

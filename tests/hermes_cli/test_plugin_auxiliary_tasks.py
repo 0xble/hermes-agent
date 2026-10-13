@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
@@ -23,7 +25,7 @@ def patched_manager(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     fresh = PluginManager()
-    fresh._discovered = True
+    mark_plugin_discovery_complete(fresh)
     monkeypatch.setattr(plugins_mod, "_PLUGIN_MANAGER", fresh, raising=False)
 
     def _stub_get_manager() -> PluginManager:

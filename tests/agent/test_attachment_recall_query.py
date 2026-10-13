@@ -132,6 +132,34 @@ def test_synthetic_recall_removes_attachment_scaffolding_inside_enrichment(enric
     assert DESCRIPTION not in query
 
 
+@pytest.mark.parametrize("generated", [_process_notice, _goal_prompt])
+def test_synthetic_recall_does_not_repeat_the_request_inside_enrichment(enrich, generated):
+    query = auto_recall_query(enrich(generated() + "\n\n" + REQUEST), include_synthetic=True)
+    assert query.count(REQUEST) == 1
+    assert query.startswith(REQUEST)
+    assert generated() in query
+
+
+def test_untranscribed_voice_fallback_note_is_not_the_recall_query(monkeypatch):
+    """gateway/run_inbound.py emits this bare note when the transcription module is missing."""
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_stt(name, *args, **kwargs):
+        if name == "tools.transcription_tools":
+            raise ModuleNotFoundError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_stt)
+    mixin = object.__new__(GatewayInboundMixin)
+    mixin.config = SimpleNamespace(stt_enabled=True)
+    enrich = getattr(mixin, "_enrich_message_with_transcription")
+    prompt, _ = asyncio.run(enrich(REQUEST, ["/cache/audio/voice.ogg"]))
+    assert prompt.startswith("[voice message could not be transcribed]")
+    assert auto_recall_query(prompt) == REQUEST
+    assert auto_recall_query(prompt, include_synthetic=True) == REQUEST
+
+
 def test_long_gateway_image_prefix_recalls_the_actual_personal_request(enrich):
     prompt = enrich(REQUEST)
     assert prompt.index(REQUEST) > 800
