@@ -137,6 +137,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
         self._on_preview = on_preview
+        self._recovered_send_uncertain = False
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.

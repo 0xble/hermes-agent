@@ -1863,6 +1863,8 @@ class TurnRunner:
             result["final_response"] = repair_explicit_computer_use_media_paths(
                 result["final_response"], result.get("messages", []), history_offset=len(agent_history),
             )
+        from gateway.stream_recovery import mark_recovered_reply
+        mark_recovered_reply(result, stream_consumer)
         ctx.result_holder[0] = result
         if stream_consumer is None:
             return

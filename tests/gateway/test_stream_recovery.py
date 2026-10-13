@@ -88,6 +88,8 @@ def test_resume_reuses_only_exact_predecessor(pending, session_id, token, restor
     recovery.restore_preview(runner, ctx, consumer)
     assert consumer.message_id == ("m1" if restored else None)
     assert consumer._already_sent is restored
+    assert consumer._recovered_send_uncertain is False
+    assert consumer.cfg.buffer_only is False
 
 
 def test_ack_lost_first_send_does_not_invent_platform_id():
@@ -97,3 +99,20 @@ def test_ack_lost_first_send_does_not_invent_platform_id():
     consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
     recovery.restore_preview(SimpleNamespace(session_store=store), SimpleNamespace(session_key="key", session_id="sid"), consumer)
     assert consumer.message_id is None
+    assert consumer._already_sent is False
+    assert consumer._recovered_send_uncertain is True
+    assert consumer.cfg.buffer_only is True
+    messages = [{"role": "assistant", "content": "real re-answer"}]
+    result = {"final_response": "real re-answer", "completed": True, "messages": messages}
+    recovery.mark_recovered_reply(result, consumer)
+    assert result["final_response"] == ledger.RECOVERED_MARKER + "real re-answer"
+    assert messages == [{"role": "assistant", "content": "real re-answer"}]
+    for flags in ({"failed": True}, {"interrupted": True}, {"completed": False}):
+        unfinished = {"final_response": "diagnostic", **flags}
+        recovery.mark_recovered_reply(unfinished, consumer)
+        assert unfinished["final_response"] == "diagnostic"
+    ordinary = {"final_response": "ordinary", "completed": True}
+    recovery.mark_recovered_reply(ordinary, GatewayStreamConsumer(SimpleNamespace(), "chat"))
+    assert ordinary["final_response"] == "ordinary"
+    recovery.mark_recovered_reply(result, consumer)
+    assert result["final_response"] == ledger.RECOVERED_MARKER + "real re-answer"

@@ -1,42 +1,71 @@
 # Stream preview crash ownership
 
+Patch identity: `stream-crash-visible-persist`.
+
 ## Required behavior
 
-After a crash during a provider stream, a resumed turn reuses its predecessor's
-known editable platform message so only one complete answer remains visible and
-normal completion persists that answer. Do not infer provider completion from
-an arbitrary preview, suppress partial-turn recovery, or edit a reset/successor's
-message. Preserve configured streaming edit cadence, tool progress, cleanup and
-live-status behavior.
+A real streamed preview survives a gateway crash as the same editable platform
+message when its ACK supplied a message ID. Recovery is fenced by the session
+key, session ID and exact resume-turn token; reset and successor turns never
+inherit a predecessor's preview. An edit whose ACK is lost retains the already
+known ID, so recovery reconciles by edit without a possible-duplicate marker.
 
-## Provenance and patches
+A provider stream is not complete until its terminal event. Never persist or
+adopt a potentially partial journaled preview as a finished assistant answer.
+The first-send-ACK-lost case cannot recover an editable ID: the platform may
+already hold that copy. The owner's option B keeps auto-resume, persists the
+real re-answer, and prefixes its delivery with the delivery ledger's existing
+`RECOVERED_MARKER`. Only this exact crash-recovery state is marked and buffered
+until completion, so its new preview cannot silently become another copy.
+Ordinary typed turns retain their streaming cadence and progress configuration.
 
-- **Identity/status:** draft, incomplete fork patch `stream-crash-visible-persist`.
-- **Base:** `origin/main` `87d06eebffb7152e77e98cc48b5eb17a9b7993fb`.
-- **Surfaces:** `gateway/stream_recovery.py`, stream consumer/transport, turn runner;
-  no `run_inbound.py` or `run_startup.py` changes.
-- **Boundary:** write-ahead real-preview snapshot before transport I/O; bind the
-  returned platform ID after ACK. Recovery keys include the original turn token,
-  routing key and session ID. Ephemeral draft frames do not enter this journal.
-- **Schema:** additive SQLite table, one latest wire observation per turn token;
-  facts are transport observations, not completed assistant turns. Existing
-  delivery-ledger connection ownership is retained. The journal writer explicitly
-  updates `updated_at`; snapshots older than seven days are pruned on writes.
-- **Regression:** added `stream_accepted_edit_unpersisted` crash param deliberately
-  waits for an initial partial preview ACK before holding the complete edit.
-  Assertions are unchanged; the original runtime xfail is not expanded or removed.
-- **Known blocker:** original `stream_accepted_unpersisted` emits the entire text in
-  one SSE chunk and its `any/hold_after` fault holds the *first send*, not an edit.
-  SIGKILL loses the returned platform message ID. The original strict cell stays
-  RED. Its assertion forbids an extra marked copy although its docstring allows
-  an honest possible duplicate; do not claim this draft closes that gap.
-- **Proof:** use `HERMES_PYTHON=<worktree>/.venv/bin/python
-  HERMES_E2E_STRICT_ACCEPTANCE=1 bash scripts/run_tests.sh <one file>`.
-  Original strict baseline: 1 failed, 57 deselected, 2 unmarked complete replies.
-  Added edit-only case on origin/main production sources: 1 failed, 58 deselected,
-  same duplicate shape with held `edit`. On patched sources: 1 passed; the five
-  existing other crash cases plus the new edit case: 6 passed. Journal units:
-  8 passed. Further conformance/ledger evidence belongs in the draft PR.
-- **Retirement:** replace only when upstream preserves exact preview ownership
-  across process death and safely handles ACK-lost first sends without discarding
-  unsent/partial answers or weakening exactly-once assertions.
+## Source and implementation
+
+`gateway/stream_recovery.py` journals exact wire text before real send/edit I/O
+and the message ID after ACK, in the existing profile-scoped `state.db`. It
+restores only the active resume token's known ID, or flags an uncertain first
+send. `TurnRunner` marks only a completed recovery result's delivery text;
+model history and normal persistence retain the actual re-answer without the
+transport marker. Failed/interrupted results are not fabricated completions.
+Ephemeral native draft frames are not journaled. Successful interim deletion
+forgets its journaled ID. Journal reads and writes stay off the gateway loop.
+
+## Upstream contract note
+
+The governing docstring in upstream `b477dd96`'s
+`test_crash_between_completion_and_send` explicitly allows any second copy the
+platform may hold when it is marked as a possible duplicate. Its helper's
+unconditional original-versus-resume rejection was stricter than that contract.
+The docstring contract governs: for `stream_accepted_unpersisted` only, allow at
+most one unmarked complete original, require one complete marked re-answer,
+require the persisted assistant text to equal that re-answer without the marker,
+and require one persisted user row. Two model calls are legitimate because the
+first never completed. This Director tracks the recovery call separately from
+`turns`; the scoped assertion permits `turns == 2` as well as that representation.
+Every assertion for the other crash points is unchanged. The cell's runtime
+xfail and its gap/signature constants are removed.
+
+Current upstream guidance was checked at
+`e06df9c2eae6901f4c88f464e0ae6e753c0428b8`: extend the existing delivery owner,
+preserve feature behavior, and prove real I/O/recovery contracts. Fresh searches
+for stream-preview crashes found no matching PR; the ACK-lost issue search found
+only unrelated cron handoff issue #109243. No upstream writes are authorized.
+
+## Verification
+
+Strict original-cell RED on fork main `87d06eeb`:
+`1 failed, 57 deselected`; two unmarked complete replies.
+Strict original-cell GREEN with option B:
+`1 tests passed, 0 failed`; one held original plus the marked, persisted re-answer.
+Recovery units: `8 tests passed, 0 failed`.
+The six original crash cells, accepted-edit case, conformance outbox suite,
+delivery-ledger units and full delivery file remain required before closeout.
+
+## Retirement
+
+Retire after upstream implements the complete same-message crash contract,
+first-send-ACK-lost honest marking, ownership fencing and visible/transcript
+alignment, with RED/GREEN proof through the real gateway crash harness.
+
+Stack fit: reused the stream consumer, resume identity, SQLite delivery ledger,
+`RECOVERED_MARKER` and existing pytest crash harness; added no dependencies.

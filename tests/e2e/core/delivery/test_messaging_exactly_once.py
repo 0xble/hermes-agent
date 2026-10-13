@@ -428,18 +428,6 @@ CRASH_POINTS = {
 # reached the delivery ledger; recovery must hand the persisted reply to the ledger rather than
 # re-run the turn. Either way exactly one complete reply must show.
 
-STREAM_CRASH_AFTER_ACCEPT_GAP = (
-    "LIVE GAP: streaming turn, the platform already shows the complete final answer, SIGKILL before "
-    "the turn is persisted -> restart auto-resumes and the model answers AGAIN; the second answer is "
-    "unmarked and the first (visible) answer was never persisted (visible != transcript).")
-# No fix PR yet: run-time xfail only when the visible pair is exactly the gap's shape, the held
-# original answer AND an auto-resumed re-answer, both unmarked.
-STREAM_CRASH_AFTER_ACCEPT_SIGNATURE = (
-    r"(?s)^(2 unmarked complete replies after catch-up|both the held answer and an auto-resumed "
-    r"re-answer are visible)\n.*<<A-fk_tg\.crash-stream_accepted_unpersisted>>.*"
-    r"<<R-fk_tg\.crash-stream_accepted_unpersisted-\d>>")
-
-
 def _replies(gw: GatewayProcess, platform: str, chat: str, token: str, aid: str):
     msgs = gw.platform_view().visible(platform, chat)
     originals = visible_copies(msgs, aid)
@@ -505,12 +493,7 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
                proc=gw.proc, log=gw.log)
     gw.wait_idle([chat], f"{token} to settle after restart")
     wait_until(lambda: ledger_quiescent(gw.db_path, chat), f"{token} ledger to settle", proc=gw.proc, log=gw.log)
-    # Every wait above must have succeeded before a known gap may XFAIL the cell: only the final
-    # assertions run under the run-time xfail, so a lost reply or a failed restart stays red.
-    guard = (known_failure(STREAM_CRASH_AFTER_ACCEPT_SIGNATURE, STREAM_CRASH_AFTER_ACCEPT_GAP)
-             if point == "stream_accepted_unpersisted" else contextlib.nullcontext())
-    with guard:
-        _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming)
+    _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming)
 
 
 def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming) -> None:
@@ -518,6 +501,24 @@ def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, 
     originals, resumes = _replies(gw, platform, chat, token, aid)
     complete = [c for c in originals + resumes if c.complete]
     unmarked = [c for c in complete if not c.marked]
+    if point == "stream_accepted_unpersisted":
+        # The first send's ACK died with the gateway, so its ID cannot be edited.
+        # The docstring's honest at-least-once contract governs this one cell:
+        # the unfinished model turn legitimately runs twice, never a fabricated completion.
+        assert len(unmarked) <= 1, f"{len(unmarked)} unmarked complete replies after catch-up\n{ctx}"
+        assert len(resumes) == 1 and resumes[0].complete and resumes[0].marked, ctx
+        assert not [c for c in originals if c.marked], ctx
+        final_aid = f"R-{token}-{director.resumes.get(token, 0)}"
+        persisted = persisted_answers(gw.db_path, final_aid)
+        # visible_copies strips the marker before constructing Copy.text.
+        assert len(persisted) == 1 and norm(persisted[0]) == resumes[0].text, (
+            f"visible final reply is not the (single) persisted assistant text: persisted={persisted}\n{ctx}")
+        # Director versions may count resume calls separately; only this cell
+        # permits two model turns for one inbound (one original, one recovery).
+        assert director.turns.get(token) in (1, 2), ctx
+        assert director.resumes.get(token) == 1, ctx
+        assert len(persisted_user_rows(gw.db_path, f"[in:{token}]")) == 1, ctx
+        return
     assert len(unmarked) <= 1, f"{len(unmarked)} unmarked complete replies after catch-up\n{ctx}"
     assert len(complete) - len(unmarked) <= (1 if point == "sent_ack_lost" else 0) or not unmarked, (
         f"unexpected extra marked copies\n{ctx}")
