@@ -63,6 +63,17 @@ def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
     other incomplete turns stay out (cf. #63180).
     """
     from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+    # A max-iteration handoff is judged from the returned summary. A blank delivery
+    # boundary is not a successful goal turn even when the result retains an older
+    # fallback summary for display.
+    if (
+        isinstance(result, dict)
+        and result.get("completed") is False
+        and str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached")
+        and isinstance(raw, str)
+        and not raw.strip()
+    ):
+        return False
     return (status == "complete" and isinstance(raw, str)
             and is_successful_goal_turn(result, raw))
 

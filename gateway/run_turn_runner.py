@@ -2105,10 +2105,18 @@ class TurnRunner:
             **usage,
         }
         if not final_response:
-            # Empty model output stays empty until the outer delivery boundary.
+            # Keep the model copy raw for evaluation, but retain the finalized display copy here.
+            # Some queued/direct delivery paths consume this result without the outer shape step.
+            from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+            display_response = _normalize_empty_agent_response(
+                result, final_response or "", history_len=len(agent_history),
+            )
+            display_response = _sanitize_gateway_final_response(ctx.source.platform, display_response)
+            if not display_response:
+                display_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
             # NOTE: deliberately omits agent_persisted/last_reasoning/response_* — the caller
             # defaults agent_persisted differently when the key is absent.
-            return {"final_response": model_response, **common}
+            return {"final_response": display_response, **common}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.
