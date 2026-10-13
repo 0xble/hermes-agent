@@ -14,6 +14,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 
 import asyncio
 import signal
+import subprocess
 import sys
 import types
 from pathlib import Path, PureWindowsPath
@@ -468,6 +469,7 @@ class TestHttpSessionLifecycle:
 
         expected_taskkill = call(
             ["taskkill", "/PID", "12345", "/T"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
