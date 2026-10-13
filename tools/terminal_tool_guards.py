@@ -231,10 +231,16 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
+    # The local backend reads the host filesystem directly, so it has no remote text to fall back on.
+    # Passing the callback there would make the installed heavy-slot peel unavailable (a remote
+    # callback cannot attest the local helper's identity) and scan its Python source as shell.
+    read_remote_script = None if env_type == "local" else (
+        lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
+    )
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        read_remote_script=read_remote_script,
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
