@@ -192,7 +192,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
                 if getattr(event, "_gateway_accepted", False) is not True:
                     continue
                 spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None:
+                if spool is not None and not getattr(event, "_hermes_queue_checkpoint", False):
                     spool.unlink(missing_ok=True)
             except Exception:
                 # One bad replay must not abort the drain: the remaining queued

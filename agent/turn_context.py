@@ -417,7 +417,8 @@ def _fail_closed_on_insufficient_progress(agent, request_tokens: int) -> None:
     raise PreflightCompressionTimedOut(
         "Context compression could not bring this session under the model's context window "
         f"(~{request_tokens:,} tokens vs {window:,}). The provider call was not "
-        "sent. Start a new session with /new; this session is too large to compress further."
+        "sent. This session and its accepted input are retained. Retry /compress "
+        "when the summary route is available; no new session is required."
     )
 
 
@@ -1131,8 +1132,17 @@ def build_turn_context(
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
     # Append the user message now that close persistence is safe.
-    append_message(messages, user_msg)
-    current_turn_user_idx = len(messages) - 1
+    # Recovery can resume the same accepted logical input. Keep its original tail
+    # (including completed tool receipts), rather than appending a second trigger.
+    accepted_idx = next((i for i, row in enumerate(messages)
+        if persist_user_platform_id is not None and row.get("role") == "user"
+        and row.get("platform_message_id") == str(persist_user_platform_id)), None)
+    if accepted_idx is None:
+        append_message(messages, user_msg)
+        current_turn_user_idx = len(messages) - 1
+    else:
+        current_turn_user_idx = accepted_idx
+        user_msg = messages[accepted_idx]
     agent._persist_user_message_idx = current_turn_user_idx
 
     agent._user_turn_count += 1
@@ -1177,6 +1187,9 @@ def build_turn_context(
         for msg in conversation_history
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
+
+    from agent.compression_recovery import admit_before_compaction
+    admit_before_compaction(agent, messages, conversation_history, user_msg)
 
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,

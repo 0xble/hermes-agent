@@ -50,6 +50,12 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     if any(getattr(event, "_hermes_recovery_spool", None) == path
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
+    if data.get("queue_accepted") is True and data.get("message_id") and any(
+        event.message_id == data["message_id"] and event.text == data.get("text", "")
+        and runner._session_key_for_source(event.source) == key
+        for event in getattr(runner, "_startup_restore_queue", ())
+    ):
+        return OTHER_PLATFORM_PENDING  # same logical input, distinct crash/retry spool
     store = runner.session_store
     with store._lock:  # noqa: SLF001 — inspect the same snapshot as the breaker
         store._ensure_loaded_locked()  # noqa: SLF001
@@ -81,7 +87,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
             logger.warning("Dropping unauthorized drain-deferred message from %s", path)
-            return DROP_PENDING
+            return None if data.get("queue_accepted") is True else DROP_PENDING
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
@@ -124,6 +130,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     )
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
+    setattr(event, "_hermes_queue_checkpoint", data.get("queue_accepted") is True)
     if recovered_events is not None:
         recovered_events.append(event)
     else:

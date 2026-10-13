@@ -54,10 +54,11 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
+def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[Path] = None,
+                   require_durable: bool = False) -> Path:
     """Atomically write one private, uniquely named recovery payload; return its path."""
     from utils import atomic_json_write
-    final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
+    final_path = path if path is not None else flush_dir / f"pending-{uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
         # Persist the directory entry too; keep the published file (the only recovery copy) even if
@@ -66,11 +67,15 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
             directory_fd = os.open(flush_dir, os.O_RDONLY)
         except OSError as exc:
             logger.debug("Failed to fsync pending-message directory: %s", exc)
+            if require_durable:
+                raise
         else:
             try:
                 os.fsync(directory_fd)
             except OSError as exc:
                 logger.debug("Failed to fsync pending-message directory: %s", exc)
+                if require_durable:
+                    raise
             finally:
                 os.close(directory_fd)
     return final_path
@@ -80,6 +85,9 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
+        checkpoint = getattr(value, "_hermes_recovery_spool", None)
+        if checkpoint is not None and checkpoint.exists():
+            return True
         if serialised is None or not has_user_content(serialised):
             return False
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
@@ -110,6 +118,29 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
+
+
+def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = False) -> bool:
+    """Admit through the native pending spool before a memory-only queue can lose input."""
+    checkpoint = getattr(event, "_hermes_recovery_spool", None)
+    if not refresh and checkpoint is not None and checkpoint.exists():
+        return True
+    try:
+        data = _serialise_value(event)
+        if data is None or not has_user_content(data):
+            return False
+        data["drain_deferred"] = True
+        data["queue_accepted"] = True
+        event._hermes_recovery_spool = _write_payload(_get_flush_dir(), {
+            "session_key": session_key, "reason": "queue_accepted",
+            "ts": _pending_arrival_ts(event, int(time.time())),
+            "seq": next(_TRANSCRIPT_SPOOL_SEQ), "data": data,
+        }, path=checkpoint if refresh else None, require_durable=True)
+        event._hermes_queue_checkpoint = True
+        return True
+    except Exception:
+        logger.warning("Queue admission checkpoint failed for %s", session_key, exc_info=True)
+        return False
 
 
 def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -519,7 +550,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
     if data.get("drain_deferred") is True:
-        if time.time() - path.stat().st_mtime > 24 * 60 * 60:
+        if data.get("queue_accepted") is not True and time.time() - path.stat().st_mtime > 24 * 60 * 60:
             logger.warning("Dropping expired drain-deferred message from %s", path)
             return DROP_PENDING
         from gateway.platforms.event import MessageEvent
@@ -529,7 +560,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         ).get_command()
         if command and resolve_command(command) is not None:
             logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
-            return DROP_PENDING
+            return False if data.get("queue_accepted") is True else DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)
@@ -553,6 +584,14 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
+    if data.get("queue_accepted") is True:
+        # Admission dedupe is not a completed reply/effect receipt. Once admitted,
+        # the native transcript/resume owner retains continuation.
+        message_id = data.get("message_id")
+        if target_db is not None and message_id and target_db.has_platform_message_id(session_id, str(message_id)):
+            return True
+        if deferred_followup is None:
+            return False
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data, path)
         if claim is DROP_PENDING:

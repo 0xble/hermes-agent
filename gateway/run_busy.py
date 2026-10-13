@@ -98,17 +98,31 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
-            return
+            return False
+        from gateway.shutdown_flush import checkpoint_queued_event
+        message_id = getattr(queued_event, "message_id", None)
+        duplicate = next((item for item in [pending_slot.get(session_key), *(self._overflow_queue(session_key) or ())]
+            if message_id and getattr(item, "message_id", None) == message_id
+            and getattr(item, "text", None) == getattr(queued_event, "text", None)
+            and list(getattr(item, "media_urls", None) or []) == list(getattr(queued_event, "media_urls", None) or [])), None)
+        if duplicate is not None:
+            if not checkpoint_queued_event(session_key, duplicate):
+                return False
+            queued_event._gateway_accepted = True
+            return True
+        if not checkpoint_queued_event(session_key, queued_event):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
         self._prefetch_queued_voice_transcript(queued_event, adapter)
+        return True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -410,10 +424,16 @@ class GatewayBusySessionMixin:
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
+            import copy
+            from gateway.shutdown_flush import checkpoint_queued_event
+            candidate_slot = {session_key: copy.deepcopy(existing)}
             merge_pending_message_event(
-                adapter._pending_messages, session_key, event,
+                candidate_slot, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
+            if not checkpoint_queued_event(session_key, candidate_slot[session_key], refresh=True):
+                return False
+            adapter._pending_messages[session_key] = candidate_slot[session_key]
             event._gateway_accepted = True
             return True
 
@@ -1157,7 +1177,8 @@ class GatewayBusySessionMixin:
                 internal=event.internal, timestamp=event.timestamp,
                 reply_expected=event.reply_expected,
             )
-            self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+            if not self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter):
+                return "Queue admission could not be durably acknowledged. No queued work was started; retry when storage is available."
             if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                 return None
         depth = self._queue_depth(quick_key, adapter=adapter)
@@ -1182,7 +1203,8 @@ class GatewayBusySessionMixin:
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context, reply_expected=event.reply_expected,
                 )
-                self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+                if not self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter):
+                    return "Queue admission could not be durably acknowledged. No queued work was started; retry when storage is available."
                 if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                     return None
             return reply
