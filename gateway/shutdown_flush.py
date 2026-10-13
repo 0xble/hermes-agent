@@ -120,10 +120,68 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     return flushed
 
 
+# A queue checkpoint that outlives this bound is retired unreplayed: a crash between turn
+# admission and retirement cannot replay the same input forever.
+QUEUE_CHECKPOINT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def queue_checkpoint_exempt(event: Any) -> bool:
+    """Gateway-authored wakes are not durably checkpointed.
+
+    Goal/heartbeat continuations and other internal wakes are re-derived from their own durable
+    owners (goal/heartbeat state, the delegation completion queue); a checkpoint for them could
+    only replay a stale wake. Human input without a platform id (leftover ``/steer`` text) is
+    still checkpointed: consumption retires it by path, not by id lookup."""
+    from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
+    if getattr(event, "internal", False):
+        return True
+    return bool((getattr(event, "metadata", None) or {}).get(GOAL_CONTINUATION_METADATA_KEY))
+
+
+def retire_queue_checkpoint(event: Any, *, reason: str) -> bool:
+    """Delete the accepted-queue spool owned by *event* (consumed or discarded).
+
+    Keyed by the checkpoint's own path, never by session lookup, so a rotation (/new, reset,
+    compression) cannot leave it behind to replay into the successor session."""
+    path = getattr(event, "_hermes_recovery_spool", None)
+    if path is None or not getattr(event, "_hermes_queue_checkpoint", False):
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not retire queue checkpoint %s (%s): %s", path, reason, exc)
+        return False
+    event._hermes_recovery_spool = None
+    event._hermes_queue_checkpoint = False
+    logger.debug("Retired queue checkpoint %s (%s)", path, reason)
+    return True
+
+
+def quarantine_pending_spool(path: Path, why: str) -> bool:
+    """Move a pending spool out of every replay glob, keeping it on disk for manual recovery."""
+    target = path.with_name(path.name + QUARANTINE_SUFFIX)
+    try:
+        path.replace(target)
+    except OSError as exc:
+        logger.error("Could not quarantine pending message %s (%s): %s", path, why, exc)
+        return False
+    logger.warning("Quarantined pending message %s to %s (%s); it will not be replayed", path, target, why)
+    return True
+
+
+def retire_queue_checkpoints(events, *, reason: str) -> int:
+    """Retire every checkpoint in *events* (None entries and plain strings are skipped)."""
+    return sum(retire_queue_checkpoint(event, reason=reason) for event in events if event is not None)
+
+
 def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = False) -> bool:
-    """Admit through the native pending spool before a memory-only queue can lose input."""
+    """Admit through the native pending spool before a memory-only queue can lose input.
+
+    Exempt wakes (see :func:`queue_checkpoint_exempt`) are accepted without a checkpoint."""
     checkpoint = getattr(event, "_hermes_recovery_spool", None)
     if not refresh and checkpoint is not None and checkpoint.exists():
+        return True
+    if checkpoint is None and queue_checkpoint_exempt(event):
         return True
     try:
         data = _serialise_value(event)
@@ -550,7 +608,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
     if data.get("drain_deferred") is True:
-        if data.get("queue_accepted") is not True and time.time() - path.stat().st_mtime > 24 * 60 * 60:
+        age = time.time() - path.stat().st_mtime
+        limit = QUEUE_CHECKPOINT_MAX_AGE_SECONDS if data.get("queue_accepted") is True else 24 * 60 * 60
+        if age > limit:
             logger.warning("Dropping expired drain-deferred message from %s", path)
             return DROP_PENDING
         from gateway.platforms.event import MessageEvent
@@ -585,6 +645,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "The message text is preserved in %s", session_key, path)
         return False
     if data.get("queue_accepted") is True:
+        from types import SimpleNamespace as _NS
+        if queue_checkpoint_exempt(_NS(internal=data.get("internal") is True, metadata=data.get("metadata") or {})):
+            # Gateway-authored wakes are re-derived by their own owners; an older build's
+            # checkpoint of one cannot be deduped by id and would otherwise replay every boot.
+            logger.info("Dropping stale gateway-authored queue checkpoint %s", path)
+            return DROP_PENDING
         # Admission dedupe is not a completed reply/effect receipt. Once admitted,
         # the native transcript/resume owner retains continuation.
         message_id = data.get("message_id")

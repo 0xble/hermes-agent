@@ -15,6 +15,36 @@ turn-start flush before risky compaction. History and logical input remain
 recoverable on a typed early exit or process restart. No second inbox, archive,
 context engine, task store, service or provider client is introduced.
 
+The fail-closed admission (`admit_before_compaction`) runs only when the turn
+may compact: compression enabled and either the idle-compaction gap reached or
+the cheap preflight pre-check (`_should_run_preflight_estimate`) passing. Those
+are exactly the turns with a compaction early exit that could otherwise lose the
+input. Other turns keep the ordinary log-and-continue turn-start flush, so a
+transient storage error does not fail a small turn with "Input checkpoint could
+not be acknowledged".
+
+### Queue checkpoint lifecycle
+
+A queued (FIFO) human input is checkpointed in the native pending spool before
+it is acknowledged. The checkpoint is retired by its own path, never by a
+session-id lookup, at exactly one of these points:
+
+- consumed: the agent's turn-start flush durably admits the input and fires the
+  one-shot, turn-scoped `_input_admitted_callback` the gateway installs for the
+  consumed event (`notify_input_admitted`); proxy turns retire on return;
+- discarded: `/stop` dropping a parked follow-up, `/new`/reset/resume clearing
+  the overflow (`_clear_conversation_scope`), adapter cancel/stale-lock heal
+  (`_discard_pending_message`), a pending slash command refused as agent input,
+  or a follow-up merged into the head's refreshed checkpoint;
+- expired: `QUEUE_CHECKPOINT_MAX_AGE_SECONDS` (7 days) bounds any crash window
+  between admission and retirement;
+- unauthorized owner at recovery: quarantined to `*.bad`, never replayed.
+
+Gateway-authored wakes (internal events, goal/heartbeat continuations) are not
+checkpointed: their own durable owners re-derive them. Older checkpoints of such
+wakes are dropped at recovery. Human input without a platform id (leftover
+`/steer`) is still checkpointed, because retirement does not need the id.
+
 After the configured native auxiliary summarizer/fallback route cannot fit a
 hard-window request, a no-network mechanical candidate may excerpt oversized
 tool observations and discard prior-turn thinking. Preserve human instructions,
@@ -69,7 +99,9 @@ MCP excerpts. None is proof of released equivalent behavior.
 Use `bash scripts/run_tests.sh`; no direct pytest or machine-slot bypass.
 Focused tests: `tests/agent/test_same_session_recovery.py`,
 `tests/gateway/test_auto_reset_clean_context.py`,
-`tests/gateway/test_same_session_queue_checkpoint.py` and
+`tests/agent/test_same_session_recovery_gaps.py`,
+`tests/gateway/test_same_session_queue_checkpoint.py`,
+`tests/gateway/test_queue_checkpoint_retirement.py` and
 `tests/e2e/core/compaction/test_same_session_recovery.py`.
 Ordinary FIFO acceptance writes the native private pending spool with file and
 directory fsync before memory acknowledgement. Such a spool is not expired or

@@ -425,8 +425,14 @@ class GatewayBusySessionMixin:
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
             import copy
-            from gateway.shutdown_flush import checkpoint_queued_event
-            candidate_slot = {session_key: copy.deepcopy(existing)}
+            from gateway.shutdown_flush import checkpoint_queued_event, retire_queue_checkpoint
+            # Shallow copy: raw_message holds live SDK objects (locks, sessions) that deepcopy
+            # cannot clone. Only the fields the merge mutates in place get their own lists/dicts.
+            candidate = copy.copy(existing)
+            for name in ("media_urls", "media_types", "media_text_inlined"):
+                setattr(candidate, name, list(getattr(existing, name, None) or []))
+            candidate.metadata = dict(getattr(existing, "metadata", None) or {})
+            candidate_slot = {session_key: candidate}
             merge_pending_message_event(
                 candidate_slot, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
@@ -434,6 +440,9 @@ class GatewayBusySessionMixin:
             if not checkpoint_queued_event(session_key, candidate_slot[session_key], refresh=True):
                 return False
             adapter._pending_messages[session_key] = candidate_slot[session_key]
+            if event is not candidate_slot[session_key]:
+                # The follow-up now lives in the merged head's checkpoint.
+                retire_queue_checkpoint(event, reason="merged_into_head")
             event._gateway_accepted = True
             return True
 

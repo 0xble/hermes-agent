@@ -1840,10 +1840,18 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            queued_event = ctx.queued_event
+            if getattr(queued_event, "_hermes_queue_checkpoint", False):
+                from gateway.shutdown_flush import retire_queue_checkpoint
+                agent._input_admitted_callback = (
+                    lambda: retire_queue_checkpoint(queued_event, reason="turn_admitted"))
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
+            # One-shot and turn-scoped: a cached agent must never fire it for a later turn.
+            with suppress(Exception):
+                agent._input_admitted_callback = None
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

@@ -2336,6 +2336,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
+                queued_event=event,
                 channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
@@ -3899,6 +3900,8 @@ class GatewayTurnMixin:
                             "Discarding command '/%s' from pending queue — "
                             "commands must not be passed as agent input", _pending_cmd_word,
                         )
+                        from gateway.shutdown_flush import retire_queue_checkpoint
+                        retire_queue_checkpoint(pending_event, reason="discarded_pending_command")
                         pending_event = None
                         pending = None
 
@@ -4123,6 +4126,9 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                # Preparation consumed or refused the follow-up; it will not run as a turn.
+                from gateway.shutdown_flush import retire_queue_checkpoint
+                retire_queue_checkpoint(pending_event, reason="followup_not_prepared")
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -4183,6 +4189,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                queued_event=pending_event,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
@@ -4547,16 +4554,21 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         title_user_message: Optional[str] = None,
+        queued_event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            # The remote server owns admission; once it answers, the queued input was handled.
+            from gateway.shutdown_flush import retire_queue_checkpoint
+            result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            retire_queue_checkpoint(queued_event, reason="proxy_turn_returned")
+            return result
 
         from run_agent import AIAgent
 
@@ -4585,7 +4597,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
-            _post_delivery_adapter=_post_delivery_adapter,
+            _post_delivery_adapter=_post_delivery_adapter, queued_event=queued_event,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(

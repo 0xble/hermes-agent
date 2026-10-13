@@ -4255,7 +4255,7 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        self._discard_pending_message(session_key, reason="stale_lock_heal")
         self._invalidate_deferred_commands(session_key)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
@@ -4319,7 +4319,7 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self._discard_pending_message(session_key, reason="cancel_session_processing")
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -5426,6 +5426,15 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def _discard_pending_message(self, session_key: str, *, reason: str) -> Optional[MessageEvent]:
+        """Drop the pending slot as user-visible discarded work; its queue checkpoint goes too,
+        or a restart would replay input the user (or a heal) deliberately threw away."""
+        dropped = self._pending_messages.pop(session_key, None)
+        if dropped is not None:
+            from gateway.shutdown_flush import retire_queue_checkpoint
+            retire_queue_checkpoint(dropped, reason=reason)
+        return dropped
 
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",

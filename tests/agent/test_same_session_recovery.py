@@ -70,6 +70,8 @@ def test_triggering_input_is_durable_before_preflight_failure(tmp_path):
     agent.client = MagicMock()
     agent.save_trajectories = False
     agent._use_prompt_caching = False
+    # A turn that may compact (P3 scoping): only such turns can hit this early exit.
+    agent.context_compressor.threshold_tokens = 1
     with patch("agent.turn_context_compaction.run_turn_start_compaction", side_effect=PreflightCompressionTimedOut("provider call was not sent")):
         result = agent.run_conversation("inspect task abc", persist_user_platform_id="telegram:101")
     assert result["failed"] is True
@@ -195,7 +197,8 @@ def test_admission_checkpoint_failure_does_not_send(tmp_path):
     from agent.turn_context import PreflightCompressionTimedOut
     db = SessionDB(db_path=tmp_path / "state.db")
     agent = _agent(db)
-    rows = [{"role": "user", "content": "inspect only"}]
+    # Over the preflight threshold: this turn may compact, so admission must fail closed.
+    rows = [{"role": "user", "content": "inspect only " + "x" * 4_000_000}]
     with patch.object(agent, "_flush_messages_to_session_db", return_value=False), pytest.raises(
             PreflightCompressionTimedOut, match="checkpoint"):
         admit_before_compaction(agent, rows, [], rows[0])

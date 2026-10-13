@@ -20,9 +20,52 @@ def recovery_active(agent: Any) -> bool:
     return _RECOVERY_AGENT.get() is agent
 
 
+def turn_may_compact(agent: Any, messages: list) -> bool:
+    """Whether turn-start idle or preflight compaction can run for *messages*.
+
+    Same cheap gates the passes themselves use (idle gap, ``_should_run_preflight_estimate``),
+    so a turn that cannot reach a compaction early exit is not failed closed on a transient
+    storage error; its input still takes the ordinary log-and-continue turn-start flush."""
+    if not getattr(agent, "compression_enabled", False) or not messages:
+        return False
+    import time
+    from agent.turn_context import _should_run_preflight_estimate
+    compressor = getattr(agent, "context_compressor", None)
+    idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
+    if isinstance(idle_after, (int, float)) and not isinstance(idle_after, bool) and idle_after > 0:
+        if time.time() - getattr(agent, "_last_activity_ts", time.time()) >= idle_after:
+            return True
+    try:
+        return bool(_should_run_preflight_estimate(
+            messages, compressor.protect_first_n, compressor.protect_last_n, compressor.threshold_tokens))
+    except Exception:
+        return True  # unknown pressure: keep the fail-closed durability guarantee
+
+
+def notify_input_admitted(agent: Any, user: Any) -> None:
+    """Fire the one-shot ``_input_admitted_callback`` once *user* is durably acknowledged.
+
+    The gateway uses it to retire the accepted-queue checkpoint of the input this turn consumed:
+    from here on the native transcript owns that input, so the checkpoint must not replay."""
+    callback = getattr(agent, "_input_admitted_callback", None)
+    if not callable(callback) or not (isinstance(user, dict) and user.get("_db_persisted")):
+        return
+    agent._input_admitted_callback = None
+    try:
+        callback()
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("input-admitted callback failed", exc_info=True)
+
+
 def admit_before_compaction(agent: Any, messages: list, history: list, user: dict) -> None:
-    """Require native durable acknowledgement before risking a compaction early exit."""
+    """Require native durable acknowledgement before risking a compaction early exit.
+
+    Scoped to turns that may compact (``turn_may_compact``); other turns keep the ordinary
+    turn-start flush, whose transient failure is logged rather than failing the turn."""
     if getattr(agent, "_persist_disabled", False) or getattr(agent, "_session_db", None) is None:
+        return
+    if not turn_may_compact(agent, messages):
         return
     from agent.session_persistence import _persist_lock
     from agent.turn_context import PreflightCompressionTimedOut
@@ -37,6 +80,7 @@ def admit_before_compaction(agent: Any, messages: list, history: list, user: dic
                 "Input checkpoint could not be acknowledged. The provider call was not sent; "
                 "the conversation is retained. Retry after durable storage is available."
             )
+    notify_input_admitted(agent, user)
 
 
 def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False, tools=None) -> bool:

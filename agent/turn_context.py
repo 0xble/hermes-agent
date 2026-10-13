@@ -1134,9 +1134,12 @@ def build_turn_context(
     # Append the user message now that close persistence is safe.
     # Recovery can resume the same accepted logical input. Keep its original tail
     # (including completed tool receipts), rather than appending a second trigger.
+    # SessionDB replays expose the id as ``message_id`` (JSONL compat) as well as
+    # ``platform_message_id``; match either so a DB-replayed trigger is not re-appended.
     accepted_idx = next((i for i, row in enumerate(messages)
-        if persist_user_platform_id is not None and row.get("role") == "user"
-        and row.get("platform_message_id") == str(persist_user_platform_id)), None)
+        if persist_user_platform_id is not None and isinstance(row, dict) and row.get("role") == "user"
+        and str(persist_user_platform_id) in (
+            str(row.get("platform_message_id") or ""), str(row.get("message_id") or ""))), None)
     if accepted_idx is None:
         append_message(messages, user_msg)
         current_turn_user_idx = len(messages) - 1
@@ -1233,6 +1236,13 @@ def build_turn_context(
             )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+    # Durable turn admission: the native transcript now owns this input (no-op if the
+    # pre-compaction admission already fired, or if the flush did not land).
+    from agent.compression_recovery import notify_input_admitted
+    _anchor = messages[current_turn_user_idx] if 0 <= current_turn_user_idx < len(messages) else None
+    for _admitted in (_anchor, user_msg):
+        if isinstance(_admitted, dict) and _admitted.get("role") == "user":
+            notify_input_admitted(agent, _admitted)
 
     return TurnContext(
         user_message=user_message, original_user_message=original_user_message, messages=messages,

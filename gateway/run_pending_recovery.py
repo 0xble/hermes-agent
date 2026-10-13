@@ -86,8 +86,14 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         if drain_deferred:
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
+            if data.get("queue_accepted") is True:
+                # Accepted user input is never silently deleted, and an owner who stays
+                # unauthorized must not hold it in the replay set forever: quarantine it.
+                from gateway.shutdown_flush import quarantine_pending_spool
+                quarantine_pending_spool(path, "resume owner not authorized")
+                return False
             logger.warning("Dropping unauthorized drain-deferred message from %s", path)
-            return None if data.get("queue_accepted") is True else DROP_PENDING
+            return DROP_PENDING
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
