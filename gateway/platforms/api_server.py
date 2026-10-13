@@ -3378,11 +3378,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return None, key_err
-        if gateway_session_key:
-            runner = getattr(self, "gateway_runner", None)
-            rehydrate = getattr(runner, "_rehydrate_session_model_override_async", None)
-            if callable(rehydrate):
-                await rehydrate(gateway_session_key)
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3424,7 +3419,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
-            selection_error = self._request_route_conflict_error(
+            selection_error = await asyncio.to_thread(
+                self._request_route_conflict_error,
                 session_id=session_id, gateway_session_key=gateway_session_key,
                 requested_model=agent_overrides.get("requested_model"),
                 requested_provider=agent_overrides.get("requested_provider"), route=route)

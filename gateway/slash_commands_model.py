@@ -443,18 +443,15 @@ class GatewayModelCommandsMixin:
         self, source, session_key: str, *, profile_home=None, **fields,
     ) -> _ModelSwitchContext:
         """Context for a model switch on ``session_key``: current route from the owning profile's
-        config, with any session override applied (one builder for every switch entry point). The
-        persisted override is rehydrated first: after a gateway restart the in-memory map is empty
-        until the session's next turn, and resolving against the global route would let a
-        model-only switch silently change the session's provider."""
+        config, with any session override applied (one builder for every switch entry point).
+        Async callers hydrate the persisted override off-loop before building this context,
+        preserving the owning profile's provider after a gateway restart."""
         from gateway.run import _hermes_home
         ctx = _ModelSwitchContext(
             session_key=session_key, source=source,
             config_path=(profile_home or _hermes_home) / "config.yaml", **fields,
         )
         ctx.read_config()
-        if session_key:
-            self._rehydrate_session_model_override(session_key)
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         return ctx
 
@@ -960,10 +957,6 @@ class GatewayModelCommandsMixin:
         from hermes_cli.models import fast_mode_route_ignored
 
         try:
-            # This helper is also called by the async /fast handler. Do not lazily hydrate here:
-            # a synchronous fallback must never take the session-store lock on the event loop.
-            if self._session_model_override(session_key) is None:
-                return ""
             model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
         except Exception:
             return ""
@@ -1006,7 +999,8 @@ class GatewayModelCommandsMixin:
             reply = t("gateway.fast.ultrafast_not_supported", model=model)
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
-            reply = self._apply_fast_selection(session_key, args, persist=persist_global)
+            reply = await asyncio.to_thread(
+                self._apply_fast_selection, session_key, args, persist=persist_global)
             return (expiry_notice + "\n\n" + reply) if expiry_notice else reply
         mode = service_tier_word(self._service_tier)
         status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
@@ -1021,7 +1015,8 @@ class GatewayModelCommandsMixin:
             status += "\n\n" + expiry_notice
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
-            return self._apply_fast_selection(session_key, value, persist=persist_global)
+            return await asyncio.to_thread(
+                self._apply_fast_selection, session_key, value, persist=persist_global)
 
         picker_sent = await self._try_send_choice_picker(
             event,

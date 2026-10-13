@@ -29,7 +29,8 @@ def reset_loop_guard():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("site", ["status", "model", "selection", "fast"])
-async def test_cold_model_override_read_runs_off_loop(site, tmp_path, monkeypatch):
+@pytest.mark.parametrize("persisted", [False, True])
+async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path, monkeypatch):
     import gateway.run as gateway_run
     import gateway.slash_commands_model as model_commands
 
@@ -37,7 +38,8 @@ async def test_cold_model_override_read_runs_off_loop(site, tmp_path, monkeypatc
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
     key = runner._session_key_for_source(source)
     runner.session_store.get_or_create_session(source)
-    runner.session_store.set_model_override(key, {"model": "persisted-model"})
+    if persisted:
+        runner.session_store.set_model_override(key, {"model": "persisted-model"})
     reads = []
     original = runner.session_store.get_model_override
 
@@ -73,7 +75,7 @@ async def test_cold_model_override_read_runs_off_loop(site, tmp_path, monkeypatc
             monkeypatch.setattr(runner, "_apply_fast_selection", apply)
             await runner._handle_fast_command(MessageEvent(text="/fast normal", source=source))
         assert reads and loop_thread not in reads, f"{site} store read on loop: {reads}"
-        if site != "fast":
+        if site != "fast" and persisted:
             assert runner._session_model_override(key)["model"] == "persisted-model"
     finally:
         hermes_loop_guard.set_loop_thread(None)
@@ -144,45 +146,127 @@ async def test_async_hydration_rejects_stale_read_after_edit(tmp_path, monkeypat
 
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["chat", "completions", "responses", "runs"])
+async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+    import gateway.run as gateway_run
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+    reads = []
+    original = runner.session_store.get_model_override
+    monkeypatch.setattr(runner.session_store, "get_model_override", lambda k: (reads.append(threading.get_ident()), original(k))[1])
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    monkeypatch.setattr(adapter, "_resolve_route", lambda _model: {"provider": "configured"})
+    monkeypatch.setattr(adapter, "_get_existing_session_or_404", AsyncMock(return_value=({}, None)))
+    monkeypatch.setattr(adapter, "_persist_session_runtime_lock", lambda *args: True)
+    original_conflict = adapter._request_route_conflict_error
+
+    def conflict(**kwargs):
+        original_conflict(**kwargs)
+        return "route validation boundary reached"
+
+    monkeypatch.setattr(adapter, "_request_route_conflict_error", conflict)
+    body = {"model": "model", "provider": "requested", "message": "hi", "input": "hi",
+            "messages": [{"role": "user", "content": "hi"}]}
+    request = MagicMock()
+    request.headers = {"X-Hermes-Session-Key": key}
+    request.match_info = {"session_id": "test-session"}
+    request.json = AsyncMock(return_value=body)
+    loop_thread = threading.get_ident()
+    hermes_loop_guard.set_loop_thread(loop_thread)
+    try:
+        if site == "chat":
+            _, response = await adapter._prepare_session_chat(request)
+        elif site == "completions":
+            response = await adapter._handle_chat_completions(request)
+        elif site == "responses":
+            response = await adapter._handle_responses(request)
+        else:
+            response = await adapter._handle_runs(request)
+        assert response.status == 400
+        assert reads and loop_thread not in reads, f"{site} store read on loop: {reads}"
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+        if adapter._session_db is not None:
+            adapter._session_db.close()
+
+
+@pytest.mark.asyncio
+async def test_new_topic_first_turn_session_setup_is_off_loop(tmp_path, monkeypatch):
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1",
+                           chat_type="dm", thread_id="311210")
+    event = MessageEvent(text="First topic turn", source=source)
+    monkeypatch.setattr(runner, "_is_telegram_topic_lane", lambda _source: True)
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        resolved = await runner._hmwa_resolve_session(event, source)
+        assert resolved is not None
+        _, entry, key = resolved
+        await runner._hmwa_open_session(entry, key, source)
+        assert entry.session_key == runner._session_key_for_source(source)
+        assert await runner.async_session_store.peek_session_id(key) == entry.session_id
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+
+
 @pytest.mark.parametrize("outcome,code", [("success", 0), ("failed", 1), ("restart", 75)])
-def test_gateway_process_exits_before_asyncio_executor_join(outcome, code, tmp_path):
+@pytest.mark.parametrize("entrypoint", ["module", "cli"])
+def test_gateway_process_exits_before_asyncio_executor_join(outcome, code, entrypoint, tmp_path):
     """A default-executor job and non-daemon worker must not outlive teardown."""
     script = textwrap.dedent('''
         import asyncio, sys, threading
         import gateway.run as run
-        outcome = sys.argv[1]
+        outcome, entrypoint = sys.argv[1:]
         block, started = threading.Event(), threading.Event()
         def stuck():
             started.set()
-            block.wait()
-        async def fake_start(_config=None):
+            block.wait(12)
+        async def fake_start(*args, **kwargs):
             asyncio.get_running_loop().run_in_executor(None, stuck)
             while not started.is_set():
                 await asyncio.sleep(0)
-            threading.Thread(target=block.wait, daemon=False).start()
+            threading.Thread(target=lambda: block.wait(12), daemon=False).start()
             print("Gateway stopped", flush=True)
             if outcome == "restart":
                 raise SystemExit(75)
             return outcome == "success"
         run.start_gateway = fake_start
         sys.argv = ["gateway.run"]
-        run.main()
+        if entrypoint == "module":
+            run.main()
+        else:
+            import hermes_cli.gateway as cli
+            from types import SimpleNamespace
+            for name in ("_guard_official_docker_root_gateway", "_guard_named_profile_under_multiplexer",
+                         "_attach_to_host_gateway_or_guard", "_guard_supervised_gateway_conflict",
+                         "_guard_existing_gateway_process_conflict"):
+                setattr(cli, name, lambda *args, **kwargs: None)
+            cli.supports_systemd_services = lambda: False
+            cli.sys.stdin = SimpleNamespace(isatty=lambda: False)
+            cli.run_gateway()
     ''')
     env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"),
                HERMES_RUNTIME_DIR=str(tmp_path / "runtime"))
-    child = subprocess.Popen([sys.executable, "-c", script, outcome], stdout=subprocess.PIPE,
+    child = subprocess.Popen([sys.executable, "-c", script, outcome, entrypoint], stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=env,
                              cwd=Path(__file__).resolve().parents[2])
     try:
         try:
             stdout, stderr = child.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            child.kill()
-            stdout, stderr = child.communicate(timeout=5)
+            # Finite test workers release themselves; never signal a running gateway.
+            stdout, stderr = child.communicate(timeout=20)
             pytest.fail(f"Gateway stopped but process remained alive: {stdout}\n{stderr}")
         assert "Gateway stopped" in stdout, stderr
         assert child.returncode == code, (stdout, stderr)
     finally:
         if child.poll() is None:
-            child.kill()
-            child.communicate(timeout=5)
+            child.communicate(timeout=30)

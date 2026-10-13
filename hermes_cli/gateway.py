@@ -35,9 +35,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 def _run_gateway_until_teardown(coro):
     """Run graceful teardown without ``asyncio.run`` joining the default executor."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    from gateway.event_loop import run_until_teardown
+    return run_until_teardown(coro)
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config  # noqa: F401 — resolved lazily by siblings through the facade
 from gateway.status import terminate_pid

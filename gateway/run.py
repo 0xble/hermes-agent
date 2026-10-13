@@ -6186,14 +6186,10 @@ def main():
 
     # start_gateway() completes teardown before returning/raising SystemExit; force-exit after so a
     # wedged non-daemon worker can't block Py_FinalizeEx's join. SystemExit caught so EVERY path exits.
-    def _run_until_teardown(coro):
-        """Avoid asyncio.run's default-executor join before the hard exit."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(coro)
+    from gateway.event_loop import run_until_teardown
 
     try:
-        success = _run_until_teardown(start_gateway(config))
+        success = run_until_teardown(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

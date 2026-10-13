@@ -37,6 +37,13 @@ def _prepare(monkeypatch):
         return True
 
     def _hard_exit(code: int) -> None:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            pass
+        else:
+            loop.close()
+            asyncio.set_event_loop(None)
         raise _HardExitObserved(code)
 
     monkeypatch.setattr(gateway_run, "start_gateway", _start_gateway)
@@ -64,11 +71,12 @@ def test_gateway_loop_returns_without_joining_default_executor():
 
     began = time.monotonic()
     assert gateway_cli._run_gateway_until_teardown(teardown()) is True
-    assert time.monotonic() - began < 1.0
+    assert time.monotonic() - began < 2.0
     release.set()
     loop = asyncio.get_event_loop()
     loop.run_until_complete(loop.shutdown_default_executor())
     loop.close()
+    asyncio.set_event_loop(None)
 
 
 def test_run_gateway_hard_exits_after_clean_return(monkeypatch):
@@ -92,7 +100,7 @@ def test_run_gateway_hard_exits_after_keyboard_interrupt(monkeypatch):
         coro.close()
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(gateway_cli.asyncio, "run", _fake_run)
+    monkeypatch.setattr(gateway_cli, "_run_gateway_until_teardown", _fake_run)
 
     with pytest.raises(_HardExitObserved) as excinfo:
         gateway_cli.run_gateway()

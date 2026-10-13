@@ -321,7 +321,7 @@ class GatewayTurnMixin:
 
     async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
         """Hydrate a persisted override without taking the session-store lock on the loop."""
-        if self._session_model_override(session_key) is not None:
+        if not session_key or self._session_model_override(session_key) is not None:
             return
         async with self._session_model_override_lock(session_key):
             if self._session_model_override(session_key) is not None:
