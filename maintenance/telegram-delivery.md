@@ -123,6 +123,11 @@ locally with `RetryAfter` for every path. The durable penalty is checked again a
 `budget.take()` returns: a flood recorded while a delivery waits for its slot must
 refuse it before the callback. Regression:
 `test_penalty_recorded_while_queued_is_rechecked_before_egress`.
+Profile-scoped replacement resolution and its bounded reconnect wait live in
+`telegram_reconnect.py`, inherited by `TelegramAdapter`; reconnect-only cron
+ledger admission lives in `cron/scheduler_delivery_reconnect.py`. Moving these
+existing owners keeps the oversized adapter, startup and cron files below their
+main-branch line-count caps without duplicate implementations or re-export shims.
 A post-slot penalty refusal conservatively retains its pacing reservation:
 `take()` has no reservation token/refund API, and rolling back shared `next_at`
 can erase later concurrent reservations. This may waste one slot, not a Bot API

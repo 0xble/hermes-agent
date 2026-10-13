@@ -6,6 +6,7 @@ import pytest
 
 from gateway.config import Platform
 import cron.scheduler_delivery as delivery
+from cron import scheduler_delivery_reconnect as reconnect
 
 
 @pytest.mark.parametrize("thread_fallback", [False, True])
@@ -19,7 +20,7 @@ def test_ambiguous_standalone_timeout_is_not_replayed(monkeypatch, thread_fallba
     queued = []
     monkeypatch.setattr(delivery._sched, "_interpreter_shutting_down", lambda *args: False)
     monkeypatch.setattr(delivery, "_get_standalone_send_timeout", lambda: 1)
-    monkeypatch.setattr(delivery, "_queue_for_live_reconnect",
+    monkeypatch.setattr(reconnect, "queue_for_live_reconnect",
                         lambda *args, **kwargs: queued.append(args))
 
     def run(coro):
@@ -68,8 +69,8 @@ def test_timeout_preserves_only_unattempted_payloads(monkeypatch, timed_out_payl
         return {}, None
 
     monkeypatch.setattr(delivery, "_standalone_send", send)
-    queue = MagicMock(wraps=delivery._queue_for_live_reconnect)
-    monkeypatch.setattr(delivery, "_queue_for_live_reconnect", queue)
+    queue = MagicMock(wraps=reconnect.queue_for_live_reconnect)
+    monkeypatch.setattr(reconnect, "queue_for_live_reconnect", queue)
     target_errors, delivery_errors = [], []
     delivery._deliver_standalone(target, "answer", media, target_errors,
                                  delivery_errors, copy_blocks=copies)

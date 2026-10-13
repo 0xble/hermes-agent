@@ -194,7 +194,7 @@ async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
         await release.wait()
         return SendResult(success=True, message_id="sent") if phase == "send" else None
 
-    if phase == "claim":
+    def delay_claim():
         real_sweep = ledger.sweep_failed_for_runtime
         def delayed_sweep(*args, **kwargs):
             rows = real_sweep(*args, **kwargs)
@@ -202,7 +202,7 @@ async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
             assert thread_release.wait(10)
             return rows
         monkeypatch.setattr(ledger, "sweep_failed_for_runtime", delayed_sweep)
-    elif phase in {"delivered_write", "refund_before", "refund_after"}:
+    def delay_write():
         name = "mark_delivered" if phase == "delivered_write" else "release_runtime_claim"
         real_write = getattr(ledger, name)
         def delayed_write(*args, **kwargs):
@@ -216,12 +216,24 @@ async def test_cancelled_recovery_settles_or_refunds_each_claim_once(
         monkeypatch.setattr(ledger, name, delayed_write)
         if phase.startswith("refund"):
             runner._async_session_store.clear_resume_pending.side_effect = RuntimeError("store unavailable")
-    elif phase == "clear":
+    def delay_clear():
         runner._async_session_store.clear_resume_pending.side_effect = blocked
-    elif phase == "note":
+
+    def delay_note():
         runner._redelivery_restart_note_event = blocked
-    else:
+
+    def delay_send():
         adapter.send.side_effect = blocked
+
+    {
+        "claim": delay_claim,
+        "delivered_write": delay_write,
+        "refund_before": delay_write,
+        "refund_after": delay_write,
+        "clear": delay_clear,
+        "note": delay_note,
+        "send": delay_send,
+    }[phase]()
 
     task = asyncio.create_task(
         runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile=profile)

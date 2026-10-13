@@ -23,6 +23,7 @@ from agent.i18n import t
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -74,7 +75,7 @@ def recover_left_core_at_gateway_start() -> None:
         recover_left_core_in(root)
 
 
-class GatewayStartupMixin:
+class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -773,60 +774,6 @@ class GatewayStartupMixin:
         """Claim + redeliver in one call. Stable shape for tests/external callers; the startup path
         calls the halves separately so the DB half runs inline before the abandonable send task."""
         return await self._redeliver_claimed_obligations(await self._claim_pending_obligations())
-
-    async def _redeliver_failed_obligations_for_platform(
-        self, platform: Platform, *, profile: Optional[str] = None,
-    ) -> int:
-        """Settle each runtime claim before honoring adapter teardown cancellation.
-
-        The claim/refund worker can commit after its caller is cancelled. Shield
-        the same operation until it completes, refund only undispatched rows,
-        and settle an in-flight send rather than treating it as safely unsent.
-        """
-        from gateway.delivery_recovery import RuntimeDeliverySettlement
-
-        settlement = RuntimeDeliverySettlement()
-        try:
-            from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
-            if not await asyncio.to_thread(ledger_enabled):
-                return 0
-            claimed = await settlement.wait(asyncio.to_thread(
-                sweep_failed_for_runtime, platform.value, profile=profile,
-            ))
-        except Exception:
-            logger.debug(
-                "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
-            )
-            if settlement.cancelled:
-                raise asyncio.CancelledError()
-            return 0
-        sendable = []
-        if claimed and not settlement.cancelled:
-            # Clear before dispatch so recovery cannot redeliver AND resume a turn.
-            sendable = await settlement.wait(
-                self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
-            )
-        sendable_ids = {row["obligation_id"] for row in sendable}
-        redelivered = 0
-        for row in claimed or []:
-            if settlement.cancelled or row["obligation_id"] not in sendable_ids:
-                await settlement.wait(self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
-                    error=row.get("last_error") or "send_path_degraded",
-                ))
-                continue
-            # Each shielded row includes the Bot API call and its ledger settlement.
-            # Once cancelled, do not start another row, and never refund this one.
-            delivered = await settlement.wait(self._redeliver_claimed_obligations(
-                [row], runtime_settlement=settlement,
-            ))
-            redelivered += delivered
-        if not settlement.cancelled:
-            with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
-                await settlement.wait(self._arm_flood_timers_for_waiting_rows())
-        if settlement.cancelled:
-            raise asyncio.CancelledError
-        return redelivered
 
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""

@@ -20,7 +20,9 @@ committed and a replacement has claimed that row.
 - Upstream main checked at `d0288be5b3330d2442e3907185b8e9d0958297bb`: still clears `_send_path_degraded` without waking replay. Related third-party PR [#105810](https://github.com/NousResearch/hermes-agent/pull/105810) adds the transition sweep, but its adapter-only tests do not cover persistence after the sweep or stale adapter ownership. Broader third-party [#107135](https://github.com/NousResearch/hermes-agent/pull/107135) addresses delivery races but is not imported wholesale; [#93440](https://github.com/NousResearch/hermes-agent/pull/93440) paces degraded send retries. No duplicate upstream PR opened.
 - Independent approach: extend the confirmed health transition with one tracked, profile-scoped runner replay; compensate after a late failure write only if its live delivery adapter is healthy. The existing SQLite transaction and owner/profile claims remain authoritative rather than adding an outbox.
 
-The cancellation settlement helper in `gateway/delivery_recovery.py` borrows
+The runtime recovery mixin and its cancellation settlement primitive live in
+`gateway/delivery_recovery.py`; `GatewayStartupMixin` inherits that owner without
+a forwarding shim. The settlement primitive borrows
 [PR #107135](https://github.com/NousResearch/hermes-agent/pull/107135)'s shielded,
 non-repeating cancellation contract only. The current runner, startup replay,
 flood worker and profile/ledger schema remain in place.

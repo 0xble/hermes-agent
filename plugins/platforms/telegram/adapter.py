@@ -28,6 +28,7 @@ from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
+from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
 from plugins.platforms.telegram.daily_quota import DEFAULT_SOFT_CEILING, DailyQuota
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
@@ -937,7 +938,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -1192,49 +1193,6 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if not getattr(self, "_fatal_error_code", None):
             return False
         return not bool(getattr(self, "_fatal_error_retryable", True))
-
-    def _replacement_telegram_adapter(self) -> Optional["TelegramAdapter"]:
-        """Live replacement for this adapter's owning profile after a reconnect.
-
-        ``runner.adapters`` belongs only to the primary profile. A secondary adapter
-        must resolve from its own map; otherwise an in-flight delivery can use the
-        wrong bot identity.
-        """
-        runner = getattr(self, "gateway_runner", None)
-        if runner is None:
-            return None
-        owner = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None)
-        resolve = getattr(runner, "_authorization_adapter", None)
-        if callable(resolve):
-            live = resolve(self.platform, owner)
-        elif owner and owner != "default" and owner != getattr(runner, "_primary_profile_name", None):
-            live = ((getattr(runner, "_profile_adapters", None) or {}).get(owner) or {}).get(self.platform)
-        else:
-            live = (getattr(runner, "adapters", None) or {}).get(self.platform)
-        if live is not None and live is not self and getattr(live, "_bot", None):
-            return live
-        return None
-
-    async def _wait_for_reconnection(self) -> bool:
-        """Wait for ``_bot`` or a replacement adapter; False on expiry or permanent fatal."""
-        if self._bot or self._replacement_telegram_adapter() is not None:
-            return True
-        if self._is_permanent_fatal():
-            return False
-        wait_s = float(getattr(self, "_RECONNECT_WAIT_SECONDS", 15.0))
-        poll_s = float(getattr(self, "_RECONNECT_POLL_INTERVAL", 0.5))
-        logger.info("[%s] Not connected — waiting for reconnection (up to %.0fs)", self.name, wait_s)
-        waited = 0.0
-        while waited < wait_s:
-            await asyncio.sleep(poll_s)
-            waited += poll_s
-            if self._is_permanent_fatal():
-                return False
-            if self._bot or self._replacement_telegram_adapter() is not None:
-                logger.info("[%s] Reconnected after %.1fs", self.name, waited)
-                return True
-        logger.warning("[%s] Still not connected after %.0fs", self.name, wait_s)
-        return False
 
     def _should_drop_delayed_delivery(self) -> bool:
         """True once teardown/fatal started: delayed flushes must not dispatch onto a torn-down session.

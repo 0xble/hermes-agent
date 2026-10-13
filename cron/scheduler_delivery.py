@@ -1882,48 +1882,6 @@ def _standalone_send(
         return _failed(e)
 
 
-def _queue_for_live_reconnect(
-    t: _TargetDelivery, content: str, media_files: list, delivery_errors: list,
-    *, copy_blocks: list[str] | None = None,
-) -> None:
-    """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
-    standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
-    owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
-    reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
-    carries text only; dropped attachments are reported."""
-    try:
-        from gateway.delivery_ledger import (
-            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
-        if not is_reconnect_only(t.live_error) or not ledger_enabled():
-            return
-        session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        job_ref = f"job:{t.job.get('id', '?')}"
-        # One row per logical message, so a replay that lands some and fails one retries only
-        # that one. Copy rows keep their markers so replay re-extracts and sends them plain.
-        rows = [(job_ref, content)] if content else []
-        from gateway.copy_blocks import wrap_copy_block
-        rows += [(f"{job_ref}#copy{index}", wrap_copy_block(block))
-                 for index, block in enumerate(copy_blocks or [])]
-        for message_ref, queued_content in rows:
-            obligation_id = compute_obligation_id(session_key, message_ref, queued_content)
-            record_obligation(
-                obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-                chat_id=str(t.chat_id), thread_id=t.thread_id, content=queued_content,
-                adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-            mark_failed(obligation_id, str(t.live_error))
-    except Exception:
-        logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
-                       t.job.get("id"), t.where, exc_info=True)
-        return
-    row_count = len(rows)
-    row_label = "row" if row_count == 1 else "rows"
-    note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
-    if media_files:
-        note += f" ({len(media_files)} attachment(s) not queued)"
-    logger.warning("Job '%s': %s", t.job.get("id"), note)
-    delivery_errors.append(note)
-
-
 def _mark_formatting_degraded(t: _TargetDelivery) -> None:
     """Record when Telegram had to use standalone after a transient live-path rejection."""
     if t.platform_name.lower() != "telegram":
@@ -1946,6 +1904,8 @@ def _deliver_standalone(
     copy_blocks: list[str] | None = None,
 ) -> None:
     """Standalone fallback for a target the live lane did not deliver."""
+    from cron import scheduler_delivery_reconnect as reconnect
+
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
@@ -2004,13 +1964,13 @@ def _deliver_standalone(
             pending_copies = (copy_blocks or [])[delivered_copy_count + int(is_copy_block):]
             pending_media = [] if payload_media else media_files
             if pending_copies or pending_media:
-                _queue_for_live_reconnect(
+                reconnect.queue_for_live_reconnect(
                     t, "", pending_media, delivery_errors, copy_blocks=pending_copies,
                 )
             return
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        _queue_for_live_reconnect(
+        reconnect.queue_for_live_reconnect(
             t,
             "" if delivered_text else content,
             media_files,
