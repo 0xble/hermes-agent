@@ -89,11 +89,9 @@ def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False,
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return False  # unknown fit cannot authorize a mechanical archive or send
     # Reserve the selected output cap plus estimator/transport framing headroom.
-    caps = (
-        getattr(agent, "max_tokens", None), getattr(agent, "_ephemeral_max_output_tokens", None),
-        getattr(compressor, "max_tokens", None),
-    )
-    output = max((v for v in caps if isinstance(v, int) and not isinstance(v, bool) and v > 0), default=0)
+    from agent.chat_completion_helpers import selected_max_output_tokens
+    selected = selected_max_output_tokens(agent)
+    output = selected if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0 else 0
     reserve = max(1024, int(window * 0.05))
     effective_prompt = (prompt or "") + ("" if wire else (getattr(agent, "ephemeral_system_prompt", "") or ""))
     request_tools = tools if wire else getattr(agent, "tools", None)

@@ -231,6 +231,27 @@ def test_complete_request_includes_media_and_output_runway(tmp_path):
     assert not request_fits(agent, rows, "")
 
 
+def test_request_fit_reserves_lowered_ephemeral_cap_without_consuming_it(tmp_path):
+    from agent.compression_recovery import request_fits
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.context_compressor.context_length = 32_768
+    agent.max_tokens = 16_000
+    agent.context_compressor.max_tokens = 16_000
+    rows = [{"role": "user", "content": "input " * 15_000}]
+    assert not request_fits(agent, rows, "")
+
+    agent._ephemeral_max_output_tokens = 1_024
+    assert request_fits(agent, rows, "")
+    assert agent._ephemeral_max_output_tokens == 1_024  # estimating is not consumption
+    kwargs = agent._build_api_kwargs(rows)
+    assert kwargs["max_tokens"] == 1_024
+    assert agent._ephemeral_max_output_tokens is None
+    assert not request_fits(agent, rows, "")  # next request uses the configured cap
+    db.close()
+
+
 def test_projection_survives_api_sidecar_replay(tmp_path):
     from agent.compression_recovery import recovery_projection
     from agent.turn_context import build_api_messages
