@@ -861,6 +861,10 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
         scan_error = _scan_cron_prompt(prompt)
         if scan_error:
             return scan_error
+        from cron.prompt_guard import prompt_update_error
+        guard_error = prompt_update_error(job.get("prompt"), prompt, allow_shrink=bool(a["allow_shrink"]))
+        if guard_error:
+            return guard_error
         updates["prompt"] = prompt
     if a["name"] is not None and a["name"].strip():
         # Blank name is a no-op, not a clear: a model re-sending the whole schema with
@@ -1064,7 +1068,8 @@ def cronjob(
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
-    hard_wall_timeout_seconds: Optional[float] = None) -> str:
+    hard_wall_timeout_seconds: Optional[float] = None,
+    allow_shrink: bool = False) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1129,7 +1134,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "prompt": {
                 "type": "string",
-                "description": "For create: the full self-contained prompt (paired with any skills as the task instruction). For run: optional transient context for that single fire (never persisted)."
+                "description": "For create: the full self-contained prompt (paired with any skills as the task instruction). For update: the COMPLETE replacement prompt text (never a file path or placeholder). For run: optional transient context for that single fire (never persisted)."
+            },
+            "allow_shrink": {
+                "type": "boolean",
+                "description": "Update only. Updates refuse a placeholder-looking prompt ('__FILE__', '<prompt>', 'TODO', '$(cat f)', '@file') and any prompt under 10% of an existing prompt of 500+ chars. Set true ONLY when that short or literal prompt is intended."
             },
             "schedule": {
                 "type": "string",
@@ -1220,7 +1229,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "allow_shrink")
 
 
 def _cronjob_handler(args, **kw):
