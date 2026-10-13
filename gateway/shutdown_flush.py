@@ -655,8 +655,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         # Admission dedupe is not a completed reply/effect receipt. Once admitted,
         # the native transcript/resume owner retains continuation.
         message_id = data.get("message_id")
-        if target_db is not None and message_id and target_db.has_platform_message_id(session_id, str(message_id)):
-            return True
+        if target_db is not None and message_id:
+            from agent.turn_context import _same_trigger_content
+            prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
+            if any(_same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
+                   for row in prior_rows):
+                return True
         if deferred_followup is None:
             return False
     if deferred_followup is not None:

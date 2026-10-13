@@ -62,6 +62,27 @@ def test_queue_spool_cannot_be_consumed_as_naked_transcript_or_expired(tmp_path,
     db.close()
 
 
+
+
+def test_restart_dedup_requires_matching_platform_id_and_content(tmp_path, monkeypatch):
+    """A reused platform id with different content is a distinct accepted input."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("same", "telegram")
+    db.append_message("same", "user", "first version", platform_message_id="101")
+    event = _event("different accepted instruction", "101")
+    assert shutdown_flush.checkpoint_queued_event("key", event)
+    claimed = []
+    recovered, _ = shutdown_flush.recover_pending_spool(
+        session_db=db, session_resolver=lambda *args, **kwargs: ("same", db),
+        deferred_followup=lambda key, sid, data, path: claimed.append(data["text"]) or True,
+    )
+    assert recovered == 1 and claimed == ["different accepted instruction"]
+    assert event._hermes_recovery_spool.exists()
+    assert [row["content"] for row in db.get_messages("same") if row["role"] == "user"] == ["first version"]
+    db.close()
+
+
 def test_admitted_input_transfers_to_native_transcript_owner_without_duplicate(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = SessionDB(db_path=tmp_path / "state.db")
