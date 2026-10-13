@@ -38,6 +38,7 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   and signalling its live targets. A blocked final result remains tracked in memory;
   only its owner may publish completion or release finite-parent waiters. Bounded
   finalizers that skip persistence retain the terminal result in the finished map.
+  A kill committed after the owner's write refreshes its receipt from current state under the result lock.
   The final prune checks its deadline throughout scanning, legacy classification,
   age deletion, and count deletion; unfinished retention work waits for a later prune.
   A busy writer may leave a receipt unwritten, but cannot hold up termination signals.

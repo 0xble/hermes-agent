@@ -2450,8 +2450,8 @@ class TestKillProcess:
         finally:
             registry._running.pop(s.id, None)
 
-    def test_kill_receipt_is_written_only_by_reader_finalizer(self, registry):
-        """A reader that finalized during signal grace remains the sole receipt writer."""
+    def test_kill_receipt_rewritten_when_reader_finalises_first(self, registry):
+        """A kill committed after the reader's write refreshes the durable outcome."""
         s = _make_session(sid="proc_kill_race", command="sleep 999")
         s.pid = 424243
         s.detached = True
@@ -2462,12 +2462,7 @@ class TestKillProcess:
             # path is still inside its grace window and finalises first.
             registry._finish_exited(s, 0)
 
-        saved = []
-
-        def record_save(session):
-            saved.append(
-                (session.completion_reason, session.termination_source, session.exit_code)
-            )
+        from hermes_constants import get_hermes_home
 
         try:
             host_guard = patch.object(
@@ -2478,17 +2473,17 @@ class TestKillProcess:
                 "_terminate_host_pid",
                 side_effect=reader_wins_during_signal,
             )
-            saver = patch(
-                "tools.process_registry.save_completed_result", side_effect=record_save
-            )
-            with host_guard, term_patch, saver:
+            with host_guard, term_patch:
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
             assert result["completion_reason"] == "killed"
             assert result["termination_source"] == "process.kill"
-            # The reader owns finalization, so the kill path must not rewrite it.
-            assert saved == [("exited", "", 0)]
+            path = get_hermes_home() / "logs" / "process-results" / f"{s.id}.json"
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+            assert (record["completion_reason"], record["termination_source"], record["exit_code"]) == (
+                "killed", "process.kill", -15,
+            )
         finally:
             registry._running.pop(s.id, None)
             registry._finished.pop(s.id, None)

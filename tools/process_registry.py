@@ -40,6 +40,7 @@ from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import (
     load_completed_results,
     prune_completed_results,
+    refresh_completed_result,
     save_completed_result,
     save_cut_pending_result,
 )
@@ -627,9 +628,9 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    # Set by the _move_to_finished call that moved the session out of _running; only that call
-    # publishes the completion, so a duplicate finisher must not release waiters early.
+    # Only the finalization claimant publishes completion and releases waiters.
     _finish_claimed: bool = field(default=False, repr=False)
+    _result_owner_write_done: bool = field(default=False, repr=False)
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.
     _scope_stop_pending: bool = field(default=False, repr=False)
@@ -2321,9 +2322,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
-            # The finalization owner writes the completed receipt. A kill that loses the
-            # finalization claim must not perform a second, racing receipt write.
-            self._move_to_finished(session)
+            refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()
             return {
@@ -3060,7 +3059,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
                         session.termination_source = source
                         if consume_output:
                             self._completion_consumed.add(session.id)
-                    self._move_to_finished(session)
+                    refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
                     killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]

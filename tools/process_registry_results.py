@@ -140,10 +140,14 @@ def _completed_result_snapshot(session) -> dict:
 
 def save_completed_result(
     session, *, completion_reason: str | None = None, termination_source: str | None = None,
-    prune: bool = True,
+    prune: bool = True, only_if_owner_done: bool = False,
 ) -> None:
     from agent.redact import redact_sensitive_text, redact_terminal_output
 
+    # An in-flight owner reconciles the kill itself; do not make the kill wait for its IO.
+    with session._lock:
+        if only_if_owner_done and not session._result_owner_write_done:
+            return
     directory = get_hermes_home() / "logs" / "process-results"
     path = directory / f"{session.id}.json"
     try:
@@ -159,10 +163,8 @@ def save_completed_result(
                 existing.get(_CUT_RECEIPT_FIELD)
                 or existing.get("completion_reason") in _CUT_COMPLETION_REASONS
             )
-            # Only the finalization owner writes. Snapshot after taking the result lock, but
-            # never hold the session lock across IO: stop signals/reaping need that lock too.
-            # If a kill reconciles during the write, the same owner refreshes its receipt
-            # before publishing completion instead of racing a second producer.
+            # Both the owner and a post-owner kill refresh snapshot under the result lock.
+            # Only terminal changes require another write; draining output cannot monopolize IO.
             while True:
                 snapshot = _completed_result_snapshot(session)
                 record = snapshot.copy()
@@ -175,8 +177,14 @@ def save_completed_result(
                 record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
                 record[_CUT_RECEIPT_FIELD] |= retained_cut
                 atomic_json_write(path, _header_first(record), mode=0o600)
-                if _completed_result_snapshot(session) == snapshot:
-                    break
+                with session._lock:
+                    if all(getattr(session, key) == snapshot[key] for key in (
+                        "exit_code", "completion_reason", "termination_source",
+                    )):
+                        # Atomic with the comparison: an earlier kill triggers another owner
+                        # write; a later kill sees this flag and serializes its own refresh.
+                        session._result_owner_write_done = True
+                        break
             if prune:
                 _result_paths()
         finally:
@@ -184,6 +192,12 @@ def save_completed_result(
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+
+
+def refresh_completed_result(session, finalization_claimed: bool, *, prune: bool = True) -> None:
+    """A kill that lost finalization refreshes only after the owner's stable write."""
+    if not finalization_claimed:
+        save_completed_result(session, only_if_owner_done=True, prune=prune)
 
 
 def save_cut_pending_result(

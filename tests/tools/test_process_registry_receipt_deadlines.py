@@ -194,6 +194,85 @@ def test_final_receipt_owner_cannot_be_overwritten_by_kill_race(tmp_path, monkey
         child.wait(timeout=5.0)
 
 
+@pytest.mark.parametrize("kill", ["all", "one"])
+@pytest.mark.platforms("posix")
+def test_kill_refreshes_receipt_after_reader_finalization(tmp_path, monkeypatch, kill):
+    """SIGTERM's reader receipt must be refreshed if the kill commits afterward."""
+    from tools import process_registry_results as receipts
+
+    registry = ProcessRegistry()
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    session = None
+    try:
+        session = registry.adopt_local(child, command="reader-first-kill", cwd=None)
+        reader = session._reader_thread
+        assert reader is not None
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        real_signal = os.kill
+        reader_receipts = []
+
+        def signal_child(pid, sig):
+            result = real_signal(pid, sig)
+            if pid == child.pid and sig == signal.SIGTERM:
+                reader.join(timeout=5.0)
+                assert not reader.is_alive(), "reader did not finalize during signal grace"
+                record = json.loads(receipt.read_text(encoding="utf-8-sig"))
+                assert record["completion_reason"] == "exited"
+                reader_receipts.append(record)
+            return result
+
+        monkeypatch.setattr(os, "kill", signal_child)
+        if kill == "all":
+            assert registry.kill_all(source="gateway_shutdown") == 1
+        else:
+            result = registry.kill_process(session.id, consume_output=False)
+            assert result["status"] == "killed"
+        reader.join(timeout=5.0)
+        assert len(reader_receipts) == 1
+        assert session.completion_reason == "killed"
+        record = json.loads(receipt.read_text(encoding="utf-8-sig"))
+        assert record["completion_reason"] == "killed"
+        assert record["exit_code"] == -15
+        assert record["termination_source"] == ("gateway_shutdown" if kill == "all" else "process.kill")
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5.0)
+        if session is not None and session._reader_thread is not None:
+            session._reader_thread.join(timeout=5.0)
+
+
+def test_output_drain_does_not_retry_a_stable_terminal_receipt(tmp_path, monkeypatch):
+    """A bounded amount of new output must not cause repeated terminal writes."""
+    from tools import process_registry_results as receipts
+
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: tmp_path)
+    session = ProcessSession(id="output-drain", command="draining-child", cwd=None)
+    session.mark_exited(-15, "killed", "process.kill")
+    session.append_output("initial output\n")
+    writes = []
+    real_write = receipts.atomic_json_write
+
+    def write_then_drain(path, record, **kwargs):
+        real_write(path, record, **kwargs)
+        writes.append(record)
+        # Stop after three changes so the old full-snapshot comparison fails finitely.
+        if len(writes) <= 3:
+            session.append_output("late output\n")
+
+    monkeypatch.setattr(receipts, "atomic_json_write", write_then_drain)
+    receipts.save_completed_result(session, prune=False)
+    assert len(writes) == 1
+    record = json.loads((tmp_path / "logs" / "process-results" / f"{session.id}.json").read_text())
+    assert record["completion_reason"] == "killed"
+    assert record["exit_code"] == -15
+
+
 @pytest.mark.parametrize("phase", ["classify", "age_delete", "cap_delete"])
 def test_prune_stops_classifying_after_deadline(tmp_path, monkeypatch, phase):
     """Expiry stops both legacy classification and deletion; later pruning repairs the cap."""
