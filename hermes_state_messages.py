@@ -2143,7 +2143,7 @@ class SessionMessagesMixin:
         return [self._row_to_message_dict(row, warn_context="platform message lookup", summary_flag=True)
                 for row in rows]
 
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False):
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any], *, include_reset: bool = False) -> bool:
         """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
         reset fork). Markers only count when they point at ``parent_session_id``: compression copies
         ``model_config`` onto the continuation, so presence-only matching would misclassify it (same binding
