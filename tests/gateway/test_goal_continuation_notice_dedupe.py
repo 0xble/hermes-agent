@@ -304,9 +304,11 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
             mgr.state.waiting_until = 1.0
             mgr._save()
             _restart_db()
-            with patch.object(goals, "judge_goal") as judge:
+            # Silent wakes are still judged (PR #531): recorded evidence, not prose, decides completion.
+            # A judged CONTINUE on an intentional silent wake keeps the parked notice identity.
+            with patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)) as judge:
                 mgr = await _turn(harness, "NO_REPLY")
-                judge.assert_not_called()
+                judge.assert_called_once()
             assert mgr.state.last_wait_notice_key == original_key
             assert mgr.state.status == "active" and mgr.is_parked()
         assert [m for m in adapter.sent if m.startswith("⏳")] == first
