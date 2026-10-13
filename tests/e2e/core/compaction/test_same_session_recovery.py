@@ -52,7 +52,7 @@ def test_saturated_summary_pool_recovers_and_resumes_same_identity(make_scenario
 
 def test_actual_auxiliary_client_forced_primary_failure_uses_configured_backup(tmp_path, monkeypatch):
     """Real native router and HTTP SDK; local scripted providers, not real authentication."""
-    import yaml
+    import hermes_yaml as yaml  # repo YAML API (ruamel); PyYAML is not provisioned
     from agent import auxiliary_client as aux
     from tests.fakes.fake_llm_provider import Error, FakeLLMServer, Text
 
