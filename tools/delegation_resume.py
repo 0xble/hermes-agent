@@ -8,11 +8,10 @@ Scope (deliberately narrow — see ``maintenance/delegation-restart.md`` slice 2
   parent model acts on with a normal, fully-authorized ``delegate_task`` spawn.
   Everything a resumed run does is therefore visible in the parent's own
   transcript and subject to every existing spawn gate (pause, depth, capacity).
-* Eligibility is intentionally minimal: a SINGLE-task delegation whose owner
-  stopped without a trustworthy terminal result, that carries a routable origin,
-  and that has no partial per-child results to reconcile. Batches, units with
-  recorded partial results and stateless origins are refused with a truthful
-  reason instead of guessed at.
+* A single-goal delegation keeps the existing scalar recovery path, even when
+  it has background batch-format metadata. Real fan-outs use durable per-child
+  claims: only unfinished, unconsumed children may be replaced, and recorded
+  successes are never rerun. Stateless origins are refused rather than guessed at.
 * The claim is DURABLE and ONE-SHOT (``resume_state``/``resume_attempts`` on the
   row). A restart loop, a double-delivered completion, or two consumers racing
   after a restart can produce at most one recovery brief per delegation.
@@ -33,11 +32,13 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Boot-time automatic resume is a parent-facing trigger only. The gateway reads
 # ``gateway.auto_resume_on_boot`` from the active profile before queueing notices;
 # the explicit one-shot resume action is independent of that setting.
+# Persisted producer token: only this shutdown cause authorizes restart-cut recovery.
+GATEWAY_RESTART_CUT_REASON = "gateway shutdown (restart)"
 AUTO_RESUME_CLAIM_TTL_SECONDS = 300.0
 AUTO_RESUME_STATE_NONE = "none"
 AUTO_RESUME_STATE_CLAIMED = "claimed"
@@ -66,13 +67,6 @@ def _ad():
     from tools import async_delegation
 
     return async_delegation
-
-
-_SELECT = """SELECT delegation_id, origin_session, origin_ui_session_id, parent_session_id,
-       state, dispatched_at, completed_at, task_json, result_json,
-       origin_session_id, resume_state, resume_attempts,
-       auto_resume_state, auto_resume_claim, auto_resume_claimed_at
-FROM async_delegations WHERE delegation_id=?"""
 
 
 def _row_to_record(row) -> Dict[str, Any]:
@@ -105,9 +99,106 @@ def _row_to_record(row) -> Dict[str, Any]:
     }
 
 
+def _batch_recovery_candidates(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return only fan-out children without a trustworthy recorded success."""
+    task = record.get("task") or {}
+    goals = list(task.get("goals") or [])
+    indexes = task.get("task_indexes") or list(range(len(goals)))
+    # All background dispatches use batch formatting, even for one goal.
+    # Only real fan-outs use child claims; preserve scalar retry admission.
+    if len(goals) <= 1:
+        return []
+    result = record.get("result") or {}
+    recorded = {entry.get("task_index"): entry for entry in result.get("results") or []
+                if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)}
+    candidates = []
+    for index in indexes:
+        entry = recorded.get(index) or {}
+        status = str(entry.get("status") or "unknown").lower()
+        if status in {"completed", "success", "succeeded"}:
+            continue
+        candidates.append({
+            "task_index": index,
+            "goal": goals[index] if 0 <= index < len(goals) else task.get("goal", ""),
+            "result": entry,
+        })
+    return candidates
+
+
+def _claim_batch_children(conn, record: Dict[str, Any], claim: str) -> List[int]:
+    """Take one durable claim for each unfinished child in a fan-out."""
+    candidates = _batch_recovery_candidates(record)
+    claimed = []
+    now = time.time()
+    for child in candidates:
+        changed = conn.execute(
+            """INSERT OR IGNORE INTO async_delegation_child_recovery
+               (delegation_id, task_index, claim, claimed_at)
+               VALUES (?, ?, ?, ?)""",
+            (record["delegation_id"], child["task_index"], claim, now),
+        ).rowcount
+        if changed == 1:
+            claimed.append(child["task_index"])
+    return claimed
+
+
+def _batch_recovery_tasks(record: Dict[str, Any], indexes: Optional[List[int]] = None) -> List[Dict[str, str]]:
+    """Build normal delegate_task task payloads for claimed unfinished children."""
+    task = record.get("task") or {}
+    candidates = _batch_recovery_candidates(record)
+    wanted = set(indexes) if indexes is not None else None
+    result = record.get("result") or {}
+    recorded = {entry.get("task_index"): entry for entry in result.get("results") or []
+                if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)}
+    transcripts = task.get("task_transcripts") or {}
+    tails = result.get("transcript_tails") or {}
+    shared = str(task.get("context") or "").strip()
+    tasks = []
+    for child in candidates:
+        index = child["task_index"]
+        if wanted is not None and index not in wanted:
+            continue
+        child_task = dict(task)
+        child_task.update(goal=child["goal"], context=shared)
+        child_record = dict(record, task=child_task)
+        instruction = build_recovery_instruction(child_record)
+        lines = [instruction, "", f"RECOVERY CHILD INDEX: {record['delegation_id']}:{index}"]
+        sibling_lines = []
+        for sibling_index, entry in sorted(recorded.items()):
+            sibling_lines.append(
+                f"- child {sibling_index}: status={entry.get('status', 'unknown')} "
+                f"summary={entry.get('summary') or entry.get('error') or '(none)'}"
+            )
+        if sibling_lines:
+            lines += ["", "RECORDED SIBLING RESULTS (do not repeat successful work):", *sibling_lines]
+        transcript = transcripts.get(str(index), transcripts.get(index)) if isinstance(transcripts, dict) else None
+        if transcript:
+            lines += ["", f"THIS CHILD'S PRIOR TRANSCRIPT: {transcript}"]
+        tail = tails.get(str(index), tails.get(index)) if isinstance(tails, dict) else None
+        if tail:
+            lines += ["", "THIS CHILD'S PRIOR TRANSCRIPT TAIL:", str(tail)]
+        if result.get("git_state_hint"):
+            lines += ["", f"OWNER GIT STATE AT CUT: {result['git_state_hint']}"]
+        tasks.append({"goal": str(child["goal"] or ""), "context": "\n".join(lines)})
+    return tasks
+
+
+def _batch_resume_eligibility(record: Dict[str, Any]) -> Optional[str]:
+    """Eligibility for a fan-out recovery, kept separate from legacy single-task rules."""
+    if record["state"] not in RESUMABLE_STATES or _recovery_stopped(record):
+        return INELIGIBLE_STATE
+    if not (record["parent_session_id"] or record["origin_session_id"]):
+        return INELIGIBLE_STATELESS
+    if record["resume_state"] != RESUME_STATE_NONE or record["resume_attempts"] > 0:
+        return INELIGIBLE_CLAIMED
+    if not _batch_recovery_candidates(record):
+        return INELIGIBLE_PARTIAL
+    return None
+
+
 def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     """None when the record may be resumed, else a stable refusal token."""
-    if record["state"] not in RESUMABLE_STATES:
+    if record["state"] not in RESUMABLE_STATES or _recovery_stopped(record):
         return INELIGIBLE_STATE
     task = record["task"]
     # Production background units retain batch metadata for completion formatting
@@ -121,17 +212,12 @@ def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     if task.get("task_indexes"):
         return INELIGIBLE_BATCH
     if record["result"].get("results"):
-        # A unit that recorded per-child results needs reconciliation, not a
-        # blind re-run: refuse rather than duplicate finished children's work.
         return INELIGIBLE_PARTIAL
     if not (record["origin_session_id"] or record["parent_session_id"]):
-        # Stateless origins (cron/one-shot CLI) have nowhere to deliver a
-        # resumed result and no conversation that can own the recovery.
         return INELIGIBLE_STATELESS
     if record["resume_state"] != RESUME_STATE_NONE or record["resume_attempts"] > 0:
         return INELIGIBLE_CLAIMED
     if not str(task.get("goal") or "").strip():
-        # Without the original goal there is nothing truthful to resume.
         return INELIGIBLE_STATE
     return None
 
@@ -146,10 +232,9 @@ def inspect_resumable(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Opt
     if not delegation_id:
         return None, INELIGIBLE_NO_ROW
     with ad._DB_LOCK, ad._transaction() as conn:
-        row = conn.execute(_SELECT, (delegation_id,)).fetchone()
-    if row is None:
+        record = _load(conn, delegation_id)
+    if record is None:
         return None, INELIGIBLE_NO_ROW
-    record = _row_to_record(row)
     return record, _eligibility(record)
 
 
@@ -168,12 +253,7 @@ def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
     candidates = []
     with ad._DB_LOCK, ad._transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, origin_session, origin_ui_session_id, parent_session_id,
-                      state, dispatched_at, completed_at, task_json, result_json,
-                      origin_session_id, resume_state, resume_attempts,
-                      auto_resume_state, auto_resume_claim, auto_resume_claimed_at
-               FROM async_delegations
-              WHERE state IN ('unknown', 'interrupted', 'stalled')
+            _RETRY_SELECT + """ WHERE state IN ('unknown', 'interrupted', 'stalled')
                 AND retry_state='none'
                 AND parent_session_id IS NOT NULL AND parent_session_id != ''
                 AND (auto_resume_state='none' OR
@@ -184,7 +264,7 @@ def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
         # Stream until the eligible result limit, not the raw-row limit. Otherwise
         # old unresumable rows permanently starve later recoverable work on every boot.
         for row in rows:
-            record = _row_to_record(row)
+            record = _retry_record(row)
             if _eligibility(record) is not None:
                 continue
             if not (record["session_key"] or record["origin_session_id"]):
@@ -207,10 +287,9 @@ def claim_auto_resume_trigger(record_or_id: Dict[str, Any] | str,
     now = time.time()
     stale_before = now - AUTO_RESUME_CLAIM_TTL_SECONDS
     with ad._DB_LOCK, ad._transaction() as conn:
-        row = conn.execute(_SELECT, (delegation_id,)).fetchone()
-        if row is None:
+        record = _load(conn, delegation_id)
+        if record is None:
             return None, INELIGIBLE_NO_ROW
-        record = _row_to_record(row)
         reason = _eligibility(record)
         if reason is not None:
             return record, reason
@@ -293,10 +372,9 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
     claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
     now = time.time()
     with ad._DB_LOCK, ad._transaction() as conn:
-        row = conn.execute(_SELECT, (delegation_id,)).fetchone()
-        if row is None:
+        record = _load(conn, delegation_id)
+        if record is None:
             return None, INELIGIBLE_NO_ROW
-        record = _row_to_record(row)
         reason = _eligibility(record)
         if reason is not None:
             return record, reason
@@ -312,6 +390,36 @@ def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[O
     record["resume_claim"] = claim_id
     record["resume_state"] = RESUME_STATE_CLAIMED
     record["resume_attempts"] = 1
+    return record, None
+
+
+def claim_batch_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Claim each unfinished child of a batch exactly once."""
+    ad = _ad()
+    if not delegation_id:
+        return None, INELIGIBLE_NO_ROW
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        record = _load(conn, delegation_id)
+        if record is None:
+            return None, INELIGIBLE_NO_ROW
+        reason = _batch_resume_eligibility(record)
+        if reason is not None:
+            return record, reason
+        changed = conn.execute(
+            """UPDATE async_delegations SET resume_state=?, resume_attempts=resume_attempts+1,
+                      resume_claim=?, resume_claimed_at=?, updated_at=?
+               WHERE delegation_id=? AND resume_state=? AND resume_attempts=0""",
+            (RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id, RESUME_STATE_NONE),
+        ).rowcount
+        if changed != 1:
+            return record, INELIGIBLE_CLAIMED
+        indexes = _claim_batch_children(conn, record, claim_id)
+    record["resume_state"] = RESUME_STATE_CLAIMED
+    record["resume_attempts"] = 1
+    record["resume_claim"] = claim_id
+    record["recovery_tasks"] = _batch_recovery_tasks(record, indexes)
     return record, None
 
 
@@ -437,7 +545,7 @@ _RETRY_SELECT = """SELECT delegation_id, origin_session, origin_ui_session_id, p
                             WHERE e.delegation_id=async_delegations.delegation_id
                               AND e.event_kind='terminal_fallback')),
        delivery_state, retry_state, retry_reason, retry_due_at, retry_notices,
-       retry_claim, retry_claimed_at, retry_root, retry_attempt, retry_root_started_at, retry_replacement
+       retry_claim, retry_claimed_at, retry_root, retry_attempt, retry_root_started_at, retry_replacement, resume_claim
 FROM async_delegations"""
 
 
@@ -451,7 +559,7 @@ def _retry_record(row) -> Dict[str, Any]:
         event=event, delivery_state=row[16] or "", retry_state=row[17] or RETRY_NONE, retry_reason=row[18] or "",
         retry_due_at=row[19], retry_notices=int(row[20] or 0), retry_claim=row[21] or "",
         retry_claimed_at=row[22], retry_root=row[23] or row[0], retry_attempt=int(row[24] or 0),
-        retry_root_started_at=row[25] or row[5], retry_replacement=row[26] or "",
+        retry_root_started_at=row[25] or row[5], retry_replacement=row[26] or "", resume_claim=row[27] or "",
     )
     return record
 
@@ -518,6 +626,29 @@ def is_user_cancel_reason(reason: str) -> bool:
     return any(marker in str(reason).lower() for marker in _USER_STOP_MARKERS)
 
 
+def is_trusted_restart_cut(reason: Any) -> bool:
+    """Only fixed gateway restart-producer reasons authorize cut recovery."""
+    return str(reason).strip().casefold() == GATEWAY_RESTART_CUT_REASON
+
+
+def _cut_reason(record: Dict[str, Any]) -> Any:
+    return (record.get("event") or {}).get("cut_reason") or (record.get("result") or {}).get("cut_reason")
+
+
+def _recovery_stopped(record: Dict[str, Any]) -> bool:
+    """Only positive user-stop evidence revokes recovery authority.
+
+    Gateway lifecycle cuts are recoverable even when their producer did not emit
+    the canonical restart token: older builds persisted phase-specific reasons,
+    and an unplanned shutdown may still be followed by a service-manager boot.
+    """
+    metadata = [record.get("event") or {}, record.get("result") or {}, *_child_results(record)]
+    return record.get("retry_state") == RETRY_CANCELLED or any(
+        is_user_cancel_reason(item.get("cut_reason") or "")
+        or is_user_cancel_reason(item.get("interrupt_reason") or "") for item in metadata
+    )
+
+
 def gateway_retry_origin(record: Dict[str, Any]) -> bool:
     """Only messaging gateway routes have the driver; CLI/TUI retain main's resume behavior."""
     # ``origin_session_id`` is the gateway's durable wake target, not a CLI/TUI
@@ -540,11 +671,13 @@ def gateway_retry_origin(record: Dict[str, Any]) -> bool:
 
 
 def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", origin_ui_session_id: str = "",
-                           parent_session_id: str = "", all_sessions: bool = False) -> set[str]:
-    """Cancel only still-owed retry states, atomically invalidating notice/report/dispatch claims."""
+                           parent_session_id: str = "", all_sessions: bool = False,
+                           reason: str = "stop_command") -> set[str]:
+    """Cancel owed retries and revoke unadmitted legacy recovery claims in one stop transaction."""
     selectors = [(field, value) for field, value in (
         ("origin_session", session_key), ("origin_ui_session_id", origin_ui_session_id),
         ("parent_session_id", parent_session_id)) if value]
+    cancel_reason = str(reason or "stop_command")
     if delegation_id:
         scope, values = "delegation_id=?", [delegation_id]
     elif all_sessions:
@@ -557,10 +690,13 @@ def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", or
     ad = _ad()
     placeholders = ",".join("?" for _ in RETRY_PENDING_STATES)
     with ad._DB_LOCK, ad._transaction() as conn:
-        rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason='stop_command',
+        rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason=?,
                        retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
-                       WHERE retry_state IN ({placeholders}) AND {scope} RETURNING delegation_id""",
-                            (time.time(), *RETRY_PENDING_STATES, *values)).fetchall()
+                       WHERE ((retry_state IN ({placeholders}))
+                              OR (retry_state=? AND resume_state=? AND COALESCE(retry_replacement, '')=''))
+                         AND {scope} RETURNING delegation_id""",
+                            (cancel_reason, time.time(), *RETRY_PENDING_STATES,
+                             RETRY_NONE, RESUME_STATE_CLAIMED, *values)).fetchall()
     return {row[0] for row in rows}
 
 
@@ -591,12 +727,19 @@ def classify_outcome(record: Dict[str, Any]) -> Tuple[str, str]:
     stop_text = " ".join(str(x) for x in (record["event"].get("interrupt_reason"),
                                           record["result"].get("interrupt_reason"),
                                           *(r.get("interrupt_reason") for r in results)) if x).lower()
+    if is_user_cancel_reason(record["event"].get("cut_reason")) or is_user_cancel_reason(record["result"].get("cut_reason")):
+        return RETRY_NONE, "stopped by user"
     if (state in {"interrupted", "cancelled"} or any(r.get("status") == "interrupted" for r in results)) and is_user_cancel_reason(stop_text):
         return RETRY_NONE, "stopped by user"
+    if _recovery_stopped(record):
+        return RETRY_NONE, "stopped without restart continuation"
     if state == "cancelled":
         return RETRY_NONE, "cancelled"
     if _goal_count(task) > 1 or task.get("task_indexes"):
-        # Fan-out units: per-index retry would need to reconcile siblings' side effects; surface instead.
+        # Lost-owner/cut batches go through the same retry claim as scalar work;
+        # the claim returns state-verifying briefs only for unfinished indexes.
+        if state in RESUMABLE_STATES and _batch_recovery_candidates(record):
+            return "retry", state
         done = len(results) - len(failed)
         return RETRY_TERMINAL, f"{len(failed) or 'some'} of {_goal_count(task)} parallel tasks did not finish ({done} done); needs review"
     if state in _LOST_OWNER_STATES or (failed and all(r.get("status") == "interrupted" for r in failed)):
@@ -645,6 +788,7 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
     if verdict == RETRY_NONE:
         return None
     return {"delegation_id": delegation_id, "retry_state": verdict, "reason": reason, "due_at": due,
+            "cut_reason": _cut_reason(record),
             "attempt": record["retry_attempt"] + (1 if verdict == RETRY_SCHEDULED else 0)}
 
 
@@ -703,6 +847,7 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     actions = []
     stale = now - RETRY_CLAIM_TTL_S
     with ad._DB_LOCK, ad._transaction() as conn:
+        conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
         rows = conn.execute(
             _RETRY_SELECT + """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
                  OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
@@ -712,12 +857,55 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
                AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
                                WHERE e.delegation_id=async_delegations.delegation_id
                                  AND e.delivery_state='pending')
-               ORDER BY updated_at ASC LIMIT ?""", (now, now - NOTICE_GRACE_S, now, stale, limit)).fetchall()
+               AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                               json_extract(result_json, '$.cut_reason')))
+                        AND (delivery_state='delivered' OR retry_notices > 0)
+                        AND retry_state IN ('scheduled','notified')
+                        AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+               ORDER BY updated_at ASC LIMIT ?""",
+            (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
         for row in rows:
             record = _retry_record(row)
+            dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
+            stopped = _recovery_stopped(record)
+            if stopped:
+                # A user stop revokes recovery, but an already-owed terminal
+                # report still gets one settlement pass. Pending retry notices
+                # are cancelled with an explicit reason and no stale claim.
+                if record["retry_state"] in (RETRY_TERMINAL, RETRY_REPORTING):
+                    if record["retry_state"] == RETRY_REPORTING:
+                        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_claim=NULL, "
+                                     "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
+                                     (now, record["delegation_id"]))
+                        record.update(retry_state=RETRY_TERMINAL, retry_claim="", retry_claimed_at=None)
+                else:
+                    conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_reason=?, "
+                                 "retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? "
+                                 "WHERE delegation_id=?",
+                                 ("stopped by user", now, record["delegation_id"]))
+                    if dispatch_claim is not None:
+                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                    continue
             if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
                 _expire_retry(conn, record, now)
             state = record["retry_state"]
+            if (not stopped and is_trusted_restart_cut(_cut_reason(record))
+                    and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0)):
+                # The cut completion/accepted continuation notice owns the one
+                # parent wake. Recovery is explicit, not an automatic rerun.
+                if state == RETRY_TERMINAL:
+                    conn.execute("UPDATE async_delegations SET retry_state='reported', retry_claim=NULL, "
+                                 "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
+                                 (now, record["delegation_id"]))
+                elif state == RETRY_DISPATCHING:
+                    conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
+                                 "retry_claimed_at=NULL, retry_due_at=?, updated_at=? WHERE delegation_id=? "
+                                 "AND retry_state='dispatching' AND retry_claim=?",
+                                 (record["retry_root_started_at"] + MAX_LINEAGE_AGE_S, now,
+                                  record["delegation_id"], dispatch_claim))
+                if dispatch_claim is not None:
+                    _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                continue
             if state == RETRY_NOTICING:  # crashed mid-injection: same notice again
                 state, record["retry_state"] = RETRY_SCHEDULED, RETRY_NOTICING
             if state == RETRY_REPORTING:
@@ -736,6 +924,8 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
             else:
                 claim = _claim(conn, record, record["retry_state"], RETRY_NOTICING, now)
                 if claim:
+                    if dispatch_claim is not None:
+                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
                     actions.append(_action(record, "notice", claim))
     return actions
 
@@ -814,12 +1004,31 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
         if record["retry_state"] not in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED):
             return record, INELIGIBLE_CLAIMED if record["retry_state"] in (RETRY_DISPATCHING, RETRY_DISPATCHED) \
                 else INELIGIBLE_STATE
+        if _recovery_stopped(record):
+            return record, INELIGIBLE_STATE
         if reason := _expire_retry(conn, record, now):
             return record, reason
+        task = record.get("task") or {}
+        candidates = _batch_recovery_candidates(record)
+        if _goal_count(task) > 1:
+            if not candidates:
+                return record, INELIGIBLE_PARTIAL
+            existing = dict(conn.execute(
+                "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
+                "WHERE delegation_id=?", (delegation_id,)))
+            # Consumed claims are permanent evidence, not a barrier to claiming
+            # the remaining children after a partial persist/release.
+            if any(child["task_index"] in existing and not existing[child["task_index"]] for child in candidates):
+                return record, INELIGIBLE_CLAIMED
+            if all(existing.get(child["task_index"]) for child in candidates):
+                return record, INELIGIBLE_CLAIMED
         claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
         if claim is None:
             return record, INELIGIBLE_CLAIMED
+        child_indexes = _claim_batch_children(conn, record, claim)
     record.update(retry_state=RETRY_DISPATCHING, retry_claim=claim, retry_claimed_at=now)
+    if child_indexes:
+        record["recovery_tasks"] = _batch_recovery_tasks(record, child_indexes)
     return record, None
 
 
@@ -833,20 +1042,43 @@ def claimed_retry_source(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def recovery_source_id(context: Any) -> Optional[str]:
+    """Current brief's source; ancestor headings in ORIGINAL CONTEXT are evidence only."""
+    match = _RECOVERY_HEADING_RE.search(str(context or ""))
+    return match.group(1) if match else None
+
+
 def is_recovery_spawn(record: Dict[str, Any]) -> bool:
     """True when the spawn carries another delegation's recovery brief (no ledger access)."""
-    m = _RECOVERY_HEADING_RE.search(str(record.get("context") or ""))
-    return bool(m and m.group(1) != record.get("delegation_id"))
+    source = recovery_source_id(record.get("context"))
+    return bool(source and source != record.get("delegation_id"))
+
+
+def _release_unspent_batch_children(conn, delegation_id: str, claim: str) -> None:
+    """Re-arm only unspent children owned by this exact row claim.
+
+    Consumed children remain durable one-shot evidence, even if a sibling failed
+    to persist. Call only inside the guarded row transition's transaction.
+    """
+    conn.execute("DELETE FROM async_delegation_child_recovery WHERE delegation_id=? "
+                 "AND claim=? AND replacement_delegation_id IS NULL", (delegation_id, claim))
 
 
 def release_retry_dispatch(record: Dict[str, Any]) -> bool:
-    """Return a claimed retry to the scheduler after replacement persistence fails."""
+    """Return a failed persist and its unspent child claims to the scheduler atomically."""
+    ad = _ad()
     now = time.time()
     due = now + _backoff(int(record.get("retry_attempt") or 0))
-    return _settle(
-        record["delegation_id"], record.get("retry_claim", ""), RETRY_DISPATCHING,
-        "retry_state='scheduled', retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=?", (due,)
-    )
+    did, claim = record["delegation_id"], record.get("retry_claim", "")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        changed = conn.execute(
+            "UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
+            "retry_claimed_at=NULL, retry_due_at=?, updated_at=? "
+            "WHERE delegation_id=? AND retry_state='dispatching' AND retry_claim=?",
+            (due, now, did, claim)).rowcount
+        if changed:
+            _release_unspent_batch_children(conn, did, claim)
+        return changed == 1
 
 
 def _replacement_source(conn, new: Dict[str, Any], task_text: str) -> Optional[Dict[str, Any]]:
@@ -861,11 +1093,48 @@ def _replacement_source(conn, new: Dict[str, Any], task_text: str) -> Optional[D
     return prior if same_owner else None
 
 
+def _replacement_children(conn, prior: Dict[str, Any], new: Dict[str, Any]) -> Optional[List[int]]:
+    """Indexes named by child recovery briefs, or None for the scalar contract.
+
+    A parent cannot turn a batch claim into a scalar whole-batch replay by
+    dropping the child marker. Every named index must be claimed and unspent.
+    """
+    task = prior.get("task") or {}
+    if not (_goal_count(task) > 1 or conn.execute(
+            "SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? LIMIT 1",
+            (prior["delegation_id"],)).fetchone()):
+        return None
+    import re
+    # Older-generation briefs remain verbatim inside ORIGINAL CONTEXT. Only the
+    # current delegation can authorize or consume its own child claims.
+    pattern = rf"RECOVERY CHILD INDEX: {re.escape(prior['delegation_id'])}:(\d+)\b"
+    return sorted({int(index) for index in re.findall(pattern, str(new.get("context") or ""))})
+
+
 def replacement_admission_error(conn, new: Dict[str, Any], task_text: str) -> Optional[str]:
     """Recheck in the INSERT transaction; commit expiry without inserting a child."""
     prior = _replacement_source(conn, new, task_text)
     if prior is None:
         return None
+    if _recovery_stopped(prior):
+        return "recovery source was stopped without restart continuation; no replacement was started"
+    indexes = _replacement_children(conn, prior, new)
+    if indexes is not None:
+        if not indexes:
+            return "batch recovery requires a claimed child index; no replacement was started"
+        for index in indexes:
+            child = conn.execute("SELECT claim, replacement_delegation_id FROM async_delegation_child_recovery "
+                                 "WHERE delegation_id=? AND task_index=?", (prior["delegation_id"], index)).fetchone()
+            expected_claim = prior["retry_claim"] if prior["retry_state"] != RETRY_NONE else prior["resume_claim"]
+            if child is None or child[0] != expected_claim:
+                return "child recovery claim missing or superseded; no replacement was started"
+            if child[1]:
+                return "child recovery claim already consumed; no replacement was started"
+        if prior["retry_state"] == RETRY_NONE:
+            return None
+        if prior["retry_state"] != RETRY_DISPATCHING:
+            return "child recovery claim cancelled or not taken; no replacement was started"
+        return _expire_retry(conn, prior, time.time())
     # Legacy/CLI/TUI rows have no durable retry state, but an explicit recovery
     # claim authorizes exactly the first replacement spawn. Admission is paired
     # with link_replacement() below, which records that replacement atomically.
@@ -907,6 +1176,23 @@ def link_replacement(conn, new: Dict[str, Any], task_text: str) -> None:
     if prior is None:
         return
     new_id, dispatched_at = new["delegation_id"], new["dispatched_at"]
+    indexes = _replacement_children(conn, prior, new)
+    if indexes is not None:
+        for index in indexes:
+            conn.execute("UPDATE async_delegation_child_recovery SET replacement_delegation_id=? "
+                         "WHERE delegation_id=? AND task_index=? AND replacement_delegation_id IS NULL",
+                         (new_id, prior["delegation_id"], index))
+        if prior["retry_state"] == RETRY_DISPATCHING:
+            conn.execute("UPDATE async_delegations SET retry_root=?, retry_attempt=?, retry_root_started_at=? "
+                         "WHERE delegation_id=?",
+                         (prior["retry_root"], prior["retry_attempt"] + 1,
+                          prior["retry_root_started_at"] or dispatched_at, new_id))
+            conn.execute("UPDATE async_delegations SET retry_state='dispatched', retry_replacement=?, updated_at=? "
+                         "WHERE delegation_id=? AND retry_state='dispatching' AND NOT EXISTS "
+                         "(SELECT 1 FROM async_delegation_child_recovery WHERE delegation_id=? "
+                         "AND replacement_delegation_id IS NULL)",
+                         (new_id, time.time(), prior["delegation_id"], prior["delegation_id"]))
+        return
     if prior["retry_state"] == RETRY_NONE:
         # Legacy explicit-resume rows have no retry claim state to advance. The
         # guarded write is the durable admission receipt for the one allowed
@@ -952,6 +1238,14 @@ def retry_note(plan: Optional[Dict[str, Any]]) -> str:
     """One line for the completion notice so the parent does not dispatch a duplicate (R5)."""
     if not plan:
         return ""
+    cut_reason = plan.get("cut_reason")
+    if cut_reason and is_user_cancel_reason(cut_reason):
+        return ""
+    if plan["retry_state"] == RETRY_SCHEDULED and is_trusted_restart_cut(cut_reason):
+        return (f"Work was cut before finishing. To continue call delegate_task(action='resume', "
+                f"subagent_id='{plan['delegation_id']}') and use its state-verification brief. "
+                "Do not rerun completed children. This recovery window expires after the 24h lineage budget; "
+                "Hermes will not automatically rerun this cut work or send another continuation notice.")
     if plan["retry_state"] == RETRY_SCHEDULED:
         return (f"Hermes will retry this automatically at {_when(plan['due_at'])} (retry {plan['attempt']}/"
                 f"{MAX_RETRY_ATTEMPTS}, {plan['reason']}); you will get a notice then. Do not re-dispatch it yourself.")
@@ -963,13 +1257,15 @@ def build_retry_notice(record: Dict[str, Any]) -> str:
     did = record["delegation_id"]
     attempt = record["retry_attempt"] + 1
     reprompt = record["retry_notices"] >= 1
+    spawn = ("then call delegate_task(tasks=<returned tasks list>), preserving each child's context verbatim. "
+             "Do not rerun completed children. " if _goal_count(record.get("task") or {}) > 1 else
+             "then call delegate_task with the returned goal and pass 'recovery_context' verbatim as context. ")
     return (
         f"[IMPORTANT: AUTOMATIC RETRY DUE — {did}] "
         + ("REMINDER: the previous retry notice was not acted on. " if reprompt else "")
         + f"A background delegation stopped ({record['retry_reason']}) and Hermes scheduled retry "
         f"{attempt}/{MAX_RETRY_ATTEMPTS}. Do it now: call delegate_task(action='resume', subagent_id='{did}'), "
-        "then call delegate_task with the returned goal and pass 'recovery_context' verbatim as context. "
-        "If it is no longer wanted, say so to the user. "
+        + spawn + "If it is no longer wanted, say so to the user. "
         + ("If you do not dispatch it, Hermes will stop retrying it." if reprompt else
            "Replying NO_REPLY without dispatching does not cancel the retry; you will be asked once more.")
         + f"]\n{PROCESS_NOTIFICATION_END}"

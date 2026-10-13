@@ -37,8 +37,43 @@ result/transcript evidence for conservative recovery through the durable retry e
 - Completion delivery settles only its own claim. Boot-notice claims remain owned
   by `claim_auto_resume_trigger`, `complete_auto_resume_trigger`, and
   `release_auto_resume_trigger`; completion acceptance cannot steal their claim.
-- This unit adds no schema or child recovery table. Per-child resume payloads and
-  fixed parent continuation notices belong to the follow-on recovery change.
+- The ledger-truth portion adds no schema. The per-child recovery extension below
+  adds one canonical, additive table without changing the existing retry lineage.
+
+## Per-child recovery and continuation extension
+
+- Only real fan-outs (`len(goals) > 1`) use `async_delegation_child_recovery`.
+  One-goal background rows still have `is_batch=True`, but retain the scalar
+  `goal` plus `recovery_context` replacement contract.
+- A fan-out resume returns a `tasks` list containing only unfinished, unconsumed
+  children. Recorded successes are never re-dispatched. Contexts carry sibling
+  outcomes, transcript evidence, and an instruction to verify external/workspace
+  state before continuing non-idempotent work.
+- Child claims are spent atomically with replacement persistence. Gateway retry
+  persistence failures re-arm only unspent children together with the row claim;
+  legacy/CLI/TUI claims remain available for a fresh durable admission attempt.
+  Recovery never executes inline on storage failure, unsupported async delivery,
+  or `background=false`. Consumed children remain one-shot evidence, and a stale
+  release cannot erase a newer claim. Cancellation is rechecked in the replacement
+  INSERT transaction, not just when the parent claims a brief.
+- Non-cut retries use the existing bounded retry notices and grace windows.
+  Fan-out notices instruct the parent to spawn the returned `tasks` list.
+- A gateway lifecycle cut lists unfinished indexes from goals/task_indexes, including
+  children whose result is missing, and gives the exact `action='resume'` command.
+  `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
+  continuation path, but recovery authority is based on positive evidence of a user
+  stop, not on a restart token. Legacy phase-specific gateway-shutdown reasons and
+  unplanned shutdowns therefore remain recoverable. `/stop`, `stop_command`,
+  cancellation, and session end do not offer or admit recovery; a sweep that revokes
+  one records `retry_reason='stopped by user'` and settles any already-owed terminal
+  report once. The accepted restart-cut completion/continuation owns the one parent
+  notice and requires explicit resume, not an automatic rerun or a second wake.
+- An unspent cut dispatch claim re-arms quietly after the normal grace window.
+  Unresumed cuts expire at the existing 24h lineage deadline and settle `reported`
+  without another parent wake; normal retention then prunes the row and orphaned
+  child-claim evidence. This keeps the notice promise and sweep contract aligned.
+- Schema reconciliation owns the additive child table. Older releases may ignore
+  it while reading the same state database.
 
 ## Tests
 
@@ -48,6 +83,11 @@ late checkpoint writes, lifecycle/fallback commit-then-raise paths, deferred
 ownership, writer fencing, and single completion settlement. Retention and boot
 claim release/reclaim invariants remain covered by
 `tests/tools/test_async_delegation_restart_cut.py`. Run both alongside the existing
-async delegation, terminal fallback, outbox, and recovery suites.
+`tests/tools/test_async_delegation*.py`, terminal fallback, outbox, and recovery
+suites, plus `test_delegation_retry.py`, `test_delegation_retry_controls.py`,
+`test_delegation_resume*.py`, `test_delegation_restart_resume_flow.py`
+(including the checkpoint-reconciled restart cut that must resume only unfinished
+children), `test_delegation_recovery_admission.py`, `test_restart_cut_notice.py`,
+and canonical state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.

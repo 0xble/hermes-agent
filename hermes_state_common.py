@@ -646,6 +646,18 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     retry_replacement TEXT
 );
 
+CREATE TABLE IF NOT EXISTS async_delegation_child_recovery (
+    delegation_id TEXT NOT NULL,
+    task_index INTEGER NOT NULL,
+    claim TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    replacement_delegation_id TEXT,
+    PRIMARY KEY (delegation_id, task_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_async_delegation_child_recovery_claim
+    ON async_delegation_child_recovery(delegation_id, claimed_at);
+
 CREATE TABLE IF NOT EXISTS async_delegation_events (
     event_id TEXT PRIMARY KEY,
     delegation_id TEXT NOT NULL,

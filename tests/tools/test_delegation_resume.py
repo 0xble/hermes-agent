@@ -407,11 +407,12 @@ def test_resume_action_second_call_is_refused():
     assert "already been claimed" in second
 
 
-def test_resume_action_batch_refusal_is_truthful():
+def test_resume_action_batch_returns_unfinished_children():
     did = _dispatch_row("deleg_action_batch", is_batch=True)
     _mark(did, "unknown")
-    out = _handle_control_action("resume", did, None, _Parent())
-    assert "multi-task batch" in out
+    out = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert out["status"] == "recovery_claimed"
+    assert [task["goal"] for task in out["tasks"]] == ["a", "b"]
 
 
 def test_resume_routes_through_delegate_task_entrypoint():

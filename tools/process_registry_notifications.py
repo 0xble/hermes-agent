@@ -17,6 +17,24 @@ WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_o
 GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
 
+
+def _cut_is_user_stop(reason) -> bool:
+    """Load stop classification lazily to avoid the delegation notification cycle."""
+    from tools.delegation_resume import is_user_cancel_reason
+    return is_user_cancel_reason(reason or "")
+
+
+def _cut_is_trusted_restart(reason) -> bool:
+    """Keep the canonical producer token useful for wording, not authority."""
+    from tools.delegation_resume import is_trusted_restart_cut
+    return is_trusted_restart_cut(reason)
+
+
+def _cut_is_recoverable(reason) -> bool:
+    """Every lifecycle cut remains recoverable unless it proves a user stop."""
+    return bool(reason) and not _cut_is_user_stop(reason)
+
+
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
@@ -227,6 +245,30 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
+def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
+    """Render recovery guidance for every lifecycle cut except an explicit user stop."""
+    cut_reason = evt.get("cut_reason")
+    if not cut_reason:
+        return []
+    reason = str(cut_reason).strip()
+    goals = evt.get("goals") or []
+    indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
+    recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
+    unfinished = [str(index + 1) for index in indexes
+                  if recorded.get(index, {}).get("status") not in _DONE]
+    detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
+    if _cut_is_user_stop(reason):
+        return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
+    when = evt.get("completed_at") or time.time()
+    stamp = time.strftime("%H:%M", time.localtime(when))
+    label = "gateway restart" if _cut_is_trusted_restart(reason) else "gateway shutdown/lifecycle"
+    return [
+        f"Cut by {label} at {stamp}. {detail}",
+        f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
+        *(["Do not rerun completed children."] if len(goals) > 1 else []),
+    ]
+
+
 def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> str:
     """Consolidated block for a delegate_task fan-out that finished as one unit."""
     results, goals = evt.get("results") or [], evt.get("goals") or []
@@ -244,8 +286,19 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
-    if evt.get("status") == "interrupted" or any(r.get("status") == "interrupted" for r in results):
-        lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+    lines += _cut_recovery_lines(evt, results)
+    restart_cut = _cut_is_recoverable(evt.get("cut_reason"))
+    if evt.get("cut_reason"):
+        lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
+        lines.append(
+            "This unit was cut by the gateway before its terminal result was trustworthy. "
+            "Resume only the unfinished children after verifying recorded results and side effects."
+            if restart_cut else
+            "This unit was stopped before its terminal result was trustworthy; no continuation was requested."
+        )
+    if evt.get("status") == "interrupted" or evt.get("cut_reason") or any(r.get("status") == "interrupted" for r in results):
+        if not evt.get("cut_reason") or restart_cut:
+            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
@@ -320,7 +373,7 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
-    lines += _notice_lines([evt]) + [
+    lines += _notice_lines([evt]) + _cut_recovery_lines(evt, [evt]) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
         "--- RESULT ---"]
@@ -331,7 +384,8 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         if status == "interrupted":
             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
-            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+            if not evt.get("cut_reason") or _cut_is_recoverable(evt.get("cut_reason")):
+                lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))

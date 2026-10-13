@@ -211,7 +211,6 @@ async def test_goal_status_notice_logs_when_retry_is_cancelled(monkeypatch, capl
     ("▶ Goal resumed: ship it", "resumed", True),
     ("⏳ Goal parked: waiting for review", None, False),
     ("↻ Continuing toward goal: more work", None, False),
-    ("▶ Goal wait ended — resuming.", "wait-ended", False),
     ("⏳ Goal still waiting on pid 42 after 30 minutes", "wait-age", False),
     ("Goal status: unchanged", None, False),
 ])

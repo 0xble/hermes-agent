@@ -13,7 +13,7 @@ import threading
 import time
 import psutil
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
@@ -79,7 +79,7 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
 
     home = tmp_path / "home"
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
-    session = _make_session(sid="proc_cut_pending")
+    session = _make_session(sid="proc_cut_pending", output="x" * 100_000)
     session.process = MagicMock(pid=12345)
     registry._running[session.id] = session
 
@@ -100,9 +100,393 @@ def test_bounded_kill_after_deadline_still_leaves_cut_receipt(registry, tmp_path
     assert result["status"] == "killed"
     receipt = home / "logs" / "process-results" / f"{session.id}.json"
     assert receipt.exists()
-    record = json.loads(receipt.read_text(encoding="utf-8"))
+    record = json.loads(receipt.read_text(encoding="utf-8-sig"))
     assert record["completion_reason"] == "cut_pending"
     assert record["termination_source"] == "gateway_shutdown"
+    assert record["output"] == ""
+
+
+def test_bounded_kill_all_uses_small_cut_receipts_and_prunes_once(registry, monkeypatch):
+    session = _make_session(sid="proc_bounded_sweep", output="x" * 100_000)
+    session.process = MagicMock(pid=12345)
+    session.process.poll.return_value = 1
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: True)
+    save_cut = MagicMock()
+    prune = MagicMock()
+    monkeypatch.setattr("tools.process_registry.save_cut_pending_result", save_cut)
+    monkeypatch.setattr("tools.process_registry.prune_completed_results", prune)
+
+    assert registry.kill_all(
+        deadline=time.monotonic() + 1.0, source="gateway_shutdown", consume_output=True,
+    ) == 1
+
+    save_cut.assert_called_once_with(
+        session, "gateway_shutdown", include_output=False, prune=False, lock_timeout=ANY,
+    )
+    prune.assert_called_once_with(deadline=ANY)
+
+
+def test_bounded_sweep_final_receipt_keeps_cut_retention(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    proc = _spawn_python_sleep(30)
+    try:
+        session = _make_session(sid="proc_sweep_real_child")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        record = json.loads(receipt.read_text(encoding="utf-8-sig"))
+        assert record["completion_reason"] == "killed"
+        assert record["cut_receipt"] is True
+
+        newer = _make_session(sid="proc_normal_after_sweep", exited=True, exit_code=0)
+        newer.completion_reason = "exited"
+        receipts.save_completed_result(newer)
+        assert receipt.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_reader_finalized_receipt_keeps_cut_retention_when_scope_stop_fails(
+    registry, tmp_path, monkeypatch,
+):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    proc = _spawn_python_sleep(30)
+    try:
+        session = _make_session(sid="proc_reader_won_scope_failed")
+        session.process = proc
+        session.pid = proc.pid
+        session.systemd_unit = "hermes-worker-proc_reader_won_scope_failed.scope"
+        registry._running[session.id] = session
+
+        def _reader_finishes_then_scope_fails(_unit, timeout=None):
+            # The reader thread observes the TERM'd child and finalizes first.
+            proc.wait(timeout=5)
+            with session._lock:
+                session.exited = True
+                session.exit_code = proc.returncode
+            registry._move_to_finished(session)
+            return False
+
+        monkeypatch.setattr(
+            "tools.process_registry._stop_systemd_unit", _reader_finishes_then_scope_fails,
+        )
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        receipt = home / "logs" / "process-results" / f"{session.id}.json"
+        assert json.loads(receipt.read_text(encoding="utf-8-sig"))["cut_receipt"] is True
+        newer = _make_session(sid="proc_normal_after_failed_scope", exited=True, exit_code=0)
+        newer.completion_reason = "exited"
+        receipts.save_completed_result(newer)
+        assert receipt.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_bounded_sweep_prunes_once_through_real_finalization(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    scans = []
+    real_scan = receipts._result_paths
+    monkeypatch.setattr(receipts, "_result_paths", lambda **kwargs: (scans.append(1), real_scan(**kwargs))[1])
+    procs = [_spawn_python_sleep(30), _spawn_python_sleep(30)]
+    try:
+        for index, proc in enumerate(procs):
+            session = _make_session(sid=f"proc_prune_once_{index}")
+            session.process = proc
+            session.pid = proc.pid
+            registry._running[session.id] = session
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        assert len(scans) == 1
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.platforms("posix")
+def test_bounded_sweep_writes_cut_receipt_before_signals(registry, tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    proc = _spawn_python_sleep(30)
+    seen_at_signal = []
+    real_killpg = os.killpg  # windows-footgun: ok — POSIX-only test
+    real_kill = os.kill
+    path = home / "logs" / "process-results" / "proc_receipt_before_term.json"
+
+    def _killpg_records_receipt(pgid, sig):
+        seen_at_signal.append(path.exists())
+        return real_killpg(pgid, sig)
+
+    def _kill_records_receipt(pid, sig):
+        if pid == proc.pid and sig != 0:
+            seen_at_signal.append(path.exists())
+        return real_kill(pid, sig)
+
+    try:
+        session = _make_session(sid="proc_receipt_before_term")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+        monkeypatch.setattr(os, "killpg", _killpg_records_receipt)
+        monkeypatch.setattr(os, "kill", _kill_records_receipt)
+
+        registry.kill_all(deadline=time.monotonic() + 5.0, source="gateway_shutdown")
+
+        assert seen_at_signal and seen_at_signal[0] is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_bounded_kill_all_receipt_lock_contention_does_not_block_signals(registry, tmp_path, monkeypatch):
+    """An unrelated result writer holding the lock must not spend the shutdown budget."""
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    proc = _spawn_python_sleep(30)
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold_result_lock():
+        with receipts._RESULT_WRITE_LOCK:
+            held.set()
+            release.wait(2.0)
+
+    holder = threading.Thread(target=_hold_result_lock, daemon=True)
+    holder.start()
+    assert held.wait(2.0)
+    try:
+        session = _make_session(sid="proc_receipt_lock_contention")
+        session.process = proc
+        session.pid = proc.pid
+        registry._running[session.id] = session
+
+        started = time.monotonic()
+        registry.kill_all(deadline=started + 0.4, source="gateway_shutdown")
+        elapsed = time.monotonic() - started
+
+        proc.wait(timeout=2.0)
+        assert proc.returncode is not None
+        assert elapsed < 2.0
+    finally:
+        release.set()
+        holder.join(timeout=5)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_cut_pending_write_never_nests_session_lock_inside_result_lock(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    session = _make_session(sid="proc_lock_order")
+    held = []
+
+    def _result_lock_held_elsewhere() -> bool:
+        # Probe from another thread: an RLock re-acquires for its owner, so only a
+        # foreign acquire observes that this thread already holds it.
+        got = []
+
+        def _try():
+            acquired = receipts._RESULT_WRITE_LOCK.acquire(timeout=0.2)
+            got.append(acquired)
+            if acquired:
+                receipts._RESULT_WRITE_LOCK.release()  # an RLock is released by its owner thread
+
+        probe = threading.Thread(target=_try)
+        probe.start()
+        probe.join()
+        return not got[0]
+
+    class _SessionLockProbe:
+        def __enter__(self):
+            held.append(_result_lock_held_elsewhere())
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    session._lock = _SessionLockProbe()  # type: ignore[assignment]
+    receipts.save_cut_pending_result(session, "gateway_shutdown", prune=False)
+
+    assert held == [False]
+
+
+def test_bounded_kill_all_skips_cut_receipts_past_deadline(registry, monkeypatch):
+    session = _make_session(sid="proc_bounded_late")
+    session.process = MagicMock(pid=12346)
+    session.process.poll.return_value = 1
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: True)
+    save_cut = MagicMock()
+    monkeypatch.setattr("tools.process_registry.save_cut_pending_result", save_cut)
+    monkeypatch.setattr("tools.process_registry.prune_completed_results", MagicMock())
+
+    registry.kill_all(deadline=time.monotonic() - 1.0, source="gateway_shutdown", consume_output=True)
+
+    save_cut.assert_not_called()
+
+
+def test_legacy_cut_receipts_without_marker_keep_cut_retention(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    directory = tmp_path / "home" / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    legacy_pending = directory / "proc_legacy_pending.json"
+    legacy_pending.write_text(json.dumps({
+        "id": legacy_pending.stem, "command": "echo " + "z" * 4096, "output": "o" * 4096,
+        "completion_reason": "cut_pending", "termination_source": "gateway_shutdown",
+    }, indent=2))
+    legacy_final = directory / "proc_legacy_final.json"
+    legacy_final.write_text(json.dumps({
+        "id": legacy_final.stem, "command": "echo " + "z" * 4096, "output": "o" * 4096,
+        "completion_reason": "killed", "termination_source": "gateway_shutdown",
+    }, indent=2))
+    explicit = directory / "proc_explicit_kill.json"
+    explicit.write_text(json.dumps({
+        "id": explicit.stem, "completion_reason": "killed", "termination_source": "process.kill",
+    }, indent=2))
+
+    assert receipts._is_cut_receipt(legacy_pending)
+    assert receipts._is_cut_receipt(legacy_final)
+    assert not receipts._is_cut_receipt(explicit)
+
+
+def test_cut_pending_write_does_not_overwrite_final_receipt(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    session = _make_session(sid="proc_final_wins", exited=True, exit_code=0)
+    session.completion_reason = "exited"
+    receipts.save_completed_result(session)
+
+    receipts.save_cut_pending_result(session, "gateway_shutdown")
+
+    record = json.loads((home / "logs" / "process-results" / f"{session.id}.json").read_text(encoding="utf-8-sig"))
+    assert record["completion_reason"] == "exited"
+    assert record["cut_receipt"] is False
+
+    finalized = _make_session(sid="proc_cut_finalized")
+    receipts.save_cut_pending_result(finalized, "gateway_shutdown")
+    finalized.exited = True
+    finalized.exit_code = -15
+    finalized.completion_reason = "killed"
+    finalized.termination_source = "gateway_shutdown"
+    receipts.save_completed_result(finalized)
+    record = json.loads((home / "logs" / "process-results" / f"{finalized.id}.json").read_text(encoding="utf-8-sig"))
+    assert record["completion_reason"] == "killed"
+    assert record["cut_receipt"] is True
+
+
+def test_cut_receipt_marker_survives_large_output_and_command(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+
+    finalized = _make_session(sid="proc_cut_large_output")
+    receipts.save_cut_pending_result(finalized, "gateway_shutdown", prune=False)
+    finalized.output_buffer = "x" * 8192
+    finalized.exited = True
+    finalized.exit_code = -15
+    finalized.completion_reason = "killed"
+    finalized.termination_source = "gateway_shutdown"
+    receipts.save_completed_result(finalized, prune=False)
+
+    pending = _make_session(sid="proc_cut_long_command")
+    pending.command = "echo " + "y" * 4096
+    receipts.save_cut_pending_result(pending, "gateway_shutdown", include_output=False, prune=False)
+
+    directory = home / "logs" / "process-results"
+    for path in (directory / "proc_cut_large_output.json", directory / "proc_cut_long_command.json"):
+        assert receipts._is_cut_receipt(path), path.name
+
+    newer = _make_session(sid="proc_normal_newer", exited=True, exit_code=0)
+    newer.completion_reason = "exited"
+    receipts.save_completed_result(newer)
+
+    assert (directory / "proc_cut_large_output.json").exists()
+    assert (directory / "proc_cut_long_command.json").exists()
+
+
+def test_cut_pending_receipts_are_not_loaded_as_completed(tmp_path, monkeypatch):
+    from gateway import session_context
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    directory = home / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(session_context, "get_session_env", lambda *_args: "owner")
+    monkeypatch.setattr(receipts, "_owns_result", lambda *_args: True)
+    record = {key: "" for key in receipts._RESULT_FIELDS}
+    record.update({
+        "id": "proc_pending_load",
+        "parent_session_id": "owner",
+        "output": "partial",
+        "completion_reason": "cut_pending",
+        "cut_receipt": True,
+    })
+    (directory / "proc_pending_load.json").write_text(json.dumps(record), encoding="utf-8")
+
+    assert receipts.load_completed_results() == {}
+
+
+def test_explicit_process_kill_receipts_use_normal_retention(tmp_path, monkeypatch):
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "home"
+    directory = home / "logs" / "process-results"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_RESULTS", 1)
+    monkeypatch.setattr(receipts, "MAX_RETAINED_CUT_RESULTS", 1)
+    now = time.time()
+    old = directory / "proc_explicit_old.json"
+    new = directory / "proc_explicit_new.json"
+    for index, path in enumerate((old, new)):
+        path.write_text(json.dumps({
+            "id": path.stem, "completion_reason": "killed", "termination_source": "process.kill",
+        }))
+        os.utime(path, (now + index, now + index))
+
+    retained = receipts._result_paths()
+
+    assert new in retained
+    assert not old.exists()
 
 
 def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
@@ -130,6 +514,7 @@ def test_cut_receipts_not_evicted_by_64_cap(tmp_path, monkeypatch):
     # Finalizing a pre-kill receipt must not return it to the normal 64-result budget.
     cut.write_text(json.dumps({
         "id": cut.stem, "completion_reason": "killed", "termination_source": "gateway_shutdown",
+        "cut_receipt": True,
     }), encoding="utf-8")
     os.utime(cut, (now - 60, now - 60))
     assert cut in receipts._result_paths()
@@ -420,7 +805,7 @@ def test_kill_all_root_exit_still_kills_snapshotted_descendant(registry):
     try:
         # Atomic publication makes existence a complete PID readiness signal.
         assert _wait_until(lambda: os.path.exists(pidfile))
-        child_pid = int(open(pidfile).read())
+        child_pid = int(open(pidfile, encoding="utf-8-sig").read())
         assert registry.kill_all("descendant-test", deadline=time.monotonic() + 3.0) == 1
         assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
     finally:
@@ -463,7 +848,7 @@ def test_kill_terminates_descendant_that_escaped_process_group(registry, mode):
     child_pid = None
     try:
         assert _wait_until(lambda: os.path.exists(pidfile))
-        child_pid = int(open(pidfile).read())
+        child_pid = int(open(pidfile, encoding="utf-8-sig").read())
         if mode == "kill_all":
             result = registry.kill_all(session.task_id, source="gateway_shutdown")
             assert result == 1
@@ -504,17 +889,19 @@ def test_kill_all_past_deadline_skips_checkpoint_write(registry):
     checkpoint.assert_not_called()
 
 
+@pytest.mark.platforms("posix")
 def test_bounded_kill_all_past_deadline_does_not_signal_live_process(registry):
     session = _make_session(sid="proc_expired_live")
     session.process = MagicMock(pid=4242)
     registry._running[session.id] = session
     with patch("tools.process_registry.os.getpgid", return_value=4242), \
          patch("tools.process_registry.os.getpgrp", return_value=9999), \
-         patch("tools.process_registry.os.killpg") as killpg:
+         patch.object(os, "killpg") as killpg:
         assert registry.kill_all(deadline=time.monotonic() - 1.0) == 0
     killpg.assert_not_called()
 
 
+@pytest.mark.platforms("posix")
 def test_bounded_kill_all_revalidates_recycled_root_before_group_signal(registry, monkeypatch):
     """A root recycled after the snapshot must not receive its snapshotted PGID signal."""
     session = _make_session(sid="proc_recycled_root")
@@ -532,11 +919,12 @@ def test_bounded_kill_all_revalidates_recycled_root_before_group_signal(registry
     )
     monkeypatch.setattr("tools.process_registry.os.getpgid", lambda _pid: 123)
     monkeypatch.setattr("tools.process_registry.os.getpgrp", lambda: 999)
-    with patch("tools.process_registry.os.killpg") as killpg:
+    with patch.object(os, "killpg") as killpg:
         assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
     killpg.assert_not_called()
 
 
+@pytest.mark.platforms("posix")
 def test_bounded_kill_all_revalidates_recycled_descendant_before_group_signal(
     registry, monkeypatch
 ):
@@ -562,7 +950,7 @@ def test_bounded_kill_all_revalidates_recycled_descendant_before_group_signal(
     monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, _expected: pid == 100)
     monkeypatch.setattr("tools.process_registry.os.getpgid", lambda pid: 999 if pid == 100 else pid)
     monkeypatch.setattr("tools.process_registry.os.getpgrp", lambda: 999)
-    with patch("tools.process_registry.os.kill"), patch("tools.process_registry.os.killpg") as killpg:
+    with patch("tools.process_registry.os.kill"), patch.object(os, "killpg") as killpg:
         assert registry.kill_all(deadline=time.monotonic() + 1.0) == 1
     killpg.assert_not_called()
 
@@ -687,6 +1075,7 @@ def test_stop_event_kill_all_waits_for_quick_systemd_teardown(registry, monkeypa
         worker.join(timeout=1.0)
 
 
+@pytest.mark.platforms("posix")
 def test_bounded_sweep_caps_signal_thread_pool(registry, monkeypatch):
     """A large process tree must not spawn one sweep thread per process."""
     import tools.process_registry as _pr
@@ -715,7 +1104,7 @@ def test_bounded_sweep_caps_signal_thread_pool(registry, monkeypatch):
         return real_pool(*args, **kwargs)
 
     monkeypatch.setattr(_pr, "ThreadPoolExecutor", _recording_pool)
-    with patch("tools.process_registry.os.killpg") as killpg:
+    with patch.object(os, "killpg") as killpg:
         registry.kill_all(deadline=time.monotonic() + 1.0)
 
     assert widths and max(widths) <= 16
@@ -728,14 +1117,14 @@ def test_move_to_finished_rechecks_deadline_before_checkpoint(registry):
     registry._running[session.id] = session
     session._kill_deadline = time.monotonic() + 0.1
 
-    def slow_save(_session):
+    def slow_save(_session, **_kwargs):
         time.sleep(0.15)
 
     with patch("tools.process_registry.save_completed_result", side_effect=slow_save) as save, \
          patch.object(registry, "_write_checkpoint") as checkpoint:
         assert registry._move_to_finished(session) is True
 
-    save.assert_called_once_with(session)
+    save.assert_called_once_with(session, prune=False)
     checkpoint.assert_not_called()
 
 
@@ -1124,7 +1513,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_orphan_test")
@@ -1154,7 +1543,7 @@ class TestOrphanedPipeReconciliation:
 
         # Clean up the orphaned descendant.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — POSIX-only class
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -1164,7 +1553,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_wait_orphan")
@@ -1184,7 +1573,7 @@ class TestOrphanedPipeReconciliation:
         )
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — POSIX-only class
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -1876,7 +2265,7 @@ class TestCheckpoint:
             "host_start_time": 123.0,
             "systemd_unit": "hermes-worker-proc_dead_scope.scope",
         }
-        checkpoint.write_text(json.dumps([entry]))
+        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
         monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
         monkeypatch.setattr(registry, "_is_host_pid_alive", lambda *_args: False)
 
@@ -1886,7 +2275,7 @@ class TestCheckpoint:
             assert registry.recover_from_checkpoint() == 0
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
-        assert json.loads(checkpoint.read_text()) == [entry]
+        assert json.loads(checkpoint.read_text(encoding="utf-8-sig")) == [entry]
 
     def test_recover_dead_wrapper_drops_reaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
@@ -1900,7 +2289,7 @@ class TestCheckpoint:
             "host_start_time": 123.0,
             "systemd_unit": "hermes-worker-proc_dead_scope.scope",
         }
-        checkpoint.write_text(json.dumps([entry]))
+        checkpoint.write_text(json.dumps([entry]), encoding="utf-8")
         monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
         monkeypatch.setattr(registry, "_is_host_pid_alive", lambda *_args: False)
 
@@ -1910,7 +2299,7 @@ class TestCheckpoint:
             assert registry.recover_from_checkpoint() == 0
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
-        assert json.loads(checkpoint.read_text()) == []
+        assert json.loads(checkpoint.read_text(encoding="utf-8-sig")) == []
 
 
     def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
@@ -1922,14 +2311,14 @@ class TestCheckpoint:
             "task_id": "t1",
             "pid_scope": "sandbox",
         }]
-        checkpoint.write_text(json.dumps(original))
+        checkpoint.write_text(json.dumps(original), encoding="utf-8")
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
 
-            data = json.loads(checkpoint.read_text())
+            data = json.loads(checkpoint.read_text(encoding="utf-8-sig"))
             assert data == []
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
@@ -1947,7 +2336,7 @@ class TestCheckpoint:
             registry._running[s.id] = s
             registry._write_checkpoint()
 
-            data = json.loads(checkpoint.read_text())
+            data = json.loads(checkpoint.read_text(encoding="utf-8-sig"))
             assert data[0]["session_id"] == "proc_secret"
             assert secret not in data[0]["command"]
             assert data[0]["command"] != command
@@ -2062,14 +2451,7 @@ class TestKillProcess:
             registry._running.pop(s.id, None)
 
     def test_kill_receipt_rewritten_when_reader_finalises_first(self, registry):
-        """A kill racing the reader thread must not persist as a plain exit.
-
-        The signal path blocks for the SIGKILL grace window, during which the
-        reader thread can observe the exit and finalise the session first. The
-        durable receipt from that first save says ``exited``; the kill result
-        returned to the caller says ``killed``. The second save must rewrite
-        the receipt so the persisted record matches what the caller was told.
-        """
+        """A kill committed after the reader's write refreshes the durable outcome."""
         s = _make_session(sid="proc_kill_race", command="sleep 999")
         s.pid = 424243
         s.detached = True
@@ -2080,12 +2462,7 @@ class TestKillProcess:
             # path is still inside its grace window and finalises first.
             registry._finish_exited(s, 0)
 
-        saved = []
-
-        def record_save(session):
-            saved.append(
-                (session.completion_reason, session.termination_source, session.exit_code)
-            )
+        from hermes_constants import get_hermes_home
 
         try:
             host_guard = patch.object(
@@ -2096,19 +2473,17 @@ class TestKillProcess:
                 "_terminate_host_pid",
                 side_effect=reader_wins_during_signal,
             )
-            saver = patch(
-                "tools.process_registry.save_completed_result", side_effect=record_save
-            )
-            with host_guard, term_patch, saver:
+            with host_guard, term_patch:
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
             assert result["completion_reason"] == "killed"
             assert result["termination_source"] == "process.kill"
-            # First save: the reader won the race and persisted a plain exit.
-            assert saved[0] == ("exited", "", 0)
-            # Second save: the receipt rewritten with the kill outcome.
-            assert saved[-1] == ("killed", "process.kill", -15)
+            path = get_hermes_home() / "logs" / "process-results" / f"{s.id}.json"
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+            assert (record["completion_reason"], record["termination_source"], record["exit_code"]) == (
+                "killed", "process.kill", -15,
+            )
         finally:
             registry._running.pop(s.id, None)
             registry._finished.pop(s.id, None)
@@ -2423,10 +2798,10 @@ class TestTerminateHostPidPosix:
             "while :; do sleep 0.1; done\n")
         parent = subprocess.Popen(["bash", str(parent_sh)], stdin=subprocess.DEVNULL)
         try:
-            assert _wait_until(lambda: log.exists() and "up" in log.read_text(), timeout=5.0)
+            assert _wait_until(lambda: log.exists() and "up" in log.read_text(encoding="utf-8-sig"), timeout=5.0)
             ProcessRegistry._terminate_host_pid(parent.pid)
             assert _wait_until(lambda: parent.poll() is not None, timeout=5.0)
-            lines = log.read_text().split()
+            lines = log.read_text(encoding="utf-8-sig").split()
             assert parent.returncode == 0, f"supervisor must exit cleanly, got {parent.returncode}"
             assert "parent-TERM" in lines and "child-TERM" not in lines, (
                 f"registry must SIGTERM only the parent, which reaps its own child: {lines}")
@@ -2631,7 +3006,7 @@ class TestSigkillEscalation:
         finally:
             for p in all_pids:
                 try:
-                    os.kill(p, signal.SIGKILL)
+                    os.kill(p, getattr(signal, "SIGKILL", signal.SIGTERM))
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             parent.wait()
@@ -2785,7 +3160,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
         s = _make_session(sid="proc_orphan_reader")
         s.process = proc
@@ -2815,7 +3190,7 @@ class TestReaderLoopOrphanedPipe:
             assert s.id in registry._finished
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — POSIX-only class
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -2829,7 +3204,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
         s = _make_session(sid="proc_orphan_notify")
         s.process = proc
@@ -2856,7 +3231,7 @@ class TestReaderLoopOrphanedPipe:
             assert item["exit_code"] == 0
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — POSIX-only class
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -3143,7 +3518,7 @@ class TestSystemdCgroupIsolation:
         with patch("subprocess.Popen", return_value=fake_proc), \
             patch("threading.Thread", return_value=broken_reader), \
             patch("tools.process_registry._stop_systemd_unit", return_value=True) as stop_unit, \
-            patch("os.killpg") as killpg, \
+            patch.object(os, "killpg") as killpg, \
             patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="reader failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
