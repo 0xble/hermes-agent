@@ -264,3 +264,40 @@ def test_completion_ack_preserves_boot_claim_for_failed_admission():
     assert reason is None
     assert again is not None
     assert dr.complete_auto_resume_trigger(did, again["auto_resume_claim"])
+
+
+@pytest.mark.parametrize("pressure", ["resumable_cap", "expired"])
+def test_retention_preserves_boot_claim_after_completion_ack(monkeypatch, pressure):
+    """Retention cannot delete a boot notice while its owner can still release it."""
+    from tools import delegation_resume as dr
+
+    now = time.time()
+    did = "boot_claim_pressure"
+    _insert_history("pending_owed", "interrupted", "pending", now - 50)
+    _insert_history(did, "interrupted", "pending", now)
+    boot, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert boot is not None
+    assert ad.mark_completion_delivered(did)
+    monkeypatch.setattr(ad, "_MAX_RETAINED_RESUMABLE", 1)
+    expired = now - ad._DURABLE_RETENTION_SECONDS - 1
+    if pressure == "expired":
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET updated_at=? WHERE delegation_id=?", (expired, did))
+
+    ad._prune_durable_records()
+    assert dr.release_auto_resume_trigger(did, boot["auto_resume_claim"])
+    again, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert again is not None
+    assert dr.complete_auto_resume_trigger(did, again["auto_resume_claim"])
+
+    # Settling the claim makes completed history evictable again.
+    if pressure == "expired":
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET updated_at=? WHERE delegation_id=?", (expired, did))
+    ad._prune_durable_records()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        ids = {row[0] for row in conn.execute("SELECT delegation_id FROM async_delegations")}
+    assert did not in ids
+    assert "pending_owed" in ids

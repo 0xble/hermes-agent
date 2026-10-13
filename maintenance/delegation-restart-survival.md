@@ -17,9 +17,10 @@ result/transcript evidence for conservative recovery through the durable retry e
   `interrupted`; successful runners remain completed, including during CLI shutdown.
 - Ordinary retention prunes superseded rows before delivered rows, logs a bounded
   list of IDs, and excludes resumable/retry-owed rows from the ordinary history cap.
-- The separate resumable ceiling evicts eligible settled history first. It must
-  never delete pending completion delivery or retry-owed rows to enforce the cap;
-  those obligations are settled by the existing bounded delivery/retry engine.
+- The separate resumable ceiling evicts eligible settled history first. Retention
+  never deletes pending completion delivery, retry-owed rows, or outstanding
+  boot-notice claims to enforce an age or count cap. Their owners must settle
+  those obligations before the rows become eligible for eviction.
 - Completion delivery settles only its own claim. Boot-notice claims remain owned
   by `claim_auto_resume_trigger`, `complete_auto_resume_trigger`, and
   `release_auto_resume_trigger`; completion acceptance cannot steal their claim.
