@@ -78,6 +78,29 @@ def test_otp_alias_origin_requires_consent_once(otp, monkeypatch):
     assert write.call_count == 2
 
 
+def test_otp_alias_origin_skips_consent_when_confirmation_disabled(otp, monkeypatch):
+    backend, write = otp
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "vault": {"confirm_alias_fills": False, "origin_aliases": {"op:otp-origin": ["https://evil.test"]}},
+    })
+    consent = Mock(return_value="unanswered")
+    monkeypatch.setattr(vault, "_confirm_alias_fill", consent)
+    assert _enter()["success"]
+    consent.assert_not_called()
+    backend.resolve_otp.assert_called_once()
+    assert write.call_count == 1
+
+
+def test_otp_disabled_confirmation_still_refuses_unlisted_origin(otp, monkeypatch):
+    backend, write = otp
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+        "vault": {"confirm_alias_fills": False, "origin_aliases": {"op:otp-origin": ["https://other.test"]}},
+    })
+    assert _enter()["error_type"] == "origin_mismatch"
+    backend.resolve_otp.assert_not_called()
+    write.assert_not_called()
+
+
 @pytest.mark.parametrize("decision,error", [("decline", "origin_alias_declined"),
                                            ("unanswered", "origin_alias_prompt_unanswered")])
 def test_otp_alias_refusal_blocks_retry(otp, monkeypatch, decision, error):

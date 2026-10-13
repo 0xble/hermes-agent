@@ -561,7 +561,9 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None) ->
         return json.dumps({"success": False, "error_type": "origin_mismatch",
                            "error": (f"Refused: current page origin ({origin}) does not match "
                                      f"the vault item's bound origin(s) ({', '.join(allowed)}).")})
-    if allowed is not None and origin not in saved_origins:
+    from agent.vault_origin_aliases import alias_fill_confirmation_enabled
+
+    if allowed is not None and origin not in saved_origins and alias_fill_confirmation_enabled():
         alias_key = _alias_fill_key(effective_task_id, handle, origin)
         decision = _alias_fill_decision(alias_key)
         if decision == "refused":
