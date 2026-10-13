@@ -31,7 +31,10 @@ session-id lookup, at exactly one of these points:
 
 - consumed: the agent's turn-start flush durably admits the input and fires the
   one-shot, turn-scoped `_input_admitted_callback` the gateway installs for the
-  consumed event (`notify_input_admitted`); proxy turns retire on return;
+  consumed event (`notify_input_admitted`); proxy turns retire only when the
+  transport returns an explicit successful-handling acknowledgement (terminal
+  SSE `[DONE]` or generated response content). Connection refusal, non-200 HTTP,
+  empty/error-only streams and pre-admission stream failure retain the checkpoint;
 - discarded: `/stop` dropping a parked follow-up, `/new`/reset/resume clearing
   the overflow (`_clear_conversation_scope`), adapter cancel/stale-lock heal
   (`_discard_pending_message`), a pending slash command refused as agent input,
@@ -56,7 +59,13 @@ use `session_search(session_id=..., around_message_id=...)` to locate it. Full
 content remains in SessionDB and the native session exporter. Do not replay
 completed effects, grant a summary authority, or silently clip giant mandatory
 user/system instructions. Requests include system/tools/media estimates,
-selected/ephemeral output cap and estimator/transport safety headroom.
+selected output cap and estimator/transport safety headroom. A one-shot ephemeral
+cap replaces the configured cap, including when lower; fit estimation peeks
+without consuming it and shares selection with request builders. The auxiliary
+summarizer cap is not a main-request cap. Native Responses fit uses the same
+route-aware checkpoint-pruned wire projection as preflight pressure, not the
+unpruned durable transcript or a stale provider usage anchor. Count system text
+and the actual request tool schemas alongside that projection.
 
 Install candidates only through native `archive_and_compact`, its existing
 lease/fence/watermark and turn-tail reconciliation. Explicit stop, lock
@@ -103,7 +112,9 @@ Focused tests: `tests/agent/test_same_session_recovery.py`,
 `tests/gateway/test_auto_reset_clean_context.py`,
 `tests/agent/test_same_session_recovery_gaps.py`,
 `tests/gateway/test_same_session_queue_checkpoint.py`,
-`tests/gateway/test_queue_checkpoint_retirement.py` and
+`tests/gateway/test_queue_checkpoint_retirement.py`,
+`tests/gateway/test_proxy_queue_checkpoint.py`,
+`tests/agent/test_native_preflight_estimate.py` and
 `tests/e2e/core/compaction/test_same_session_recovery.py`.
 Ordinary FIFO acceptance writes the native private pending spool with file and
 directory fsync before memory acknowledgement. Such a spool is not expired or

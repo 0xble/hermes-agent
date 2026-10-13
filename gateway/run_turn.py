@@ -3099,6 +3099,9 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            # Only a terminal SSE acknowledgement or actual generated content
+            # proves the remote handled the input. HTTP/transport errors do not.
+            "_proxy_input_handled": saw_done or bool(full_response),
         }
 
     async def _run_agent(
@@ -4560,14 +4563,15 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            # The remote server owns admission; once it answers, the queued input was handled.
+            # The remote owns admission. A returned error dict is not an acknowledgement.
             from gateway.shutdown_flush import retire_queue_checkpoint
             result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
-            retire_queue_checkpoint(queued_event, reason="proxy_turn_returned")
+            if result.get("_proxy_input_handled") is True:
+                retire_queue_checkpoint(queued_event, reason="proxy_input_handled")
             return result
 
         from run_agent import AIAgent
