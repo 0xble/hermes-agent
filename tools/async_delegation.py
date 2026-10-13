@@ -2612,7 +2612,7 @@ def _cancel_pending_retries_safely(caller: str, **selectors: Any) -> set:
     if not is_user_cancel_reason(reason):
         return set()
     try:
-        return set(cancel_pending_retries(**selectors))
+        return set(cancel_pending_retries(**selectors, reason=reason))
     except Exception as exc:  # noqa: BLE001 - live child interruption is the safety path
         logger.warning("%s: durable retry cancellation failed: %s", caller, exc, exc_info=True)
         return set()

@@ -410,6 +410,14 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     # Keep them at the durable boundary too, otherwise replacement lineage is lost.
     contexts = dict.fromkeys(t["context"] for _, t, _ in unit.children if t.get("context"))
     effective_context = "\n\n".join(contexts) or unit.context
+    from tools.delegation_resume import recovery_source_id
+    # Choose each brief's current source before losing task boundaries. Older
+    # headings nested in ORIGINAL CONTEXT cannot authorize this unit's work.
+    sources = {source for context in contexts if (source := recovery_source_id(context))}
+    if len(sources) > 1:
+        return {"status": "rejected", "accepted": False, "no_inline_fallback": True,
+                "delegation_id": unit_id,
+                "error": "A completion unit cannot mix multiple recovery sources; dispatch each source separately."}
 
     def _interrupt(reason: str = "Async delegation cancelled"):
         for c in child_agents:

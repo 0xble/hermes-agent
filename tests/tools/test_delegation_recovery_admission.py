@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -202,3 +202,114 @@ def test_recovery_cannot_bypass_atomic_admission_on_sync_routes(monkeypatch, rou
     dispatch._execute_and_aggregate.assert_not_called()
     assert dr.retry_status(batch.live_deleg_id) is None
     assert dr.retry_status(did)["resume_attempts"] == 1
+
+
+
+def _cut_live_batch(did, *, tui=False):
+    checkpointed, release = threading.Event(), threading.Event()
+
+    def runner():
+        ad.record_unit_child(did, {"task_index": 0, "status": "completed", "summary": "done"})
+        checkpointed.set()
+        assert release.wait(5)
+        raise RuntimeError("shutdown aggregation failed")
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["done", "unfinished"], delegation_id=did, context="shared", toolsets=None,
+        role="leaf", model="m", session_key="" if tui else "agent:main:telegram:dm:1",
+        origin_ui_session_id="tui-owner" if tui else "", parent_session_id=_Parent.session_id,
+        runner=runner, interrupt_fn=lambda reason=None: None, max_async_children=1,
+    )
+    assert handle["accepted"] and checkpointed.wait(5)
+    assert ad.interrupt_all(reason="gateway shutdown (restart)") == 1
+    release.set()
+    event = process_registry.completion_queue.get(timeout=5)
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim and ad.complete_completion_delivery(did, claim)
+    if not tui:
+        dr.schedule_retry(did)
+    payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert "tasks" in payload, json.dumps([payload, dr.retry_status(did)], indent=2)
+    return payload
+
+
+def _dispatch_recovery_tasks(tasks, did, monkeypatch, *, tui=False):
+    import tools.delegate_tool_dispatch as dispatch
+    # Credential/LLM and transcript I/O boundaries only; admission and stop are real.
+    tasks = [dict(task, group="recovery") for task in tasks]
+    batch = dispatch._Batch(
+        task_list=tasks, children=[(i, task, MagicMock()) for i, task in enumerate(tasks)],
+        parent_agent=_Parent(), creds={"model": "m"}, context=None, top_role="leaf",
+        max_children=len(tasks), live_deleg_id=did, live_writers=[], live_paths=[],
+        origin_wake_sid="", origin_ui_session_id="tui-owner" if tui else "",
+        origin_owner_transport=None, origin_owner_session_record=None,
+        origin_session_history_delivery=False, overall_start=time.monotonic(),
+    )
+    monkeypatch.setattr(dispatch, "_resolve_async_wake_sid", lambda *args: "")
+    monkeypatch.setattr(dispatch, "_resolve_async_session_key", lambda *args: (
+        "" if tui else "agent:main:telegram:dm:1", "tui-owner" if tui else ""))
+    monkeypatch.setattr(dispatch, "_cleanup_unit", MagicMock())
+    executed = MagicMock(return_value={"results": [{"task_index": i, "status": "completed"}
+                                                  for i in range(len(tasks))]})
+    monkeypatch.setattr(dispatch, "_execute_and_aggregate", executed)
+    payload = json.loads(dispatch._run_batch(batch, background=True))
+    deadline = time.monotonic() + 5
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+    if payload["status"] == "dispatched":
+        event = process_registry.completion_queue.get(timeout=5)
+        assert event.get("delegation_id") == did
+        claim = ad.claim_event_delivery(event, "test")
+        assert claim and ad.complete_completion_delivery(did, claim)
+    return payload, executed
+
+
+def test_combined_recovery_tasks_from_two_sources_are_rejected_atomically(monkeypatch):
+    first, second = "deleg_mixed_source_a", "deleg_mixed_source_b"
+    first_payload = _cut_live_batch(first)
+    second_payload = _cut_live_batch(second)
+    assert first_payload["status"] == second_payload["status"] == "retry_claimed"
+    payload, executed = _dispatch_recovery_tasks(
+        [*first_payload["tasks"], *second_payload["tasks"]], "deleg_mixed_replacement", monkeypatch,
+    )
+
+    assert payload["status"] == "rejected"
+    assert "multiple recovery sources" in payload["error"]
+    executed.assert_not_called()
+    assert dr.retry_status("deleg_mixed_replacement") is None
+    with ad._DB_LOCK, ad._transaction() as conn:
+        rows = conn.execute(
+            "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
+            "WHERE delegation_id IN (?, ?)", (first, second),
+        ).fetchall()
+    assert rows == [(1, None), (1, None)]
+    # Rejected work can be claimed again quietly; no duplicate parent notice.
+    assert dr.sweep_retries(now=time.time() + dr.NOTICE_GRACE_S + 1) == []
+    for did in (first, second):
+        again = json.loads(_handle_control_action("resume", did, None, _Parent()))
+        assert again["status"] == "retry_claimed"
+        assert [task["goal"] for task in again["tasks"]] == ["unfinished"]
+
+
+@pytest.mark.parametrize("reason", ["stop_command", "session_end"])
+def test_actual_session_stop_revokes_claimed_legacy_recovery(monkeypatch, reason):
+    did = "deleg_claimed_stop"
+    claimed = _cut_live_batch(did, tui=True)
+    assert claimed["status"] == "recovery_claimed"
+    affected = ad.interrupt_for_session(origin_ui_session_id="tui-owner", reason=reason)
+    payload, executed = _dispatch_recovery_tasks(
+        claimed["tasks"], "deleg_claimed_stop_replacement", monkeypatch, tui=True,
+    )
+
+    assert payload["status"] == "rejected"
+    assert "stopped" in payload["error"]
+    executed.assert_not_called()
+    assert affected == 1
+    assert dr.retry_status("deleg_claimed_stop_replacement") is None
+    assert dr.retry_status(did)["retry_state"] == dr.RETRY_CANCELLED
+    assert "error" in json.loads(_handle_control_action("resume", did, None, _Parent()))

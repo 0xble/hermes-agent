@@ -666,11 +666,13 @@ def gateway_retry_origin(record: Dict[str, Any]) -> bool:
 
 
 def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", origin_ui_session_id: str = "",
-                           parent_session_id: str = "", all_sessions: bool = False) -> set[str]:
-    """Cancel only still-owed retry states, atomically invalidating notice/report/dispatch claims."""
+                           parent_session_id: str = "", all_sessions: bool = False,
+                           reason: str = "stop_command") -> set[str]:
+    """Cancel owed retries and revoke unadmitted legacy recovery claims in one stop transaction."""
     selectors = [(field, value) for field, value in (
         ("origin_session", session_key), ("origin_ui_session_id", origin_ui_session_id),
         ("parent_session_id", parent_session_id)) if value]
+    cancel_reason = str(reason or "stop_command")
     if delegation_id:
         scope, values = "delegation_id=?", [delegation_id]
     elif all_sessions:
@@ -683,10 +685,13 @@ def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", or
     ad = _ad()
     placeholders = ",".join("?" for _ in RETRY_PENDING_STATES)
     with ad._DB_LOCK, ad._transaction() as conn:
-        rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason='stop_command',
+        rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason=?,
                        retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
-                       WHERE retry_state IN ({placeholders}) AND {scope} RETURNING delegation_id""",
-                            (time.time(), *RETRY_PENDING_STATES, *values)).fetchall()
+                       WHERE ((retry_state IN ({placeholders}))
+                              OR (retry_state=? AND resume_state=? AND COALESCE(retry_replacement, '')=''))
+                         AND {scope} RETURNING delegation_id""",
+                            (cancel_reason, time.time(), *RETRY_PENDING_STATES,
+                             RETRY_NONE, RESUME_STATE_CLAIMED, *values)).fetchall()
     return {row[0] for row in rows}
 
 
@@ -1017,10 +1022,16 @@ def claimed_retry_source(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def recovery_source_id(context: Any) -> Optional[str]:
+    """Current brief's source; ancestor headings in ORIGINAL CONTEXT are evidence only."""
+    match = _RECOVERY_HEADING_RE.search(str(context or ""))
+    return match.group(1) if match else None
+
+
 def is_recovery_spawn(record: Dict[str, Any]) -> bool:
     """True when the spawn carries another delegation's recovery brief (no ledger access)."""
-    m = _RECOVERY_HEADING_RE.search(str(record.get("context") or ""))
-    return bool(m and m.group(1) != record.get("delegation_id"))
+    source = recovery_source_id(record.get("context"))
+    return bool(source and source != record.get("delegation_id"))
 
 
 def _release_unspent_batch_children(conn, delegation_id: str, claim: str) -> None:
