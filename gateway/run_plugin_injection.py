@@ -142,16 +142,26 @@ class GatewayPluginInjectionMixin:
         if adapter is None:
             return False
 
-        async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
-                metadata={
-                    "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
-                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
-                    "gateway_session_strict": True,
-                },
-            ))
+        event = MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+                "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
+                "gateway_session_strict": True,
+            },
+        )
+        from gateway.wake import WakeNotAccepted, admit_internal_event
+        try:
+            async with self._plugin_injection_scope(source):
+                # True only on the adapter's admission receipt: a busy queue can refuse the event
+                # without raising, and callers treat True as a durable delivery acknowledgement.
+                await admit_internal_event(adapter, event)
+        except WakeNotAccepted:
+            logger.info(
+                "Plugin message injection not admitted: plugin=%s session=%s", plugin_id, session_key,
+            )
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,

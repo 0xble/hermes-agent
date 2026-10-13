@@ -39,6 +39,10 @@ class WakeNotAccepted(RuntimeError):
     """No adapter admission: retry without treating a healthy chat as dead."""
 
 
+class WakeSuperseded(WakeNotAccepted):
+    """The control's saved goal definition no longer authorizes this continuation."""
+
+
 def session_owned_by_profile(config: Any, profile: Optional[str], session_id: Any) -> bool:
     """True when a stateless (``api_server``) destination's raw session id is canonically owned by
     served *profile*'s own session store.
@@ -83,6 +87,10 @@ async def admit_internal_event(adapter: Any, event: Any) -> None:
     not model execution, authorization of a later turn, or successful outbound delivery.
     """
     event._gateway_accepted = False
+    metadata = getattr(event, "metadata", None)
+    from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
+    if is_gateway_wake(event) and not await asyncio.to_thread(internal_wake_is_current, event):
+        raise WakeSuperseded("goal continuation or loop tick superseded before admission")
     await adapter.handle_message(event)
     if event._gateway_accepted is not True:
         raise WakeNotAccepted("internal wake not accepted by adapter")

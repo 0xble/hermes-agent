@@ -150,9 +150,31 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         assert manager.has_gateway_message_injector is False
 
 
+def _admitting_adapter(accept: bool = True):
+    async def handle(event):
+        event._gateway_accepted = accept
+
+    return SimpleNamespace(handle_message=AsyncMock(side_effect=handle))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_reports_false_when_adapter_does_not_admit():
+    """A busy adapter can refuse the event without raising: callers must not see a delivery."""
+    adapter = _admitting_adapter(accept=False)
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="outcome", plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = _admitting_adapter()
     entry = _entry()
     runner = _runner(entry, adapter)
 

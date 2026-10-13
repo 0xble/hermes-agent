@@ -31,6 +31,10 @@ def hermes_home(tmp_path, monkeypatch):
     from hermes_state_registry import close_all_under
 
     goals._DB_CACHE.clear()
+    # Open the store up front: under load the lazy bootstrap can miss its grace window, leaving loop
+    # writes unpersisted while the wake fence reads the store.
+    from hermes_state_registry import acquire
+    goals._DB_CACHE[str(home)] = acquire(home / "state.db")
     yield home
     goals._DB_CACHE.clear()
     close_all_under(home)
@@ -42,6 +46,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.events.append(event)
+        event._gateway_accepted = True  # the admission receipt a real adapter returns
 
 
 def _runner(adapter):
@@ -157,3 +162,51 @@ async def test_goal_continuation_silence_is_gateway_quiet_but_updates_deliver(
     assert event.reply_expected is False
     assert await _deliver(event, "[SILENT]", monkeypatch) == ""
     assert await _deliver(event, "Queue depth changed to 2.", monkeypatch) == "Queue depth changed to 2."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["stop", "pause", "reset"])
+async def test_fired_loop_wake_is_dropped_once_its_tick_is_no_longer_running(
+    hermes_home, monkeypatch, control,
+):
+    """A stop or pause approved after the tick was claimed must not start the obsolete prompt."""
+    from hermes_cli.loops import LoopManager
+    from hermes_cli.session_controls import internal_wake_is_current, loop_wake_is_current
+
+    route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42"}
+    mgr = LoopManager(session_id="loop-sid")
+    mgr.set("check the queue", interval_seconds=300, route=route)
+    mgr.state.next_due_at = 0
+    mgr._save()
+
+    adapter = _Adapter()
+    import hermes_cli.loops as loops
+    monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
+    runner = _runner(adapter)
+    runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.TELEGRAM, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"], user_name=evt.get("user_name"),
+    )
+    runner._session_key_for_source = lambda source: "agent:main:telegram:dm:42"
+    await runner._loop_wakeup_fire_one("loop-sid", mgr.state, 1e12, set())
+    event = adapter.events[0]
+    assert loop_wake_is_current(event.metadata, "loop-sid") is True
+    assert internal_wake_is_current(event, "loop-sid") is True
+
+    real = type(mgr)(session_id="loop-sid")
+    if control == "stop":
+        real.clear()
+    elif control == "pause":
+        real.pause("approved in Telegram")
+    else:
+        real.set("a different loop", interval_seconds=300, route=route)
+    assert loop_wake_is_current(event.metadata, "loop-sid") is False
+    assert internal_wake_is_current(event, "loop-sid") is False
+
+
+def test_untagged_internal_events_are_not_loop_fenced():
+    from hermes_cli.session_controls import loop_wake_is_current
+
+    assert loop_wake_is_current({}, "x") is True
+    assert loop_wake_is_current(None, "x") is True
