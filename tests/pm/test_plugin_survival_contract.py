@@ -333,8 +333,9 @@ def test_malformed_secondary_cannot_evict_recorded_member(admission_env, monkeyp
 
 
 @pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
-def test_update_sync_cannot_evict_bundled_memory_provider(admission_env, monkeypatch):
-    """A bundled provider stays configured when its dependency resolution fails.
+@pytest.mark.parametrize("failure", ["resolution", "python"])
+def test_update_sync_cannot_evict_bundled_memory_provider(admission_env, failure):
+    """A bundled provider survives resolver failure and static incompatibility.
 
     Release-owned providers must fail the update loudly rather than letting the
     eviction transaction clear ``memory.provider`` and silently disable memory.
@@ -344,23 +345,29 @@ def test_update_sync_cannot_evict_bundled_memory_provider(admission_env, monkeyp
 
     tmp_path, home = admission_env
     core = tmp_path / "core"
-    monkeypatch.setenv("UV_HTTP_RETRIES", "0")
+    _plug_a, _plug_b, _shared1, shared2 = _local_conflict_members(home)
     provider = core / "plugins" / "memory" / "bundled-provider"
     provider.mkdir(parents=True)
     (provider / "__init__.py").write_text("", encoding="utf-8")
     (provider / "plugin.yaml").write_text("name: bundled-provider\n", encoding="utf-8")
+    requires_python = ">999" if failure == "python" else ">=3.11"
+    # The provider and plug-a select different local sources for sharedlib,
+    # an unsatisfiable union. Neither case needs a network or mocked resolver.
     (provider / "pyproject.toml").write_text(
-        '[project]\nname="bundled-provider"\nversion="1"\nrequires-python=">=3.11"\n'
-        'dependencies=["gone"]\n[tool.uv]\npackage=false\n'
-        '[tool.uv.sources]\ngone = { url = "https://127.0.0.1:9/gone-1.0-py3-none-any.whl" }\n',
+        '[project]\nname="bundled-provider"\nversion="1"\n'
+        f'requires-python="{requires_python}"\n'
+        'dependencies=["sharedlib==2.0.0"]\n[tool.uv]\npackage=false\n'
+        f'[tool.uv.sources]\nsharedlib = {{ path = "{shared2.as_posix()}" }}\n',
         encoding="utf-8",
     )
-    _write_enabled(home, [], provider="bundled-provider")
+    _write_enabled(home, ["plug-a"], provider="bundled-provider")
+    before = (home / "config.yaml").read_bytes()
 
     with pytest.raises(InstallError, match="bundled memory provider"):
         sync_venv(explicit=True, evict_incompatible_plugins=True)
 
-    cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert (home / "config.yaml").read_bytes() == before
+    cfg = yaml.safe_load(before)
     assert cfg["memory"]["provider"] == "bundled-provider"
     assert "bundled-provider" not in cfg.get("plugins", {}).get("disabled", [])
 

@@ -32,6 +32,10 @@ real replacement generation, verifies the provider client is importable, and
 checks that disabling the provider removes it from the next generation. It
 covers bundled, catalog-installed, and bundled-over-user-copy lookup.
 The focused guard is `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/pm/test_extras.py`.
+`tests/pm/test_plugin_survival_contract.py::test_update_sync_cannot_evict_bundled_memory_provider`
+checks resolver conflicts and static Python incompatibility through public sync,
+requiring a loud failure with the provider config unchanged. Bundled providers
+ship with the release and are not eligible for automatic plugin eviction.
 
 Upstream-status: No equivalent immutable-release PM handoff or bundled-provider eviction guard was found in the upstream baseline; this remains fork-local until an equivalent released implementation exists upstream.
 
