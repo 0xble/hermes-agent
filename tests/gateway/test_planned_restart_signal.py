@@ -22,6 +22,14 @@ from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_ver
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_home(tmp_path, monkeypatch):
+    # Shutdown writes notification markers via the facade's process-home snapshot;
+    # isolating only HERMES_HOME leaves those markers shared across collected tests.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+
 async def _deliver_sigterm(monkeypatch):
     """Drive the real SIGTERM handler through a full stop with one agent that outlives the drain."""
     runner, adapter = make_restart_runner()
