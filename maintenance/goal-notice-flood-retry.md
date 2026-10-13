@@ -2,7 +2,7 @@
 
 ## Required behavior
 
-Goal status notices (`⏳` parked, `↻` continuing, `▶` wait ended/resumed, `✓`
+Goal status notices (`⏳` parked, `↻` continuing, `▶` resumed, `✓`
 achieved, `⏸` paused, and blocked) must not be silently lost when the delivery
 adapter refuses a send with a short `flood_control:<seconds>` window. The first
 send remains on the normal path; only the bounded recovery wait runs off the
@@ -16,7 +16,7 @@ warning are the documented recovery boundary for notices.
 
 The shared goal notice boundary classifies achieved, blocked, genuine pause,
 failure/exhaustion and resumed-control receipts as existing `OUTBOUND_FINAL`;
-routine parked, continuing, wait-ended, wait-age and generic status remain
+routine parked, continuing, wait-age and generic status remain
 `OUTBOUND_NOTICE`. Initial send, deferred post-delivery send and background retry
 use the same existing goal-kind inference. The actual message outcome wins over
 an incidental caller hint: a six-hour blocker pause arrives on the idle
