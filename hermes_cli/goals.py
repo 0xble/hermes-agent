@@ -1207,6 +1207,8 @@ def _process_outcome(session_id: str) -> Optional[Dict[str, Any]]:
 
         path = get_hermes_home() / "logs" / "process-results" / f"{session_id}.json"
         record = json.loads(path.read_text(encoding="utf-8-sig"))
+        if record.get("completion_reason") == "cut_pending":
+            return None
         return {k: record.get(k) for k in ("exit_code", "completion_reason", "termination_source")}
     except Exception:
         return None
