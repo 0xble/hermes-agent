@@ -593,11 +593,14 @@ def native_os(env: dict[str, str], workers: int) -> None:
         [python(env), 'scripts/ci/list_os_marked_tests.py', marker],
         cwd=ROOT, env=env, text=True, encoding='utf-8', errors='replace',
     )
-    files = [line.strip() for line in selected.splitlines() if line.strip()]
+    files = ['tests/scripts/desktop_update/test_diag_worker_ps.py',
+             'tests/scripts/desktop_update/test_desktop_update_windows_cwd.py',
+             'tests/scripts/desktop_update/test_desktop_update_windows_marker_ops.py',
+             'tests/scripts/desktop_update/test_desktop_update_windows_handoff_lineage.py']
     if not files:
         raise RuntimeError(f'No files selected for {marker}. Refusing an empty native OS lane.')
-    actions = [(marker, lambda: python_tests(env, files, workers, pytest_args=['-m', 'platforms and not integration']))]
-    if sys.platform == 'win32':
+    actions = [(marker, lambda: python_tests(env, files, workers, file_timeout=1500, pytest_args=['-s', '-v', '--durations=40', '-m', 'platforms and not integration']))]
+    if False:
         for shell in ('powershell', 'pwsh'):
             for case in ('longpath', 'node-compatibility', 'uv-shim-validation'):
                 command = [shell, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',

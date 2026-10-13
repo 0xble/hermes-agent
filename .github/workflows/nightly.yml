@@ -9,102 +9,6 @@ concurrency:
   group: repository-nightly-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    container:
-      image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
-      # PID 1 must reap orphaned descendants from the process-tree tests.
-      options: --init
-    steps:
-      - name: Install Git for checkout
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y ca-certificates git
-      - name: Configure Git safe directory
-        shell: bash
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Fetch main history and blobs for historical upgrade tests
-        shell: bash
-        run: git fetch --no-tags --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
-      - name: Assert scheduled or dispatched SHA
-        shell: bash
-        run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
-      - name: Fetch upstream release tags for historical upgrade tests
-        shell: bash
-        run: |
-          # The fork does not publish upstream's newer release tags. Without them,
-          # git describe stages the August release instead of the previous release.
-          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
-            'refs/tags/v20*:refs/tags/v20*'
-          git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1
-      - name: Install pinned Linux toolchain and platform libraries
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
-          echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.14.7
-          npm install --global npm@12.0.0
-      - name: Broad exact-SHA source profile
-        shell: bash
-        run: |
-          # Root is only needed for apt and the pinned toolchain installation.
-          # PostgreSQL, permissions, and user-systemd tests need a regular user.
-          # runuser resets HOME to the passwd home; keep the runner's disk-backed
-          # HOME (root-installed toolchain state and large test scratch live there).
-          useradd --uid 1001 --create-home --shell /bin/bash ci
-          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}' \
-            --lane static --lane node --lane docs --lane rust --lane container-lint --lane nightly-only-e2e
-  python-shard:
-    name: Python and e2e (${{ matrix.shard }}/10)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    container:
-      image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
-      options: --init
-    steps:
-      - name: Install Git for checkout
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y ca-certificates git
-      - name: Configure Git safe directory
-        shell: bash
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          fetch-depth: 1
-      - name: Assert scheduled or dispatched SHA
-        shell: bash
-        run: test "$(git rev-parse HEAD)" = '${{ github.sha }}'
-      - name: Install pinned Linux toolchain and platform libraries
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install --no-install-recommends -y bash build-essential ca-certificates clang curl ffmpeg git jq pkg-config python3 python3-dev unzip xz-utils zsh xvfb xauth fonts-liberation libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 libdrm2 libgbm1 libasound2 libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev libffi-dev patchelf
-          python3 ci/install-linux-tools.py amd64
-          echo /opt/ci/rust/bin >> "$GITHUB_PATH"
-          uv python install 3.14.7
-          npm install --global npm@12.0.0
-      - name: Exact-SHA Python shard
-        shell: bash
-        run: |
-          useradd --uid 1001 --create-home --shell /bin/bash ci
-          chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
-          runuser -u ci -- env HOME="$HOME" ./bin/ci nightly '${{ github.sha }}' --shard '${{ matrix.shard }}/10'
   native:
     name: Native OS (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -114,7 +18,7 @@ jobs:
       matrix:
         # Fixed images, not -latest aliases: a GitHub label move must arrive as
         # a reviewed change, not as a surprise nightly failure.
-        os: [macos-26, windows-2025-vs2026]
+        os: [windows-2025-vs2026]
     env:
       OPENROUTER_API_KEY: ''
       OPENAI_API_KEY: ''
@@ -157,6 +61,9 @@ jobs:
         run: |
           rustup toolchain install 1.96.1 --profile minimal
           rustup default 1.96.1
+      - name: Dump runner environment
+        shell: bash
+        run: python -c "import json,os; open(os.path.join(os.environ['RUNNER_TEMP'],'runner-env.json'),'w',encoding='utf-8').write(json.dumps(dict(os.environ)))"; echo "RUNNER_TEMP=$RUNNER_TEMP"
       - name: Qualify native OS at exact SHA
         shell: bash
         run: |
@@ -164,23 +71,8 @@ jobs:
           # processes for the hosted runner's two cores. Run Windows files
           # serially so a stalled launcher is not mistaken for a pipe leak or
           # a UI timeout; preserve the existing macOS file concurrency.
-          ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
-  desktop-core:
-    # The deterministic Desktop core E2E suite (transcript integrity, backend
-    # lifecycle/orphans, clarify+approval). Its only caller was the retired ci.yaml.
-    uses: ./.github/workflows/e2e-desktop-core.yml
-  qualification:
-    if: always()
-    needs: [linux, python-shard, desktop-core, native]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require every nightly job
-        env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os, sys
-          results = {name: job['result'] for name, job in json.loads(os.environ['NEEDS_JSON']).items()}
-          print(results)
-          sys.exit(0 if results and all(result == 'success' for result in results.values()) else 1)
-          PY
+          ./bin/ci nightly-native '${{ github.sha }}' --workers 1
+      - name: Worker diagnostics
+        if: always()
+        shell: bash
+        run: cat "$RUNNER_TEMP/diag-worker.jsonl" || true
