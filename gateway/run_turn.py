@@ -1874,7 +1874,7 @@ class GatewayTurnMixin:
                 # message_id + logical content (Telegram retries after transient failures).
                 if (
                     event.message_id
-                    and store.has_platform_message_id(
+                    and await store.has_platform_message_id(
                         sid, str(event.message_id), _user_row.get("content"), _user_row.get("content")
                     )
                 ):

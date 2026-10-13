@@ -130,7 +130,10 @@ consumed by restart replay as a naked transcript row; it transfers to the native
 transcript only after the matching platform id is durably admitted. A platform id
 is admission dedupe, never proof of a completed reply or effect. A turn reuses a
 historical trigger row only for an identical retry (same id and content); new
-content under a reused id is new input.
+content under a reused id is new input. Gateway persistence accesses this lookup
+through `AsyncSessionStore`, so its content-aware result must be awaited; the
+underlying SessionDB query is synchronous. A truthy unawaited coroutine is not
+an admission receipt.
 Durable checkpoint refreshes stage under a non-eligible name and preserve the
 previous accepted payload until the replacement's directory entry is fsynced. A
 failed admission leaves no eligible replay file; a failed refresh leaves the prior
