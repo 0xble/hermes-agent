@@ -11,7 +11,7 @@ import pytest
 
 from tools.environments import base
 from tools.environments.local import LocalEnvironment
-from tools.interrupt import acting_for_tid, set_interrupt
+from tools.interrupt import set_interrupt
 
 pytestmark = pytest.mark.platforms("linux", "macos")
 RECORDED = 178864182760
@@ -36,7 +36,7 @@ def owned_group(monkeypatch):
     return proc, signals
 
 
-@pytest.mark.parametrize("trigger", ["gateway", "deadline_worker", "cleanup"])
+@pytest.mark.parametrize("trigger", ["gateway", "cleanup"])
 @pytest.mark.parametrize("recycled", [False, True])
 def test_shutdown_kill_does_not_wait_for_slow_children(monkeypatch, owned_group, trigger, recycled):
     """An indefinitely slow psutil scan cannot delay shutdown or authorize a recycled PGID."""
@@ -60,16 +60,11 @@ def test_shutdown_kill_does_not_wait_for_slow_children(monkeypatch, owned_group,
         # Use the real cleanup admission, not a test-only shutdown switch.
         monkeypatch.setattr(base, "_live_foreground", {id(proc): (env, proc)})
         monkeypatch.setattr(base, "_spawns_in_flight", 0)
-    if trigger == "deadline_worker":
-        set_interrupt(True, owner_tid, reason="gateway shutdown")
 
     def kill():
-        token = None
         try:
             if trigger == "gateway":
                 set_interrupt(True, reason="gateway shutdown")
-            if trigger == "deadline_worker":
-                token = acting_for_tid.set(owner_tid)
             if trigger == "cleanup":
                 base.kill_live_foreground_processes()
             else:
@@ -77,8 +72,6 @@ def test_shutdown_kill_does_not_wait_for_slow_children(monkeypatch, owned_group,
         except BaseException as exc:
             errors.append(exc)
         finally:
-            if token is not None:
-                acting_for_tid.reset(token)
             set_interrupt(False)
             finished.set()
 
@@ -93,6 +86,59 @@ def test_shutdown_kill_does_not_wait_for_slow_children(monkeypatch, owned_group,
         release.set()
         worker.join(10)
         set_interrupt(False, owner_tid)
+
+
+def test_execute_gateway_shutdown_skips_descendant_scan_on_deadline_worker(monkeypatch):
+    """A real execute wait must inherit shutdown from its submitting tool thread."""
+    env = LocalEnvironment()
+    spawned = []
+    ready = threading.Event()
+    finished = threading.Event()
+    release_scan = threading.Event()
+    scan_threads = []
+    errors = []
+    results = []
+    run_bash = env._run_bash
+
+    def publish_spawn(*args, **kwargs):
+        proc = run_bash(*args, **kwargs)
+        spawned.append(proc)
+        ready.set()
+        return proc
+
+    def slow_children(_self, recursive=False):
+        scan_threads.append(threading.current_thread().name)
+        release_scan.wait(10)
+        return []
+
+    def execute():
+        try:
+            results.append(env.execute("sleep 20", timeout=20))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(env, "_run_bash", publish_spawn)
+    monkeypatch.setattr(psutil.Process, "children", slow_children)
+    worker = threading.Thread(target=execute, name="shutdown-tool", daemon=True)
+    try:
+        worker.start()
+        assert ready.wait(5), "execute did not spawn its real subprocess"
+        set_interrupt(True, worker.ident, reason="gateway shutdown")
+        assert finished.wait(3), f"shutdown blocked in children() on {scan_threads}"
+        assert not errors
+        assert results[0]["returncode"] == 130
+        assert not scan_threads, "shutdown must not enumerate the host process table"
+        assert spawned[0].poll() is not None
+    finally:
+        release_scan.set()
+        worker.join(10)
+        set_interrupt(False, worker.ident)
+        for proc in spawned:
+            if proc.poll() is None:
+                env._kill_process(proc)
+        assert not worker.is_alive(), "execute worker survived cleanup"
 
 
 @pytest.mark.parametrize("recycled_after_term", [False, True])
