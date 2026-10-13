@@ -54,7 +54,10 @@ on rejection, restore the original orphan FIFO/slot and process the arrival as
 the current turn. Do not consume an older orphan while dropping the arrival.
 
 Goal continuations and heartbeat ticks are not checkpointed: goal state and the
-heartbeat poller re-derive them. Older goal-continuation checkpoints are dropped
+heartbeat poller re-derive them. User `/goal` kickoffs retain the user's platform
+message id and are not exempt: the command must propagate a rejected admission,
+log it, and return failure text instead of claiming the kickoff started. Older
+goal-continuation checkpoints are dropped
 at recovery. Internal completions (delegation/watch notifications) are
 claim-settled at admission, so their checkpoint is their only durable copy and
 stays until consumed. The same holds for human input without a platform id
