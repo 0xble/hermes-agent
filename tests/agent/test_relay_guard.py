@@ -171,3 +171,124 @@ def test_top_level_mcp_parent_target_remains_allowed(tmp_path, monkeypatch):
 
     assert "child_parent_relay" not in result
     assert result == "stub"
+
+
+def _docker_env_capturing(calls):
+    from tools.environments import docker as docker_env
+
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+    env.cwd, env.timeout, env._forward_env, env._env = "/root", 60, [], {}
+    env._prepare_command = lambda command: (command, None)
+    env._container_id, env._docker_exe = "test-container", "/usr/bin/docker"
+    env._session_id, env._cwd_marker = "t1", "__HERMES_CWD_t1__"
+    env._snapshot_path = "/tmp/hermes-snap-t1.sh"
+    env._snapshot_ready, env._prefer_nonlogin = True, False
+    env._snapshot_passthrough_names, env._init_env_args = set(), []
+    env._persist_across_processes = False
+    env._wait_for_process = lambda proc, **_: {"output": "", "returncode": 0}
+    return env
+
+
+def _ssh_env_capturing(monkeypatch):
+    from tools.environments import ssh as ssh_env
+
+    env = ssh_env.SSHEnvironment.__new__(ssh_env.SSHEnvironment)
+    env.host, env.user, env.port, env.key_path = "h", "u", 22, ""
+    env.cwd, env.timeout = "~", 60
+    env.control_socket = __import__("pathlib").Path("/tmp/hermes-ssh-test/x.sock")
+    env._session_id, env._cwd_marker = "t2", "__HERMES_CWD_t2__"
+    env._snapshot_path = "/tmp/hermes-snap-t2.sh"
+    env._snapshot_ready, env._prefer_nonlogin = True, False
+    env._snapshot_passthrough_names, env._sync_manager = set(), None
+    env._wait_for_process = lambda proc, **_: {"output": "", "returncode": 0}
+    return env
+
+
+@pytest.mark.parametrize("backend", ["docker", "ssh"])
+def test_remote_backend_commands_carry_parent_address_only_for_children(tmp_path, monkeypatch, backend):
+    """Remote backends forward no host env, so the shared command wrapper carries
+    the address. It is exported after the snapshot is sourced and unset before the
+    re-dump, so a later top-level command on the same backend never inherits it."""
+    import shlex
+
+    from tools.environments import docker as docker_env, ssh as ssh_env
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    calls: list[list[str]] = []
+    module = docker_env if backend == "docker" else ssh_env
+    monkeypatch.setattr(module, "_popen_bash", lambda cmd, stdin_data=None, **kw: calls.append(cmd) or object())
+    env = _docker_env_capturing(calls) if backend == "docker" else _ssh_env_capturing(monkeypatch)
+    tokens = _bind("parent-session")
+    try:
+        env.execute("relay send hermes:default/parent-session")
+        with delegated_child_context("child-session"):
+            env.execute("relay send hermes:default/parent-session")
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    def script(cmd):
+        # ssh quotes the script once more for the remote login shell.
+        return shlex.split(cmd[-1])[-1] if backend == "ssh" else cmd[-1]
+
+    top_level, child = map(script, calls)
+    export = f"export {RELAY_PARENT_ADDRESS_ENV}={PARENT_ADDRESS}"
+    assert RELAY_PARENT_ADDRESS_ENV + "=" not in top_level
+    assert export in child.splitlines()
+    lines = child.splitlines()
+    assert lines.index(export) > next(i for i, ln in enumerate(lines) if ln.startswith("source "))
+    assert lines.index(export) < next(i for i, ln in enumerate(lines) if ln.startswith("eval "))
+
+
+def test_wrapper_quotes_parent_address_and_keeps_it_out_of_snapshot(tmp_path):
+    """Real bash: the command sees the address verbatim; the re-dumped snapshot does not carry it."""
+    import subprocess
+
+    from tools.environments.base_session_env import _wrap_command_script
+
+    snap = tmp_path / "snap.sh"
+    snap.write_text("")
+    hostile = "hermes:default/p'; touch pwned; '"
+    script = _wrap_command_script(
+        f'printf "%s" "${RELAY_PARENT_ADDRESS_ENV}"', quoted_cwd=str(tmp_path), quoted_snap=str(snap),
+        snap_tmp_template=f"{snap}.tmp.XXXXXX", passthrough_names=(), snapshot_ready=True,
+        cwd_marker="__M__", relay_parent_address=hostile)
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=tmp_path,
+                         env={"PATH": "/usr/bin:/bin"}).stdout
+    assert out.startswith(hostile)
+    assert not (tmp_path / "pwned").exists()
+    assert RELAY_PARENT_ADDRESS_ENV not in snap.read_text()
+
+
+def test_managed_modal_exec_payload_carries_parent_address_only_for_children(tmp_path, monkeypatch):
+    from tools.environments.managed_modal import ManagedModalEnvironment
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    env = ManagedModalEnvironment.__new__(ManagedModalEnvironment)
+    env.cwd, env.timeout, env._sandbox_id = "/root", 60, "sb"
+    env._prepare_command = lambda command: (command, None)
+    payloads = []
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def _request(method, path, json=None, timeout=None):
+        payloads.append(json)
+        return _Resp({"status": "completed", "output": "", "returncode": 0})
+
+    env._request = _request
+    tokens = _bind("parent-session")
+    try:
+        env.execute("true")
+        with delegated_child_context("child-session"):
+            env.execute("true")
+    finally:
+        session_context.clear_session_vars(tokens)
+    assert RELAY_PARENT_ADDRESS_ENV not in payloads[0]["command"]
+    assert payloads[1]["command"].startswith(f"export {RELAY_PARENT_ADDRESS_ENV}={PARENT_ADDRESS}\n")

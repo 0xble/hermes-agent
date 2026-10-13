@@ -17,6 +17,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from tools.environments.base import BaseEnvironment
+from tools.environments.base_session_env import relay_parent_export_line
 from tools.interrupt import is_interrupted
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 
@@ -86,6 +87,10 @@ class ManagedModalEnvironment(BaseEnvironment):
         if sudo_stdin is not None:
             # Feed sudo via a shell pipe: the transport has no direct stdin piping.
             exec_command = f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+        # No shared wrapper here, so carry a delegated child's parent relay address directly.
+        from agent.delegation_context import in_process_child_relay_parent_address
+        if relay_parent := in_process_child_relay_parent_address():
+            exec_command = f"{relay_parent_export_line(relay_parent)}\n{exec_command}"
         timeout = timeout or self.timeout
         exec_id = str(uuid.uuid4())
         payload: Dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,

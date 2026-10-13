@@ -147,7 +147,8 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
-    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str) -> str:
+    passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
+    relay_parent_address: str = "") -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``source`` stdout goes to /dev/null because macOS bash 3.2 / some Homebrew builds echo
     ``declare -x`` lines when sourcing. AI_AGENT/HERMES_AGENT advertise the harness to remote
@@ -157,7 +158,9 @@ def _wrap_command_script(
     same mktemp+mv atomic publish, and chains ``mv`` on the dump succeeding so a failed dump never
     replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
-    changing the command's umask.
+    changing the command's umask. ``relay_parent_address`` (a delegated child's parent) is
+    exported after the snapshot is sourced, so every backend's command sees it, including remote
+    ones whose process env is not inherited; the re-dump unsets it, so it never persists.
     """
     escaped = command.replace("'", "'\\''")
     save, restore = _passthrough_save_restore(passthrough_names)
@@ -165,6 +168,8 @@ def _wrap_command_script(
     if snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
     parts += restore
+    if relay_parent_address:
+        parts.append(relay_parent_export_line(relay_parent_address))
     parts += [
         'export AI_AGENT="${AI_AGENT:-hermes-agent}" HERMES_AGENT="${HERMES_AGENT:-true}"',
         'export GIT_PAGER="${GIT_PAGER:-cat}" PAGER="${PAGER:-cat}"',
@@ -181,6 +186,11 @@ def _wrap_command_script(
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]
     return "\n".join(parts)
+
+
+def relay_parent_export_line(address: str) -> str:
+    """Shell line exporting a delegated child's parent relay address (relay refuses sends to it)."""
+    return f"export RELAY_PARENT_ADDRESS={shlex.quote(address)}"
 
 
 def _split_cwd_marker(output: str, marker: str) -> tuple[str | None, str] | None:
