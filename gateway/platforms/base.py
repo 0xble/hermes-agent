@@ -1939,6 +1939,48 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     pending_messages[session_key] = event
 
 
+def checkpointed_merge_pending_message_event(
+    pending_messages: Dict[str, MessageEvent], session_key: str, event: MessageEvent,
+    *, merge_text: bool = False,
+) -> bool:
+    """Commit one pending-slot mutation only after its native recovery checkpoint succeeds.
+
+    Merges happen on a shallow event copy so a failed refresh leaves the live slot unchanged. Every
+    production path that accepts or merges pending content uses this single admission boundary.
+    """
+    import copy
+
+    from gateway.shutdown_flush import checkpoint_queued_event, retire_queue_checkpoint
+
+    existing = pending_messages.get(session_key)
+    if existing is event:
+        return checkpoint_queued_event(session_key, event, refresh=True)
+    if existing is None:
+        candidate = event
+        refresh = False
+    else:
+        candidate = copy.copy(existing)
+        for name in ("media_urls", "media_types", "media_text_inlined"):
+            if hasattr(existing, name):
+                setattr(candidate, name, list(getattr(existing, name, None) or []))
+        if hasattr(existing, "metadata"):
+            candidate.metadata = dict(getattr(existing, "metadata", None) or {})
+        temp = {session_key: candidate}
+        merge_pending_message_event(temp, session_key, event, merge_text=merge_text)
+        candidate = temp[session_key]
+        refresh = candidate is not event and getattr(existing, "_hermes_recovery_spool", None) is not None
+
+    if not checkpoint_queued_event(session_key, candidate, refresh=refresh):
+        return False
+    pending_messages[session_key] = candidate
+    if existing is not None and candidate is not existing and candidate is not event:
+        if event is not candidate:
+            retire_queue_checkpoint(event, reason="merged_into_head")
+    elif existing is not None and candidate is event:
+        retire_queue_checkpoint(existing, reason="replaced_pending_event")
+    return True
+
+
 # Transient *connection* failures worth retrying. Plain/read/write "timeout" excluded on purpose:
 # the send may have reached the server (retry = duplicate); "connecttimeout" never connected.
 _RETRYABLE_ERROR_PATTERNS = (
@@ -4175,7 +4217,11 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    from gateway.platforms.base import checkpointed_merge_pending_message_event
+                    if not checkpointed_merge_pending_message_event(
+                        self._pending_messages, session_key, event, merge_text=True,
+                    ):
+                        return
                 return
         now = time.monotonic()
         if state is None:
@@ -4220,8 +4266,11 @@ class BasePlatformAdapter(ABC):
         pending = self._pending_messages.get(session_key)
         if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
             return False
+        if not checkpointed_merge_pending_message_event(
+            self._pending_messages, session_key, state.event, merge_text=True,
+        ):
+            return False
         store.pop(session_key, None)
-        merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -4531,8 +4580,10 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
-            event._gateway_accepted = True
+            from gateway.platforms.base import checkpointed_merge_pending_message_event
+            event._gateway_accepted = checkpointed_merge_pending_message_event(
+                self._pending_messages, session_key, event,
+            )
             return
         if self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
@@ -4542,9 +4593,11 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
-            event._gateway_accepted = True
+            from gateway.platforms.base import checkpointed_merge_pending_message_event
+            event._gateway_accepted = checkpointed_merge_pending_message_event(
+                self._pending_messages, session_key, event,
+                merge_text=event.message_type == MessageType.TEXT,
+            )
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range

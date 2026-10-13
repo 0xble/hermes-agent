@@ -13,6 +13,7 @@ on success), ``flush_agent_history_to_file`` (DB flush raised),
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
@@ -125,12 +126,30 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[P
 
 
 
+def _payload_fingerprint(data: Any) -> str:
+    """Stable content identity used to detect in-memory mutations after queue admission."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
         checkpoint = getattr(value, "_hermes_recovery_spool", None)
         if checkpoint is not None and checkpoint.exists():
+            if serialised is None:
+                return True
+            fingerprint = _payload_fingerprint(serialised)
+            if fingerprint == getattr(value, "_hermes_recovery_fingerprint", None):
+                return True
+            if getattr(value, "_hermes_queue_checkpoint", False):
+                return checkpoint_queued_event(session_key, value, refresh=True)
+            _write_payload(
+                flush_dir, {"session_key": session_key, **extra, "data": serialised},
+                path=checkpoint, require_durable=True,
+            )
+            value._hermes_recovery_fingerprint = fingerprint
             return True
         if serialised is None or not has_user_content(serialised):
             return False
@@ -239,6 +258,7 @@ def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = Fal
             "ts": _pending_arrival_ts(event, int(time.time())),
             "seq": next(_TRANSCRIPT_SPOOL_SEQ), "data": data,
         }, path=checkpoint if refresh else None, require_durable=True)
+        event._hermes_recovery_fingerprint = _payload_fingerprint(_serialise_value(event))
         event._hermes_queue_checkpoint = True
         return True
     except Exception:

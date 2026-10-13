@@ -1,4 +1,5 @@
 """Every FIFO producer must honor failed durable admission, not consume its input."""
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -166,6 +167,82 @@ async def test_leftover_steer_survives_fifo_rejection(failed_storage):
     )
     assert event is None
     assert pending == "priority\n\nalso retain this"
+
+
+def test_pending_photo_merge_refreshes_checkpoint_and_empty_slot_is_checkpointed(tmp_path, monkeypatch):
+    from gateway.platforms.event import MessageType
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = _make_runner(_session_entry())
+    source = _make_source()
+    key = build_session_key(source)
+    head = _event("head", "photo-head")
+    assert runner._queue_or_replace_pending_event(key, head)
+    follow = _event("caption", "photo-follow")
+    follow.message_type = MessageType.PHOTO
+    follow.media_urls = ["/tmp/follow.jpg"]
+    follow.media_types = ["image/jpeg"]
+    assert runner._hm_merge_pending_for_source(source, key, follow)
+    spool = head._hermes_recovery_spool
+    assert json.loads(spool.read_text())["data"]["media_urls"] == ["/tmp/follow.jpg"]
+
+    empty = _event("first photo", "photo-empty")
+    empty.message_type = MessageType.PHOTO
+    empty.media_urls = ["/tmp/empty.jpg"]
+    empty.media_types = ["image/jpeg"]
+    empty_key = key + "-empty"
+    assert runner._hm_merge_pending_for_source(source, empty_key, empty)
+    assert json.loads(empty._hermes_recovery_spool.read_text())["data"]["media_urls"] == ["/tmp/empty.jpg"]
+
+
+def test_flush_rewrites_stale_pending_checkpoint_after_in_memory_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = _make_runner(_session_entry())
+    key = build_session_key(_make_source())
+    event = _event("before mutation", "stale-spool")
+    assert runner._queue_or_replace_pending_event(key, event)
+    path = event._hermes_recovery_spool
+    event.text = "after mutation"
+    assert shutdown_flush.flush_pending_to_file(adapter._pending_messages) == 1
+    assert json.loads(path.read_text())["data"]["text"] == "after mutation"
+
+
+def test_busy_internal_admission_failure_is_not_acknowledged():
+    import asyncio
+
+    runner, adapter = _make_runner(_session_entry())
+    event = _event("internal completion", "internal-fail")
+    event.internal = True
+    event.allow_gateway_control = True
+    key = build_session_key(event.source)
+    adapter._pending_messages[key] = _event("occupied", "occupied")
+    runner._queue_or_replace_pending_event = Mock(return_value=False)
+    assert asyncio.run(runner._handle_active_session_busy_message(event, key)) is False
+
+
+@pytest.mark.asyncio
+async def test_draining_internal_admission_failure_is_not_acknowledged():
+    runner, adapter = _make_runner(_session_entry())
+    event = _event("internal completion", "drain-fail")
+    event.internal = True
+    runner._draining = True
+    runner._preserve_drain_event = Mock(return_value=False)
+    assert await runner._handle_active_session_busy_message(event, build_session_key(event.source)) is False
+
+
+@pytest.mark.asyncio
+async def test_internal_busy_admission_failure_is_not_acknowledged():
+    runner, adapter = _make_runner(_session_entry())
+    event = _event("internal completion", "internal-fail-normal")
+    event.internal = True
+    event.allow_gateway_control = False
+    key = build_session_key(event.source)
+    runner._draining = False
+    runner._is_user_authorized_for_source = Mock(return_value=True)
+    runner._admit_bot_message_for_source = Mock(return_value=True)
+    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+    runner._queue_or_replace_pending_event = Mock(return_value=False)
+    assert await runner._handle_active_session_busy_message(event, key) is False
 
 
 @pytest.mark.asyncio

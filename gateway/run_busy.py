@@ -394,7 +394,7 @@ class GatewayBusySessionMixin:
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         """Return whether this event actually entered the adapter slot or FIFO."""
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.base import checkpointed_merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return False
@@ -429,25 +429,11 @@ class GatewayBusySessionMixin:
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
-            import copy
-            from gateway.shutdown_flush import checkpoint_queued_event, retire_queue_checkpoint
-            # Shallow copy: raw_message holds live SDK objects (locks, sessions) that deepcopy
-            # cannot clone. Only the fields the merge mutates in place get their own lists/dicts.
-            candidate = copy.copy(existing)
-            for name in ("media_urls", "media_types", "media_text_inlined"):
-                setattr(candidate, name, list(getattr(existing, name, None) or []))
-            candidate.metadata = dict(getattr(existing, "metadata", None) or {})
-            candidate_slot = {session_key: candidate}
-            merge_pending_message_event(
-                candidate_slot, session_key, event,
+            if not checkpointed_merge_pending_message_event(
+                adapter._pending_messages, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
-            )
-            if not checkpoint_queued_event(session_key, candidate_slot[session_key], refresh=True):
+            ):
                 return False
-            adapter._pending_messages[session_key] = candidate_slot[session_key]
-            if event is not candidate_slot[session_key]:
-                # The follow-up now lives in the merged head's checkpoint.
-                retire_queue_checkpoint(event, reason="merged_into_head")
             event._gateway_accepted = True
             return True
 
@@ -904,13 +890,11 @@ class GatewayBusySessionMixin:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if self._draining and event.internal and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(session_key, event)
-            return True
+            return bool(self._preserve_drain_event(session_key, event))
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
-                self._queue_or_replace_pending_event(session_key, event)
-                return True
+                return bool(self._queue_or_replace_pending_event(session_key, event))
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
@@ -933,8 +917,7 @@ class GatewayBusySessionMixin:
         if await self._route_plaintext_approval_while_busy(event, session_key):
             return True
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(session_key, event)
-            return True
+            return bool(self._preserve_drain_event(session_key, event))
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:
             # A command not bypassed by the adapter still uses the ordinary busy
@@ -954,8 +937,7 @@ class GatewayBusySessionMixin:
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).
         if getattr(event, "internal", False):
-            self._queue_or_replace_pending_event(session_key, event)
-            return True
+            return bool(self._queue_or_replace_pending_event(session_key, event))
         _busy_state = self._peek_session_state(session_key)
         preempt = effective_mode == "queue" and self._human_preempts_autonomous_turn(event, _busy_state)
         if preempt:

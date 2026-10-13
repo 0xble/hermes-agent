@@ -45,6 +45,15 @@ session-id lookup, at exactly one of these points:
   declined accepted-queue claim stops recovery for that checkpoint; it never
   falls through to a naked transcript row.
 
+Every pending-slot content merge (running photos, setup-time input, non-queue
+Telegram grace and adapter batching) uses the same copy-then-checkpoint admission
+boundary. Refresh succeeds before publishing the new slot; failure preserves the
+accepted head and returns rejection to its caller. Shutdown compares the event's
+serialized content fingerprint against its checkpoint and durably refreshes a
+stale spool rather than treating path existence as proof of current content.
+Internal busy/drain callers return the actual admission receipt so rejected
+completion notifications can refund their claims.
+
 Every FIFO producer must honor its durable-admission boolean, including the
 Telegram follow-up grace window. A failed busy queue admission must produce a
 failure reply, not a successful queue acknowledgement or a silently consumed

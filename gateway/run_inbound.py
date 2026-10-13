@@ -643,12 +643,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
     def _hm_merge_pending_for_source(
         self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
-    ) -> None:
-        """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
-        from gateway.platforms.base import merge_pending_message_event
+    ) -> bool:
+        """Merge *event* into the source adapter's pending slot through durable admission."""
+        from gateway.platforms.base import checkpointed_merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
-        if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+        return bool(
+            adapter and checkpointed_merge_pending_message_event(
+                adapter._pending_messages, _quick_key, event, merge_text=merge_text,
+            )
+        )
 
     async def _hm_busy_slash_or_photo(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
@@ -679,7 +682,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-            self._hm_merge_pending_for_source(source, _quick_key, event)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event):
+                return True, QUEUE_ADMISSION_FAILURE
             return True, None
         return False, None
 
@@ -700,7 +704,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             time.time() - _started_at, _quick_key,
         )
         if effective_busy_input_mode != "queue":
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):
+                return QUEUE_ADMISSION_FAILURE
         else:
             adapter = self._delivery_adapter_for(source)
             if adapter:
@@ -766,7 +771,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         if self._draining and not self._hm_is_registered_command(event):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
-            self._preserve_drain_event(_quick_key, event)
+            if not self._preserve_drain_event(_quick_key, event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
@@ -788,7 +794,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 await self._pause_goal_for_stop(_quick_key, source)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):  # picked up after start
+                return QUEUE_ADMISSION_FAILURE
             return None
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -1182,7 +1189,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            if not self._preserve_drain_event(self._session_key_for_source(source), event):
+                return True, QUEUE_ADMISSION_FAILURE, command
             return True, None, command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -1460,7 +1468,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # here would send it a second time.
             return None
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            if not self._preserve_drain_event(self._session_key_for_source(source), event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
