@@ -46,12 +46,34 @@ def _reload_if_readable(manager: GoalManager, db: SessionDB | None) -> None:
             logger.warning("Could not reload goal %s; retaining in-memory state", manager.session_id)
 
 
+def commit_goal_snapshot(session_id: str, expected: str, state: GoalState, db: SessionDB) -> None:
+    """Validate and commit in the SessionDB writer transaction, including unchanged results."""
+    from hermes_cli.goals import GoalState, _meta_key
+
+    def commit(cursor):
+        row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+        if not row or not row[0] or GoalState.from_json(row[0]).to_json() != expected:
+            raise GoalEvaluationConflict
+        if state.to_json() != expected:
+            state.mutation_id = uuid.uuid4().hex
+            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
+
+    try:
+        db._execute_write(commit)
+    except GoalEvaluationConflict:
+        raise
+    except Exception as exc:
+        raise GoalEvaluationPersistenceError from exc
+
+
 def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: Any) -> dict[str, Any]:
-    from hermes_cli.goals import GoalState, _decision, _get_session_db, _meta_key
+    from hermes_cli.goals import GoalState, _decision, _get_session_db
 
     state = manager.state
     if state is None or state.status != "active":
         return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+    if not manager.session_id:
+        return manager._evaluate_after_turn(last_response, **kwargs)
     expected = state.to_json()
     db = None
     try:
@@ -71,20 +93,7 @@ def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: A
         decision = evaluator._evaluate_after_turn(last_response, **kwargs)
         result = evaluator.state
 
-        def commit(conn):
-            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(manager.session_id),)).fetchone()
-            if not row or not row[0] or GoalState.from_json(row[0]).to_json() != expected:
-                raise GoalEvaluationConflict
-            if result.to_json() != expected:
-                result.mutation_id = uuid.uuid4().hex
-                conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (result.to_json(), _meta_key(manager.session_id)))
-
-        try:
-            db._execute_write(commit)
-        except GoalEvaluationConflict:
-            raise
-        except Exception as exc:
-            raise GoalEvaluationPersistenceError from exc
+        commit_goal_snapshot(manager.session_id, expected, result, db)
         manager._state = result
         return decision
     except GoalEvaluationConflict:

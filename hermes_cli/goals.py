@@ -25,6 +25,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.goal_evidence import (
+    JUDGE_EVIDENCE_BLOCK_TEMPLATE as JUDGE_EVIDENCE_BLOCK_TEMPLATE,
+    _READ_ONLY_STATUS_CALL_RE as _READ_ONLY_STATUS_CALL_RE,
+    _READ_ONLY_STATUS_TOOLS as _READ_ONLY_STATUS_TOOLS,
+    _read_only_status_call as _read_only_status_call,
+    _evidence_only_read_only_status,
+    _evidence_scan_truncated_for_turn,
+    _goal_progress_fingerprint,
+    _render_evidence_block,
+)
+from hermes_cli.goals_revisions import GoalRevisionsMixin
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
 
@@ -1521,13 +1532,6 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     return _EvidenceRows(selected, truncated=scan_truncated)
 
 
-from hermes_cli.goal_evidence import (
-    JUDGE_EVIDENCE_BLOCK_TEMPLATE,
-    _evidence_only_read_only_status,
-    _evidence_scan_truncated_for_turn,
-    _goal_progress_fingerprint,
-    _render_evidence_block,
-)
 
 
 
@@ -2059,7 +2063,7 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
-class GoalManager:
+class GoalManager(GoalRevisionsMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -2228,77 +2232,6 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         self._save()
-
-    # --- revisions ------------------------------------------------------
-
-    # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
-    # and changing constraints. Other contract fields may be restructured by the agent; the judge
-    # still holds an unauthorized revision to any earlier requirement it weakened.
-    _AUTHORITY_FIELDS = ("goal", "constraints")
-
-    def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
-               contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-               user_quote: str = "", user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Record a versioned revision of the goal, contract fields and/or subgoal list.
-
-        ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
-        A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
-        excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
-        user messages since the goal was set). Returns ``{"ok", "error_code", "error", "revision"}``."""
-        state = self._require_goal()
-        reason = (reason or "").strip()
-        if not reason:
-            return {"ok": False, "error_code": "reason_required", "error": "a revision needs a reason"}
-        before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
-        after = dict(before)
-        if goal is not None and goal.strip():
-            after["goal"] = goal.strip()
-        for key, value in (contract or {}).items():
-            if key not in _CONTRACT_FIELDS:
-                return {"ok": False, "error_code": "unknown_field", "error": f"unknown contract field: {key}"}
-            after[key] = str(value or "").strip()
-        if subgoals is not None:
-            after["subgoals"] = [str(s).strip() for s in subgoals if str(s).strip()]
-        changed = [k for k in after if after[k] != before[k]]
-        if not changed:
-            return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
-        dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
-        needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
-        quote = " ".join((user_quote or "").split())
-        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
-            return {"ok": False, "error_code": "user_authority_required",
-                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
-                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
-        source = ""
-        if quote:
-            # Deterministic part: the quote must come from a real user message. Whether that message
-            # authorizes this specific change is judged against the full message, shown with the revision.
-            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-                return {"ok": False, "error_code": "user_quote_too_short",
-                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
-            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
-            if not sources:
-                return {"ok": False, "error_code": "user_quote_not_found",
-                        "error": "user_quote does not match any user message sent since the goal was set"}
-            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
-            if not source:
-                return {"ok": False, "error_code": "user_message_too_long",
-                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
-                                 "long to judge whether it authorizes this change; ask the user to state the "
-                                 "change in a short message and quote that"}
-        revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
-                    "user_message": source,
-                    "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
-        state.goal = after["goal"]
-        state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
-        state.subgoals = after["subgoals"]
-        state.revisions.append(revision)
-        # The bar moved: an earlier dispute streak was about the superseded wording.
-        state.consecutive_disputes = 0
-        state.last_dispute_evidence = ""
-        self._save()
-        return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
 
     # --- /subgoal user controls ---------------------------------------
 

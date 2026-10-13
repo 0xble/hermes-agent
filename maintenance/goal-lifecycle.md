@@ -52,12 +52,21 @@ clears the goal once with one short notice, before dispute pause or timed backof
 - Fork patch identity: `goal-pause-race`. Evaluation runs on an isolated snapshot and atomically
   compares that snapshot with the durable row before committing any verdict. Every durable
   mutation carries a fresh token, including pause/resume cycles returning to equal values.
+  Versioned revisions use the same transaction owner and exact canonical comparison,
+  including legacy rows without a token. Revision authority lookup runs on an isolated
+  copy. Stale revisions return `state_changed` and reload the winner, including a
+  conflict at a no-op return or the final write. Operational read/write errors return
+  `persistence_failed`, log the cause, and publish no staged state. An empty session ID
+  remains explicitly ephemeral for both revisions and evaluation.
+  The `goal-adaptive` revision body is moved unchanged to
+  `hermes_cli/goals_revisions.py`; its quote and retained-requirement policy is unchanged.
   Stale evaluations and failed persistence never authorize continuation. Commands remain
   authoritative before evaluation, during gates/judging, and at the final write boundary.
   Our upstream [PR #124017](https://github.com/NousResearch/hermes-agent/pull/124017)
   now carries this complete atomic settlement and mutation-token contract.
   Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_evaluation_atomic.py
-  tests/hermes_cli/test_goals.py tests/hermes_cli/test_goal_gates.py`.
+  tests/hermes_cli/test_goal_revision_atomic.py tests/hermes_cli/test_goals.py
+  tests/hermes_cli/test_goal_gates.py tests/hermes_cli/test_goal_adaptive.py`.
 
 - Fork patch identity: `goal-judge-evidence`. Own fork patch, no upstream PR yet.
   The judge receives an evidence ledger: up to 8 recent non-bookkeeping tool
@@ -177,22 +186,45 @@ the blocker. This adopts upstream's conversational recovery policy, not semantic
 proof that the blocker is solved. The next judge may block again. Explicit user
 pauses remain authoritative.
 
-## Successful empty turn admission
+## Successful Empty Turn Admission
 
 Fork patch identity: `goal-turn-outcome`. No upstream implementation of this shared
-admission boundary was found. Gateway, CLI, TUI and Desktop admit successful turns
+admission boundary was found in the owner preflight against upstream
+`63d0b94120027d487c9a5235b9ec64b696af1b26`. Gateway, CLI, TUI and Desktop admit successful turns
 to the goal evaluator even when the response is empty or whitespace. Failure
 notices, interrupted replies and incomplete turns are not progress. Explicit
 outcomes are authoritative; only legacy callers without an outcome retain the
-nonempty-text fallback. Existing non-failed iteration-summary handoffs remain
-resumable boundaries. The CLI uses the current result's response, never an earlier
-assistant message, when that result is available. Loop cleanup remains independent
+nonempty-text fallback. Existing iteration-summary handoffs require a nonempty
+result summary and nonempty evaluator input, with no failed/interrupted/error/partial
+outcome. An explicit unsuccessful surface outcome still excludes the turn.
+The CLI resets its outcome before credential/setup work and uses the current raw
+result's response, never an earlier assistant message or rendered failure notice.
+Loop cleanup remains independent
 of goal admission. This changes no user-authority, provenance, display/silence or
 revision semantics; the full revision history contract above remains binding.
 
+Admission means the evaluator may examine the boundary, not that it proved
+completion or progress. Successful empty/tool-only turns retain runtime evidence.
+Automatic bare silence still follows the existing silent-turn policy. A silent
+stall, a disputed completion claim, a no-progress streak, and an explicit wait
+remain distinct: this patch introduces no stall threshold or new terminal behavior.
+Read-only/no-evidence automatic turns still use the existing backoff, and timed,
+pid/session/delegation waits retain their existing wake rules. CAS controls which
+state may be committed, without changing verdict, cadence, or revision authority.
+
+The `goal-judge-evidence` helpers moved to `hermes_cli/goal_evidence.py` retain
+their goal-module exports and original explanatory docstrings. Browser-console
+status classification remains owned by
+[External-Wait Goal Backoff](goal-external-wait-backoff.md), independently of
+success admission and completion judgment.
+
 Proof: the `test_goal_empty_turn.py` suites in gateway and tui_gateway plus
-`tests/hermes_cli/test_cli_goal_empty_turn.py` cover successful empty/tool-only and
-silent replies, legacy fallback, and failed/interrupted/incomplete rejection.
+`tests/hermes_cli/test_cli_goal_empty_turn.py` enter the real surface hooks and
+evaluator with isolated SessionDB evidence. They cover successful empty/tool-only
+turns, generated failure-copy exclusion, incomplete/interrupted rejection, and
+loop-claim release independent of goal admission. Classification is covered by
+`tests/hermes_cli/test_goal_readonly_evidence.py`. TUI handoff tests keep the
+result summary consistent with the evaluator input.
 Rollback reverts this boundary; there is no schema migration or configuration.
 Retire when upstream provides the same outcome-based admission on all surfaces.
 
