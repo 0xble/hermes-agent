@@ -157,12 +157,12 @@ _DISPUTED_PAUSE_PREFIX = "judge disputed completion: "
 # on concrete evidence instead of a vibe check.
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
-# A live pid/session barrier emits its first age notice after this interval. Timed barriers
+# A live pid/session barrier begins silent age-cap rechecks after this interval. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
 # A live target cannot hold a goal forever. After this ceiling the goal pauses with a named blocker.
 _MAX_LIVE_BARRIER_S = 6 * 60 * 60
-# Liveness is re-checked on an escalating schedule after the age notice. The deadline is stored
+# Liveness is re-checked on an escalating schedule after the age cap. The deadline is stored
 # separately from ``waiting_until`` so pid/session readers retain their target semantics.
 _BARRIER_REARM_BACKOFF_S = (5 * 60, 15 * 60, 30 * 60)
 # A judge-selected timed wait is bounded to the existing one-minute minimum. Automatic
@@ -2632,20 +2632,17 @@ class GoalManager:
         index = min(max(0, s.barrier_rearms), len(_BARRIER_REARM_BACKOFF_S) - 1)
         delay = _BARRIER_REARM_BACKOFF_S[index]
         notice_key = f"live-barrier:{target}|reason:{s.waiting_reason or ''}"
-        notice = None
-        if age >= _MAX_BARRIER_WAIT_S and s.last_age_notice_key != notice_key:
-            notice = f"⏳ Goal still waiting on {target} after 30 minutes; checking again with backoff."
-        changed, current = rearm_goal_barrier_if_since(
+        # Elapsed time/backoff is not a new user-visible outcome. Keep the durable
+        # re-arm and age identity without emitting a second unchanged wait notice.
+        _, current = rearm_goal_barrier_if_since(
             self.session_id, s.waiting_since, recheck_at=now + delay,
-            rearm_count=s.barrier_rearms + 1, age_notice_key=notice_key if notice else None,
+            rearm_count=s.barrier_rearms + 1,
+            age_notice_key=notice_key if age >= _MAX_BARRIER_WAIT_S else None,
         )
         if current is not None:
             self._state = current
-        # The notice is delivered directly by idle callers. Do not retain it on the
-        # manager: an immediate evaluator pass would otherwise replay the already
-        # committed age notice through _waiting_decision().
         self._last_live_barrier_notice = None
-        return notice if changed else None
+        return None
 
     def _stage_live_barrier(self) -> tuple[bool, Optional[str], Optional[str]]:
         """Stage live-barrier maintenance on an isolated evaluator state.
@@ -2686,11 +2683,10 @@ class GoalManager:
         s.barrier_rearms += 1
         s.barrier_recheck_at = now + _BARRIER_REARM_BACKOFF_S[index]
         notice_key = f"live-barrier:{target}|reason:{s.waiting_reason or ''}"
-        notice = None
-        if age >= _MAX_BARRIER_WAIT_S and s.last_age_notice_key != notice_key:
+        # Match the idle re-arm path: persist backoff, but age alone stays quiet.
+        if age >= _MAX_BARRIER_WAIT_S:
             s.last_age_notice_key = notice_key
-            notice = f"⏳ Goal still waiting on {target} after 30 minutes; checking again with backoff."
-        return True, notice, None
+        return True, None, None
 
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied; never mutates durable state."""
@@ -2958,10 +2954,10 @@ class GoalManager:
             )
         state.last_verdict = verdict
         state.last_reason = reason
-        # A non-WAIT verdict is a real lifecycle transition out of the previous
-        # parked state. Preserve the key only across timer/barrier lifts that
-        # re-park on the same reason; CONTINUE must announce a later re-park.
-        if verdict == "continue":
+        # A judged CONTINUE is a real transition out of the parked state. The
+        # synthetic CONTINUE for an intentional silent wake is not: retain the
+        # durable identity so unchanged no-progress/delegation re-parks stay quiet.
+        if verdict == "continue" and not silent_automatic:
             state.last_wait_notice_key = None
         # Real user turns and actionable tool results are progress signals. Automatic turns whose
         # current evidence is empty or read-only/status-only count toward the backoff regardless of

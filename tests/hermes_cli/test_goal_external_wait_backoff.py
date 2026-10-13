@@ -117,7 +117,8 @@ def test_user_turn_at_age_cap_stages_notice_without_conflict(hermes_home):
         decision = mgr.evaluate_after_turn("user checked the status", user_initiated=True)
 
     assert decision["verdict"] == "waiting"
-    assert "30 minutes" in decision["message"]
+    assert "Goal parked" in decision["message"]
+    assert "30 minutes" not in decision["message"]
     assert mgr.state.turns_used == 0
     assert mgr.state.last_age_notice_key.startswith("live-barrier:session watcher-user")
     judge.assert_not_called()
@@ -159,7 +160,7 @@ def test_age_notice_does_not_repost_parked_notice(hermes_home):
         st.barrier_recheck_at = 0.0
         goals.save_goal(sid, st)
         fresh = goals.GoalManager(sid)
-        assert fresh.rearm_live_barrier()
+        assert fresh.rearm_live_barrier() is None
         second = fresh.evaluate_after_turn("internal status", user_initiated=False)
 
     assert second["message"] == ""
@@ -316,7 +317,7 @@ def test_unchanged_continuation_reason_is_not_reposted(hermes_home):
     assert mgr.state.last_continuation_notice_key == "continuation|reason:nothing actionable until the watchdog"
 
 
-def test_live_barrier_emits_one_age_notice(hermes_home):
+def test_live_barrier_age_recheck_is_silent(hermes_home):
     from hermes_cli import goals
     from hermes_cli.goals import GoalManager
 
@@ -330,7 +331,7 @@ def test_live_barrier_emits_one_age_notice(hermes_home):
         first = mgr.rearm_live_barrier()
         second = mgr.rearm_live_barrier()
 
-    assert first and "30 minutes" in first
+    assert first is None
     assert second is None
     assert mgr.state.last_age_notice_key.startswith("live-barrier:session watcher-age")
     assert mgr.state.waiting_until == 0.0
