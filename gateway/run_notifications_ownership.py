@@ -218,10 +218,14 @@ class GatewayNotificationOwnershipMixin:
         with runner._completion_delivery_lock:
             for delegation_id in completion_ids:
                 runner._completion_deliveries_delivered.pop(("async_delegation", delegation_id, ""), None)
+            # The turn can run before admission's off-loop acknowledgement commits: hand the requeue
+            # that claim so it reopens the still-pending row and the late acknowledgement loses.
+            pending_acks = dict(runner._pending_completion_acks())
         for delegation_id in completion_ids:
             try:
                 requeued = await asyncio.to_thread(
-                    requeue_admitted_completion, delegation_id, process_registry.completion_queue)
+                    requeue_admitted_completion, delegation_id, process_registry.completion_queue,
+                    pending_acks.get(delegation_id, ""))
             except Exception:
                 logger.debug("Could not requeue admitted completion %s", delegation_id, exc_info=True)
                 requeued = False

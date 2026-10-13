@@ -1169,6 +1169,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
         accepted = identity_claimed = refused = cancelled = False
+        ack_claims: list[tuple[str, str]] = []
         try:
             claim = await self._preflight_completion_delivery(evt, claim)
             if not claim.proceed:
@@ -1190,13 +1191,24 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             completion_ids = [claim.delegation_id] if claim.claim_id else []
             completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
             evt = {**evt, "completion_ids": completion_ids}
+            # Publish the admission claims before the turn can start; it may resolve ownership while
+            # the acknowledgement below is still in flight (see ``_requeue_uncertain_completion``).
+            ack_claims = [(claim.delegation_id, claim.claim_id)] if claim.claim_id else []
+            ack_claims += [(sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims if claim_id]
+            with self._completion_delivery_lock:
+                self._pending_completion_acks().update(ack_claims)
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True
-            if identity is not None:
-                with self._completion_delivery_lock:
-                    self._mark_completions_delivered_locked((identity,))
+            with self._completion_delivery_lock:
+                # Before the awaited acknowledgement: a turn that requeues meanwhile must find these
+                # marks to clear, not have them restored after it ran.
+                self._mark_completions_delivered_locked(
+                    ([identity] if identity is not None else [])
+                    + [i for i in map(self._completion_delivery_identity,
+                                      [event for event, _claim_id in sibling_claims]) if i is not None]
+                )
             return True
         except asyncio.CancelledError:
             # Cancellation is a shutdown/retry boundary, not a failed delivery. Refund every
@@ -1218,9 +1230,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             operations.extend(
                 (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
             )
-            await self._settle_durable_claims(operations)
-            if accepted and sibling_claims:
-                self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
+            try:
+                await self._settle_durable_claims(operations)
+            finally:
+                with self._completion_delivery_lock:
+                    pending_acks = self._pending_completion_acks()
+                    for delegation_id, claim_id in ack_claims:
+                        if pending_acks.get(delegation_id) == claim_id:
+                            del pending_acks[delegation_id]
+
+    def _pending_completion_acks(self) -> dict:
+        """``delegation_id -> admission claim`` whose acknowledgement has not finished. Caller holds
+        ``_completion_delivery_lock``. Lazily created: some runners are built without ``__init__``."""
+        return self.__dict__.setdefault("_completion_acks_pending", {})
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
