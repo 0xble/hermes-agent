@@ -474,12 +474,14 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            if session_entry is None or not pinned_session_id or not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
+            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
@@ -495,7 +497,8 @@ class GatewayTurnMixin:
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
-            if strict_session and session_entry.session_id != pinned_session_id:
+            if strict_session and not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
                 # Topic-binding recovery may switch conversations; a pinned event belongs only to
                 # the session it was admitted for, never to whatever the topic now points at.
                 logger.warning(
@@ -521,6 +524,17 @@ class GatewayTurnMixin:
             return
         return source, session_entry, session_key
 
+    async def _wake_pin_matches(self, event, pinned: str, session_id: str) -> bool:
+        """Keep strict routing pinned, except for a verified, still-current compressed wake."""
+        if pinned == session_id:
+            return True
+        if not GatewayTurnMixin._is_gateway_wake(event):
+            return False
+        from hermes_cli.session_controls import internal_wake_is_current
+        if not await asyncio.to_thread(internal_wake_is_current, event, session_id):
+            return False
+        return event.metadata.get("gateway_session_id") == session_id
+
     async def _strict_session_pin_holds(self, event, session_id: Optional[str] = None) -> bool:
         """The ``_hmwa_resolve_session`` strict rule for every other admission and queue boundary.
 
@@ -534,11 +548,12 @@ class GatewayTurnMixin:
         pinned = str(metadata.get("gateway_session_id") or "").strip()
         key = str(metadata.get("gateway_session_key") or "").strip()
         current = None
-        if pinned and key and (session_id is None or session_id == pinned):
+        if pinned and key:
             entry = await self.async_session_store.lookup_by_session_key(key)
             current = getattr(entry, "session_id", None)
-        if current is not None and current == pinned:
-            return True
+        if current is not None and (session_id is None or session_id == current):
+            if await GatewayTurnMixin._wake_pin_matches(self, event, pinned, current):
+                return True
         logger.warning(
             "Dropping internally routed event: pinned session id=%s no longer owns key=%s (running=%s)",
             pinned or "missing", key or "missing", session_id or "-",

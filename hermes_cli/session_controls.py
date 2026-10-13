@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any, Dict, Optional, Tuple
 
@@ -561,7 +561,47 @@ def _definition_fingerprint(kind: str, raw: Optional[str]) -> str:
         return ""
 
 
-def _goal_continuation_matches(metadata: Any, session_id: str, definition: Any) -> bool:
+def _wake_session_matches(stamped_sid: str, session_id: str, *, cursor=None) -> bool:
+    """Only compression may carry a queued wake into a different running session.
+
+    Use the same edge predicates as transcript recovery: an inherited fork marker is OK,
+    but a branch/delegate/reset marker bound to this edge's parent is not. Bound the walk
+    so corrupt/cyclic or excessively deep ancestry fails closed.
+    """
+    if not session_id or stamped_sid == session_id:
+        return True
+    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+
+    db = _db() if cursor is None else None
+    if cursor is None and db is None:
+        return False
+    with (db._read_ctx() if cursor is None else nullcontext(cursor)) as conn:
+        row = conn.execute(
+            f"""WITH RECURSIVE lineage(id, depth) AS (
+                SELECT ?, 0
+                UNION ALL
+                SELECT c.parent_session_id, lineage.depth + 1
+                FROM lineage JOIN sessions c ON c.id = lineage.id
+                WHERE lineage.depth < 64
+                  AND {_COMPRESSION_CHILD_SQL.format(a='c')}
+                  {_non_continuation_child_sql('c.', 'c.parent_session_id')}
+            ) SELECT 1 FROM lineage WHERE id = ? AND depth > 0 LIMIT 1""",
+            (session_id, stamped_sid),
+        ).fetchone()
+    return row is not None
+
+
+def _rebind_wake_session(metadata: Dict[str, Any], key: str, session_id: str) -> None:
+    """Publish the validated child's identity for execution and post-turn settlement."""
+    old_sid = metadata[key]
+    if session_id and old_sid != session_id:
+        metadata[key] = session_id
+        # Strict control wakes also pin a routing session. Never rewrite an unrelated pin.
+        if metadata.get("gateway_session_id") == old_sid:
+            metadata["gateway_session_id"] = session_id
+
+
+def _goal_continuation_matches(metadata: Any, session_id: str, definition: Any, *, cursor=None) -> bool:
     """Match an active goal instance; authored edits are refreshed at turn consumption."""
     if not isinstance(metadata, dict) or not isinstance(definition, dict):
         return False
@@ -569,7 +609,7 @@ def _goal_continuation_matches(metadata: Any, session_id: str, definition: Any) 
     fingerprint = metadata.get("goal_continuation_fingerprint")
     instance = metadata.get("goal_continuation_instance")
     return bool(
-        isinstance(sid, str) and sid and (not session_id or sid == session_id)
+        isinstance(sid, str) and sid and _wake_session_matches(sid, session_id, cursor=cursor)
         and isinstance(fingerprint, str) and fingerprint.startswith("v2:")
         and type(instance) in (int, float) and instance > 0
         and definition.get("status") == "active" and instance == definition.get("created_at")
@@ -581,14 +621,18 @@ def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=
     if not isinstance(metadata, dict):
         return False
     sid = metadata.get("goal_continuation_session_id")
-    if not isinstance(sid, str) or not sid or (session_id and sid != session_id):
+    if not isinstance(sid, str) or not sid:
         return False
+    target_sid = session_id or sid
     try:
         db = _db() if cursor is None else None
-        raw = _meta_value(cursor, _definition_key("goal", sid)) if cursor is not None else (
-            db.get_meta(_definition_key("goal", sid)) if db is not None else None
+        raw = _meta_value(cursor, _definition_key("goal", target_sid)) if cursor is not None else (
+            db.get_meta(_definition_key("goal", target_sid)) if db is not None else None
         )
-        return _goal_continuation_matches(metadata, session_id, json.loads(raw) if raw else None)
+        if not _goal_continuation_matches(metadata, session_id, json.loads(raw) if raw else None, cursor=cursor):
+            return False
+        _rebind_wake_session(metadata, "goal_continuation_session_id", target_sid)
+        return True
     except Exception:
         logger.debug("goal continuation instance check failed", exc_info=True)
         return False
@@ -618,23 +662,41 @@ def loop_wake_is_current(metadata: Any, session_id: str = "", *, cursor=None) ->
     if not isinstance(metadata, dict) or not metadata.get(LOOP_WAKE_METADATA_KEY):
         return True
     sid = metadata.get("loop_wakeup_session_id")
-    if not isinstance(sid, str) or not sid or (session_id and sid != session_id):
+    if not isinstance(sid, str) or not sid:
         return False
+    target_sid = session_id or sid
+    rebinding = sid != target_sid
+    try:
+        if not _wake_session_matches(sid, target_sid, cursor=cursor):
+            return False
+        if not _loop_wake_matches(metadata, target_sid, cursor=cursor, require_stored=rebinding):
+            return False
+        _rebind_wake_session(metadata, "loop_wakeup_session_id", target_sid)
+        return True
+    except Exception:
+        # A different session must prove both ancestry and a migrated tick. The historical
+        # unreadable-store exception applies only to a wake still in its stamped session.
+        logger.debug("loop wake lineage check could not read the store", exc_info=True)
+        return not rebinding
+
+
+def _loop_wake_matches(metadata: Dict[str, Any], sid: str, *, cursor=None, require_stored: bool = False) -> bool:
     try:
         db = _db() if cursor is None else None
         if cursor is None and db is None:
-            return True
+            return not require_stored
         raw = _meta_value(cursor, _definition_key("loop", sid)) if cursor is not None else (
             db.get_meta(_definition_key("loop", sid))
         )
         stored = json.loads(raw) if raw else None
     except Exception:
         logger.debug("loop wake identity check could not read the store", exc_info=True)
-        return True
+        return not require_stored
     if stored is None:
         # Loop rows are never deleted (a stop marks them cleared), so a missing row means no
-        # pause, stop or re-set was ever written there: nothing superseded this wake.
-        return True
+        # pause, stop or re-set was ever written there: nothing superseded this wake. A rotated
+        # wake, however, must positively match a migrated row before rebinding.
+        return not require_stored
     if not (isinstance(stored, dict)
             and stored.get("created_at") == metadata.get("loop_wakeup_instance")
             and stored.get("ticks_fired") == metadata.get("loop_wakeup_tick")):
@@ -689,6 +751,7 @@ def refresh_goal_continuation(event: Any, session_id: str) -> Optional[str]:
                 return None
             event.text = prompt
             metadata["goal_continuation_fingerprint"] = fingerprint
+        _rebind_wake_session(metadata, "goal_continuation_session_id", session_id)
         return event.text
     except Exception:
         logger.debug("goal continuation refresh failed", exc_info=True)

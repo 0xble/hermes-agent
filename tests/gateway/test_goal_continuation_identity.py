@@ -182,6 +182,303 @@ async def test_ordinary_continuation_identity_fences_new_goal_instances(state, a
     runner._queue_or_replace_pending_event.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_goal_continuation_rebinds_to_compression_child_after_rotation(state):
+    from hermes_cli.goals import GoalManager, migrate_goal_to_session
+    from hermes_cli.session_controls import refresh_goal_continuation
+
+    runner = _runner(state)
+    GoalManager("target").set("same objective")
+    event = await _post_turn_event(runner)
+    state.end_session("target", "compression")
+    state.create_session(
+        "compression-child", "telegram", parent_session_id="target", profile_name="default",
+        chat_id="target", chat_type="private", session_key="agent:main:telegram:dm:target",
+    )
+    assert migrate_goal_to_session("target", "compression-child", reason="compression")
+
+    assert refresh_goal_continuation(event, "compression-child") == event.text
+    assert event.metadata["goal_continuation_session_id"] == "compression-child"
+
+
+@pytest.mark.asyncio
+async def test_loop_wake_rebinds_to_compression_child_after_rotation(state):
+    from hermes_cli.loops import LoopManager, migrate_loop_to_session
+    from hermes_cli.session_controls import loop_wake_metadata, loop_wake_is_current
+
+    manager = LoopManager("target")
+    manager.set("check the queue", interval_seconds=300)
+    manager.state.next_due_at = 0
+    manager._save()
+    assert manager.fire_tick()
+    event_metadata = loop_wake_metadata("target", manager.state)
+
+    state.end_session("target", "compression")
+    state.create_session(
+        "compression-child", "telegram", parent_session_id="target", profile_name="default",
+        chat_id="target", chat_type="private", session_key="agent:main:telegram:dm:target",
+    )
+    assert migrate_loop_to_session("target", "compression-child", reason="compression")
+
+    assert loop_wake_is_current(event_metadata, "compression-child")
+    assert event_metadata["loop_wakeup_session_id"] == "compression-child"
+
+
+def _rotate_wake(state, kind, *, parent="target", child="compression-child",
+                 reason="compression", marker=None):
+    from hermes_cli.goals import migrate_goal_to_session
+    from hermes_cli.loops import migrate_loop_to_session
+
+    state.end_session(parent, reason)
+    state.create_session(child, "telegram", parent_session_id=parent,
+                         model_config={marker: parent} if marker else None,
+                         profile_name="default", chat_id="target", chat_type="private",
+                         session_key="agent:main:telegram:dm:target")
+    migrate = migrate_goal_to_session if kind == "goal" else migrate_loop_to_session
+    assert migrate(parent, child, reason="compression")
+    return child
+
+
+async def _queued_wake(runner, kind, strict):
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+    from hermes_cli.session_controls import loop_wake_metadata
+
+    if kind == "goal":
+        GoalManager("target").set("watch the build")
+        return await _post_turn_event(runner)
+    manager = LoopManager("target")
+    manager.set("check the queue", interval_seconds=300)
+    manager.state.next_due_at = 0
+    manager._save()
+    prompt = manager.fire_tick()
+    event = runner._synthetic_prompt_event(runner.target.origin, prompt, internal=True)
+    event.metadata.update(loop_wake_metadata("target", manager.state))
+    if strict:
+        event.metadata.update(gateway_session_strict=True, gateway_session_id="target",
+                              gateway_session_key=runner.target.session_key)
+    return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("path", ["execution", "fifo"])
+@pytest.mark.parametrize("strict", [False, True])
+async def test_queued_wake_runs_and_settles_after_compression(state, kind, path, strict):
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    runner = _runner(state)
+    # Control continuations use the real strict producer and the fixture's typed authority.
+    if kind == "goal" and strict:
+        GoalManager("target").set("watch the build")
+        GoalManager("target").pause()
+        event = await _control_event(runner, _apply(state, "resume"))
+    else:
+        event = await _queued_wake(runner, kind, strict)
+    identity = runner._post_turn_goal_identity(event)
+    child = _rotate_wake(state, kind)
+    runner.target.session_id = child
+    runner.async_session_store = SimpleNamespace(
+        lookup_by_session_key=AsyncMock(return_value=runner.target))
+    if path == "execution":
+        message = await GatewayTurnMixin._internal_wake_input_at_execution(
+            runner, event, child, event.text)
+        assert message == event.text
+    else:
+        runner._MAX_INTERRUPT_DEPTH = 5
+        runner._session_key_for_source = lambda source: runner.target.session_key
+        runner._prepare_profile_scoped_inbound_message_text = AsyncMock(
+            side_effect=lambda **kw: kw["event"].text)
+        runner._reply_anchor_for_event = lambda event: None
+        runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+        runner._persist_prompt_pins = AsyncMock()
+        runner._intake_adapter_for = lambda source: None
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        runner._run_agent = AsyncMock(return_value={"final_response": "progress", "messages": []})
+        ctx = TurnContext(source=runner.target.origin, session_key=runner.target.session_key,
+                          session_id=child, run_generation=1, history=[])
+        await GatewayTurnMixin._run_agent_queued_followup(
+            runner, ctx, runner.adapter, event.text, event, "",
+            {"interrupted": True, "messages": []}, None)
+        runner._run_agent.assert_awaited_once()
+        assert runner._run_agent.await_args.kwargs["session_id"] == child
+    key = "goal_continuation_session_id" if kind == "goal" else "loop_wakeup_session_id"
+    assert event.metadata[key] == child
+    assert runner._post_turn_goal_identity(event) == identity
+    if strict:
+        assert event.metadata["gateway_session_id"] == child
+        assert await GatewayTurnMixin._strict_session_pin_holds(runner, event, child)
+    if kind == "loop":
+        await runner._post_turn_loop_completion(session_entry=runner.target, source=event.source,
+                                                final_response="progress", loop_tick=identity["loop_tick"])
+        manager = LoopManager(child)
+        assert manager.state.awaiting_response is False
+        assert manager.state.ticks_fired == 1
+        assert manager.fire_tick() is None
+        manager.state.next_due_at = 0
+        manager._save()
+        assert manager.fire_tick()
+        assert LoopManager(child).state.ticks_fired == 2
+    else:
+        assert GoalManager(child).state.created_at == identity["goal_instance"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_pre_turn_hygiene_compression_reaches_model_on_child(state, kind):
+    from gateway.run_turn import GatewayTurnMixin
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, kind, False)
+    instance = runner._post_turn_goal_identity(event)
+
+    async def hygiene(*args):
+        # Compression owns the durable migration; hygiene publishes the new session id before
+        # the model-boundary fence. Exercise the real handler across that exact await boundary.
+        runner.target.session_id = _rotate_wake(state, kind)
+        return []
+
+    runner._hmwa_run_session_hygiene = AsyncMock(side_effect=hygiene)
+    runner._PreparedTurn = GatewayTurnMixin._PreparedTurn
+
+    async def prepare(*args):
+        history = await runner._hmwa_run_session_hygiene(*args)
+        return runner._PreparedTurn(history, "", event.text, None, None, None), None
+
+    class ModelEntered(BaseException):
+        pass
+
+    runner._hmwa_resolve_session = AsyncMock(
+        return_value=(event.source, runner.target, runner.target.session_key))
+    runner._hmwa_prepare_turn = prepare
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    runner._is_user_turn_event = lambda event: False
+    runner._revive_blocked_goal_for_user_turn = AsyncMock()
+    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+    runner._persist_prompt_pins = AsyncMock()
+    runner._reply_anchor_for_event = lambda event: None
+    runner._clear_session_env = lambda tokens: None
+    runner._run_agent = AsyncMock(side_effect=ModelEntered)
+    with pytest.raises(ModelEntered):
+        await GatewayTurnMixin._handle_message_with_agent(runner, event, event.source, "k", 1)
+    runner._hmwa_run_session_hygiene.assert_awaited_once()
+    assert runner._run_agent.await_args.kwargs["session_id"] == "compression-child"
+    metadata = runner._run_agent.await_args.kwargs["event_metadata"]
+    assert metadata["goal_continuation_session_id" if kind == "goal" else "loop_wakeup_session_id"] == "compression-child"
+    assert runner._post_turn_goal_identity(event) == instance
+    if kind == "goal":
+        assert GoalManager("compression-child").state.created_at == instance["goal_instance"]
+    else:
+        await runner._post_turn_loop_completion(session_entry=runner.target, source=event.source,
+                                                final_response="progress", loop_tick=instance["loop_tick"])
+        from hermes_cli.loops import LoopManager
+        assert LoopManager("compression-child").state.awaiting_response is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("boundary", ["reset", "branch", "delegate", "marker_reset", "unrelated"])
+async def test_compression_wake_rejects_noncontinuation_rebind(state, kind, boundary):
+    from gateway.run_turn import GatewayTurnMixin
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, kind, False)
+    marker = {"branch": "_branched_from", "delegate": "_delegate_from", "marker_reset": "_reset_from"}.get(boundary)
+    child = _rotate_wake(state, kind, reason="session_reset" if boundary == "reset" else "compression",
+                         marker=marker)
+    if boundary == "unrelated":
+        state.create_session("resumed", "telegram")
+        child = "resumed"
+    event.metadata.update(gateway_session_strict=True, gateway_session_id="target",
+                          gateway_session_key=runner.target.session_key)
+    runner.target.session_id = child
+    runner.async_session_store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=runner.target))
+    original = dict(event.metadata)
+    assert not await GatewayTurnMixin._strict_session_pin_holds(runner, event, child)
+    assert await GatewayTurnMixin._internal_wake_input_at_execution(runner, event, child, event.text) is None
+    assert event.metadata == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["replace", "clear"])
+async def test_compression_child_superseded_goal_still_drops_queued_wake(state, change):
+    from gateway.run_turn import GatewayTurnMixin
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, "goal", False)
+    child = _rotate_wake(state, "goal")
+    manager = GoalManager(child)
+    manager.set("new objective") if change == "replace" else manager.clear()
+    original = dict(event.metadata)
+    assert await GatewayTurnMixin._internal_wake_input_at_execution(runner, event, child, event.text) is None
+    assert event.metadata == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("depth,boundary,accepted", [
+    (3, "inherited", True), (3, "reset", False), (3, "branch", False),
+    (64, "compression", True), (65, "compression", False),
+])
+async def test_compression_wake_walks_only_bounded_continuation_edges(state, kind, depth, boundary, accepted):
+    from hermes_cli.session_controls import internal_wake_is_current
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, kind, False)
+    parent = "target"
+    for index in range(depth):
+        parent = _rotate_wake(
+            state, kind, parent=parent, child=f"compressed-{index}",
+            reason="session_reset" if index == 1 and boundary == "reset" else "compression",
+            marker="_branched_from" if index == 1 and boundary == "branch" else None)
+        if boundary == "inherited":
+            # Real compression copies model_config, so a marker for some older branch root
+            # must not be confused with a fork from the immediate parent being walked.
+            state._execute_write(lambda conn, sid=parent: conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                ('{"_branched_from": "older-root"}', sid)))
+    original = dict(event.metadata)
+    assert internal_wake_is_current(event, parent) is accepted
+    if accepted:
+        key = "goal_continuation_session_id" if kind == "goal" else "loop_wakeup_session_id"
+        assert event.metadata[key] == parent
+    else:
+        assert event.metadata == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["replace", "stop", "next_tick", "missing", "unreadable"])
+async def test_compression_loop_requires_same_readable_live_tick(state, change):
+    from hermes_cli.loops import LoopManager
+    from hermes_cli.session_controls import loop_wake_is_current
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, "loop", False)
+    child = _rotate_wake(state, "loop")
+    manager = LoopManager(child)
+    if change == "replace":
+        manager.set("different task", interval_seconds=300)
+    elif change == "stop":
+        manager.clear()
+    elif change == "next_tick":
+        manager.complete_tick("progress")
+        manager.state.next_due_at = 0
+        manager._save()
+        manager.fire_tick()
+    elif change == "missing":
+        state._execute_write(lambda conn: conn.execute("DELETE FROM state_meta WHERE key = ?", (f"loop:{child}",)))
+    else:
+        state.set_meta(f"loop:{child}", "unreadable")
+    original = dict(event.metadata)
+    assert not loop_wake_is_current(event.metadata, child)
+    assert event.metadata == original
+
+
 async def _execute_continuation(runner, state, tmp_path, event, path):
     """Run real ingress/FIFO preparation, stopping only at the next model-turn boundary."""
     from types import MethodType
