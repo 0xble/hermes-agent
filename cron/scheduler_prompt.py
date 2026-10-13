@@ -291,9 +291,9 @@ _CRON_HINT_DELIVERY = (
 _CRON_HINT_LOCAL = _CRON_HINT.replace(
     _CRON_HINT_DELIVERY,
     "DELIVERY: This job delivers locally: your final response is saved to local output only "
-    "and is not sent to anyone. If your task instructions say to relay or send the result "
-    "somewhere, do that yourself with the tool they name; otherwise just produce your output "
-    "as the final response. ",
+    "and is not sent anywhere (failure notices still follow the job's failure lane). If your task "
+    "instructions say to relay or send the result somewhere, do that yourself with the tool they "
+    "name; otherwise just produce your output as the final response. ",
 )
 if _CRON_HINT_LOCAL == _CRON_HINT:  # pragma: no cover - import-time drift guard
     raise RuntimeError("cron DELIVERY sentence drifted from _CRON_HINT")

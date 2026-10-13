@@ -31,8 +31,10 @@ instead. Open issue #69495 asks for a customizable preamble.
 ## Verification and retirement
 
 Run `scripts/run_tests.sh tests/cron/test_cron_local_delivery_hint.py tests/cron/test_scheduler.py tests/agent/test_synthetic_prompt.py`.
-The focused regression fails on the pre-patch base for local, missing, empty, list and
-repeated-local `deliver` values.
+The focused regression fails on the pre-patch base for local, missing, empty, list,
+repeated-local and padded-local `deliver` values. The system-level `PLATFORM_HINTS["cron"]`
+sentence in `agent/prompt_builder.py` defers to the run's DELIVERY note, so both surfaces agree.
+Failure notices still follow `failure_deliver`; the local sentence covers successful output.
 
 Retire when a released upstream cron hint distinguishes local-only delivery and allows
 instruction-required self-relay. Rollback: revert the commit carrying
