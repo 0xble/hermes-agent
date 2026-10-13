@@ -92,8 +92,8 @@ authorization settles the obligation without delivery.
   delivery remains separate; its stale automatic-retry promise is recomputed.
 - Rows written before this unit (`retry_state='none'`) keep the legacy one-shot
   resume and boot notice. Boot notices skip retry-owned rows.
-- Retention: `_RETRY_OWED_SQL` exempts `armed/scheduled/noticing/notified/dispatching/
-  terminal/reporting` rows from both the 50-row cap and the 7-day delivered cut. A
+- Retention: `_RETENTION_OWED_SQL` exempts `armed/scheduled/noticing/notified/dispatching/
+  terminal/reporting` retry rows and outstanding boot-notice claims from age and count caps. A
   legacy `resume_state='claimed'` no longer drops protection: that dropped protection is
   how deleg_a11d4b48 was pruned. `_prune_durable_records` first classifies armed rows,
   so plain successes leave the protected set immediately.

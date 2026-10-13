@@ -206,10 +206,11 @@ async def test_goal_status_notice_logs_when_retry_is_cancelled(monkeypatch, capl
     ("⏸ Goal paused — quality gate exhausted retries", None, True),
     ("⏸ Goal paused — blocker: exceeded the 6h lifetime ceiling", "wait-age", True),
     ("✗ Quality gate failed (3/20 turns, attempt 1/3): $ check", None, True),
+    # Terminal silent-stall stop: the goal is already cleared, so shedding it loses the outcome.
+    ("✗ Goal stopped: 3 silent rechecks returned continue with no new evidence.", None, True),
     ("▶ Goal resumed: ship it", "resumed", True),
     ("⏳ Goal parked: waiting for review", None, False),
     ("↻ Continuing toward goal: more work", None, False),
-    ("▶ Goal wait ended — resuming.", "wait-ended", False),
     ("⏳ Goal still waiting on pid 42 after 30 minutes", "wait-age", False),
     ("Goal status: unchanged", None, False),
 ])

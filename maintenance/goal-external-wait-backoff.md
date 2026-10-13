@@ -22,7 +22,7 @@ liveness checks, age identities and six-hour blocker pause, but omit age-only
 "still waiting after 30 minutes" notices. A first or changed parked target/reason
 and explicit user-control receipts remain visible. Delivery classification for
 meaningful outcomes is owned by [goal notice delivery](goal-notice-flood-retry.md).
-The separately owned fork PR432 wait-ended removal is not part of this repair.
+Wait lifts are silent; fork PR432 removed the separate wait-ended notice.
 
 The regression came from composing the intentional-silence synthetic CONTINUE
 with the older real-CONTINUE notice-key invalidation. On fork base

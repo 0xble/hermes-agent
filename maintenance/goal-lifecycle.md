@@ -7,7 +7,15 @@ subgoals. Only the assistant-response preview is bounded. Admitted real user
 input revives a judge-blocked goal before model work without resetting its budget.
 Explicit pauses, interrupts, exhausted budgets, failed judges, unauthorized input,
 hidden messages, relayed agents, and synthetic notifications do not revive it.
-Failed or interrupted model turns do not run completion judging.
+Failed or interrupted model turns do not run completion judging. The autonomous
+silent-recheck streak resets only on a real break in silence: a user-initiated
+turn, a visible autonomous reply, new eligible non-read-only evidence, or a DONE
+or BLOCKED verdict. Entry resets precede every wait or gate return. An autonomous
+silence marker increments it only when the judge returns CONTINUE, including a
+disputed completion claim, with no new eligible non-read-only evidence. Nonjudging
+pacing, backoff, parked and delegation-wait exits, silent quality-gate failures,
+and judge transport/parse failures leave it unchanged. The third counted judgment
+clears the goal once with one short notice, before dispute pause or timed backoff.
 
 ## Provenance and adaptation
 
@@ -67,6 +75,25 @@ Failed or interrupted model turns do not run completion judging.
   red without the patch. Rollback reverts the source change; old goal rows load
   with a zero dispute counter and no schema change.
 
+- Fork patch identity: `goal-capability-evidence`. Corrects the shared exclusions
+  used by `goal-judge-evidence` and `goal-adaptive`: capability discovery,
+  installation and readback results can prove the goal's outcome. `skill_view`,
+  `skills_list`, `skill_manage`, `tool_search` and `tool_describe` reach the bounded,
+  redacted recent ledger and citation lookup, including archived results. Merely
+  reading/discovering a capability remains read-only for no-progress detection;
+  `skill_manage` remains actionable. Goal/memory bookkeeping stays excluded.
+  This fixes a skill-deployment goal whose judge repeatedly requested a successful
+  load that the evidence filter hid, even when full (not deduplicated) results
+  existed. No forced DONE, pause, budget, delivery or prompt change is introduced.
+  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_capability_evidence.py
+  tests/hermes_cli/test_goal_judge_evidence.py tests/hermes_cli/test_goal_adaptive.py`.
+  Retire when the selected upstream passes the same recorded-capability proof;
+  rollback restores only these evidence/read-only classifications. No schema or
+  live-state migration is needed.
+
+- Fork patch identity: `goal-done-repeat-silence`. Own fork patch for PR #531. Autonomous continuation replies distinguish the first done/blocker report from an unchanged repeat: the first done claim remains visible and must include exact Evidence; an unchanged done claim or unchanged blocker/input need must be exactly `[SILENT]`. Changed state, new evidence, or a changed blocker makes the next report visible again. Silent repeats still reach `judge_goal()`. On a silent autonomous recheck, the runtime passes the newest visible final report in this goal's SessionDB history (since `created_at`, at most 500 assistant rows) verbatim, excluding hidden rows, compression summaries and tool-call commentary. No completion-phrase recognizer remains. The per-turn judge input labels it as the agent's last visible report and applies the existing 4,000-character head plus 3,000-character tail bound; report text never enters the stable system prefix. Citations resolve from the full report through the existing lifetime-bounded evidence finders, including proof outside the eight-row ledger and citations in an omitted middle. Plain, subgoal and contract judges decide whether the report claims and proves completion. A newer non-completion report replaces the older done report and its citations by construction. Prose is not proof, and no eligible visible report leaves the original silent judge input unchanged.
+  Three autonomous silent CONTINUE or disputed verdicts without a real break in silence and with no new eligible non-read-only evidence rows clear the goal through the convergence-breaker path and emit one short `Goal stopped` notice. This uses the existing no-progress threshold (`DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 3`) and terminal `cleared` status, not a user-resumable pause or a rearmed timer. The persisted streak resets only on new eligible non-read-only evidence, user-initiated turns (including silence markers), visible autonomous replies, DONE or BLOCKED. These facts reset at evaluator entry or when the verdict becomes known, before early returns. Read-only/status-only evidence does not reset it. Pacing/continuation-gap, timed-backoff/no-progress, parked and delegation-wait exits that do not judge, silent quality-gate failures, and transport/parse failures preserve it. The judged increment is persisted even when pacing or backoff prevents immediate dispatch; the terminal silent-stall rule takes precedence over dispute pause and timed no-progress backoff. Later stale turns, restarts and user messages do not replay the stop notice. Existing visible dispute pauses remain unchanged; silent disputes use this non-blocking backstop. The existing gateway notice path delivers the terminal notice; its `✗` prefix makes the shared classifier treat it as a protected outcome, so daily-quota shedding cannot drop the only record that the goal ended. No delivery-level duplicate filter or gateway source change is needed. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_judge_evidence.py tests/gateway/test_goal_continuation_notice_dedupe.py` covers plain/subgoal/contract newest-report input, emoji/heading/bullet and ordinary completion reports with citations older than the ledger across silent repeats, newer failed-verification reports replacing older done reports, bounded head/tail with omitted citations still resolved, no-visible-report input equivalence, goal-lifetime isolation, real-break resets before failing gates or waits, unchanged nonjudging exits, and one-notice terminal convergence under the gateway default 900-second continuation gap with expired timers advanced. Retire when upstream supplies the same first-visible/unchanged-silent reply contract, newest-visible-report citation handling without phrase matching and bounded non-blocking stall behavior; rollback reverts this identity's prompt, judge-input, counter and tests, with old serialized rows defaulting the silent counter to zero.
+
 - Fork patch identity: `unlimited-goal-budget`. `goals.max_turns: 0` is a durable unlimited sentinel: config consumers preserve zero, serialized and migrated goal rows round-trip it, and the standing-goal continuation checks skip only the finite budget pause. Kanban task budgets retain their existing single-shot and finite semantics. Done, blocked, judge-failure, dispute, wait, pause, resume, clear, and positive finite budgets remain unchanged. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/tui_gateway/test_goal_command.py`. Retire when the selected upstream release preserves zero through the same surfaces and passes this proof; rollback reverts this identity's normalization, budget guards, notices, docs, and tests.
 
 - Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork
@@ -116,7 +143,8 @@ Failed or interrupted model turns do not run completion judging.
   (default 900, `0` disables) after `GoalState.last_continuation_at`, stamped on
   every judge CONTINUE and on the idle ticker's CAS clear. The hold is the ordinary
   durable timed wait with reason `minimum gap between autonomous goal continuations`;
-  it is silent (no parked or wait-ended notice). A user turn or an event with
+  it is silent (no parked notice). Every idle-ticker resume is silent: the
+  continuation turn is the visible signal, so no wait-ended notice is sent. A user turn or an event with
   `notification_origin=process_registry_synthetic` (also carried through queued
   follow-up chains as `queued_terminal_notification_origin`) pierces only this hold;
   judge waits and pid/session/delegation barriers stay authoritative. CLI/TUI

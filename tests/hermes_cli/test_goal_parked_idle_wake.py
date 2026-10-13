@@ -63,6 +63,18 @@ def test_kill_all_process_lifts_barrier_with_an_outcome_only_note(hermes_home):
     assert goals.load_goal("s-killed").waiting_on_session == proc
 
 
+def test_cut_pending_receipt_lifts_goal_as_unknown_not_finished(hermes_home):
+    proc = "proc_cutpending0000"
+    _write_receipt(hermes_home, proc, exit_code=None, completion_reason="cut_pending")
+    mgr = _park_on_session("s-cut-pending", proc)
+
+    prompt = mgr.lifted_barrier_prompt()
+
+    assert prompt is not None
+    assert "no longer tracked" in prompt
+    assert "finished" not in prompt
+
+
 def test_untracked_process_reports_unknown_outcome(hermes_home):
     mgr = _park_on_session("s-unknown", "proc_gone0000000")
     prompt = mgr.lifted_barrier_prompt()
