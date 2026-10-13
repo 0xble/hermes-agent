@@ -66,6 +66,20 @@ strategy and cron-exclusion behavior.
   Proof: `tests/plugins/memory/test_hindsight_generated_turns.py` and the existing provider suite.
   Retire when the selected upstream provider applies the same whole-turn exclusion. Revert only
   that patch to restore user-side-only filtering.
+- First-person auto-recall (`recall_owner_subject`, default empty = off). "What car do I drive"
+  names no subject, so the owner's personal facts never enter Hindsight's candidate pool: the
+  controlled traces show the targets absent before fusion, and no budget, recency or reranker
+  setting reorders what was never retrieved. When the owner name is configured and the query has
+  I/me/my/mine/we/our/ours/us (case-sensitive `us`, so the country "US" does not count) and does
+  not already name the owner, recall runs the user's words and `<words> (<owner>)` and merges the
+  two lists round-robin with dedupe, capped at one `recall_max_tokens` budget. Merging, not
+  replacing, is required: on the optimization holdout (30 attributes x 2 rounds, 2 request shapes)
+  appending alone gained 13-14 personal hits but lost Toyota, birthday and anniversary and pushed
+  generic answers out of non-personal first-person queries. Round-robin kept every gain with 0
+  losses and 60-64% of the original top 5. Only automatic recall changes. The `hindsight_recall`
+  tool keeps the model's own query. Proof: `TestOwnerSubjectRecall` in
+  `tests/plugins/memory/test_hindsight_provider.py`. Retire when Hindsight resolves first-person
+  queries to the bank owner server-side.
 - Template boundary rule: when a template's closing paragraph appears more than once, the LAST
   copy is the generated boundary. Every template is tried and the FURTHEST boundary wins, because
   templates share openings and a payload can hold a complete sibling template (a goal quoting a
@@ -120,7 +134,7 @@ strategy and cron-exclusion behavior.
 - Fork patch identities: `HERMES-122`, `hindsight-retain-strategy`,
   `hindsight-cron-retention`, `hindsight-bundled-provider`,
   `memory-note-not-authoritative`, `synthetic-prompt-memory-gate`,
-  `hindsight-generated-turn-retention`. Local narrow patches
+  `hindsight-generated-turn-retention`, `hindsight-owner-subject-recall`. Local narrow patches
   on the `v2026.9.14` baseline.
 - `HERMES-122` (`6878e95d58`, re-landed `65059fa22d`) defaults `_cron_skipped` in
   `__init__`. Its first landing was reverted hours later by `fc45821e1f`, a backup
