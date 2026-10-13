@@ -131,6 +131,11 @@ transcript only after the matching platform id is durably admitted. A platform i
 is admission dedupe, never proof of a completed reply or effect. A turn reuses a
 historical trigger row only for an identical retry (same id and content); new
 content under a reused id is new input.
+Durable checkpoint refreshes stage under a non-eligible name and preserve the
+previous accepted payload until the replacement's directory entry is fsynced. A
+failed admission leaves no eligible replay file; a failed refresh leaves the prior
+accepted checkpoint intact. Use the shared `_same_trigger_content` normalization
+helper for every restart-admission comparison; never dedupe by platform id alone.
 Also exercise native preflight, in-place/commit rollback, tail watermark,
 compression fallback/attempt lifecycle, pending-input dedupe and isolated
 loopback-provider/kill9 compaction suites. Local recording fake-provider traffic

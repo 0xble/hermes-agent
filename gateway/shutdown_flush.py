@@ -54,31 +54,75 @@ def _get_flush_dir():
     return flush_dir
 
 
+def _fsync_directory(flush_dir: Path) -> None:
+    """Durably publish directory-entry changes, raising on failure."""
+    directory_fd = os.open(flush_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[Path] = None,
                    require_durable: bool = False) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path."""
+    """Atomically write one private, uniquely named recovery payload; return its path.
+
+    Durable queue admission stages the payload under a non-eligible name. A directory-fsync failure
+    therefore cannot leave a new replayable file behind or replace an already accepted checkpoint.
+    """
     from utils import atomic_json_write
     final_path = path if path is not None else flush_dir / f"pending-{uuid.uuid4().hex}.json"
-    atomic_json_write(final_path, payload, mode=0o600, default=str)
-    if os.name == "posix":
-        # Persist the directory entry too; keep the published file (the only recovery copy) even if
-        # fsync fails.
-        try:
-            directory_fd = os.open(flush_dir, os.O_RDONLY)
-        except OSError as exc:
-            logger.debug("Failed to fsync pending-message directory: %s", exc)
-            if require_durable:
-                raise
-        else:
+    if not require_durable:
+        atomic_json_write(final_path, payload, mode=0o600, default=str)
+        if os.name == "posix":
             try:
-                os.fsync(directory_fd)
+                _fsync_directory(flush_dir)
             except OSError as exc:
                 logger.debug("Failed to fsync pending-message directory: %s", exc)
-                if require_durable:
-                    raise
-            finally:
-                os.close(directory_fd)
-    return final_path
+        return final_path
+
+    stage_path = flush_dir / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
+    backup_path = flush_dir / f".{final_path.name}.{uuid.uuid4().hex}.backup"
+    had_previous = final_path.exists()
+    try:
+        atomic_json_write(stage_path, payload, mode=0o600, default=str)
+        if os.name == "posix":
+            _fsync_directory(flush_dir)
+        if had_previous:
+            # Keep the previously accepted payload available until the staged replacement is
+            # fully published. The backup is intentionally non-eligible and is fsynced first.
+            with open(final_path, "rb") as source, open(backup_path, "wb") as backup:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    backup.write(chunk)
+                backup.flush()
+                os.fsync(backup.fileno())
+            if os.name == "posix":
+                _fsync_directory(flush_dir)
+        stage_path.replace(final_path)
+        try:
+            if os.name == "posix":
+                _fsync_directory(flush_dir)
+        except OSError:
+            if had_previous:
+                backup_path.replace(final_path)
+            else:
+                final_path.unlink(missing_ok=True)
+            if os.name == "posix":
+                with contextlib.suppress(OSError):
+                    _fsync_directory(flush_dir)
+            raise
+        backup_path.unlink(missing_ok=True)
+        return final_path
+    except Exception:
+        stage_path.unlink(missing_ok=True)
+        if not had_previous:
+            final_path.unlink(missing_ok=True)
+        backup_path.unlink(missing_ok=True)
+        raise
+
 
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:

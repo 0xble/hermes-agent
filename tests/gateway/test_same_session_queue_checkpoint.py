@@ -45,6 +45,42 @@ def test_failed_checkpoint_is_not_acknowledged_or_enqueued(tmp_path, monkeypatch
     assert not runner._overflow_queue(key)
 
 
+
+
+def test_directory_fsync_failure_does_not_publish_initial_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    event = _event("must not replay", "queue-fsync-new")
+    original_fsync = os.fsync
+
+    def fail_directory(fd):
+        if (os.fstat(fd).st_mode & 0o170000) == 0o040000:
+            raise OSError("injected directory fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(shutdown_flush.os, "fsync", fail_directory)
+    assert shutdown_flush.checkpoint_queued_event("key", event) is False
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+
+
+def test_directory_fsync_failure_preserves_existing_checkpoint_on_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    event = _event("accepted original", "queue-fsync-refresh")
+    assert shutdown_flush.checkpoint_queued_event("key", event)
+    path = event._hermes_recovery_spool
+    original = json.loads(path.read_text())
+    event.text = "rejected replacement"
+    original_fsync = os.fsync
+
+    def fail_directory(fd):
+        if (os.fstat(fd).st_mode & 0o170000) == 0o040000:
+            raise OSError("injected directory fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(shutdown_flush.os, "fsync", fail_directory)
+    assert shutdown_flush.checkpoint_queued_event("key", event, refresh=True) is False
+    assert json.loads(path.read_text()) == original
+
+
 def test_queue_spool_cannot_be_consumed_as_naked_transcript_or_expired(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = SessionDB(db_path=tmp_path / "state.db")
