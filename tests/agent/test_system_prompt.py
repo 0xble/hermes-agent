@@ -71,7 +71,7 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     else:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
     monkeypatch.setattr(
         model_tools,
         "get_tool_definitions",

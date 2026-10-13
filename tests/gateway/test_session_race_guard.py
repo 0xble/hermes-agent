@@ -39,6 +39,9 @@ class _FakeAdapter:
 
 
 def _make_runner():
+    # Match the completed startup barrier that this bare runner bypasses.
+    from hermes_cli.plugins import get_plugin_manager
+    get_plugin_manager().discover_and_load()
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}

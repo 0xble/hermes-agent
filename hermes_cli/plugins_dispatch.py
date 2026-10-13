@@ -59,6 +59,148 @@ _HOOK_MAX_ABANDONED_WORKERS = 3
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = "pre_tool_call plugin callback timed out or is still running"
 
 
+class PluginDiscoveryIncomplete(RuntimeError):
+    """The policy registry is not ready; callers must not authorize delivery."""
+
+
+def _delivery_manager():
+    """Only deliver from a complete registry; synchronous loop callers refuse instead of blocking.
+
+    Lazy foreground/background barriers preserve one-shot parity. Async callers acquire this
+    manager off-loop, then await callbacks on their original loop. Look up facade seams lazily
+    so scoped managers and compatibility monkeypatches retain one authoritative import path.
+    """
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        worker = plugins._background_discovery_thread
+        if (not getattr(manager, "_discovery_complete", True)
+                or not getattr(manager, "_discovered", True)
+                or (worker is not None and worker.is_alive())):
+            raise PluginDiscoveryIncomplete("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
+        return manager
+    plugins._join_background_discovery()
+    try:
+        if not getattr(manager, "_discovered", True):
+            manager.discover_and_load()
+        if not getattr(manager, "_discovery_complete", True) and plugins._await_foreground_discovery(manager):
+            if not getattr(manager, "_discovered", True):
+                manager.discover_and_load()  # retry a failed sweep after its lock was released
+    except Exception as exc:
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry loading failed") from exc
+    if not getattr(manager, "_discovery_complete", True):
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete; defer hook delivery until loading finishes")
+    return manager
+
+
+# Only hooks whose return values do not authorize, rewrite or suppress work may
+# use a partial snapshot on a running loop. Unknown/new hooks stay strict.
+_LOOP_OBSERVER_HOOKS = frozenset({
+    "post_tool_call", "post_llm_call", "post_api_request", "api_request_error",
+    "pre_auxiliary_call", "post_auxiliary_call", "on_session_start", "on_session_end",
+    "on_session_finalize", "on_session_reset", "on_skill_lifecycle", "subagent_start",
+    "subagent_stop", "agent_loop_stopped", "pre_approval_request",
+    "post_approval_response", "on_human_input_request", "on_human_input_resolved",
+    "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
+    "on_room_member_activity", "kanban_task_claimed", "kanban_task_completed",
+    "kanban_task_blocked", "on_kanban_worker_spawned", "on_kanban_worker_exited",
+    "on_kanban_worker_stale_claim", "on_kanban_task_updated", "on_kanban_dispatch_tick",
+    "gateway_platform_event", "pre_command",
+})
+
+
+def _loop_observer_snapshot(hook_name: str):
+    """Snapshot observer callbacks on-loop without discovery or registry lock waits."""
+    if hook_name not in _LOOP_OBSERVER_HOOKS:
+        return None
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    return manager, manager.iter_hook_callbacks(hook_name)
+
+
+async def _async_delivery_snapshot(hook_name: str):
+    """Snapshot a ready registry under a nonblocking lock; wait for reloads off-loop."""
+    from hermes_cli import plugins
+    manager = plugins.get_plugin_manager()
+    while True:
+        worker = plugins._background_discovery_thread
+        ready = (getattr(manager, "_discovered", True)
+                 and getattr(manager, "_discovery_complete", True)
+                 and not (worker is not None and worker.is_alive()))
+        lock = getattr(manager, "_discovery_lock", None)
+        if ready and (lock is None or lock.acquire(blocking=False)):
+            try:
+                # Recheck under the sweep lock: reload may have started after the fast probe.
+                if getattr(manager, "_discovered", True) and getattr(manager, "_discovery_complete", True):
+                    return manager, manager.iter_hook_callbacks(hook_name)
+            finally:
+                if lock is not None:
+                    lock.release()
+        if ready:
+            # Deferred loading, activation and unload can hold the registry lock
+            # without clearing readiness. _delivery_manager would return at once;
+            # wait once off-loop instead of busy-spinning through worker hops.
+            try:
+                available = await asyncio.to_thread(plugins._await_foreground_discovery, manager)
+            except Exception as exc:
+                raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry lock wait failed") from exc
+            if not available:
+                raise PluginDiscoveryIncomplete("Plugin discovery incomplete; registry lock wait timed out")
+        else:
+            manager = await asyncio.to_thread(_delivery_manager)
+
+
+def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
+    """Wait for an in-flight background discovery.
+
+    ``timeout=None`` is reserved for strict startup: each plugin load already
+    has its own deadline, so the sweep itself is the availability boundary.
+    Listing callers keep the short barrier and may use the available registry.
+    """
+    from hermes_cli import plugins
+    t = plugins._background_discovery_thread
+    if t is None or t is threading.current_thread() or plugins.in_plugin_load_worker():
+        return
+    if not t.is_alive():
+        if timeout is None and (plugins._background_discovery_error is not None
+                                or not getattr(plugins.get_plugin_manager(), "_discovery_complete", False)):
+            error = plugins._background_discovery_error
+            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+        return
+    if timeout is None:
+        while t.is_alive():
+            t.join(timeout=10.0)
+            if t.is_alive():
+                logger.info("Waiting for background plugin discovery to finish")
+    else:
+        t.join(timeout=timeout)
+    if t.is_alive():
+        raise PluginDiscoveryIncomplete("Plugin discovery incomplete after timeout; refusing partial registry delivery")
+    if plugins._background_discovery_error is not None:
+        error = plugins._background_discovery_error
+        raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if timeout is None and not getattr(plugins.get_plugin_manager(), "_discovery_complete", False):
+        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
+
+
+def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
+    """Bounded wait for a sibling sweep, never from its own plugin-load worker."""
+    from hermes_cli import plugins
+    lock = getattr(manager, "_discovery_lock", None)
+    if lock is None or plugins.in_plugin_load_worker() or not lock.acquire(timeout=timeout):
+        return False
+    lock.release()
+    return True
+
+
 def _callback_identity(cb: Callable) -> str:
     """An attributable callback label without inspecting its arguments or instance state."""
     module = getattr(cb, "__module__", type(cb).__module__)
@@ -68,6 +210,14 @@ def _callback_identity(cb: Callable) -> str:
 # pipe drain that follows a ``communicate`` expiry — so the shell layer's fail-open/fail-closed
 # decision is always the one that counts (#132096).
 _SHELL_HOOK_WRAPPER_MARGIN_SECS = 10.0
+
+
+@dataclass(frozen=True)
+class _PreToolCallDirective:
+    action: Optional[str] = None
+    message: Optional[str] = None
+    rule_key: Optional[str] = None
+    modified_args: Optional[Dict[str, Any]] = None
 
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> Dict[str, str]:
@@ -221,7 +371,9 @@ class PluginDispatchMixin:
         from hermes_cli.plugins import resolve_plugin_command_result
         return resolve_plugin_command_result(callback(**cls._hook_callback_kwargs(callback, payload)))
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, _callbacks: Optional[tuple[Callable, ...]] = None, **kwargs: Any
+    ) -> List[Any]:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
 
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
@@ -239,7 +391,7 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
             cb_timeout, cb_fail_closed = timeout, fail_closed
             try:
                 spec = getattr(cb, "hermes_shell_hook_spec", None)
@@ -513,7 +665,9 @@ class PluginDispatchMixin:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
-    async def ainvoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    async def ainvoke_hook(
+        self, hook_name: str, *, _callbacks: Optional[tuple[Callable, ...]] = None, **kwargs: Any
+    ) -> List[Any]:
         """:meth:`invoke_hook` for callers that are already on an event loop.
 
         Same payload narrowing, per-callback isolation and result contract. The difference is
@@ -531,7 +685,8 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        callbacks = self._hooks.get(hook_name, []) if _callbacks is None else _callbacks
+        for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))

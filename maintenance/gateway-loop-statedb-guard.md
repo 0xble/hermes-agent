@@ -46,6 +46,11 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
   maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
   behind it); usermerge floor and bounded pages unchanged.
+- Compaction recomputes historical display identities on a pooled-reader snapshot before
+  taking `SessionDB._lock`. Under the writer lock it folds from the display indexes and
+  recomputes only new or changed rows, including user `display_metadata` edits not watched
+  by the identity trigger. A missing reader or display index retains the full-scan fallback.
+  Branch refreshes must preserve this off-lock path and its regression coverage.
 - Generation stamping checkpoints only until its `application_id` is visible in the main DB file.
   A reader can block the first PASSIVE checkpoint and leave both the header and `state_meta` row
   WAL-only; later warm opens retry until the header is durable. The lock-safe header probe avoids
@@ -175,6 +180,7 @@ disk. Upstream has no matching issue or PR (searched 2026-10-10).
 (reaped-session probe), `gateway/run_startup.py` (resume admission), `agent/turn_facade_lease.py` (post-expiry lock
 tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, write marker),
 `hermes_state_gateway.py` (routing diff), `hermes_state_health.py`,
+`hermes_state_messages.py` (off-lock historical display fold),
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound). Proof surface:
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
@@ -185,7 +191,9 @@ in `tests/hermes_state/test_wal_checkpoint_strategy.py`,
 `tests/hermes_state/test_generation_checkpoint_durability.py` (real reader-blocked first checkpoint;
 main-file-only snapshot proves header and row durability after a warm open),
 `test_warm_writable_open_skips_generation_checkpoint` in `tests/hermes_state/test_hermes_state.py`,
-`tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, and
+`tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`,
+`tests/hermes_state/test_archive_compact_off_writer_lock.py` (event-gated writer availability,
+changed rows and user metadata, fold equivalence and non-WAL fallback), and
 `test_waiting_on_a_contended_state_db_writer_is_not_a_stall` in `tests/agent/test_turn_liveness_watchdog.py`.
 
 Further proof surface: `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`,

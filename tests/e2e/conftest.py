@@ -176,6 +176,10 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> Gatew
 
     Skips __init__ to avoid filesystem/network side effects.
     """
+    # Production startup completes discovery before adapters accept messages. These
+    # hand-built runners skip start(), so establish the same policy-ready state here.
+    from hermes_cli.plugins import get_plugin_manager
+    get_plugin_manager().discover_and_load()
     if session_entry is None:
         session_entry = make_session_entry(platform)
 
