@@ -3890,12 +3890,21 @@ class GatewayTurnMixin:
                 steer_event = MessageEvent(
                     text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
                 )
-                if session_key:
-                    self._enqueue_fifo(session_key, steer_event, adapter)
-                logger.debug(
-                    "Enqueued leftover /steer behind pending message for session %s: '%s...'",
-                    session_key or "?", leftover_steer[:40],
-                )
+                admitted = bool(session_key and self._enqueue_fifo(session_key, steer_event, adapter))
+                if admitted:
+                    logger.debug(
+                        "Enqueued leftover /steer behind pending message for session %s: '%s...'",
+                        session_key or "?", leftover_steer[:40],
+                    )
+                else:
+                    # Keep both eventless follow-ups in the current turn when the durable
+                    # FIFO checkpoint cannot be written; never consume the steer on a false
+                    # admission receipt.
+                    pending = f"{pending}\n\n{leftover_steer}"
+                    logger.warning(
+                        "Could not enqueue leftover /steer for session %s; retaining it in-band",
+                        session_key or "?",
+                    )
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):

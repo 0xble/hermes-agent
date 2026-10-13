@@ -458,9 +458,12 @@ class GatewayBusySessionMixin:
             )
             return False
 
-        self._enqueue_fifo(session_key, event, adapter)
-        return ((isinstance(pending_slot, dict) and pending_slot.get(session_key) is event)
-                or any(item is event for item in (self._overflow_queue(session_key) or ())))
+        admitted = self._enqueue_fifo(session_key, event, adapter)
+        if not admitted:
+            return False
+        # A duplicate retry is logically admitted even though it is intentionally not
+        # inserted into the slot/overflow a second time.
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -973,7 +976,9 @@ class GatewayBusySessionMixin:
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            if not self._queue_or_replace_pending_event(session_key, event):
+                await self._send_busy_ack_reply(event, adapter, QUEUE_ADMISSION_FAILURE)
+                return True
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must
         # NOT also be replayed as a next-turn user message. Route through _queue_or_replace_pending_event

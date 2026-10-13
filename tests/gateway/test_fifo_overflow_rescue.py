@@ -131,7 +131,7 @@ class TestRescueOrphanedOverflow:
 
         rescued = runner._rescue_orphaned_overflow(session_key, adapter)
         assert rescued is not None and rescued.text == "orphan-1"
-        runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
+        assert runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
 
         # Drain order after this turn: slot (orphan-2), then overflow (new-msg)
         assert adapter._pending_messages[session_key].text == "orphan-2"
@@ -152,7 +152,7 @@ class TestRescueOrphanedOverflow:
 
         rescued = runner._rescue_orphaned_overflow(session_key, adapter)
         assert rescued is not None and rescued.text == "orphan-1"
-        runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
+        assert runner._enqueue_fifo(session_key, _text_event("new-msg", "new1"), adapter)
 
         assert adapter._pending_messages[session_key].text == "new-msg"
         assert runner._session_state(session_key).conversation.queued_events == []

@@ -128,7 +128,7 @@ class TestQueueConsumptionAfterCompletion:
 
         # /queue once — lands in slot. Second /queue — overflow.
         for text in ("Q1", "Q2"):
-            runner._enqueue_fifo(
+            assert runner._enqueue_fifo(
                 session_key,
                 MessageEvent(
                     text=text,
