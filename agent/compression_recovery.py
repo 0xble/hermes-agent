@@ -88,10 +88,16 @@ def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False,
     window = compressor.context_length
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return False  # unknown fit cannot authorize a mechanical archive or send
-    # Reserve the selected output cap plus estimator/transport framing headroom.
-    from agent.chat_completion_helpers import selected_max_output_tokens
-    selected = selected_max_output_tokens(agent)
-    output = selected if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0 else 0
+    # Reserve the output cap the transport will actually send (a None cap resolves to the native
+    # default on Anthropic) when the endpoint validates input + cap against the window. Endpoints
+    # that instead stop generation at the window (Claude 4.5+) keep only an explicitly selected
+    # cap as answer runway, so a native ceiling equal to the window does not force compaction.
+    # Plus estimator/transport framing headroom.
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens, selected_max_output_tokens
+    cap, enforced = effective_wire_max_output_tokens(agent)
+    if not enforced:
+        cap = selected_max_output_tokens(agent)
+    output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
     reserve = max(1024, int(window * 0.05))
     effective_prompt = (prompt or "") + ("" if wire else (getattr(agent, "ephemeral_system_prompt", "") or ""))
     request_tools = tools if wire else getattr(agent, "tools", None)

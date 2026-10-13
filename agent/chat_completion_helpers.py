@@ -1336,13 +1336,20 @@ def _reasoning_config_for_wire(agent):
     session: the request goes out without a reasoning config and the route
     applies its own default.
     """
+    cfg = _resolve_reasoning_config_for_wire(agent, _consume_ephemeral_reasoning_off(agent))
+    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
+    # disable (drop the disable) from a rejected level (drop the reasoning fields).
+    agent._wire_reasoning_config = cfg
+    return cfg
+
+
+def _resolve_reasoning_config_for_wire(agent, ephemeral_off: bool):
+    """Side-effect-free core of :func:`_reasoning_config_for_wire` (fit checks peek through it)."""
     cfg = agent.reasoning_config
-    ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
         # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
         # the route default — as the auxiliary ladder does; resending would 400 identically.
-        agent._wire_reasoning_config = None
         return None
     if cfg is None:
         # Unset effort: the profile's default (custom/OpenAI-compatible: medium) rather than the
@@ -1364,17 +1371,11 @@ def _reasoning_config_for_wire(agent):
             if getattr(agent, "_reasoning_floor_required", False):
                 from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
                 floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
-                agent._wire_reasoning_config = floored
                 return floored
-            agent._wire_reasoning_config = None
             return None
-        agent._wire_reasoning_config = cfg
         return cfg
     if ephemeral_off:
         cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
-    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
-    # disable (drop the disable) from a rejected level (drop the reasoning fields).
-    agent._wire_reasoning_config = cfg
     return cfg
 
 
@@ -1420,6 +1421,37 @@ def _consume_ephemeral_max_output(agent):
     if ephemeral_out is not None:
         agent._ephemeral_max_output_tokens = None
     return ephemeral_out
+
+
+def effective_wire_max_output_tokens(agent):
+    """``(cap, enforced)`` for the next request without consuming one-shot state.
+
+    ``cap`` is the output cap the active builder would put on the wire (None when the request
+    omits it and the server applies its own default), resolved by the same helpers the builders
+    call: Anthropic's native ceiling, window clamp and manual-thinking floor; a provider profile's
+    default and the Gemini thinking raise on chat completions. ``enforced`` is whether the endpoint
+    rejects ``input + cap > window`` up front rather than stopping generation at the window."""
+    selected = selected_max_output_tokens(agent)
+    api_mode = getattr(agent, "api_mode", None)
+    window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    if api_mode == "anthropic_messages":
+        from agent.anthropic_adapter import anthropic_validates_output_against_window, anthropic_wire_output_cap
+        reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
+        cap = anthropic_wire_output_cap(
+            agent.model, selected, reasoning, context_length=window,
+            base_url=getattr(agent, "_anthropic_base_url", None), preserve_dots=agent._anthropic_preserve_dots())
+        return cap, anthropic_validates_output_against_window(agent.model)
+    if api_mode == "chat_completions":
+        from agent.transports.chat_completions import resolve_chat_max_tokens
+        profile_max = None
+        with contextlib.suppress(Exception):
+            from providers import get_provider_profile
+            profile = get_provider_profile(agent.provider)
+            profile_max = profile.get_max_tokens(agent.model) if profile else None
+        reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
+        cap = resolve_chat_max_tokens(agent.model, reasoning, None, selected, profile_max)
+        return (cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else None), True
+    return (selected if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0 else None), True
 
 
 def _anthropic_fast_route_supported(agent) -> bool:

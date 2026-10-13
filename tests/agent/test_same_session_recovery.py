@@ -265,3 +265,48 @@ def test_projection_survives_api_sidecar_replay(tmp_path):
     api, _ = build_api_messages(agent, projected, current_turn_user_idx=3,
         ext_prefetch_cache="", plugin_user_context="", moa_config=None, active_system_prompt="")
     assert len(next(m for m in api if m["role"] == "tool")["content"]) < 10000
+
+
+def _anthropic_agent(db, model):
+    agent = _agent(db)
+    agent.api_mode = "anthropic_messages"
+    agent.provider = "anthropic"
+    agent.model = model
+    agent.max_tokens = None
+    agent.context_compressor.max_tokens = None
+    agent.context_compressor.context_length = 64_000
+    agent.reasoning_config = None
+    return agent
+
+
+def test_request_fit_reserves_anthropic_native_default_when_window_is_validated(tmp_path):
+    """A None cap is not zero: build_anthropic_kwargs sends the native ceiling (clamped to the
+    window), and pre-4.5 Claude rejects input + max_tokens > window up front."""
+    from agent.compression_recovery import request_fits
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _anthropic_agent(db, "claude-3-7-sonnet-20250219")
+    rows = [{"role": "user", "content": "input " * 25_000}]
+    assert agent._build_api_kwargs(rows)["max_tokens"] == 63_999  # what the wire carries
+    assert not request_fits(agent, rows, "")
+    agent._ephemeral_max_output_tokens = 1_024  # a lowered one-shot cap still fits
+    assert request_fits(agent, rows, "")
+    agent._ephemeral_max_output_tokens = None
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens
+    assert effective_wire_max_output_tokens(agent) == (63_999, True)
+    db.close()
+
+
+def test_request_fit_does_not_force_compaction_for_window_stopping_claude(tmp_path):
+    """Claude 4.5+ accepts input + max_tokens > window and stops at the window, so its native
+    default ceiling (here equal to the window) is not reserved; an explicit cap still is."""
+    from agent.compression_recovery import request_fits
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _anthropic_agent(db, "claude-sonnet-4-5")
+    rows = [{"role": "user", "content": "input " * 25_000}]
+    assert agent._build_api_kwargs(rows)["max_tokens"] == 64_000
+    assert request_fits(agent, rows, "")
+    agent.max_tokens = 40_000
+    assert not request_fits(agent, rows, "")
+    db.close()
