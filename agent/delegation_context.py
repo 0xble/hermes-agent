@@ -155,6 +155,12 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
+    # relay's CLI refuses a send to this address (relay C27), so a child's
+    # `relay send` to its parent fails however the shell spells it. Inherited
+    # values pass through untouched; an in-process child names its own parent.
+    from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV, child_parent_relay_address
+    if _DELEGATED_CHILD_CONTEXT.get() and (parent_address := child_parent_relay_address()):
+        cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
     return cleaned
 
 

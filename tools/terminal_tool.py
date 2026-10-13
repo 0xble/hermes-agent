@@ -1351,13 +1351,9 @@ def _pre_exec_block(
 ) -> None:
     """Raise :class:`_Rejected` with the blocked-result JSON when the command must not run.
 
-    Order matters: delegated child relay guard first (before any relay CLI transport),
-    then gateway lifecycle, then the dangerous-workdir check, then the self-repo guard (local only).
+    Order matters: gateway lifecycle first (protects the running gateway),
+    then the dangerous-workdir check, then the self-repo guard (local only).
     """
-    from agent.relay_guard import cli_child_parent_relay_error
-    relay_error = cli_child_parent_relay_error(command)
-    if relay_error:
-        raise _Rejected(_error_json(relay_error, status="blocked"))
     blocked = gateway_lifecycle_block(
         command=command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
     )

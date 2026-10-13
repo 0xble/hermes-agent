@@ -101,13 +101,17 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
     from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
+        DELEGATED_CHILD_ENV_MARKER, DELEGATED_PARENT_SESSION_ENV, delegated_child_subprocess_env,
     )
+    from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
     scoped = delegated_child_subprocess_env(source_env)
     # Preserve location only when carrying the descendant fence, not for arbitrary
     # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
     if scoped.get(DELEGATED_CHILD_ENV_MARKER):
-        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        # The parent identity rides with the fence so the sandbox's own `relay send`
+        # to its parent is refused by relay (relay C27).
+        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    DELEGATED_PARENT_SESSION_ENV, RELAY_PARENT_ADDRESS_ENV):
             if key in scoped:
                 scrubbed[key] = scoped[key]
     return delegated_child_subprocess_env(scrubbed)

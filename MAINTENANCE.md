@@ -406,11 +406,11 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 ## Active patch record: child-parent relay guard
 
 - **Patch identity:** `child-parent-relay-guard`.
-- **Behavior:** A delegated child cannot send a relay message directly to its own parent through the Relay MCP tool or the `relay send` CLI. CLI checks resolve only each invocation's destination argument, not body text, option values, redirection operands, or later commands' arguments. The shared shell heredoc scanner keeps stdin data out of argument parsing, including apostrophes and quoted/tab-stripped delimiters; shell operators and line continuations preserve the boundary. Ambiguous apparent relay syntax fails closed only for a child with a resolvable parent identity, while top-level sends and valid other-session sends remain unchanged.
-- **Source surfaces:** `agent/relay_guard.py` and `tests/agent/test_relay_guard.py`.
-- **Upstream status:** Fork-only guard carried by PR #541.
-- **Focused regression:** `scripts/run_tests.sh tests/agent/test_relay_guard.py -q`.
-- **Retirement:** Remove when upstream provides the same child-parent relay boundary and shell-operator coverage.
+- **Behavior:** A delegated child cannot send a relay message directly to its own parent. The Relay MCP tool is refused in process before the call server is acquired. For the `relay send` CLI, Hermes never parses shell text: every subprocess environment built for a delegated child (foreground terminal, background processes, execute_code, other `delegated_child_subprocess_env` spawns) carries `RELAY_PARENT_ADDRESS=hermes:<profile>/<immediate parent session>`, and relay's CLI refuses a send whose parsed target equals it (relay C27, 0xble/relay#45). Both the variable and `HERMES_DELEGATED_PARENT_SESSION_ID` are excluded from the shared shell snapshot so a child's parent identity never reaches a later top-level command. Top-level sends and child sends to other sessions are unchanged.
+- **Source surfaces:** `agent/relay_guard.py`, `agent/delegation_context.py`, `tools/code_execution_env.py`, `tools/environments/base_session_env.py`, `tools/mcp_tool_handlers.py`, `tools/delegate_tool_child_run.py`, and `tests/agent/test_relay_guard.py`.
+- **Upstream status:** Fork-only guard carried by PR #541. Requires a relay release containing 0xble/relay#45; until then the CLI path is unguarded and the MCP path still holds.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_relay_guard.py tests/tools/test_snapshot_session_id_leak.py -q`.
+- **Retirement:** Remove when upstream provides the same child-parent relay boundary for MCP and CLI.
 - **Rollback:** Revert the commits carrying `Fork-Patch: child-parent-relay-guard`.
 
 ## Eager plugin tools
