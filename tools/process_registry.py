@@ -40,6 +40,8 @@ from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_survival import ProcessSurvivalMixin
 from tools.process_registry_results import (
     load_completed_results,
+    prune_completed_results,
+    refresh_completed_result,
     save_completed_result,
     save_cut_pending_result,
 )
@@ -631,12 +633,15 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    # Set by the _move_to_finished call that moved the session out of _running; only that call
-    # publishes the completion, so a duplicate finisher must not release waiters early.
+    # Only the finalization claimant publishes completion and releases waiters.
     _finish_claimed: bool = field(default=False, repr=False)
+    _result_owner_write_done: bool = field(default=False, repr=False)
     # The last stop of ``systemd_unit`` failed, so its descendants may still be alive; bulk
     # cleanup retries the stop even after the session finished.
     _scope_stop_pending: bool = field(default=False, repr=False)
+    # Stopped by a restart/bounded sweep: the final receipt keeps cut retention even when
+    # it is written before (or instead of) the pre-signal cut_pending snapshot.
+    _cut_receipt: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -1644,20 +1649,24 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
-        """Move a session from running to finished.
-        Idempotent: kill_process() and the reader thread can both call this; only
-        the FIRST move enqueues the completion notification, so no duplicates.
-        Returns True when this call is the one that persisted the session."""
+        """Claim finalization once; publish completion only after persistence finishes.
+        Keep pending results tracked, but never wait for receipt IO under the registry lock.
+        Returns True for the owner; reader/kill duplicates return False."""
         with self._lock:
             was_running = session.id in self._running
             if was_running:
+                if session._finish_claimed:
+                    return False
                 session._finish_claimed = True
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
-                if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
-                    save_completed_result(session)
-                self._running.pop(session.id)
+        if was_running and (session._kill_deadline is None or time.monotonic() < session._kill_deadline):
+            if session._kill_deadline is None:
+                save_completed_result(session)
+            else:
+                save_completed_result(session, prune=False)
+        with self._lock:
+            if was_running:
+                self._running.pop(session.id, None)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
@@ -1701,7 +1710,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 "started_at": session.started_at,
             }
             _redact_process_result(notification)
-            self.completion_queue.put(notification)
+            if session.survive_restart:
+                self._queue_survivor_completion(notification)
+            else:
+                self.completion_queue.put(notification)
 
     @staticmethod
     def _exit_fields(session: ProcessSession) -> dict:
@@ -2285,7 +2297,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             or (session.env_ref and session.pid)
             or (session.detached and session.pid_scope == "host" and session.pid)
         ):
-            save_cut_pending_result(session, source)
+            # Set the marker before the snapshot/write so a reader that wins the race
+            # still persists the final receipt in the cut-retention budget.
+            session._cut_receipt = True
+            # Bounded kills keep half the remaining budget for the signals themselves.
+            save_cut_pending_result(
+                session, source, include_output=deadline is None, prune=deadline is None,
+                lock_timeout=(
+                    None if deadline is None
+                    else max(0.0, deadline - time.monotonic()) / 2
+                ),
+            )
         # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
         bounded = {} if deadline is None else {"deadline": deadline}
         try:
@@ -2340,13 +2362,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
                 session.termination_source = source
-            # The reader thread can finalise the session while the signal path
-            # blocks in the SIGKILL grace window: its ``save_completed_result``
-            # then persists this kill as a plain ``exited``. Re-write the receipt
-            # so the durable record matches what the caller was told.
-            if not self._move_to_finished(session):
-                if deadline is None or time.monotonic() < deadline:
-                    save_completed_result(session)
+            refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
             if deadline is None or time.monotonic() < deadline:
                 self._write_checkpoint()
             return {
@@ -2907,6 +2923,31 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if deadline is not None:
                 for session in targets:
                     session._kill_deadline = deadline
+            # Mark before any signal: a reader that finalizes during TERM, or a failed scope
+            # teardown that skips reconciliation, must still write a cut-retention receipt.
+            for session in signalable:
+                session._cut_receipt = True
+            # Small pre-signal receipts, capped at half the remaining budget so the signals
+            # themselves always keep the other half; any session not covered here gets one
+            # more attempt after the signals.
+            pre_signal_receipts: set[str] = set()
+            if source == "gateway_shutdown" or bounded_sweep:
+                receipt_cutoff = None if deadline is None else (
+                    time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+                )
+                for session in signalable:
+                    if (stop_event is not None and stop_event.is_set()) or (
+                        receipt_cutoff is not None and time.monotonic() >= receipt_cutoff
+                    ):
+                        break
+                    if save_cut_pending_result(
+                        session, source, include_output=False, prune=False,
+                        lock_timeout=(
+                            None if receipt_cutoff is None
+                            else receipt_cutoff - time.monotonic()
+                        ),
+                    ):
+                        pre_signal_receipts.add(session.id)
             escalated_ids: set[str] = set()
             systemd_stops: dict[str, tuple[threading.Thread, threading.Event, dict[str, bool]]] = {}
 
@@ -2947,9 +2988,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 thread.start()
 
             if signalable:
-                if source == "gateway_shutdown" or bounded_sweep:
-                    for session in signalable:
-                        save_cut_pending_result(session, source)
                 # Signal every snapshotted root/descendant group in one parallel pass. A
                 # descendant may have called setsid(), so the root group alone is not an
                 # ownership boundary for the full psutil tree.
@@ -3080,9 +3118,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                         session.termination_source = source
                         if consume_output:
                             self._completion_consumed.add(session.id)
-                    moved = self._move_to_finished(session)
-                    if not moved and (deadline is None or time.monotonic() < deadline):
-                        save_completed_result(session)
+                    refresh_completed_result(session, self._move_to_finished(session), prune=deadline is None)
                     killed += 1
                 # Non-local targets are handled by the same bounded parallel phase, never serially.
                 remainder = [session for session in targets if session not in signalable]
@@ -3098,8 +3134,27 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 for session in targets:
                     if _fallback_kill_one(session):
                         killed += 1
+            if source == "gateway_shutdown" or bounded_sweep:
+                for session in signalable:
+                    if session.id in pre_signal_receipts:
+                        continue
+                    # Receipts are evidence, not the stop itself: never let them spend the
+                    # restart's shared deadline once the signals have gone out.
+                    if bounded_sweep and (
+                        (stop_event is not None and stop_event.is_set())
+                        or (deadline is not None and time.monotonic() >= deadline)
+                    ):
+                        break
+                    save_cut_pending_result(
+                        session, source, include_output=not bounded_sweep, prune=not bounded_sweep,
+                        lock_timeout=None if deadline is None else deadline - time.monotonic(),
+                    )
             scope_retried = _retry_finished_scopes()
             _close_detached_nonrunning()
+            if bounded_sweep and (stop_event is None or not stop_event.is_set()) and (
+                deadline is None or time.monotonic() < deadline
+            ):
+                prune_completed_results(deadline=deadline)
             if (stop_event is None or not stop_event.is_set()) and (
                 deadline is None or time.monotonic() < deadline
             ):

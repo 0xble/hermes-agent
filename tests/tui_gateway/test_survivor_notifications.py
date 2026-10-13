@@ -59,7 +59,7 @@ def test_poller_path_acks_survivor_after_status_emission(tmp_path, monkeypatch):
     stop = threading.Event()
 
     def emit(method, sid, payload):
-        assert json.loads(Path(process.delivered_path).read_text())["state"] == "claimed"
+        assert json.loads(Path(process.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "claimed"
         status.append(payload)
         stop.set()
 

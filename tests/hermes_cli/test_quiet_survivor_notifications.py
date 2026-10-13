@@ -18,8 +18,8 @@ def _pending_result(tmp_path, monkeypatch):
     monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
     run_dir = home / "process-runs" / "proc_quiet"
     run_dir.mkdir(parents=True)
-    (run_dir / "out.log").write_text("quiet result\n")
-    (run_dir / "exit").write_text("0\n")
+    (run_dir / "out.log").write_text("quiet result\n", encoding="utf-8")
+    (run_dir / "exit").write_text("0\n", encoding="utf-8")
     producer = ProcessRegistry()
     producer._running["proc_quiet"] = ProcessSession(
         id="proc_quiet", command="echo quiet", pid=999999, task_id="task", session_key="session",
@@ -58,8 +58,8 @@ def test_quiet_success_acknowledges_before_fresh_successor(tmp_path, monkeypatch
     if session is not None:
         assert session._completion_event.wait(5)
     assert successor.drain_notifications(session_key="session") == []
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
-    assert json.loads((home / "processes.json").read_text()) == []
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
+    assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig")) == []
 
 
 @pytest.mark.parametrize("failure", ["raise", "failed", "partial", "interrupted", "incomplete", "none"])
@@ -73,7 +73,7 @@ def test_quiet_failed_admission_releases_and_retries_same_result(tmp_path, monke
 
     def fail(text):
         calls.append(text)
-        assert json.loads((run_dir / "delivered").read_text())["state"] == "claimed"
+        assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"] == "claimed"
         if failure == "raise":
             raise RuntimeError("turn not admitted")
         return {
@@ -87,11 +87,11 @@ def test_quiet_failed_admission_releases_and_retries_same_result(tmp_path, monke
     else:
         qsq.continue_quiet_notify_completions("session", fail, linger_budget=0, max_rounds=1)
     assert not (run_dir / "delivered").exists()
-    assert json.loads((home / "processes.json").read_text())
+    assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))
     result = qsq.continue_quiet_notify_completions(
         "session", lambda text: calls.append(text) or {"final_response": "retried"}, linger_budget=0,
     )
     assert result == {"final_response": "retried"}
     assert len(calls) == 2 and calls[0] == calls[1]
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
-    assert json.loads((home / "processes.json").read_text()) == []
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
+    assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig")) == []

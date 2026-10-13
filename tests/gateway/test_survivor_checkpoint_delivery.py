@@ -20,8 +20,8 @@ async def test_recycled_pid_recorded_exit_restores_gateway_watcher(tmp_path, mon
     monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
     run_dir = home / "process-runs" / "proc_recycled"
     run_dir.mkdir(parents=True)
-    (run_dir / "out.log").write_text("finished\n")
-    (run_dir / "exit").write_text("4\n")
+    (run_dir / "out.log").write_text("finished\n", encoding="utf-8")
+    (run_dir / "exit").write_text("4\n", encoding="utf-8")
     producer = ProcessRegistry()
     session = ProcessSession(
         id="proc_recycled", command="echo finished", pid=999999, task_id="task", session_key="session",
@@ -54,4 +54,4 @@ async def test_recycled_pid_recorded_exit_restores_gateway_watcher(tmp_path, mon
     assert adapter.send.await_args.kwargs["metadata"]["thread_id"] == "7"
     runner._enqueue_process_completion_notification.assert_awaited_once()
     assert runner._enqueue_process_completion_notification.await_args.args[1]["exit_code"] == 4
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True

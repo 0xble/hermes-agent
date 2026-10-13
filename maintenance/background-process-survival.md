@@ -47,11 +47,33 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
 ## Provenance and patches
 
-- Fork patch identities: `background-process-cut-receipts` (PR3) and
-  `terminal-background-survival` (PR4). They are stacked draft PRs in the
-  `0xble/hermes-agent` fork; do not push to `NousResearch`.
+- Fork patch identity: `background-process-cut-receipts` (PR3, merged fork PR #538).
+- Fork patch identity: `terminal-background-survival` (PR4, draft fork PR #534).
+  Track both units in the `0xble/hermes-agent` fork; do not push to `NousResearch`.
 - `tools/process_registry_survival.py` owns the file-backed wrapper and survivor
   polling; the registry facade only routes the opt-in and lifecycle boundaries.
+- Follow-up cut-receipt finalization fixes keep final receipts authoritative,
+  exclude `cut_pending` from terminal-result loading, mark cut receipts explicitly
+  for retention, and write small bounded-sweep receipts before signalling within half
+  the remaining budget, retrying any uncovered session once after the signals.
+  Cut/final receipt lock acquisition and the final prune respect the bounded stop's
+  deadline. Reader finalization claims the session under the registry lock, then
+  persists outside it: an unrelated writer cannot prevent a sweep from selecting
+  and signalling its live targets. A blocked final result remains tracked in memory;
+  only its owner may publish completion or release finite-parent waiters. Bounded
+  finalizers that skip persistence retain the terminal result in the finished map.
+  A kill committed after the owner's write refreshes its receipt from current state under the result lock.
+  The final prune checks its deadline throughout scanning, legacy classification,
+  age deletion, and count deletion; unfinished retention work waits for a later prune.
+  A busy writer may leave a receipt unwritten, but cannot hold up termination signals.
+- Shutdown survival filtering precedes cut marking, receipt writes, deadline
+  assignment, and signals. A surviving command keeps its normal result retention
+  and finalization owner; only an explicit process/operator stop may finalize it
+  as killed. Receipt finalization and the file-backed delivery claim are separate:
+  the former publishes one completion offer, the latter fences consumer delivery.
+  The shutdown fence protects only queue publication, never receipt IO. An owner
+  blocked behind another result writer may finish persisting after teardown begins;
+  it leaves a pending checkpoint and no old-gateway offer, so the successor delivers.
 - Compatibility is additive: new checkpoint and receipt keys have safe absence
   behavior so an older release can roll back without a destructive migration.
 - Do not touch `gateway/platforms/event.py`, `response_filters.py`, locales, or
@@ -61,6 +83,14 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.
+The receipt-deadline regressions hold a real reader behind an unrelated result
+writer while a bounded sweep kills a real child, then verify durable output and
+one completion after release. `test_survivor_receipt_finalization.py` adds a real
+survivor blocked behind the result lock, verifies shutdown can fence it without
+waiting for IO, and checks successor delivery once after owner persistence. It
+also checks a mixed bounded shutdown cuts only ordinary jobs and leaves the
+survivor's exit receipt uncut. Legacy-inventory tests force expiry during
+classification, age deletion, and count deletion, then verify a later prune repairs retention.
 For PR4, verify a real local non-PTY process survives a gateway restart and that
 its completion is observed once after repeated polls.
 

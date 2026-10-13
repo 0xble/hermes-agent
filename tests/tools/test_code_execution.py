@@ -287,9 +287,9 @@ class TestRemoteSharedHostLockdown(unittest.TestCase):
         self.assertEqual(sh(mkdir_cmd).returncode, 0)
         for d in (local, f"{local}/rpc"):
             self.assertEqual(os.stat(d).st_mode & 0o777, 0o700, d)
-        with open(f"{local}/sandbox.env", "w") as fh:
+        with open(f"{local}/sandbox.env", "w", encoding="utf-8") as fh:
             fh.write(env_ship.args[2])
-        with open(f"{local}/script.py", "w") as fh:
+        with open(f"{local}/script.py", "w", encoding="utf-8") as fh:
             fh.write("import os, sys\nprint(os.environ['HERMES_RPC_TOKEN'])\nsys.exit(7)\n")
         # The env reaches the child, its exit code is the command's, and the
         # token never leaks into the outer shell (the backend's session
@@ -863,7 +863,7 @@ class TestHeadTailTruncation(unittest.TestCase):
         self.assertIn("execute_code stdout was truncated", result["warning"])
         self.assertIn("read_file", result["warning"])
         self.assertIn("stdout_spill_path", result)
-        with open(result["stdout_spill_path"], encoding="utf-8") as f:
+        with open(result["stdout_spill_path"], encoding="utf-8-sig") as f:
             body = f.read()
         self.assertIn("HEAD", body)
         self.assertIn("TAIL", body)

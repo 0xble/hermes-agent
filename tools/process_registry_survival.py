@@ -322,20 +322,27 @@ class ProcessSurvivalMixin:
                 with fence:
                     stopped.set()
 
-    def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
-        """Finish only while the shutdown fence is open; return whether delivery was queued."""
+    def _queue_survivor_completion(self, notification: dict) -> None:
+        """Fence only queue publication, never a finalization owner's receipt IO."""
         stopped = getattr(self, "_survivor_pollers_stopped", None)
         fence = getattr(self, "_survivor_poller_fence", None)
         if fence is None:
-            if stopped is not None and stopped.is_set():
-                return False
-            self._finish_survivor(session, exit_code, reason, source)
-            return True
+            if stopped is None or not stopped.is_set():
+                self.completion_queue.put(notification)
+            return
         with fence:
-            if stopped is not None and stopped.is_set():
-                return False
-            self._finish_survivor(session, exit_code, reason, source)
-            return True
+            if stopped is None or not stopped.is_set():
+                self.completion_queue.put(notification)
+
+    def _finish_survivor_if_allowed(self, session: ProcessSession, exit_code, reason: str, source: str) -> bool:
+        """Do not start new finalization after shutdown; an in-flight owner may persist."""
+        stopped = getattr(self, "_survivor_pollers_stopped", None)
+        if stopped is not None and stopped.is_set():
+            return False
+        # Shutdown can win during receipt IO. Publication rechecks under its short fence,
+        # leaving the checkpoint pending for the successor instead of blocking teardown.
+        self._finish_survivor(session, exit_code, reason, source)
+        return True
 
     def _survivor_poller_loop(self, session: ProcessSession):
         """Collect a file-backed local survivor after this or a successor gateway boots."""

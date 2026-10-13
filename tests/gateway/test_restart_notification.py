@@ -25,7 +25,7 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     marker = tmp_path / ".restart_pending.json"
 
     assert gateway_run._planned_restart_notification_pending() is False
-    marker.write_text("{}")
+    marker.write_text("{}", encoding="utf-8")
     assert gateway_run._planned_restart_notification_pending() is True
 
     gateway_run._planned_restart_notification_path().unlink()
@@ -56,7 +56,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
-    data = json.loads(notify_path.read_text())
+    data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
     assert data["platform"] == "telegram"
     assert data["chat_id"] == "42"
     assert data["chat_type"] == "dm"
@@ -258,7 +258,7 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
                 "delivered_via_upstream_relay": True,
             }
         )
-    )
+    , encoding="utf-8")
 
     runner, _native = make_restart_runner()
     relay = MagicMock()
@@ -303,7 +303,7 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     notify_path.write_text(json.dumps({
         "platform": "telegram",
         "chat_id": "42",
-    }))
+    }), encoding="utf-8")
 
     runner, adapter = make_restart_runner()
     adapter.send = AsyncMock(
@@ -365,7 +365,7 @@ async def test_survivor_notification_acknowledges_only_successful_gateway_admiss
     attempts = []
 
     async def admit(_text, _event, **kwargs):
-        assert json.loads((run_dir / "delivered").read_text())["state"] == "claimed"
+        assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"] == "claimed"
         attempts.append("admit")
         return len(attempts) > 1
 
@@ -377,7 +377,7 @@ async def test_survivor_notification_acknowledges_only_successful_gateway_admiss
         "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
     }), timeout=5)
     assert attempts == ["admit", "admit"]
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
     assert not registry.is_completion_consumed(session.id)
     await runner._run_process_watcher({
         "session_id": session.id, "check_interval": 0.01, "notify_on_complete": True,
@@ -546,12 +546,12 @@ async def test_survivor_text_watcher_acknowledges_after_presenting(tmp_path, mon
     sent = []
 
     async def send(*args):
-        sent.append(json.loads((run_dir / "delivered").read_text())["state"])
+        sent.append(json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"])
 
     runner._send_watcher_message = send
     await runner._run_process_watcher({"session_id": "proc_text", "check_interval": 0.01})
     assert sent == ([] if mode == "off" else ["claimed"])
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
 
 
 @pytest.mark.asyncio
@@ -579,7 +579,7 @@ async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tm
     sent = []
 
     async def send(*args, **kwargs):
-        sent.append(json.loads((run_dir / "delivered").read_text())["state"])
+        sent.append(json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["state"])
         return SendResult(success=len(sent) > 1)
 
     adapter.send = send
@@ -587,5 +587,5 @@ async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tm
         "session_id": "proc_retry", "check_interval": 0.01,
         "platform": "telegram", "chat_id": "123"}), timeout=5)
     assert sent == ["claimed", "claimed"]
-    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+    assert json.loads((run_dir / "delivered").read_text(encoding="utf-8-sig"))["delivered"] is True
 

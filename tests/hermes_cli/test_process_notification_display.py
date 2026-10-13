@@ -51,10 +51,10 @@ def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch, mode):
         batch = cli._pending_input.get_nowait()
         rendered = batch.render(registry)
         assert rendered is not None and "exit code 3" in rendered
-        assert json.loads(Path(session.delivered_path).read_text())["state"] == "claimed"
+        assert json.loads(Path(session.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "claimed"
         unwrapped, _is_voice, _is_seeded = cli._tui_unwrap_input(batch)
         assert unwrapped is not None
-    assert json.loads(Path(session.delivered_path).read_text())["state"] == "delivered"
+    assert json.loads(Path(session.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "delivered"
 
 
 @pytest.mark.parametrize("mode,expect_injected", [("off", False), ("concise", True), ("all", True)])
