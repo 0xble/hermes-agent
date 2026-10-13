@@ -3122,7 +3122,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         prunable = {
             sid: s for sid, s in self._finished.items()
             if not getattr(s, "_scope_stop_pending", False)
-            and not (s.survive_restart and s.notify_on_complete
+            and not (getattr(s, "survive_restart", False) and s.notify_on_complete
                      and self._survivor_delivery_state(s) != "delivered")
         }
         expired = [sid for sid, s in prunable.items() if (now - s.started_at) > FINISHED_TTL_SECONDS]

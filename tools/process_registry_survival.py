@@ -101,7 +101,7 @@ class ProcessSurvivalMixin:
     def _read_survivor_marker(session: ProcessSession) -> dict | None:
         """The delivery marker: absent (pending), a claim with its owner, or delivered."""
         try:
-            payload = json.loads(Path(session.delivered_path).read_text(encoding="utf-8"))
+            payload = json.loads(Path(session.delivered_path).read_text(encoding="utf-8-sig"))
         except FileNotFoundError:
             return None
         except (OSError, ValueError, TypeError):
@@ -161,7 +161,7 @@ class ProcessSurvivalMixin:
             path = Path(session.delivered_path)
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(path.with_name("delivery.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "w") as lock_file:
+            with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
                 yield path
         return held()
@@ -285,7 +285,7 @@ class ProcessSurvivalMixin:
 
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
         """Prune an aged survivor only after its completion was delivered."""
-        if session.survive_restart and self._survivor_delivery_state(session) == "delivered":
+        if getattr(session, "survive_restart", False) and self._survivor_delivery_state(session) == "delivered":
             self._remove_survivor_run_dir(session)
 
     def _prune_delivered_survivor_runs(self) -> None:
@@ -303,7 +303,7 @@ class ProcessSurvivalMixin:
                 try:
                     if now - marker.stat().st_mtime <= registry.FINISHED_TTL_SECONDS:
                         continue
-                    payload = json.loads(marker.read_text(encoding="utf-8"))
+                    payload = json.loads(marker.read_text(encoding="utf-8-sig"))
                     if isinstance(payload, dict) and payload.get("delivered") is True:
                         shutil.rmtree(run_dir)
                 except (OSError, ValueError, TypeError):
@@ -351,7 +351,7 @@ class ProcessSurvivalMixin:
             try:
                 exit_text = ""
                 if exit_path.exists():
-                    exit_text = exit_path.read_text(encoding="utf-8", errors="replace").strip()
+                    exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip()
                 self._read_survivor_log(session)
                 if exit_text:
                     try:
@@ -370,7 +370,7 @@ class ProcessSurvivalMixin:
                     # Give the wrapper's final printf a short chance to become visible before
                     # reporting a genuinely lost process.
                     time.sleep(0.05)
-                    exit_text = exit_path.read_text(encoding="utf-8", errors="replace").strip() if exit_path.exists() else ""
+                    exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip() if exit_path.exists() else ""
                     if not exit_text:
                         if not self._finish_survivor_if_allowed(session, None, "lost", "survivor_lost"):
                             return
@@ -384,7 +384,7 @@ class ProcessSurvivalMixin:
     def _recorded_survivor_exit(exit_path: str | None) -> int | None:
         """The wrapper's recorded exit code, or None when it never wrote one."""
         try:
-            text = Path(exit_path).read_text(encoding="utf-8", errors="replace").strip() if exit_path else ""
+            text = Path(exit_path).read_text(encoding="utf-8-sig", errors="replace").strip() if exit_path else ""
         except OSError:
             return None
         if not text:

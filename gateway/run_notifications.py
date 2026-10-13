@@ -3086,7 +3086,8 @@ class GatewayNotificationsMixin:
                     if admitted is False:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result. Only this claim owner may return it to pending.
-                        process_registry.release_survivor_completion(session_id)
+                        if getattr(session, "survive_restart", False):
+                            process_registry.release_survivor_completion(session_id)
                         continue
                     if admitted is not False:
                         acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
