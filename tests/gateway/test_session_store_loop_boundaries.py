@@ -117,6 +117,22 @@ async def test_session_owner_peek_runs_off_loop(site, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_owner_lookup_runs_off_loop(tmp_path):
+    from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    entry = runner.session_store.get_or_create_session(source)
+    event = MessageEvent(text="heartbeat", source=source)
+    event._heartbeat_session_id = entry.session_id
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        assert await resolve_heartbeat_owner(runner, event, entry)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+
+
+@pytest.mark.asyncio
 async def test_async_hydration_rejects_stale_read_after_edit(tmp_path, monkeypatch):
     """Off-loop reads must retain the synchronous hydration's epoch/edit-pending fence."""
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
