@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent.agent_runtime_helpers import _requeue_pending_steer
+from agent.steer_delivery import _requeue_pending_steer
 from agent.client_lifecycle import ClientLifecycleMixin
 from agent.interrupt_control import InterruptControlMixin
 

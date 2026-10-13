@@ -25,7 +25,7 @@ def _write_config(home: Path, data: dict) -> None:
 
 def _read_config(home: Path) -> dict:
     config_path = home / ".hermes" / "config.yaml"
-    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    return yaml.safe_load(config_path.read_text(encoding="utf-8-sig")) or {}
 
 # ---------------------------------------------------------------------------
 # _read_chain / _write_chain
@@ -388,6 +388,43 @@ class TestCooldownsCommand:
     def test_clear_requires_exactly_one_selector(self, isolated_home, argv):
         with pytest.raises(SystemExit):
             _parse(argv)
+
+    def test_malformed_state_status_is_truthful(self, isolated_home, capsys):
+        from agent.shared_primary_cooldown import _state_path
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "status"]))
+        status = capsys.readouterr().out
+        assert "unreadable" in status.lower()
+        assert "No primary-model cooldowns active" not in status
+        assert path.read_text(encoding="utf-8-sig") == "{"
+
+    @pytest.mark.parametrize("failure", ["malformed", "wrong_shape", "permission"])
+    def test_unreadable_state_clear_all_quarantines_it(self, isolated_home, capsys, monkeypatch, failure):
+        from pathlib import Path
+        from agent.shared_primary_cooldown import _state_path, read_cooldown
+        path = _state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "[]" if failure == "wrong_shape" else "{"
+        path.write_text(original, encoding="utf-8")
+        real_read = Path.read_text
+        if failure == "permission":
+            def denied(self, *args, **kwargs):
+                if self == path:
+                    raise PermissionError("unreadable cooldown fixture")
+                return real_read(self, *args, **kwargs)
+            monkeypatch.setattr(Path, "read_text", denied)
+        from hermes_cli.fallback_cmd import cmd_fallback
+        cmd_fallback(_parse(["fallback", "cooldowns", "clear", "--all"]))
+        assert not path.exists()
+        backups = list(path.parent.glob(path.name + ".corrupt-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text(encoding="utf-8-sig") == original
+        assert "Quarantined" in capsys.readouterr().out
+        monkeypatch.setattr(Path, "read_text", real_read)
+        assert read_cooldown(("custom", "https://fixture.invalid/v1", "primary")) is None
 
     def test_status_survives_a_non_finite_record(self, isolated_home, capsys):
         import json

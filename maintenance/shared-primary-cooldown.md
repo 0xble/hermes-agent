@@ -24,7 +24,15 @@ An agent already on a provider fallback re-reads the shared record at every turn
 start. While the record is active, the agent stays on the fallback and its in-memory
 deadline follows the record, so a longer window that another process re-armed wins.
 Restore only proceeds once the shared window has passed or the record is gone, and
-restore never rewrites the record.
+restore never rewrites the record. Unreadable or malformed state files are not cleared
+outages: fresh agents with a fallback chain use that chain without re-arming state or
+inventing a record, and cached provider-fallback agents stay on fallback even after their
+local deadline passes. Existing cached records and deadlines are preserved. If no
+configured fallback can bind, turn-start adoption refuses the turn rather than probing
+the primary. A successful read of absent or expired state releases this hold; agents
+without a fallback chain retain the existing state-file skip. Unavailable-state adoption
+uses the explicit `cooldown_state_unreadable` reason so its fallback notice describes the
+state-file failure rather than inventing a provider failure.
 
 Overload (`FailoverReason.overloaded`: HTTP 529 or 503 unless the body reads as context
 overflow, any 5xx or 400 whose body names a local memory ceiling, a 429 with overload
@@ -42,7 +50,9 @@ Readers treat a record whose `reset_at` or `recorded_at` is not a finite number 
 `arm_cooldown` ignores such a provider reset and falls back to the shared backoff. The
 31-day ceiling admits weekly and monthly usage caps. `hermes fallback status` prints
 `unknown` for a reset it cannot format instead of raising. A corrupted state file
-therefore cannot pin a route forever or crash the status listing.
+therefore cannot pin a route through a malformed route entry or crash the status listing.
+A malformed or unreadable top-level file is different: agents remain fail closed, and
+status reports that the state is unreadable rather than claiming no cooldowns are active.
 
 A 429 that arrives while the record is still active came from a request already in
 flight before the outage was recorded, not from a fresh probe. It keeps the current
@@ -60,7 +70,10 @@ with a fresh outage id, an unclaimed notice, and backoff starting again at 60 s.
 Readers prune these stale records, along with malformed ones.
 
 `hermes fallback status` and `hermes fallback cooldowns` list active records.
-`hermes fallback cooldowns clear --all` clears every record.
+`hermes fallback cooldowns clear --all` clears every record. If the file itself cannot be
+read or parsed, this explicit operator action renames it to a `.corrupt-<time_ns>` backup
+under the same writer lock, preserving the bytes for diagnosis. The CLI reports the
+backup path. Lock or rename failures still exit nonzero; targeted clears do not quarantine.
 `hermes fallback cooldowns clear <provider/model | model>` clears records that match
 exactly. A bare model name matches that model on every provider, and substrings never
 match. Neither form changes the configured fallback chain. `hermes fallback clear`
@@ -76,7 +89,8 @@ and clears it with one recovery notice.
 
 - `agent/shared_primary_cooldown.py`: file-locked, atomic per-`HERMES_HOME` state.
 - `agent/fallback_cooldown.py`: writer and shared backoff escalation.
-- `agent/agent_runtime_helpers.py`: fresh-agent adoption, the turn-start shared-record refresh for
+- `agent/shared_primary_cooldown_runtime.py`: fresh-agent adoption, including unavailable-state fallback.
+- `agent/agent_runtime_helpers.py`: the turn-start shared-record refresh for
   agents already on a fallback, and turn-start gating.
 - `agent/chat_completion_helpers.py` and `agent/chat_completion_nonstream.py`: notice claim and recovery clear.
 - `hermes_cli/fallback_cmd.py`, `hermes_cli/subcommands/fallback.py`: `status` and `cooldowns [clear]`.

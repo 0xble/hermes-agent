@@ -21,6 +21,8 @@ import threading
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from hermes_cli.plugins import (
     _EVENT_EMIT_DEPTH_CAP,
     PluginContext,
@@ -40,7 +42,7 @@ def _make_ctx(manager: PluginManager, name: str, key: str = "") -> PluginContext
 
 def _fresh_manager() -> PluginManager:
     manager = PluginManager()
-    manager._discovered = True  # skip auto-discovery
+    mark_plugin_discovery_complete(manager)  # skip auto-discovery
     return manager
 
 
