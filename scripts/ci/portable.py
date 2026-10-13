@@ -245,12 +245,22 @@ def windows_appdata_environment(home: Path) -> dict[str, str]:
     roaming = home / 'AppData' / 'Roaming'
     local.mkdir(parents=True, exist_ok=True)
     roaming.mkdir(parents=True, exist_ok=True)
+    cache = local / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'
+    prebuilt = os.environ.get('PSModuleAnalysisCachePath')
+    if prebuilt:
+        source = Path(prebuilt)
+        if source.is_file() and source != cache and not cache.exists():
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, cache)
+            except OSError as error:
+                print(f'portable CI: could not seed PowerShell module-analysis cache: {error}; using cold cache', file=sys.stderr)
     return {
         'LOCALAPPDATA': str(local), 'APPDATA': str(roaming),
         # Windows PowerShell can derive its cache from a missing per-user
         # special folder despite LOCALAPPDATA being set in the process env.
         # Point both powershell.exe and pwsh explicitly outside the checkout.
-        'PSModuleAnalysisCachePath': str(local / 'Microsoft' / 'Windows' / 'PowerShell' / 'ModuleAnalysisCache'),
+        'PSModuleAnalysisCachePath': str(cache),
     }
 
 

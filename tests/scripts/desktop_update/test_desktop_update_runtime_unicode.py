@@ -63,11 +63,9 @@ def _run_helper(script: str, home: Path, env_extra: dict[str, str], out: Path) -
     The answer goes through a file, not stdout: under code page 437 or 936 the console cannot
     represent ``ł``, so stdout would lose the very characters under test.
     """
-    # The console code page is under test, not interactive line editing. Avoid
-    # PowerShell's interactive startup and give this unattended probe EOF.
-    result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', f"$out = '{out}'; " + script],
+    result = subprocess.run(['powershell', '-NoProfile', '-Command', f"$out = '{out}'; " + script],
                             env={**os.environ, 'HERMES_HOME': str(home), **env_extra},
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+                            capture_output=True, timeout=120)
     assert result.returncode == 0, (result.stdout + result.stderr).decode('utf-8', 'replace')
     return out.read_text(encoding='utf-8-sig').splitlines()
 
