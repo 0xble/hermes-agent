@@ -178,10 +178,9 @@ def test_receipt_is_recorded_only_on_a_day_the_sender_can_ever_send(marks, monke
 
     t0 = datetime(2026, 10, 6, tzinfo=timezone.utc)
     clock = {"now": t0 + timedelta(hours=9)}
+    # One scenario clock drives consent day, recording and receipt age, so the scenario
+    # cannot expire once the real date passes t0 + MAX_RECEIPT_AGE_SECONDS.
     monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
-    # The receipt age check reads wall time; pin it to the same clock so the scenario
-    # does not expire once the real date passes t0 + MAX_RECEIPT_AGE_SECONDS.
-    monkeypatch.setattr(install_run, "time", SimpleNamespace(time=lambda: clock["now"].timestamp()))
     monkeypatch.setattr("hermes_cli.config.read_raw_config_readonly",
                         lambda: {"telemetry": {"shared_metrics": {"enabled": True, "send": True}}})
     store = store_module.SharedMetricsStore()
@@ -228,6 +227,26 @@ def test_receipt_waits_without_an_open_send_window_and_is_recorded_at_once_when_
     config["send"] = False  # collected on this machine only: nothing waits on a send window
     install_run.report_pending_installs(marks.home)
     assert not receipt.exists() and len(marks.rows) == 1
+
+
+@pytest.mark.parametrize("wall_offset_days", [-3650, 3650], ids=["past", "future"])
+def test_receipt_age_uses_the_store_clock_when_wall_time_disagrees(marks, monkeypatch, wall_offset_days):
+    """A pending receipt ages with the same clock as consent and recording, not the host clock."""
+    t0 = datetime.now(timezone.utc) + timedelta(days=wall_offset_days)
+    clock = {"now": t0}
+    monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
+    marks.store["saves"] = False  # a busy store leaves a fresh receipt pending
+    finished = int(t0.timestamp())
+    receipt = _park(marks.home, _receipt(started_at=finished - 200, finished_at=finished))
+
+    clock["now"] = t0 + timedelta(days=6)
+    install_run.report_pending_installs(marks.home)
+    assert receipt.exists() and marks.rows == []
+
+    clock["now"] = t0 + timedelta(days=8)
+    install_run.report_pending_installs(marks.home)
+    assert not receipt.exists() and marks.rows == []
+    assert not install_run._recorded_latch(marks.home, receipt.stem).exists()
 
 
 def test_unreadable_and_week_old_receipts_are_deleted_unreported(marks):
