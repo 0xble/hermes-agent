@@ -4578,7 +4578,6 @@ class GatewayTurnMixin:
         ask, title, or reply anchor. The outer human contract still owns the terminal verdict.
         """
         from gateway.run import _preserve_queued_followup_history_offset
-
         session_id = response.get("session_id") or turn_ctx.session_id
         await self._refresh_agent_cache_message_count(turn_ctx.session_key, session_id)
         if not turn_ctx._run_still_current():

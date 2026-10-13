@@ -22,19 +22,31 @@ _GATEWAY_SILENCE_RETRY_NOTE = (
 
 @contextmanager
 def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
-    """Scope the recovery note to one execution of the already-resolved (cached) agent.
+    """Scope recovery guidance and its provider-only continuation cue to one execution.
 
-    The note never enters the stable ephemeral prompt that keys the agent cache, so
-    normal -> recovery -> normal reuses one AIAgent. Restored on every exit path."""
+    Neither value enters the stable prompt or durable history: the note is appended to the
+    ephemeral system prompt, while the cue repairs the API-only final user row that the
+    gateway continuation intentionally stages empty. Restored on every exit path."""
     if not ctx.silence_retry:
         yield
         return
     stable = agent.ephemeral_system_prompt
+    wire_attr = "_gateway_silence_retry_wire_message"
+    had_wire_attr = hasattr(agent, wire_attr)
+    previous_wire_message = getattr(agent, wire_attr, None)
     agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
+    setattr(agent, wire_attr, "Continue with the latest genuine user request.")
     try:
         yield
     finally:
         agent.ephemeral_system_prompt = stable
+        if had_wire_attr:
+            setattr(agent, wire_attr, previous_wire_message)
+        else:
+            try:
+                delattr(agent, wire_attr)
+            except AttributeError:
+                pass
 
 
 @dataclass

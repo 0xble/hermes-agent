@@ -432,7 +432,16 @@ async def test_retry_guidance_is_api_only_and_real_compaction_keeps_typed_ask(ha
     wire_calls = h.agent.client.chat.completions.create.call_args_list
     assert _GATEWAY_SILENCE_RETRY_NOTE not in str(wire_calls[0])
     assert _GATEWAY_SILENCE_RETRY_NOTE in str(wire_calls[-1])
-    assert _GATEWAY_SILENCE_RETRY_NOTE not in str(messages)
+    retry_wire_messages = wire_calls[-1].kwargs["messages"]
+    assert retry_wire_messages[-1]["role"] in {"user", "assistant"}
+    wire_cue = retry_wire_messages[-1]["content"]
+    assert wire_cue.strip()
+    for ephemeral in (_GATEWAY_SILENCE_RETRY_NOTE, wire_cue):
+        assert ephemeral not in str(messages)
+    assert not any(
+        row.get("display_kind") == "internal_notification" and row.get("content")
+        for row in messages
+    )
     # The actual compressed-user selector must look past the synthetic empty runtime row.
     compressor = h.agent.context_compressor
     idx = compressor._find_last_user_message_idx(messages, head_end=0)
@@ -446,7 +455,12 @@ async def test_retry_guidance_is_api_only_and_real_compaction_keeps_typed_ask(ha
         h.agent._flush_messages_to_session_db(messages)
         archived_before = db.get_messages_as_conversation("silence-test")
         assert TYPED_TEXT in str(archived_before)
-        assert _GATEWAY_SILENCE_RETRY_NOTE not in str(archived_before)
+        for ephemeral in (_GATEWAY_SILENCE_RETRY_NOTE, wire_cue):
+            assert ephemeral not in str(archived_before)
+        assert not any(
+            row.get("display_kind") == "internal_notification" and row.get("content")
+            for row in archived_before
+        )
         h.agent.compression_enabled = True
         h.agent.compression_in_place = True
         compressor.protect_first_n = 0
@@ -454,9 +468,12 @@ async def test_retry_guidance_is_api_only_and_real_compaction_keeps_typed_ask(ha
         compressor.tail_token_budget = 80
         summary = f"{SUMMARY_PREFIX}\n## Historical task\nUser asked about the brief.\n## Completed Actions\nRead the brief."
         padding = [{"role": "assistant", "content": f"Earlier step {i}: " + "x" * 300} for i in range(24)]
-        with patch.object(compressor, "_generate_summary", return_value=summary):
+        with patch.object(compressor, "_generate_summary", return_value=summary) as summarize:
             compacted, _ = compress_context(h.agent, padding + messages, "You are helpful.",
                                             approx_tokens=90_000, force=True)
+        assert summarize.called
+        for ephemeral in (_GATEWAY_SILENCE_RETRY_NOTE, wire_cue):
+            assert ephemeral not in str(summarize.call_args_list)
         assert len(compacted) < len(padding + messages)
         retained_idx = compressor._find_last_user_message_idx(compacted, head_end=0)
         assert TYPED_TEXT in str(compacted[retained_idx]["content"])
@@ -466,7 +483,10 @@ async def test_retry_guidance_is_api_only_and_real_compaction_keeps_typed_ask(ha
         assert _GATEWAY_SILENCE_RETRY_NOTE not in str(archived_after)
         # Sidecars, archived rows, and live messages must not hide the note either.
         rows = db._conn.execute("SELECT content, api_content FROM messages").fetchall()
-        assert _GATEWAY_SILENCE_RETRY_NOTE not in str(rows)
+        for ephemeral in (_GATEWAY_SILENCE_RETRY_NOTE, wire_cue):
+            assert ephemeral not in str(compacted)
+            assert ephemeral not in str(archived_after)
+            assert ephemeral not in str(rows)
 
 
 @pytest.mark.asyncio

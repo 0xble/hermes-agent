@@ -106,6 +106,7 @@ def _assert_restored(h):
     assert h.runner._agent_cache[SESSION_KEY][0] is agent
     assert agent.ephemeral_system_prompt == "Platform context.\n\nChannel context.\n\nGateway context."
     assert agent._cached_system_prompt == "Frozen conversation prompt."
+    assert not hasattr(agent, "_gateway_silence_retry_wire_message")
     assert all(tools is agent.tools for _, _, _, tools in h.requests)
     assert all(ctx.source is h.event.source for ctx, _ in h.executions)
 
@@ -121,13 +122,50 @@ async def test_recovery_and_next_human_reuse_real_cache(cached_harness, marker):
     calls = h.agent.client.chat.completions.create.call_args_list
     assert _GATEWAY_SILENCE_RETRY_NOTE not in str(calls[0])
     assert _GATEWAY_SILENCE_RETRY_NOTE in str(calls[1])
+    retry_final = calls[1].kwargs["messages"][-1]
+    assert retry_final["role"] == "user" and retry_final["content"].strip()
+    assert retry_final["content"] not in str(result["messages"])
     assert _GATEWAY_SILENCE_RETRY_NOTE not in str(result["messages"])
     # Drive the whole normal → recovery → normal cycle before checking construction count.
     result = await _human_turn(h, ["Next answer."], history=result["messages"])
     assert result["final_response"] == "Next answer."
     assert _GATEWAY_SILENCE_RETRY_NOTE not in str(h.agent.client.chat.completions.create.call_args_list[-1])
+    assert retry_final["content"] not in str(h.agent.client.chat.completions.create.call_args_list[-1])
     assert [ctx.silence_retry for ctx, _ in h.executions] == [False, True, False]
     _assert_restored(h)
+
+
+@pytest.mark.parametrize(("retry", "kind", "content", "expect_cue"), [
+    (True, "internal_notification", "", True),
+    (False, "internal_notification", "", False),
+    (True, None, "", False),
+    (True, "internal_notification", "A folded human request.", False),
+    (False, None, "A normal human request.", False),
+])
+def test_wire_cue_is_scoped_to_empty_internal_recovery(harness, retry, kind, content, expect_cue):
+    from copy import deepcopy
+    from agent.turn_context import build_api_messages
+    from gateway.turn_context import TurnContext, silence_retry_prompt
+
+    agent = harness.agent
+    agent._current_turn_timestamp = 1.0
+    messages = [{"role": "assistant", "content": "NO_REPLY"},
+                {"role": "user", "content": content}]
+    if kind:
+        messages[-1]["display_kind"] = kind
+    frozen = deepcopy(messages)
+    with silence_retry_prompt(agent, TurnContext(silence_retry=retry)):
+        wire, _ = build_api_messages(
+            agent, messages, current_turn_user_idx=1, ext_prefetch_cache="",
+            plugin_user_context="", moa_config=None, active_system_prompt="Fixed system prompt.",
+        )
+        assert wire[-1]["role"] == "user"
+        if expect_cue:
+            assert wire[-1]["content"].strip() and wire[-1]["content"] != content
+        else:
+            assert wire[-1]["content"] == content
+    assert messages == frozen
+    assert not hasattr(agent, "_gateway_silence_retry_wire_message")
 
 
 @pytest.mark.asyncio
