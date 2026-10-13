@@ -2915,16 +2915,18 @@ class GatewayNotificationsMixin:
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
-    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> None:
+    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> bool:
         from gateway.run import _non_conversational_metadata
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
         if adapter and chat_id:
             with _log_suppressed(logging.ERROR, "Watcher delivery error: %s"):
                 send_meta = {"thread_id": thread_id} if thread_id else None
-                await adapter.send(
+                result = await adapter.send(
                     chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                 )
+                return bool(result.success)
+        return False
 
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
@@ -3041,6 +3043,8 @@ class GatewayNotificationsMixin:
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
+                    if getattr(session, "survive_restart", False) and process_registry._claim_survivor_delivery(session):
+                        process_registry._mark_survivor_delivered(session)
                     break
                 continue
             current_output_len = len(session.output_buffer)
@@ -3048,7 +3052,11 @@ class GatewayNotificationsMixin:
             last_output_len = current_output_len
             if session.exited:
                 # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
+                # Claim before admission; while a live peer gateway holds the claim, wait so
+                # this watcher can reclaim the completion if that peer dies before delivering.
                 if getattr(session, "survive_restart", False) and not process_registry._claim_survivor_delivery(session):
+                    if process_registry._survivor_delivery_pending(session):
+                        continue
                     break
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
@@ -3076,9 +3084,10 @@ class GatewayNotificationsMixin:
                     admitted = await delivery
                     if admitted is False:
                         # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
+                        # of suppressing the result. Only this claim owner may return it to pending.
+                        process_registry.release_survivor_completion(session_id)
                         continue
-                    if admitted is True:
+                    if admitted is not False:
                         acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
@@ -3088,17 +3097,32 @@ class GatewayNotificationsMixin:
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
+                    if getattr(session, "survive_restart", False):
+                        process_registry._mark_survivor_delivered(session)
                     break
                 if notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and session.exit_code not in {0, None}
                 ):
                     message_text = self._format_process_final_message(session_id, session, notify_mode)
                     from gateway.warning_notifications import present_notification
+                    sent = True  # policy suppression is deliberate consumption, not transport failure
+
+                    async def send_final():
+                        nonlocal sent
+                        sent = await self._send_watcher_message(
+                            platform_name, chat_id, thread_id, message_text, watcher)
+
                     async with self._completion_event_scope(watcher):
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
-                        await present_notification(
-                            lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
-                            platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                        await present_notification(send_final, platform=platform_name,
+                                                   diagnostic=session.exit_code not in {0, None})
+                    if sent is False and getattr(session, "survive_restart", False):
+                        process_registry.release_survivor_completion(session_id)
+                        continue
+                # Presented, or deliberately suppressed by the notification mode: either way the
+                # claimed survivor completion is settled and must not replay on a successor.
+                if getattr(session, "survive_restart", False):
+                    process_registry.acknowledge_survivor_completion(session_id)
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers

@@ -16,11 +16,24 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 - Boot adoption matches the checkpoint by container or owner identity, restores
   the live process without rerunning the command, and polls for its completion.
   A gone process without an exit file emits a `lost`
-  completion with `survivor_lost` provenance. Enqueueing is not delivery: pending
-  completions stay checkpointed and replay after a crash. The delivered marker is
-  written only after a CLI/TUI consumer renders or admits the event; delivered
-  markers suppress restart replays. Shutdown fences survivor pollers
-  before teardown. Run directories are pruned after acknowledged-result retention
+  completion with `survivor_lost` provenance. A checkpointed survivor whose PID
+  start time positively mismatches (`reused`) is never adopted, supervised, or
+  signalled: a recorded exit file is reported once; otherwise the stale entry and
+  its run directory are discarded without a `lost` notice.
+  Enqueueing is not delivery: pending completions stay checkpointed and replay
+  after a crash. Delivery is one flock-guarded marker transition,
+  pending -> `claimed` (owner PID, start time, per-registry nonce) -> `delivered`.
+  A consumer (CLI/TUI drain, gateway watcher) takes the exclusive claim BEFORE
+  render/admission and only that owner may settle or release it. A known failed
+  send/admission releases the claim and keeps the completion retryable. A peer
+  facing a live owner's claim retains its offer; a claim whose owner is gone,
+  recycled, or an exec'd predecessor (same PID, unknown nonce) is reclaimed.
+  This is an owner-lifetime lease: slow live owners are never overtaken by a
+  timeout. A crash before rendering/admission retries; a crash after external
+  delivery but before its marker is written has an ambiguous outcome and may
+  replay (the transport and marker are not one transaction). Delivered markers
+  suppress restart replays. Shutdown fences survivor pollers before teardown.
+  Run directories are pruned after acknowledged-result retention
   expires, and immediately on spawn failure. Log polls read only a bounded tail.
 - `gateway_shutdown` (both restart and an operator gateway stop) leaves opted-in
   processes running. Explicit operator stop paths (`process.kill`, `cli.stop`,

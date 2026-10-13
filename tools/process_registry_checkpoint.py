@@ -97,6 +97,9 @@ class ProcessCheckpointMixin:
             # do not adopt it and do not signal it.
             fate = self._detached_host_fate(pid, entry.get("host_start_time"))
             survivor = bool(entry.get("survive_restart"))
+            # A survivor whose PID was recycled is never adopted, supervised, or signalled
+            # either. Only a result its wrapper already recorded is reported (once, via the
+            # delivery claim); without one the stale entry is discarded like any other.
             if fate == "reused" and not survivor:
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
@@ -114,16 +117,32 @@ class ProcessCheckpointMixin:
                     unresolved_scope_entries.append(entry)
                 continue
             fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
+            recycled_exit = None
+            if fate == "reused":
+                recycled_exit = self._recorded_survivor_exit(fields.get("exit_path"))
+                if recycled_exit is None:
+                    logger.info(
+                        "Not recovering survivor %s: pid %d was recycled onto an unrelated "
+                        "process and no exit was recorded; discarding the stale entry.",
+                        entry.get("session_id", "?"), pid)
+                    self._remove_survivor_run_dir(ProcessSession(
+                        id=entry["session_id"], command="", log_path=fields.get("log_path", "")))
+                    continue
             fields.update(
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
             # detached: can't read output, but can report status + kill
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            if recycled_exit is not None:
+                session.pid = None  # never signal or probe the recycled PID
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+            if recycled_exit is not None:
+                self._finish_survivor(session, recycled_exit, "exited", "")
+                continue
             if session.survive_restart:
                 from contextvars import copy_context
                 poller = threading.Thread(

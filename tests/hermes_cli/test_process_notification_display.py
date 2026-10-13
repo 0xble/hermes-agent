@@ -1,4 +1,5 @@
 """Background-process completions paint a compact title while the model keeps the raw wall."""
+import json
 import queue
 from pathlib import Path
 import threading
@@ -23,7 +24,8 @@ def _event(sid, exit_code, command="cd /tmp && bash long-build.sh"):
     return {"type": "completion", "session_id": sid, "session_key": "display-session", "command": command,
             "exit_code": exit_code, "completion_reason": "exited", "output": "web tsc=0\nSECRET_OUTPUT_LINE"}
 
-def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["concise", "off"])
+def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch, mode):
     home = tmp_path / "home"
     monkeypatch.setattr("tools.process_registry.get_hermes_home", lambda: home)
     registry = ProcessRegistry()
@@ -35,18 +37,24 @@ def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch):
     registry._running[session.id] = session
     event = _event(session.id, 3, command="make test")
     registry.completion_queue.put(event)
-
-    drained = registry.drain_notifications(session_key="display-session")
-    rendered = ProcessNotificationBatch(tuple(drained)).render(registry)
-
-    assert rendered is not None
-    assert "exit code 3" in rendered
-    assert not Path(session.delivered_path).exists()
     monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr("cli.CLI_CONFIG", {"display": {"background_process_notifications": mode}})
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "claimed")
+    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda *a: None)
     cli = HermesCLI.__new__(HermesCLI)
-    unwrapped, _is_voice, _is_seeded = cli._tui_unwrap_input(ProcessNotificationBatch(tuple(drained)))
-    assert unwrapped is not None
-    assert Path(session.delivered_path).exists()
+    cli.session_id = "display-session"
+    cli._pending_input = queue.Queue()
+    cli._drain_process_notifications("cli-post-turn")
+    if mode == "off":
+        assert cli._pending_input.empty()
+    else:
+        batch = cli._pending_input.get_nowait()
+        rendered = batch.render(registry)
+        assert rendered is not None and "exit code 3" in rendered
+        assert json.loads(Path(session.delivered_path).read_text())["state"] == "claimed"
+        unwrapped, _is_voice, _is_seeded = cli._tui_unwrap_input(batch)
+        assert unwrapped is not None
+    assert json.loads(Path(session.delivered_path).read_text())["state"] == "delivered"
 
 
 @pytest.mark.parametrize("mode,expect_injected", [("off", False), ("concise", True), ("all", True)])

@@ -1682,7 +1682,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
             self._write_checkpoint()
         if was_running and session.notify_on_complete:
-            if session.survive_restart and not self._claim_survivor_delivery(session):
+            # Enqueueing is not delivery: only a consumer claims (before render) and acks (after).
+            if session.survive_restart and not self._survivor_delivery_pending(session):
                 return
             notification = {
                 "type": "completion",
@@ -1978,7 +1979,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if text := format_process_notification(evt):
                 if evt.get("type") == "completion":
                     session = self.get(_evt_sid)
+                    # Claim BEFORE handing the event to a renderer; the consumer acks after render.
                     if session is not None and session.survive_restart and not self._claim_survivor_delivery(session):
+                        # A live peer holds the claim: keep our copy so we can reclaim if it dies.
+                        if self._survivor_delivery_pending(session):
+                            requeue.append(evt)
                         continue
                 results.append((evt, text))
         for evt in requeue:
@@ -2154,7 +2159,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if exited and observed_completion_output and not finalizing:
             self._completion_consumed.add(session_id)
-            self.acknowledge_survivor_completion(session_id)
+            self._consume_survivor_completion(session_id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2189,7 +2194,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             result = None
             if session.exited and not self._reader_finalizing(session):
                 self._completion_consumed.add(session_id)
-                self.acknowledge_survivor_completion(session_id)
+                self._consume_survivor_completion(session_id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -2268,7 +2273,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             # the explicit kill result, matching wait/log consumption.
             if consume_output and not finalizing:
                 self._completion_consumed.add(session_id)
-                self.acknowledge_survivor_completion(session_id)
+                self._consume_survivor_completion(session_id)
             session._kill_deadline = previous_kill_deadline
             return result
         # Keep an additive receipt before a restart/shutdown signal can outlive this
@@ -2357,7 +2362,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             session._kill_requested = False
             if (consume_output and session.exited and session_id in self._completion_consumed
                     and (deadline is None or time.monotonic() < deadline)):
-                self.acknowledge_survivor_completion(session_id)
+                self._consume_survivor_completion(session_id)
 
     @staticmethod
     def _stop_scope(session: ProcessSession, deadline: Optional[float] = None) -> bool:

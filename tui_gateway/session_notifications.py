@@ -585,14 +585,29 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
     if dedup_key not in emitted:
+        claim_survivor = getattr(registry, "claim_survivor_completion", None)
+        if evt_type == "completion" and claim_survivor is not None and not claim_survivor(evt.get("session_id", "")):
+            # A live peer owns delivery: retain our offer without rendering or starting a turn.
+            process = registry.get(evt.get("session_id", ""))
+            if process is not None and registry._survivor_delivery_pending(process):
+                (deferred.append if deferred is not None else queue.put)(evt)
+                if deferred is None:
+                    time.sleep(0.1)
+            return True
         from tools.process_registry_notifications import (
             acknowledge_survivor_notifications, async_delegation_display_text, process_completion_display_text)
         display_text = (async_delegation_display_text(evt) if is_delegation
                         else process_completion_display_text([evt]) if evt_type == "completion" else text)
         from agent.notification_presentation import diagnostic_process_event
         from gateway.warning_notifications import render_notification
-        render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
-                            platform="tui", diagnostic=diagnostic_process_event(evt))
+        try:
+            render_notification(lambda: _emit("status.update", sid, {"kind": "process", "text": display_text}),
+                                platform="tui", diagnostic=diagnostic_process_event(evt))
+        except Exception:
+            release_survivor = getattr(registry, "release_survivor_completion", None)
+            if release_survivor is not None and release_survivor(evt.get("session_id", "")):
+                queue.put(evt)
+            raise
         acknowledge_survivor_notifications(registry, ((evt, text),))
         emitted.add(dedup_key)
     if evt_type != "async_delegation" and _background_notifications_off(session):

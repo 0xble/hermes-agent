@@ -365,7 +365,7 @@ async def test_survivor_notification_acknowledges_only_successful_gateway_admiss
     attempts = []
 
     async def admit(_text, _event, **kwargs):
-        assert not (run_dir / "delivered").exists()
+        assert json.loads((run_dir / "delivered").read_text())["state"] == "claimed"
         attempts.append("admit")
         return len(attempts) > 1
 
@@ -476,4 +476,116 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
 
     adapter.send.assert_not_awaited()
 
+
+
+
+@pytest.mark.asyncio
+async def test_survivor_watcher_does_not_admit_completion_claimed_by_live_peer(tmp_path, monkeypatch):
+    """A peer gateway's unacknowledged claim fences admission; its ack ends the watcher."""
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_peer"
+    run_dir.mkdir(parents=True)
+
+    def survivor():
+        return ProcessSession(id="proc_peer", command="echo ok", task_id="task", session_key="session",
+                              survive_restart=True, exited=True, exit_code=0, notify_on_complete=True,
+                              log_path=str(run_dir / "out.log"), delivered_path=str(run_dir / "delivered"),
+                              output_buffer="ok")
+
+    peer, registry = ProcessRegistry(), ProcessRegistry()
+    peer._finished["proc_peer"] = survivor()
+    registry._finished["proc_peer"] = survivor()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    assert peer._claim_survivor_delivery(peer._finished["proc_peer"]) is True
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "off"
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    admitted = []
+    runner._enqueue_process_completion_notification = AsyncMock(side_effect=lambda *a, **k: admitted.append(a) or True)
+    runner._build_process_completion_event = lambda *_: {"type": "completion", "session_id": "proc_peer",
+                                                         "output": "ok", "command": "echo ok",
+                                                         "exit_code": 0, "task_id": "task"}
+    watcher = asyncio.ensure_future(runner._run_process_watcher({
+        "session_id": "proc_peer", "check_interval": 0.01, "notify_on_complete": True,
+    }))
+    await asyncio.sleep(0.1)
+    assert admitted == []
+    peer.acknowledge_survivor_completion("proc_peer")
+    await asyncio.wait_for(watcher, timeout=5)
+    assert admitted == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["concise", "off"])
+async def test_survivor_text_watcher_acknowledges_after_presenting(tmp_path, monkeypatch, mode):
+    """The text-only watcher claims before sending and settles the claim after it."""
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_text"
+    run_dir.mkdir(parents=True)
+    registry = ProcessRegistry()
+    registry._finished["proc_text"] = ProcessSession(
+        id="proc_text", command="echo ok", task_id="task", session_key="session", survive_restart=True,
+        exited=True, exit_code=0, log_path=str(run_dir / "out.log"),
+        delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    runner, _ = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: mode
+    sent = []
+
+    async def send(*args):
+        sent.append(json.loads((run_dir / "delivered").read_text())["state"])
+
+    runner._send_watcher_message = send
+    await runner._run_process_watcher({"session_id": "proc_text", "check_interval": 0.01})
+    assert sent == ([] if mode == "off" else ["claimed"])
+    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_survivor_text_watcher_retries_failed_send_before_acknowledging(tmp_path, monkeypatch):
+    import asyncio
+    import contextlib
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    run_dir = home / "process-runs" / "proc_retry"
+    run_dir.mkdir(parents=True)
+    registry = ProcessRegistry()
+    registry._finished["proc_retry"] = ProcessSession(
+        id="proc_retry", command="echo ok", task_id="task", session_key="session", survive_restart=True,
+        exited=True, exit_code=0, log_path=str(run_dir / "out.log"),
+        delivered_path=str(run_dir / "delivered"), output_buffer="ok")
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    runner, adapter = make_restart_runner()
+    runner._completion_event_scope = lambda _: contextlib.nullcontext()
+    runner._load_background_notifications_mode = lambda: "concise"
+    runner._build_process_event_source = lambda _: make_restart_source(chat_id="123")
+    runner._resolve_injection_adapter = lambda *_: adapter
+    sent = []
+
+    async def send(*args, **kwargs):
+        sent.append(json.loads((run_dir / "delivered").read_text())["state"])
+        return SendResult(success=len(sent) > 1)
+
+    adapter.send = send
+    await asyncio.wait_for(runner._run_process_watcher({
+        "session_id": "proc_retry", "check_interval": 0.01,
+        "platform": "telegram", "chat_id": "123"}), timeout=5)
+    assert sent == ["claimed", "claimed"]
+    assert json.loads((run_dir / "delivered").read_text())["delivered"] is True
 

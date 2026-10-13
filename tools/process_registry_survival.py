@@ -17,6 +17,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Claim nonces of registries alive in this process image. An exec'd predecessor keeps
+# the PID and start time but not this set, so its unacknowledged claims are stale.
+_LIVE_CLAIM_NONCES: set[str] = set()
+
 
 class ProcessSurvivalMixin:
     """Keep restart survival separate from ordinary pipe/PTY process supervision."""
@@ -93,51 +97,164 @@ class ProcessSurvivalMixin:
         except OSError:
             logger.debug("Could not prune survivor run directory %s", run_dir, exc_info=True)
 
-    def _survivor_delivery_state(self, session: ProcessSession) -> str | None:
-        if not session.delivered_path:
-            return None
+    @staticmethod
+    def _read_survivor_marker(session: ProcessSession) -> dict | None:
+        """The delivery marker: absent (pending), a claim with its owner, or delivered."""
         try:
             payload = json.loads(Path(session.delivered_path).read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                return "claimed"
         except FileNotFoundError:
             return None
         except (OSError, ValueError, TypeError):
-            return "claimed"
-        if payload.get("delivered") is True or payload.get("state") == "delivered":
-            return "delivered"
-        return "claimed"
+            return {"state": "claimed"}
+        return payload if isinstance(payload, dict) else {"state": "claimed"}
 
-    def _claim_survivor_delivery(self, session: ProcessSession) -> bool:
-        """A queued event is not delivered: a successor may replay it after a crash."""
-        return self._survivor_delivery_state(session) != "delivered"
+    @staticmethod
+    def _marker_delivered(payload: dict | None) -> bool:
+        return payload is not None and (payload.get("delivered") is True or payload.get("state") == "delivered")
 
-    def _mark_survivor_delivered(self, session: ProcessSession) -> bool:
-        """Acknowledge consumption/admission; exclusively dedup subsequent drains."""
+    def _survivor_delivery_state(self, session: ProcessSession) -> str | None:
         if not session.delivered_path:
-            return True
-        try:
-            import fcntl
-            from utils import atomic_json_write
+            return None
+        payload = self._read_survivor_marker(session)
+        if payload is None:
+            return None
+        return "delivered" if self._marker_delivered(payload) else "claimed"
+
+    def _survivor_claim_owner(self) -> dict:
+        """This registry's claim identity: host PID + start time + a per-registry nonce.
+
+        The nonce separates registries sharing a PID (tests, multiplexers) and an
+        exec'd predecessor, which keeps both the PID and its start time.
+        """
+        nonce = getattr(self, "_survivor_claim_nonce", None)
+        if nonce is None:
+            import uuid
+            import weakref
+            nonce = self._survivor_claim_nonce = uuid.uuid4().hex
+            _LIVE_CLAIM_NONCES.add(nonce)
+            weakref.finalize(self, _LIVE_CLAIM_NONCES.discard, nonce)
+        pid = os.getpid()
+        return {"pid": pid, "start": self._safe_host_start_time(pid), "nonce": nonce}
+
+    def _survivor_claim_is_live(self, owner) -> bool:
+        """Whether a recorded claim still has a live owner that will deliver it.
+
+        Owner-lifetime lease: a slow live owner must never be overtaken by an
+        expiry timeout (that would double deliver). A crashed owner's PID is
+        gone or recycled, so its claim is stale.
+        """
+        if not isinstance(owner, dict):
+            return False  # unreadable claims have no owner left to wait for
+        pid = owner.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        if pid == os.getpid():
+            return owner.get("nonce") in _LIVE_CLAIM_NONCES
+        return self._host_pid_is_ours(pid, owner.get("start"))
+
+    def _survivor_delivery_lock(self, session: ProcessSession):
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def held():
             path = Path(session.delivered_path)
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(path.with_name("delivery.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
             with os.fdopen(fd, "w") as lock_file:
                 fcntl.flock(lock_file, fcntl.LOCK_EX)
-                if self._survivor_delivery_state(session) == "delivered":
+                yield path
+        return held()
+
+    def _survivor_delivery_pending(self, session: ProcessSession) -> bool:
+        """Read-only producer check: a queued event is not delivered and may replay after a crash."""
+        return self._survivor_delivery_state(session) != "delivered"
+
+    def _claim_survivor_delivery(self, session: ProcessSession) -> bool:
+        """Atomically claim the right to render/admit this completion, before doing so.
+
+        flock serializes the marker transition across processes: pending -> claimed(owner)
+        -> delivered. Exactly one live registry holds the claim; the consumer writes
+        ``delivered`` after render/admission. A claim whose owner died before
+        delivery is reclaimed by a successor. Re-claiming one's own claim is
+        idempotent (retries); an ambiguous post-delivery crash may replay.
+        """
+        if not session.delivered_path:
+            return True
+        try:
+            from utils import atomic_json_write
+            mine = self._survivor_claim_owner()
+            with self._survivor_delivery_lock(session) as path:
+                payload = self._read_survivor_marker(session)
+                if self._marker_delivered(payload):
                     return False
-                # A crash may leave an unacknowledged claim, never a partial delivered marker.
+                if payload is not None:
+                    owner = payload.get("owner")
+                    if (isinstance(owner, dict) and owner.get("nonce") == mine["nonce"]
+                            and owner.get("pid") == mine["pid"]):
+                        return True
+                    if self._survivor_claim_is_live(owner):
+                        return False
+                atomic_json_write(path, {"state": "claimed", "owner": mine}, mode=0o600, fsync_dir=True)
+            return True
+        except OSError:
+            # Fail closed: an unwritable claim must not let two gateways both deliver.
+            logger.warning("Could not claim survivor completion %s", session.id, exc_info=True)
+            return False
+
+    def claim_survivor_completion(self, session_id: str) -> bool:
+        """Fence a consumer before rendering/admission; ordinary completions need no lease."""
+        session = self.get(session_id)
+        return session is None or not session.survive_restart or self._claim_survivor_delivery(session)
+
+    def release_survivor_completion(self, session_id: str) -> bool:
+        """Return failed delivery to pending, only while we still own its lease."""
+        session = self.get(session_id)
+        if session is None or not session.survive_restart or not session.delivered_path:
+            return False
+        try:
+            mine = self._survivor_claim_owner()
+            with self._survivor_delivery_lock(session) as path:
+                payload = self._read_survivor_marker(session) or {}
+                owner = payload.get("owner")
+                if (payload.get("state") != "claimed" or not isinstance(owner, dict)
+                        or owner.get("nonce") != mine["nonce"] or owner.get("pid") != mine["pid"]):
+                    return False
+                path.unlink()
+            return True
+        except OSError:
+            logger.warning("Could not release survivor completion %s", session.id, exc_info=True)
+            return False
+
+    def _mark_survivor_delivered(self, session: ProcessSession) -> bool:
+        """Only the claim owner acknowledges delivery, even when another owner died."""
+        if not session.delivered_path:
+            return True
+        try:
+            from utils import atomic_json_write
+            mine = self._survivor_claim_owner()
+            with self._survivor_delivery_lock(session) as path:
+                payload = self._read_survivor_marker(session) or {}
+                owner = payload.get("owner")
+                if (payload.get("state") != "claimed" or not isinstance(owner, dict)
+                        or owner.get("nonce") != mine["nonce"] or owner.get("pid") != mine["pid"]):
+                    return False
                 atomic_json_write(path, {"state": "delivered", "delivered": True}, mode=0o600, fsync_dir=True)
             self._write_checkpoint()
             return True
         except OSError:
             logger.warning("Could not record delivered survivor completion %s", session.id, exc_info=True)
-            return True
+            return False
 
     def acknowledge_survivor_completion(self, session_id: str) -> None:
         session = self.get(session_id)
         if session is not None and session.survive_restart:
             self._mark_survivor_delivered(session)
+
+    def _consume_survivor_completion(self, session_id: str) -> None:
+        """An explicit wait/log claims first rather than settling a peer's lease."""
+        if self.claim_survivor_completion(session_id):
+            self.acknowledge_survivor_completion(session_id)
 
     def _read_survivor_log(self, session: ProcessSession) -> None:
         """Append only bytes not read on the previous poll, bounded on recovery."""
@@ -266,6 +383,20 @@ class ProcessSurvivalMixin:
                 self._finish_survivor_if_allowed(session, None, "lost", "survivor_lost")
                 return
             time.sleep(0.1)
+
+    @staticmethod
+    def _recorded_survivor_exit(exit_path: str | None) -> int | None:
+        """The wrapper's recorded exit code, or None when it never wrote one."""
+        try:
+            text = Path(exit_path).read_text(encoding="utf-8", errors="replace").strip() if exit_path else ""
+        except OSError:
+            return None
+        if not text:
+            return None
+        try:
+            return int(text.splitlines()[-1])
+        except ValueError:
+            return -1
 
     def _finish_survivor(self, session: ProcessSession, exit_code, reason: str, source: str) -> None:
         self._read_survivor_log(session)

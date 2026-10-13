@@ -181,6 +181,7 @@ def test_survivor_delivered_marker_suppresses_restart_replay(tmp_path, monkeypat
     home = _home(monkeypatch, tmp_path)
     producer = ProcessRegistry()
     session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="delivered\\n")
+    assert producer._claim_survivor_delivery(session) is True
     producer._mark_survivor_delivered(session)
     successor = ProcessRegistry()
     assert successor.recover_from_checkpoint() == 1
@@ -194,6 +195,7 @@ def test_survivor_run_dir_pruned_after_delivered_session_ages_out(tmp_path, monk
     session = _checkpoint_survivor(registry, home, pid=999999, exit_code=0)
     from tools.process_registry import FINISHED_TTL_SECONDS
     session.started_at = time.time() - FINISHED_TTL_SECONDS - 1
+    assert registry._claim_survivor_delivery(session) is True
     registry._mark_survivor_delivered(session)
     session.exited = True
     registry._running.pop(session.id, None)
@@ -210,6 +212,7 @@ def test_survivor_delivered_artifacts_are_pruned_on_boot_after_ttl(tmp_path, mon
     home = _home(monkeypatch, tmp_path)
     producer = ProcessRegistry()
     session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0)
+    assert producer._claim_survivor_delivery(session) is True
     producer._mark_survivor_delivered(session)
     marker = Path(session.delivered_path)
     expired = time.time() - FINISHED_TTL_SECONDS - 1
@@ -306,7 +309,7 @@ def test_shutdown_stops_survivor_poller_before_it_claims_delivery(tmp_path, monk
     session.process = None
     monkeypatch.setattr(registry, "_detached_host_fate", lambda *_args: "running")
     claimed = []
-    monkeypatch.setattr(registry, "_claim_survivor_delivery", lambda _session: claimed.append(True) or True)
+    monkeypatch.setattr(registry, "_survivor_delivery_pending", lambda _session: claimed.append(True) or True)
 
     registry.stop_survivor_pollers()
     registry._survivor_poller_loop(session)
@@ -335,6 +338,7 @@ def test_recovered_survivor_emits_single_completion_with_exit_code(tmp_path, mon
     time.sleep(0.1)
     assert recovered.completion_queue.empty()
     assert not (home / "process-runs" / session.id / "delivered").exists()
+    assert recovered.claim_survivor_completion(session.id) is True
     recovered.acknowledge_survivor_completion(session.id)
     assert json.loads((home / "process-runs" / session.id / "delivered").read_text())["delivered"] is True
     snapshot = recovered.poll(session.id)
@@ -454,6 +458,7 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
     assert event["exit_code"] == 9
     assert "SURVIVOR_BOOT_OK" in event["output"]
     assert recovered.completion_queue.empty()
+    assert recovered.claim_survivor_completion(session_id) is True
     recovered.acknowledge_survivor_completion(session_id)
     # Even replaying the old checkpoint cannot duplicate an acknowledged completion.
     (home / "processes.json").write_text(checkpoint)
@@ -461,3 +466,146 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
     assert again.recover_from_checkpoint() == 1
     time.sleep(0.2)
     assert again.completion_queue.empty()
+
+
+def _ready_successors(home, monkeypatch, count=2, **survivor):
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="one result\n", **survivor)
+    successors = [ProcessRegistry() for _ in range(count)]
+    for successor in successors:
+        assert successor.recover_from_checkpoint() == 1
+        recovered = successor.get(session.id)
+        assert recovered is not None and recovered._completion_event.wait(5)
+    return session, successors
+
+
+def test_survivor_claim_is_exclusive_before_any_consumer_acknowledges(tmp_path, monkeypatch):
+    """Two live successors must not both hand the same completion to a renderer."""
+    home = _home(monkeypatch, tmp_path)
+    session, (first, second) = _ready_successors(home, monkeypatch)
+    assert len(first.drain_notifications(session_key="session")) == 1
+    # first has not rendered/acknowledged yet: its claim alone must fence second.
+    assert second.drain_notifications(session_key="session") == []
+    claim = json.loads((home / "process-runs" / session.id / "delivered").read_text())
+    assert claim["state"] == "claimed" and claim["owner"]["pid"]
+    first.acknowledge_survivor_completion(session.id)
+    assert second.drain_notifications(session_key="session") == []
+    assert second.completion_queue.empty()
+
+
+@pytest.mark.parametrize("owner_alive", [True, False])
+def test_survivor_only_claim_owner_can_settle_or_release(tmp_path, monkeypatch, owner_alive):
+    home = _home(monkeypatch, tmp_path)
+    session, (first, second) = _ready_successors(home, monkeypatch)
+    assert len(first.drain_notifications(session_key="session")) == 1
+    marker = home / "process-runs" / session.id / "delivered"
+    claim = json.loads(marker.read_text())
+    monkeypatch.setattr(second, "_survivor_claim_is_live", lambda _owner: owner_alive)
+    # An unrelated acknowledgement cannot settle even an abandoned claim: it must
+    # first win a new claim, not pretend to acknowledge the old owner's delivery.
+    assert second._mark_survivor_delivered(second.get(session.id)) is False
+    assert second.release_survivor_completion(session.id) is False
+    assert json.loads(marker.read_text()) == claim
+    assert first.release_survivor_completion(session.id) is True
+    assert not marker.exists()
+    assert len(second.drain_notifications(session_key="session")) == 1
+    second.acknowledge_survivor_completion(session.id)
+    assert json.loads(marker.read_text())["delivered"] is True
+
+
+def test_survivor_concurrent_drainers_deliver_exactly_once(tmp_path, monkeypatch):
+    import threading
+
+    home = _home(monkeypatch, tmp_path)
+    session, successors = _ready_successors(home, monkeypatch, count=4)
+    barrier = threading.Barrier(len(successors))
+    delivered = []
+
+    def drain(registry):
+        barrier.wait()
+        delivered.extend(registry.drain_notifications(session_key="session"))
+
+    threads = [threading.Thread(target=drain, args=(registry,)) for registry in successors]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert len(delivered) == 1
+
+
+def test_survivor_claim_by_crashed_owner_is_reclaimed_once(tmp_path, monkeypatch):
+    """A crash between claim and delivered must still allow exactly one later delivery."""
+    import sys
+    import textwrap
+
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=0, log_text="after crash\n")
+    crashed = subprocess.run([sys.executable, "-c", textwrap.dedent(f"""
+        import os
+        from pathlib import Path
+        import tools.process_registry as module
+        module.get_hermes_home = lambda: Path({str(home)!r})
+        registry = module.ProcessRegistry()
+        assert registry.recover_from_checkpoint() == 1
+        assert registry.get({session.id!r})._completion_event.wait(5)
+        assert len(registry.drain_notifications(session_key="session")) == 1
+        os._exit(0)  # crash after claim, before render/acknowledgement
+    """)], capture_output=True, text=True, timeout=20)
+    assert crashed.returncode == 0, crashed.stderr
+    claim = json.loads((home / "process-runs" / session.id / "delivered").read_text())
+    assert claim["state"] == "claimed"
+    successor = ProcessRegistry()
+    assert successor.recover_from_checkpoint() == 1
+    assert successor.get(session.id)._completion_event.wait(5)
+    events = successor.drain_notifications(session_key="session")
+    assert len(events) == 1 and "after crash" in events[0][0]["output"]
+    successor.acknowledge_survivor_completion(session.id)
+    assert json.loads((home / "processes.json").read_text()) == []
+    again = ProcessRegistry()
+    again.recover_from_checkpoint()
+    time.sleep(0.2)
+    assert again.drain_notifications(session_key="session") == []
+
+
+def test_survivor_claim_by_execd_predecessor_in_same_pid_is_reclaimed(tmp_path, monkeypatch):
+    """An in-place exec keeps the PID and start time; an unknown registry nonce is not live."""
+    import os
+
+    home = _home(monkeypatch, tmp_path)
+    session, (successor,) = _ready_successors(home, monkeypatch, count=1)
+    stale = {"state": "claimed", "owner": {"pid": os.getpid(), "start": ProcessRegistry._safe_host_start_time(os.getpid()),
+                                            "nonce": "predecessor-image"}}
+    (home / "process-runs" / session.id / "delivered").write_text(json.dumps(stale))
+    assert len(successor.drain_notifications(session_key="session")) == 1
+
+
+def test_reused_pid_survivor_without_exit_file_is_not_adopted(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, log_text="stale\n")
+    successor = ProcessRegistry()
+    monkeypatch.setattr(successor, "_detached_host_fate", lambda *_args: "reused")
+    signalled = []
+    monkeypatch.setattr("os.kill", lambda *args: signalled.append(args))
+    assert successor.recover_from_checkpoint() == 0
+    assert successor.get(session.id) is None
+    time.sleep(0.2)
+    assert successor.completion_queue.empty()
+    assert signalled == []
+    assert json.loads((home / "processes.json").read_text()) == []
+
+
+def test_reused_pid_survivor_with_exit_file_reports_real_result_without_supervision(tmp_path, monkeypatch):
+    home = _home(monkeypatch, tmp_path)
+    producer = ProcessRegistry()
+    session = _checkpoint_survivor(producer, home, pid=999999, exit_code=4, log_text="finished\n")
+    successor = ProcessRegistry()
+    monkeypatch.setattr(successor, "_detached_host_fate", lambda *_args: "reused")
+    successor.recover_from_checkpoint()
+    recovered = successor.get(session.id)
+    # Finished synchronously: no poller ever supervises the recycled PID.
+    assert recovered is not None and recovered.exited and recovered._reader_thread is None
+    event = successor.completion_queue.get(timeout=1)
+    assert event["exit_code"] == 4 and event["completion_reason"] == "exited"
+    assert successor.completion_queue.empty()
