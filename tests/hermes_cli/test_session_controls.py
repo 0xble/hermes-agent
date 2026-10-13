@@ -994,6 +994,46 @@ def test_replace_followed_by_a_line_break_correction_falls_back_to_approval(stat
 
 
 @pytest.mark.parametrize("message,quote", [
+    ("Please replace the target goal with writing docs, actually keep the current goal",
+     "replace the target goal with writing docs"),
+    ("Replace the target goal with writing docs and actually keep the current goal",
+     "Replace the target goal with writing docs"),
+    ("Replace the target goal with writing docs \u2014 no wait, keep it",
+     "Replace the target goal with writing docs"),
+    ("Replace the target goal with writing docs instead of the release",
+     "Replace the target goal with writing docs"),
+])
+def test_replace_with_a_correcting_clause_falls_back_to_approval(state, message, quote):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    state.set_session_title("target", "Target")
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", message)
+    result = apply_control("goal", "replace", "target", requester_sid="requester", user_quote=quote,
+                           payload={"goal": "writing docs"}, reason="user asked")
+    assert result["status"] == "pending"
+    assert result["quote_refused"]
+    current = load_goal("target")
+    assert current is not None and current.goal == "watch the build"
+
+
+def test_plain_replace_with_a_new_objective_still_applies(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    state.set_session_title("target", "Target")
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please replace the target goal with writing the deploy docs")
+    result = apply_control("goal", "replace", "target", requester_sid="requester",
+                           user_quote="replace the target goal with writing the deploy docs",
+                           payload={"goal": "write the deploy docs"}, reason="user asked")
+    assert result["status"] == "applied"
+    current = load_goal("target")
+    assert current is not None and current.goal == "write the deploy docs"
+
+
+@pytest.mark.parametrize("message,quote", [
     # The clear governs another goal; the target is only mentioned.
     ("Keep the target goal and clear the other goal now", "Keep the target goal and clear the other goal now"),
     # Quoted or literal text, not an instruction.

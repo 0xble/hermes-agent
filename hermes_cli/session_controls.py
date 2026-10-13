@@ -331,6 +331,14 @@ _TAIL_WORDS = frozenset({"now", "immediately", "please", "right", "away", "asap"
                          "thanks", "thank", "you", "entirely", "completely", "fully", "altogether",
                          "for", "good", "as", "well", "then", "already", "again"})
 _REPLACE_LINKS = frozenset({"with", "to", "into"})
+# The new objective after "with/to" is free text, so nothing in its words can be read as part of the
+# instruction. A second clause there can still take the replacement back ("with X, actually keep the
+# current goal"), so an objective with a clause break or a correction word falls back to Approve/Deny,
+# where the user sees the exact objective before it applies.
+_REPLACE_TAIL_BREAK = re.compile(r"[,;:()\u2013\u2014]|\s-\s")
+_CORRECTION_TOKENS = frozenset({"actually", "instead", "keep", "rather", "but", "except", "nevermind",
+                                "mind", "scratch", "ignore", "disregard", "undo", "revert", "cancel"})
+_REPLACE_LINK_RE = re.compile(r"(?<![a-z0-9'])(?:with|to|into)(?![a-z0-9'])")
 
 
 def _target_name_phrases(target_sid: str, *, cursor=None) -> list[list[str]]:
@@ -370,7 +378,13 @@ def _is_direct_instruction(kind: str, action: str, target_sid: str, requester_si
         return False
     tail = words[k + 1:]
     if action == "replace" and tail and tail[0] in _REPLACE_LINKS:
-        return len(tail) > 1  # "with/to <new objective>"; the card shows the objective in full
+        if len(tail) < 2 or any(w in _CORRECTION_TOKENS for w in tail[1:]):
+            return False
+        lowered = sentence.lower().replace("\u2019", "'")
+        link = _REPLACE_LINK_RE.search(lowered)
+        if link is None or _REPLACE_TAIL_BREAK.search(lowered[link.end():]):
+            return False
+        return True  # "with/to <new objective>"; the card shows the objective in full
     return all(w in _TAIL_WORDS for w in tail)
 
 
