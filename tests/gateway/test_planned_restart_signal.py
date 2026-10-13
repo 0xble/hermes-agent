@@ -102,8 +102,8 @@ def test_marker_for_another_pid_is_ignored_and_stale_marker_cleared(monkeypatch)
     assert not marker.exists()
 
     assert status.write_planned_restart_marker(os.getpid())
-    record = json.loads(marker.read_text())
+    record = json.loads(marker.read_text(encoding="utf-8-sig"))
     record["written_at"] = "2000-01-01T00:00:00+00:00"
-    marker.write_text(json.dumps(record))
+    marker.write_text(json.dumps(record), encoding="utf-8")
     assert status.consume_planned_restart_marker_for_self() is False
     assert not marker.exists()
