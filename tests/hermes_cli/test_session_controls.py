@@ -963,6 +963,8 @@ def test_quote_refused_unless_the_whole_message_is_a_plain_instruction(state, me
     ("Clear the target goal now. Actually, keep it running instead.", "Clear the target goal now"),
     ("Thanks; please clear the target goal now", "clear the target goal now"),
     ("Stop the target loop. Clear the target goal now", "Clear the target goal now"),
+    # A line break separates sentences too, even though quote matching collapses it.
+    ("Clear the target goal now\nActually, keep it running instead", "Clear the target goal now"),
 ])
 def test_any_other_sentence_in_the_message_falls_back_to_approval(state, message, quote):
     from hermes_cli.goals import GoalManager, load_goal
@@ -974,6 +976,21 @@ def test_any_other_sentence_in_the_message_falls_back_to_approval(state, message
     result = apply_control("goal", "clear", "target", requester_sid="requester", user_quote=quote)
     assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_multi_sentence")
     assert load_goal("target").status == "active"
+
+
+def test_replace_followed_by_a_line_break_correction_falls_back_to_approval(state):
+    from hermes_cli.goals import GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    state.set_session_title("target", "Target")
+    GoalManager("target").set("watch the build")
+    _user(state, "requester", "Please replace the target goal with writing docs\nActually, keep the current goal")
+    result = apply_control("goal", "replace", "target", requester_sid="requester",
+                           user_quote="replace the target goal with writing docs",
+                           payload={"goal": "writing docs"}, reason="user asked")
+    assert (result["status"], result["quote_refused"]) == ("pending", "user_quote_multi_sentence")
+    current = load_goal("target")
+    assert current is not None and current.goal == "watch the build"
 
 
 @pytest.mark.parametrize("message,quote", [

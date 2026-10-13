@@ -255,7 +255,8 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
     # The whole message must be the one instruction. Any other sentence can revoke, correct or
     # reframe it ("Disregard the next sentence. Clear ...", "Clear ... Actually, keep it"), and no
     # word list can read that reliably, so a multi-sentence message falls back to Approve/Deny.
-    if len([part for part in _CLAUSE_BREAK.split(source) if part.strip()]) != 1:
+    # Judge the raw message: normalization collapses the newlines that separate sentences.
+    if len([part for part in _CLAUSE_BREAK.split(stripped) if part.strip()]) != 1:
         return "user_quote_multi_sentence"
     return normalized, source
 
