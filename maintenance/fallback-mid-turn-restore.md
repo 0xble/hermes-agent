@@ -11,8 +11,11 @@ successful probe in another session lets this session restore at its next call.
 The request-local system prompt is synchronized after restoration. The restore
 check runs at the start of the iteration-entry phase and does not alter the
 messages list, so assistant tool calls remain paired with their tool results. The optional,
-provider-independent per-entry `max_stay_seconds` also re-walks the fallback
-chain from entry zero while the shared primary cooldown still blocks a restore.
+provider-independent per-entry `max_stay_seconds` also retries only fallback
+entries strictly earlier than the current entry while the shared primary
+cooldown still blocks a restore. If none is available, the current route stays
+active and its timer resets; stay expiry never demotes it or emits a failure
+notice or failure metric.
 A concrete regression against the upstream-only port kept the last entry active
 for the next tool-loop request even though the first fallback was available;
 primary recovery alone cannot cover this case. Unset limits retain the normal
@@ -37,7 +40,11 @@ clearance, ordered-chain recovery after a failed primary retry, stay-limit
 re-evaluation, unchanged behavior for unset limits, and rollback on errors.
 Real conversation-loop regressions also cover voice routing across a tool call,
 uncooled generic-500 failures across several tool iterations, an uncooled
-stay-limit fallback re-walk, and bookkeeping reset on restore or explicit switch.
+stay-limit fallback re-walk, non-last-entry stay limits without demotion,
+quiet earlier-backup reclamation, and bookkeeping reset on restore or explicit
+switch. Voice turns that start on a provider fallback remain pinned across a
+tool call even when another session clears the shared outage. Both accepted
+and rejected voice routes preserve the session fallback's entry and stay timer.
 Retire this patch when the selected upstream release contains equivalent
 mid-turn restore and optional stay-limit behavior and the regressions pass
 without the local implementation.

@@ -74,11 +74,51 @@ def _fallback_max_stay_seconds(agent):
     return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
+def _try_reclaim_earlier_fallback(agent, before_index):
+    """A stay expiry is recovery, not a failure: try only better-ranked entries."""
+    from agent.chat_completion_helpers import (
+        _fallback_entry_key, _reset_stale_streak, _should_skip_fallback_candidate,
+        rewrite_prompt_model_identity,
+    )
+    from agent.native_compaction import resolve_native_compaction_capabilities
+    from agent.route_binding import bind_route_entry
+
+    unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+    if unavailable is None:
+        unavailable = agent._unavailable_fallback_keys = set()
+    for index, entry in enumerate(agent._fallback_chain[:before_index]):
+        provider = (entry.get("provider") or "").strip().lower()
+        model = (entry.get("model") or "").strip()
+        if _should_skip_fallback_candidate(agent, entry, _fallback_entry_key(entry), provider, model, unavailable):
+            continue
+        try:
+            bound = bind_route_entry(agent, entry, provider, model)
+        except Exception:
+            logger.debug("Earlier fallback %s could not be rebound", model, exc_info=True)
+            continue
+        if bound is None:
+            continue
+        rewrite_prompt_model_identity(agent, agent.model, provider)
+        _reset_stale_streak(agent)
+        agent.runtime_capabilities = resolve_native_compaction_capabilities(
+            model=agent.model, base_url=agent.base_url, provider=provider,
+            is_codex_backend=provider == "openai-codex")
+        agent._fallback_index = index + 1
+        agent._provider_fallback_route = (str(agent.model), str(provider))
+        logger.debug("Returned to earlier fallback %s via %s", agent.model, provider)
+        return True
+    return False
+
+
 def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
     """Re-evaluate an aged fallback only at the next model-request boundary."""
     if not getattr(agent, "_fallback_activated", False):
         return active_system_prompt
     if not getattr(agent, "_provider_fallback_active", False):
+        return active_system_prompt
+    # Voice bindings preserve the session's fallback provenance while running
+    # on their own route; recovery must wait until that explicit binding ends.
+    if getattr(agent, "_voice_route_state", None) or getattr(agent, "_turn_route_task", None):
         return active_system_prompt
     max_stay = _fallback_max_stay_seconds(agent)
     if max_stay is None:
@@ -112,10 +152,10 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
             return restored if isinstance(restored, str) else active_system_prompt
 
         # An active primary cooldown still blocks restoration; an uncooled
-        # failure has no mid-turn recovery signal. In either case retry only
-        # fallback entries, never the primary, using normal candidate skips.
+        # failure has no mid-turn recovery signal. Retry only entries strictly
+        # earlier than the current one: stay expiry must never demote a route.
         agent._fallback_index = 0
-        if agent._try_activate_fallback(reason=None):
+        if _try_reclaim_earlier_fallback(agent, max(0, previous_index - 1)):
             from agent.conversation_loop import _sync_failover_system_message
             prompt = _sync_failover_system_message(agent, None, active_system_prompt)
             committed = True
@@ -132,4 +172,3 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
                 vars(compressor).update(compressor_state)
         if getattr(agent, "_provider_fallback_active", False):
             agent._fallback_stay_started_at = time.monotonic()
-
