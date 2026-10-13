@@ -13,6 +13,10 @@ import time
 logger = logging.getLogger(__name__)
 
 
+# Shared-outage state a failed primary restore may legitimately refresh; never rolled back.
+_COOLDOWN_BOOKKEEPING = ("_rate_limited_until", "_rate_limit_backoff_count", "_shared_primary_cooldown_record")
+
+
 def _mid_turn_recovery_allowed(agent):
     """Return whether this route has a real provider-fallback recovery signal."""
     # A held shared record alone is not a signal: an expired record stays cached as a recovery
@@ -40,11 +44,24 @@ def _restore_primary_runtime_for_iteration(agent, active_system_prompt):
     # Uncooled 5xx/transport fallbacks have no mid-turn primary recovery signal.
     if not _mid_turn_recovery_allowed(agent):
         return active_system_prompt
+    # restore_primary_runtime applies primary identity before rebuilding the client and reports a
+    # rebuild failure as False. Mid-turn, the next request must still use one coherent route, so
+    # an unrestored attempt rolls the route back. Cooldown bookkeeping it refreshed is kept.
+    snapshot = _capture_route_state(agent)
+    for name in _COOLDOWN_BOOKKEEPING:
+        snapshot.pop(name, None)
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_state = dict(vars(compressor)) if compressor is not None else None
+    restored = False
     try:
-        if not agent._restore_primary_runtime():
-            return active_system_prompt
+        restored = bool(agent._restore_primary_runtime())
     except Exception:
         logger.warning("Mid-turn primary restore failed; keeping fallback", exc_info=True)
+    if not restored:
+        _restore_route_state(agent, snapshot)
+        if compressor_state is not None:
+            vars(compressor).clear()
+            vars(compressor).update(compressor_state)
         return active_system_prompt
 
     restored_system_prompt = getattr(agent, "_cached_system_prompt", None)

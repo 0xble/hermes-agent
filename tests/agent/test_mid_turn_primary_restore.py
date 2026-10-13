@@ -649,6 +649,26 @@ def test_primary_restore_clears_stay_bookkeeping(tool_loop_agent):
     assert agent._fallback_stay_started_at is None
 
 
+def test_failed_mid_turn_primary_rebuild_keeps_one_coherent_fallback_route(tool_loop_agent, recovery_runtime):
+    # restore_primary_runtime applies primary identity before rebuilding the client and returns
+    # False when the rebuild raises. Mid-turn, that must not leave a primary name on the
+    # fallback client for the next request.
+    agent = tool_loop_agent
+    assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+    agent._rate_limited_until = 0
+    fallback = (agent.model, agent.provider, agent.base_url, agent.client)
+    with (
+        patch("agent.agent_runtime_helpers._refresh_from_shared_cooldown", return_value="expired"),
+        patch("agent.agent_runtime_helpers._rebuild_primary_client", side_effect=RuntimeError("rebuild failed")),
+    ):
+        prompt = recovery_runtime._restore_primary_runtime_for_iteration(agent, "Model: backup")
+
+    assert prompt == "Model: backup"
+    assert (agent.model, agent.provider, agent.base_url, agent.client) == fallback
+    assert agent._fallback_activated and agent._provider_fallback_active
+    agent.client.close.assert_not_called()
+
+
 def test_explicit_switch_clears_stay_bookkeeping(tool_loop_agent):
     agent = tool_loop_agent
     assert agent._try_activate_fallback(reason=FailoverReason.server_error)
