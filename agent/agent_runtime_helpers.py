@@ -2488,6 +2488,7 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._fallback_stay_started_at = None
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
+    agent._fallback_episode_cooled = False
     agent._fallback_index = 0
     agent._credential_pool_revert_id = None
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;

@@ -7,12 +7,25 @@ is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, Dict, Optional, Tuple
 
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+
+def _close_failed_route_client(agent: Any, client: Any) -> None:
+    if client is None:
+        return
+    close = getattr(agent, "_close_openai_client", None)
+    if callable(close):
+        with contextlib.suppress(Exception):
+            close(client, reason="failed_route_bind", shared=False)
+        return
+    with contextlib.suppress(Exception):
+        client.close()
 
 
 def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: str) -> Optional[Tuple[str, str]]:
@@ -73,13 +86,19 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
     reset_codex_reasoning_replay(agent)
     agent._fallback_activated = True
 
-    _rebind_fallback_credential_pool(agent, provider, model)
-    if provider == "moa":
-        from agent.moa_loop import bind_moa_runtime
-        bind_moa_runtime(agent, model)
-    else:
-        from agent.client_lifecycle import _swap_fallback_clients
-        _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
+    try:
+        _rebind_fallback_credential_pool(agent, provider, model)
+        if provider == "moa":
+            from agent.moa_loop import bind_moa_runtime
+            bind_moa_runtime(agent, model)
+        else:
+            from agent.client_lifecycle import _swap_fallback_clients
+            _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
+    except Exception:
+        # Resolution happened before the in-place swap; do not leak a client if
+        # binding or provider-specific setup fails before it becomes reachable.
+        _close_failed_route_client(agent, client)
+        raise
 
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
@@ -177,3 +196,5 @@ def reinstall_primary_runtime(
     agent._fallback_stay_started_at = None
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
+    agent._rate_limited_until = 0
+    agent._fallback_episode_cooled = False

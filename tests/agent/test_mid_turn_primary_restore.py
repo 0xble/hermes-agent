@@ -26,7 +26,8 @@ def recovery_runtime():
 def test_restores_primary_prompt_identity_when_runtime_recovers(recovery_runtime):
     restore = Mock(return_value=True)
     agent = SimpleNamespace(
-        _fallback_activated=True, _provider_fallback_active=True, _rate_limited_until=1,
+        _fallback_activated=True, _provider_fallback_active=True, _fallback_episode_cooled=True,
+        _rate_limited_until=1,
         _cached_system_prompt="Model: primary\nProvider: primary-provider",
         _restore_primary_runtime=restore,
     )
@@ -40,7 +41,8 @@ def test_restores_primary_prompt_identity_when_runtime_recovers(recovery_runtime
 def test_keeps_fallback_prompt_when_cooldown_has_not_expired(recovery_runtime):
     restore = Mock(return_value=False)
     agent = SimpleNamespace(
-        _fallback_activated=True, _provider_fallback_active=True, _rate_limited_until=1,
+        _fallback_activated=True, _provider_fallback_active=True, _fallback_episode_cooled=True,
+        _rate_limited_until=1,
         _cached_system_prompt="Model: primary",
         _restore_primary_runtime=restore,
     )
@@ -221,7 +223,7 @@ def test_failed_reevaluation_keeps_route_and_resets_timer(failure, recovery_runt
     agent = SimpleNamespace(
         _fallback_activated=True, _fallback_index=2, _fallback_chain=[{}, entry],
         _active_fallback_entry=entry, _fallback_stay_started_at=time.monotonic() - 2,
-        _provider_fallback_active=True, model="last-resort", provider="backup",
+        _provider_fallback_active=True, _fallback_episode_cooled=True, model="last-resort", provider="backup",
         client=original_client, context_compressor=compressor,
         _cached_system_prompt="Model: last-resort", _rate_limited_until=200,
         _restore_primary_runtime=Mock(return_value=False),
@@ -248,11 +250,53 @@ def test_failed_reevaluation_keeps_route_and_resets_timer(failure, recovery_runt
     assert time.monotonic() - agent._fallback_stay_started_at < 1
 
 
+def test_failed_partial_bind_restores_original_objects_and_retires_only_new_clients(recovery_runtime):
+    original_client = Mock()
+    original_anthropic = Mock()
+    candidate_client = Mock()
+    transport_cache = {"route": "last-resort"}
+    entry = {"provider": "backup", "model": "last-resort", "max_stay_seconds": 1}
+    agent = SimpleNamespace(
+        _fallback_activated=True, _fallback_index=2, _fallback_chain=[{}, entry],
+        _active_fallback_entry=entry, _fallback_stay_started_at=time.monotonic() - 2,
+        _provider_fallback_active=True, _fallback_episode_cooled=True,
+        model="last-resort", provider="backup", client=original_client, _anthropic_client=original_anthropic,
+        _bedrock_region="us-west-2", _bedrock_guardrail_config={"id": "g"}, _transport_cache=transport_cache,
+        _codex_reasoning_replay_enabled=False, _codex_reasoning_replay_rejected=True,
+        _cached_system_prompt="Model: last-resort", _restore_primary_runtime=Mock(return_value=False),
+    )
+
+    def fail(*args, **kwargs):
+        # Mirror bind_route_entry's side effects before a late step raises.
+        agent.client = candidate_client
+        agent.model = "broken-candidate"
+        agent._bedrock_region = "eu-central-1"
+        agent._bedrock_guardrail_config = None
+        agent._transport_cache.clear()
+        agent._codex_reasoning_replay_enabled = True
+        agent._codex_reasoning_replay_rejected = False
+        agent._active_fallback_entry = {"provider": "other", "model": "broken-candidate"}
+        raise RuntimeError("bind failed partway")
+
+    with patch.object(recovery_runtime, "_try_reclaim_earlier_fallback", side_effect=fail):
+        assert recovery_runtime._maybe_recheck_fallback_route_for_iteration(agent, "old prompt") == "old prompt"
+
+    assert agent.client is original_client and agent._anthropic_client is original_anthropic
+    assert agent.model == "last-resort" and agent._active_fallback_entry is entry
+    assert agent._bedrock_region == "us-west-2" and agent._bedrock_guardrail_config == {"id": "g"}
+    assert agent._transport_cache == {"route": "last-resort"}
+    assert agent._codex_reasoning_replay_enabled is False and agent._codex_reasoning_replay_rejected is True
+    assert agent._fallback_index == 2
+    original_client.close.assert_not_called()
+    original_anthropic.close.assert_not_called()
+    candidate_client.close.assert_called_once_with()
+
+
 @pytest.mark.parametrize("value", [None, 0, -1, False, "bad", float("nan"), float("inf")])
 def test_unset_or_invalid_stay_limit_does_not_rewalk_chain(value, recovery_runtime):
     agent = SimpleNamespace(
         _fallback_activated=True, _fallback_index=1,
-        _provider_fallback_active=True, _rate_limited_until=1,
+        _provider_fallback_active=True, _fallback_episode_cooled=True, _rate_limited_until=1,
         _fallback_chain=[{"provider": "backup", "model": "last", "max_stay_seconds": value}],
         _fallback_stay_started_at=time.monotonic() - 100,
         _restore_primary_runtime=Mock(return_value=False),
@@ -402,6 +446,31 @@ def test_uncooled_500_primary_is_not_retried_on_tool_iterations(tool_loop_agent,
     assert not (tmp_path / "state" / "model_cooldowns.json").exists()
 
 
+def test_stale_expired_deadline_does_not_reprobe_uncooled_fallback(tool_loop_agent):
+    agent = tool_loop_agent
+    agent._rate_limited_until = time.monotonic() - 1000
+    requested = []
+    backup_calls = 0
+
+    def request(kwargs):
+        nonlocal backup_calls
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            response = httpx.Response(500, request=httpx.Request("POST", "https://primary.invalid/v1"))
+            raise InternalServerError("internal server error", response=response, body={})
+        backup_calls += 1
+        return _tool_loop_response(f"stale_call_{backup_calls}" if backup_calls < 4 else None)
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", return_value="tool result"),
+    ):
+        result = agent.run_conversation("do not re-probe a stale uncooled fallback")
+
+    assert result["final_response"] == "finished"
+    assert requested == ["primary-model"] + ["backup"] * 4
+
+
 def test_uncooled_primary_stay_limit_rewalks_only_fallbacks(tool_loop_agent):
     agent = tool_loop_agent
     agent._api_max_retries = 2  # permits two fallback activations in one logical iteration
@@ -488,7 +557,8 @@ def test_stay_limit_only_reclaims_earlier_backups_quietly(
     assert agent._shared_primary_cooldown_record["reset_at"] == original_cooldown["reset_at"]
     assert agent._shared_primary_cooldown_record["outage_id"] == original_cooldown["outage_id"]
     if expected_model == original_model:
-        assert agent.client is original_client
+        assert agent.model == original_model
+        assert agent.provider == "openai"
     assert time.monotonic() - agent._fallback_stay_started_at < 1
     notice.assert_not_called()
     metric.assert_not_called()

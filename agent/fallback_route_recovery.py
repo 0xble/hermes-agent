@@ -5,6 +5,7 @@ optional per-entry stay limits retry earlier backups without clearing the shared
 primary cooldown.
 """
 
+import contextlib
 import logging
 import math
 import time
@@ -17,7 +18,7 @@ def _mid_turn_recovery_allowed(agent):
     return bool(
         getattr(agent, "_provider_fallback_active", False)
         and (
-            getattr(agent, "_rate_limited_until", 0)
+            getattr(agent, "_fallback_episode_cooled", False)
             or isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict)
         )
     )
@@ -74,13 +75,29 @@ def _fallback_max_stay_seconds(agent):
     return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
+def _close_discarded_route_clients(agent, clients) -> None:
+    """Retire clients made unreachable by a failed route re-evaluation."""
+    seen = set()
+    for client in clients:
+        if client is None or id(client) in seen:
+            continue
+        seen.add(id(client))
+        retire = getattr(agent, "_retire_shared_openai_client", None)
+        if callable(retire):
+            with contextlib.suppress(Exception):
+                retire(client, reason="failed_fallback_reevaluation")
+            continue
+        close = getattr(client, "close", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                close()
+
+
 def _try_reclaim_earlier_fallback(agent, before_index):
     """A stay expiry is recovery, not a failure: try only better-ranked entries."""
     from agent.chat_completion_helpers import (
-        _fallback_entry_key, _reset_stale_streak, _should_skip_fallback_candidate,
-        rewrite_prompt_model_identity,
+        _fallback_entry_key, _finalize_fallback_route, _should_skip_fallback_candidate,
     )
-    from agent.native_compaction import resolve_native_compaction_capabilities
     from agent.route_binding import bind_route_entry
 
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
@@ -98,13 +115,8 @@ def _try_reclaim_earlier_fallback(agent, before_index):
             continue
         if bound is None:
             continue
-        rewrite_prompt_model_identity(agent, agent.model, provider)
-        _reset_stale_streak(agent)
-        agent.runtime_capabilities = resolve_native_compaction_capabilities(
-            model=agent.model, base_url=agent.base_url, provider=provider,
-            is_codex_backend=provider == "openai-codex")
+        _finalize_fallback_route(agent, provider)
         agent._fallback_index = index + 1
-        agent._provider_fallback_route = (str(agent.model), str(provider))
         logger.debug("Returned to earlier fallback %s via %s", agent.model, provider)
         return True
     return False
@@ -131,17 +143,18 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
         return _restore_primary_runtime_for_iteration(agent, active_system_prompt)
 
     previous_index = getattr(agent, "_fallback_index", 0)
-    from agent.agent_runtime_helpers import _snapshot_switch_state, _restore_switch_snapshot
+    # Rollback restores the exact pre-check objects instead of rebuilding them: a rebuild can
+    # itself fail and leave a mixed runtime. Only clients created during the check are retired.
+    from agent.agent_runtime_helpers import _snapshot_switch_state
+    from agent.voice_turn_route import _EXTRA_FIELDS, _REASONING_FIELDS
     snapshot = _snapshot_switch_state(agent)
-    for name in (
-        "_fallback_index", "_fallback_activated", "_provider_fallback_active", "_provider_fallback_route",
-        "_active_fallback_entry",
-        "_cached_system_prompt", "_cached_system_prompt_static", "_use_prompt_caching", "_use_native_cache_layout",
-        "reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override", "request_overrides",
-        "_rate_limited_until", "_rate_limit_backoff_count", "_shared_primary_cooldown_record",
-    ):
+    for name in (*_EXTRA_FIELDS, *_REASONING_FIELDS, "_cached_system_prompt", "_cached_system_prompt_static",
+                 "_use_prompt_caching", "_use_native_cache_layout", "request_overrides", "_rate_limited_until",
+                 "_shared_primary_cooldown_record"):
         if hasattr(agent, name):
-            snapshot[name] = getattr(agent, name)
+            value = getattr(agent, name)
+            snapshot[name] = dict(value) if name == "_transport_cache" and isinstance(value, dict) else value
+    original_clients = {id(c) for c in (snapshot.get("client"), snapshot.get("_anthropic_client")) if c is not None}
     compressor = getattr(agent, "context_compressor", None)
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     committed = False
@@ -166,9 +179,13 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
         return active_system_prompt
     finally:
         if not committed:
+            created = [c for c in (getattr(agent, "client", None), getattr(agent, "_anthropic_client", None))
+                       if c is not None and id(c) not in original_clients]
+            from agent.agent_runtime_helpers import _restore_switch_snapshot
             _restore_switch_snapshot(agent, snapshot)
-            agent._fallback_index = previous_index
             if compressor_state is not None:
+                vars(compressor).clear()
                 vars(compressor).update(compressor_state)
+            _close_discarded_route_clients(agent, created)
         if getattr(agent, "_provider_fallback_active", False):
             agent._fallback_stay_started_at = time.monotonic()
