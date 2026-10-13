@@ -1,5 +1,6 @@
-"""Known text-send failure has bounded retries and survives for the next owner."""
+"""Known send failures stay retryable in-process and across a gateway restart."""
 
+import asyncio
 import contextlib
 import json
 from unittest.mock import AsyncMock
@@ -13,7 +14,19 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 @pytest.mark.asyncio
-async def test_text_survivor_failed_sends_back_off_and_leave_pending(tmp_path, monkeypatch):
+async def test_watcher_unknown_send_result_is_not_repeated(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner._build_process_event_source = lambda _: make_restart_source(chat_id="123")
+    runner._resolve_injection_adapter = lambda *_: adapter
+    adapter.send = AsyncMock(return_value=None)
+
+    assert await runner._send_watcher_message("telegram", "123", "", "finished", {}) is True
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["in-process", "restart", "unknown-result"])
+async def test_text_survivor_failed_sends_back_off_and_leave_pending(tmp_path, monkeypatch, recovery):
     home = tmp_path / "home"
     monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
     run_dir = home / "process-runs" / "proc_failed_text"
@@ -40,20 +53,32 @@ async def test_text_survivor_failed_sends_back_off_and_leave_pending(tmp_path, m
 
     async def sleep(delay):
         delays.append(delay)
-        assert len(delays) <= 5, "text watcher retries without a bound"
+        assert registry._survivor_delivery_state(session) is None
+        assert len(delays) <= 14, "watcher repeated a successful or unknown send"
+        if recovery == "restart" and len(delays) == 14:
+            raise asyncio.CancelledError
 
     async def send(*args, **kwargs):
         claims.append(registry._survivor_delivery_state(session))
-        assert len(claims) <= 5, "text watcher retries without a bound"
-        return SendResult(success=False)
+        assert len(claims) <= 14, "watcher repeated a successful or unknown send"
+        if len(claims) <= 13:
+            return SendResult(success=False)
+        return None if recovery == "unknown-result" else SendResult(success=True, message_id="delivered")
 
     monkeypatch.setattr("gateway.run_notifications.asyncio.sleep", sleep)
     adapter.send = send
-    await runner._run_process_watcher({
-        "session_id": session.id, "check_interval": 0.01, "platform": "telegram", "chat_id": "123",
-    })
-    assert claims == ["claimed"] * 5
-    assert delays == [0.01, 1.0, 2.0, 4.0, 8.0]
+    watcher = {"session_id": session.id, "check_interval": 0.01, "platform": "telegram", "chat_id": "123"}
+    if recovery == "restart":
+        with pytest.raises(asyncio.CancelledError):
+            await runner._run_process_watcher(watcher)
+    else:
+        await runner._run_process_watcher(watcher)
+    assert delays == [0.01, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 900.0, 900.0, 900.0]
+    assert claims == ["claimed"] * (13 if recovery == "restart" else 14)
+    if recovery != "restart":
+        assert registry._survivor_delivery_state(session) == "delivered"
+        assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig")) == []
+        return
     assert registry._survivor_delivery_state(session) is None
     assert json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))[0]["session_id"] == session.id
 

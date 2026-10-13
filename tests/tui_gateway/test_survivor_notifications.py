@@ -32,7 +32,8 @@ def _survivor_registry(tmp_path, monkeypatch, session_key="tui-session"):
 
 
 @pytest.mark.parametrize("batch", [False, True], ids=["single", "batch"])
-def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, batch):
+@pytest.mark.parametrize("refusal", ["exception", "false"])
+def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, batch, refusal):
     registry, process, event = _survivor_registry(tmp_path, monkeypatch)
     processes, events = [process], [event]
     if batch:
@@ -52,9 +53,14 @@ def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, b
     def submit(*args, **kwargs):
         attempts.append(args)
         if len(attempts) == 1:
-            raise RuntimeError("turn admission failed")
+            if refusal == "exception":
+                raise RuntimeError("turn admission failed")
+            # Actual admission refusals return False; no worker owns the turn.
+            server._notif_release_turn(session)
+            return False
         accepted.append(args)
         server._notif_release_turn(session)
+        return True
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
 

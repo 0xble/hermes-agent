@@ -2925,7 +2925,9 @@ class GatewayNotificationsMixin:
                 result = await adapter.send(
                     chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                 )
-                return bool(result.success)
+                # Some adapters send successfully but return no receipt. Unknown is not
+                # a known failure: replaying it could duplicate an already delivered message.
+                return result is None or bool(result.success)
         return False
 
     @staticmethod
@@ -3035,8 +3037,7 @@ class GatewayNotificationsMixin:
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
         busy_receipt_sent = False
-        text_send_failures = 0
-        text_retry_base = min(max(interval, 1.0), 30.0)
+        text_retry_interval = min(max(interval, 1.0), 30.0)
         while True:
             await asyncio.sleep(interval)
             # A finished process falls back to retained results, whose ownership check reads state.db.
@@ -3121,11 +3122,10 @@ class GatewayNotificationsMixin:
                                                    diagnostic=session.exit_code not in {0, None})
                     if sent is False and getattr(session, "survive_restart", False):
                         process_registry.release_survivor_completion(session_id)
-                        text_send_failures += 1
-                        if text_send_failures >= 5:
-                            logger.warning("Process watcher send retries exhausted; completion pending: %s", session_id)
-                            break
-                        interval = min(text_retry_base * (2 ** (text_send_failures - 1)), 30.0)
+                        # Keep one offer alive until shutdown cancels the watcher, even if
+                        # transport recovery takes hours. A capped scalar bounds retry state.
+                        interval = text_retry_interval
+                        text_retry_interval = min(text_retry_interval * 2, 15 * 60.0)
                         continue
                 # Presented, or deliberately suppressed by the notification mode: either way the
                 # claimed survivor completion is settled and must not replay on a successor.
