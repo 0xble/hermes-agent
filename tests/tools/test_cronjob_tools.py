@@ -802,3 +802,110 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+
+
+# =========================================================================
+# Prompt-update guard: placeholder and drastic-shrink prompts are refused
+# =========================================================================
+
+_LONG_PROMPT = ("Collect the overnight metrics, compare them with last week, and report regressions. " * 12).strip()
+
+
+class TestPromptUpdateGuard:
+    """Regression for the 2026-10-12 incident: ``update`` with prompt="__FILE__"
+    replaced an 11,137-char prompt. Placeholder and >90% shrink rewrites of a long
+    prompt are refused without persisting anything unless ``allow_shrink`` is set."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def _create(self, prompt=_LONG_PROMPT):
+        created = json.loads(cronjob(action="create", prompt=prompt, schedule="every 1h"))
+        assert created["success"] is True
+        return created["job_id"]
+
+    @pytest.mark.parametrize("placeholder", [
+        "__FILE__", "  __PROMPT__\n", "<prompt>", "<full prompt here>", "...", "\u2026",
+        "TODO", "tbd", "$(cat prompt.md)", "`cat prompt.md`", "@prompt.md", "${PROMPT}",
+    ])
+    def test_placeholder_prompt_refused_and_not_persisted(self, placeholder):
+        from cron.jobs import get_job
+        job_id = self._create()
+
+        result = json.loads(cronjob(action="update", job_id=job_id, prompt=placeholder, name="renamed"))
+
+        assert result["success"] is False
+        assert "placeholder" in result["error"]
+        assert f"{len(_LONG_PROMPT)} chars" in result["error"]
+        assert f"{len(placeholder.strip())} chars" in result["error"]
+        stored = get_job(job_id)
+        assert stored["prompt"] == _LONG_PROMPT
+        assert stored["name"] != "renamed"
+
+    def test_placeholder_refused_even_when_existing_prompt_is_short(self):
+        from cron.jobs import get_job
+        job_id = self._create("Check disk usage")
+        result = json.loads(cronjob(action="update", job_id=job_id, prompt="__FILE__"))
+        assert result["success"] is False
+        assert get_job(job_id)["prompt"] == "Check disk usage"
+
+    def test_drastic_shrink_refused_and_not_persisted(self):
+        from cron.jobs import get_job
+        job_id = self._create()
+        short = "Report regressions."
+
+        result = json.loads(cronjob(action="update", job_id=job_id, prompt=short))
+
+        assert result["success"] is False
+        assert "shrink" in result["error"]
+        assert f"{len(_LONG_PROMPT)} chars" in result["error"]
+        assert f"{len(short)} chars" in result["error"]
+        assert get_job(job_id)["prompt"] == _LONG_PROMPT
+
+    def test_allow_shrink_overrides_shrink_and_placeholder(self):
+        from cron.jobs import get_job
+        job_id = self._create()
+
+        shrunk = json.loads(cronjob(action="update", job_id=job_id, prompt="Report regressions.",
+                                    allow_shrink=True))
+        assert shrunk["success"] is True
+        assert get_job(job_id)["prompt"] == "Report regressions."
+
+        literal = json.loads(cronjob(action="update", job_id=job_id, prompt="TODO", allow_shrink=True))
+        assert literal["success"] is True
+        assert get_job(job_id)["prompt"] == "TODO"
+
+    def test_registered_handler_forwards_allow_shrink(self):
+        from cron.jobs import get_job
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+        from tools.registry import registry
+        assert "allow_shrink" in CRONJOB_SCHEMA["parameters"]["properties"]
+        job_id = self._create()
+
+        refused = json.loads(registry.dispatch(
+            "cronjob_manage", {"action": "update", "job_id": job_id, "prompt": "short"}))
+        assert refused["success"] is False
+
+        allowed = json.loads(registry.dispatch(
+            "cronjob_manage",
+            {"action": "update", "job_id": job_id, "prompt": "short", "allow_shrink": True}))
+        assert allowed["success"] is True
+        assert get_job(job_id)["prompt"] == "short"
+
+    def test_normal_edits_allowed(self):
+        from cron.jobs import get_job
+        long_job = self._create()
+        revised = _LONG_PROMPT.replace("last week", "the previous fortnight")
+        assert json.loads(cronjob(action="update", job_id=long_job, prompt=revised))["success"] is True
+        assert get_job(long_job)["prompt"] == revised
+
+        short_job = self._create("Check disk usage on the build host and alert above 90 percent")
+        assert json.loads(cronjob(action="update", job_id=short_job, prompt="Ping"))["success"] is True
+        assert get_job(short_job)["prompt"] == "Ping"
+
+    def test_create_is_unaffected(self):
+        created = json.loads(cronjob(action="create", prompt="TODO", schedule="every 1h"))
+        assert created["success"] is True

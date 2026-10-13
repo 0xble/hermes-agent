@@ -131,6 +131,44 @@ class TestCronCommandLifecycle:
         assert jobs[0]["name"] == "Skill combo"
 
 
+class TestCronEditPromptGuard:
+    """`hermes cron edit` shares the tool's prompt-update guard; --allow-shrink overrides it."""
+
+    _LONG = ("Summarize every open incident, its owner, and the next action. " * 12).strip()
+
+    def _run(self, *argv):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        return cron_command(parser.parse_args(["cron", "edit", *argv]))
+
+    def test_edit_refuses_placeholder_prompt(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "__FILE__") == 1
+        out = capsys.readouterr().out
+        assert "placeholder" in out
+        assert f"{len(self._LONG)} chars" in out and "8 chars" in out
+        assert get_job(job["id"])["prompt"] == self._LONG
+
+    def test_edit_refuses_drastic_shrink(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "Summarize incidents.") == 1
+        assert "shrink" in capsys.readouterr().out
+        assert get_job(job["id"])["prompt"] == self._LONG
+
+    def test_edit_allow_shrink_flag_overrides(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        assert self._run(job["id"], "--prompt", "Summarize incidents.", "--allow-shrink") == 0
+        assert get_job(job["id"])["prompt"] == "Summarize incidents."
+        assert "Updated job" in capsys.readouterr().out
+
+    def test_edit_similar_length_prompt_allowed(self, tmp_cron_dir, capsys):
+        job = create_job(prompt=self._LONG, schedule="every 1h")
+        revised = self._LONG.replace("owner", "assignee")
+        assert self._run(job["id"], "--prompt", revised) == 0
+        assert get_job(job["id"])["prompt"] == revised
+
+
 class TestUnverifiedDeliveryVisibility:
     """An evidence-free live-adapter ack (Slack/Matrix/Mattermost bare
     ``SendResult(success=True)``) is accepted as delivered, but the UNVERIFIED
