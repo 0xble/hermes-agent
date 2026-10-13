@@ -45,6 +45,11 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
     return tuple(seen)
 
 
+QUEUE_ADMISSION_FAILURE = (
+    "Queue admission could not be durably acknowledged. "
+    "No queued work was started; retry when storage is available."
+)
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 

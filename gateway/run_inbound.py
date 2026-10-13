@@ -22,7 +22,7 @@ from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run_busy import approval_input_words
+from gateway.run_busy import QUEUE_ADMISSION_FAILURE, approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
@@ -704,7 +704,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         else:
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(_quick_key, event, adapter)
+                return self._enqueue_fifo(_quick_key, event, adapter)
+            return False
         return True
 
     @staticmethod
@@ -784,7 +785,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             return None
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-            self._queue_or_replace_pending_event(_quick_key, event)
+            if not self._queue_or_replace_pending_event(_quick_key, event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         if effective_busy_input_mode == "steer":
             self._hm_busy_steer(event, running_agent, _quick_key)
@@ -801,7 +803,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
             return None
         logger.info("PRIORITY interrupt demoted to queue for session %s %s", _quick_key, _demote)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        if not self._queue_or_replace_pending_event(_quick_key, event):
+            return QUEUE_ADMISSION_FAILURE
         return None
 
     def _hm_quick_commands(self) -> dict:

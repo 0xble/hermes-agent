@@ -45,6 +45,11 @@ session-id lookup, at exactly one of these points:
   declined accepted-queue claim stops recovery for that checkpoint; it never
   falls through to a naked transcript row.
 
+Every FIFO producer must honor its durable-admission boolean, including the
+Telegram follow-up grace window. A failed busy queue admission must produce a
+failure reply, not a successful queue acknowledgement or a silently consumed
+event; an active turn is not proof that its follow-up was checkpointed.
+
 Goal continuations and heartbeat ticks are not checkpointed: goal state and the
 heartbeat poller re-derive them. Older goal-continuation checkpoints are dropped
 at recovery. Internal completions (delegation/watch notifications) are
