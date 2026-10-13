@@ -1499,9 +1499,20 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
         # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
         self._hm_evict_idle_stale_agent(_quick_key)
-        if self._is_session_running(_quick_key):
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        pending_state = self._peek_session_state(_quick_key)
+        owns_startup_claim = (
+            is_internal and pending_state is not None
+            and getattr(event, "_startup_resume_claim", False) is True
+            and pending_state.turn.event is event
+            and pending_state.turn.agent is _AGENT_PENDING_SENTINEL
+        )
+        if owns_startup_claim:
+            event._startup_resume_claim = False
+        if not owns_startup_claim and self._is_session_running(_quick_key):
             await self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
+        if not owns_startup_claim and self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)

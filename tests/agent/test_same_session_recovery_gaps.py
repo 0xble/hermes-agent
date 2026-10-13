@@ -82,6 +82,51 @@ def test_presend_gate_lets_fitting_request_through_without_recovery(tmp_path):
     assert v.api_call_count == 1
 
 
+def test_disabled_compression_pauses_unfittable_request_without_compacting(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.compression_enabled = False
+    rows = _seed_tool(db, agent.session_id)
+    original = db.get_messages(agent.session_id, include_inactive=True)
+    with patch.object(agent, "_compress_context", return_value=(rows, "p")) as compress:
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    compress.assert_not_called()
+    assert verdict.action == "break" and verdict.failed
+    assert verdict.messages is rows
+    assert db.get_messages(agent.session_id, include_inactive=True) == original
+
+
+def test_presend_pause_adopts_committed_compaction_that_still_cannot_fit(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.context_compressor.context_length = 8000
+    rows = _seed_tool(db, agent.session_id)
+    originals = {r["id"]: r["content"] for r in db.get_messages(agent.session_id)}
+    compacted = [
+        {"role": "user", "content": "[Context compaction] " + "summary detail " * 5000},
+        {"role": "assistant", "content": "Continuing with the retained instructions."},
+        copy.deepcopy(rows[-1]),
+    ]
+
+    def commit_compaction(*args, **kwargs):
+        db.archive_and_compact(agent.session_id, compacted)
+        agent._last_compression_attempt_recorded = True
+        agent._last_compression_attempt_in_place = True
+        return db.get_messages_as_conversation(agent.session_id), "recovered prompt"
+
+    with patch.object(agent, "_compress_context", side_effect=commit_compaction):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+
+    assert verdict.action == "break" and verdict.failed
+    assert verdict.messages == db.get_messages_as_conversation(agent.session_id)
+    assert verdict.conversation_history == verdict.messages
+    assert verdict.active_system_prompt == "recovered prompt"
+    assert verdict.messages[-1]["content"] == rows[-1]["content"]
+    retained = {r["id"]: r["content"] for r in db.get_messages(agent.session_id, include_inactive=True)}
+    assert all(retained[rid] == content for rid, content in originals.items())
+    assert agent.session_id == "recovery"
+
+
 def test_presend_gate_counts_tool_schemas_in_the_final_request(tmp_path):
     """Messages alone fit; the wire request with tool schemas does not → no send."""
     from agent.turn_preflight_gate import run_preflight_gate

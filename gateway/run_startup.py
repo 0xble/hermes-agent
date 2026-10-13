@@ -901,6 +901,10 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
             event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
                                  message_id=getattr(source, "message_id", None), internal=True)
+            # This event owns the sentinel claimed above. Other input must still queue, but the
+            # resume itself must enter the turn instead of bouncing into its own pending slot.
+            _resume_state.turn.event = event
+            event._startup_resume_claim = True
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
             if resume_marker:
                 # Keep the transport reply anchor for threading, but admit each interruption marker

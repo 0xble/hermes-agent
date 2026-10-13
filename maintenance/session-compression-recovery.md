@@ -61,6 +61,12 @@ order and leave it untouched if the new checkpoint fails. Moving an unchanged,
 already-admitted event between the head, overflow and local drain references is
 not a new content admission and must retain its existing checkpoint.
 
+An already-drained eventless follow-up whose new checkpoint fails retains an
+unacknowledged owner in the native FIFO. Startup's synthetic resume event owns
+its exact preclaimed turn slot, so it enters that turn rather than queuing its
+own empty wake. Unrelated input still queues and requires its normal durable
+admission, including other internal completions.
+
 Every FIFO producer must honor its durable-admission boolean, including the
 Telegram follow-up grace window. A failed busy queue admission must produce a
 failure reply, not a successful queue acknowledgement or a silently consumed
@@ -154,8 +160,9 @@ Focused tests: `tests/agent/test_same_session_recovery.py`,
 `tests/gateway/test_same_session_queue_checkpoint.py`,
 `tests/gateway/test_queue_checkpoint_retirement.py`,
 `tests/gateway/test_proxy_queue_checkpoint.py`,
-`tests/agent/test_native_preflight_estimate.py` and
-`tests/e2e/core/compaction/test_same_session_recovery.py`.
+`tests/agent/test_native_preflight_estimate.py`,
+`tests/e2e/core/compaction/test_same_session_recovery.py` and
+`tests/e2e/core/compaction/test_recovery_gateway_crash.py`.
 Ordinary FIFO acceptance writes the native private pending spool with file and
 directory fsync before memory acknowledgement. Such a spool is not expired or
 consumed by restart replay as a naked transcript row; it transfers to the native
@@ -175,6 +182,11 @@ Also exercise native preflight, in-place/commit rollback, tail watermark,
 compression fallback/attempt lifecycle, pending-input dedupe and isolated
 loopback-provider/kill9 compaction suites. Local recording fake-provider traffic
 is simulated provider evidence, not authenticated fallback or real Telegram.
+The combined gateway crash test kills after a giant observation is archived and
+the answer is persisted, but before platform acceptance. It queues an input
+before that kill and verifies full native archive retrieval, occurrence identity,
+one reply per input in the original topic, unchanged manual title/icon and model
+settings, consumed goal budgets, a stopped control lane and one completed effect.
 The parent owns candidate review, exact merge, native source updater, live
 adoption and Telegram inbound/send/readback/restart canary. Source or a healthy
 process alone is not end-to-end completion.

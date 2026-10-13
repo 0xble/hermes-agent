@@ -36,6 +36,7 @@ def loop_agent():
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.compression_enabled = False
+        a.max_tokens = 1024
         a.save_trajectories = False
         a.context_compressor.context_length = 32768
         return a

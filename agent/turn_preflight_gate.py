@@ -68,22 +68,24 @@ def run_preflight_gate(
         from agent.turn_context_compaction import _refund_api_call
         v.api_call_count = _refund_api_call(agent, v.api_call_count)
         before = list(messages)
-        try:
-            recovered, prompt = agent._compress_context(
-                messages, system_message, task_id=effective_task_id,
-                approx_tokens=request_pressure_tokens,
-            )
-        except Exception:
-            logger.warning("Hard-window recovery failed; retaining the same session", exc_info=True)
-            recovered, prompt = messages, active_system_prompt
-        if recovered != before and request_fits(agent, recovered, prompt):
+        recovered, prompt = messages, active_system_prompt
+        if getattr(agent, "compression_enabled", True):
+            try:
+                recovered, prompt = agent._compress_context(
+                    messages, system_message, task_id=effective_task_id,
+                    approx_tokens=request_pressure_tokens,
+                )
+            except Exception:
+                logger.warning("Hard-window recovery failed; retaining the same session", exc_info=True)
+        if recovered != before:
             v.messages = recovered
             v.active_system_prompt = prompt
             v.conversation_history = conversation_history_after_compression(agent, recovered)
-            v._preflight_compression_blocked = False
-            v._last_preflight_pressure = request_pressure_tokens
-            v.action = "continue"
-            return v
+            if request_fits(agent, recovered, prompt):
+                v._preflight_compression_blocked = False
+                v._last_preflight_pressure = request_pressure_tokens
+                v.action = "continue"
+                return v
         v.final_response = (
             "The complete request cannot safely fit the model window. No provider call was sent. "
             "This session, its history and accepted input are retained; retry /compress "

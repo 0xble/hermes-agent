@@ -4093,6 +4093,9 @@ class GatewayTurnMixin:
                             self._session_state(session_key).conversation.queued_events.insert(0, existing)
                         adapter._pending_messages[session_key] = deferred
                     else:
+                        # The follow-up was already drained from its prior owner. Keep it
+                        # unacknowledged in the native FIFO until storage can accept it.
+                        self._session_state(session_key).conversation.queued_events.insert(0, deferred)
                         logger.warning("Could not checkpoint deferred follow-up for %s", session_key)
                 logger.warning("Queued follow-up deferred after failed first delivery for %s", session_key)
                 return result or {"final_response": response, "messages": history}

@@ -315,7 +315,11 @@ async def test_failed_first_delivery_checkpoints_eventless_followup(tmp_path, mo
     ) is result
     if reject:
         assert adapter._pending_messages[key] is existing
-        assert not runner._overflow_queue(key)
+        retained = runner._overflow_queue(key)
+        assert len(retained) == 1
+        assert retained[0].text == "eventless follow-up"
+        assert not getattr(retained[0], "_gateway_accepted", False)
+        assert not getattr(retained[0], "_hermes_recovery_spool", None)
     else:
         deferred = adapter._pending_messages[key]
         assert deferred.text == "eventless follow-up"
