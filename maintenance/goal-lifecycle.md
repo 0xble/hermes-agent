@@ -187,7 +187,8 @@ pauses remain authoritative.
   messages and stops at the first one that does not fit, marking it omitted rather
   than excerpting it, so a newer refusal can never be dropped while an older
   approval stays. Relay
-  deliveries, identified by the trailing `[relay from=… receipt=…]` header, are
+  deliveries, identified by a `[relay from=… receipt=…]` header on the first or last
+  line (the gateway agent-origin rule, any sender kind), are
   never user-typed, so they cannot satisfy a revision `user_quote`. An explicit
   `/goal resume` over a judge block records a user-command revision that renders
   as user authority with a waiver rule in every judge prompt; the judge does not

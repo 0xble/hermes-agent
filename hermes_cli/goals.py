@@ -2197,16 +2197,26 @@ _USER_MESSAGES_MAX_CHARS = 8000
 
 
 def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
-    """Return ``(profile, session_id)`` from relay's last non-empty content line."""
+    """Return ``(profile, session_id)`` from a Hermes relay header on the first or last non-empty line."""
     if not isinstance(content, str):
         return None
-    for line in reversed(content.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    for line in (lines[-1:] + lines[:1]) if lines else []:
         match = _RELAY_HEADER_RE.fullmatch(line)
-        return (match.group("profile"), match.group("session")) if match else None
+        if match:
+            return match.group("profile"), match.group("session")
     return None
+
+
+def _is_agent_origin(content: str) -> bool:
+    """Any complete relay header on an edge line (any sender kind), matching the gateway's rule."""
+    try:
+        from gateway.response_filters import is_agent_origin_text
+        return bool(is_agent_origin_text(content))
+    except Exception:  # pragma: no cover - gateway ships with the runtime
+        lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
+        return any(re.fullmatch(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]", line)
+                   for line in (lines[:1] + lines[-1:]))
 
 
 def _active_profile_name() -> str:
@@ -2307,7 +2317,7 @@ def _is_user_typed(row: Dict[str, Any]) -> bool:
         return False
     if str(row.get("display_kind") or "") not in _USER_TYPED_KINDS:
         return False
-    if _relay_sender(content) is not None:
+    if _is_agent_origin(content):
         return False
     if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
         return False
