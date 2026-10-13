@@ -67,6 +67,15 @@ class FailoverReason(enum.Enum):
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 
+def is_context_overflow_reason(reason: Any) -> bool:
+    """Return whether a classified failure is a genuine context overflow.
+
+    Callers that suppress transcript persistence must use the classifier's verdict, not a
+    status-code or message-size heuristic that can mislabel billing and account failures.
+    """
+    return getattr(reason, "value", reason) == FailoverReason.context_overflow.value
+
+
 @dataclass
 class ClassifiedError:
     """Structured classification of an API error with recovery hints."""
@@ -726,6 +735,10 @@ def _profile_verdict(c: _Ctx) -> Optional[Verdict]:
     A ``kind: model-provider`` plugin never enters the PluginManager hook lifecycle, so without this a
     vendor-specific body (a 403 ``quota_exhausted`` that is billing, not auth) could only be corrected by
     shipping a second plugin component. Scoped to the provider that produced the error; no name table."""
+    if c.status_code and 500 <= c.status_code < 600 and "auth_unavailable" in c.msg and "last upstream error" in c.msg:
+        # The proxy envelope is more specific than a provider profile's generic 503/overload verdict;
+        # let the built-in status handler classify the named upstream billing/rate-limit cause.
+        return None
     if not c.provider_slug:
         return None
     try:
@@ -1088,12 +1101,22 @@ def _status_429(c: _Ctx) -> Verdict:
 
 
 def _status_5xx(c: _Ctx) -> Verdict:
+    # CLIProxyAPI uses 503 ``auth_unavailable`` when its upstream credential cannot serve the
+    # request. The final upstream reason is provider/account-wide: route billing and rate limits
+    # into the existing shared cooldown/fallback path instead of retrying every session locally.
+    if "auth_unavailable" in c.msg and "last upstream error" in c.msg:
+        if any(pattern in c.msg for pattern in _BILLING_PATTERNS):
+            return _V_BILLING
+        if "rate_limit_error" in c.msg:
+            return _V_RATE_LIMIT
     # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
     # retry-flooding — unless the parameter was injected server-side.
     validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
-    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
+    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or (
+        _V_OVERLOADED if c.status_code in (503, 529) else _V_SERVER_ERROR
+    )
 
 
 def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
@@ -1228,8 +1251,8 @@ _STATUS_HANDLERS: Dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
-    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: _status_5xx,
+    529: _status_5xx,
 }
 
 

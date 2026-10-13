@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
@@ -106,6 +107,12 @@ def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> 
         return False
     if agent_result.get("compression_exhausted"):
         return True
+    # A classified reason is authoritative: a billing/auth/rate-limit 400 must never be
+    # mistaken for overflow just because this is a long session. Keep the old 400 guard only
+    # when the result is truly unclassified, preserving #1630 for legacy result producers.
+    failure_reason = agent_result.get("failure_reason")
+    if failure_reason is not None:
+        return is_context_overflow_reason(failure_reason)
     err = str(agent_result.get("error") or "").lower()
     return any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES) or ("400" in err and history_len > 50)
 

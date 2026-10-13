@@ -19,6 +19,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Billing outage persistence and provider-wide classification
+
+- Fork patch identity: `billing-outage-recovery`.
+- A provider/account billing or rate-limit failure must retain the failed user turn, avoid the context-overflow auto-reset path, and classify provider-wide proxy `auth_unavailable` envelopes into the existing shared cooldown/fallback route. Request-specific 5xx failures remain on their existing retry path.
+- Guard: `tests/gateway/test_billing_failure_transcript.py` and `tests/agent/test_billing_proxy_error_classification.py`.
+
 ## Production-only unused imports
 
 - Fork patch identity: `production-unused-imports`.

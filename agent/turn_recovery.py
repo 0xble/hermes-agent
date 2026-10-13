@@ -21,7 +21,7 @@ from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STA
 from agent.fast_mode import fast_mode_unprovisioned, mark_fast_mode_unavailable
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import FailoverReason, classify_api_error, is_context_overflow_reason
 from agent.message_sanitization import (
     _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates, _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
@@ -1104,11 +1104,13 @@ def nonretryable_client_error_result(
             "        for localhost, or add the server's cert to your trust store.",
         )
     logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
-    # Skip persistence on likely context-overflow (400 + large session): persisting the
-    # failed message grows the session and repeats the failure.
-    # Persisting the failed user message would make the session even larger, causing the same failure on the
-    # next attempt. (#1630)
-    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+    # Skip persistence only for genuine context-overflow verdicts. A large 400 with no
+    # classified reason retains the historical #1630 guard; classified billing/auth/rate-limit
+    # failures must persist so the user turn is not lost.
+    is_unclassified_large_400 = status_code == 400 and classified.reason == FailoverReason.unknown and (
+        approx_tokens > 50000 or len(api_messages) > 80
+    )
+    if is_context_overflow_reason(classified.reason) or is_unclassified_large_400:
         _vlines(agent, "⚠️  Skipping session persistence for large failed session to prevent growth loop.")
     else:
         agent._persist_session(messages, conversation_history)
