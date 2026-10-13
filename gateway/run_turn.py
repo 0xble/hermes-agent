@@ -521,6 +521,30 @@ class GatewayTurnMixin:
             return
         return source, session_entry, session_key
 
+    async def _strict_session_pin_holds(self, event, session_id: Optional[str] = None) -> bool:
+        """The ``_hmwa_resolve_session`` strict rule for every other admission and queue boundary.
+
+        True for an unpinned event. A ``gateway_session_strict`` event holds only while its pinned
+        ``gateway_session_id`` still owns ``gateway_session_key`` and, when ``session_id`` is given,
+        is the session about to run it: after /new or /resume rebinds the key the event is dropped,
+        never run in the conversation that replaced it."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or not metadata.get("gateway_session_strict"):
+            return True
+        pinned = str(metadata.get("gateway_session_id") or "").strip()
+        key = str(metadata.get("gateway_session_key") or "").strip()
+        current = None
+        if pinned and key and (session_id is None or session_id == pinned):
+            entry = await self.async_session_store.lookup_by_session_key(key)
+            current = getattr(entry, "session_id", None)
+        if current is not None and current == pinned:
+            return True
+        logger.warning(
+            "Dropping internally routed event: pinned session id=%s no longer owns key=%s (running=%s)",
+            pinned or "missing", key or "missing", session_id or "-",
+        )
+        return False
+
     @staticmethod
     def _is_gateway_wake(event) -> bool:
         """A goal continuation or a loop tick, recognized by its stamp, never by ``internal``."""
@@ -4181,6 +4205,10 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
+            # A strict event queued before /new or /resume rebound this key belongs to the session
+            # it was pinned to, not to whichever conversation this drain is now running.
+            if not await GatewayTurnMixin._strict_session_pin_holds(self, pending_event, session_id):
+                return result
             from gateway.platforms.event import is_goal_continuation_event
             if is_goal_continuation_event(pending_event):
                 from hermes_cli.session_controls import refresh_goal_continuation

@@ -32,6 +32,10 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
   which refuses a rebound key and carries the original ID in the strict gateway event pin through
   admission and execution. A `/new` or `/resume` race cannot notify a different conversation, and
   refused admission leaves `requester_notified` false for the existing retry/skipped lifecycle.
+  `GatewayTurnMixin._strict_session_pin_holds` is the one strict-pin rule outside
+  `_hmwa_resolve_session`: `admit_internal_event`, busy admission and the FIFO follow-up drain each
+  drop (without an admission receipt) a strict event whose pinned ID no longer owns its key or is not
+  the session the drain is running.
 
 ## Continuation lifecycle fence
 
@@ -81,6 +85,6 @@ A goal replacement installs its goal, contract and max turns, so the approval ca
 - A replacement payload is normalized once (stripped goal, full contract, positive integer max turns) and stored, shown and applied in that form.
 - Loop completion judges only the tick the completed turn's wake carried (`loop_tick` from the terminal turn's identity, passed to `complete_tick(tick=...)`), so a stop, re-set and new tick before the hooks run never lets the old response finish the new loop.
 - A turn that ran no loop wake owns no tick: the post-turn loop hook settles only the tick the turn or its queued chain ran (`queued_chain_loop_tick`, the deepest loop wake in the chain). With no tick it leaves an in-flight tick claimed by this gateway process to its own wake, and only releases one claimed before this process started, whose wake can no longer arrive.
-- The loop scheduler injects every wake through `admit_internal_event`, so an adapter refusal without an exception rolls the claimed tick back for the next scan. A command tick's fence accepts its own tick after the post-admission completion reaches the run cap (`done`) or tick budget (budget `paused` reason); a user or control pause or a stop drops it. A missing loop row admits the wake, because rows are never deleted.
+- The loop scheduler injects every wake through `admit_internal_event`, so an adapter refusal without an exception rolls the claimed tick back for the next scan. A command tick that a busy adapter dispatches inline (`_dispatch_inline_reply`) is stamped admitted once its handler ran, so the tick counts toward `times`/`max_ticks` instead of being rolled back after the command already executed. A command tick's fence accepts its own tick after the post-admission completion reaches the run cap (`done`) or tick budget (budget `paused` reason); a user or control pause or a stop drops it. A missing loop row admits the wake, because rows are never deleted.
 - Wakes are fenced at admission, at session resolution, and again at the model boundary (`_internal_wake_input_at_execution`, right before `_run_agent` for both the head turn and a queued follow-up, recognizing wakes by their goal-continuation or loop stamp rather than the `internal` flag, since goal continuations are built with `internal=False`), so a control committed while the turn was being prepared still drops the obsolete wake, and an edited goal's continuation runs its refreshed prompt.
 - The latest message must be exactly one sentence, the instruction itself (`user_quote_multi_sentence` otherwise). Another sentence can revoke, correct or reframe it ("Disregard the next sentence. Clear ...", "Clear ... Actually, keep it"), so any multi-sentence message falls back to Approve/Deny instead of being interpreted.

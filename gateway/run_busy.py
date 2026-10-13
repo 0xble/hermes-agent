@@ -866,6 +866,11 @@ class GatewayBusySessionMixin:
         if is_gateway_wake(event) and not await self._run_in_executor_with_context(
                 internal_wake_is_current, event):
             return True
+        # Handled without a receipt: a strict event whose pinned session lost its key is dropped,
+        # not queued behind (and later run in) the conversation that replaced it.
+        from gateway.run_turn import GatewayTurnMixin
+        if not await GatewayTurnMixin._strict_session_pin_holds(self, event):  # type: ignore[arg-type]
+            return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if self._draining and event.internal and not self._hm_is_registered_command(event):
@@ -896,6 +901,7 @@ class GatewayBusySessionMixin:
         event._bot_loop_admitted = True
 
         if await self._route_plaintext_approval_while_busy(event, session_key):
+            event._gateway_accepted = True  # consumed by the blocked approval, an admission
             return True
         if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
@@ -942,6 +948,8 @@ class GatewayBusySessionMixin:
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+        else:
+            event._gateway_accepted = True  # folded into the running turn: admitted, not queued
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must
         # NOT also be replayed as a next-turn user message. Route through _queue_or_replace_pending_event
