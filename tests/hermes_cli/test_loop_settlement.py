@@ -192,6 +192,52 @@ def test_conflict_cleanup_cannot_release_another_claim(hermes_home, monkeypatch,
 
 
 @pytest.mark.parametrize("operation", ["revise", "settle"])
+@pytest.mark.parametrize("owner", ["same", "other"])
+@pytest.mark.parametrize("change", ["pause", "clear", "replace"])
+def test_loop_preserves_same_manager_controls_after_commit(tmp_path, monkeypatch, operation, owner, change):
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(loops, "_get_session_db", lambda: db)
+    try:
+        manager = loops.LoopManager("loop-after-commit")
+        manager.set("Check the deployment", interval_seconds=300, times=5)
+        if operation == "settle":
+            assert manager.fire_tick()
+        execute = db._execute_write
+        saved = []
+
+        def interleave(write, *args, **kwargs):
+            monkeypatch.setattr(db, "_execute_write", execute)
+            result = execute(write, *args, **kwargs)
+            # The snapshot transaction has committed; copyback has not happened.
+            control = manager if owner == "same" else loops.LoopManager(manager.session_id)
+            {"pause": control.pause, "clear": control.clear,
+             "replace": lambda: control.set("Watch the replacement", interval_seconds=600, times=5)}[change]()
+            saved.append(db.get_meta("loop:loop-after-commit"))
+            return result
+
+        monkeypatch.setattr(db, "_execute_write", interleave)
+        result = (manager.revise(reason="Less polling", interval_seconds=600) if operation == "revise"
+                  else manager.complete_tick("checked"))
+        assert result.get("ok", not result.get("stopped")) is True
+        if operation == "settle":
+            assert result["error_code"] == "state_changed"
+            assert result["message"] == ""
+        assert db.get_meta("loop:loop-after-commit") == saved[-1]
+        if change == "clear":
+            assert manager.state is None or manager.state.status == "cleared"
+        else:
+            assert manager.state.to_json() == saved[-1]
+            assert manager.revise(reason="Fewer checks", times=3)["ok"]
+            after = loops.load_loop(manager.session_id)
+            assert after.status == ("paused" if change == "pause" else "active")
+            assert after.prompt == ("Watch the replacement" if change == "replace" else "Check the deployment")
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("operation", ["revise", "settle"])
 @pytest.mark.parametrize("failure", ["read", "write", "unavailable", "ephemeral"])
 def test_loop_persistence_failure_preserves_state(hermes_home, monkeypatch, caplog, operation, failure):
     manager = loops.LoopManager("" if failure == "ephemeral" else "loop-failure")

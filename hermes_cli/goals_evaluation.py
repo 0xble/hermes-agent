@@ -6,6 +6,8 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
+
 if TYPE_CHECKING:
     from hermes_cli.goals import GoalManager, GoalState
     from hermes_state import SessionDB
@@ -37,6 +39,7 @@ def assert_goal_snapshot(session_id: str, expected: str, db: SessionDB) -> None:
         raise GoalEvaluationConflict
 
 
+@snapshot_control
 def _reload_if_readable(manager: GoalManager, db: SessionDB | None) -> None:
     if db is not None:
         try:
@@ -93,8 +96,16 @@ def evaluate_goal_snapshot(manager: GoalManager, last_response: str, **kwargs: A
         decision = evaluator._evaluate_after_turn(last_response, **kwargs)
         result = evaluator.state
 
-        commit_goal_snapshot(manager.session_id, expected, result, db)
-        manager._state = result
+        published = commit_and_publish_snapshot(
+            manager, result, lambda: commit_goal_snapshot(manager.session_id, expected, result, db),
+            lambda: _read_goal(manager.session_id, db), preserve_reference=False,
+        )
+        if not published:
+            return _decision(
+                manager.state.status if manager.state else None, False, None, "interrupted",
+                "goal changed after evaluation committed",
+                "Goal state changed during evaluation; the current goal was preserved.",
+            )
         return decision
     except GoalEvaluationConflict:
         _reload_if_readable(manager, db)

@@ -36,6 +36,7 @@ from hermes_cli.goal_evidence import (
     _render_evidence_block,
 )
 from hermes_cli.goals_revisions import GoalRevisionsMixin
+from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
 
@@ -2073,6 +2074,7 @@ class GoalManager(GoalRevisionsMixin):
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
                  min_continuation_gap_seconds: Optional[float] = None):
+        self._snapshot_lock = threading.RLock()
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         if min_continuation_gap_seconds is None:
@@ -2157,6 +2159,7 @@ class GoalManager(GoalRevisionsMixin):
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
+    @snapshot_control
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
@@ -2168,6 +2171,7 @@ class GoalManager(GoalRevisionsMixin):
         )
         return self._save()
 
+    @snapshot_control
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
         if self._state is None:
@@ -2175,6 +2179,7 @@ class GoalManager(GoalRevisionsMixin):
         self._state.contract = contract or GoalContract()
         return self._save()
 
+    @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
@@ -2185,6 +2190,7 @@ class GoalManager(GoalRevisionsMixin):
         self._state.backoff_level = 0
         return self._save()
 
+    @snapshot_control
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
@@ -2200,6 +2206,7 @@ class GoalManager(GoalRevisionsMixin):
             self._state.turns_used = 0
         return self._save()
 
+    @snapshot_control
     def resume_for_user_input(self) -> bool:
         """Reactivate a goal the judge paused as BLOCKED because a real user message just
         arrived. BLOCKED means "the next step needs user input" (#100954), and that message
@@ -2217,6 +2224,7 @@ class GoalManager(GoalRevisionsMixin):
         self.resume(reset_budget=False)
         return True
 
+    @snapshot_control
     def clear(self) -> None:
         if self._state is None:
             return
@@ -2224,6 +2232,7 @@ class GoalManager(GoalRevisionsMixin):
         self._save()
         self._state = None
 
+    @snapshot_control
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
@@ -2235,6 +2244,7 @@ class GoalManager(GoalRevisionsMixin):
 
     # --- /subgoal user controls ---------------------------------------
 
+    @snapshot_control
     def add_subgoal(self, text: str) -> str:
         """Append a user-added criterion; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -2261,10 +2271,12 @@ class GoalManager(GoalRevisionsMixin):
         self._save()
         return prev
 
+    @snapshot_control
     def remove_subgoal(self, index_1based: int) -> str:
         """Remove a subgoal by 1-based index. Returns the removed text."""
         return self._pop_item("subgoals", index_1based)
 
+    @snapshot_control
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
         return self._clear_items("subgoals")
@@ -2277,6 +2289,7 @@ class GoalManager(GoalRevisionsMixin):
 
     # --- /goal gate quality gates ---------------------------------------
 
+    @snapshot_control
     def add_gate(self, command: str, *, timeout_seconds: Optional[int] = None, max_retries: Optional[int] = None) -> GoalGate:
         """Append a quality-gate command; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -2292,10 +2305,12 @@ class GoalManager(GoalRevisionsMixin):
         self._save()
         return gate
 
+    @snapshot_control
     def remove_gate(self, index_1based: int) -> str:
         """Remove a gate by 1-based index. Returns the removed command."""
         return self._pop_item("gates", index_1based).command
 
+    @snapshot_control
     def clear_gates(self) -> int:
         """Remove all gates. Returns the previous count."""
         return self._clear_items("gates")
@@ -2388,6 +2403,7 @@ class GoalManager(GoalRevisionsMixin):
         # differ even though the durable behavior is identical.
         return self._save()
 
+    @snapshot_control
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
         """Park the goal loop until a background PID exits (no turn burned, no judge call). For a
         process with a watch/notify trigger prefer ``wait_on_session``. Requires an active goal."""
@@ -2399,6 +2415,7 @@ class GoalManager(GoalRevisionsMixin):
             raise ValueError("pid is not alive on this host")
         return self._park(reason, waiting_on_pid=pid)
 
+    @snapshot_control
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
         """Park on a process_registry session's OWN trigger: exit OR ``watch_patterns`` match. The
         right barrier for a long-lived watcher/poller that signals mid-run and may never exit."""
@@ -2408,6 +2425,7 @@ class GoalManager(GoalRevisionsMixin):
             raise ValueError("session_id must be a non-empty string")
         return self._park(reason, waiting_on_session=session_id)
 
+    @snapshot_control
     def wait_for_seconds(self, seconds: int, reason: str = "", *, on_delegations: int = 0) -> GoalState:
         """Park until ``seconds`` from now (backoff/cooldown waits with no process to track). With
         ``on_delegations`` the wait is FOR those live delegation batches: it also lifts as soon as

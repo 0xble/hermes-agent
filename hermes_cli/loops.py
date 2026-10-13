@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, fields, asdict
@@ -20,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER, is_intentional_silence_response
 from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES
 from hermes_cli.loops_revisions import LoopRevisionsMixin
+from hermes_cli.lifecycle_snapshot import snapshot_control
 
 logger = logging.getLogger(__name__)
 
@@ -551,6 +553,7 @@ class LoopManager(LoopRevisionsMixin):
     """
 
     def __init__(self, session_id: str):
+        self._snapshot_lock = threading.RLock()
         self.session_id = session_id
         self._state: Optional[LoopState] = load_loop(session_id)
 
@@ -558,6 +561,7 @@ class LoopManager(LoopRevisionsMixin):
     def state(self) -> Optional[LoopState]:
         return self._state
 
+    @snapshot_control
     def refresh(self) -> None:
         """Re-read state from the DB (cross-process safety for the gateway).
 
@@ -609,6 +613,7 @@ class LoopManager(LoopRevisionsMixin):
             return f"✓ Loop finished ({version}{fired}{_dash(s.last_stop_reason)}): {s.prompt}"
         return f"Loop ({s.status}, {version}{meta}): {s.prompt}"
 
+    @snapshot_control
     def set(
         self,
         prompt: str,
@@ -641,6 +646,7 @@ class LoopManager(LoopRevisionsMixin):
         self._state = state
         return self._save()
 
+    @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
         s = self._state
         if not s or s.status not in {"active", "paused"}:
@@ -648,6 +654,7 @@ class LoopManager(LoopRevisionsMixin):
         s.status, s.paused_reason, s.awaiting_response = "paused", reason, False
         return self._save()
 
+    @snapshot_control
     def resume(self) -> Optional[LoopState]:
         s = self._state
         if not s or s.status == "cleared":
@@ -658,6 +665,7 @@ class LoopManager(LoopRevisionsMixin):
         s.next_due_at = time.time() + min(delay, 5.0)
         return self._save()
 
+    @snapshot_control
     def clear(self) -> bool:
         if self._state is None or self._state.status == "cleared":
             return False
@@ -674,6 +682,7 @@ class LoopManager(LoopRevisionsMixin):
             and (now if now is not None else time.time()) >= s.next_due_at
         )
 
+    @snapshot_control
     def fire_tick(self) -> Optional[str]:
         """Claim a due tick; returns the message to inject, or None.
 
@@ -699,6 +708,7 @@ class LoopManager(LoopRevisionsMixin):
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
+    @snapshot_control
     def abandon_tick(self) -> None:
         """Roll back a fired tick whose injection failed (nothing ran)."""
         s = self._state

@@ -14,8 +14,10 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
     from hermes_cli.goals import GoalState, _get_session_db
     from hermes_cli.goals_evaluation import (
         GoalEvaluationConflict, GoalEvaluationPersistenceError, _reload_if_readable,
-        assert_goal_snapshot, commit_goal_snapshot,
+        assert_goal_snapshot, commit_goal_snapshot, _read_goal,
     )
+
+    from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot
 
     original = manager._require_goal()
     if not manager.session_id:
@@ -35,9 +37,11 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         staged._evaluation_snapshot = (db, expected)
         result = staged._revise(**kwargs)
         # No-op and validation returns must also observe conflicting command writes.
-        commit_goal_snapshot(manager.session_id, expected, staged.state, db)
-        original.__dict__.update(staged.state.__dict__)
-        manager._state = original
+        commit_and_publish_snapshot(
+            manager, staged.state,
+            lambda: commit_goal_snapshot(manager.session_id, expected, staged.state, db),
+            lambda: _read_goal(manager.session_id, db),
+        )
         return result
     except GoalEvaluationConflict:
         _reload_if_readable(manager, db)

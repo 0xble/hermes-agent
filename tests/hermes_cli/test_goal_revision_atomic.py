@@ -64,6 +64,50 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
         db.close()
 
 
+@pytest.mark.parametrize("operation", ["revise", "evaluate"])
+@pytest.mark.parametrize("owner", ["same", "other"])
+@pytest.mark.parametrize("change", ["pause", "clear", "replace"])
+def test_revision_preserves_same_manager_controls_after_commit(tmp_path, monkeypatch, operation, owner, change):
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    try:
+        manager = goals.GoalManager("revision-after-commit")
+        manager.set("original task")
+        execute = db._execute_write
+        saved = []
+
+        def interleave(write, *args, **kwargs):
+            monkeypatch.setattr(db, "_execute_write", execute)
+            result = execute(write, *args, **kwargs)
+            # The revision is durable, but its staged state has not been published.
+            control = manager if owner == "same" else goals.GoalManager(manager.session_id)
+            {"pause": control.pause, "clear": control.clear,
+             "replace": lambda: control.set("replacement task")}[change]()
+            saved.append(db.get_meta("goal:revision-after-commit"))
+            return result
+
+        monkeypatch.setattr(db, "_execute_write", interleave)
+        if operation == "revise":
+            result = manager.revise(reason="More proof", contract={"verification": "check the artifact"})
+            assert result["ok"] is True  # revision committed before the lifecycle command
+        else:
+            monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "more work", False, None, False))
+            decision = manager.evaluate_after_turn("progress")
+            assert decision["should_continue"] is False
+            assert decision["continuation_prompt"] is None
+        assert db.get_meta("goal:revision-after-commit") == saved[-1]
+        if change == "clear":
+            assert manager.state is None or manager.state.status == "cleared"
+        else:
+            assert manager.state.to_json() == saved[-1]
+            manager.add_subgoal("verify the current task")
+            after = goals.load_goal(manager.session_id)
+            assert after.status == ("paused" if change == "pause" else "active")
+            assert after.goal == ("replacement task" if change == "replace" else "original task")
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize("failure", ["read", "write", "unavailable", "ephemeral"])
 def test_revision_persistence_failure_is_not_ephemeral_success(tmp_path, monkeypatch, caplog, failure):
     db = SessionDB(tmp_path / "state.db")

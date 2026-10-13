@@ -12,6 +12,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
+
 if TYPE_CHECKING:
     from hermes_cli.loops import LoopState
 
@@ -72,6 +74,7 @@ def _same_tick(first: LoopState, second: LoopState) -> bool:
     )
 
 
+@snapshot_control
 def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None:
     """Release only the SAME tick on the winner, never apply its obsolete verdict.
 
@@ -89,12 +92,15 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None
     updated.awaiting_response = False
     updated.next_due_at = time.time() + updated.current_delay
     try:
-        _commit(manager.session_id, expected, updated, db)
-        manager._state = updated
+        commit_and_publish_snapshot(
+            manager, updated, lambda: _commit(manager.session_id, expected, updated, db),
+            lambda: _read_loop(manager.session_id, db), preserve_reference=False,
+        )
     except LoopSnapshotChanged:
         manager._state = _read_loop(manager.session_id, db)
 
 
+@snapshot_control
 def _reload_if_readable(manager: Any, db: Any) -> None:
     if db is not None:
         try:
@@ -139,16 +145,21 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
         staged._evaluation_snapshot = (db, expected)
         result = getattr(staged, method)(*args, **kwargs)
         # Even a no-op must validate at the transactional boundary.
-        _commit(manager.session_id, expected, staged.state, db)
-        original.__dict__.update(staged.state.__dict__)
-        manager._state = original
+        published = commit_and_publish_snapshot(
+            manager, staged.state,
+            lambda: _commit(manager.session_id, expected, staged.state, db),
+            lambda: _read_loop(manager.session_id, db),
+        )
+        if settlement and not published:
+            return _failure(manager, True, "state_changed", "loop changed after settlement committed")
         return result
     except LoopSnapshotChanged:
         try:
             if settlement:
                 _release_superseded_tick(manager, initial, db)
             else:
-                manager._state = _read_loop(manager.session_id, db)
+                with manager._snapshot_lock:
+                    manager._state = _read_loop(manager.session_id, db)
         except LoopPersistenceError:
             logger.warning("Could not reload or release superseded loop %s", manager.session_id, exc_info=True)
             return _failure(manager, settlement, "persistence_failed",
