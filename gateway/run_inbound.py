@@ -1396,12 +1396,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
+            _orphan_queue = self._overflow_queue(_quick_key)
+            _orphan_snapshot = list(_orphan_queue or ())
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
                 return event, source, is_internal
             # Into the slot when the chain was a single orphan (post-turn drain picks it up),
             # otherwise into overflow behind the already-staged next orphan.
-            self._enqueue_fifo(_quick_key, event, _orphan_adapter)
+            _admitted = False
+            try:
+                _admitted = self._enqueue_fifo(_quick_key, event, _orphan_adapter)
+            finally:
+                if not _admitted:
+                    # Rescue is synchronous: restore the exact pre-rescue FIFO and empty slot.
+                    # The current arrival stays this turn, so storage failure cannot lose it.
+                    _orphan_adapter._pending_messages.pop(_quick_key, None)
+                    _orphan_queue[:] = _orphan_snapshot
+            if not _admitted:
+                logger.warning("FIFO orphan rescue deferred for %s: incoming checkpoint failed", _quick_key)
+                return event, source, is_internal
             # Same session key by construction; carry the orphan's own source so reply anchors /
             # thread metadata point at the message actually being answered.
             _rescued_source = getattr(_rescued, "source", None)

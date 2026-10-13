@@ -48,7 +48,10 @@ session-id lookup, at exactly one of these points:
 Every FIFO producer must honor its durable-admission boolean, including the
 Telegram follow-up grace window. A failed busy queue admission must produce a
 failure reply, not a successful queue acknowledgement or a silently consumed
-event; an active turn is not proof that its follow-up was checkpointed.
+event; an active turn is not proof that its follow-up was checkpointed. Orphan
+rescue may replace the incoming turn only after that incoming input is admitted;
+on rejection, restore the original orphan FIFO/slot and process the arrival as
+the current turn. Do not consume an older orphan while dropping the arrival.
 
 Goal continuations and heartbeat ticks are not checkpointed: goal state and the
 heartbeat poller re-derive them. Older goal-continuation checkpoints are dropped
