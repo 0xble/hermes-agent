@@ -83,15 +83,21 @@ def _read_existing_record(path) -> dict:
     return record if isinstance(record, dict) else {}
 
 
-def _result_paths():
-    """Prune normal and pre-kill receipts independently by completion time."""
+def _result_paths(*, deadline: float | None = None):
+    """Prune independently; leave unfinished inventory untouched when the stop budget expires."""
     directory = get_hermes_home() / "logs" / "process-results"
     now = time.time()
     retained = {"normal": [], "cut": []}
     for path in directory.glob("proc_*.json"):
+        if deadline is not None and time.monotonic() >= deadline:
+            return []
         try:
             modified = path.stat().st_mtime
+            if deadline is not None and time.monotonic() >= deadline:
+                return []
             kind = "cut" if _is_cut_receipt(path) else "normal"
+            if deadline is not None and time.monotonic() >= deadline:
+                return []
             retention = CUT_RECEIPT_RETENTION_SECONDS if kind == "cut" else RESULT_RETENTION_SECONDS
             if modified < now - retention:
                 path.unlink(missing_ok=True)
@@ -99,11 +105,17 @@ def _result_paths():
                 retained[kind].append((modified, path))
         except FileNotFoundError:
             continue  # Another producer pruned it.
+    if deadline is not None and time.monotonic() >= deadline:
+        return []
     retained["normal"].sort(key=lambda item: (item[0], item[1].name), reverse=True)
     retained["cut"].sort(key=lambda item: (item[0], item[1].name), reverse=True)
     for _, path in retained["normal"][MAX_RETAINED_RESULTS:]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return []
         path.unlink(missing_ok=True)
     for _, path in retained["cut"][MAX_RETAINED_CUT_RESULTS:]:
+        if deadline is not None and time.monotonic() >= deadline:
+            return []
         path.unlink(missing_ok=True)
     return [
         path
@@ -213,7 +225,7 @@ def prune_completed_results(*, deadline: float | None = None) -> None:
     if not _acquire_result_lock(deadline):
         return
     try:
-        _result_paths()
+        _result_paths(deadline=deadline)
     finally:
         _RESULT_WRITE_LOCK.release()
 

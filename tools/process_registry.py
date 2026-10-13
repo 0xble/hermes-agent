@@ -1628,24 +1628,24 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
-        """Move a session from running to finished.
-        Idempotent: kill_process() and the reader thread can both call this; only
-        the FIRST move enqueues the completion notification, so no duplicates.
-        Returns True when this call is the one that persisted the session."""
+        """Claim finalization once; publish completion only after persistence finishes.
+        Keep pending results tracked, but never wait for receipt IO under the registry lock.
+        Returns True for the owner; reader/kill duplicates return False."""
         with self._lock:
             was_running = session.id in self._running
             if was_running:
+                if session._finish_claimed:
+                    return False
                 session._finish_claimed = True
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
-                if session._kill_deadline is None or time.monotonic() < session._kill_deadline:
-                    # A bounded stop owns one final prune; its finalizers only write.
-                    if session._kill_deadline is None:
-                        save_completed_result(session)
-                    else:
-                        save_completed_result(session, prune=False)
-                self._running.pop(session.id)
+        if was_running and (session._kill_deadline is None or time.monotonic() < session._kill_deadline):
+            if session._kill_deadline is None:
+                save_completed_result(session)
+            else:
+                save_completed_result(session, prune=False)
+        with self._lock:
+            if was_running:
+                self._running.pop(session.id, None)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)

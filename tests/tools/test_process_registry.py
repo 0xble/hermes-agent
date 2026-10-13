@@ -208,7 +208,7 @@ def test_bounded_sweep_prunes_once_through_real_finalization(registry, tmp_path,
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
     scans = []
     real_scan = receipts._result_paths
-    monkeypatch.setattr(receipts, "_result_paths", lambda: (scans.append(1), real_scan())[1])
+    monkeypatch.setattr(receipts, "_result_paths", lambda **kwargs: (scans.append(1), real_scan(**kwargs))[1])
     procs = [_spawn_python_sleep(30), _spawn_python_sleep(30)]
     try:
         for index, proc in enumerate(procs):

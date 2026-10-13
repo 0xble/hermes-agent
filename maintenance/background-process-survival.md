@@ -33,8 +33,14 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   for retention, and write small bounded-sweep receipts before signalling within half
   the remaining budget, retrying any uncovered session once after the signals.
   Cut/final receipt lock acquisition and the final prune respect the bounded stop's
-  deadline. A busy writer may leave a receipt unwritten, but cannot hold up the
-  termination signals.
+  deadline. Reader finalization claims the session under the registry lock, then
+  persists outside it: an unrelated writer cannot prevent a sweep from selecting
+  and signalling its live targets. A blocked final result remains tracked in memory;
+  only its owner may publish completion or release finite-parent waiters. Bounded
+  finalizers that skip persistence retain the terminal result in the finished map.
+  The final prune checks its deadline throughout scanning, legacy classification,
+  age deletion, and count deletion; unfinished retention work waits for a later prune.
+  A busy writer may leave a receipt unwritten, but cannot hold up termination signals.
 - Compatibility is additive: new checkpoint and receipt keys have safe absence
   behavior so an older release can roll back without a destructive migration.
 - Do not touch `gateway/platforms/event.py`, `response_filters.py`, locales, or
@@ -44,6 +50,10 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
 
 Run the focused process-registry and terminal proof surfaces with the canonical
 FIFO runner, then run Ruff and `scripts/check_fork_patches.py --source-only`.
+The receipt-deadline regressions hold a real reader behind an unrelated result
+writer while a bounded sweep kills a real child, then verify durable output and
+one completion after release. Legacy-inventory tests force expiry during
+classification, age deletion, and count deletion, then verify a later prune repairs retention.
 For PR4, verify a real local non-PTY process survives a gateway restart and that
 its completion is observed once after repeated polls.
 
