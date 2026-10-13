@@ -210,11 +210,12 @@ CONTINUATION_PROMPT_TEMPLATE = (
 )
 
 # Appended to every continuation prompt once the goal has been revised. The runtime cannot tell
-# whether a quoted user message really authorizes a change (the judge decides that after the
-# fact), so the working agent keeps seeing each replaced requirement as binding: a prohibition the
-# agent dropped on its own must still stop it before an irreversible action, not only at judging.
+# whether a quoted user message really authorizes an ordinary revision (the judge decides that
+# after the fact). An explicitly user-authorized replacement, however, starts a new outcome scope.
+# Earlier requirements remain in the audit history, but must not bind the replacement goal.
 CONTINUATION_REVISIONS_TEMPLATE = (
-    "\n\nThis goal has been revised. Each earlier requirement listed below still "
+    "\n\nThis goal has been revised. Requirements marked superseded (no longer binding) "
+    "are audit history only, not obligations for the current goal. Each remaining earlier requirement still "
     "binds you unless the user message cited for that revision plainly instructs "
     "that specific change. When in doubt, honor the earlier requirement.\n"
     "{revision_lines}"
@@ -408,7 +409,10 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
 # Judge prompt block for the goal's revision history (empty without revisions).
 JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "Revision history (the goal and criteria above are the CURRENT version). "
-    "A revision may clarify or restructure, but only the user can lower the "
+    "Requirements marked superseded (no longer binding) are audit history only: "
+    "a user-authorized replacement resets the outcome scope, so do not judge the current "
+    "goal against any requirement at or before that replacement. For the remaining history, "
+    "a revision may clarify or restructure, but only the user can lower the "
     "bar. For each earlier requirement a revision dropped or weakened: it is "
     "superseded only when the cited user message plainly instructs that "
     "specific change; otherwise, including every revision with no user "
@@ -802,9 +806,17 @@ class GoalState:
     def render_revisions_block(self) -> str:
         """Every revision with every requirement it replaced, in full; empty without revisions.
 
-        Nothing is windowed or truncated: a replaced requirement stays binding unless a user message
-        instructs the change, so dropping it from the prompt would silently lower the bar."""
+        Nothing is windowed or truncated. Ordinary revisions preserve earlier requirements, but
+        the latest user-authorized replacement supersedes the entire preceding outcome scope.
+        Derive that boundary from the audit entries rather than storing a second source of truth.
+        """
         lines = []
+        replacement_boundary = max(
+            (i for i, rev in enumerate(self.revisions)
+             if rev.get("kind") == "replace" and rev.get("actor") == "user"
+             and rev.get("authority") in {"quote", "button"}),
+            default=-1,
+        )
         for i, rev in enumerate(self.revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
@@ -814,22 +826,30 @@ class GoalState:
                 authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
             else:
                 authority = "agent, no user authority"
-            before, after = rev.get("before") or {}, rev.get("after") or {}
+            # Ordinary revisions flatten the contract; replacements keep a full nested snapshot.
+            # Render both representations, including the old verification and constraints.
+            before, after = dict(rev.get("before") or {}), dict(rev.get("after") or {})
+            for snapshot in (before, after):
+                contract = snapshot.pop("contract", None)
+                if isinstance(contract, dict):
+                    snapshot.update({key: contract.get(key, "") for key in _CONTRACT_FIELDS})
             changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
+            superseded = i - 1 <= replacement_boundary
             lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
-                         f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}")
-            # A user-authorized replacement supersedes the old objective; label it so it is not read as binding.
-            superseded = rev.get("kind") == "replace" and rev.get("actor") == "user"
+                         f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}"
+                         + (" — superseded history (no longer binding)" if superseded else ""))
             for key in changed:
                 if superseded and key == "goal":
                     lines.append(f"    superseded goal (replaced with user authority, no longer binding): "
                                  f"{str(before.get(key) or '(empty)')}")
                 elif key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
-                    lines.append(f"    earlier {key}: {str(before.get(key) or '(empty)')}")
+                    label = f"superseded {key} (no longer binding)" if superseded else f"earlier {key}"
+                    lines.append(f"    {label}: {str(before.get(key) or '(empty)')}")
                 elif key == "subgoals":
                     dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
                     if dropped:
-                        lines.append("    dropped criteria: " + "; ".join(str(s) for s in dropped))
+                        label = "superseded criteria (no longer binding)" if superseded else "dropped criteria"
+                        lines.append(f"    {label}: " + "; ".join(str(s) for s in dropped))
         return "\n".join(lines)
 
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:

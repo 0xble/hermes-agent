@@ -242,6 +242,89 @@ def test_goal_replace_records_continuation_prompt(state):
     assert result["record"]["continuation_prompt"] == result["continuation_prompt"]
 
 
+@pytest.mark.parametrize("via", ["quote", "button"])
+@pytest.mark.parametrize("replacement_count", [1, 2])
+def test_replacement_boundary_resets_prior_scope_but_not_later_revisions(state, via, replacement_count):
+    """Both real authority paths supersede all prior contracts/criteria, not subsequent revisions."""
+    import copy
+    from unittest.mock import MagicMock, patch
+    from hermes_cli.goals import GoalContract, GoalManager, judge_goal, load_goal
+    from hermes_cli.session_controls import apply_control, resolve_request
+
+    manager = GoalManager("target")
+    manager.set("migrate production", contract=GoalContract(
+        verification="production migration verified", constraints="do not lose production data",
+        boundaries="production shards only", stop_when="production unavailable",
+    ))
+    manager.add_subgoal("production shard")
+    assert manager.revise(reason="reword verification", contract={
+        "verification": "production migration fully verified",
+    })["ok"]
+    original_revision = copy.deepcopy(manager.state.revisions[0])
+
+    def replace(goal, verification):
+        quote = f"replace the target goal with {goal}"
+        if via == "quote":
+            _user(state, "requester", f"Please {quote}")
+        result = apply_control(
+            "goal", "replace", "target", requester_sid="requester", reason="user pivot",
+            user_quote=quote if via == "quote" else "",
+            payload={"goal": goal, "contract": {"verification": verification}},
+        )
+        if via == "button":
+            assert result["status"] == "pending"
+            record = resolve_request(result["request_id"], "approve", "42")
+        else:
+            record = result["record"]
+        assert record["status"] == "applied"
+        return GoalManager("target")
+
+    manager = replace("write a local design note", "design note exists")
+    manager.add_subgoal("include local examples")
+    assert manager.revise(reason="reword local verification", contract={
+        "verification": "design note reviewed",
+    })["ok"]
+    if replacement_count == 2:
+        manager = replace("write a local checklist", "local checklist exists")
+        assert manager.state.subgoals == []
+        assert manager.revise(reason="reword checklist verification", contract={
+            "verification": "local checklist reviewed",
+        })["ok"]
+    history = copy.deepcopy(manager.state.revisions)
+    assert history[0] == original_revision
+    assert len(history) == 2 * replacement_count + 1
+    assert manager.state.revisions[-1].get("actor") == "agent"
+
+    with patch("agent.auxiliary_client.call_llm", return_value=MagicMock(
+        choices=[MagicMock(message=MagicMock(content='{"verdict": "continue", "reason": "more"}'))],
+    )) as call_llm:
+        judge_goal(manager.state.goal, "still working", contract=manager.state.contract,
+                   subgoals=manager.state.subgoals,
+                   revisions_block=manager.state.render_revisions_block())
+    prompts = [manager.next_continuation_prompt(), call_llm.call_args.kwargs["messages"][1]["content"]]
+    for prompt in prompts:
+        for text in ("production migration verified", "production migration fully verified"):
+            assert f"superseded verification (no longer binding): {text}" in prompt
+            assert f"earlier verification: {text}" not in prompt
+        assert "superseded criteria (no longer binding): production shard" in prompt
+        assert "superseded constraints (no longer binding): do not lose production data" in prompt
+        assert "superseded boundaries (no longer binding): production shards only" in prompt
+        assert "superseded stop_when (no longer binding): production unavailable" in prompt
+        if replacement_count == 2:
+            assert "superseded verification (no longer binding): design note exists" in prompt
+            assert "superseded verification (no longer binding): design note reviewed" in prompt
+            assert "superseded criteria (no longer binding): include local examples" in prompt
+            assert "earlier verification: local checklist exists" in prompt
+        else:
+            assert "earlier verification: design note exists" in prompt
+            assert "include local examples" in prompt
+        assert "agent, no user authority" in prompt
+    # Rendering changes no audit data; round-trip/reloading derives the same boundary.
+    assert manager.state.revisions == history
+    assert load_goal("target").revisions == history
+    assert load_goal("target").render_revisions_block() == manager.state.render_revisions_block()
+
+
 def test_button_approved_replace_records_user_authority(state):
     from hermes_cli.goals import GoalManager, load_goal
     from hermes_cli.session_controls import request_control, resolve_request

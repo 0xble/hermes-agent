@@ -207,6 +207,44 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
 
 
 @pytest.mark.asyncio
+async def test_dispatch_rejects_rebound_session_when_identity_is_pinned():
+    """A requester outcome must not follow a session key after /new or /resume rebinds it."""
+    adapter = _admitting_adapter()
+    old_entry = _entry()
+    rebound = _entry()
+    rebound.session_id = "new-session-after-reset"
+    runner = _runner(rebound, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key,
+        expected_session_id=old_entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_matching_pinned_session_identity():
+    adapter = _admitting_adapter()
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        expected_session_id=entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["gateway_session_id"] == entry.session_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("entry", "with_adapter"),
     [

@@ -310,6 +310,7 @@ class GatewaySessionControlsMixin:
                 try:
                     accepted = await self._dispatch_plugin_message_injection(
                         session_key=requester_entry.session_key,
+                        expected_session_id=record["requester_session_id"],
                         content=content,
                         plugin_id="session-controls",
                     )

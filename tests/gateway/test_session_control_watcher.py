@@ -148,7 +148,78 @@ async def test_watcher_applied_clear_delivers_notice_injection_and_marks_done(st
     assert runner.cleared == "target-key"
     assert len(runner.adapter.sends) == 1
     assert len(runner.injections) == 1
+    assert runner.injections[0]["expected_session_id"] == "requester"
     assert pending_outbox() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebind", ["new", "resume", None])
+@pytest.mark.parametrize("timing", ["lookup", "scope"])
+async def test_requester_outcome_stays_in_its_recorded_session(state, rebind, timing):
+    """Drive real outbox + injector + strict resolution across a session-key rebind."""
+    from contextlib import asynccontextmanager
+    from types import MethodType
+    from gateway.run_plugin_injection import GatewayPluginInjectionMixin
+    from gateway.run_turn import GatewayTurnMixin
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.session_controls import apply_control, _load_record
+
+    runner = _runner(state)
+    old_requester = runner.requester
+    current = old_requester
+    admitted = []
+
+    def move_route():
+        nonlocal current
+        if rebind:
+            current = SimpleNamespace(
+                session_key=old_requester.session_key, session_id=f"{rebind}-session",
+                origin=old_requester.origin,
+            )
+
+    async def lookup(_key):
+        if timing == "lookup":
+            move_route()
+        return current
+
+    @asynccontextmanager
+    async def scope(_source):
+        if timing == "scope":
+            move_route()
+        yield
+
+    async def handle(event):
+        resolved = await GatewayTurnMixin._hmwa_resolve_session(runner, event, event.source)
+        if resolved is not None:
+            admitted.append(resolved[1].session_id)
+            event._gateway_accepted = True
+
+    runner.async_session_store = SimpleNamespace(lookup_by_session_key=lookup)
+    runner._plugin_injection_accepting = lambda: True
+    runner._plugin_injection_authorized = lambda *args, **kwargs: True
+    runner._plugin_injection_scope = scope
+    runner._session_key_for_source = lambda source: old_requester.session_key
+    runner._cache_session_source = lambda *args: None
+    runner._is_telegram_topic_lane = lambda source: False
+    runner._delivery_adapter_for = lambda source: runner.adapter
+    runner.adapter.handle_message = handle
+    runner._dispatch_plugin_message_injection = MethodType(
+        GatewayPluginInjectionMixin._dispatch_plugin_message_injection, runner,
+    )
+    GoalManager("target").set("watch the build")
+    state.append_message("requester", "user", "Please clear the target goal immediately")
+    result = apply_control("goal", "clear", "target", requester_sid="requester",
+                           user_quote="clear the target goal immediately")
+
+    await runner._drain_session_controls()
+
+    record = _load_record(result["record"]["id"])
+    assert record is not None
+    assert record["requester_notified"] is (rebind is None)
+    assert not record["requester_notification_skipped"]
+    assert record["outbox_done"] is (rebind is None)
+    assert admitted == ([] if rebind else ["requester"])
+
 
 
 @pytest.mark.asyncio

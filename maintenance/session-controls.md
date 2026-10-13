@@ -18,7 +18,7 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
 - Residual risk: quote authority is a verbatim substring matched against deterministic word sets, not an interpretation of intent. It is mitigated by using only the latest typed message, the negation and control-match checks, the full source message shown in the target-topic notice, and Approve/Deny buttons as the fallback.
 - Goal resume applies only to a `paused` goal; done, cleared, and already-active goals return `nothing_to_resume`. Pause, clear, and replace require an active or paused goal.
 - Button requests are created only for targets whose session source has an Approve/Deny surface (Telegram); others return `target_unapprovable`. The base adapter's text fallback remains for safety, and the quote path still works for any routable target.
-- A replacement records `actor="user"` with `authority` `quote` or `button` (plus `approved_by`), so the judge and continuation present the old goal as superseded. Replace notices show `old -> new`.
+- A replacement records `actor="user"` with `authority` `quote` or `button` (plus `approved_by`). The latest such revision resets the entire outcome scope: both judge and continuation label every preceding requirement, contract and dropped criterion as superseded audit history, including requirements in older agent revisions. Subsequent ordinary revisions keep earlier requirements in the new scope binding unless specifically user-authorized. Audit data is preserved; the boundary is derived from existing revision kind/authority, not a second persisted field. Replace notices show `old -> new`.
 - Use the existing GoalManager and LoopManager methods for mutations. Goal replacement preserves revision history and refuses without explicit authority.
 - Telegram callbacks must pass the existing callback allowlist and resolve through a durable compare-and-set; a second, expired, or unauthorized press must not mutate state.
 - Gateway delivery is profile-scoped and drains durable request/outcome rows after restart. The watcher
@@ -28,6 +28,10 @@ Agents reach this primitive through the `goal_set` and `loop_set` tools, which t
   marks undeliverable CLI/TUI rows skipped/done rather than growing the outbox forever. The watcher drains every served
   profile's SessionDB under that profile's runtime scope, and an Approve/Deny tap resolves under the
   scope of the profile that owns the tapped chat.
+  Requester outcome injection passes the record's requester session ID to the shared plugin injector,
+  which refuses a rebound key and carries the original ID in the strict gateway event pin through
+  admission and execution. A `/new` or `/resume` race cannot notify a different conversation, and
+  refused admission leaves `requester_notified` false for the existing retry/skipped lifecycle.
 
 ## Continuation lifecycle fence
 
