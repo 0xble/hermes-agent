@@ -984,10 +984,18 @@ def _iter_referenced_shell_scripts(
         index = _command_token_index(segment)
         if index is None:
             continue
-        for position in _iter_prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot):
+        positions = list(_iter_prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot))
+        reachable = set(positions)
+        for position in positions:
             if position >= len(segment):
                 continue
-            if allow_heavy_slot and _heavy_slot_command_index(segment, position) is not None:
+            heavy_target = _heavy_slot_command_index(segment, position) if allow_heavy_slot else None
+            if heavy_target is not None:
+                # The helper is transparent only when the iterator reached its wrapped target. If
+                # the prefix budget ended on the helper, retain the strict source walk instead of
+                # silently removing the only remaining scan candidate.
+                if heavy_target not in reachable:
+                    yield from _references_at(segment, position, cwd)
                 continue
             yield from _references_at(segment, position, cwd)
 
@@ -999,9 +1007,11 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        # Read at the ORIGINAL token: peeling past `su`/`env` would discard the command option.
-        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
-            yield from _iter_option_values(segment, index, option)
+        for position in _iter_prefix_positions(segment, index):
+            if position >= len(segment):
+                continue
+            for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
+                yield from _iter_option_values(segment, position, option)
         index = _executed_command_index(segment)
         if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue

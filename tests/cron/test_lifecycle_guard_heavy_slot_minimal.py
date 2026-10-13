@@ -1,5 +1,6 @@
 """Only the installed helper's exact, explicit-path wrapper grammar is transparent."""
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -110,3 +111,17 @@ def test_peel_does_not_hide_an_untrusted_outer_wrapper(tmp_path, trusted_slot):
 
 def test_shell_command_payload_is_still_scanned(trusted_slot):
     assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- bash -c 'hermes gateway restart'") == (True, None)
+
+
+def test_string_wrapper_payload_after_heavy_slot_is_scanned(tmp_path, trusted_slot):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- env -S {payload}") == (True, None)
+
+
+def test_exhausted_prefix_budget_walks_heavy_slot_strictly(tmp_path, trusted_slot):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    command = " ".join(["nohup"] * 8 + [str(trusted_slot), "--label", "proof", "--", "bash", str(child)])
+    unsafe, refusal = scan_gateway_lifecycle(command)
+    assert unsafe is True
+    assert refusal is not None and "/dev/null" in refusal
