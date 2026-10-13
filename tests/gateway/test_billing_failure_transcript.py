@@ -1,98 +1,85 @@
-"""A classified billing 400 on a long session is persisted, not reset/dropped."""
+"""A classified billing 400 on a long session is durably persisted, not reset/dropped."""
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.run_turn import GatewayTurnMixin
+from gateway.config import GatewayConfig, Platform
+from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
+from gateway.session import AsyncSessionStore, SessionSource, SessionStore
+from hermes_state import SessionDB
 
 
-class _Store:
-    def __init__(self) -> None:
-        self.appended = []
-        self.updated = []
-        self.reset_called = False
-
-    async def append_to_transcript(self, session_id, row, **kwargs):
-        self.appended.append((session_id, row, kwargs))
-
-    async def update_session(self, session_key, **kwargs):
-        self.updated.append((session_key, kwargs))
-
-    async def reset_session(self, *_args, **_kwargs):
-        self.reset_called = True
-        raise AssertionError("billing failures must not auto-reset the session")
-
-    async def transcript_tail_role(self, _session_id):
-        return "user"
-
-    async def has_platform_message_id(self, _session_id, _message_id):
-        return False
+@pytest.fixture
+def long_session(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = SessionDB(db_path=tmp_path / "state.db")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    entry = store.get_or_create_session(source)
+    store._db.create_session(session_id=entry.session_id, source="telegram", user_id="u1")
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)} for i in range(60)]
+    store._db.replace_messages(entry.session_id, history)
+    yield store, source, entry, history
+    store._db.close()
 
 
 @pytest.mark.asyncio
-async def test_long_session_billing_400_persists_and_does_not_auto_reset():
+async def test_long_session_billing_400_persists_and_does_not_auto_reset(long_session):
+    store, source, session_entry, history = long_session
     runner = object.__new__(GatewayTurnMixin)
-    store = _Store()
-    runner.async_session_store = store
+    runner.async_session_store = AsyncSessionStore(store)
+    runner.async_session_store.reset_session = AsyncMock(side_effect=AssertionError("unexpected auto-reset"))
     runner._session_db = None
     runner._refresh_agent_cache_message_count = AsyncMock()
-    runner._hmwa_close_failed_turn = AsyncMock()
-    runner._hmwa_failed_turn_notice = Mock(return_value="failed turn")
-    runner._evict_cached_agent = Mock()
-    runner._clear_conversation_scope = Mock()
-    runner._session_model_override_lock = Mock()
-    runner._sync_telegram_topic_binding = Mock()
-
-    session_entry = SimpleNamespace(session_id="session-1", session_key="key-1")
-    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": str(i)} for i in range(60)]
+    original_session_id = session_entry.session_id
     agent_result = {
         "failed": True,
         "failure_reason": "billing",
         "error": "HTTP 400: Your credit balance is too low to access the Anthropic API",
         "messages": history,
-        "history_offset": 0,
+        "history_offset": len(history),
     }
-
     failed, hidden, overflow = runner._hmwa_classify_turn_failure(agent_result, history, session_entry)
-
     assert failed is True
     assert hidden is False
     assert overflow is False
 
     prepared = SimpleNamespace(
-        history=history,
-        persist_user_message=None,
-        message_text="please continue",
-        persist_user_timestamp=None,
-        persist_user_display_kind=None,
-        persistence_owner=None,
+        history=history, persist_user_message=None, message_text="please continue",
+        persist_user_timestamp=None, persist_user_display_kind=None, persistence_owner=None,
     )
     event = SimpleNamespace(message_id="msg-1", internal=False)
-    source = SimpleNamespace(platform=SimpleNamespace(value="cli"))
-    await runner._hmwa_persist_turn_transcript(
-        event=event,
-        source=source,
-        session_entry=session_entry,
-        session_key="key-1",
-        agent_result=agent_result,
-        agent_messages=history,
-        prepared=prepared,
-        response="billing failure",
-        agent_failed_early=failed,
-        hidden_reasoning_incomplete=hidden,
-        is_context_overflow_failure=overflow,
-    )
-
-    assert any(row[1]["role"] == "user" for row in store.appended)
-    runner._hmwa_close_failed_turn.assert_awaited_once()
-
     response, returned_entry = await runner._hmwa_compression_exhaustion_reset(
-        agent_result, "billing failure", session_entry, "key-1", source,
+        agent_result, "billing failure", session_entry, session_entry.session_key, source,
+    )
+    await runner._hmwa_persist_turn_transcript(
+        event=event, source=source, session_entry=returned_entry,
+        session_key=session_entry.session_key, agent_result=agent_result, agent_messages=history,
+        prepared=prepared, response=response, agent_failed_early=failed,
+        hidden_reasoning_incomplete=hidden, is_context_overflow_failure=overflow,
+    )
+    # Read the exact durable target, not a persistence mock or an agent-returned message list.
+    transcript = await runner.async_session_store.load_transcript(original_session_id)
+    assert transcript[-2]["role"] == "user"
+    assert transcript[-2]["content"] == "please continue"
+    assert transcript[-1]["role"] == "assistant"
+    assert len(transcript) == len(history) + 2
+    assert returned_entry.session_id == original_session_id
+    assert response == "billing failure"
+    runner.async_session_store.reset_session.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reason", ["billing", "auth", "rate_limit", "content_policy_blocked", "format_error"])
+def test_classified_nonoverflow_400_overrides_long_history_heuristic(reason):
+    assert not is_context_overflow_failure_result(
+        {"failed": True, "failure_reason": reason, "error": "HTTP 400 invalid request"}, 100,
     )
 
-    assert returned_entry is session_entry
-    assert response == "billing failure"
-    assert store.reset_called is False
+
+@pytest.mark.parametrize("reason", [None, "unknown", "context_overflow"])
+def test_unclassified_and_genuine_overflow_keep_the_growth_loop_guard(reason):
+    assert is_context_overflow_failure_result(
+        {"failed": True, "failure_reason": reason, "error": "HTTP 400 request too large"}, 100,
+    )
