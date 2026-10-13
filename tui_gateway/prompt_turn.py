@@ -56,9 +56,11 @@ def _hook_failure(what: str, exc: BaseException) -> None:
 
 
 def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
-    """Admit successful boundaries, including empty/tool-only iteration handoffs.
+    """Admit successful boundaries, including empty/tool-only completed turns.
 
-    Failed, interrupted and other incomplete turns stay out (cf. #63180).
+    A non-failed ``max_iterations_reached(...)`` handoff with a summary remains
+    resumable, so an active goal can judge it (#102213). Failed, interrupted and
+    other incomplete turns stay out (cf. #63180).
     """
     from hermes_cli.goal_turn_outcome import is_successful_goal_turn
     return (status == "complete" and isinstance(raw, str)
@@ -404,8 +406,8 @@ def _goal_followup_after_turn(
     return goal_followup
 
 
-def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
-    """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
+def _settle_loop_after_turn(sid: str, session: dict, raw: Any) -> None:
+    """Release the in-flight loop claim even when the model turn was unsuccessful."""
     try:
         from hermes_cli.loops import LoopManager
         loop_sid_key = session.get("session_key") or ""
@@ -417,7 +419,13 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
                 if loop_msg := loop_decision.get("message") or "":
                     _emit("status.update", sid, {"kind": "loop", "text": loop_msg})
     except Exception as _loop_exc:
-        _hook_failure("loop completion hook", _loop_exc)
+        logger.warning("loop completion hook failed: %s", _loop_exc, exc_info=True)
+
+
+def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
+    """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
+    successful = _is_successful_goal_turn(getattr(st, "result", None), "complete", raw)
+    _settle_loop_after_turn(sid, session, raw if successful else "")
     # Apply pending_title now that the DB row exists — in the session-owned profile store.
     if _pending := session.get("pending_title"):
         _session_key = session.get("session_key") or sid
@@ -1329,6 +1337,8 @@ def _run_prompt_submit(
                 sid, session, st.result, status, raw, user_initiated=user_turn)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
+            else:
+                _settle_loop_after_turn(sid, session, "")
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the
             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
             _publish_session_control_snapshot(sid, session, only_if_present=True)

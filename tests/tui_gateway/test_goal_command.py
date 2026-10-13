@@ -206,7 +206,9 @@ def _max_iterations_fallback(final_response="fallback summary"):
         ),
         (_max_iterations_fallback(), "error", "fallback summary", False),
         (_max_iterations_fallback(), "interrupted", "fallback summary", False),
-        (_max_iterations_fallback(), "complete", "   ", True),
+        (_max_iterations_fallback(), "complete", "   ", False),
+        (_max_iterations_fallback("   "), "complete", "   ", False),
+        (_max_iterations_fallback(""), "complete", "", False),
     ],
 )
 def test_successful_goal_turn_accepts_only_valid_completion_outcomes(

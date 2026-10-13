@@ -740,6 +740,8 @@ class CLILoopsMixin:
     def _post_turn_response(self) -> tuple[str, bool]:
         """Read the current result before falling back to legacy transcript-only callers."""
         from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        if getattr(self, "_last_turn_started", True) is False:
+            return "", False  # chat() returned before the model ran (credentials/setup)
         result = getattr(self, "_last_turn_result", None)
         response = (
             str(result.get("final_response") or "") if isinstance(result, dict)

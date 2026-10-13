@@ -638,8 +638,12 @@ class GatewayGoalsMixin:
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
         """Text for /goal and /loop after a gateway turn. Streamed turns return None from
         _handle_message_with_agent (already_sent); the delivered reply is stashed on the event."""
-        # Delivery strips display-only control markers (LOOP_COMPLETE) from the returned text;
-        # the raw reply it stashed is authoritative for /loop completion detection.
+        # Explicit model output is authoritative even when empty. Delivery normalization can
+        # manufacture notices that must never become goal/loop judgment evidence.
+        model_text = getattr(event, "_agent_final_response", None)
+        if isinstance(model_text, str):
+            return model_text
+        # Older callers stash only the pre-marker-stripping delivery text.
         raw = getattr(event, "_raw_final_response", None)
         if isinstance(raw, str) and raw.strip():
             return raw

@@ -99,7 +99,7 @@ async def _deliver(event, final_response, monkeypatch):
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     return await runner._hmwa_deliver_turn_response(
         event, event.source, session, None, 0,
-        {"final_response": final_response}, [], shaped, None, marker, raw_response=shaped,
+        {"final_response": final_response}, [], shaped, None, marker,
     )
 
 
