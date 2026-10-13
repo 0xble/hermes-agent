@@ -15,12 +15,11 @@ logger = logging.getLogger(__name__)
 
 def _mid_turn_recovery_allowed(agent):
     """Return whether this route has a real provider-fallback recovery signal."""
+    # A held shared record alone is not a signal: an expired record stays cached as a recovery
+    # probe after the primary returns, so it can outlive the episode that armed it.
     return bool(
         getattr(agent, "_provider_fallback_active", False)
-        and (
-            getattr(agent, "_fallback_episode_cooled", False)
-            or isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict)
-        )
+        and getattr(agent, "_fallback_episode_cooled", False)
     )
 
 
@@ -93,6 +92,31 @@ def _close_discarded_route_clients(agent, clients) -> None:
                 close()
 
 
+def _capture_route_state(agent):
+    """Snapshot every field a route bind can touch, so a failed bind restores exact objects
+    instead of rebuilding them (a rebuild can itself fail and leave a mixed runtime)."""
+    from agent.agent_runtime_helpers import _snapshot_switch_state
+    from agent.voice_turn_route import _EXTRA_FIELDS, _REASONING_FIELDS
+    snapshot = _snapshot_switch_state(agent)
+    for name in (*_EXTRA_FIELDS, *_REASONING_FIELDS, "_cached_system_prompt", "_cached_system_prompt_static",
+                 "_use_prompt_caching", "_use_native_cache_layout", "request_overrides", "_rate_limited_until",
+                 "_shared_primary_cooldown_record", "_fallback_index"):
+        if hasattr(agent, name):
+            value = getattr(agent, name)
+            snapshot[name] = dict(value) if name == "_transport_cache" and isinstance(value, dict) else value
+    return snapshot
+
+
+def _restore_route_state(agent, snapshot):
+    """Restore a captured route and retire only clients created after the capture."""
+    from agent.agent_runtime_helpers import _restore_switch_snapshot
+    original = {id(snapshot.get(n)) for n in ("client", "_anthropic_client") if snapshot.get(n) is not None}
+    created = [c for c in (getattr(agent, "client", None), getattr(agent, "_anthropic_client", None))
+               if c is not None and id(c) not in original]
+    _restore_switch_snapshot(agent, snapshot)
+    _close_discarded_route_clients(agent, created)
+
+
 def _try_reclaim_earlier_fallback(agent, before_index):
     """A stay expiry is recovery, not a failure: try only better-ranked entries."""
     from agent.chat_completion_helpers import (
@@ -108,12 +132,15 @@ def _try_reclaim_earlier_fallback(agent, before_index):
         model = (entry.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, entry, _fallback_entry_key(entry), provider, model, unavailable):
             continue
+        attempt = _capture_route_state(agent)
         try:
             bound = bind_route_entry(agent, entry, provider, model)
         except Exception:
             logger.debug("Earlier fallback %s could not be rebound", model, exc_info=True)
-            continue
+            bound = None
         if bound is None:
+            # Each candidate starts from the pre-attempt route, never a partial failed bind.
+            _restore_route_state(agent, attempt)
             continue
         _finalize_fallback_route(agent, provider)
         agent._fallback_index = index + 1
@@ -143,18 +170,7 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
         return _restore_primary_runtime_for_iteration(agent, active_system_prompt)
 
     previous_index = getattr(agent, "_fallback_index", 0)
-    # Rollback restores the exact pre-check objects instead of rebuilding them: a rebuild can
-    # itself fail and leave a mixed runtime. Only clients created during the check are retired.
-    from agent.agent_runtime_helpers import _snapshot_switch_state
-    from agent.voice_turn_route import _EXTRA_FIELDS, _REASONING_FIELDS
-    snapshot = _snapshot_switch_state(agent)
-    for name in (*_EXTRA_FIELDS, *_REASONING_FIELDS, "_cached_system_prompt", "_cached_system_prompt_static",
-                 "_use_prompt_caching", "_use_native_cache_layout", "request_overrides", "_rate_limited_until",
-                 "_shared_primary_cooldown_record"):
-        if hasattr(agent, name):
-            value = getattr(agent, name)
-            snapshot[name] = dict(value) if name == "_transport_cache" and isinstance(value, dict) else value
-    original_clients = {id(c) for c in (snapshot.get("client"), snapshot.get("_anthropic_client")) if c is not None}
+    snapshot = _capture_route_state(agent)
     compressor = getattr(agent, "context_compressor", None)
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     committed = False
@@ -179,13 +195,9 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
         return active_system_prompt
     finally:
         if not committed:
-            created = [c for c in (getattr(agent, "client", None), getattr(agent, "_anthropic_client", None))
-                       if c is not None and id(c) not in original_clients]
-            from agent.agent_runtime_helpers import _restore_switch_snapshot
-            _restore_switch_snapshot(agent, snapshot)
+            _restore_route_state(agent, snapshot)
             if compressor_state is not None:
                 vars(compressor).clear()
                 vars(compressor).update(compressor_state)
-            _close_discarded_route_clients(agent, created)
         if getattr(agent, "_provider_fallback_active", False):
             agent._fallback_stay_started_at = time.monotonic()

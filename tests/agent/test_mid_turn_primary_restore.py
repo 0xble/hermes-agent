@@ -471,6 +471,81 @@ def test_stale_expired_deadline_does_not_reprobe_uncooled_fallback(tool_loop_age
     assert requested == ["primary-model"] + ["backup"] * 4
 
 
+def test_held_recovery_probe_record_does_not_reprobe_uncooled_fallback(tool_loop_agent):
+    # After a cooled episode ends, an expired shared record stays cached as a recovery probe.
+    # A later uncooled 500 must not treat it as permission to probe the primary mid-turn.
+    agent = tool_loop_agent
+    requested = []
+    backup_calls = 0
+
+    def request(kwargs):
+        nonlocal backup_calls
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            # The record a previous cooled episode left behind is still cached when this
+            # uncooled failure starts a new fallback episode.
+            agent._shared_primary_cooldown_record = {"reset_at": time.time() - 60, "reason": "billing"}
+            response = httpx.Response(500, request=httpx.Request("POST", "https://primary.invalid/v1"))
+            raise InternalServerError("internal server error", response=response, body={})
+        backup_calls += 1
+        return _tool_loop_response(f"probe_call_{backup_calls}" if backup_calls < 4 else None)
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", return_value="tool result"),
+        patch("agent.agent_runtime_helpers._refresh_from_shared_cooldown", return_value="expired"),
+    ):
+        result = agent.run_conversation("do not re-probe on a held recovery record")
+
+    assert result["final_response"] == "finished"
+    assert requested == ["primary-model"] + ["backup"] * 4
+
+
+def test_failed_candidate_bind_does_not_leak_into_next_candidate(recovery_runtime):
+    original_client = Mock()
+    good_client = Mock()
+    broken_client = Mock()
+    chain = [
+        {"provider": "broken", "model": "first"},
+        {"provider": "good", "model": "second"},
+        {"provider": "backup", "model": "last-resort"},
+    ]
+    agent = SimpleNamespace(
+        _fallback_chain=chain, _fallback_index=0, _unavailable_fallback_keys=set(),
+        model="last-resort", provider="backup", base_url="https://last.invalid",
+        client=original_client, _bedrock_region="us-west-2", _transport_cache={"route": "last"},
+        _codex_reasoning_replay_rejected=True,
+    )
+
+    def bind(agent, entry, provider, model):
+        if provider == "broken":
+            agent.client = broken_client
+            agent.base_url = "https://broken.invalid"
+            agent._bedrock_region = "eu-central-1"
+            agent._transport_cache.clear()
+            agent._codex_reasoning_replay_rejected = False
+            raise RuntimeError("bind failed partway")
+        agent.client = good_client
+        agent.model, agent.provider = model, provider
+        return True
+
+    with (
+        patch("agent.route_binding.bind_route_entry", side_effect=bind),
+        patch("agent.chat_completion_helpers._should_skip_fallback_candidate", return_value=False),
+        patch("agent.chat_completion_helpers._finalize_fallback_route"),
+    ):
+        assert recovery_runtime._try_reclaim_earlier_fallback(agent, 2)
+
+    assert agent.client is good_client and agent.model == "second"
+    assert agent.base_url == "https://last.invalid"
+    assert agent._bedrock_region == "us-west-2"
+    assert agent._transport_cache == {"route": "last"}
+    assert agent._codex_reasoning_replay_rejected is True
+    assert agent._fallback_index == 2
+    broken_client.close.assert_called_once_with()
+    original_client.close.assert_not_called()
+
+
 def test_uncooled_primary_stay_limit_rewalks_only_fallbacks(tool_loop_agent):
     agent = tool_loop_agent
     agent._api_max_retries = 2  # permits two fallback activations in one logical iteration
