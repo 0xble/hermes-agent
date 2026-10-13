@@ -6,7 +6,7 @@ Patch identity: `reviewed-cron-delivery`.
 
 Only jobs carrying a `review` declaration opt in, and they require `deliver: local`. Setting review also sets `output_local_only: true`. Other jobs retain their existing save, queue, delivery, silence, failure, and transcript behavior. CLI and cron tool edits preserve review unless explicitly replaced or cleared.
 
-Resolve exactly 1 live, unended, unarchived, visible topic binding from the owning profile's `state.db`, by exact thread ID or exact session title. Exclude threads `255600` and `258219`. Unresolved or ambiguous subjects send nothing and upsert a normal cron incident.
+Resolve exactly 1 live, unended, unarchived, visible topic binding from the owning profile's `state.db`, by exact thread ID or exact session title. Exclude threads `255600` and `258219`. Recheck the binding before final send. Unresolved, ambiguous, ended, or changed subjects send nothing and upsert a normal cron incident.
 
 The gateway control socket is the only review hand-in path. It injects an internal event with a reply capture, without a Telegram user message, typing indicator, or posted agent reply. Preserve human follow-ups for their own events. Control handlers run on executor threads, so submission must marshal onto the gateway loop. Routed profiles use the socket of the gateway serving them.
 

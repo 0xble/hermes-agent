@@ -48,7 +48,7 @@ def _resolve_review_subject(review: dict) -> dict:
 def _review_wake_text(original: str, contract: dict) -> str:
     return (
         "You are the invisible presentation reviewer for a cron report. Do not send any message, "
-        "call relay, or speak in Brian's voice. Inspect the original report mechanically against "
+        "call relay, or speak in the user's voice. Inspect the original report mechanically against "
         "the supplied contract. Reply with exactly one protocol form and nothing else:\n"
         "PRESENT\n"
         "FIX\n<the full corrected report>\n"
@@ -56,6 +56,21 @@ def _review_wake_text(original: str, contract: dict) -> str:
         f"CONTRACT:\n{json.dumps({k: v for k, v in contract.items() if not k.startswith('_')}, sort_keys=True)}\n\n"
         f"ORIGINAL REPORT:\n{original}"
     )
+
+
+def _review_subject_or_incident(job, receipt, expected=None):
+    try:
+        subject = _resolve_review_subject(job["review"])
+        if expected is not None and any(subject[key] != expected[key] for key in (
+                "chat_id", "thread_id", "session_id", "session_key", "user_id")):
+            raise ValueError("review subject binding changed before final delivery; refusing to guess")
+        return subject
+    except Exception as exc:
+        from cron.incidents import upsert_incident
+        logger.exception("Job '%s': review subject could not resolve", job["id"])
+        receipt.update({"decision": "UNRESOLVED", "error": str(exc)})
+        upsert_incident(str(job["id"]), str(exc), job_name=job.get("name"))
+        return None
 
 
 def _run_review_hop(subject: dict, prompt: str, adapters, loop, deadline: float) -> str:
@@ -195,15 +210,10 @@ def _deliver_reviewed_result(job: dict, content: str, adapters, loop) -> Optiona
         receipt["decision"] = "SILENT"
         finish()
         return None
-    try:
-        subject = _resolve_review_subject(review)
-    except Exception as exc:
-        logger.exception("Job '%s': review subject could not resolve", job["id"])
-        from cron.incidents import upsert_incident
-        receipt.update({"decision": "UNRESOLVED", "error": str(exc)})
-        upsert_incident(str(job["id"]), str(exc), job_name=job.get("name"))
+    subject = _review_subject_or_incident(job, receipt)
+    if subject is None:
         finish()
-        return str(exc)
+        return receipt["error"]
     receipt["subject_thread"] = subject["thread_id"]
     receipt["subject_session"] = subject["session_id"]
     selected = content
@@ -226,6 +236,10 @@ def _deliver_reviewed_result(job: dict, content: str, adapters, loop) -> Optiona
         except Exception as exc:
             logger.exception("Job '%s': review failed, using original report", job["id"])
             receipt.update({"decision": "TIMEOUT_OR_ERROR", "review_error": str(exc)})
+    # Reviewing or rerunning may take minutes, during which a topic can end or be rebound.
+    if _review_subject_or_incident(job, receipt, expected=subject) is None:
+        finish()
+        return receipt["error"]
     delivery_job = dict(job)
     delivery_job.pop("review", None)
     delivery_job["deliver"] = f"telegram:{subject['chat_id']}:{subject['thread_id']}"

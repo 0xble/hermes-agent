@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 def is_review_event(event):
-    return event.internal and (event.metadata or {}).get("_cron_review_capture") is not None
+    return (getattr(event, "internal", False)
+            and (getattr(event, "metadata", None) or {}).get("_cron_review_capture") is not None)
 
 
 def private_turn_response(event, agent_result):
@@ -39,7 +40,7 @@ def defer_review_followup(runner, ctx, adapter, event, text):
 class ReviewCapture:
     """Keep captured turn output and errors off all adapter delivery paths."""
     def __init__(self, event):
-        self.future = (event.metadata or {}).get("_cron_review_capture") if event.internal else None
+        self.future = (getattr(event, "metadata", None) or {}).get("_cron_review_capture") if is_review_event(event) else None
 
     def finish(self, value="", error=None):
         if self.future is None or self.future.done():

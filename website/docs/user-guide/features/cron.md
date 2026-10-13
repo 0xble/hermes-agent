@@ -620,7 +620,7 @@ review:
 output_local_only: true
 ```
 
-`contract` and `subject` are required. The subject must exactly match a Telegram topic thread ID or session title and resolve to exactly 1 live, unarchived, visible session. Inbox and Ops Log are excluded. If lookup fails or is ambiguous, nothing is sent and a cron incident records the error.
+`contract` and `subject` are required. The subject must exactly match a Telegram topic thread ID or session title and resolve to exactly 1 live, unarchived, visible session. Inbox and Ops Log are excluded. If lookup fails or is ambiguous, nothing is sent and a cron incident records the error. The scheduler rechecks the binding immediately before the final send and refuses it if the topic ended or changed during review.
 
 Set or replace the declaration with `hermes cron create/edit --review-json '{"contract":"reports/stripe-brief.yaml","subject":"139328"}'`. Clear it with `hermes cron edit <job_id> --clear-review`. Unrelated edits preserve the declaration. Setting review also sets `output_local_only: true`, and clearing it sets that flag to false. The cron tool exposes the same `review_json` and `clear_review` arguments.
 

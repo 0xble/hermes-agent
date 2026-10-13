@@ -147,3 +147,28 @@ def test_receipt_is_persisted_under_profile_cron(tmp_path, monkeypatch):
     append_receipt({"job_id": "j", "decision": "PRESENT"})
     assert receipt_path() == tmp_path / "cron" / "review-receipts.jsonl"
     assert json.loads(receipt_path().read_text())["decision"] == "PRESENT"
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_subject_must_still_be_live_and_same_at_final_send(delivery, monkeypatch, changed):
+    sr, sent, receipts, incidents, _ = delivery
+    subject = {"chat_id": "chat", "thread_id": "139328", "user_id": "u",
+               "session_id": "sid", "session_key": "key"}
+    calls = []
+    def resolve(review):
+        calls.append(True)
+        if len(calls) == 1:
+            return subject
+        if changed:
+            return {**subject, "session_id": "replacement"}
+        raise ValueError("subject ended during review")
+    monkeypatch.setattr(sr, "_resolve_review_subject", resolve)
+    monkeypatch.setattr(sr, "_run_review_hop", lambda *a: "PRESENT")
+    error = sr._deliver_reviewed_result({"id": "j", "deliver": "local", "review": {
+        "subject": "topic", "contract": "x"}}, GOOD, {}, None)
+    assert error
+    assert len(calls) == 2
+    assert sent == []
+    assert len(incidents) == 1
+    assert receipts[0]["decision"] == "UNRESOLVED"
+    assert receipts[0]["text_sent"] is None
