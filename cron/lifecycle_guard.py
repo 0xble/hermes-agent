@@ -574,6 +574,13 @@ def _unreadable_reason(path: Path) -> str:
     return f"`{path}` is larger than the scan cap ({_MAX_REFERENCED_SCRIPT_BYTES} bytes) or the remaining walk budget"
 
 
+def _refuse_named(budget: _LifecycleScanBudget, reason: str) -> bool:
+    """Fail closed on an unscannable wrapper shape without inventing a filesystem path."""
+    logger.warning("lifecycle guard cannot determine wrapped command: %s; failing closed", reason)
+    budget.refusal = reason
+    return True
+
+
 def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) -> bool:
     logger.warning("lifecycle guard cannot scan referenced script %s: %s; failing closed", path, reason)
     budget.refusal = reason
@@ -655,21 +662,25 @@ def _executable_name(token: str) -> str:
     return Path(token).name or token
 
 
+def _installed_heavy_slot_path(token: str) -> bool:
+    """Whether *token* is an explicit path resolving to this profile's installed helper."""
+    try:
+        path = Path(token)
+        if not path.is_absolute() or _on_cloud_path(path):
+            return False
+        installed = Path.home() / ".local" / "bin" / "heavy-slot"
+        return path.resolve(strict=True) == installed.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
     """Peel only an explicit absolute path to the installed helper and its exact grammar.
 
     Bare names never earn this exception: modelling shell PATH mutations is unnecessary for the
     LPG caller, which uses the installed absolute path. Other scripts keep the strict walk.
     """
-    token = segment[index]
-    path = Path(token)
-    if not path.is_absolute() or _on_cloud_path(path):
-        return None
-    try:
-        installed = Path.home() / ".local" / "bin" / "heavy-slot"
-        if path.resolve(strict=True) != installed.resolve(strict=True):
-            return None
-    except (OSError, RuntimeError, ValueError):
+    if not _installed_heavy_slot_path(segment[index]):
         return None
     position = index + 1
     while position < len(segment):
@@ -690,6 +701,43 @@ def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
     return None
 
 
+def _heavy_slot_fallback_command_index(
+    segment: list[str], index: int,
+) -> tuple[Optional[int], Optional[str]]:
+    """Find the command tail when heavy-slot's transparent grammar cannot be peeled.
+
+    The helper remains a strict source reference on this path. A delimiter makes the tail
+    unambiguous; without one, only known value-taking options may be consumed. Unknown options
+    make the command boundary ambiguous and therefore fail closed with a named refusal.
+    """
+    if _executable_name(segment[index]) != "heavy-slot" and not _installed_heavy_slot_path(segment[index]):
+        return None, None
+    arguments = segment[index + 1:]
+    if not arguments or arguments == ["--help"]:
+        return None, None
+    if "--" in arguments:
+        delimiter = arguments.index("--")
+        if delimiter + 1 >= len(arguments):
+            return None, "heavy-slot wrapper has `--` but no wrapped command"
+        return index + delimiter + 2, None
+
+    position = 0
+    while position < len(arguments):
+        option = arguments[position]
+        if option in {"--label", "--gate-fd"}:
+            if position + 1 >= len(arguments) or arguments[position + 1].startswith("-"):
+                return None, "heavy-slot wrapper has an option without a value or command delimiter"
+            position += 2
+            continue
+        if option.startswith("--label=") or option.startswith("--gate-fd="):
+            position += 1
+            continue
+        if option.startswith("-"):
+            return None, "heavy-slot wrapper has an unknown option without a command delimiter"
+        return index + position + 1, None
+    return None, None
+
+
 def _prefix_positions(
     segment: list[str], index: int, *, allow_heavy_slot: bool = True,
 ) -> tuple[list[int], bool]:
@@ -706,6 +754,11 @@ def _prefix_positions(
         heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
         if heavy_target is not None:
             index = heavy_target
+            positions.append(index)
+            continue
+        fallback_target, _ = _heavy_slot_fallback_command_index(segment, index)
+        if fallback_target is not None:
+            index = fallback_target
             positions.append(index)
             continue
         name = _executable_name(segment[index])
@@ -843,7 +896,7 @@ def _is_non_executable_device_path(candidate: str) -> bool:
     return (
         candidate in _NON_EXECUTABLE_DEVICE_PATHS
         or candidate == "/dev/fd"
-        or candidate.startswith("/dev/fd/")
+        or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
     )
 
 
@@ -997,6 +1050,28 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
         return
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
         yield from _resolved_or_nothing(executable, cwd)
+
+
+def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
+    """Yield named refusals for heavy-slot invocations with an ambiguous command boundary."""
+    for segment in _iter_command_segments(command):
+        index = _command_token_index(segment)
+        if index is None:
+            continue
+        positions, complete = _prefix_positions(segment, index, allow_heavy_slot=False)
+        if not complete and positions[-1] < len(segment):
+            # No operand after the peel limit may be silently discarded, even when the helper
+            # itself lies beyond that limit. Retain strict references below, then refuse.
+            yield "the command wrapper chain exceeds the prefix scan budget"
+        for position in positions:
+            if position >= len(segment):
+                continue
+            if (_executable_name(segment[position]) != "heavy-slot"
+                    and not _installed_heavy_slot_path(segment[position])):
+                continue
+            _, reason = _heavy_slot_fallback_command_index(segment, position)
+            if reason:
+                yield reason
 
 
 def _iter_referenced_shell_scripts(
@@ -1212,6 +1287,8 @@ def _contains_unsafe_gateway_action(
 
     walk_command = strip_inert_heredoc_bodies(command)
 
+    wrapper_refusal = next(_iter_heavy_slot_fallback_refusals(walk_command), None) if executed else None
+
     for payload in _iter_shell_command_payloads(walk_command):
         if recurse(payload, cwd, executed):
             return True
@@ -1277,6 +1354,8 @@ def _contains_unsafe_gateway_action(
         # Relative references inside a script resolve against that script's directory, not the cwd.
         if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
             return True
+    if wrapper_refusal is not None:
+        return _refuse_named(budget, wrapper_refusal)
     return False
 
 

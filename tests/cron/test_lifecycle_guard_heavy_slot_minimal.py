@@ -105,15 +105,76 @@ def test_bare_heavy_slot_ignores_python_docstring_device_path(
     assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
 
 
-def test_bare_heavy_slot_still_scans_executed_restart_script(
-    tmp_path, trusted_slot, monkeypatch,
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "heavy-slot --label t -- bash scripts/r.sh",
+        "nohup heavy-slot --label t -- bash scripts/r.sh",
+        "heavy-slot --label t -- ./scripts/r.sh",
+        "heavy-slot --label t -- . scripts/r.sh",
+        "{trusted} --bogus -- bash scripts/r.sh",
+        "{trusted} --label t bash scripts/r.sh",
+        "{trusted} --label t -- bash scripts/r.sh",
+    ],
+)
+def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
+    tmp_path, trusted_slot, monkeypatch, command_template,
 ):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
-    _script(scripts, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
+    _script(scripts, "r.sh", "#!/bin/sh\nhermes gateway restart\n")
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    command = command_template.format(trusted=trusted_slot)
+    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
+
+
+def test_heavy_slot_device_path_predicate_is_exact():
+    from cron.lifecycle_guard import _is_non_executable_device_path
+
+    assert _is_non_executable_device_path("/dev/fd/0")
+    assert _is_non_executable_device_path("/dev/fd/123")
+    assert not _is_non_executable_device_path("/dev/fd/../root/restart.sh")
+    assert not _is_non_executable_device_path("/dev/fd/../cwd/restart.sh")
+
+
+@pytest.mark.parametrize("wrapper", ["heavy-slot", "{trusted}"])
+@pytest.mark.parametrize("tail", ["env -S {payload}", "su -c {payload}", "runuser -c {payload}"])
+def test_opaque_heavy_slot_keeps_option_carried_commands(tmp_path, trusted_slot, monkeypatch, wrapper, tail):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    payload = shlex.quote(f"bash {child}")
+    command = f"{wrapper.format(trusted=trusted_slot)} --bogus -- {tail.format(payload=payload)}"
+    assert scan_gateway_lifecycle(command) == (True, None)
+
+
+@pytest.mark.parametrize("options", ["--bogus", "--label", "--gate-fd", "--"])
+def test_ambiguous_heavy_slot_command_is_refused_by_name(trusted_slot, options):
+    unsafe, refusal = scan_gateway_lifecycle(f"{trusted_slot} {options}")
+    assert unsafe is True
+    assert refusal is not None and "heavy-slot wrapper" in refusal
+    assert "/dev/null" not in refusal
+
+
+@pytest.mark.parametrize("command_template", [
+    "{trusted} --label t -- " + "nohup " * 8 + "true",
+    "nohup " * 9 + "{trusted} --label t -- true",
+])
+def test_exhausted_heavy_slot_tail_is_refused_instead_of_dropped(trusted_slot, command_template):
+    command = command_template.format(trusted=trusted_slot)
+    unsafe, refusal = scan_gateway_lifecycle(command)
+    assert unsafe is True
+    assert refusal is not None and "prefix scan budget" in refusal
+
+
+def test_remote_heavy_slot_fallback_scans_the_wrapped_command(tmp_path):
+    slot = tmp_path / "heavy-slot"
+    child = tmp_path / "child.sh"
+    source = {
+        str(slot): '#!/usr/bin/env python3\n"""/dev/null"""\n',
+        str(child): "#!/bin/sh\nhermes gateway restart\n",
+    }
     assert scan_gateway_lifecycle(
-        f"{trusted_slot} --label t -- bash scripts/restart.sh", cwd=str(tmp_path),
+        f"{slot} --label t -- bash {child}", read_remote_script=source.get,
     ) == (True, None)
 
 
