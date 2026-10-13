@@ -540,6 +540,40 @@ async def test_stale_execution_does_not_retry(harness):
 
 
 @pytest.mark.asyncio
+async def test_interrupted_partial_marker_does_not_retry(harness):
+    """A provider interrupt preserves streamed partial text as final_response; a partial
+    NO_REPLY is not a completed silence choice, so it must never restart execution."""
+    h = harness
+    # A human-addressed turn: relay-only silence is allowed and would never re-prompt.
+    h.event = MessageEvent(text=TYPED_TEXT, source=h.event.source, message_id="human-1")
+    h.state.turn.event = h.event
+    first = True
+
+    def interrupt_after_partial_marker(response):
+        nonlocal first
+        if first:
+            first = False
+            h.agent._current_streamed_assistant_text = "NO_REPLY"
+            raise InterruptedError("provider request interrupted after partial marker")
+
+    h.model_hook = interrupt_after_partial_marker
+    executions = []
+    original = h.agent.run_conversation
+
+    def run(*args, **kwargs):
+        result = original(*args, **kwargs)
+        executions.append(result)
+        return result
+
+    h.agent.run_conversation = run
+    result = await _run(h, ["NO_REPLY", ANSWER], typed=False, first_tool=False)
+    assert executions and executions[0].get("interrupted") is True
+    assert [ctx.silence_retry for ctx in h.calls] == [False], (
+        "an interrupted partial marker started a silence re-prompt")
+    assert ANSWER not in str(result.get("final_response"))
+
+
+@pytest.mark.asyncio
 async def test_queued_human_after_retry_gets_fallback_once_and_own_fresh_retry(harness, monkeypatch):
     from gateway.run_turn import _GATEWAY_SILENCE_RETRY_NOTE
 

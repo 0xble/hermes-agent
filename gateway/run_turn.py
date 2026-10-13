@@ -4724,6 +4724,7 @@ class GatewayTurnMixin:
                 )
             if (
                 not (_silence_retry or scheduled_heartbeat) and isinstance(response, dict)
+                and not response.get("interrupted") and response.get("completed") is not False
                 and self._is_intentional_silence(response, response.get("final_response", ""))
                 and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
                 and turn_ctx._run_still_current()
