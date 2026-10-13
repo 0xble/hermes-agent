@@ -91,6 +91,25 @@ def _fallback_max_stay_seconds(agent):
     return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
+def _active_entry_position(agent, cursor):
+    """Chain position of the bound fallback entry, the boundary for stay-limit reclaims.
+
+    ``_fallback_index`` is the next-candidate cursor: a failed walk can leave it past the chain
+    end while an earlier entry is still the bound route. Using it would treat later entries as
+    earlier and demote a working route, so locate the entry that was actually bound.
+    """
+    chain = getattr(agent, "_fallback_chain", None) or []
+    entry = getattr(agent, "_active_fallback_entry", None)
+    if isinstance(entry, dict):
+        for position, candidate in enumerate(chain):
+            if candidate is entry:
+                return position
+        for position, candidate in enumerate(chain):
+            if candidate == entry:
+                return position
+    return max(0, cursor - 1)
+
+
 def _close_discarded_route_clients(agent, clients) -> None:
     """Retire clients made unreachable by a failed route re-evaluation."""
     seen = set()
@@ -201,7 +220,7 @@ def _maybe_recheck_fallback_route_for_iteration(agent, active_system_prompt):
         # failure has no mid-turn recovery signal. Retry only entries strictly
         # earlier than the current one: stay expiry must never demote a route.
         agent._fallback_index = 0
-        if _try_reclaim_earlier_fallback(agent, max(0, previous_index - 1)):
+        if _try_reclaim_earlier_fallback(agent, _active_entry_position(agent, previous_index)):
             from agent.conversation_loop import _sync_failover_system_message
             prompt = _sync_failover_system_message(agent, None, active_system_prompt)
             committed = True

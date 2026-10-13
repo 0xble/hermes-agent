@@ -546,6 +546,35 @@ def test_failed_candidate_bind_does_not_leak_into_next_candidate(recovery_runtim
     original_client.close.assert_not_called()
 
 
+def test_stay_expiry_never_demotes_when_cursor_ran_past_the_active_entry(recovery_runtime):
+    # A transient failure on the first backup can walk the cursor to the chain end (later pools
+    # cooling) before that same backup is retried successfully. Its stay expiry must reclaim only
+    # entries ranked above it, never the later ones the cursor already passed.
+    chain = [
+        {"provider": "openai", "model": "best-backup", "max_stay_seconds": 1},
+        {"provider": "openai", "model": "middle-backup"},
+        {"provider": "openai", "model": "worse-backup"},
+    ]
+    bind = Mock(return_value=True)
+    agent = SimpleNamespace(
+        _fallback_activated=True, _provider_fallback_active=True, _fallback_episode_cooled=True,
+        _fallback_chain=chain, _fallback_index=len(chain), _active_fallback_entry=chain[0],
+        _fallback_stay_started_at=time.monotonic() - 2, _unavailable_fallback_keys=set(),
+        model="best-backup", provider="openai", client=Mock(),
+        _restore_primary_runtime=Mock(return_value=False),
+    )
+    with (
+        patch("agent.route_binding.bind_route_entry", bind),
+        patch("agent.chat_completion_helpers._should_skip_fallback_candidate", return_value=False),
+        patch("agent.chat_completion_helpers._finalize_fallback_route"),
+    ):
+        assert recovery_runtime._maybe_recheck_fallback_route_for_iteration(agent, "Model: best") == "Model: best"
+
+    bind.assert_not_called()
+    assert agent.model == "best-backup" and agent._active_fallback_entry is chain[0]
+    assert agent._fallback_index == len(chain)
+
+
 def test_uncooled_primary_stay_limit_rewalks_only_fallbacks(tool_loop_agent):
     agent = tool_loop_agent
     agent._api_max_retries = 2  # permits two fallback activations in one logical iteration
