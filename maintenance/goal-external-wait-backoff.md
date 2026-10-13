@@ -391,7 +391,7 @@ The full collected set that must turn green is:
 - `test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks`;
 - `test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early`;
 - `test_real_judge_wait_then_evaluator_age_recheck_stays_silent`;
-- `test_real_judge_wait_then_idle_rearm_delivers_age_notice`;
+- `test_real_judge_wait_then_idle_rearm_keeps_age_only_silent`;
 - `test_real_timed_wait_expiry_reparks_through_evaluator_with_one_notice`;
 - `test_real_judge_wait_mixed_continue_and_wait_uses_shared_backoff_formula`;
 - `test_real_judge_wait_with_active_delegations_uses_delegation_floor_and_key`;
