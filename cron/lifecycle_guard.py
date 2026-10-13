@@ -828,6 +828,25 @@ def _direct_lifecycle_scan(command: str) -> bool:
 
 # --- path handling ----------------------------------------------------------------------------
 
+_NON_EXECUTABLE_DEVICE_PATHS = frozenset({
+    "/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr",
+})
+
+
+def _is_non_executable_device_path(candidate: str) -> bool:
+    """True for POSIX device paths that cannot name an executable script.
+
+    They commonly occur as shell redirections or incidental prose in helper source. Treating them
+    as referenced scripts would turn a harmless token into a fail-closed refusal because devices
+    are deliberately not regular files.
+    """
+    return (
+        candidate in _NON_EXECUTABLE_DEVICE_PATHS
+        or candidate == "/dev/fd"
+        or candidate.startswith("/dev/fd/")
+    )
+
+
 def _resolve_lenient(path: Path) -> Path:
     """``path.resolve(strict=False)``, falling back to *path* on OSError (unreadable/long) or
     ValueError (embedded NUL from decoded binary tokenized as a path) — never crash the guard."""
@@ -876,6 +895,8 @@ def _expand_candidate_path(candidate: str) -> Optional[Path]:
 
 def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
     """Yield *candidate* anchored on *cwd* (or the process cwd) when it is a real path."""
+    if _is_non_executable_device_path(candidate):
+        return
     path = _expand_candidate_path(candidate)
     if path is None:
         return

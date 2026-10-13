@@ -52,17 +52,17 @@ def test_exact_wrappers_scan_the_wrapped_command(tmp_path, trusted_slot, options
     "--gate-fd=", "--label --unknown", "run", "--label proof bash",
 ])
 def test_unknown_grammar_reads_the_helper_strictly(tmp_path, trusted_slot, options):
+    trusted_slot.write_text("#!/usr/bin/env python3\nhermes gateway restart\n", encoding="utf-8")
     benign = _script(tmp_path, "benign.sh", "#!/bin/sh\ntrue\n")
     unsafe, refusal = scan_gateway_lifecycle(f"{trusted_slot} {options} -- bash {benign}")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert (unsafe, refusal) == (True, None)
 
 
 def test_missing_double_dash_stays_strict(tmp_path, trusted_slot):
-    restart = _script(tmp_path, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
+    trusted_slot.write_text("#!/usr/bin/env python3\nhermes gateway restart\n", encoding="utf-8")
+    restart = _script(tmp_path, "restart.sh", "#!/bin/sh\ntrue\n")
     unsafe, refusal = scan_gateway_lifecycle(f"{trusted_slot} --label proof bash {restart}")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert (unsafe, refusal) == (True, None)
 
 
 def test_identity_not_basename_controls_trust(tmp_path, trusted_slot):
@@ -70,43 +70,71 @@ def test_identity_not_basename_controls_trust(tmp_path, trusted_slot):
     alias.symlink_to(trusted_slot)
     benign = _script(tmp_path, "benign.sh", "#!/bin/sh\ntrue\n")
     assert scan_gateway_lifecycle(f"{alias} --label proof -- bash {benign}") == (False, None)
-    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\n"""/dev/null"""\n')
+    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\nhermes gateway restart\n')
     unsafe, refusal = scan_gateway_lifecycle(f"{shadow} --label proof -- bash {benign}")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert (unsafe, refusal) == (True, None)
 
 
 @pytest.mark.parametrize("prefix", ["", "PATH=/tmp/evil ", "export PATH=/tmp/evil; ", "env PATH=/tmp/evil "])
-def test_bare_names_never_earn_the_peel(tmp_path, trusted_slot, monkeypatch, prefix):
+def test_bare_names_stay_strict_without_refusing_device_prose(tmp_path, trusted_slot, monkeypatch, prefix):
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
     benign = _script(tmp_path, "benign.sh", "#!/bin/sh\ntrue\n")
-    unsafe, refusal = scan_gateway_lifecycle(f"{prefix}heavy-slot --label proof -- bash {benign}")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert scan_gateway_lifecycle(f"{prefix}heavy-slot --label proof -- bash {benign}") == (False, None)
 
 
 def test_path_shadowed_bare_heavy_slot_is_strict(tmp_path, monkeypatch):
-    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\n"""/dev/null"""\n')
+    shadow = _script(tmp_path, "heavy-slot", '#!/usr/bin/env python3\nhermes gateway restart\n')
     monkeypatch.setenv("PATH", str(shadow.parent))
-    unsafe, refusal = scan_gateway_lifecycle("heavy-slot --label proof -- true")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert scan_gateway_lifecycle("heavy-slot --label proof -- true") == (True, None)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "heavy-slot --help",
+        "heavy-slot --label t -- bash scripts/run_tests.sh tests/a.py",
+    ],
+)
+def test_bare_heavy_slot_ignores_python_docstring_device_path(
+    tmp_path, trusted_slot, monkeypatch, command,
+):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    _script(scripts, "run_tests.sh", "#!/bin/sh\ntrue\n")
+    monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+
+
+def test_bare_heavy_slot_still_scans_executed_restart_script(
+    tmp_path, trusted_slot, monkeypatch,
+):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    _script(scripts, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
+    monkeypatch.setenv("PATH", str(trusted_slot.parent))
+    assert scan_gateway_lifecycle(
+        f"{trusted_slot} --label t -- bash scripts/restart.sh", cwd=str(tmp_path),
+    ) == (True, None)
 
 
 def test_remote_callback_cannot_attest_local_helper_identity(trusted_slot):
-    source = {str(trusted_slot): '#!/usr/bin/env python3\n/dev/null\n', "/dev/null": "x" * 1_048_577}
+    remote = "/tmp/remote-script.sh"
+    source = {
+        str(trusted_slot): f'#!/usr/bin/env python3\n"""/dev/null"""\n{remote}\n',
+        remote: "x" * 1_048_577,
+    }
+    trusted_slot.unlink()
     unsafe, refusal = scan_gateway_lifecycle(
         f"{trusted_slot} --label proof -- true", read_remote_script=source.get,
     )
     assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert refusal is not None and remote in refusal
 
 
 def test_peel_does_not_hide_an_untrusted_outer_wrapper(tmp_path, trusted_slot):
-    outer = _script(tmp_path, "env", "#!/bin/sh\n/dev/null\n")
+    outer = _script(tmp_path, "env", "#!/bin/sh\nhermes gateway restart\n")
     unsafe, refusal = scan_gateway_lifecycle(f"{outer} {trusted_slot} --label proof -- true")
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+    assert (unsafe, refusal) == (True, None)
 
 
 def test_shell_command_payload_is_still_scanned(trusted_slot):
