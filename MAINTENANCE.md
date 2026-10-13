@@ -403,6 +403,16 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 - **Retirement:** Remove when released upstream provides equivalent neutral resume instructions, preserves all replay/reconciliation safety clauses, and uses a transport-neutral duplicate marker for ambiguous redelivery.
 - **Rollback:** Revert the commit carrying `Fork-Patch: routine-restart-resume-note`.
 
+## Active patch record: child-parent relay guard
+
+- **Patch identity:** `child-parent-relay-guard`.
+- **Behavior:** A delegated child cannot send a relay message directly to its own parent through the Relay MCP tool or the `relay send` CLI. Shell punctuation attached to a CLI target is tokenized separately, while quoted or escaped punctuation remains part of the target argument.
+- **Source surfaces:** `agent/relay_guard.py` and `tests/agent/test_relay_guard.py`.
+- **Upstream status:** Fork-only guard carried by PR #541.
+- **Focused regression:** `scripts/run_tests.sh tests/agent/test_relay_guard.py -q`.
+- **Retirement:** Remove when upstream provides the same child-parent relay boundary and shell-operator coverage.
+- **Rollback:** Revert the commits carrying `Fork-Patch: child-parent-relay-guard`.
+
 ## Eager plugin tools
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).

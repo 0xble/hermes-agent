@@ -54,9 +54,17 @@ def mcp_child_parent_relay_error(server_name: str, tool_name: str, args: Any) ->
 
 
 def cli_child_parent_relay_error(command: str) -> str | None:
-    """Apply the guard to a direct ``relay send`` command before terminal execution."""
+    """Apply the guard to a direct ``relay send`` command before terminal execution.
+
+    Tokenize shell punctuation separately so an operator attached to the target
+    (for example ``parent-session>/dev/null``) cannot hide the target from the
+    guard. Quoting and escaping still follow normal shell rules.
+    """
     try:
-        tokens = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
     except ValueError:
         return None
     relay_index = next(

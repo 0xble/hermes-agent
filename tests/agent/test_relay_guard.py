@@ -80,6 +80,45 @@ def test_relay_cli_parent_target_is_blocked_before_terminal_execution(tmp_path, 
         session_context.clear_session_vars(tokens)
 
 
+def test_relay_cli_parent_target_is_blocked_with_attached_shell_operators(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = _bind("parent-session")
+    try:
+        with delegated_child_context("child-session"):
+            for command in (
+                "relay send hermes:default/parent-session; printf done",
+                "relay send hermes:default/parent-session|printf done",
+                "relay send hermes:default/parent-session>/dev/null",
+            ):
+                assert cli_child_parent_relay_error(command) == CHILD_PARENT_RELAY_ERROR
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+def test_relay_cli_shell_operators_inside_target_arguments_are_not_reinterpreted(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tokens = _bind("parent-session")
+    try:
+        with delegated_child_context("child-session"):
+            assert cli_child_parent_relay_error(
+                "relay send 'hermes:default/parent-session;printf done'"
+            ) is None
+            assert cli_child_parent_relay_error(
+                r"relay send hermes:default/parent-session\;printf done"
+            ) is None
+            assert cli_child_parent_relay_error(
+                'relay send "hermes:default/parent-session"'
+            ) == CHILD_PARENT_RELAY_ERROR
+            assert cli_child_parent_relay_error(
+                "relay send hermes:default/other-session>/dev/null"
+            ) is None
+        assert cli_child_parent_relay_error(
+            "relay send hermes:default/parent-session>/dev/null"
+        ) is None
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
 def test_top_level_mcp_parent_target_remains_allowed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     tokens = _bind("parent-session")
