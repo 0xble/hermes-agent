@@ -119,9 +119,35 @@ def test_string_wrapper_payload_after_heavy_slot_is_scanned(tmp_path, trusted_sl
     assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- env -S {payload}") == (True, None)
 
 
-def test_exhausted_prefix_budget_walks_heavy_slot_strictly(tmp_path, trusted_slot):
-    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
-    command = " ".join(["nohup"] * 8 + [str(trusted_slot), "--label", "proof", "--", "bash", str(child)])
-    unsafe, refusal = scan_gateway_lifecycle(command)
-    assert unsafe is True
-    assert refusal is not None and "/dev/null" in refusal
+@pytest.mark.parametrize(
+    ("outer_nohups", "tail"),
+    [
+        (8, "bash {child}"),
+        (7, "nohup bash {child}"),
+        (6, "nohup nohup bash {child}"),
+    ],
+    ids=["at-helper", "after-helper", "after-helper-twice"],
+)
+def test_exhaustion_at_or_after_heavy_slot_keeps_helper_strict(
+    tmp_path, trusted_slot, monkeypatch, outer_nohups, tail,
+):
+    """A budget stop never earns the helper peel, whether it lands at or after the helper."""
+    monkeypatch.setattr("cron.lifecycle_guard._MAX_PREFIX_PEELS", 8)
+    trusted_slot.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\ntrue\n")
+    command = " ".join(
+        ["nohup"] * outer_nohups
+        + [str(trusted_slot), "--label", "proof", "--"]
+        + tail.format(child=shlex.quote(str(child))).split()
+    )
+    assert scan_gateway_lifecycle(command) == (True, None)
+
+
+def test_natural_heavy_slot_peel_reaches_wrapped_script(tmp_path, trusted_slot):
+    restart = _script(tmp_path, "restart.sh", "#!/bin/sh\nhermes gateway restart\n")
+    trusted_slot.write_text("#!/bin/sh\ntrue\n", encoding="utf-8")
+    command = " ".join(
+        ["nohup"] * 5
+        + [str(trusted_slot), "--label", "proof", "--", "nohup", "bash", str(restart)]
+    )
+    assert scan_gateway_lifecycle(command) == (True, None)

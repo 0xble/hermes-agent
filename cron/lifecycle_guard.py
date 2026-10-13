@@ -690,22 +690,27 @@ def _heavy_slot_command_index(segment: list[str], index: int) -> Optional[int]:
     return None
 
 
-def _iter_prefix_positions(
+def _prefix_positions(
     segment: list[str], index: int, *, allow_heavy_slot: bool = True,
-) -> Iterator[int]:
-    """Keep every wrapper position so peeling cannot hide an untrusted local wrapper's source."""
-    yield index
+) -> tuple[list[int], bool]:
+    """Return every peeled position and whether the chain ended before the peel budget.
+
+    ``complete`` is the sole authority for the heavy-slot exception: only a natural stop at a
+    non-wrapper command may omit the installed helper's own source. A loop that reaches
+    ``_MAX_PREFIX_PEELS`` is incomplete even when its last position happens to be a command.
+    """
+    positions = [index]
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return
+            return positions, False
         heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
         if heavy_target is not None:
             index = heavy_target
-            yield index
+            positions.append(index)
             continue
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
-            return
+            return positions, True
         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         while index < len(segment):
@@ -723,14 +728,14 @@ def _iter_prefix_positions(
         for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
-        yield index
+        positions.append(index)
+    return positions, False
 
 
 def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
     """Index of the wrapper chain's final command; callers must bounds-check."""
-    for index in _iter_prefix_positions(segment, index):
-        pass
-    return index
+    positions, _ = _prefix_positions(segment, index)
+    return positions[-1]
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -984,18 +989,15 @@ def _iter_referenced_shell_scripts(
         index = _command_token_index(segment)
         if index is None:
             continue
-        positions = list(_iter_prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot))
-        reachable = set(positions)
+        positions, complete = _prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot)
+        if allow_heavy_slot and not complete:
+            # An exhausted chain gets exactly the pre-heavy-slot walk: the helper is a normal
+            # executable, so its source stays in the strict scan set and earns no peel benefit.
+            positions, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
         for position in positions:
             if position >= len(segment):
                 continue
-            heavy_target = _heavy_slot_command_index(segment, position) if allow_heavy_slot else None
-            if heavy_target is not None:
-                # The helper is transparent only when the iterator reached its wrapped target. If
-                # the prefix budget ended on the helper, retain the strict source walk instead of
-                # silently removing the only remaining scan candidate.
-                if heavy_target not in reachable:
-                    yield from _references_at(segment, position, cwd)
+            if allow_heavy_slot and complete and _heavy_slot_command_index(segment, position) is not None:
                 continue
             yield from _references_at(segment, position, cwd)
 
@@ -1007,7 +1009,8 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        for position in _iter_prefix_positions(segment, index):
+        positions, _ = _prefix_positions(segment, index)
+        for position in positions:
             if position >= len(segment):
                 continue
             for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
