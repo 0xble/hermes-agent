@@ -959,9 +959,10 @@ class TestControls:
             gens.append(load_loop("c4").control_generation)
         assert gens == sorted(set(gens)), gens
         stale.state.status = "active"
-        stale._save()  # a cached copy written blindly still cannot regress the fence
-        assert load_loop("c4").control_generation == gens[-1] + 1
-        assert loop_control_generation("c4") == gens[-1] + 1
+        stale._save()  # stale whole-row saves must not revive a newer clear or advance its fence
+        assert load_loop("c4").status == "cleared"
+        assert load_loop("c4").control_generation == gens[-1]
+        assert loop_control_generation("c4") == gens[-1]
 
         fresh = LoopManager(session_id="c5")
         fresh.set("poll", interval_seconds=300)

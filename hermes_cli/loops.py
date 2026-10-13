@@ -495,16 +495,16 @@ def _next_control_generation(session_id: str, stored: Optional[LoopState], state
     return current + 1 if changed else current
 
 
-def save_loop(session_id: str, state: LoopState, *, cursor=None, tick_lifecycle: bool = False) -> None:
-    """Persist a loop to SessionDB. No-op if DB unavailable.
+def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None,
+              tick_lifecycle: bool = False, apply=None):
+    """Write a loop or apply a command to the current row under the same control fence.
 
-    The one write path for ``loop:*`` rows and the control-fence chokepoint: the stored row is
-    read in the same transaction and ``state.control_generation`` is assigned from it (see
-    :func:`_next_control_generation`). ``tick_lifecycle`` marks the tick claim/settle writes,
-    whose clearing of their own in-flight tick is not a control boundary.
+    Command callbacks validate and edit only their owned fields on the live row. They may
+    be replayed on lock contention and must not mutate a manager's cached state. Return the
+    persisted row and command result only after a successful write; cursor owners see errors.
     """
     if not session_id:
-        return
+        return None
     db = _get_session_db()
     if db is None:
         if cursor is not None:
@@ -512,33 +512,35 @@ def save_loop(session_id: str, state: LoopState, *, cursor=None, tick_lifecycle:
         from hermes_cli.goals import _warn_dropped_write
 
         _warn_dropped_write("LoopManager", "loop", session_id)
-        return
+        return None
     key = _meta_key(session_id)
 
-    def write(conn) -> bool:
+    def write(conn):
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         stored = _parse_state(row[0]) if row and row[0] else None
-        state.control_generation = _next_control_generation(
-            session_id, stored, state, tick_lifecycle=tick_lifecycle)
-        # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
-        state.mutation_id = uuid.uuid4().hex
-        db.set_meta(key, state.to_json(), cursor=conn)
-        return True
+        original = stored.to_json() if stored is not None else None
+        live = _parse_state(original) if original is not None else None
+        result = apply(live) if apply is not None else None
+        updated = live if apply is not None else state
+        if updated is not None and (apply is None or updated.to_json() != original):
+            updated.control_generation = _next_control_generation(
+                session_id, stored, updated, tick_lifecycle=tick_lifecycle)
+            # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
+            updated.mutation_id = uuid.uuid4().hex
+            db.set_meta(key, updated.to_json(), cursor=conn)
+        return updated, result
 
-    if cursor is not None:
-        # Transaction owners must see failures, not report an unapplied control as successful.
-        write(cursor)
-    elif not _db_op("set_meta", lambda: db._execute_write(write), False):
-        return  # unapplied: the process fence must not run ahead of the stored row
-    _remember_control_generation(session_id, state)
+    # Transaction owners must see failures, not acknowledge an unapplied control.
+    saved = write(cursor) if cursor is not None else _db_op(
+        "set_meta", lambda: db._execute_write(write))
+    if saved is not None:
+        _remember_control_generation(session_id, saved[0])
+    return saved
 
 
 def clear_loop(session_id: str) -> None:
-    """Mark a loop cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_loop(session_id)
-    if state is not None:
-        state.status = "cleared"
-        save_loop(session_id, state)
+    """Retire the current loop without overwriting a concurrent definition or tick."""
+    LoopManager(session_id).clear()
 
 
 def list_active_loops() -> List[Tuple[str, LoopState]]:
@@ -648,6 +650,7 @@ class LoopManager(LoopRevisionsMixin):
         (pause/resume, revise, cadence change) rescheduled the loop since, and that schedule wins
         over this manager's cached copy."""
         self._synced_due_at = self._state.next_due_at if self._state is not None else None
+        self._synced_json = self._state.to_json() if self._state is not None else None
 
     @property
     def state(self) -> Optional[LoopState]:
@@ -671,8 +674,17 @@ class LoopManager(LoopRevisionsMixin):
     def has_loop(self) -> bool:
         return self._state is not None and self._state.status in {"active", "paused"}
 
-    def _save(self) -> LoopState:
-        """Persist a user/agent control; ``save_loop`` assigns its control fence."""
+    def _mutate_current(self, apply, *, failure=None) -> Any:
+        """Validate and edit the live row atomically, adopting it only on success."""
+        saved = save_loop(self.session_id, cursor=self._cursor, apply=apply)
+        if saved is None:
+            return failure
+        self._state, result = saved
+        self._mark_synced()
+        return result
+
+    def _save(self) -> Optional[LoopState]:
+        """Legacy snapshot edits are CAS-only; commands use ``_mutate_current``."""
         snapshot = getattr(self, "_evaluation_snapshot", None)
         if snapshot is not None:
             # Staged settlement/revision: the snapshot CAS commits, never this direct write.
@@ -680,12 +692,16 @@ class LoopManager(LoopRevisionsMixin):
             db, expected = snapshot
             assert_loop_snapshot(self.session_id, expected, db)
             return self._state
-        if self._cursor is None:
-            save_loop(self.session_id, self._state)
-        else:
-            save_loop(self.session_id, self._state, cursor=self._cursor)
-        self._mark_synced()
-        return self._state
+        candidate = self._state
+
+        def apply(stored):
+            if stored is not None and stored.to_json() == self._synced_json and candidate is not None:
+                snapshot = LoopState.from_json(candidate.to_json())
+                for item in fields(LoopState):
+                    setattr(stored, item.name, getattr(snapshot, item.name))
+            return stored
+
+        return self._mutate_current(apply)
 
     def status_line(self) -> str:
         s = self._state
@@ -751,37 +767,50 @@ class LoopManager(LoopRevisionsMixin):
             next_due_at=now,
             route=dict(route or {}),
         )
-        self._state = state
-        return self._save()
+        saved = save_loop(self.session_id, state, cursor=self._cursor)
+        if saved is None:
+            raise ValueError("loop could not be saved")
+        self._state = saved[0]
+        self._mark_synced()
+        return state
 
     @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
-        s = self._state
-        if not s or s.status not in {"active", "paused"}:
-            return None
-        s.status, s.paused_reason, s.awaiting_response = "paused", reason, False
-        return self._save()
+        def apply(state):
+            if state is None or state.status not in {"active", "paused"}:
+                return None
+            state.status, state.paused_reason, state.awaiting_response = "paused", reason, False
+            return state
+
+        return self._mutate_current(apply)
 
     @snapshot_control
     def resume(self) -> Optional[LoopState]:
-        s = self._state
-        if not s or s.status == "cleared":
-            return None
-        s.status, s.paused_reason, s.awaiting_response = "active", None, False
-        # Re-arm relative to now so a long pause doesn't fire instantly N times.
-        delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
-        s.next_due_at = time.time() + min(delay, 5.0)
-        return self._save()
+        def apply(state):
+            if state is None or state.status == "cleared":
+                return None
+            state.status, state.paused_reason, state.awaiting_response = "active", None, False
+            # Re-arm relative to now so a long pause doesn't fire instantly N times.
+            delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
+            state.next_due_at = time.time() + min(delay, 5.0)
+            return state
+
+        return self._mutate_current(apply)
 
     @snapshot_control
     def clear(self) -> bool:
-        if self._state is None or self._state.status == "cleared":
-            return False
-        self._state.status = "cleared"
-        self._state.awaiting_response = False
-        self._save()
-        self._state = None
-        return True
+        def apply(state):
+            if state is None or state.status == "cleared":
+                return False
+            state.status = "cleared"
+            state.awaiting_response = False
+            return True
+
+        cleared = self._mutate_current(apply, failure=False)
+        if cleared:
+            self._state = None
+            self._mark_synced()
+        return bool(cleared)
 
     def is_due(self, now: Optional[float] = None) -> bool:
         """Cheap check: active, not mid-wakeup, and the clock has passed."""
