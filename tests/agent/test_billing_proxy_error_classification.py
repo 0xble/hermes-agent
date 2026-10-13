@@ -13,7 +13,7 @@ class _ProxyError(Exception):
     def __init__(self, message: str, status_code: int = 503) -> None:
         super().__init__(message)
         self.status_code = status_code
-        self.body = {"type": "api_error", "message": message}
+        self.body: dict = {"type": "api_error", "message": message}
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
@@ -64,6 +64,60 @@ def test_request_specific_or_generic_5xx_does_not_mark_provider_wide(status, mes
     classified = classify_api_error(_ProxyError(message, status))
     assert classified.reason is reason
     assert not classified.error_context.get("provider_wide")
+
+
+@pytest.mark.parametrize("envelope", ["direct", "proxy"])
+@pytest.mark.parametrize("status", [503, 529])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid_request_error: prompt is too long: 210000 tokens > 200000 maximum",
+        "invalid_request_error: input length and max_tokens exceed context limit",
+    ],
+)
+def test_proxy_and_anthropic_5xx_overflow_beats_validation(status, message, envelope):
+    base = classify_api_error(_ProxyError(message, 400))
+    body_message = (
+        "auth_unavailable: no auth available (providers=claude; "
+        f"last upstream error: {message})"
+        if envelope == "proxy" else message
+    )
+    classified = classify_api_error(
+        _ProxyError(body_message, status),
+        provider="custom:claude-proxy" if envelope == "proxy" else "anthropic",
+        model="claude-opus-5-5",
+    )
+    assert base.reason is FailoverReason.context_overflow
+    assert classified.reason is base.reason
+    assert classified.error_context.get("provider_wide") is not True
+
+
+@pytest.mark.parametrize("status", [500, 502])
+def test_plain_capacity_message_preserves_generic_5xx_classification(status):
+    classified = classify_api_error(_ProxyError("upstream at capacity", status))
+    assert classified.reason is FailoverReason.server_error
+    assert not classified.error_context.get("provider_wide")
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+@pytest.mark.parametrize("field", ["type", "code"])
+def test_explicit_overloaded_error_code_is_provider_wide(status, field):
+    error = _ProxyError("upstream at capacity", status)
+    error.body = {"error": {field: "overloaded_error", "message": str(error)}}
+    classified = classify_api_error(error)
+    assert classified.reason is FailoverReason.overloaded
+    assert classified.error_context["provider_wide"] is True
+
+
+def test_proxy_provider_overload_signal_is_provider_wide():
+    error = _ProxyError(
+        "auth_unavailable: no auth available (providers=claude; "
+        "last upstream error: overloaded_error: upstream at capacity)",
+        503,
+    )
+    classified = classify_api_error(error, provider="custom:claude-proxy")
+    assert classified.reason is FailoverReason.overloaded
+    assert classified.error_context["provider_wide"] is True
 
 
 class _Agent:

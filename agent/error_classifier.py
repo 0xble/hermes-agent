@@ -1007,10 +1007,19 @@ def _proxy_upstream_verdict(c: _Ctx) -> Optional[Verdict]:
     _prefix, marker, upstream = c.msg.partition("last upstream error:")
     if not marker:
         return None
+    overflow = _first_match(upstream, _OVERFLOW_AS_5XX_RULES)
+    if overflow is not None:
+        return overflow
+    # A bare invalid_request_error is also used for billing; only an actual request
+    # validation detail should outrank that upstream account reason.
+    if any(pattern in upstream for pattern in _400_VALIDATION_PATTERNS):
+        return _V_FORMAT_ERROR
     if any(pattern in upstream for pattern in _BILLING_PATTERNS):
         return _billing_hints(upstream)
     if "rate_limit_error" in upstream:
         return _V_RATE_LIMIT
+    if any(pattern in upstream for pattern in _OVERLOADED_PATTERNS):
+        return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
     return None
 
 
@@ -1140,15 +1149,16 @@ def _status_429(c: _Ctx) -> Verdict:
 
 
 def _status_5xx(c: _Ctx) -> Verdict:
-    # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
-    # retry-flooding — unless the parameter was injected server-side.
-    validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
-    if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
-        return _V_FORMAT_ERROR
     verdict = _first_match(c.msg, _OVERFLOW_AS_5XX_RULES)
     if verdict is not None:
         return verdict
-    if c.status_code == 529 or any(pattern in c.msg for pattern in _OVERLOADED_PATTERNS):
+    # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
+    # retry-flooding — unless the parameter was injected server-side. Overflow
+    # must be checked first because Anthropic wraps it in invalid_request_error.
+    validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
+    if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
+        return _V_FORMAT_ERROR
+    if c.status_code == 529 or c.code == "overloaded_error":
         return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
     return _V_OVERLOADED if c.status_code == 503 else _V_SERVER_ERROR
 

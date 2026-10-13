@@ -1935,15 +1935,19 @@ def route_classified_error(
     # backoff, even when the fallback chain is empty or its switch is deferred. Ordinary 5xx,
     # timeouts and request-specific errors do not poison other sessions' primary route.
     if (is_rate_limited and _wrapped_output_cap_budget is None) or _provider_wide_overload:
-        from agent.fallback_cooldown import _arm_rate_limit_cooldown
         pool_may_recover = (
             False if classified.reason == FailoverReason.upstream_rate_limit or _provider_wide_overload
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
-        if not pool_may_recover and agent._fallback_index >= len(agent._fallback_chain):
-            # With no fallback candidate, arm here; otherwise try_activate_fallback owns the
-            # single arm after honoring min_switch_reset_seconds. Arming in both places doubled
-            # the shared backoff when its durable write failed.
+        if (
+            not pool_may_recover
+            and agent._fallback_index >= len(agent._fallback_chain)
+            and not _retry.shared_cooldown_arm_attempted
+        ):
+            # With no fallback candidate, arm once for this turn's retries. Set the guard
+            # before the durable write: its failure must not escalate local backoff per retry.
+            _retry.shared_cooldown_arm_attempted = True
+            from agent.fallback_cooldown import _arm_rate_limit_cooldown
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at)
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect

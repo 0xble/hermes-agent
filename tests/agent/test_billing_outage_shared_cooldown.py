@@ -16,8 +16,9 @@ from tests.agent import _shared_cooldown_stub as harness
         (503, "auth_unavailable: no auth available (providers=claude; last upstream error: "
          "rate_limit_error: This request would exceed your account's rate limit)", "rate_limit"),
         (400, "Your credit balance is too low to access the Anthropic API", "billing"),
-        (503, "The server is overloaded, please try again later", "overloaded"),
-        (500, "The server is overloaded, please try again later", "overloaded"),
+        (503, "auth_unavailable: no auth available (providers=claude; last upstream error: "
+         "overloaded_error: upstream at capacity)", "overloaded"),
+        (529, "The server is overloaded, please try again later", "overloaded"),
     ],
 )
 def test_provider_outage_is_shared_without_backoff_or_fresh_agent_primary_probe(
@@ -62,14 +63,23 @@ def test_provider_outage_is_shared_without_backoff_or_fresh_agent_primary_probe(
 @pytest.mark.parametrize(
     ("status", "message"),
     [(500, "Internal server error"),
+     (500, "upstream at capacity"),
+     (502, "upstream at capacity"),
      (503, "maximum context length exceeded"),
+     (503, "invalid_request_error: prompt is too long: 210000 tokens > 200000 maximum"),
+     (503, "auth_unavailable: no auth available; last upstream error: "
+      "invalid_request_error: prompt is too long: 210000 tokens > 200000 maximum"),
      (503, "request validation failed: unsupported parameter temperature")],
 )
 def test_request_specific_or_unclassified_failures_do_not_arm_shared_cooldown(
     tmp_path, monkeypatch, status, message,
 ):
     home = tmp_path / ".hermes"
-    harness.write_home_config(home)  # zero retries; no real provider backoff in the regression
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "agent:\n  api_max_retries: 0\n  auto_recovery_cycles: 0\ncompression:\n  enabled: false\n",
+        encoding="utf-8",
+    )
     monkeypatch.setitem(harness._FAILURE_BODIES, status, {"type": "api_error", "message": message})
     with harness.StubProvider() as stub:
         stub.failure_status = status
@@ -104,3 +114,37 @@ def test_known_outage_arms_even_when_agent_a_has_no_fallback_chain(
     records = json.loads((home / "state" / "model_cooldowns.json").read_text(encoding="utf-8-sig"))["routes"]
     (record,) = records.values()
     assert record["reason"] == reason
+
+
+def test_retryable_rate_limit_arms_once_without_fallback_when_shared_write_fails(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "agent:\n  api_max_retries: 3\n  auto_recovery_cycles: 0\ncompression:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+    child = harness.CHILD.replace("fallback_model=fallback", "fallback_model=[]")
+    # Keep real classification, routing and local cooldown/backoff arithmetic. Fail only
+    # the durable write and replace waiting, so this tests repeated real API attempts.
+    child = (
+        'from unittest.mock import patch\n'
+        'patch("agent.shared_primary_cooldown.arm_cooldown", '
+        'side_effect=OSError("shared cooldown directory is unwritable")).start()\n'
+        'patch("agent.turn_api_error.interruptible_backoff_sleep", return_value=None).start()\n'
+        + child
+    ).replace(
+        '"notices": notices,',
+        '"notices": notices, "backoff_count": agent._rate_limit_backoff_count,',
+    )
+    monkeypatch.setattr(harness, "CHILD", child)
+    with harness.StubProvider() as stub:
+        stub.failure_status = 429
+        stub.retry_after = None
+        result = harness.run_turn(home, stub.url, "nonstream")
+        primary_requests = stub.primary_requests()
+    assert result["failed"] is True
+    assert len(primary_requests) >= 3, "exercise multiple retries of the rate-limited turn"
+    assert result["backoff_count"] == 1, "local backoff must count turns, not retries"
+    assert not (home / "state" / "model_cooldowns.json").exists()
