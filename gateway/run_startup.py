@@ -812,12 +812,19 @@ class GatewayStartupMixin:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
+        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending). A pending
+        # /restart or planned service-restart marker identifies the predecessor as intentional. The guard
+        # gives one such restart a chain-local allowance, then counts repeated planned restarts so an
+        # auto-resumed agent cannot evade the breaker by calling request_restart forever.
         if candidates and record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
+                from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap):
+                _planned_restart = _restart_notification_pending() or _planned_restart_notification_pending()
+                if _rlg.check_and_record(
+                    _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
+                ):
                     return None
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)

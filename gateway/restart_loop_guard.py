@@ -3,10 +3,11 @@
 Defenses 1-2 (``_HERMES_GATEWAY`` guard on ``hermes gateway stop|restart`` /
 ``terminal_tool``, cron lifecycle filter) stop the agent scheduling its own restart
 but not every SIGTERM source: the supervisor respawns, the gateway auto-resumes the
-restart-interrupted session, whose next turn re-runs the offending logic.  Boots are
-persisted to ``<HERMES_HOME>/gateway/restart_loop.json`` and CHAIN while gaps stay
-within ``max_gap_seconds`` (a ~150s watchdog-kill cycle trips like a ~10s loop).
-Tripped → caller SKIPS auto-resume.  Any I/O failure fails OPEN, never wedging.
+restart-interrupted session, whose next turn re-runs the offending logic. Boots are persisted to
+``<HERMES_HOME>/gateway/restart_loop.json``. The first boot whose predecessor left a planned-restart
+marker is recorded separately from the crash chain; a second planned restart in the same
+gap-bounded chain is counted, preserving the breaker against an auto-resumed agent that repeatedly
+requests restart. Tripped → caller SKIPS auto-resume. Any I/O failure fails OPEN, never wedging.
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("gateway.run")
 
-# A legitimate operator restart (or two) never trips; a ~10s respawn loop does
-# within a few cycles.
+# The first planned restart in a chain is exempt; subsequent planned restarts count so an
+# auto-resumed agent cannot loop forever by repeatedly requesting a graceful restart.
 DEFAULT_MAX_RESTARTS = 3
 DEFAULT_WINDOW_SECONDS = 60
 # Longest gap between consecutive restart-interrupted boots still counted as the
@@ -38,22 +39,34 @@ def _state_path():
     return get_hermes_home() / "gateway" / "restart_loop.json"
 
 
-def _load_boots() -> List[float]:
+def _load_state() -> tuple[List[float], List[float]]:
     try:
         # utf-8-sig: our BOM-tolerant read fix for the persisted boot log.
         raw = _state_path().read_text(encoding="utf-8-sig")
         data = json.loads(raw)
         boots = data.get("boots", [])
-        return [float(t) for t in boots if isinstance(t, (int, float))]
+        planned = data.get("planned", [])
+        return (
+            [float(t) for t in boots if isinstance(t, (int, float))],
+            [float(t) for t in planned if isinstance(t, (int, float))],
+        )
     except (OSError, ValueError, TypeError):
-        return []
+        return [], []
 
 
-def _save_boots(boots: List[float]) -> None:
+def _load_boots() -> List[float]:
+    return _load_state()[0]
+
+
+def _save_state(boots: List[float], planned: List[float]) -> None:
     with contextlib.suppress(OSError):
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"boots": boots}), encoding="utf-8")
+        path.write_text(json.dumps({"boots": boots, "planned": planned}), encoding="utf-8")
+
+
+def _save_boots(boots: List[float]) -> None:
+    _save_state(boots, _load_state()[1])
 
 
 def _chain_gap(window_seconds: int, max_gap_seconds: int) -> float:
@@ -101,10 +114,27 @@ def clear() -> None:
 def check_and_record(
     max_restarts: int = DEFAULT_MAX_RESTARTS, window_seconds: int = DEFAULT_WINDOW_SECONDS, *,
     now: Optional[float] = None, max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
+    planned_restart: bool = False,
 ) -> bool:
-    """Gateway entry point: record this boot; True when the chain reached
-    ``max_restarts`` and auto-resume should be SKIPPED."""
-    boots = record_restart_interrupted_boot(window_seconds, now=now, max_gap_seconds=max_gap_seconds)
+    """Record this boot and return True when auto-resume should be skipped.
+
+    The first planned restart in a contiguous chain is kept as a separate marker instead of
+    spending breaker budget. A second planned restart in that same chain is counted, so an
+    auto-resumed agent that repeatedly asks the gateway to restart still trips the breaker.
+    """
+    ts = time.time() if now is None else now
+    gap = _chain_gap(window_seconds, max_gap_seconds)
+    boots, planned = _load_state()
+    boots = _chain_ending_at(boots, ts, gap)
+    planned = _chain_ending_at(planned, ts, gap)
+    if planned_restart and not planned:
+        planned = [ts]
+        _save_state(boots[-_MAX_STORED_BOOTS:], planned[-_MAX_STORED_BOOTS:])
+        return False
+    boots = boots + [ts]
+    if planned_restart:
+        planned = planned + [ts]
+    _save_state(boots[-_MAX_STORED_BOOTS:], planned[-_MAX_STORED_BOOTS:])
     tripped = max_restarts > 0 and len(boots) >= max_restarts
     if tripped:
         logger.warning(
@@ -112,6 +142,6 @@ def check_and_record(
             "threshold %d). Skipping auto-resume to break a suspected SIGTERM-respawn loop (#30719, #81642). "
             "Restart-interrupted sessions stay resume-pending and will continue on the next real user message. "
             "If this is a false positive, delete %s.",
-            len(boots), int(_chain_gap(window_seconds, max_gap_seconds)), max_restarts, _state_path(),
+            len(boots), int(gap), max_restarts, _state_path(),
         )
     return tripped
