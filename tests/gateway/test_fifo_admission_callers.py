@@ -169,30 +169,75 @@ async def test_leftover_steer_survives_fifo_rejection(failed_storage):
     assert pending == "priority\n\nalso retain this"
 
 
-def test_pending_photo_merge_refreshes_checkpoint_and_empty_slot_is_checkpointed(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["photo", "setup", "grace"])
+@pytest.mark.parametrize("occupied", [False, True], ids=["empty", "checkpointed-head"])
+@pytest.mark.parametrize("reject", [False, True], ids=["accepted", "rejected"])
+async def test_pending_merge_admission_covers_running_photo_setup_and_grace(
+    tmp_path, monkeypatch, route, occupied, reject,
+):
     from gateway.platforms.event import MessageType
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.run_busy import QUEUE_ADMISSION_FAILURE
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3" if route == "grace" else "0")
     runner, adapter = _make_runner(_session_entry())
     source = _make_source()
     key = build_session_key(source)
-    head = _event("head", "photo-head")
-    assert runner._queue_or_replace_pending_event(key, head)
-    follow = _event("caption", "photo-follow")
-    follow.message_type = MessageType.PHOTO
-    follow.media_urls = ["/tmp/follow.jpg"]
-    follow.media_types = ["image/jpeg"]
-    assert runner._hm_merge_pending_for_source(source, key, follow)
-    spool = head._hermes_recovery_spool
-    assert json.loads(spool.read_text())["data"]["media_urls"] == ["/tmp/follow.jpg"]
+    runner._draining = False
+    runner._effective_busy_input_mode = lambda source: "steer"
+    state = runner._session_state(key)
+    state.turn.agent = _AGENT_PENDING_SENTINEL if route == "setup" else SimpleNamespace()
+    state.turn.started_ts = time.time() if route == "grace" else 0
+    head = _event("head", "head") if occupied else None
+    if head is not None:
+        assert runner._queue_or_replace_pending_event(key, head)
+        original_spool = head._hermes_recovery_spool.read_bytes()
+    follow = _event("follow-up", "follow")
+    if route == "photo":
+        follow.message_type = MessageType.PHOTO
+        follow.media_urls = [str(tmp_path / "follow.jpg")]
+        follow.media_types = ["image/jpeg"]
+    if reject:
+        def fail(*args, **kwargs):
+            raise OSError("injected merge checkpoint failure")
+        monkeypatch.setattr(shutdown_flush, "_write_payload", fail)
 
-    empty = _event("first photo", "photo-empty")
-    empty.message_type = MessageType.PHOTO
-    empty.media_urls = ["/tmp/empty.jpg"]
-    empty.media_types = ["image/jpeg"]
-    empty_key = key + "-empty"
-    assert runner._hm_merge_pending_for_source(source, empty_key, empty)
-    assert json.loads(empty._hermes_recovery_spool.read_text())["data"]["media_urls"] == ["/tmp/empty.jpg"]
+    reply = await runner._hm_handle_running_session_message(follow, source, key)
+    if reject:
+        assert reply == QUEUE_ADMISSION_FAILURE
+        assert adapter._pending_messages.get(key) is head
+        if head is not None:
+            assert head.text == "head" and head.media_urls == []
+            assert head._hermes_recovery_spool.read_bytes() == original_spool
+        assert not follow._gateway_accepted
+        return
+    assert reply is None
+    merged = adapter._pending_messages[key]
+    path = getattr(merged, "_hermes_recovery_spool", None)
+    assert path is not None and path.exists()
+    data = json.loads(path.read_text())["data"]
+    assert data["text"] == merged.text and "follow-up" in data["text"]
+    assert data["media_urls"] == follow.media_urls
+    assert data["queue_accepted"] and data["drain_deferred"]
+    assert len(list((tmp_path / "pending_messages").glob("pending-*.json"))) == 1
+
+    # Exercise restart claiming, not only JSON serialization: the accepted merged content must be
+    # offered to the next gateway exactly once with the refreshed media and text intact.
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("sid", "telegram")
+        claimed = []
+        shutdown_flush.recover_pending_spool(
+            session_db=db, session_resolver=lambda *a, **kw: ("sid", db),
+            deferred_followup=lambda k, sid, data, path: claimed.append(data) or True,
+        )
+        assert len(claimed) == 1
+        assert claimed[0]["text"] == merged.text
+        assert claimed[0]["media_urls"] == follow.media_urls
+    finally:
+        db.close()
 
 
 def test_flush_rewrites_stale_pending_checkpoint_after_in_memory_mutation(tmp_path, monkeypatch):
@@ -243,6 +288,71 @@ async def test_internal_busy_admission_failure_is_not_acknowledged():
     runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
     runner._queue_or_replace_pending_event = Mock(return_value=False)
     assert await runner._handle_active_session_busy_message(event, key) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject", [False, True], ids=["accepted", "rejected"])
+async def test_failed_first_delivery_checkpoints_eventless_followup(tmp_path, monkeypatch, reject):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = _make_runner(_session_entry())
+    source = _make_source()
+    key = build_session_key(source)
+    existing = _event("already waiting", "waiting")
+    assert runner._enqueue_fifo(key, existing, adapter)
+    runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    ctx = SimpleNamespace(
+        source=source, session_id="sid", session_key=key, run_generation=1,
+        _interrupt_depth=0, history=[], _status_thread_metadata={},
+        internal=False, reply_expected=True, event_metadata={},
+    )
+    if reject:
+        def fail(*args, **kwargs):
+            raise OSError("injected deferred checkpoint failure")
+        monkeypatch.setattr(shutdown_flush, "_write_payload", fail)
+    result = {"messages": [], "final_response": "not delivered"}
+    assert await runner._run_agent_queued_followup(
+        ctx, adapter, "eventless follow-up", None, "not delivered", result, None,
+    ) is result
+    if reject:
+        assert adapter._pending_messages[key] is existing
+        assert not runner._overflow_queue(key)
+    else:
+        deferred = adapter._pending_messages[key]
+        assert deferred.text == "eventless follow-up"
+        assert json.loads(deferred._hermes_recovery_spool.read_text())["data"]["text"] == deferred.text
+        assert runner._overflow_queue(key) == [existing]
+
+
+@pytest.mark.parametrize("reject", [False, True], ids=["accepted", "rejected"])
+def test_yuanbao_recall_replacement_requires_checkpoint(tmp_path, monkeypatch, reject):
+    import asyncio
+    from gateway.platforms.yuanbao import RecallGuardMiddleware
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source = _make_source()
+    key = build_session_key(source)
+    original = _event("already queued", "original")
+    assert shutdown_flush.checkpoint_queued_event(key, original)
+    adapter = SimpleNamespace(
+        name="yuanbao", _pending_messages={key: original},
+        _active_sessions={key: asyncio.Event()}, _processing_msg_texts={},
+    )
+    monkeypatch.setattr(RecallGuardMiddleware, "_build_source", lambda *args: source)
+    if reject:
+        def fail(*args, **kwargs):
+            raise OSError("injected recall checkpoint failure")
+        monkeypatch.setattr(shutdown_flush, "_write_payload", fail)
+    RecallGuardMiddleware._interrupt_for_recall(adapter, key, "recalled", "group", "user")
+    if reject:
+        assert adapter._pending_messages[key] is original
+        assert not adapter._active_sessions[key].is_set()
+        assert original._hermes_recovery_spool.exists()
+    else:
+        recalled = adapter._pending_messages[key]
+        assert "MESSAGE RECALLED" in recalled.text
+        assert json.loads(recalled._hermes_recovery_spool.read_text())["data"]["text"] == recalled.text
+        assert adapter._active_sessions[key].is_set()
+        assert not original._hermes_recovery_spool.exists()
 
 
 @pytest.mark.asyncio

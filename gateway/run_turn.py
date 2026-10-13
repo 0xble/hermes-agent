@@ -4086,10 +4086,14 @@ class GatewayTurnMixin:
                     metadata=dict(turn_ctx.event_metadata or {}),
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
-                    existing = adapter._pending_messages.get(session_key)
-                    if existing is not None:
-                        self._session_state(session_key).conversation.queued_events.insert(0, existing)
-                    adapter._pending_messages[session_key] = deferred
+                    from gateway.shutdown_flush import checkpoint_queued_event
+                    if checkpoint_queued_event(str(session_key), deferred):
+                        existing = adapter._pending_messages.get(session_key)
+                        if existing is not None and existing is not deferred:
+                            self._session_state(session_key).conversation.queued_events.insert(0, existing)
+                        adapter._pending_messages[session_key] = deferred
+                    else:
+                        logger.warning("Could not checkpoint deferred follow-up for %s", session_key)
                 logger.warning("Queued follow-up deferred after failed first delivery for %s", session_key)
                 return result or {"final_response": response, "messages": history}
 

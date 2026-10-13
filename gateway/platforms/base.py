@@ -1941,7 +1941,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
 
 def checkpointed_merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent], session_key: str, event: MessageEvent,
-    *, merge_text: bool = False,
+    *, merge_text: bool = False, replace: bool = False,
 ) -> bool:
     """Commit one pending-slot mutation only after its native recovery checkpoint succeeds.
 
@@ -1955,7 +1955,7 @@ def checkpointed_merge_pending_message_event(
     existing = pending_messages.get(session_key)
     if existing is event:
         return checkpoint_queued_event(session_key, event, refresh=True)
-    if existing is None:
+    if existing is None or replace:
         candidate = event
         refresh = False
     else:
@@ -1973,10 +1973,9 @@ def checkpointed_merge_pending_message_event(
     if not checkpoint_queued_event(session_key, candidate, refresh=refresh):
         return False
     pending_messages[session_key] = candidate
-    if existing is not None and candidate is not existing and candidate is not event:
-        if event is not candidate:
-            retire_queue_checkpoint(event, reason="merged_into_head")
-    elif existing is not None and candidate is event:
+    if existing is not None and candidate is not event:
+        retire_queue_checkpoint(event, reason="merged_into_head")
+    elif existing is not None:
         retire_queue_checkpoint(existing, reason="replaced_pending_event")
     return True
 

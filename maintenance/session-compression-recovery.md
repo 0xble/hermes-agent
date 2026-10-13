@@ -52,7 +52,14 @@ accepted head and returns rejection to its caller. Shutdown compares the event's
 serialized content fingerprint against its checkpoint and durably refreshes a
 stale spool rather than treating path existence as proof of current content.
 Internal busy/drain callers return the actual admission receipt so rejected
-completion notifications can refund their claims.
+completion notifications can refund their claims. Yuanbao recall replacements
+use this boundary too: checkpoint the replacement before publishing the slot or
+signalling the active turn, and retire the displaced checkpoint only on success.
+A failed-first-delivery deferral must checkpoint a newly synthesized eventless
+follow-up before replacing the head; keep the displaced admitted head in FIFO
+order and leave it untouched if the new checkpoint fails. Moving an unchanged,
+already-admitted event between the head, overflow and local drain references is
+not a new content admission and must retain its existing checkpoint.
 
 Every FIFO producer must honor its durable-admission boolean, including the
 Telegram follow-up grace window. A failed busy queue admission must produce a
