@@ -406,7 +406,7 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 ## Active patch record: child-parent relay guard
 
 - **Patch identity:** `child-parent-relay-guard`.
-- **Behavior:** A delegated child cannot send a relay message directly to its own parent through the Relay MCP tool or the `relay send` CLI. Shell punctuation attached to a CLI target is tokenized separately, while quoted or escaped punctuation remains part of the target argument.
+- **Behavior:** A delegated child cannot send a relay message directly to its own parent through the Relay MCP tool or the `relay send` CLI. CLI checks resolve only each invocation's destination argument, not body text, option values, redirection operands, or later commands' arguments. The shared shell heredoc scanner keeps stdin data out of argument parsing, including apostrophes and quoted/tab-stripped delimiters; shell operators and line continuations preserve the boundary. Ambiguous apparent relay syntax fails closed only for a child with a resolvable parent identity, while top-level sends and valid other-session sends remain unchanged.
 - **Source surfaces:** `agent/relay_guard.py` and `tests/agent/test_relay_guard.py`.
 - **Upstream status:** Fork-only guard carried by PR #541.
 - **Focused regression:** `scripts/run_tests.sh tests/agent/test_relay_guard.py -q`.
