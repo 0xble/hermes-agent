@@ -24,6 +24,11 @@ took 0.19–0.51 seconds. That startup cost exhausted the 300-second commit-outc
 file budget and could expire the R6 lock before the hand-off reached its release
 wait. Keep the actual native subprocesses, console-code-page coverage, assertions,
 and timeout bounds; do not emulate Windows or relax the wait proof.
+The hermetic Windows worker environment sets `PSModulePath` explicitly empty
+when the parent leaves it unset; an empty value still autoloads built-in
+cmdlets from `$PSHOME\Modules` in both Windows PowerShell 5.1 and pwsh 7
+(native run 38399052622), and
+`tests/scripts/ci/test_portable_windows_environment.py` pins that contract.
 
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
