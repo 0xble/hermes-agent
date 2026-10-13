@@ -1155,7 +1155,12 @@ def _status_5xx(c: _Ctx) -> Verdict:
     # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
     # retry-flooding — unless the parameter was injected server-side. Overflow
     # must be checked first because Anthropic wraps it in invalid_request_error.
-    validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
+    # 503/529 are capacity signals. Proxies also wrap account-level outages in a bare
+    # invalid_request_error there, so only explicit parameter rejections fail fast.
+    if c.status_code in (503, 529):
+        validation = any(p in c.msg for p in _400_VALIDATION_PATTERNS) or c.code in _400_VALIDATION_CODES
+    else:
+        validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
     if c.status_code == 529 or c.code == "overloaded_error":

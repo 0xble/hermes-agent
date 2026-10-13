@@ -1942,14 +1942,16 @@ def route_classified_error(
         if (
             not pool_may_recover
             and agent._fallback_index >= len(agent._fallback_chain)
-            and not _retry.shared_cooldown_arm_attempted
+            and not getattr(_retry, "shared_cooldown_arm_attempted", False)
         ):
-            # With no fallback candidate, arm once for this turn's retries. Set the guard
-            # before the durable write: its failure must not escalate local backoff per retry.
-            _retry.shared_cooldown_arm_attempted = True
+            # With no fallback candidate, arm once for this turn's retries. A durable-write
+            # failure still returns the local cooldown, so it never escalates backoff per retry.
+            # Mark the guard only when a cooldown was armed: an unarmed attempt (e.g. a rate
+            # limit from an active fallback) must leave terminal exhaustion its short window.
             from agent.fallback_cooldown import _arm_rate_limit_cooldown
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at)
+            if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at) is not None:
+                _retry.shared_cooldown_arm_attempted = True
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
     # directly so the long backoff runs, and raise the ceiling to reach it.
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)

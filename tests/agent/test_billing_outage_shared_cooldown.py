@@ -148,3 +148,32 @@ def test_retryable_rate_limit_arms_once_without_fallback_when_shared_write_fails
     assert len(primary_requests) >= 3, "exercise multiple retries of the rate-limited turn"
     assert result["backoff_count"] == 1, "local backoff must count turns, not retries"
     assert not (home / "state" / "model_cooldowns.json").exists()
+
+
+def test_unarmed_rate_limit_leaves_terminal_exhaustion_its_short_window(monkeypatch):
+    # An active fallback rate-limited after the chain is spent arms no primary cooldown.
+    # The per-turn guard must stay clear, so terminal exhaustion still runs
+    # _fallback_chain_exhausted and its short window gates the next turn's primary probe.
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent import fallback_cooldown, turn_recovery
+    from agent.error_classifier import ClassifiedError, FailoverReason
+    from agent.turn_retry_state import TurnRetryState
+
+    arm = Mock(return_value=None)
+    monkeypatch.setattr(fallback_cooldown, "_arm_rate_limit_cooldown", arm)
+    retry = TurnRetryState()
+    agent = SimpleNamespace(_fallback_index=1, _fallback_chain=[{}], _credential_pool=None)
+    classified = ClassifiedError(reason=FailoverReason.upstream_rate_limit, status_code=429)
+    try:
+        turn_recovery.route_classified_error(
+            agent, Exception("429"), classified, retry, error_msg="429", error_context={},
+            recovered_with_pool=False, base_url="https://backup.invalid", model="backup",
+            messages=[], api_messages=[], system_message=None, active_system_prompt="",
+            conversation_history=[], retry_count=0, max_retries=3, compression_attempts=0,
+            max_compression_attempts=1, api_call_count=1, effective_task_id="t",
+        )
+    except Exception:
+        pass  # Only the guard state before later routing steps matters here.
+    arm.assert_called_once()
+    assert retry.shared_cooldown_arm_attempted is False

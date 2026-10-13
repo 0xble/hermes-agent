@@ -351,7 +351,7 @@ def settle_unrecovered_error(
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if (
-                (not _retry.shared_cooldown_arm_attempted or agent._has_pending_fallback())
+                (not getattr(_retry, "shared_cooldown_arm_attempted", False) or agent._has_pending_fallback())
                 and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at)
             ):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -404,7 +404,7 @@ def settle_unrecovered_error(
         # An empty-chain rate-limit arm already happened in classified-error routing.
         # Do not arm again on terminal exhaustion, including after a durable-write failure.
         if (
-            (not _retry.shared_cooldown_arm_attempted or agent._has_pending_fallback())
+            (not getattr(_retry, "shared_cooldown_arm_attempted", False) or agent._has_pending_fallback())
             and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at)
         ):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler

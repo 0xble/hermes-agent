@@ -148,3 +148,30 @@ def test_classified_nonoverflow_400_persists_a_large_failed_session(reason):
         base_url="http://127.0.0.1:8317/v1", model="claude-opus-5-5",
     )
     agent._persist_session.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "body"),
+    [
+        (503, "auth_unavailable: no auth available; last upstream error: "
+              "invalid_request_error: This organization has been disabled.", None),
+        (503, "Service temporarily unavailable", {"error": {"type": "invalid_request_error",
+                                                             "message": "Service temporarily unavailable"}}),
+        (529, "invalid_request_error: overloaded", None),
+    ],
+)
+def test_capacity_status_with_bare_invalid_request_error_stays_retryable(status, message, body):
+    # Proxies wrap account-level and capacity outages in a bare invalid_request_error on
+    # 503/529. Only explicit parameter rejections are request-shape failures there.
+    error = _ProxyError(message, status)
+    if body is not None:
+        error.body = body
+    classified = classify_api_error(error, provider="custom:claude-proxy", model="claude-opus-5-5")
+    assert classified.reason is FailoverReason.overloaded
+    assert classified.retryable is True
+
+
+@pytest.mark.parametrize("status", [503, 529])
+def test_capacity_status_with_explicit_parameter_rejection_still_fails_fast(status):
+    error = _ProxyError("invalid_request_error: unsupported parameter temperature", status)
+    assert classify_api_error(error, provider="custom:claude-proxy").reason is FailoverReason.format_error
