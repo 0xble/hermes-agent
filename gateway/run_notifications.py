@@ -1212,7 +1212,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     self._completion_deliveries_inflight.discard(identity)
             operations = []
             if not claim.settled:
-                operation = "complete" if accepted else "defer" if refused or cancelled else "release"
+                operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
                 operations.append((operation, claim.delegation_id, claim.claim_id))
             operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
             operations.extend(
