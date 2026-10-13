@@ -30,12 +30,16 @@ class ReadResult:
     #: is free must not read that as "absent". See patch_parser._apply_add.
     not_found: bool = False
     similar_files: List[str] = field(default_factory=list)
+    resolved_path: Optional[str] = None
     _snapshot: Optional[tuple] = None
     # sha256 of the exact on-disk bytes ``read_file_raw`` decoded (BOM included).
     _content_sha256: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None and v != []}
+        result = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None and v != []}
+        if self.not_found:
+            result["similar_files"] = self.similar_files
+        return result
 
 
 @dataclass
@@ -69,6 +73,8 @@ class PatchResult:
     lint: Optional[Dict[str, Any]] = None
     lsp_diagnostics: Optional[str] = None  # see WriteResult.lsp_diagnostics
     error: Optional[str] = None
+    match_count: Optional[int] = None
+    match_lines: List[int] = field(default_factory=list)
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
     note: Optional[str] = None
@@ -80,7 +86,7 @@ class PatchResult:
     # Emission order is part of the output contract.
     _DICT_FIELDS: ClassVar[tuple] = (
         "diff", "files_modified", "files_created", "files_deleted",
-        "lint", "lsp_diagnostics", "error",
+        "lint", "lsp_diagnostics", "error", "match_count", "match_lines",
     )
 
     def to_dict(self) -> dict:
@@ -116,6 +122,10 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
+
+    resolved_path: Optional[str] = None
+    resolved_cwd: Optional[str] = None
+    nearest_existing_parent: Optional[str] = None
 
     # Below this many matches the verbose array is already compact enough that
     # a path-grouping header would cost more tokens than it saves.
@@ -159,7 +169,8 @@ class SearchResult:
         if self.truncated:
             result["truncated"] = True
             result["total_count_is_lower_bound"] = True
-        for key in ("limit_reason", "warning", "error"):
+        for key in ("limit_reason", "warning", "error", "resolved_path",
+                    "resolved_cwd", "nearest_existing_parent"):
             value = getattr(self, key)
             if value:
                 result[key] = value

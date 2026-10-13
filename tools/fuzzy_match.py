@@ -336,11 +336,13 @@ def _format_match_locations(content: str, matches: list[Span], cap: int = 5) -> 
 
 
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
-                           replace_all: bool = False) -> tuple[str, int, Optional[str], Optional[str]]:
+                           replace_all: bool = False, *,
+                           diagnostics: Optional[dict] = None) -> tuple[str, int, Optional[str], Optional[str]]:
     """Find and replace via the strategy chain.
 
     Returns ``(new_content, match_count, strategy_name, error)``; on failure
-    ``(content, 0, None, error)``.
+    ``(content, 0, None, error)``. When supplied, ``diagnostics`` receives
+    the ambiguous match_count and every 1-based starting match_lines entry.
     """
     if not old_string:
         # Actionable recovery text: a terse "cannot be empty" leaves the model
@@ -366,12 +368,16 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         if not matches:
             continue
 
+        if len(matches) > 1 and diagnostics is not None and (
+                not replace_all or strategy_name in SIMILARITY_STRATEGIES):
+            diagnostics.update(match_count=len(matches),
+                               match_lines=[content.count("\n", 0, start) + 1 for start, _ in matches])
         if len(matches) > 1 and not replace_all:
             _note_edit_match(None, "ambiguous")
             locations = _format_match_locations(content, matches)
             return content, 0, None, (
                 f"Found {len(matches)} matches for old_string. "
-                f"Provide more context to make it unique, or use replace_all=True. "
+                f"Widen the old_string anchor with surrounding context to make it unique, or use replace_all=True. "
                 f"Matches:\n{locations}")
         if replace_all and len(matches) > 1 and strategy_name in SIMILARITY_STRATEGIES:
             _note_edit_match(None, "ambiguous")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import difflib
 import logging
 from typing import Any, Optional
 
@@ -56,10 +57,17 @@ def _icon_choices(options) -> str:
 
 
 def _match_icon(options, emoji: str) -> str:
-    match = next((item for item in options if item.get("emoji") == emoji), None)
-    if match is None or not match.get("custom_emoji_id"):
+    from agent.topic_icons import normalize_emoji
+
+    normalized = normalize_emoji(emoji)
+    valid = [item for item in options if item.get("emoji") and item.get("custom_emoji_id")]
+    match = next((item for item in valid if normalize_emoji(item) == normalized), None)
+    if match is None:
+        catalog = {normalize_emoji(item): item["emoji"] for item in valid}
+        closest = difflib.get_close_matches(normalized, catalog, n=1, cutoff=0) if normalized else []
+        hint = f". Closest spelling: {catalog[closest[0]]}" if closest else ""
         raise TopicRequestError(
-            f"Unsupported topic icon {emoji!r}. Available icons: {_icon_choices(options) or 'none'}")
+            f"Unsupported topic icon {emoji!r}{hint}. Available icons: {_icon_choices(valid) or 'none'}")
     return str(match["custom_emoji_id"])
 
 
