@@ -134,3 +134,37 @@ def test_control_write_failure_does_not_apply_locally(store, monkeypatch, operat
     assert manager.state.to_json() == before
     stored = load_loop("failure")
     assert stored is not None and stored.to_json() == before
+
+
+def test_cursor_owned_stale_claim_cannot_undo_a_pause(store):
+    """A cursor owner holds the write transaction; the stale manager still CAS-checks the row."""
+    from hermes_cli.loops import LoopManager, load_loop
+
+    LoopManager("cursor-claim").set("watch", interval_seconds=60)
+
+    def transaction(cursor):
+        stale = LoopManager("cursor-claim", cursor=cursor)
+        LoopManager("cursor-claim", cursor=cursor).pause()
+        return stale.fire_tick()
+
+    assert store._execute_write(transaction) is None
+    after = load_loop("cursor-claim")
+    assert after.status == "paused" and not after.awaiting_response and after.ticks_fired == 0
+
+
+def test_cursor_owned_stale_settle_cannot_clear_a_successor_tick(store):
+    from hermes_cli.loops import LoopManager, load_loop
+
+    manager = LoopManager("cursor-settle")
+    manager.set("watch", interval_seconds=60)
+    assert manager.fire_tick()
+    tick = (manager.state.created_at, manager.state.ticks_fired)
+
+    def transaction(cursor):
+        stale = LoopManager("cursor-settle", cursor=cursor)
+        LoopManager("cursor-settle", cursor=cursor).pause()
+        return stale.complete_tick("done", tick=tick)
+
+    store._execute_write(transaction)
+    after = load_loop("cursor-settle")
+    assert after.status == "paused"

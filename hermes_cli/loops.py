@@ -663,7 +663,9 @@ class LoopManager(LoopRevisionsMixin):
         A failed read also yields None; keep the cached state then, or a transient DB error during a
         wakeup would drop ``awaiting_response`` handling and wedge the tick. Rows are never deleted
         (stop marks them cleared), so None with a cached state means the read failed."""
-        fresh = load_loop(self.session_id)
+        # A cursor owner holds the write lock; reading outside it would block on that same lock.
+        fresh = (load_loop(self.session_id) if self._cursor is None
+                 else load_loop(self.session_id, cursor=self._cursor))
         if fresh is not None or self._state is None:
             self._state = fresh
             self._mark_synced()
@@ -866,14 +868,11 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         # An unbound manager is intentionally ephemeral: there is no stored row to fence against.
         db = _get_session_db() if self._cursor is None and self.session_id else None
-        if db is None:
+        if db is None and self._cursor is None:
             if can_claim is not None and not can_claim():
                 return False
             claim(s)
-            if self._cursor is None:
-                save_loop(self.session_id, s, tick_lifecycle=True)
-            else:
-                save_loop(self.session_id, s, cursor=self._cursor, tick_lifecycle=True)
+            save_loop(self.session_id, s, tick_lifecycle=True)
             self._mark_synced()
             return True
 
@@ -902,8 +901,12 @@ class LoopManager(LoopRevisionsMixin):
             return claimed
 
         try:
-            claimed = db._execute_write(write)
+            # A cursor owner already holds the write transaction: run the same guarded
+            # stored-row check through it, never an unconditional cached-state write.
+            claimed = write(self._cursor) if self._cursor is not None else db._execute_write(write)
         except Exception as exc:
+            if self._cursor is not None:
+                raise  # transaction owners must see failures, as save_loop(cursor=...) does
             logger.debug("LoopManager: tick claim write failed: %s", exc, exc_info=True)
             return False
         if claimed is None:
@@ -931,12 +934,9 @@ class LoopManager(LoopRevisionsMixin):
         db = _get_session_db() if self._cursor is None and self.session_id else None
         if s is None:
             return False
-        if db is None:
+        if db is None and self._cursor is None:
             settle(s)
-            if self._cursor is None:
-                save_loop(self.session_id, s, tick_lifecycle=True)
-            else:
-                save_loop(self.session_id, s, cursor=self._cursor, tick_lifecycle=True)
+            save_loop(self.session_id, s, tick_lifecycle=True)
             self._mark_synced()
             return True
 
@@ -957,8 +957,10 @@ class LoopManager(LoopRevisionsMixin):
             return stored
 
         try:
-            settled = db._execute_write(write)
+            settled = write(self._cursor) if self._cursor is not None else db._execute_write(write)
         except Exception as exc:
+            if self._cursor is not None:
+                raise  # transaction owners must see failures, as save_loop(cursor=...) does
             logger.debug("LoopManager: tick outcome write failed: %s", exc, exc_info=True)
             return False
         if settled is None and self._follow_compression():
