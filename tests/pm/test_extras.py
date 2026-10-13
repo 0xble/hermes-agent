@@ -274,10 +274,46 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
     assert {"fal", "telegram", "vertex", "exa"} <= set(selection)
     assert "messaging" not in selection
     assert "piper" not in selection
-    assert "hindsight" not in selection  # Catalog plugin owns this dependency, not a core extra.
+    assert "hindsight" in selection  # The active memory provider is a declared PM extra.
     assert extras.legacy_selection(tmp_path / "no-venv") == ["all"]
 
 
+
+
+def test_immutable_release_promotion_preserves_hindsight_in_new_facts(monkeypatch, tmp_path):
+    """A release replacement must keep the active install's Hindsight extra."""
+    import json
+
+    from pm.environments import runtime_facts_path
+    from pm.lock import Facts
+
+    home = tmp_path / "home"
+    previous = home / "releases" / "old"
+    candidate = home / "releases" / "new"
+    site = candidate / ".venv" / "lib" / "python3.11" / "site-packages"
+    candidate.mkdir(parents=True)
+    site.joinpath("hindsight_client").mkdir(parents=True)
+    (candidate / "pyproject.toml").write_text(
+        "[project]\nname='hermes-agent'\nversion='1'\n"
+        "[project.optional-dependencies]\nhindsight=['hindsight-client>=0.6.1,<1']\n",
+        encoding="utf-8",
+    )
+    previous.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    Facts(runtime_facts_path(previous)).record_state("venv", "old", ["all", "hindsight"])
+    old_fact = Facts(runtime_facts_path(previous), strict=True).get("venv")
+    assert old_fact is not None
+    assert old_fact["extras"] == ["all", "hindsight"]
+    (home / "current").symlink_to(candidate, target_is_directory=True)
+    (home / "previous").symlink_to(previous, target_is_directory=True)
+    monkeypatch.setattr("pm.environments.base_venv", lambda _root: candidate / ".venv")
+    monkeypatch.setattr("pm.environments.site_packages", lambda _venv: site)
+
+    selected = extras.installed_selection(candidate)
+    Facts(runtime_facts_path(candidate)).record_state("venv", "new", selected)
+    new_fact = json.loads(runtime_facts_path(candidate).read_text(encoding="utf-8"))["packages"]["venv"]
+
+    assert "hindsight" in new_fact["extras"]
 
 
 def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_path):

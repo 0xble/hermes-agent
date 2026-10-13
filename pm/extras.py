@@ -62,6 +62,7 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "documents": ("docx", "pptx", "openpyxl", "pypdf", "pdfplumber", "pypdfium2", "lxml",
                   "pandas", "matplotlib", "bs4", "fontTools", "playwright.sync_api", "fitz",
                   "reportlab"),
+    "hindsight": "hindsight_client",
     "computer-use": "mcp",
     "trace-upload": "huggingface_hub",
     # Pillow resize recovery for vision tools (the `vision` extra is a no-op
