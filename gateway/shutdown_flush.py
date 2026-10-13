@@ -665,7 +665,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         ).get_command()
         if command and resolve_command(command) is not None:
             logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
-            return False if data.get("queue_accepted") is True else DROP_PENDING
+            # Both accepted-queue checkpoints and drain arrivals discard commands
+            # terminally. Retaining an eligible file here re-warns on every boot.
+            return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)

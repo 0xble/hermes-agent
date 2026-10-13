@@ -58,7 +58,9 @@ heartbeat poller re-derive them. User `/goal` kickoffs retain the user's platfor
 message id and are not exempt: the command must propagate a rejected admission,
 log it, and return failure text instead of claiming the kickoff started. Older
 goal-continuation checkpoints are dropped
-at recovery. Internal completions (delegation/watch notifications) are
+at recovery. Registered built-in commands also terminate through `DROP_PENDING`,
+including accepted-queue checkpoints; they must not remain eligible and warn
+again on every restart. Internal completions (delegation/watch notifications) are
 claim-settled at admission, so their checkpoint is their only durable copy and
 stays until consumed. The same holds for human input without a platform id
 (leftover `/steer`): retirement is by path and does not need an id.
