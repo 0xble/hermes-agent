@@ -268,7 +268,7 @@ def test_output_drain_does_not_retry_a_stable_terminal_receipt(tmp_path, monkeyp
     monkeypatch.setattr(receipts, "atomic_json_write", write_then_drain)
     receipts.save_completed_result(session, prune=False)
     assert len(writes) == 1
-    record = json.loads((tmp_path / "logs" / "process-results" / f"{session.id}.json").read_text())
+    record = json.loads((tmp_path / "logs" / "process-results" / f"{session.id}.json").read_text(encoding="utf-8-sig"))
     assert record["completion_reason"] == "killed"
     assert record["exit_code"] == -15
 
