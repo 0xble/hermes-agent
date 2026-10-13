@@ -16,7 +16,7 @@ warning are the documented recovery boundary for notices.
 
 The shared goal notice boundary classifies achieved, blocked, genuine pause,
 failure/exhaustion and resumed-control receipts as existing `OUTBOUND_FINAL`;
-routine parked, continuing, wait-ended, wait-age and generic status remain
+routine parked, continuing, wait-age and generic status remain
 `OUTBOUND_NOTICE`. Initial send, deferred post-delivery send and background retry
 use the same existing goal-kind inference. The actual message outcome wins over
 an incidental caller hint: a six-hour blocker pause arrives on the idle
