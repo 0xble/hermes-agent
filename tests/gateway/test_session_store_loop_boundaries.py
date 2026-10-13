@@ -176,7 +176,10 @@ async def test_api_route_validation_reads_store_off_loop(site, tmp_path, monkeyp
     body = {"model": "model", "provider": "requested", "message": "hi", "input": "hi",
             "messages": [{"role": "user", "content": "hi"}]}
     request = MagicMock()
-    request.headers = {"X-Hermes-Session-Key": key}
+    request.headers = {"X-Hermes-Session-Key": key, "Authorization": "Bearer test-key"}
+    request.path = "/v1/runs" if site == "runs" else "/v1/chat/completions"
+    request.app = {}
+    request.get.side_effect = lambda _key, default=None: default
     request.match_info = {"session_id": "test-session"}
     request.json = AsyncMock(return_value=body)
     loop_thread = threading.get_ident()
