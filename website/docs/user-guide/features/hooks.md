@@ -454,6 +454,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
 | `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
+| [`post_steer_delivered`](#post_steer_delivered) | Observer | After native mid-turn steer-row insertion at either drain site; return ignored, timeout fails open. | `session_id`, `turn_id`, `platform`, `text`, `delivery_id`, `ordinal` | `text` is raw user text and may contain private content or secrets; it is not redacted. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
@@ -671,6 +672,51 @@ def track_metrics(tool_name, result, duration_ms=0, **kwargs):
 def register(ctx):
     ctx.register_hook("post_tool_call", track_metrics)
 ```
+
+---
+
+### `post_steer_delivered`
+
+Fires once **after** a native mid-turn steer row is inserted, at either the
+post-tool or pre-API drain site, under the active turn/profile scope.
+
+**Callback signature:**
+
+```python
+def my_callback(session_id, turn_id: str, platform: str, text: str,
+                delivery_id: str, ordinal: int, **kwargs):
+    ...
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `str \| None` | Current session identity; it can rotate during compression. |
+| `turn_id` | `str` | Existing admitted turn identity, as supplied to `pre_llm_call` and `pre_api_request`; empty string if absent. |
+| `platform` | `str` | Current surface, such as `cli` or `telegram`; empty string if absent. |
+| `text` | `str` | Exact drained steer text, without the out-of-band marker frame. |
+| `delivery_id` | `str` | Host-minted UUID4 identifying this insertion. |
+| `ordinal` | `int` | 1-based insertion counter, reset each turn and shared across both drain sites. |
+
+The existing `steer()` entry point strips each input and joins pending inputs
+with `\n`. The resulting batch is one delivery, not separate events for the
+original messages. No event fires for an empty drain, a requeue, or next-turn
+fallback; fallback becomes ordinary `user_message` on a new admitted turn.
+Retries and transcript replay do not emit delivery events.
+
+**Return value:** Ignored. Callbacks cannot rewrite or veto the inserted row.
+Python callbacks use `plugins.hook_callback_timeout` (default 30 seconds;
+`0` disables the bound, maximum 600). A timed-out worker is abandoned without
+joining it, later callbacks continue, and the agent turn proceeds. Exceptions
+also fail open. A timed-out callback may continue running in the background;
+keep callbacks fast and give their I/O its own timeout.
+
+**Privacy:** `text` carries raw user text, including any private content or
+secrets supplied in the steer. It is not redacted. Avoid logging or exporting
+it without appropriate consent and handling.
+
+This is an insertion receipt, not proof of provider acceptance or durable
+exactly-once persistence under process death. Use it for delivery-time input
+capture rather than inferring fresh input from transcript rows.
 
 ---
 
