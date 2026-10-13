@@ -333,6 +333,39 @@ def test_malformed_secondary_cannot_evict_recorded_member(admission_env, monkeyp
 
 
 @pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
+def test_update_sync_cannot_evict_bundled_memory_provider(admission_env, monkeypatch):
+    """A bundled provider stays configured when its dependency resolution fails.
+
+    Release-owned providers must fail the update loudly rather than letting the
+    eviction transaction clear ``memory.provider`` and silently disable memory.
+    """
+    from pm.install import sync_venv
+    from pm.package import InstallError
+
+    tmp_path, home = admission_env
+    core = tmp_path / "core"
+    monkeypatch.setenv("UV_HTTP_RETRIES", "0")
+    provider = core / "plugins" / "memory" / "bundled-provider"
+    provider.mkdir(parents=True)
+    (provider / "__init__.py").write_text("", encoding="utf-8")
+    (provider / "plugin.yaml").write_text("name: bundled-provider\n", encoding="utf-8")
+    (provider / "pyproject.toml").write_text(
+        '[project]\nname="bundled-provider"\nversion="1"\nrequires-python=">=3.11"\n'
+        'dependencies=["gone"]\n[tool.uv]\npackage=false\n'
+        '[tool.uv.sources]\ngone = { url = "https://127.0.0.1:9/gone-1.0-py3-none-any.whl" }\n',
+        encoding="utf-8",
+    )
+    _write_enabled(home, [], provider="bundled-provider")
+
+    with pytest.raises(InstallError, match="bundled memory provider"):
+        sync_venv(explicit=True, evict_incompatible_plugins=True)
+
+    cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["memory"]["provider"] == "bundled-provider"
+    assert "bundled-provider" not in cfg.get("plugins", {}).get("disabled", [])
+
+
+@pytest.mark.skipif(not _uv_available(), reason="uv not on PATH")
 def test_update_sync_disables_plugin_excluded_by_requires_python(admission_env):
     """An update never fails because of a plugin: a member whose requires-python excludes the
     interpreter core now runs on is disabled in every home that enables it (plugins.enabled in

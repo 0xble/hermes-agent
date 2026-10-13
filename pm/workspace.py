@@ -200,7 +200,7 @@ def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,
                 plugin_dir = provider_directory(plugins_dir.parent, name, installing=installing)
                 if plugin_dir is not None:
                     entries.append((plugins_dir, name, plugin_dir))
-                continue
+                    continue
             plugin_dir = plugins_dir / relative
             proposed = installing is not None and plugin_dir.resolve() == installing.resolve()
             if not proposed and not _is_directory(plugin_dir):

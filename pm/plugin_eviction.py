@@ -33,6 +33,14 @@ from pm.package import InstallError
 Entry = tuple[Path, str, Path]  # (home plugins dir, selection key, plugin dir)
 
 
+def _is_bundled_provider(entry: Entry) -> bool:
+    """Release-owned memory providers are never candidates for update eviction."""
+    _plugins_dir, name, plugin_dir = entry
+    from pm.paths import repo_root
+
+    return plugin_dir.resolve() == (repo_root() / "plugins" / "memory" / name).resolve()
+
+
 def _interpreter_version() -> str:
     """The Python the generation is built for; a plugin's requires-python is judged against it."""
     from pm._uv import _toolchain
@@ -82,6 +90,13 @@ class PluginEviction:
         from pm.publication import selection_snapshot
 
         self.configs = selection_snapshot()
+        for plugins_dir, name, plugin_dir in entries:
+            reason = reasons.get(plugin_dir.resolve())
+            if reason and _is_bundled_provider((plugins_dir, name, plugin_dir)):
+                raise InstallError(
+                    "venv",
+                    f"bundled memory provider '{name}' cannot be evicted: {reason}",
+                )
         by_home: dict[Path, list[str]] = {}
         for plugins_dir, name, plugin_dir in entries:
             if plugin_dir.resolve() in reasons:
@@ -160,6 +175,17 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
             notices.append(f"Skipped the plugins of profile {home}: {exc}; they rejoin once its config.yaml is fixed")
     entries = enabled_plugin_entries(skip_invalid_secondary=True)
     reasons, waiting = static_verdicts(entries, _interpreter_version())
+    bundled_static: list[tuple[str, str]] = []
+    for entry in entries:
+        reason = reasons.get(entry[2].resolve())
+        if reason and _is_bundled_provider(entry):
+            bundled_static.append((entry[1], reason))
+    if bundled_static:
+        name, reason = bundled_static[0]
+        raise InstallError(
+            "venv",
+            f"bundled memory provider '{name}' cannot be evicted: {reason}",
+        )
 
     def members() -> list[Path]:
         return list(dict.fromkeys(plugin_dir for _plugins_dir, _name, plugin_dir in entries
@@ -191,6 +217,12 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
         for member in kept:
             reason = _trial(package, enabled, explicit, [*fitting, member])
             if reason:
+                entry = next(entry for entry in entries if entry[2].resolve() == member.resolve())
+                if _is_bundled_provider(entry):
+                    raise InstallError(
+                        "venv",
+                        f"bundled memory provider '{entry[1]}' cannot be evicted: {reason}",
+                    )
                 reasons[member.resolve()] = reason
             else:
                 fitting.append(member)
