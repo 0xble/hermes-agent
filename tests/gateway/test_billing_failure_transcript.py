@@ -71,14 +71,22 @@ async def test_long_session_billing_400_persists_and_does_not_auto_reset(long_se
     runner.async_session_store.reset_session.assert_not_awaited()
 
 
-@pytest.mark.parametrize("reason", ["billing", "auth", "rate_limit", "content_policy_blocked", "format_error"])
+@pytest.mark.parametrize("reason", ["billing", "auth", "rate_limit", "content_policy_blocked"])
 def test_classified_nonoverflow_400_overrides_long_history_heuristic(reason):
     assert not is_context_overflow_failure_result(
         {"failed": True, "failure_reason": reason, "error": "HTTP 400 invalid request"}, 100,
     )
 
 
-@pytest.mark.parametrize("reason", [None, "unknown", "context_overflow"])
+
+
+def test_format_error_keeps_large_400_growth_guard():
+    assert is_context_overflow_failure_result(
+        {"failed": True, "failure_reason": "format_error", "error": "HTTP 400 invalid request"}, 100,
+    )
+
+
+@pytest.mark.parametrize("reason", [None, "unknown", "context_overflow", "payload_too_large", "long_context_tier"])
 def test_unclassified_and_genuine_overflow_keep_the_growth_loop_guard(reason):
     assert is_context_overflow_failure_result(
         {"failed": True, "failure_reason": reason, "error": "HTTP 400 request too large"}, 100,

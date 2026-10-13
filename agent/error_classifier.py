@@ -67,17 +67,42 @@ class FailoverReason(enum.Enum):
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 
-def is_context_overflow_reason(reason: Any, *, unclassified_overflow: bool = False) -> bool:
-    """Use the authoritative failure reason, retaining the growth guard only when unclassified.
+_OVERFLOW_REASONS = frozenset({
+    FailoverReason.context_overflow.value,
+    FailoverReason.payload_too_large.value,
+    FailoverReason.long_context_tier.value,
+})
+# These verdicts are intrinsically about the account, credential, provider policy, or request
+# content rather than the size of the transcript. Every other explicit verdict stays eligible for
+# the historical large-400 heuristic: ``format_error`` is a classifier catch-all, and a provider can
+# use it for an unrecognised context rejection (#1630).
+_NON_OVERFLOW_REASONS = frozenset({
+    FailoverReason.billing.value,
+    FailoverReason.auth.value,
+    FailoverReason.auth_permanent.value,
+    FailoverReason.rate_limit.value,
+    FailoverReason.upstream_rate_limit.value,
+    FailoverReason.content_policy_blocked.value,
+    FailoverReason.provider_policy_blocked.value,
+    FailoverReason.upstream_blocked.value,
+    FailoverReason.model_entitlement.value,
+    FailoverReason.model_not_found.value,
+})
 
-    Both persistence layers use this verdict so billing/account failures cannot be relabelled by
-    message length or HTTP status. Legacy producers without a verdict (or the classifier's
-    ``unknown`` verdict) may pass their old overflow guard via ``unclassified_overflow``.
+
+def is_context_overflow_reason(reason: Any, *, unclassified_overflow: bool = False) -> bool:
+    """Use the authoritative failure reason, retaining the growth guard when it is not decisive.
+
+    Billing/account/provider-policy failures must never be relabelled by message length. Overflow
+    reasons always win, while ``format_error``, ``unknown`` and missing reasons remain eligible for
+    the legacy heuristic because they can conceal an unrecognised provider context rejection.
     """
     value = getattr(reason, "value", reason)
-    if value in (None, FailoverReason.unknown.value):
-        return unclassified_overflow
-    return value == FailoverReason.context_overflow.value
+    if value in _OVERFLOW_REASONS:
+        return True
+    if value in _NON_OVERFLOW_REASONS:
+        return False
+    return unclassified_overflow
 
 
 @dataclass
@@ -983,7 +1008,7 @@ def _proxy_upstream_verdict(c: _Ctx) -> Optional[Verdict]:
     if not marker:
         return None
     if any(pattern in upstream for pattern in _BILLING_PATTERNS):
-        return _V_BILLING
+        return _billing_hints(upstream)
     if "rate_limit_error" in upstream:
         return _V_RATE_LIMIT
     return None

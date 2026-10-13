@@ -1940,7 +1940,10 @@ def route_classified_error(
             False if classified.reason == FailoverReason.upstream_rate_limit or _provider_wide_overload
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
-        if not pool_may_recover:
+        if not pool_may_recover and agent._fallback_index >= len(agent._fallback_chain):
+            # With no fallback candidate, arm here; otherwise try_activate_fallback owns the
+            # single arm after honoring min_switch_reset_seconds. Arming in both places doubled
+            # the shared backoff when its durable write failed.
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at)
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect

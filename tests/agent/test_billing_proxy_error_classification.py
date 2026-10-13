@@ -20,7 +20,7 @@ class _ProxyError(Exception):
 @pytest.mark.parametrize(
     ("upstream", "reason"),
     [
-        ("invalid_request_error: Your credit balance is too low to access the Anthropic API", FailoverReason.billing),
+        ("invalid_request_error: You're out of extra usage", FailoverReason.billing),
         ("rate_limit_error: This request would exceed your account's rate limit", FailoverReason.rate_limit),
     ],
 )
@@ -33,6 +33,9 @@ def test_proxy_auth_unavailable_uses_named_upstream_reason(status, upstream, rea
     assert classified.reason is reason
     assert classified.should_fallback is True
     assert classified.retryable is (reason is FailoverReason.rate_limit)
+    if "out of extra usage" in upstream:
+        assert classified.error_context["billing_unverified"] is True
+        assert classified.error_context["possible_content_filter"] is True
 
 
 @pytest.mark.parametrize(
@@ -77,7 +80,7 @@ class _Agent:
 @pytest.mark.parametrize(
     "reason",
     [FailoverReason.billing, FailoverReason.auth, FailoverReason.rate_limit,
-     FailoverReason.content_policy_blocked, FailoverReason.format_error],
+     FailoverReason.content_policy_blocked],
 )
 def test_classified_nonoverflow_400_persists_a_large_failed_session(reason):
     error = _ProxyError("HTTP 400 rejected request", 400)
