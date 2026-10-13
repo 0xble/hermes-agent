@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,11 @@ MAX_DUMP_BYTES = 1024 * 1024
 
 
 @pytest.mark.parametrize("secret_leaf", ["DB_PASSWORD=abcdef12", "PASS=174"])
-def test_dump_redacts_structurally_and_preserves_json(tmp_path, secret_leaf):
+def test_dump_redacts_structurally_and_preserves_json(tmp_path, monkeypatch, secret_leaf):
+    # The short secret also occurs in harmless timestamp metadata.
+    monkeypatch.setattr("agent.agent_runtime_helpers.datetime", SimpleNamespace(
+        now=lambda: datetime(2026, 10, 13, 3, 11, 55, 617442),
+    ))
     request = {"model": "debug-model", "messages": [{"role": "user", "content": secret_leaf,
                                                        "password": "hunter2"}]}
     original = copy.deepcopy(request)
@@ -24,9 +29,28 @@ def test_dump_redacts_structurally_and_preserves_json(tmp_path, secret_leaf):
     serialized = path.read_text(encoding="utf-8")
     payload = json.loads(serialized)
     assert payload["request"]["body"]["messages"][0]["content"].startswith(secret_leaf.split("=")[0])
-    assert secret_leaf.split("=")[1] not in serialized
-    assert "hunter2" not in serialized
+    serialized_request = json.dumps(payload["request"])
+    assert secret_leaf.split("=")[1] not in serialized_request
+    assert "hunter2" not in serialized_request
     assert request == original
+
+
+@pytest.mark.parametrize("leaked_field", ["content", "password"])
+def test_redaction_check_rejects_real_leaks_despite_timestamp_collision(tmp_path, monkeypatch, leaked_field):
+    real_dump = dump_api_request_debug
+
+    def leaking_dump(agent, request, **kwargs):
+        path = real_dump(agent, request, **kwargs)
+        assert path is not None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["request"]["body"]["messages"][0][leaked_field] = request["messages"][0][leaked_field]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    with monkeypatch.context() as patch:
+        patch.setattr(__name__ + ".dump_api_request_debug", leaking_dump)
+        with pytest.raises(AssertionError):
+            test_dump_redacts_structurally_and_preserves_json(tmp_path, patch, "PASS=174")
 
 
 @pytest.mark.platforms("posix")

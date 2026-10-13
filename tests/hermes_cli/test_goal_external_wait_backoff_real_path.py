@@ -639,8 +639,8 @@ def test_real_tui_followup_dispatch_reaches_goal_followup_as_automatic(hermes_ho
 
 
 @pytest.mark.asyncio
-async def test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan(hermes_home, monkeypatch):
-    """P2: gateway idle delivery sends one wait-age notice and cross-path dedupe holds."""
+async def test_real_gateway_idle_age_recheck_stays_silent_on_due_scans(hermes_home, monkeypatch):
+    """Age-only gateway/evaluator rechecks keep the barrier without routine chatter."""
     from gateway.config import Platform
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
@@ -674,32 +674,32 @@ async def test_real_gateway_idle_age_notice_delivery_dedupes_on_second_due_scan(
     runner._send_goal_status_notice = AsyncMock()
 
     await GatewayRunner._goal_wakeup_fire_one(runner, sid)
-    assert runner._send_goal_status_notice.await_count == 1
-    assert runner._send_goal_status_notice.await_args.kwargs["notice_kind"] == "wait-age"
+    assert runner._send_goal_status_notice.await_count == 0
 
     st = goals.GoalManager(sid).state
     st.barrier_recheck_at = 0.0
     goals.save_goal(sid, st)
     await GatewayRunner._goal_wakeup_fire_one(runner, sid)
-    assert runner._send_goal_status_notice.await_count == 1
+    assert runner._send_goal_status_notice.await_count == 0
 
-    # The evaluator may commit the age notice before the idle scanner gets the row.
+    # Evaluator rechecks preserve the same silent age-only contract.
     sid2, _db2, manager2 = _new_goal()
     manager2.wait_on_session("watcher-evaluator-age", reason="external watcher")
     manager2.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
     manager2.state.barrier_recheck_at = 0.0
     manager2._save()
     decision = manager2.evaluate_after_turn("The user asked for a status.", user_initiated=True)
-    assert "30 minutes" in decision["message"]
+    assert "Goal parked" in decision["message"]
+    assert "30 minutes" not in decision["message"]
     entry.session_id = sid2
     manager2.state.barrier_recheck_at = 0.0
     manager2._save()
     await GatewayRunner._goal_wakeup_fire_one(runner, sid2)
-    assert runner._send_goal_status_notice.await_count == 1
+    assert runner._send_goal_status_notice.await_count == 0
 
 
-def test_real_tui_idle_age_notice_reaches_status_and_dedupes(hermes_home, monkeypatch):
-    """P2: the TUI idle owner emits wait-age through its status surface once."""
+def test_real_tui_idle_age_recheck_stays_silent(hermes_home, monkeypatch):
+    """The TUI idle owner re-arms unchanged waits without a status notification."""
     from hermes_cli import goals
     from tui_gateway import session_notifications
 
@@ -719,11 +719,11 @@ def test_real_tui_idle_age_notice_reaches_status_and_dedupes(hermes_home, monkey
     st.barrier_recheck_at = 0.0
     goals.save_goal(sid, st)
     session_notifications._maybe_resume_tui_parked_goal("tui-age", session)
-    assert len(notices) == 1 and "30 minutes" in notices[0]
+    assert notices == []
 
 
-def test_real_cli_idle_age_notice_reaches_user_and_dedupes(hermes_home, monkeypatch):
-    """P2: the CLI idle owner prints wait-age once, even when a second scan is due."""
+def test_real_cli_idle_age_recheck_stays_silent(hermes_home, monkeypatch):
+    """The CLI idle owner stays silent across repeated age-only rechecks."""
     from hermes_cli import goals
 
     sid, _db, manager = _new_goal()
@@ -741,7 +741,7 @@ def test_real_cli_idle_age_notice_reaches_user_and_dedupes(hermes_home, monkeypa
         cli._last_goal_barrier_check = 0.0
         cli._maybe_resume_parked_goal()
     age_lines = [call.args[0] for call in cprint.call_args_list if "30 minutes" in call.args[0]]
-    assert len(age_lines) == 1
+    assert age_lines == []
 
 
 def test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks(hermes_home, monkeypatch):
@@ -757,7 +757,7 @@ def test_real_exited_after_rearm_lifts_only_after_live_barrier_rechecks(hermes_h
 
     now = 1000.0 + goals._MAX_BARRIER_WAIT_S + 1
     with patch.object(goals.time, "time", return_value=now):
-        assert manager.rearm_live_barrier() is not None
+        assert manager.rearm_live_barrier() is None
     assert manager.state.barrier_rearms > 0
     assert manager.state.barrier_recheck_at > now
     assert manager.lifted_barrier_prompt() is None
@@ -824,10 +824,10 @@ def test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early(
             delegation._records.pop(record_id, None)
 
 
-def test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user(
+def test_real_judge_wait_then_evaluator_age_recheck_stays_silent(
     hermes_home, monkeypatch, capsys,
 ):
-    """P2: a judge WAIT followed by an aged user turn must emit the 30-minute notice."""
+    """An aged user turn keeps its normal reply; the unchanged wait adds no chatter."""
     from hermes_cli import goals
 
     sid, _db, manager = _new_goal()
@@ -852,16 +852,16 @@ def test_real_judge_wait_then_evaluator_age_notice_reaches_cli_user(
     cli._maybe_continue_goal_after_turn()
 
     output = capsys.readouterr().out
-    assert "30 minutes" in output
+    assert "30 minutes" not in output
     assert len(calls) == 1
     aged = goals.GoalManager(sid).state
     assert aged is not None and aged.last_age_notice_key
 
 
-def test_real_judge_wait_then_idle_rearm_delivers_age_notice(
+def test_real_judge_wait_then_idle_rearm_keeps_age_only_silent(
     hermes_home, monkeypatch,
 ):
-    """The idle barrier entry point emits the same notice when no user turn arrives."""
+    """The idle barrier re-arms durably without adding an unchanged-state notice."""
     from hermes_cli import goals
 
     sid, _db, manager = _new_goal()
@@ -875,8 +875,7 @@ def test_real_judge_wait_then_idle_rearm_delivers_age_notice(
     monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: True)
 
     notice = goals.GoalManager(sid).rearm_live_barrier()
-    assert notice is not None
-    assert "30 minutes" in notice
+    assert notice is None
     assert goals.GoalManager(sid).state.last_age_notice_key
 
 
@@ -899,7 +898,7 @@ def test_real_judge_wait_rearms_live_barrier_at_five_fifteen_and_thirty_minutes(
     monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: True)
 
     with patch.object(goals.time, "time", return_value=1000.0 + goals._MAX_BARRIER_WAIT_S + 1):
-        assert goals.GoalManager(sid).rearm_live_barrier()
+        assert goals.GoalManager(sid).rearm_live_barrier() is None
     state = goals.GoalManager(sid).state
     assert state.barrier_recheck_at == pytest.approx(1000.0 + goals._MAX_BARRIER_WAIT_S + 1 + 5 * 60)
 

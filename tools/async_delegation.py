@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
+from tools.async_delegation_completion import durable_status, reconcile_checkpoint, recovered_children, sync_completion_payload
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _DEFAULT_MAX_QUEUED_DELEGATIONS = 0
 # Completed records retained (in memory and in the ledger) for status queries.
 _MAX_RETAINED_COMPLETED = 50
+# Restart-cut/retry rows are protected from the ordinary terminal-history cap, but
+# a pathological stream must still have a bounded footprint.
+_MAX_RETAINED_RESUMABLE = 500
+_PRUNE_ID_LOG_LIMIT = 8
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 # Rows delegation_resume would still accept for an explicit resume (owner present,
@@ -89,10 +94,14 @@ _MAX_DURABLE_PENDING = 1000
 # A row the retry engine still owes an outcome (pending retry, claimed dispatch,
 # unreported terminal line) is exempt regardless of age; budgets bound how long
 # that lasts. A legacy explicit-resume claim no longer drops protection either:
-# that is how a claimed row was pruned mid-recovery (deleg_a11d4b48).
-_RETRY_OWED_SQL = "(retry_state IN ('armed','scheduled','noticing','notified','dispatching','terminal','reporting'))"
+# that is how a claimed row was pruned mid-recovery (deleg_a11d4b48). Boot-notice
+# claims likewise belong to their owner until completed or released, not retention.
+_RETENTION_OWED_SQL = """(
+    retry_state IN ('armed','scheduled','noticing','notified','dispatching','terminal','reporting')
+    OR auto_resume_state='claimed'
+)"""
 _RESUMABLE_RETENTION_SQL = """(
-    """ + _RETRY_OWED_SQL + """
+    """ + _RETENTION_OWED_SQL + """
     OR (state IN ('unknown','interrupted','stalled')
         AND (COALESCE(parent_session_id, '') != '' OR COALESCE(origin_session_id, '') != '')
         AND updated_at >= ?)
@@ -325,32 +334,74 @@ def _durable_state(delegation_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _log_pruned_ids(kind: str, ids: List[str]) -> None:
+    """Make retention decisions auditable without dumping a whole high-churn ledger."""
+    if ids:
+        shown = ids[:_PRUNE_ID_LOG_LIMIT]
+        suffix = "..." if len(ids) > len(shown) else ""
+        logger.info("Pruned async delegation %s rows: count=%d ids=%s%s",
+                    kind, len(ids), ",".join(shown), suffix)
+
+
 def _prune_durable_records() -> None:
     """Bound terminal history without deleting rows still eligible for recovery.
 
-    Delivered rows go first, then unsuccessful ones; an undelivered (pending)
-    completion is the parent's only copy of a child result, so it goes last.
+    Restart-cut/retry rows are exempt from the ordinary history cap and have a
+    separate hard ceiling; pending completions are bounded last.
     """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
-    # Classify finished-but-unclassified rows first so a plain success stops being "owed".
     from tools.delegation_resume import classify_armed
     classify_armed()
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(f"""DELETE FROM async_delegations WHERE delivery_state IN ('delivered','superseded')
-                         AND updated_at < ? AND NOT {_RETRY_OWED_SQL}""", (cutoff,))
-        # Count only rows the cap may delete: protected retry/resume rows and undelivered results (bounded
-        # separately below) must never be displaced by history pruning.
-        terminal_count = conn.execute(
-            f"""SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)).fetchone()[0]
-        if terminal_count > _MAX_RETAINED_COMPLETED:
-            conn.execute(f"""DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                       AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
-                   )""", (cutoff, terminal_count - _MAX_RETAINED_COMPLETED))
+        old_ids = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?
+                  AND NOT {_RETENTION_OWED_SQL}""", (cutoff,))]
+        if old_ids:
+            marks = ",".join("?" for _ in old_ids)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", old_ids)
+            _log_pruned_ids("expired", old_ids)
+
+        ordinary_count = conn.execute(
+            f"""SELECT COUNT(*) FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+        ).fetchone()[0]
+        ordinary = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
+                ORDER BY CASE delivery_state
+                           WHEN 'superseded' THEN 0
+                           WHEN 'delivered' THEN 1
+                           ELSE 2
+                         END,
+                         updated_at ASC, delegation_id ASC
+                LIMIT ?""", (cutoff, max(0, ordinary_count - _MAX_RETAINED_COMPLETED))
+        )]
+        if ordinary:
+            marks = ",".join("?" for _ in ordinary)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", ordinary)
+            _log_pruned_ids("ordinary-cap", ordinary)
+
+        protected_count = conn.execute(
+            f"""SELECT COUNT(*) FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+        ).fetchone()[0]
+        protected = [row[0] for row in conn.execute(
+            f"""SELECT delegation_id FROM async_delegations
+                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
+                  AND {_RESUMABLE_RETENTION_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}
+                ORDER BY updated_at ASC, delegation_id ASC
+                LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
+        )]
+        if protected:
+            marks = ",".join("?" for _ in protected)
+            conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", protected)
+            _log_pruned_ids("resumable-cap", protected)
+
         pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
                WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'""").fetchone()[0]
         if pending_count > _MAX_DURABLE_PENDING:
@@ -358,18 +409,17 @@ def _prune_durable_records() -> None:
             evict = [r[0] for r in conn.execute(f"""SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'
                        AND NOT {_RESUMABLE_RETENTION_SQL}
-                     ORDER BY updated_at ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
+                     ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
             marks = ",".join("?" for _ in evict)
             if evict:
-                # A gateway success still owes the user one line: convert it to an owed terminal notice
-                # (kept by _RETRY_OWED_SQL) instead of deleting its only record.
                 conn.execute(f"""UPDATE async_delegations SET delivery_state='dropped', retry_state='terminal',
                                  retry_reason=?, retry_due_at=NULL, updated_at=?
                                  WHERE delegation_id IN ({marks}) AND retry_state='none'
-                                   AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})""",
+                                   AND retry_reason IN ({','.join('?' for _ in SUCCESS_REASONS)})""",
                              (RESULT_UNDELIVERABLE, time.time(), *evict, *SUCCESS_REASONS))
-                conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETRY_OWED_SQL}",
+                conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETENTION_OWED_SQL}",
                              evict)
+                _log_pruned_ids("pending-cap", evict)
         conn.execute(
             """DELETE FROM async_delegation_events
                WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?""",
@@ -385,6 +435,8 @@ def _persist_completion(
     now = time.time()
     expected_state = expected_state or event.get("expected_state") or "queued"
     with _DB_LOCK, _transaction() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        reconcile_checkpoint(conn, event, result, expected_state)
         changed = conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state=?
                WHERE delegation_id=? AND state=?""",
@@ -448,11 +500,14 @@ def _persist_outbox_event(
     delivery identity.
     """
     event_id = _outbox_event_id(event, event_kind)
-    persisted = dict(event)
-    persisted["_delivery_event_id"] = event_id
     now = time.time()
-    result_json = json.dumps(result) if result is not None else None
     with _DB_LOCK, _transaction() as conn:
+        if terminal_status is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            terminal_status = reconcile_checkpoint(conn, event, result, expected_state or "running", terminal_status)
+        persisted = dict(event)
+        persisted["_delivery_event_id"] = event_id
+        result_json = json.dumps(result) if result is not None else None
         conn.execute(
             """INSERT OR IGNORE INTO async_delegation_events
                (event_id, delegation_id, event_kind, event_json, result_json, created_at, updated_at)
@@ -631,12 +686,12 @@ def _outbox_delivery_rows(conn):
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
-    """Durably record ONE finished child of a still-running multi-child unit on the unit's own row, so a crash before
-    the unit joins loses only the children that had not finished. Stored in ``result_json`` (overwritten by the real
-    result at finalize); ``recover_abandoned_delegations`` replays it. Best-effort: a failed write costs recovery
-    fidelity, never the live result."""
+    """Checkpoint one finished child on the running unit's own row. The terminal owner reconciles
+    ``result_json`` before claiming completion; abandoned-unit recovery also replays it.
+    Best-effort: a failed write costs recovery fidelity, never the live result."""
     try:
         with _DB_LOCK, _transaction() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state='running'",
                                (delegation_id,)).fetchone()
             if row is None:
@@ -648,17 +703,6 @@ def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
                          (json.dumps({"results": results, "partial": True}), time.time(), delegation_id))
     except Exception:  # noqa: BLE001 — recovery bookkeeping must never fail a live child
         logger.warning("Async delegation %s: could not record finished child %s", delegation_id, entry.get("task_index"), exc_info=True)
-
-
-def _recovered_results(task: Dict[str, Any], result_json: Optional[str], error: str) -> Optional[List[Dict[str, Any]]]:
-    """Per-task results for an abandoned unit: recorded children as they finished, the rest ``unknown``."""
-    partial = json.loads(result_json or "{}") or {}
-    # One-child units record too (their whole pre-finalize window), so replay them, not just batches.
-    if not (partial.get("partial") and partial.get("results")):
-        return None
-    recorded = {r["task_index"]: r for r in partial["results"] if isinstance(r.get("task_index"), int)}
-    indexes = task.get("task_indexes") or list(range(max(1, len(task.get("goals") or []))))
-    return [recorded.get(i) or {"task_index": i, "status": "unknown", "summary": None, "error": error} for i in indexes]
 
 
 def _owner_liveness() -> Optional[Callable[[Any, Any], bool]]:
@@ -764,7 +808,7 @@ def recover_abandoned_delegations() -> int:
             error = ("Cron execution record missing; outcome unknown."
                      if cron_execution_id else
                      "No terminal result was recorded; outcome unknown.")
-            recovered_results = _recovered_results(task, result_json, error)
+            recovered_results = recovered_children(task, result_json, error)
             if recovered_results:
                 done = sum(1 for r in recovered_results if r.get("status") != "unknown")
                 error = (f"The unit did not finish; {done}/{len(recovered_results)} child "
@@ -946,8 +990,8 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    return _update_delivery(
-        """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
+    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
+                   delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
 
 
@@ -1010,7 +1054,7 @@ def _resolve_terminal_ownership(evt: Dict[str, Any], meta: Dict[str, Any]) -> st
     disposition = _reconcile_terminal_write(event, result, expected, persisted)
     if disposition == "active":
         try:
-            _persist_outbox_event(dict(event), result, event_kind="terminal_fallback",
+            _persist_outbox_event(event, result, event_kind="terminal_fallback",
                                   terminal_status=meta["terminal_status"], expected_state=expected)
             return "outbox"
         except Exception as exc:  # noqa: BLE001 — lost the CAS, or committed before raising
@@ -1051,6 +1095,13 @@ def resolve_event_ownership(evt: Dict[str, Any]) -> bool:
         logger.error("Async delegation %s: unproven terminal result lost ownership to a competing "
                      "result; permanently rejecting it", evt.get("delegation_id"))
         return False
+    sync_completion_payload(evt, meta["event"])
+    with _records_lock:
+        live = _records.get(evt.get("delegation_id"))
+        if live and live.get("status") in {*_TERMINAL_STATES, "finalizing"} and hermes_home_key(_record_context_run(live, get_hermes_home)) == hermes_home_key(meta["home"]):
+            live.update(_completion_status=evt["status"], _terminal_state=durable_status(evt, meta["terminal_status"]))
+            if live["status"] != "finalizing":
+                live.update(status=live["_completion_status"], _durable_state=live["_terminal_state"])
     evt.pop(_TERMINAL_OWNERSHIP_KEY, None)
     return True
 
@@ -1139,8 +1190,7 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return _update_outbox_delivery(event_id, claim_id, "complete")
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
-                  delivered_at=?, updated_at=?, delivery_claim=NULL,
-                  delivery_claimed_at=NULL
+                  delivered_at=?, updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
 
@@ -1992,8 +2042,9 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
     with _records_lock:
         live = _records.get(delegation_id)
         if live is not None:
-            _transition_memory_locked(live, status, expected="finalizing")
-            live["_durable_state"] = live.get("_terminal_state") or status
+            completion = live if live.get("_completion_status") else snapshot
+            _transition_memory_locked(live, completion.get("_completion_status") or status, expected="finalizing")
+            live["_durable_state"] = completion.get("_terminal_state") or status
         _prune_completed_locked()
     # A terminal event does not free a submitted slot; only release_slot does.
 
@@ -2004,6 +2055,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
     must not crash the worker, but it WOULD mean a silently-lost result, so we log loudly."""
     is_batch = bool(record.get("is_batch"))
+    cut_reason = record.get("_cut_reason")
     label = " batch" if is_batch else ""
     try:
         from tools.process_registry import process_registry
@@ -2034,6 +2086,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "context": record.get("context"), "toolsets": record.get("toolsets"), "role": record.get("role"),
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
+        **({"cut_reason": cut_reason} if cut_reason else {}),
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
@@ -2046,6 +2099,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
                                 expected_state=record.get("_durable_state") or "running")
         except Exception as exc:  # noqa: BLE001 — the replacement still reports; only the audit row is lost
             logger.error("Async delegation %s: superseded completion write failed: %s", record.get("delegation_id"), exc)
+        record.update(_terminal_state=durable_status(evt, record.get("_terminal_state") or status), _completion_status=evt["status"])
         logger.info("Async delegation%s %s superseded by %s; completion recorded, not delivered",
                     label, record.get("delegation_id"), record["superseded_by"])
         return
@@ -2059,6 +2113,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.error("Async delegation%s %s: durable terminal row write failed; reconciling fallback ownership: %s",
                      label, record.get("delegation_id"), exc)
         ok = False
+    sync_completion_payload(evt, persist_evt)
     queue_event = ok
     if not ok:
         def reconcile():
@@ -2104,6 +2159,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         if not queue_event:
             logger.error("Async delegation %s terminal fallback lost ownership to a competing result",
                          record.get("delegation_id"))
+    record.update(_terminal_state=durable_status(evt, terminal_status), _completion_status=evt["status"])
     if queue_event:
         if not evt.get(_TERMINAL_OWNERSHIP_KEY):
             _record_context_run(record, _attach_retry_note, evt)
@@ -2503,6 +2559,10 @@ def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, 
                 interrupt_fn = None
             else:
                 interrupt_fn = live.get("interrupt_fn")
+                if caller == "interrupt_all":
+                    # A signal is only a cut request. A runner that finishes
+                    # successfully before returning must keep its completed result.
+                    live["_cut_reason"] = reason
         if persist_wait is not None:
             persist_wait.wait(30)
             count += _interrupt_records([record], caller, reason, msg, affected_ids)

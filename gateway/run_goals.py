@@ -42,6 +42,8 @@ def _goal_notice_kind(message: str) -> str:
         return "continuing"
     if text.startswith("✓"):
         return "achieved"
+    if text.startswith("✗"):
+        return "failed"
     if text.startswith("▶"):
         return "wait-ended" if "wait ended" in lowered else "resumed"
     if text.startswith("⏸"):
@@ -51,6 +53,21 @@ def _goal_notice_kind(message: str) -> str:
     if "wait ended" in lowered:
         return "wait-ended"
     return "status"
+
+
+def _goal_notice_outbound_class(message: str, notice_kind: Optional[str] = None) -> str:
+    """Protect outcomes/control receipts, not routine automatic status chatter.
+
+    Infer the actual outcome before a caller hint: an idle lifetime-ceiling pause
+    arrives on the same wait-age path as a routine recheck. Retries use this same
+    classification after the first send's context exits.
+    """
+    from gateway.platforms.base import OUTBOUND_FINAL, OUTBOUND_NOTICE
+
+    kind = _goal_notice_kind(message)
+    if kind == "status":
+        kind = notice_kind or kind
+    return OUTBOUND_FINAL if kind in {"achieved", "blocked", "paused", "failed", "resumed"} else OUTBOUND_NOTICE
 
 
 class GatewayGoalsMixin:
@@ -317,9 +334,9 @@ class GatewayGoalsMixin:
                 )
                 return
             try:
-                from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
-                # The retry task runs after the first send's label exited: re-label it as a notice.
-                with outbound_class(OUTBOUND_NOTICE):
+                from gateway.platforms.base import outbound_class
+                # The retry task runs after the first send's class context exited.
+                with outbound_class(_goal_notice_outbound_class(message, notice_kind)):
                     result = await adapter.send(source.chat_id, message, metadata=metadata)
             except Exception as exc:
                 error = exc
@@ -350,9 +367,9 @@ class GatewayGoalsMixin:
         metadata = None
         with suppress(Exception):
             metadata = self._thread_metadata_for_source(source)
-        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        from gateway.platforms.base import outbound_class
         try:
-            with outbound_class(OUTBOUND_NOTICE):
+            with outbound_class(_goal_notice_outbound_class(message, notice_kind)):
                 result = await adapter.send(source.chat_id, message, metadata=metadata)
         except Exception as exc:
             error = exc

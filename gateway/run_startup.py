@@ -23,6 +23,7 @@ from agent.i18n import t
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
+from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -74,7 +75,7 @@ def recover_left_core_at_gateway_start() -> None:
         recover_left_core_in(root)
 
 
-class GatewayStartupMixin:
+class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
 
     @staticmethod
@@ -654,7 +655,7 @@ class GatewayStartupMixin:
             logger.debug("Restart-note snapshot failed for recovered %s", session_key, exc_info=True)
             return None
 
-    async def _redeliver_claimed_obligations(self, claimed: list) -> int:
+    async def _redeliver_claimed_obligations(self, claimed: list, *, runtime_settlement=None) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
@@ -666,7 +667,7 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
-        blocked_chats: dict = {}
+        blocked_chats = runtime_settlement.blocked_chats if runtime_settlement is not None else {}
         for row in claimed:
             # Ordering is per bot identity: one bot's refusal never holds another bot's messages.
             chat_key = (row.get("platform"), row.get("profile") or "default", row.get("chat_id"), row.get("thread_id"))
@@ -695,6 +696,13 @@ class GatewayStartupMixin:
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else {}
             payloads = [(content, metadata)] if content.strip() else []
             payloads.extend((block, {**metadata, "copy_block": True, "plain": True}) for block in copy_blocks)
+            if runtime_settlement is not None and runtime_settlement.cancelled:
+                # Cancellation during adapter/note admission must not begin a send.
+                await self._release_runtime_claim_quiet(
+                    row["obligation_id"], "failed to release cancelled runtime delivery claim %s",
+                    error=row.get("last_error") or "send_path_degraded",
+                )
+                continue
             result = None
             for payload, payload_metadata in payloads:
                 try:
@@ -729,8 +737,9 @@ class GatewayStartupMixin:
                     )
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
-        with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
-            await self._arm_flood_timers_for_waiting_rows()
+        if runtime_settlement is None:
+            with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
+                await self._arm_flood_timers_for_waiting_rows()
         return redelivered
 
     async def _obligation_adapter(self, row: dict):
@@ -766,35 +775,6 @@ class GatewayStartupMixin:
         calls the halves separately so the DB half runs inline before the abandonable send task."""
         return await self._redeliver_claimed_obligations(await self._claim_pending_obligations())
 
-    async def _redeliver_failed_obligations_for_platform(
-        self, platform: Platform, *, profile: Optional[str] = None,
-    ) -> int:
-        """Replay one adapter identity's transient failures after reconnect: the startup sweep cannot
-        claim live-owner rows, so ``send_path_degraded`` responses would otherwise stay failed until
-        the next restart. Best-effort; reuses the startup redelivery contract."""
-        try:
-            from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
-            if not await asyncio.to_thread(ledger_enabled):
-                return 0
-            claimed = await asyncio.to_thread(sweep_failed_for_runtime, platform.value, profile=profile)
-        except Exception:
-            logger.debug(
-                "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
-            )
-            return 0
-        if not claimed:
-            return 0
-        # Clear before any send so the reconnect path cannot both redeliver AND resume the same turn.
-        sendable = await self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
-        sendable_ids = {row["obligation_id"] for row in sendable}
-        for row in claimed:
-            if row["obligation_id"] not in sendable_ids:
-                await self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
-                    error=row.get("last_error") or "send_path_degraded",
-                )
-        return await self._redeliver_claimed_obligations(sendable)
-
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
@@ -812,12 +792,29 @@ class GatewayStartupMixin:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
         # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending).
+        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending). A pending
+        # /restart marker, or a planned service-restart marker requested within one chain gap, identifies
+        # the predecessor as intentional (``.restart_pending.json`` outlives later crashes while a home
+        # channel is unreachable, so an old one proves nothing). The guard gives one such restart a
+        # chain-local allowance, then counts repeated planned restarts so an auto-resumed agent cannot
+        # evade the breaker by calling request_restart forever.
         if candidates and record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
+                from gateway.run import (
+                    _planned_restart_notification_path,
+                    _planned_restart_notification_pending,
+                    _restart_notification_pending,
+                )
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window, max_gap_seconds=_max_gap):
+                _planned_restart = _restart_notification_pending() or (
+                    _planned_restart_notification_pending() and _rlg.planned_marker_is_recent(
+                        _planned_restart_notification_path(), window_seconds=_window, max_gap_seconds=_max_gap,
+                    )
+                )
+                if _rlg.check_and_record(
+                    _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
+                ):
                     return None
             except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
                 logger.debug("Restart-loop guard check skipped: %s", exc)
