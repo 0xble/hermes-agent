@@ -1,11 +1,30 @@
+import json
+import time
+
 import pytest
 
+from tools import async_delegation as ad
 from tools.process_registry_notifications import _format_async_delegation
+
+
+@pytest.fixture(autouse=True)
+def ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+
+
+def _format_recorded_cut(evt):
+    """Rendering a resume promise requires the durable row the producer writes."""
+    ad._persist_dispatch({**evt, "session_key": "", "parent_session_id": "owner",
+                          "dispatched_at": time.time(), "role": "leaf", "model": "m"})
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET state='interrupted', event_json=?, result_json=? "
+                     "WHERE delegation_id=?", (json.dumps(evt), json.dumps(evt), evt["delegation_id"]))
+    return _format_async_delegation(evt)
 
 
 @pytest.mark.parametrize("goals", [None, ["recover this task"]])
 def test_scalar_cut_notice_uses_task_wording(goals):
-    text = _format_async_delegation({
+    text = _format_recorded_cut({
         "type": "async_delegation", "delegation_id": "deleg_scalar_notice",
         "goal": "recover this task", "status": "interrupted", "is_batch": bool(goals), "goals": goals,
         "completed_at": 1_760_000_000.0, "cut_reason": "gateway shutdown (restart)",
@@ -22,7 +41,7 @@ def test_scalar_cut_notice_uses_task_wording(goals):
 ])
 @pytest.mark.parametrize("batch", [False, True])
 def test_explicit_user_stop_cut_notice_has_no_resume_or_gateway_restart(cut_reason, expected_detail, batch):
-    text = _format_async_delegation({
+    text = _format_recorded_cut({
         "type": "async_delegation", "delegation_id": "deleg_user_stop_notice",
         "is_batch": batch, "goal": "2 parallel subagents" if batch else "first",
         "goals": ["first", "second"] if batch else [],
@@ -42,7 +61,7 @@ def test_explicit_user_stop_cut_notice_has_no_resume_or_gateway_restart(cut_reas
                                         "gateway shutdown (final-cleanup)"])
 @pytest.mark.parametrize("batch", [False, True])
 def test_gateway_lifecycle_cut_notice_remains_recoverable(cut_reason, batch):
-    text = _format_async_delegation({
+    text = _format_recorded_cut({
         "type": "async_delegation", "delegation_id": "deleg_lifecycle_notice",
         "is_batch": batch, "goal": "2 parallel subagents" if batch else "first",
         "goals": ["first", "second"] if batch else [],
@@ -50,11 +69,17 @@ def test_gateway_lifecycle_cut_notice_remains_recoverable(cut_reason, batch):
         "status": "interrupted", "cut_reason": cut_reason, "completed_at": 1_760_000_000.0,
     })
     assert "action='resume'" in text
-    assert "gateway shutdown/lifecycle" in text or "gateway restart" in text
+    if cut_reason in {"cli shutdown", "oneshot shutdown", "stopped before finishing"}:
+        assert "Cut by CLI exit" in text
+        assert "gateway" not in text.lower()
+    elif cut_reason.startswith("gateway"):
+        assert "Cut by gateway shutdown/lifecycle" in text
+    else:
+        assert "Cut by lifecycle shutdown" in text
 
 
 def test_cut_batch_notice_has_fixed_resume_block():
-    text = _format_async_delegation({
+    text = _format_recorded_cut({
         "type": "async_delegation",
         "delegation_id": "deleg_cut_notice",
         "is_batch": True,

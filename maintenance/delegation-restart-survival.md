@@ -44,7 +44,9 @@ result/transcript evidence for conservative recovery through the durable retry e
 
 - Only real fan-outs (`len(goals) > 1`) use `async_delegation_child_recovery`.
   One-goal background rows still have `is_batch=True`, but retain the scalar
-  `goal` plus `recovery_context` replacement contract.
+  `goal` plus `recovery_context` replacement contract. On the legacy TUI/API/CLI
+  path, one unfinished child result does not turn the unit into a fan-out or a
+  partial-success refusal; a successfully completed child remains ineligible.
 - A fan-out resume returns a `tasks` list containing only unfinished, unconsumed
   children. Recorded successes are never re-dispatched. Contexts carry sibling
   outcomes, transcript evidence, and an instruction to verify external/workspace
@@ -58,8 +60,12 @@ result/transcript evidence for conservative recovery through the durable retry e
   INSERT transaction, not just when the parent claims a brief.
 - Non-cut retries use the existing bounded retry notices and grace windows.
   Fan-out notices instruct the parent to spawn the returned `tasks` list.
-- A gateway lifecycle cut lists unfinished indexes from goals/task_indexes, including
-  children whose result is missing, and gives the exact `action='resume'` command.
+- A lifecycle cut lists unfinished indexes from goals/task_indexes, including
+  children whose result is missing. It gives the exact `action='resume'` command
+  only while the same durable scalar/fan-out/retry admission gates would allow it;
+  missing rows, completed work, spent claims, user stops, and exhausted budgets
+  cannot advertise recovery, including through a previously serialized retry note.
+  CLI exits are labeled as CLI exits, not gateway shutdowns.
   `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
   continuation path, but recovery authority is based on positive evidence of a user
   stop, not on a restart token. Legacy phase-specific gateway-shutdown reasons and
@@ -88,6 +94,8 @@ suites, plus `test_delegation_retry.py`, `test_delegation_retry_controls.py`,
 `test_delegation_resume*.py`, `test_delegation_restart_resume_flow.py`
 (including the checkpoint-reconciled restart cut that must resume only unfinished
 children), `test_delegation_recovery_admission.py`, `test_restart_cut_notice.py`,
-and canonical state reconciliation tests.
+`test_delegation_scalar_cut_recovery.py` (TUI/API/CLI notice-to-scalar-resume,
+replacement admission, completed-child and spent-claim refusal), and canonical
+state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.

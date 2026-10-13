@@ -246,7 +246,9 @@ def _recovery_lines(evt: dict) -> "list[str]":
 
 
 def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
-    """Render recovery guidance for every lifecycle cut except an explicit user stop."""
+    """Offer cut recovery only when durable admission still permits the claim."""
+    from tools.delegation_resume import resume_available
+
     cut_reason = evt.get("cut_reason")
     if not cut_reason:
         return []
@@ -255,18 +257,32 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
     indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
     recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
     unfinished = [str(index + 1) for index in indexes
-                  if recorded.get(index, {}).get("status") not in _DONE]
-    detail = f"Unfinished children: {', '.join(unfinished)}." if len(goals) > 1 else "The task did not finish."
+                  if str(recorded.get(index, {}).get("status") or "").lower() not in (*_DONE, "succeeded")]
+    if len(goals) > 1:
+        detail = f"Unfinished children: {', '.join(unfinished)}." if unfinished else "No unfinished children."
+    else:
+        detail = "The task did not finish." if unfinished else "The task finished before the cut."
     if _cut_is_user_stop(reason):
         return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
     when = evt.get("completed_at") or time.time()
     stamp = time.strftime("%H:%M", time.localtime(when))
-    label = "gateway restart" if _cut_is_trusted_restart(reason) else "gateway shutdown/lifecycle"
-    return [
-        f"Cut by {label} at {stamp}. {detail}",
-        f"To continue from current state call delegate_task(action='resume', subagent_id='{evt.get('delegation_id', 'unknown')}').",
-        *(["Do not rerun completed children."] if len(goals) > 1 else []),
-    ]
+    label = _cut_label(reason)
+    lines = [f"Cut by {label} at {stamp}. {detail}"]
+    if unfinished and resume_available(evt.get("delegation_id", "")):
+        lines.append(
+            f"To continue from current state call delegate_task(action='resume', subagent_id='{evt['delegation_id']}').")
+    if len(goals) > 1:
+        lines.append("Do not rerun completed children.")
+    return lines
+
+
+def _cut_label(reason: str) -> str:
+    """Preserve the producer identity rather than describing every exit as a gateway cut."""
+    if _cut_is_trusted_restart(reason):
+        return "gateway restart"
+    if reason.casefold() in {"cli shutdown", "oneshot shutdown", "stopped before finishing"}:
+        return "CLI exit"
+    return "gateway shutdown/lifecycle" if reason.casefold().startswith("gateway") else "lifecycle shutdown"
 
 
 def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> str:
@@ -291,7 +307,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     if evt.get("cut_reason"):
         lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
         lines.append(
-            "This unit was cut by the gateway before its terminal result was trustworthy. "
+            "This unit was cut before its terminal result was trustworthy. "
             "Resume only the unfinished children after verifying recorded results and side effects."
             if restart_cut else
             "This unit was stopped before its terminal result was trustworthy; no continuation was requested."
@@ -351,6 +367,15 @@ def _process_accounting_lines(r: dict) -> list:
     return lines
 
 
+def _retry_notice_suffix(evt: dict) -> str:
+    """A serialized cut retry note must not bypass the current admission gate."""
+    from tools.delegation_resume import resume_available
+
+    if evt.get("cut_reason") and not resume_available(evt.get("delegation_id", "")):
+        return ""
+    return f"\nRETRY: {evt['retry_note']}"
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the original task
     source (goal, bounded context, toolsets, role, model), dispatch time, status
@@ -361,7 +386,7 @@ def _format_async_delegation(evt: dict) -> str:
         return _format_task_failure_notice(evt, deleg_id)
     if evt.get("retry_note"):
         # Durable retry status (tools/delegation_resume.retry_note): tells the parent not to duplicate.
-        return _format_async_delegation({**evt, "retry_note": None}) + f"\nRETRY: {evt['retry_note']}"
+        return _format_async_delegation({**evt, "retry_note": None}) + _retry_notice_suffix(evt)
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), _outcome_only_stop_detail(evt.get("error"))

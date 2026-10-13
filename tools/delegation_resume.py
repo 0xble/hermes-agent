@@ -196,6 +196,16 @@ def _batch_resume_eligibility(record: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _unfinished_scalar_result(task: Dict[str, Any], results: Any) -> bool:
+    """Batch-format evidence may describe one unfinished scalar, never a success."""
+    return bool(
+        task.get("is_batch") and isinstance(task.get("goals"), list) and len(task["goals"]) == 1
+        and isinstance(results, list) and len(results) == 1 and isinstance(results[0], dict)
+        and results[0].get("task_index", 0) == 0
+        and str(results[0].get("status") or "").lower() in RESUMABLE_STATES | {"cut"}
+    )
+
+
 def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     """None when the record may be resumed, else a stable refusal token."""
     if record["state"] not in RESUMABLE_STATES or _recovery_stopped(record):
@@ -211,7 +221,10 @@ def _eligibility(record: Dict[str, Any]) -> Optional[str]:
             return INELIGIBLE_BATCH
     if task.get("task_indexes"):
         return INELIGIBLE_BATCH
-    if record["result"].get("results"):
+    results = record["result"].get("results")
+    # One-goal background units serialize unfinished scalar evidence as a list.
+    # Successes and ambiguous/multi-child evidence must never be replayed.
+    if results and not _unfinished_scalar_result(task, results):
         return INELIGIBLE_PARTIAL
     if not (record["origin_session_id"] or record["parent_session_id"]):
         return INELIGIBLE_STATELESS
@@ -991,6 +1004,43 @@ def release_terminal_report(delegation_id: str, claim: str) -> bool:
             (now, due, delegation_id, claim)).rowcount == 1
 
 
+def _retry_child_claim_eligibility(conn, record: Dict[str, Any]) -> Optional[str]:
+    """Share the unspent-child gate between notices and atomic retry admission."""
+    if _goal_count(record.get("task") or {}) <= 1:
+        return None
+    candidates = _batch_recovery_candidates(record)
+    if not candidates:
+        return INELIGIBLE_PARTIAL
+    existing = dict(conn.execute(
+        "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
+        "WHERE delegation_id=?", (record["delegation_id"],)))
+    # Consumed claims allow recovery of remaining siblings; an unspent claim
+    # belongs to its current consumer and must not be advertised again.
+    if any(child["task_index"] in existing and not existing[child["task_index"]] for child in candidates):
+        return INELIGIBLE_CLAIMED
+    if all(existing.get(child["task_index"]) for child in candidates):
+        return INELIGIBLE_CLAIMED
+    return None
+
+
+def resume_available(delegation_id: str) -> bool:
+    """Read-only cut-notice admission; the control action rechecks before claiming."""
+    ad = _ad()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        record = _load(conn, delegation_id)
+        if record is None:
+            return False
+        if record["retry_state"] in RETRY_PENDING_STATES + (RETRY_DISPATCHED, RETRY_REPORTED):
+            return (record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED)
+                    and not _recovery_stopped(record)
+                    and _retry_budget_reason(record, time.time()) is None
+                    and _retry_child_claim_eligibility(conn, record) is None)
+        reason = _eligibility(record)
+        if reason == INELIGIBLE_BATCH:
+            reason = _batch_resume_eligibility(record)
+        return reason is None
+
+
 def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Atomically take the one dispatch claim for a retry-pending row (concurrent callers: one winner)."""
     ad = _ad()
@@ -1008,20 +1058,8 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
             return record, INELIGIBLE_STATE
         if reason := _expire_retry(conn, record, now):
             return record, reason
-        task = record.get("task") or {}
-        candidates = _batch_recovery_candidates(record)
-        if _goal_count(task) > 1:
-            if not candidates:
-                return record, INELIGIBLE_PARTIAL
-            existing = dict(conn.execute(
-                "SELECT task_index, replacement_delegation_id FROM async_delegation_child_recovery "
-                "WHERE delegation_id=?", (delegation_id,)))
-            # Consumed claims are permanent evidence, not a barrier to claiming
-            # the remaining children after a partial persist/release.
-            if any(child["task_index"] in existing and not existing[child["task_index"]] for child in candidates):
-                return record, INELIGIBLE_CLAIMED
-            if all(existing.get(child["task_index"]) for child in candidates):
-                return record, INELIGIBLE_CLAIMED
+        if reason := _retry_child_claim_eligibility(conn, record):
+            return record, reason
         claim = _claim(conn, record, record["retry_state"], RETRY_DISPATCHING, now)
         if claim is None:
             return record, INELIGIBLE_CLAIMED

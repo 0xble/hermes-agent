@@ -1221,7 +1221,7 @@ def _lock_holder_provably_dead(record) -> bool:
     if not persistent_record_pidns_checkable(record.get("pidns")):
         return False  # foreign namespace: a local reading is not proof — defer
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — called only by the POSIX flock acquisition path
     except ProcessLookupError:
         return True
     except OSError:
