@@ -9,7 +9,7 @@ import pytest
 from cron.scheduler_prompt import _CRON_HINT, _build_job_prompt
 
 _AUTO = "automatically delivered"
-_LOCAL = "saved to local output only and is not sent to anyone"
+_LOCAL = "saved to local output only and is not sent anywhere"
 _SHARED_TAIL = _CRON_HINT[_CRON_HINT.index("SILENT:"):]
 
 
