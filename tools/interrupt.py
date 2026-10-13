@@ -12,6 +12,9 @@ from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+# Shared with gateway shutdown: tools cannot import the gateway runner.
+INTERRUPT_REASON_GATEWAY_SHUTDOWN = "gateway shutdown"
+
 # Opt-in debug tracing — pairs with HERMES_DEBUG_INTERRUPT in tools/environments/base.py.
 _DEBUG_INTERRUPT = env_var_enabled("HERMES_DEBUG_INTERRUPT")
 if _DEBUG_INTERRUPT:

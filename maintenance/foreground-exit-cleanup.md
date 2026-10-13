@@ -20,10 +20,13 @@ work before sending a signal. The other nine requested dumps are truncated at
 Two show a main-thread session-store lock wait; current fork goal lookups already
 use the async session-store boundary.
 
-For a `gateway shutdown` interrupt, including a deadline worker acting for the
-interrupted tool thread, or an active foreground cleanup fence, local POSIX
-teardown omits descendant discovery. It retains the existing bounded group
-TERM→KILL/reap sequence and both PGID fingerprint checks. Windows is unchanged.
+For the shared `tools.interrupt.INTERRUPT_REASON_GATEWAY_SHUTDOWN` cause or an
+active foreground cleanup fence, local POSIX teardown omits descendant discovery.
+`execute()` binds its deadline wait worker's `acting_for_tid` to the submitting
+tool thread and resets it after the wait, so the kill decision sees the same
+shutdown cause as `_wait_for_process`'s parent-thread interrupt check. It retains
+the existing bounded group TERM→KILL/reap sequence and both PGID fingerprint
+checks. Windows is unchanged.
 Normal timeout and `/stop` paths still snapshot before signalling and sweep
 identity-checked setsid escapees. Shutdown deliberately gives up that best-effort
 escapee sweep rather than spending its budget enumerating the entire host.
@@ -34,8 +37,11 @@ An ordinary descendant scan already in progress before shutdown is not cancelled
 Run `scripts/run_tests.sh tests/tools/test_local_interrupt_cleanup.py` on Linux with a reaping init process, plus the local process-tree tests. The spawn-before-publication regression holds a real child behind a gate while exit cleanup starts, then releases it and requires its process group to disappear. The preexisting exit-cleanup assertion remains strict. In a minimal container without `ps`, diagnostics use psutil; without an init reaper, a killed sleep may remain a zombie indefinitely and make the strict group-existence probe fail for a test-environment reason.
 
 The shutdown-specific checks are in `tests/tools/test_local_shutdown_kill.py`: gated
-slow scans cannot delay a gateway interrupt, deadline worker, or foreground
-cleanup; recycled group leaders must not be signalled before TERM or during
+slow scans cannot delay a gateway interrupt or foreground cleanup. The real
+`execute()` → `run_bounded_sync` → `_wait_for_process` regression spawns a child,
+interrupts only the submitting tool thread, and requires returncode 130 without
+any `children()` call; it does not set worker interrupt context itself.
+Recycled group leaders must not be signalled before TERM or during
 escalation; the caller's group is never signalled; normal cancellation retains
 identity-checked escapee sweeping. Run these with `test_pgid_starttime_drift.py`,
 `test_interrupt.py`, `test_local_interrupt_cleanup.py`, and

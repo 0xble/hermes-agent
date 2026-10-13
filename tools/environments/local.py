@@ -1094,10 +1094,10 @@ class LocalEnvironment(BaseEnvironment):
     def _kill_process(self, proc):
         """Kill the owned group; ordinary cancellation also sweeps setsid escapees."""
         from tools.environments.base import foreground_cleanup_in_progress
-        from tools.interrupt import get_interrupt_reason
+        from tools.interrupt import INTERRUPT_REASON_GATEWAY_SHUTDOWN, get_interrupt_reason
 
         shutdown = not _IS_WINDOWS and (foreground_cleanup_in_progress()
-                                         or get_interrupt_reason() == "gateway shutdown")
+                                         or get_interrupt_reason() == INTERRUPT_REASON_GATEWAY_SHUTDOWN)
         try:
             if shutdown:
                 # macOS children(recursive=True) scans every host PID's ppid. Repeating
