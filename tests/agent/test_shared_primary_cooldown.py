@@ -474,7 +474,7 @@ def test_stranded_fallback_index_does_not_send_the_turn_to_a_cooled_primary():
 def test_adoption_skips_the_state_file_without_a_fallback_chain():
     with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
         agent = _agent_with_chain([])
-    with patch("agent.shared_primary_cooldown.get_cooldown", side_effect=AssertionError("locked")):
+    with patch("agent.shared_primary_cooldown.read_cooldown", side_effect=AssertionError("locked")):
         from agent.agent_runtime_helpers import _adopt_shared_primary_cooldown
         assert _adopt_shared_primary_cooldown(agent) is False
         assert agent._restore_primary_runtime() is False

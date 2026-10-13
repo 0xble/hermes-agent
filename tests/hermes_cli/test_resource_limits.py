@@ -226,7 +226,7 @@ def test_serve_startup_applies_limit_before_web_server(monkeypatch):
     monkeypatch.setattr(cli_main, "_build_web_ui", lambda *args, **kwargs: True)
     monkeypatch.setattr(main_web_build, "_build_web_ui", lambda *args, **kwargs: True)
     monkeypatch.setattr(cli_main, "_maybe_setup_dashboard_auth_interactively", lambda args: None)
-    monkeypatch.setattr(hermes_cli.plugins, "discover_plugins", lambda: None)
+    monkeypatch.setattr(hermes_cli.plugins, "discover_plugins", lambda *a, **k: None)
     served: dict = {}
     monkeypatch.setattr(
         hermes_cli.web_server,

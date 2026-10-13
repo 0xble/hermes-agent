@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.plugin_helpers import mark_plugin_discovery_complete
+
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.run import _profile_runtime_scope
@@ -23,7 +25,7 @@ def _register(callback) -> None:
     from hermes_cli.plugins import get_plugin_manager
 
     manager = get_plugin_manager()
-    manager._discovered = True  # no on-disk plugins in the test home; skip discovery
+    mark_plugin_discovery_complete(manager)  # no on-disk plugins in the test home; skip discovery
     manager._hooks.setdefault(HOOK, []).append(callback)
 
 

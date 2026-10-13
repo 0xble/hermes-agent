@@ -96,7 +96,7 @@ def _route_fields(route: tuple[str, str, str]) -> dict[str, str]:
 
 
 @contextmanager
-def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
+def _locked_state(*, quarantine_unreadable: bool = False) -> Iterator[tuple[Path, dict[str, Any]]]:
     """Hold an exclusive lock while reading and atomically rewriting the state file."""
     state_path = _state_path()
     lock_path = _lock_path()
@@ -116,16 +116,27 @@ def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
             unlock = lambda: (lock_file.seek(0), msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1))
         try:
+            backup = None
             try:
-                raw = json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
-            except (OSError, ValueError, TypeError):
-                logger.warning("Ignoring unreadable primary cooldown state at %s", state_path)
-                raw = {}
-            state = raw if isinstance(raw, dict) else {}
-            routes = state.get("routes")
-            if not isinstance(routes, dict):
-                routes = {}
-            state = {"version": _STATE_VERSION, "routes": routes}
+                try:
+                    raw = json.loads(state_path.read_text(encoding="utf-8-sig"))
+                except FileNotFoundError:
+                    raw = {"routes": {}}
+                except (ValueError, TypeError) as exc:
+                    raise OSError(f"Malformed primary cooldown state at {state_path}") from exc
+                if not isinstance(raw, dict) or not isinstance(raw.get("routes"), dict):
+                    raise OSError(f"Malformed primary cooldown state at {state_path}")
+            except OSError:
+                if not quarantine_unreadable:
+                    raise
+                # Only explicit operator clear-all may recover, under the same writer lock.
+                backup = state_path.with_name(f"{state_path.name}.corrupt-{time.time_ns()}")
+                state_path.replace(backup)
+                logger.warning("Quarantined unreadable primary cooldown state at %s", backup)
+                raw = {"routes": {}}
+            state = {"version": _STATE_VERSION, "routes": raw["routes"]}
+            if backup is not None:
+                state["quarantined"] = str(backup)
             yield state_path, state
         finally:
             unlock()
@@ -337,8 +348,11 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool
         return False
 
 
-def list_cooldowns() -> list[dict[str, Any]]:
+def list_cooldowns(*, strict: bool = False) -> list[dict[str, Any]]:
     """Return active (still cooling) records.
+
+    ``strict=True`` propagates unreadable-state errors for operator status; the default keeps
+    runtime/listing callers compatible with the historical empty result.
 
     Malformed and stale records are pruned from the state file. A recently expired record is
     kept, but not returned, so the first successful primary response can still clear it and
@@ -352,6 +366,8 @@ def list_cooldowns() -> list[dict[str, Any]]:
             return [dict(entry) for entry in state["routes"].values() if _active(entry, now)]
     except OSError as exc:
         logger.debug("Could not list primary cooldowns: %s", exc)
+        if strict:
+            raise
         return []
 
 
@@ -373,12 +389,16 @@ def clear_cooldowns(target: str | None = None, *, all_routes: bool = False) -> l
     *target* is ``provider/model`` or a bare model name, compared exactly (no substrings). A
     bare model clears that model on every provider. Returns the removed records. Raises
     ``ValueError`` when neither or both selectors are given, and ``OSError`` when the state
-    cannot be updated, so the CLI never reports a clear that did not happen.
+    cannot be updated, so the CLI never reports a clear that did not happen. Explicit
+    ``all_routes`` quarantines an unreadable file under the writer lock and returns its
+    backup path as a ``quarantined`` result; targeted clears keep strict read behavior.
     """
     wanted = str(target or "").strip()
     if all_routes == bool(wanted):
         raise ValueError("pass exactly one of a target or all_routes=True")
-    with _locked_state() as (path, state):
+    with _locked_state(quarantine_unreadable=all_routes) as (path, state):
+        if state.get("quarantined"):
+            return [{"quarantined": state["quarantined"]}]
         removed = []
         for key, entry in list(state["routes"].items()):
             if not isinstance(entry, dict):

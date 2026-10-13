@@ -55,9 +55,11 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
-    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
-    RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
-    is_valid_system_prompt_section_id,
+    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginDiscoveryIncomplete, PluginSystemPromptSection,
+    RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
+    _async_delivery_snapshot, _await_foreground_discovery, _delivery_manager,
+    _join_background_discovery, _loop_observer_snapshot,
+    format_system_prompt_sections, is_valid_system_prompt_section_id,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_state import (
@@ -1167,6 +1169,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
+        self._discovery_complete: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
         # the installed scope may then hold plugin-supplied names, and a later discovery that finds NO
         # enabled plugin source (plugin removed / disabled) must still reconcile once to drop them.
@@ -1297,11 +1300,12 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             # ``on_plugin_loaded`` reports the plugins this sweep loads that the process did not have before
             # (boot: everything; a mid-run install/enable: just the newcomer), keyed on the pre-sweep set.
             loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            self._discovery_complete = False
             if force:
                 self.unload()  # the ledger owns teardown of process-global registries
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-                self._discovered = True
+                self._discovered = self._discovery_complete = True
                 return
             # Flag set up front as a re-entrancy guard (register() can trigger discovery again) but
             # reset on failure so a failed scan is NOT cached as "discovered with an empty registry"
@@ -1309,11 +1313,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             self._discovered = True
             try:
                 self._discover_and_load_inner()
-                # Persistent registrations survived the unload-all; now that plugins re-registered,
-                # dispose the ones whose plugin did not come back.
-                # Now that plugins have had their chance to re-register, dispose the ones whose plugin did
-                # not come back (disabled, removed, or omitted from this discovery pass) so e.g. a disabled
-                # auth plugin's provider does not stay live process-wide until restart. See #91701.
+                # Evict registrations from disabled/removed plugins after re-registration (#91701).
                 self._evict_stale_persistent_registrations()
                 # load_hermes_dotenv() ran at import, before plugin secret sources existed: re-pull.
                 # Plugin secret sources register during discover; the initial load_hermes_dotenv() already
@@ -1325,6 +1325,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # Re-register so force-reload is symmetric (#60036; tracking #64178 — salvaged from PR
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
+                self._discovery_complete = True
             except BaseException:
                 self._discovered = False
                 raise
@@ -1759,14 +1760,25 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
     return PluginManager().has_enabled_portable_mcp(raw_config)
 
 
-def discover_plugins(force: bool = False) -> None:
-    """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
-    background discovery instead of racing a second scan."""
-    _join_background_discovery()
+def discover_plugins(force: bool = False, *, require_complete: bool = False) -> None:
+    """Load plugins; only listing/completion callers may use an incomplete registry."""
+    try:
+        if require_complete:
+            _join_background_discovery(timeout=None)
+        else:
+            _join_background_discovery()
+    except PluginDiscoveryIncomplete as exc:
+        if require_complete:
+            raise
+        logger.warning("background plugin discovery did not finish; using the available registry: %s", exc)
+        return
     get_plugin_manager().discover_and_load(force=force)
+    if require_complete:
+        _delivery_manager()
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
+_background_discovery_error: Optional[BaseException] = None
 _background_discovery_lock = threading.Lock()
 
 
@@ -1774,7 +1786,7 @@ def start_background_plugin_discovery() -> None:
     """Run discovery in a daemon thread to overlap the rest of CLI startup (~150ms). Every
     synchronous consumer joins it via :func:`discover_plugins`, so no one sees a half-loaded
     registry. No-op when already done or in flight."""
-    global _background_discovery_thread
+    global _background_discovery_error, _background_discovery_thread
     manager = get_plugin_manager()
     if manager._discovered:
         return
@@ -1782,24 +1794,19 @@ def start_background_plugin_discovery() -> None:
         if _background_discovery_thread is not None and _background_discovery_thread.is_alive():
             return
 
+        _background_discovery_error = None
+
         def _run() -> None:
+            global _background_discovery_error
             try:
                 manager.discover_and_load()
                 _persist_plugin_toolset_keys()
-            except Exception:
+            except BaseException as exc:
+                _background_discovery_error = exc
                 logger.warning("background plugin discovery failed", exc_info=True)
 
         _background_discovery_thread = threading.Thread(target=_run, name="plugin-discovery", daemon=True)
         _background_discovery_thread.start()
-
-
-def _join_background_discovery(timeout: float = 30.0) -> None:
-    """Wait for an in-flight background discovery (no-op from its own thread or a plugin-load worker it
-    spawned — that worker's parent is blocked waiting on it)."""
-    t = _background_discovery_thread
-    if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
-        return
-    t.join(timeout=timeout)
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1849,45 +1856,24 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     return _nowait_plugin_set("portable_mcp", lambda m: set(m.get_portable_mcp_servers()))
 
 
-def _delivery_manager() -> PluginManager:
-    """Active manager, lazily discovering if it never ran — delivery must not depend on WHICH
-    surface imported us (dashboards/TUI/cron never import model_tools). ``getattr`` default
-    ``True`` leaves test doubles untouched.
-
-    Hook/middleware delivery must not depend on WHICH surface imported us: dashboards, TUI slash workers,
-    query mode, and cron delivery paths never import ``model_tools`` (whose import side-effect is the
-    discovery trigger on the interactive CLI path), so hooks registered by user plugins were silently dead
-    on those surfaces (#50776, #67597, #67890, #50937; tracking #64178 — salvaged from PR #64188).
-    """
-    manager = get_plugin_manager()
-    # ``PluginManager.discover_and_load`` sets ``_discovered`` before loading any
-    # plugin so recursive discovery cannot re-enter the sweep.  A startup caller
-    # can therefore observe ``_discovered`` while the background worker is still
-    # populating hooks; join the worker before reading the registry.
-    _join_background_discovery()
-    if not getattr(manager, "_discovered", True):
-        manager.discover_and_load()
-    return manager
-
-
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
+    """Invoke hooks, waiting for policy discovery; loop observers snapshot current callbacks.
 
-    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
-    bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
-    fail closed with a block directive; other bounded hooks fail open (skip).
-    Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
-    ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
-    callbacks registered by user plugins (tracking #64178).
+    Bounded hooks use ``plugins.hook_callback_timeout``; timed-out or still-running
+    ``pre_tool_call`` callbacks fail closed with a block directive. Unknown/policy
+    hooks never use a partial registry. Observer returns cannot authorize work.
     """
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        manager, callbacks = snapshot
+        return manager.invoke_hook(hook_name, _callbacks=callbacks, **kwargs)
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
 
 
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
-    """:func:`invoke_hook` for callers on an event loop: ``async def`` callbacks are awaited
-    there instead of bridged through a helper thread (see ``PluginManager.ainvoke_hook``)."""
-    return await _delivery_manager().ainvoke_hook(hook_name, **kwargs)
+    """Await cold/reloading discovery off-loop, preserving inline ready-registry ordering."""
+    manager, callbacks = await _async_delivery_snapshot(hook_name)
+    return await manager.ainvoke_hook(hook_name, _callbacks=callbacks, **kwargs)
 
 
 def render_system_prompt_sections(session_info: Mapping[str, Any]) -> List[RenderedPluginSystemPromptSection]:
@@ -1919,20 +1905,24 @@ def has_middleware(kind: str) -> bool:
 
 
 def has_hook(hook_name: str) -> bool:
-    """True when a loaded plugin handles a hook (lazy-discovers first, like :func:`has_middleware`).
-
-    Lazy-discovers first — same gate-before-invoke rationale as :func:`has_middleware` (tracking #64178).
-    """
+    """Probe hooks; loop observers snapshot, policy/worker callers await discovery."""
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        return bool(snapshot[1])
     return _delivery_manager().has_hook(hook_name)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
-    """Return a stable snapshot of callbacks registered for a hook.
-
-    Goes through :func:`_delivery_manager` so streaming hook consumers wait for an in-flight
-    background discovery, like :func:`invoke_hook` and :func:`has_hook`.
-    """
+    """Snapshot hooks; loop observers do not wait, policy callers require readiness."""
+    snapshot = _loop_observer_snapshot(hook_name)
+    if snapshot is not None:
+        return snapshot[1]
     return _delivery_manager().iter_hook_callbacks(hook_name)
+
+
+def snapshot_hook_callbacks_nowait(hook_name: str) -> tuple[Callable, ...]:
+    """Return current callbacks without discovery or lock waits."""
+    return get_plugin_manager().iter_hook_callbacks(hook_name)
 
 
 def fire_pre_command_hook(
@@ -1943,10 +1933,11 @@ def fire_pre_command_hook(
     logged at debug so future block/rewrite adopters are discoverable."""
     try:
         manager = get_plugin_manager()
-        if not manager.has_hook("pre_command"):
+        callbacks = snapshot_hook_callbacks_nowait("pre_command")
+        if not callbacks:
             return
         results = manager.invoke_hook(
-            "pre_command", surface=surface, command=command, alias_used=alias_used,
+            "pre_command", _callbacks=callbacks, surface=surface, command=command, alias_used=alias_used,
             args_raw=args_raw, session_key=session_key, platform=platform,
         )
         for result in results:
@@ -1959,14 +1950,6 @@ def fire_pre_command_hook(
 
 
 _thread_tool_whitelist = threading.local()
-
-
-@dataclass(frozen=True)
-class _PreToolCallDirective:
-    action: Optional[str] = None
-    message: Optional[str] = None
-    rule_key: Optional[str] = None
-    modified_args: Optional[Dict[str, Any]] = None
 
 
 def set_thread_tool_whitelist(
@@ -1996,12 +1979,18 @@ def _get_pre_tool_call_directive_details(
     if allowed is not None and tool_name not in allowed:
         fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
         return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
-    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
-    hook_results = invoke_lifecycle_hook(
-        "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
-        task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
-        api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
-    )
+    try:
+        from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
+
+        hook_results = invoke_lifecycle_hook(
+            "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
+            task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
+            api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
+        )
+    except Exception:
+        # Dispatchers may swallow hook exceptions; unavailable policy must be a veto.
+        logger.warning("pre_tool_call policy delivery failed for %s", tool_name, exc_info=True)
+        return _PreToolCallDirective(action="block", message="BLOCKED: plugin discovery or pre_tool_call policy unavailable")
     modified_args: Optional[Dict[str, Any]] = None
     first_approve: Optional[Tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
     for result in hook_results:
