@@ -120,6 +120,99 @@ def test_default_scratch_profiles_are_unique_and_use_temp_root(rehearsal, tmp_pa
     assert all(home.parent == tmp_path for home in homes)
 
 
+@pytest.mark.parametrize("existing", ["state", "symlink", "populated"])
+def test_candidate_open_refuses_nonfresh_scratch_home(rehearsal, tmp_path, monkeypatch, existing):
+    copy = tmp_path / "copy.db"
+    copy.write_bytes(b"disposable copy")
+    home = tmp_path / "scratch"
+    home.mkdir()
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
+    target = home / "state.db"
+    if existing == "state":
+        target.write_bytes(b"live profile database")
+    elif existing == "symlink":
+        target.symlink_to(copy)
+    else:
+        (home / "config.yaml").write_text("live profile", encoding="utf-8")
+    monkeypatch.setattr(rehearsal.subprocess, "run", lambda *a, **kw: pytest.fail("spawned on nonfresh home"))
+    with pytest.raises(SystemExit, match="fresh|state.db"):
+        rehearsal.open_with_candidate(copy, home, "python")
+    if existing == "state":
+        assert target.read_bytes() == b"live profile database"
+    elif existing == "symlink":
+        assert target.is_symlink()
+    assert copy.read_bytes() == b"disposable copy"
+
+
+@pytest.mark.parametrize("location", ["equal", "ancestor", "nested", "symlink_nested"])
+def test_candidate_open_refuses_live_home_or_its_ancestor(rehearsal, tmp_path, monkeypatch, location):
+    live = tmp_path / "live-profile"
+    live.mkdir()
+    copy = tmp_path / "copy.db"
+    copy.write_bytes(b"disposable copy")
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
+    home = live if location == "equal" else tmp_path if location == "ancestor" else live / "scratch"
+    if location == "symlink_nested":
+        alias = tmp_path / "profile-alias"
+        alias.symlink_to(live, target_is_directory=True)
+        home = alias / "scratch"
+    spawned = []
+
+    def spawn(*args, **kwargs):
+        spawned.append(args)
+        return type("Result", (), {"returncode": 0, "stdout": '{"opened": true}', "stderr": ""})()
+
+    monkeypatch.setattr(rehearsal.subprocess, "run", spawn)
+    with pytest.raises(SystemExit, match="fresh scratch"):
+        rehearsal.open_with_candidate(copy, home, "python")
+    assert not spawned
+    assert not (live / "scratch").exists()
+    assert copy.read_bytes() == b"disposable copy"
+
+
+@pytest.mark.parametrize("location", ["scratch_temp", "explicit_scratch", "nested_temp", "symlink_temp"])
+def test_candidate_open_accepts_hermes_temp_scratch_home(rehearsal, v2_copy, tmp_path, monkeypatch, location):
+    import sys
+    live = tmp_path / "live-profile"
+    scratch_root = live / "cache" / "scratch"
+    live.mkdir()
+    temp_root = live / "temporary" if location == "nested_temp" else scratch_root
+    home = temp_root / "candidate"
+    if location == "explicit_scratch":
+        temp_root = tmp_path
+    elif location == "symlink_temp":
+        alias = tmp_path / "profile-alias"
+        alias.symlink_to(live, target_is_directory=True)
+        home = alias / "cache" / "scratch" / "candidate"
+    monkeypatch.setenv("HERMES_HOME", str(live))
+    monkeypatch.setenv("TMPDIR", str(temp_root))
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(temp_root))
+    result = rehearsal.open_with_candidate(v2_copy, home, sys.executable)
+    assert result["opened"] and result["exit"] == 0, result
+    assert (home / "state.db").resolve() == v2_copy.resolve()
+
+
+def test_candidate_open_uses_fresh_home_and_real_candidate(rehearsal, v2_copy, tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(rehearsal.tempfile, "tempdir", str(tmp_path))
+    home = tmp_path / "fresh-scratch"
+    result = rehearsal.open_with_candidate(v2_copy, home, sys.executable)
+    assert result["opened"] and result["exit"] == 0, result
+    assert (home / "state.db").resolve() == v2_copy.resolve()
+
+
+def test_rehearsal_refuses_active_custom_profile(rehearsal, tmp_path, monkeypatch):
+    home = tmp_path / "custom-profile"
+    home.mkdir()
+    copy = home / "state.db"
+    copy.touch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(rehearsal, "snapshot", lambda p: pytest.fail("read live profile"))
+    with pytest.raises(SystemExit, match="live profile"):
+        rehearsal.main([str(copy)])
+
+
 def test_invalid_copy_does_not_allocate_scratch_home(rehearsal, tmp_path, monkeypatch):
     def unexpected_allocation(**kwargs):
         pytest.fail('invalid input allocated a scratch profile')

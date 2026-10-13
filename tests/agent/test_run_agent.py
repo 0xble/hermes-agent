@@ -58,9 +58,8 @@ def test_is_destructive_command_treats_cp_as_mutating():
 
 @pytest.fixture(autouse=True)
 def _mock_plugin_discovery(monkeypatch):
-    # Tool definitions are supplied by these unit fixtures. Scanning every
-    # bundled plugin again for each isolated test home adds no coverage.
-    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    from tests.plugin_helpers import mock_completed_plugin_discovery
+    mock_completed_plugin_discovery(monkeypatch)
 
 
 @pytest.fixture()
