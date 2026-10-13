@@ -1383,3 +1383,109 @@ def test_cancelled_settle_waits_for_queued_worker():
     finally:
         pool.shutdown(wait=True)
     assert operations == [("drop", "delegation", "claim")]
+
+
+@pytest.mark.parametrize("outcome", ["refused", "unrouted", "failed", "cancelled"])
+def test_unadmitted_delivery_unpublishes_its_admission_claim(monkeypatch, isolated_registry, outcome):
+    """Admission claims are published before injection; every non-admitted exit (refusal, no route,
+    transport failure, cancellation mid-injection) must still forget them once its refund settles,
+    or a later owner retry could reopen a row this delivery no longer holds."""
+    from gateway.wake import WakeNotAccepted
+    from tools import async_delegation
+
+    event = _distinct_async_event(f"deleg_unpublish_{outcome}")
+    _persist_pending_completion(event)
+    entered = asyncio.Event()
+
+    async def _inject(evt, *_args, **_kwargs):
+        with runner._completion_delivery_lock:
+            assert evt["delegation_id"] in runner._pending_completion_acks()
+        entered.set()
+        if outcome == "refused":
+            raise WakeNotAccepted("busy")
+        if outcome == "cancelled":
+            await asyncio.Event().wait()
+        return None if outcome == "unrouted" else False
+
+    runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
+    runner._completion_delivery_ready = AsyncMock(return_value=True)
+    runner._inject_watch_notification = lambda _text, evt, **kw: _inject(evt, **kw)
+
+    async def _exercise():
+        task = asyncio.create_task(runner._deliver_completion_notification_scoped("completion", dict(event)))
+        await entered.wait()
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            for _ in range(300):
+                with runner._completion_delivery_lock:
+                    if not runner._pending_completion_acks():
+                        return
+                await asyncio.sleep(0.01)
+        else:
+            await task
+
+    asyncio.run(_exercise())
+    with runner._completion_delivery_lock:
+        assert runner._pending_completion_acks() == {}
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    spent = 1 if outcome in ("unrouted", "failed") else 0  # release spends; defer refunds
+    assert (row["delivery_state"], row["delivery_attempts"]) == ("pending", spent)
+
+
+def test_settle_callback_runs_after_worker_even_if_settle_raises_or_caller_cancels():
+    """``on_settled`` fires once, from the worker, after the last settle, never at cancellation."""
+    import threading
+
+    from gateway.run_notifications_ledger import settle_durable_claims
+
+    entered, proceed = threading.Event(), threading.Event()
+    trace = []
+
+    def _settle(kind, delegation_id, claim_id):
+        entered.set()
+        assert proceed.wait(5)
+        trace.append(claim_id)
+        raise RuntimeError("settle blew up")
+
+    async def _exercise():
+        task = asyncio.create_task(settle_durable_claims(
+            [("complete", "d1", "c1")], _settle, on_settled=lambda: trace.append("settled"),
+        ))
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert trace == []  # cancellation alone must not run the callback
+        proceed.set()
+        for _ in range(300):
+            if trace == ["c1", "settled"]:
+                return
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_exercise())
+    assert trace == ["c1", "settled"]
+
+
+def test_settle_callback_runs_when_nothing_settles_or_executor_is_gone():
+    """No pending work, or a loop whose default executor is shut down, leaves nothing in flight:
+    the callback runs inline so a published claim cannot leak."""
+    import concurrent.futures
+
+    from gateway.run_notifications_ledger import settle_durable_claims
+
+    calls = []
+
+    async def _exercise():
+        await settle_durable_claims([("complete", "d", "")], on_settled=lambda: calls.append("empty"))
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(pool)
+        pool.shutdown(wait=True)
+        with pytest.raises(RuntimeError):
+            await settle_durable_claims(
+                [("complete", "d", "c")], lambda *_: calls.append("ran"), on_settled=lambda: calls.append("gone"),
+            )
+
+    asyncio.run(_exercise())
+    assert calls == ["empty", "gone"]

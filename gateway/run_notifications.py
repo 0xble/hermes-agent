@@ -996,8 +996,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
 
-    async def _settle_durable_claims(self, operations) -> None:
-        await settle_durable_claims(operations, self._settle_durable_claim)
+    async def _settle_durable_claims(self, operations, *, on_settled=None) -> None:
+        await settle_durable_claims(operations, self._settle_durable_claim, on_settled=on_settled)
 
     async def _completion_delivery_ready(self, evt: dict) -> bool:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
@@ -1230,14 +1230,22 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             operations.extend(
                 (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
             )
-            try:
+            if not ack_claims:
                 await self._settle_durable_claims(operations)
-            finally:
-                with self._completion_delivery_lock:
-                    pending_acks = self._pending_completion_acks()
-                    for delegation_id, claim_id in ack_claims:
-                        if pending_acks.get(delegation_id) == claim_id:
-                            del pending_acks[delegation_id]
+            else:
+                # Unpublish only once the settle worker has actually finished: cancellation of this
+                # coroutine must not orphan an acknowledgement that is still running, or an owner
+                # retry meanwhile would lose the claim it needs to reopen the pending row.
+                await self._settle_durable_claims(
+                    operations, on_settled=lambda: self._unpublish_completion_acks(ack_claims))
+
+    def _unpublish_completion_acks(self, ack_claims) -> None:
+        """Forget admission claims whose settle finished. Runs in the settle worker thread."""
+        with self._completion_delivery_lock:
+            pending_acks = self._pending_completion_acks()
+            for delegation_id, claim_id in ack_claims:
+                if pending_acks.get(delegation_id) == claim_id:
+                    del pending_acks[delegation_id]
 
     def _pending_completion_acks(self) -> dict:
         """``delegation_id -> admission claim`` whose acknowledgement has not finished. Caller holds

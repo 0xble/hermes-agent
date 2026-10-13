@@ -38,6 +38,8 @@ def settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
 async def settle_durable_claims(
     operations: Iterable[tuple[str, str, str]],
     settle: Callable[[str, str, str], None] = settle_durable_claim,
+    *,
+    on_settled: Callable[[], None] | None = None,
 ) -> None:
     """Settle ``(kind, delegation_id, claim_id)`` claims in ONE worker-thread hop.
 
@@ -45,18 +47,38 @@ async def settle_durable_claims(
     batch whole: the worker future is shielded so cancellation of the awaiting task cannot cancel a
     queued settle before the thread starts, and the thread finishes every settle regardless.
     Operations without a claim id are skipped.
+
+    ``on_settled`` runs exactly once, after every settle has actually finished (or raised): in the
+    worker thread itself, so neither cancellation of the awaiting task nor loop teardown can run it
+    early or skip it. It runs inline when nothing needs settling or the worker cannot be started.
     """
     pending = [op for op in operations if op[2]]
+
+    def _finish() -> None:
+        if on_settled is not None:
+            try:
+                on_settled()
+            except Exception:
+                logger.warning("Durable claim settle callback failed", exc_info=True)
+
     if not pending:
+        _finish()
         return
 
     def _settle_all() -> None:
-        for kind, delegation_id, claim_id in pending:
-            settle(kind, delegation_id, claim_id)
+        try:
+            for kind, delegation_id, claim_id in pending:
+                settle(kind, delegation_id, claim_id)
+        finally:
+            _finish()
 
     loop = asyncio.get_running_loop()
     settle_ctx = contextvars.copy_context()
-    future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
+    try:
+        future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
+    except BaseException:
+        _finish()  # No worker will run: nothing is left in flight.
+        raise
     await asyncio.shield(future)
 
 
