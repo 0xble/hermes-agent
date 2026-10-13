@@ -245,3 +245,22 @@ def test_completion_does_not_steal_boot_notice_claim(outbox):
     assert reason is None
     assert again is not None
     assert dr.complete_auto_resume_trigger(did, again["auto_resume_claim"])
+
+
+def test_completion_ack_preserves_boot_claim_for_failed_admission():
+    """A completion acknowledgment must not settle a still-owned boot notice claim."""
+    from tools import delegation_resume as dr
+
+    did = "boot_claim_ack"
+    _insert_history(did, "interrupted", "pending", time.time())
+    boot, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert boot is not None
+
+    assert ad.mark_completion_delivered(did)
+    assert dr.release_auto_resume_trigger(did, boot["auto_resume_claim"])
+
+    again, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert again is not None
+    assert dr.complete_auto_resume_trigger(did, again["auto_resume_claim"])

@@ -996,8 +996,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
     return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
-                   delivered_at=?, updated_at=?, auto_resume_state=CASE
-                     WHEN auto_resume_state='claimed' THEN 'delivered' ELSE auto_resume_state END
+                   delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
 
 
