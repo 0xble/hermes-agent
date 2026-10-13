@@ -274,46 +274,106 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
     assert {"fal", "telegram", "vertex", "exa"} <= set(selection)
     assert "messaging" not in selection
     assert "piper" not in selection
-    assert "hindsight" in selection  # The active memory provider is a declared PM extra.
+    assert "hindsight" not in selection  # Catalog plugin owns this dependency, not a core extra.
     assert extras.legacy_selection(tmp_path / "no-venv") == ["all"]
 
 
 
 
-def test_immutable_release_promotion_preserves_hindsight_in_new_facts(monkeypatch, tmp_path):
-    """A release replacement must keep the active install's Hindsight extra."""
+@pytest.mark.parametrize("provider_source", ["bundled", "catalog", "bundled-with-user-copy"])
+def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
+    monkeypatch, tmp_path, provider_source,
+):
+    """First-generation selection keeps leaf extras; the selected plugin owns its deps."""
     import json
+    import os
+    import shutil
+    import subprocess
+    from pathlib import Path
 
-    from pm.environments import runtime_facts_path
+    from pm import paths
+    from pm.environments import runtime_facts_path, selected_venv, site_packages
+    from pm.install import _target_selection
     from pm.lock import Facts
+    from pm.packages import Venv
+    from tests.pm._fixtures import _wheel
 
     home = tmp_path / "home"
-    previous = home / "releases" / "old"
     candidate = home / "releases" / "new"
-    site = candidate / ".venv" / "lib" / "python3.11" / "site-packages"
     candidate.mkdir(parents=True)
-    site.joinpath("hindsight_client").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(paths, "repo_root", lambda: candidate)
+    monkeypatch.setattr(paths, "lockfile_path", lambda: tmp_path / "tool-lock.json")
+    uv = shutil.which("uv")
+    assert uv, "the regression requires the real offline resolver"
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (Path(uv), Path(sys.executable)))
+
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    _wheel(wheels, "hindsight_client", "0.10.1")
     (candidate / "pyproject.toml").write_text(
-        "[project]\nname='hermes-agent'\nversion='1'\n"
-        "[project.optional-dependencies]\nhindsight=['hindsight-client>=0.6.1,<1']\n",
+        '[project]\nname="hermes-agent"\nversion="1"\nrequires-python=">=3.11"\n'
+        '[project.optional-dependencies]\nall=[]\nfal=[]\nhindsight=[]\n'
+        '[tool.uv]\npackage=false\nno-index=true\noffline=true\n'
+        f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8",
+    )
+    subprocess.run([uv, "lock", "--python", sys.executable], cwd=candidate,
+                   env=dict(os.environ), check=True, capture_output=True, timeout=60)
+    config = home / "config.yaml"
+    config.write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
+    provider = (home / "plugins" / "hindsight" if provider_source == "catalog"
+                else candidate / "plugins" / "memory" / "hindsight")
+    provider.mkdir(parents=True)
+    (provider / "__init__.py").write_text("# MemoryProvider fixture\n", encoding="utf-8")
+    (provider / "plugin.yaml").write_text(
+        'name: hindsight\nversion: 1.0.0\npip_dependencies: ["hindsight-client>=0.10.1,<1"]\n',
         encoding="utf-8",
     )
-    previous.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    Facts(runtime_facts_path(previous)).record_state("venv", "old", ["all", "hindsight"])
-    old_fact = Facts(runtime_facts_path(previous), strict=True).get("venv")
-    assert old_fact is not None
-    assert old_fact["extras"] == ["all", "hindsight"]
-    (home / "current").symlink_to(candidate, target_is_directory=True)
-    (home / "previous").symlink_to(previous, target_is_directory=True)
-    monkeypatch.setattr("pm.environments.base_venv", lambda _root: candidate / ".venv")
-    monkeypatch.setattr("pm.environments.site_packages", lambda _venv: site)
+    if provider_source == "bundled-with-user-copy":
+        user_copy = home / "plugins" / "hindsight"
+        user_copy.mkdir(parents=True)
+        (user_copy / "plugin.yaml").write_text(
+            'name: hindsight\npip_dependencies: ["not-the-active-provider==99"]\n',
+            encoding="utf-8",
+        )
 
-    selected = extras.installed_selection(candidate)
-    Facts(runtime_facts_path(candidate)).record_state("venv", "new", selected)
-    new_fact = json.loads(runtime_facts_path(candidate).read_text(encoding="utf-8"))["packages"]["venv"]
+    # The payload already carried both a real leaf extra and the provider client.
+    # An undeclared anchor must be pruned, and the client must NOT become a core extra.
+    site = site_packages(candidate / ".venv")
+    for module in ("fal_client", "hindsight_client", "telegram"):
+        (site / module).mkdir(parents=True)
+    facts = Facts(runtime_facts_path(candidate), strict=True)
+    assert facts.get("venv") is None, "this must exercise a brand-new install key"
+    package = Venv(candidate)
+    enabled, stamp, inputs = _target_selection(
+        package, {}, extras=None, inputs={}, repair=False, shipped=None, frozen=None,
+    )
+    assert enabled == ["fal"]
+    prepared = package.apply(enabled, explicit=True, **inputs)
+    facts.record_state("venv", stamp, enabled, **prepared)
+    fact = Facts(runtime_facts_path(candidate), strict=True).get("venv")
+    assert fact is not None
+    assert fact["extras"] == ["fal"]
+    assert selected_venv(candidate) != candidate / ".venv"
+    python = selected_venv(candidate) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    probe = subprocess.run([str(python), "-I", "-c",
+                            "import hindsight_client; print(hindsight_client.__version__)"],
+                           check=True, capture_output=True, text=True, timeout=30)
+    assert probe.stdout.strip() == "0.10.1"
 
-    assert "hindsight" in new_fact["extras"]
+    # Removing the provider must remove its dependency from the next generation,
+    # not preserve a sticky hindsight extra inferred from the previous payload.
+    config.write_text("memory:\n  provider: none\n", encoding="utf-8")
+    enabled, next_stamp, inputs = _target_selection(
+        package, fact, extras=None, inputs={}, repair=False, shipped=None, frozen=None,
+    )
+    assert enabled == ["fal"] and next_stamp != stamp
+    prepared = package.apply(enabled, explicit=True, **inputs)
+    facts.record_state("venv", next_stamp, enabled, **prepared)
+    python = selected_venv(candidate) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run([str(python), "-I", "-c",
+                    "import importlib.util; assert importlib.util.find_spec('hindsight_client') is None"],
+                   check=True, capture_output=True, text=True, timeout=30)
 
 
 def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_path):
