@@ -81,7 +81,7 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
     fired = []
 
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1, created_at=1.0)
+        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0)
 
         def __init__(self, session_id=None):
             pass
@@ -89,7 +89,10 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
         def is_due(self, now):
             return True
 
-        def fire_tick(self):
+        def fire_tick(self, run_generation=0, *, can_claim=None):
+            # Mirrors LoopManager.fire_tick: admission claims only while the gateway still owns the run.
+            if can_claim is not None and not can_claim():
+                return None
             fired.append(1)
             return "tick"
 

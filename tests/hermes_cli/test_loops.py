@@ -409,7 +409,7 @@ class TestTickLifecycle:
         state.next_due_at = time.time() - 1
         assert mgr.fire_tick() == "/recap"
 
-    def test_abandon_tick_rolls_back(self, hermes_home):
+    def test_abandon_tick_skips_without_refund(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t5")
@@ -418,7 +418,8 @@ class TestTickLifecycle:
         mgr.fire_tick()
         mgr.abandon_tick()
         assert mgr.state.awaiting_response is False
-        assert mgr.state.ticks_fired == 0
+        assert mgr.state.status == "active"
+        assert mgr.state.ticks_fired == 1
 
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -966,7 +967,7 @@ class TestControls:
         fresh.set("poll", interval_seconds=300)
         before = load_loop("c5").control_generation
         assert fresh.fire_tick()
-        assert fresh.start_tick((fresh.state.created_at, fresh.state.ticks_fired))
+        assert fresh.state.claim_phase == "started"
         assert fresh.revise(reason="slower", interval_seconds=600)["ok"]
         assert load_loop("c5").control_generation == before
 

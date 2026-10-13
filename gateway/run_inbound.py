@@ -909,32 +909,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
                 return []
 
-        if getattr(event, "_gateway_loop_execution_fence", None) is not None:
-            def _has_hook_producer():
-                from hermes_cli.plugins import has_hook
-                if has_hook("pre_command"):
-                    return True
-                registry = self.hooks
-                active = getattr(registry, "_active", None)
-                if callable(active):
-                    registry = active()
-                resolve = getattr(registry, "_resolve_handlers", None)
-                if callable(resolve):
-                    return bool(resolve(f"command:{canonical}"))
-                # Unknown hook hosts with a dispatcher are effectful until proven otherwise.
-                return callable(getattr(registry, "emit_collect", None))
-
-            if await self._run_in_executor_with_context(_has_hook_producer):
-                _started, hook_results = await self._invoke_loop_wake_effect(
-                    event, _dispatch_hooks,
-                )
-                if not _started:
-                    return True, None, None
-            else:
-                # An empty registry is not an observer effect and must leave the tick transferable.
-                hook_results = []
-        else:
-            hook_results = await _dispatch_hooks()
+        _started, hook_results = await self._invoke_loop_wake_effect(event, _dispatch_hooks)
+        if not _started:
+            return True, None, command
 
         for hook_result in hook_results:
             if not isinstance(hook_result, dict):
@@ -1172,13 +1149,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 return True, result
         if canonical in self._HM_CANONICAL_COMMANDS:
             handler = getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")
-            loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
-            if loop_fence is not None and canonical in {"learn", "plan"}:
-                # These handlers only build a model prompt for a wake: no transport ack, plugin,
-                # or user-visible effect starts here. An observer hook, if present, owns its CAS.
-                if not self._loop_wake_execution_fence_sync(event, loop_fence):
-                    return True, None
-                return await handler(event, source, _quick_key)
             started, result = await self._invoke_loop_wake_effect(
                 event, handler, event, source, _quick_key,
             )
@@ -1421,30 +1391,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         self, event: "MessageEvent", source: SessionSource, _quick_key: str
     ) -> Tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
-        get_command = getattr(event, "get_command", None)
-        loop_fence = None
-        if callable(get_command) and get_command():
-            loop_identity = self._loop_wake_command_identity(event)
-            if loop_identity is not None:
-                sid, tick = loop_identity
-                loop_fence = (sid, tick, self._current_session_run_generation(_quick_key), None)
-                event._gateway_loop_execution_fence = loop_fence
-            if not await self._begin_command_loop_tick(event, source):
-                return True, None  # superseded /loop tick: its command must not run
-
         async def _loop_command_current() -> bool:
-            nonlocal loop_fence
-            if loop_fence is None:
-                return True
-            sid, tick, run_generation, _control_generation = loop_fence
-            current_control_generation = await self._loop_wake_execution_current(
-                sid, tick, source, run_generation=run_generation,
-            )
-            if current_control_generation is None:
-                return False
-            loop_fence = (sid, tick, run_generation, current_control_generation)
-            event._gateway_loop_execution_fence = loop_fence
-            return True
+            return await self._prepare_loop_wake_execution(event, source)
 
         if not await _loop_command_current():
             return True, None
@@ -1452,18 +1400,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             event, source, _quick_key,
         )
         async def _loop_command_fallthrough():
-            if loop_fence is not None:
-                if not await _loop_command_current():
-                    return True, None
-                sid, tick, run_generation, control_generation = loop_fence
-                if control_generation is None:
-                    return True, None
-                event.metadata["gateway_loop_run_handoff"] = {
-                    "session_id": sid,
-                    "tick": list(tick),
-                    "run_generation": int(run_generation),
-                    "control_generation": int(control_generation),
-                }
+            if not await _loop_command_current():
+                return True, None
             return False, None
 
         if not _handled:
@@ -1620,6 +1558,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # Claim this session before any await: many awaits sit between here and _run_agent
         # registering the real AIAgent; without this sentinel a second message during any of them
         # passes the "already running" guard and spins up a duplicate agent for the same session.
+        _loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if not self._loop_wake_execution_fence_sync(event, _loop_fence):
+            return None
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
@@ -1628,6 +1569,17 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
+        # A rewrite continues the wake's admission generation. No await may separate this
+        # check from sentinel installation, and no rejected wake inherits a successor token.
+        _loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if not self._loop_wake_execution_fence_sync(event, _loop_fence):
+            if _active_session_lease is not None:
+                _active_session_lease.release()
+            return None
+        _run_generation = (
+            _loop_fence[2] if _loop_fence is not None
+            else self._begin_session_run_generation(_quick_key)
+        )
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
@@ -1637,14 +1589,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
-        _run_generation = self._current_session_run_generation(_quick_key)
-
         try:
-            _run_generation, _run_generation_ready = await self._begin_model_run_generation_for_event(
-                event, _quick_key,
-            )
-            if not _run_generation_ready:
-                return None
             if not is_internal:  # fail-open plugin consume, inside the claimed slot (#129958)
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)

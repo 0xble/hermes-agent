@@ -2452,6 +2452,12 @@ class GatewayTurnMixin:
             (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
         )
 
+        if not await self._prepare_loop_wake_execution(event, source):
+            return
+        _owned_loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if _owned_loop_fence is not None:
+            run_generation = _owned_loop_fence[2]
+
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
@@ -2487,6 +2493,8 @@ class GatewayTurnMixin:
                 logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
         event._restart_note_marker_api_available = _resume_marker_reader_available
         event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
+        if not await self._prepare_loop_wake_execution(event, source):
+            return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2495,6 +2503,8 @@ class GatewayTurnMixin:
         history, message_text = prepared.history, prepared.message_text
 
         try:
+            if not await self._prepare_loop_wake_execution(event, source):
+                return
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -2517,35 +2527,11 @@ class GatewayTurnMixin:
                 self._clear_user_stop_latch(_quick_key)
             await self._revive_blocked_goal_for_user_turn(session_entry, source, event)
             _run_start_session_id = session_entry.session_id
-            # A /loop adapter admission is not model execution. Re-check the durable session
-            # lineage and atomically promote only this exact claimed tick to executing immediately
-            # before model work. A reset that wins this boundary retires the old conversation and
-            # no external effect is replayed.
-            _loop_tick = None
-            _loop_mgr = None
-            _loop_meta = getattr(event, "metadata", None) or {}
-            if _loop_meta.get("hermes_loop_wakeup"):
-                raw_tick = _loop_meta.get("gateway_loop_tick")
-                if not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2:
-                    return
-                _loop_tick = (raw_tick[0], raw_tick[1])
-                current_entry = await self.async_session_store.lookup_by_session_key(session_key)
-                if (current_entry is None or current_entry.session_id != _run_start_session_id
-                        or not self._is_session_run_current(_quick_key, run_generation)):
-                    return
-                from hermes_cli.loops import LoopManager
-                def _start_owned_loop_tick():
-                    return LoopManager(_run_start_session_id).start_tick(_loop_tick, run_generation)
-                if not await self._run_in_executor_with_context(_start_owned_loop_tick):
-                    return
-                _control_generation = await self._loop_wake_execution_current(
-                    _run_start_session_id, _loop_tick, source, run_generation=run_generation,
-                )
-                if _control_generation is None:
-                    return
-                event._gateway_loop_execution_fence = (
-                    _run_start_session_id, _loop_tick, run_generation, _control_generation,
-                )
+            _loop_tick = self._loop_wake_command_identity(event)
+            _loop_tick = _loop_tick[1] if _loop_tick is not None else None
+            if not await self._prepare_loop_wake_execution(event, source):
+                return
+            if _loop_tick is not None:
                 event._gateway_loop_tick = _loop_tick
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and

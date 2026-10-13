@@ -361,9 +361,9 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         _record("list_active_loops")
         return real_list(*a, **k)
 
-    def _fire_tick(self):
+    def _fire_tick(self, *args, **kwargs):
         _record("fire_tick")
-        return real_fire(self)
+        return real_fire(self, *args, **kwargs)
 
     def _complete_tick(self, last_response):
         _record("complete_tick")
@@ -393,10 +393,8 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env, monkeypatch, tmp_path):
-    """A secondary profile with no ACTIVE loop must not get its runtime scope entered on
-    every tick (each entry re-parses the profile's config/secrets — the dominant idle-CPU
-    cost on multiplex gateways); a profile holding an active loop must still be scanned."""
+async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydration(loop_env, monkeypatch, tmp_path):
+    """Loop discovery reads the owning store without hydrating secrets before tick admission."""
     from hermes_state import SessionDB
 
     work_home = tmp_path / "profiles" / "work"
@@ -433,6 +431,13 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
     runner.config.multiplex_profiles = True
     runner._running_agents = {}
     runner.adapters = {}
+    from hermes_constants import get_hermes_home
+    admitted = []
+
+    async def admission(sid, state, now, warned, profile=None):
+        admitted.append((sid, get_hermes_home(), profile))
+
+    runner._loop_wakeup_fire_one = admission
 
     orig_sleep = asyncio.sleep
 
@@ -463,22 +468,26 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
         assert raw
         work_db.set_meta("loop:sid-work-loop", raw)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"profile with an active loop must still be scanned; got {entered}")
+        assert entered == [], f"secret hydration preceded admission: {entered}"
+        assert admitted == [
+            ("sid-gateway-loop", loop_env, None),
+            ("sid-work-loop", work_home, "work"),
+        ]
 
         # A cleared loop keeps its row (status=cleared): the gate must read status, not key existence.
         entered.clear()
         cleared = loops.LoopState.from_json(raw)
         cleared.status = "cleared"
         work_db.set_meta("loop:sid-work-loop", cleared.to_json())
+        admitted.clear()
         await _run_one_tick()
         assert entered == [], f"cleared loop row must not open the gate; got {entered}"
+        assert admitted == [("sid-gateway-loop", loop_env, None)]
 
         # Fail OPEN: a store the probe cannot open is "unknown", never "idle" — the scan runs.
         monkeypatch.setattr("gateway.run_idle_gates._profile_session_db_probe", lambda _home: None)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"unavailable store must fall back to the historical scan; got {entered}")
+        assert entered == [], f"an unavailable store triggered pre-admission hydration: {entered}"
     finally:
         work_db.close()
 
