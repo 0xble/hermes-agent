@@ -62,12 +62,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   parked marker and still shows a running gateway.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_parked_status_still_reports_a_forced_gateway`).
-- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
-  `f974222e69278b856b1b75053774e10014c4797b` contains the same runtime-snapshot
-  guard and the equivalent forced-gateway regression.
-- **Retirement:** The fork's status implementation is already source-equivalent for
-  this behavior; retain the shared implementation and record only this ledger
-  retirement.
+- **Status:** Upstream-main comparison at
+  `f974222e69278b856b1b75053774e10014c4797b` is source-equivalent and contains
+  the same runtime-snapshot guard and forced-gateway regression. This is not a
+  released-upstream retirement proof, so the fork patch remains active.
+- **Retirement:** Retire only after the selected released upstream contains the
+  equivalent behavior and the regression passes there without the local implementation.
 
 ## Stale Bot Desktop lease survives a rename
 
@@ -116,11 +116,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   restart path.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_restart_after_stop_unparks_and_serves_the_profile`).
-- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
-  `f974222e69278b856b1b75053774e10014c4797b` contains the same parked-profile
-  restart path and regression.
-- **Retirement:** `hermes_cli/gateway_profile_lifecycle.py` is already identical
-  to upstream for this identity; record the retirement without source changes.
+- **Status:** Upstream-main comparison at
+  `f974222e69278b856b1b75053774e10014c4797b` is source-equivalent and contains
+  the same parked-profile restart path and regression. This is not a
+  released-upstream retirement proof, so the fork patch remains active.
+- **Retirement:** Retire only after the selected released upstream contains the
+  equivalent behavior and the regression passes there without the local implementation.
 
 ## Launchd restart tests depend on the host gateway
 
