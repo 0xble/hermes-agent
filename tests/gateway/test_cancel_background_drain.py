@@ -189,3 +189,94 @@ async def test_cancel_background_tasks_discards_deferred_command_behind_live_own
     await adapter.cancel_background_tasks()
     await asyncio.sleep(0.05)
     assert ran == ["turn"]
+
+
+def _dropped_notices(adapter):
+    return [c.kwargs.get("content", c.args[1] if len(c.args) > 1 else None)
+            for c in adapter.send.await_args_list
+            if "/compress" in str(c.kwargs.get("content", c.args[1] if len(c.args) > 1 else ""))]
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_reports_unrun_deferred_command():
+    """A deferred command acknowledged with "scheduled after the current turn commits" that the
+    teardown discards gets exactly one visible outcome instead of vanishing (the queue is in-memory
+    and a restart cannot replay it)."""
+    from agent.i18n import t
+
+    adapter = _make_adapter()
+    adapter.send = AsyncMock(return_value=None)
+    sk = build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm"))
+    started = asyncio.Event()
+    ran: list[str] = []
+
+    async def handler(event):
+        ran.append(event.text)
+        if event.text == "turn":
+            started.set()
+            await asyncio.Event().wait()
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("turn"))
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    adapter.defer_command_until_idle(sk, _event("/compress"))
+    await adapter.cancel_background_tasks()
+    await asyncio.sleep(0.05)
+    assert ran == ["turn"]
+    assert _dropped_notices(adapter) == [t("gateway.busy.deferred_dropped", command="compress")]
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_tasks_reports_inflight_deferred_command():
+    """A deferred /compress whose replay is still running when the adapter is torn down (the
+    2026-10-13 restart case) ends with one failure line, not silence."""
+    from agent.i18n import t
+
+    adapter = _make_adapter()
+    adapter.send = AsyncMock(return_value=None)
+    sk = build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm"))
+    release = asyncio.Event()
+    compress_started = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "turn":
+            await release.wait()
+            return None
+        compress_started.set()
+        await asyncio.Event().wait()
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("turn"))
+    await asyncio.sleep(0)
+    adapter.defer_command_until_idle(sk, _event("/compress"))
+    release.set()
+    await asyncio.wait_for(compress_started.wait(), timeout=2.0)
+    await adapter.cancel_background_tasks()
+    assert _dropped_notices(adapter) == [t("gateway.busy.deferred_dropped", command="compress")]
+
+
+@pytest.mark.asyncio
+async def test_completed_deferred_command_gets_no_dropped_notice():
+    """A deferred command that already delivered its own result is not reported again at teardown."""
+    adapter = _make_adapter()
+    adapter.send = AsyncMock(return_value=None)
+    sk = build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm"))
+    release = asyncio.Event()
+    done = asyncio.Event()
+
+    async def handler(event):
+        if event.text == "turn":
+            await release.wait()
+            return None
+        done.set()
+        return None
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_event("turn"))
+    await asyncio.sleep(0)
+    adapter.defer_command_until_idle(sk, _event("/compress"))
+    release.set()
+    await asyncio.wait_for(done.wait(), timeout=2.0)
+    await asyncio.sleep(0.05)
+    await adapter.cancel_background_tasks()
+    assert _dropped_notices(adapter) == []
