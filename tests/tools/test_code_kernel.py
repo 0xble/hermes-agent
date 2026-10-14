@@ -386,17 +386,17 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         self.assertIn("kernel evicted", after["kernel"]["note"])
         self.assertIn("re-create variables", after["kernel"]["note"])
 
-    def test_owner_shutdown_retains_unconsumed_eviction_signal(self):
-        from tools.code_kernel import shutdown_kernels_for_owner
+    def test_conversation_reset_drops_eviction_signal(self):
+        from tools.approval import clear_session
 
         with _kernel_config(max_session_kernels=1):
             self._run_as("conv-a", "x = 41", task_id="turn-a")
             self._run_as("conv-b", "y = 1", task_id="turn-b")
-            shutdown_kernels_for_owner("conv-a")
-            after = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
-        self.assertEqual(after["status"], "error", after)
-        self.assertTrue(after["kernel"]["state_reset"], after)
-        self.assertIn("kernel evicted", after["kernel"]["note"])
+            clear_session("conv-a")
+            after = self._run_as("conv-a", "print('hello')", task_id="turn-new")
+        self.assertEqual(after["status"], "success", after)
+        self.assertFalse(after["kernel"]["state_reset"], after)
+        self.assertNotIn("note", after["kernel"])
 
     def test_eviction_signal_is_present_when_replacement_spawn_fails(self):
         from unittest.mock import patch

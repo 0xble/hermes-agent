@@ -465,17 +465,20 @@ def shutdown_all_kernels() -> None:
 
 
 def shutdown_kernels_for_owner(owner: str) -> None:
-    """Dispose every live kernel a session owns — wired into ``tools.approval.clear_session``
+    """Dispose every kernel a session owns — wired into ``tools.approval.clear_session``
     so kernels die at the same boundary that clears approval/yolo state (/new, session close).
 
-    An eviction tombstone is deliberately retained here: a resumable conversation can
-    lose its live kernel during LRU pressure before this cleanup runs, and its next
-    execute_code call still needs the model-facing state-reset signal.
+    Eviction tombstones die with the owner too. ``clear_session`` is the boundary for
+    /new, /reset and auto-reset, which reuse the session key for a different
+    conversation that never had the evicted variables. A conversation resumed after
+    this boundary starts with a fresh kernel whether its kernel was evicted earlier
+    or killed here, so neither case carries a state-reset note across it.
 
     See #88637.
     """
     if owner:
         _REGISTRY.shutdown(owner)
+        _forget_kernel_evictions(lambda candidate: candidate == owner)
 
 
 def delegated_child_owner_matcher(child_session_id: str) -> Callable[[str], bool]:
@@ -951,6 +954,8 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
                 with _REGISTRY.lock:
                     _EVICTED_KERNELS[key] = state_reset_note
                     _EVICTED_KERNELS.move_to_end(key)
+                    while len(_EVICTED_KERNELS) > _MAX_REMEMBERED_KERNEL_EVICTIONS:
+                        _EVICTED_KERNELS.popitem(last=False)
             body = json.loads(_error_result(
                 str(exc), tool_calls_made=kernel.tool_call_counter[0],
                 duration=round(time.monotonic() - exec_start, 2),
