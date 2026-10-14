@@ -35,6 +35,16 @@ def _cut_is_recoverable(reason) -> bool:
     return bool(reason) and not _cut_is_user_stop(reason)
 
 
+def acknowledge_survivor_notifications(registry, notifications) -> None:
+    """Record durable delivery only after a notification consumer rendered/admitted it."""
+    acknowledge = getattr(registry, "acknowledge_survivor_completion", None)
+    if acknowledge is None:
+        return
+    for event, _text in notifications:
+        if event.get("type", "completion") == "completion":
+            acknowledge(event.get("session_id", ""))
+
+
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
