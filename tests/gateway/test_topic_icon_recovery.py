@@ -30,3 +30,15 @@ async def test_unsupported_topic_icon_still_refuses_and_suggests_only_catalog_ch
     assert "Unsupported topic icon" in text
     assert "Available icons: 👨 ⚡" in text
     assert "Closest" in text and "👨" in text
+
+
+@pytest.mark.asyncio
+async def test_unrelated_topic_icon_gets_no_closest_suggestion():
+    adapter = SimpleNamespace(get_forum_topic_icon_options=AsyncMock(return_value=[
+        {"emoji": "👨", "custom_emoji_id": "person"},
+        {"emoji": "⚡", "custom_emoji_id": "lightning"},
+    ]))
+    with pytest.raises(TopicRequestError) as exc:
+        await _create_icon(adapter, "🍕")
+    assert "Closest" not in str(exc.value)
+    assert "Available icons: 👨 ⚡" in str(exc.value)

@@ -1204,7 +1204,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     def _suggest_similar_files(self, path: str) -> ReadResult:
         """"File not found" result listing up to 5 similar names from the same directory."""
         from tools.file_operations_search import _normalized_filename_search_root
-        path = _normalized_filename_search_root(self.env, path, self.cwd)
+        # Report the resolution separately; the probe and error keep the raw path.
+        resolved_path = _normalized_filename_search_root(self.env, path, self.cwd)
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
         basename_no_ext = os.path.splitext(filename)[0].lower()
@@ -1238,7 +1239,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 if score > 0:
                     scored.append((score, os.path.join(dir_path, f)))
         scored.sort(key=lambda x: -x[0])
-        return ReadResult(error=f"File not found: {path}", not_found=True, resolved_path=path,
+        return ReadResult(error=f"File not found: {path}", not_found=True, resolved_path=resolved_path,
                           similar_files=[fp for _, fp in scored[:5]],
                           hint="Do not retry the same path; use similar_files or search_files to locate the file.")
 
@@ -1693,8 +1694,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         exclusions = self._macos_search_exclusions(path)
         if exclusions and not result.error:
             skipped = ", ".join(item.split("/")[-1] for item in exclusions)
-            result.warning = (
+            protected = (
                 "Skipped macOS protected folders during broad search to avoid "
                 f"an unattended privacy prompt: {skipped}. Search a protected "
                 "folder directly when access is intentional.")
+            # Append: earlier disclosures (e.g. a literal-search retry) must survive.
+            result.warning = f"{result.warning} {protected}" if result.warning else protected
         return result

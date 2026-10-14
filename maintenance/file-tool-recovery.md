@@ -28,7 +28,11 @@ native-search, fuzzy-match, and unicode filename tests as compatibility checks.
 ## Adoption and retirement
 
 During upstream sync, compare the literal retry bound and warning on every output
-mode, execution-backend path resolution, and complete ambiguity locations. Adopt
+mode (the retry note is appended to multiline and macOS protected-folder notes,
+never replacing them), execution-backend path resolution (reported in
+`resolved_path` while the probe and error keep the raw path), and ambiguity
+locations (exact `match_count`, first 20 `match_lines`, `match_lines_truncated`
+when more exist). Adopt
 an equivalent upstream implementation only after the dispatch tests pass without
 the fork code. Never turn approximate replace-all refusal into an automatic edit.
 Retire this unit when those recovery contracts are upstream-equivalent. Rollback

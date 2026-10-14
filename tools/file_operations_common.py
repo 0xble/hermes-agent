@@ -75,6 +75,7 @@ class PatchResult:
     error: Optional[str] = None
     match_count: Optional[int] = None
     match_lines: List[int] = field(default_factory=list)
+    match_lines_truncated: bool = False
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
     note: Optional[str] = None
@@ -87,6 +88,7 @@ class PatchResult:
     _DICT_FIELDS: ClassVar[tuple] = (
         "diff", "files_modified", "files_created", "files_deleted",
         "lint", "lsp_diagnostics", "error", "match_count", "match_lines",
+        "match_lines_truncated",
     )
 
     def to_dict(self) -> dict:

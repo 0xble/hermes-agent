@@ -68,6 +68,21 @@ def test_invalid_regex_retries_literal_once_without_broadening_search(dispatch, 
     assert "Permission denied" in denied_result["error"] and len(calls) == 1
 
 
+def test_literal_retry_warning_survives_protected_folder_and_multiline_notes(dispatch, tmp_path, monkeypatch):
+    if not dispatch.ops._has_command("rg"):
+        pytest.skip("requires ripgrep")
+    (tmp_path / "data.txt").write_text("call(\n")
+    monkeypatch.setattr(dispatch.ops, "_macos_search_exclusions", lambda path: ["Desktop"])
+    broad = dispatch("search_files", pattern="call(", path=".")
+    assert "fixed-string" in broad["warning"] and "Skipped macOS protected folders" in broad["warning"]
+    assert broad["warning"].index("fixed-string") < broad["warning"].index("Skipped macOS")
+    # A malformed multiline pattern keeps the -U note and appends the retry note.
+    monkeypatch.setattr(dispatch.ops, "_macos_search_exclusions", lambda path: [])
+    multi = dispatch("search_files", pattern="call(\\nx", path=".")
+    assert multi.get("error") is None, multi
+    assert multi["warning"].index("multiline") < multi["warning"].index("fixed-string"), multi
+
+
 def test_missing_paths_report_resolution_and_stable_suggestions(dispatch, tmp_path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "AGENTS.md").write_text("guide\n")
@@ -101,6 +116,12 @@ def test_ambiguous_patch_reports_every_location_and_never_writes(dispatch, tmp_p
     fuzzy = dispatch("patch", path="data.txt", old_string="\tanchor", new_string="changed")
     assert fuzzy.get("match_count") == 2 and fuzzy.get("match_lines") == [2, 4], fuzzy
     assert path.read_text() == spaced
+    many = "anchor\n" * 25
+    path.write_text(many)
+    capped = dispatch("patch", path="data.txt", old_string="anchor", new_string="changed")
+    assert capped["match_count"] == 25
+    assert capped["match_lines"] == list(range(1, 21)) and capped["match_lines_truncated"] is True
+    assert "match_lines_truncated" not in result
     path.write_text(content)
     applied = dispatch("patch", path="data.txt", old_string="anchor", new_string="changed", replace_all=True)
     assert applied["success"] is True

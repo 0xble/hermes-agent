@@ -1094,8 +1094,10 @@ class SearchMixin:
             # Retry only a malformed regex, retaining the same root, globs and bounds.
             cmd_parts.insert(1, "--fixed-strings")
             note = "Invalid regex; retried once as a fixed-string (literal) search."
-            result = self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context)
-            result.warning = note
+            result = self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context,
+                                               warning=ml_note)
+            # Append to the multiline note (count mode does not carry it through).
+            result.warning = " ".join(part for part in (result.warning or ml_note, note) if part)
         return result
 
     def _grep_cmd(self, head: List[str], pattern: str, output_mode: str, context: int,
