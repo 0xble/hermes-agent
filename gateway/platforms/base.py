@@ -3135,7 +3135,7 @@ class BasePlatformAdapter(ABC):
         """Send a session-control approval request; non-button adapters use text fallback."""
         return await self.send(
             chat_id=chat_id,
-            content=f"{text}\n\nRequest: {request_id} (buttons unavailable on this platform.)",
+            content=f"{text}\n\nRequest: {request_id} (approval requires the Telegram buttons; this adapter cannot render them.)",
             metadata=metadata,
         )
 

@@ -1503,6 +1503,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1535,6 +1536,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
                 await self._run_post_turn_hooks(

@@ -1143,16 +1143,33 @@ class LoopManager:
         return {"status": s.status if s else None, "stopped": False,
                 "reason": "loop changed during the tick", "message": ""}
 
-    def abandon_tick(self) -> None:
-        """Roll back a fired tick whose injection failed (nothing ran)."""
+    def abandon_tick(self, *, tick: Optional[Tuple[float, int]] = None) -> None:
+        """Roll back a fired tick whose turn never ran.
+
+        ``tick`` fences the rollback to the wake that is being abandoned. Without that fence, a
+        stale early-exit handler could undo a newer tick claimed after the original wake was queued.
+        """
         s = self._state
         if s is None or not s.awaiting_response:
             return
-        fired = s.ticks_fired
+        if tick is not None:
+            try:
+                instance, fired = tick
+            except (TypeError, ValueError):
+                return
+            if s.created_at != instance or s.ticks_fired != fired:
+                if not self._follow_compression():
+                    return
+                s = self._state
+                if s is None or not s.awaiting_response or s.created_at != instance or s.ticks_fired != fired:
+                    return
+        else:
+            fired = s.ticks_fired
 
         def settle(state: LoopState) -> None:
             state.awaiting_response = False
             state.ticks_fired = max(0, fired - 1)
+            state.next_due_at = time.time()
 
         self._save_tick_outcome(fired, settle)
 

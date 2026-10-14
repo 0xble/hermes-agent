@@ -707,6 +707,32 @@ class GatewayGoalsMixin:
         streamed = getattr(event, "_streamed_final_response", None)
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
+    async def _release_unsettled_loop_tick(self, event: Any, *, ran: bool) -> None:
+        """Release a stamped loop claim when an admitted wake never reaches post-turn hooks.
+
+        The scheduler has already marked the tick in flight before handing the event to the adapter.
+        Admission can still return early, for example on the active-session cap or a lease timeout.
+        Those paths must roll back exactly the wake they carried, and the DB write stays in the
+        executor because SessionDB is not event-loop safe.
+        """
+        if ran or event is None or getattr(event, "_loop_tick_settled", False):
+            return
+        metadata = getattr(event, "metadata", None) or {}
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        if not metadata.get(LOOP_WAKE_METADATA_KEY) or metadata.get("loop_wakeup_command"):
+            return
+        session_id = metadata.get("loop_wakeup_session_id")
+        instance = metadata.get("loop_wakeup_instance")
+        fired = metadata.get("loop_wakeup_tick")
+        if not isinstance(session_id, str) or not session_id or type(instance) not in (int, float) or type(fired) is not int:
+            return
+        from hermes_cli.loops import LoopManager
+        manager = LoopManager(session_id=session_id)
+        await self._run_in_executor_with_context(
+            functools.partial(manager.abandon_tick, tick=(instance, fired))
+        )
+        event._loop_tick_settled = True
+
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
         loop_tick: Optional[tuple] = None,
