@@ -532,6 +532,8 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     record_delivery_outcome, recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+from cron.scheduler_review import enqueue_review, record_review_suppression
+from cron.scheduler_worker_failure import finish_interrupted_run
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -3081,11 +3083,9 @@ class _RunDelivery:
 
 def _run_delivery_outcome(d: _RunDelivery) -> str:
     job = d.job
-    if job.get("_review_pending"):
-        return "queued"
     return _classify_delivery_outcome(
         delivery_error=d.delivery_error,
-        delivery_queued=job.get("last_delivery_queued"),
+        delivery_queued=job.get("last_delivery_queued") or job.get("_review_pending"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
@@ -3149,7 +3149,6 @@ def _save_compose_deliver(
         logger.warning("Job '%s': skipping delivery after fire claim ownership loss", job["id"])
 
     if not d.should_deliver:
-        from cron.scheduler_review import record_review_suppression
         record_review_suppression(job, deliver_content, d.success)
         if commit_result is not None:
             commit_result()
@@ -3163,12 +3162,8 @@ def _save_compose_deliver(
             if not owns_delivery:
                 raise _FireClaimLostDuringSideEffect
             d.delivery_attempted = True
-            if d.success and isinstance(job.get("review"), dict):
-                from cron.scheduler_review import enqueue_review
-                if enqueue_review(job, deliver_content):
-                    if commit_result is not None:
-                        commit_result()
-                    return
+            if d.success and enqueue_review(job, deliver_content, commit_result):
+                return
             # Queue before committing terminal: a worker killed between those
             # writes cannot lose the notice. The gateway claims only after the
             # ledger is terminal (delivery_queue.claim_next).
@@ -3198,26 +3193,6 @@ def _save_compose_deliver(
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-
-def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
-    """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
-    if delivery_error:
-        try:
-            # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
-            # — but it could not know that the notice we just tried to send never left the process (the
-            # adapters were torn down first, #82232). Record the delivery failure on its own via update_job:
-            # mark_job_run also advances next_run_at and the repeat counter, and running that a second time
-            # for one run would skip a fire or auto-delete the job early.
-            from cron.jobs import update_job
-            update_job(job["id"], {"last_delivery_error": delivery_error})
-        except Exception as _rec_err:
-            logger.debug(
-                "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    finish_execution(
-        execution_id, success=False,
-        error="Run stopped before finishing; no terminal result was recorded.")
 
 
 def _record_committed_delivery_outcome(execution_id: str, outcome: str) -> None:
@@ -3558,7 +3533,7 @@ def _run_one_job_body(
                 return True
 
         if _consume_interrupted_flag(job["id"], execution_token):
-            _finish_interrupted_run(job, execution_id, delivery_error)
+            finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
         return _finish_completed_run(d, fire_owner, execution_id, result_committed=committed)

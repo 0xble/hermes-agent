@@ -176,17 +176,19 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
     raise RuntimeError("review rerun child failed: " + stderr[-500:])
 
 
-def enqueue_review(job, content) -> bool:
+def enqueue_review(job, content, commit_result=None) -> bool:
     """Queue under the caller's fire fence before committing the terminal run."""
     from cron.delivery_queue import enqueue
     from cron.execution_identity import current_cron_execution
     identity = current_cron_execution()
-    if identity is None:
+    if identity is None or not isinstance(job.get("review"), dict):
         return False
     review_job = dict(job, _review_run_id=identity.execution_id,
                       _review_deadline_epoch=time.time() + float(job["review"].get("deadline_minutes", 10)) * 60)
     enqueue(identity.execution_id, review_job, content, terminal_gate=True)
     job["_review_pending"] = True
+    if commit_result is not None:
+        commit_result()
     return True
 
 

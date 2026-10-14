@@ -16,8 +16,6 @@ import os
 import re
 import uuid
 
-from cron.review import normalize_review, validate_review_delivery
-
 # Cross-process advisory locking for jobs.json: fcntl (Unix) or msvcrt (Windows). If both are
 # absent, _jobs_lock() degrades to in-process locking rather than failing.
 try:
@@ -34,6 +32,8 @@ from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
 from cron.scheduler_ownership import _claim_owner_is_dead
+from cron.scheduler_detached_worker import normalize_hard_wall_timeout
+from cron.review import apply_review_update, normalize_review, validate_review_delivery
 from cron import store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
@@ -1803,21 +1803,6 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
-def _normalize_hard_wall_timeout(value: Any) -> Optional[float]:
-    """Positive finite seconds; None/zero/empty clears a per-job override."""
-    import math
-
-    if value is None or value == "":
-        return None
-    try:
-        seconds = float(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.") from None
-    if isinstance(value, bool) or not math.isfinite(seconds) or seconds < 0:
-        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.")
-    return seconds or None
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1834,7 +1819,7 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "failure_deliver": _normalize_failure_deliver,
     "review": normalize_review,
     "interpreter": _normalize_job_optional_text,
-    "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
+    "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1846,7 +1831,7 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
     "review": normalize_review,
-    "hard_wall_timeout_seconds": _normalize_hard_wall_timeout,
+    "hard_wall_timeout_seconds": normalize_hard_wall_timeout,
 }
 
 
@@ -2023,8 +2008,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
-        ("review", f["review"]),
-        ("output_local_only", True if f["review"] else None),
+        ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
     ):
@@ -2231,10 +2215,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
-        if "review" in updates:
-            updated["output_local_only"] = bool(updated.get("review"))
-        if {"review", "deliver"}.intersection(updates):
-            validate_review_delivery(updated.get("review"), updated.get("deliver", "local"))
+        apply_review_update(updated, updates)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):

@@ -182,3 +182,11 @@ def normalize_review(value: Any) -> Optional[dict[str, Any]]:
 def validate_review_delivery(review, deliver):
     if review and str(deliver).strip().lower() != "local":
         raise ValueError("review requires deliver=local")
+
+
+def apply_review_update(updated: dict, updates: dict) -> None:
+    """A reviewed report stays on the local lane through every edit."""
+    if "review" in updates:
+        updated["output_local_only"] = bool(updated.get("review"))
+    if {"review", "deliver"}.intersection(updates):
+        validate_review_delivery(updated.get("review"), updated.get("deliver", "local"))
