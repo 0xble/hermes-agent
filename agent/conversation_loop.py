@@ -936,9 +936,19 @@ _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB = (
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None,
+                             dropped_tool_argument_chars: int = 0) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
+        from agent.chat_completion_helpers import PARTIAL_TOOL_ARGUMENT_SIZE_THRESHOLD_CHARS
+        if int(dropped_tool_argument_chars or 0) < PARTIAL_TOOL_ARGUMENT_SIZE_THRESHOLD_CHARS:
+            # A small call cut off by a transport drop: splitting it is wrong advice.
+            return (
+                f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was cut off by a network "
+                "interruption before it finished streaming, so it was not executed. Its size was not "
+                "the problem: reissue the same call as-is if it is still needed, then continue the task. "
+                "Your tools remain fully available.]"
+            )
         return (
             f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and "
             "the stream timed out before it could be delivered. Do NOT retry the same tool call "

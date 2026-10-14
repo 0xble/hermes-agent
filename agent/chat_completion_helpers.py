@@ -2474,8 +2474,14 @@ def cleanup_task_resources(agent, task_id: str) -> None:
                 logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, e)
 
 
+# Tool-call argument streams above this size use the chunked continuation guidance. This is
+# intentionally expressed in characters: streamed argument fragments are not tokenized locally,
+# and ~24K characters is a conservative approximation of the existing ~8K-token guidance.
+PARTIAL_TOOL_ARGUMENT_SIZE_THRESHOLD_CHARS = 24_000
+
+
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None, overflow_terminal=False, api_mode=None, clean_eof=False):
+    dropped_tool_names=None, dropped_tool_argument_chars=0, overflow_terminal=False, api_mode=None, clean_eof=False):
     """Stub for an SSE stream that ended without ``finish_reason`` after
     delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
     so the loop enters its continuation/retry path instead of accepting
@@ -2509,6 +2515,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
             stop_sequence=None,
             usage=usage_obj,
             _dropped_tool_names=dropped_tool_names or None,
+            _dropped_tool_argument_chars=int(dropped_tool_argument_chars or 0),
             _overflow_terminal=overflow_terminal,
             _clean_eof=clean_eof,
         )
@@ -2523,6 +2530,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
         )],
         usage=usage_obj,
         _dropped_tool_names=dropped_tool_names or None,
+        _dropped_tool_argument_chars=int(dropped_tool_argument_chars or 0),
         _overflow_terminal=overflow_terminal,
         _clean_eof=clean_eof,
     )
@@ -2569,11 +2577,33 @@ def _anthropic_connection_error_types() -> tuple:
 
 
 def _is_sse_connection_error(exc: BaseException) -> bool:
-    from openai import APIError as _APIError
-    if not isinstance(exc, _APIError) or getattr(exc, "status_code", None):
+    """Recognize proxy-relayed transport failures from either provider SDK.
+
+    An SSE ``event: error`` is surfaced by Anthropic as ``APIStatusError`` with
+    an HTTP-200 response, so status-code presence alone cannot distinguish it
+    from a real request error. Restrict this path to transport wording and known
+    transport-shaped API error types; genuine 4xx/5xx API errors remain terminal.
+    """
+    error_types = []
+    with contextlib.suppress(ImportError):
+        from openai import APIError as _OpenAIAPIError
+        error_types.append(_OpenAIAPIError)
+    error_types.extend(_anthropic_api_error_types())
+    if not error_types or not isinstance(exc, tuple(error_types)):
+        return False
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None and status_code != 200:
         return False
     err_lower = str(exc).lower()
     return any(phrase in err_lower for phrase in _SSE_CONN_PHRASES)
+
+
+def _anthropic_api_error_types() -> tuple:
+    anthropic = sys.modules.get("anthropic")
+    if anthropic is None:
+        return ()
+    return tuple(t for t in (getattr(anthropic, "APIError", None),
+                             getattr(anthropic, "APIStatusError", None)) if isinstance(t, type))
 
 
 def _relay_stream_identity(agent, name_default: str) -> dict:
@@ -2893,7 +2923,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.api_kwargs = api_kwargs
         self.on_first_delta = on_first_delta
         self.worker = None  # request thread; None in inline mode
-        self.result = {"response": None, "error": None, "partial_tool_names": []}
+        self.result = {"response": None, "error": None, "partial_tool_names": [], "partial_tool_argument_chars": 0}
         self.clients = _RequestClientRegistry(agent)
         # Request-local cancel flag: the worker recognizes its own interrupt
         # force-close (RemoteProtocolError) and exits instead of retrying (#6600).
@@ -2964,6 +2994,8 @@ class _StreamingCall(StreamingWaitMonitor):
         # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
         # before any text must not label a later attempt's partial stub or its retry decision.
         self.result["partial_tool_names"] = []
+        self.result["partial_tool_argument_chars"] = 0
+        self.result["attempt_started_at"] = time.monotonic()
         return attempt_id
 
     def _cancel_current_stream_attempt(self, reason: str) -> None:
@@ -3349,6 +3381,9 @@ class _StreamingCall(StreamingWaitMonitor):
                 _flush_pending_stream_text()
                 for tc_delta in delta_tool_calls:
                     name = tool_calls.feed(tc_delta)
+                    # Incremental: re-summing every buffered part per delta is quadratic on big args.
+                    self.result["partial_tool_argument_chars"] += len(
+                        getattr(getattr(tc_delta, "function", None), "arguments", None) or "")
                     if name is not None:
                         self._emit_tool_started(name)
                         # Lets the stub-builder warn if streaming dies before the args
@@ -3367,7 +3402,7 @@ class _StreamingCall(StreamingWaitMonitor):
         response = self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
             "length" if runaway else finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
             response_id=response_id, upstream_provider=upstream_provider, reasoning_details=reasoning_details,
-            refusal_parts=refusal_parts)
+            refusal_parts=refusal_parts, dropped_tool_argument_chars=self.result["partial_tool_argument_chars"])
         if runaway:
             # Cut, not finished: the length path ends the turn on this mark instead of continuing.
             response._runaway_repetition = True
@@ -3447,7 +3482,7 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _finish_chat_stream(self, stream, role, content_parts, reasoning_parts, tool_calls_acc, finish_reason,
         model_name, usage_obj, *, flush_pending, response_id=None, upstream_provider=None, reasoning_details=None,
-        refusal_parts=None):
+        refusal_parts=None, dropped_tool_argument_chars=0):
         """Assemble the non-streaming-shaped response after the chunk loop. A
         stream ending with no finish_reason is a drop, not a completion: return a
         partial-stream stub so the loop fails fast instead of executing empty
@@ -3476,7 +3511,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 _dropped_names)
             return _build_partial_stream_stub(
                 role, full_content, full_reasoning, model_name, usage_obj, dropped_tool_names=_dropped_names or None,
-                clean_eof=True)
+                dropped_tool_argument_chars=self.result["partial_tool_argument_chars"], clean_eof=True)
         if finish_reason is None and (content_parts or reasoning_parts) and not tool_calls_acc and usage_obj is None:
             # Text-only (or reasoning-only) drop: otherwise the partial text is stamped "stop"
             # and the next step is lost — for reasoning-only, the clean-stop promotion in
@@ -3608,6 +3643,10 @@ class _StreamingCall(StreamingWaitMonitor):
                         if thinking_watch.feed(delta.thinking):
                             runaway = "reasoning"
                             break
+                    elif delta_type == "input_json_delta":
+                        # Sized for the dropped-call diagnostics: only a genuinely large
+                        # argument stream earns the "split it up" continuation guidance.
+                        self.result["partial_tool_argument_chars"] += len(getattr(delta, "partial_json", "") or "")
             raw_stream = _stream_context["stream"]
             if not self.agent._interrupt_requested and raw_stream is not None and not runaway:
                 if not saw_message_stop:
@@ -4053,14 +4092,22 @@ class _StreamingCall(StreamingWaitMonitor):
             _name_str = ", ".join(_partial_names[:3])
             if len(_partial_names) > 3:
                 _name_str += f", +{len(_partial_names) - 3} more"
-            _warn = (f"\n\n⚠ Stream stalled mid tool-call ({_name_str}); the action was not executed. "
-                     f"Ask me to retry if you want to continue.")
+            # The loop continues automatically (length-continuation path), so the warning
+            # must not ask the user to retry by hand.
+            _warn = (f"\n\n⚠ Connection dropped before {_name_str} ran; the action was not executed. "
+                     f"Continuing automatically.")
+            _text_chars = len(_partial_text or "")
             _partial_text = (_partial_text or "") + _warn  # model/result bookkeeping, never gated
             if self.agent._warning_presentation_enabled():
                 self._quiet(self.agent._fire_stream_delta, _warn)  # visible immediately
+            _started = self.result.get("attempt_started_at")
             logger.warning(
-                "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
-                _partial_names, len(_partial_text or ""), error)
+                "Partial stream dropped tool call(s) %s: provider=%s model=%s base_url=%s error_class=%s "
+                "elapsed=%.1fs text_chars=%s tool_argument_chars=%s: %s",
+                _partial_names, getattr(self.agent, "provider", None), getattr(self.agent, "model", None),
+                getattr(self.agent, "base_url", None), type(error).__name__,
+                (time.monotonic() - _started) if _started else -1.0, _text_chars,
+                self.result.get("partial_tool_argument_chars", 0), error)
         # Classify the error before it is swallowed into the stub: the loop reads the
         # content-filter tag and falls back; a context overflow must not be continued at all.
         _cls = None
@@ -4081,7 +4128,7 @@ class _StreamingCall(StreamingWaitMonitor):
             )
             return _build_partial_stream_stub(
                 "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
-                dropped_tool_names=_partial_names, overflow_terminal=True,
+                dropped_tool_names=_partial_names, dropped_tool_argument_chars=self.result["partial_tool_argument_chars"], overflow_terminal=True,
                 api_mode=getattr(self.agent, "api_mode", None),
             )
         if not _partial_names:
@@ -4091,6 +4138,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 len(_partial_text or ""), error)
         _stub = _build_partial_stream_stub("assistant", _partial_text, None,
             getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names,
+            dropped_tool_argument_chars=self.result["partial_tool_argument_chars"],
             api_mode=getattr(self.agent, "api_mode", None))
         if _cls is not None and _cls.reason == FailoverReason.content_policy_blocked:
             _stub._content_filter_terminated = True

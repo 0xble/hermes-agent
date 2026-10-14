@@ -1442,7 +1442,7 @@ class TestPartialToolCallWarning:
         assert "Let me write the audit:" in content, (
             f"Partial text not preserved in stub: {content!r}"
         )
-        assert "Stream stalled mid tool-call" in content, (
+        assert "the action was not executed" in content, (
             f"Stub content is missing the dropped-tool-call warning; users "
             f"get silent failure.  Got content={content!r}"
         )
@@ -1450,7 +1450,7 @@ class TestPartialToolCallWarning:
             f"Warning should name the dropped tool. Got: {content!r}"
         )
         assert response.choices[0].message.tool_calls is None
-        assert any("Stream stalled mid tool-call" in d for d in fired_deltas), (
+        assert any("the action was not executed" in d for d in fired_deltas), (
             f"Warning was not surfaced as a live stream delta. "
             f"fired_deltas={fired_deltas}"
         )
@@ -1681,7 +1681,7 @@ class TestSilentRetryMidToolCall:
 
         # After retries exhaust, the stub-with-warning path must engage.
         content = response.choices[0].message.content or ""
-        assert "Stream stalled mid tool-call" in content, (
+        assert "the action was not executed" in content, (
             f"Exhausted-retry fallback dropped the user-visible warning: {content!r}"
         )
         assert response.choices[0].message.tool_calls is None
