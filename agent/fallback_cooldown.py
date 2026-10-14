@@ -14,6 +14,96 @@ _RATE_LIMIT_FAILOVER_REASONS = frozenset({FailoverReason.rate_limit, FailoverRea
 # shared record, backoff and single outage notice. Generic 5xx and transport faults do not.
 _SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overloaded}
 
+# Delegated, cron, and other unattended runs should give a temporarily unhealthy provider a
+# chance to recover before spending the next fallback route.  Three minutes is long enough to
+# cover the short 5xx/429 incidents seen in practice without parking a task indefinitely.
+DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS = 180.0
+_NONINTERACTIVE_PLATFORMS = frozenset({"subagent", "cron", "background", "goal"})
+_NONINTERACTIVE_TRANSIENT_REASONS = frozenset({
+    FailoverReason.rate_limit,
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def noninteractive_transient_retry_window_seconds(agent) -> float:
+    """Return the configured same-provider retry window for unattended sessions.
+
+    The setting lives under ``delegation.fallback`` because delegated work is its primary
+    consumer; cron/background goal agents use the same policy.  A malformed or negative value
+    falls back to the safe default, while zero deliberately restores immediate failover.
+    """
+    override = getattr(agent, "_noninteractive_transient_retry_window_seconds", None)
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except (TypeError, ValueError):
+            pass
+    try:
+        from hermes_cli.config import load_config
+        configured = (
+            (load_config() or {}).get("delegation", {}).get("fallback", {})
+            .get("transient_retry_window_seconds", DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS)
+        )
+        value = float(configured)
+    except (AttributeError, TypeError, ValueError, ImportError):
+        value = DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS
+    return value if math.isfinite(value) and value >= 0 else DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS
+
+
+def is_noninteractive_session(agent) -> bool:
+    """True for provider calls with no human waiting on the retry decision."""
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    return platform in _NONINTERACTIVE_PLATFORMS or bool(getattr(agent, "side_agent", False))
+
+
+def is_noninteractive_transient(classified, error_message: str = "") -> bool:
+    """Classify only the transient failures eligible for delayed fallback.
+
+    Billing/entitlement refusals intentionally do not qualify, even when the provider reports
+    them with a 403 or 429. ``auth_unavailable`` is the provider-specific transient auth form;
+    ordinary rejected credentials remain immediate failover.
+    """
+    reason = getattr(classified, "reason", None)
+    if reason in _NONINTERACTIVE_TRANSIENT_REASONS:
+        return True
+    return reason == FailoverReason.auth and "auth_unavailable" in str(error_message or "").lower()
+
+
+def hold_noninteractive_transient_retry(agent, classified, *, error_message: str = "", now=None) -> bool:
+    """Record an outage start and return whether fallback must wait for this provider.
+
+    The timestamp is keyed to the active route so a successful fallback switch starts a fresh
+    window.  Callers reset it after a successful response; the helper itself never sleeps — the
+    existing retry/backoff machinery remains the sole pacing mechanism.
+    """
+    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
+        return False
+    window = noninteractive_transient_retry_window_seconds(agent)
+    if window <= 0:
+        return False
+    route = (
+        str(getattr(agent, "provider", "") or ""),
+        str(getattr(agent, "model", "") or ""),
+        str(getattr(agent, "base_url", "") or ""),
+    )
+    now = time.monotonic() if now is None else float(now)
+    prior_route = getattr(agent, "_noninteractive_transient_retry_route", None)
+    started = getattr(agent, "_noninteractive_transient_retry_started_at", None)
+    if prior_route != route or not isinstance(started, (int, float)):
+        agent._noninteractive_transient_retry_route = route
+        agent._noninteractive_transient_retry_started_at = now
+        return True
+    return now - started < window
+
+
+def clear_noninteractive_transient_retry(agent) -> None:
+    """Forget a provider outage after a successful response or a route switch."""
+    agent._noninteractive_transient_retry_route = None
+    agent._noninteractive_transient_retry_started_at = None
+
 
 def _provider_reset_epoch(reset_at) -> float | None:
     """Absolute epoch for a future provider reset, or None when missing/invalid/expired."""

@@ -1373,6 +1373,11 @@ DEFAULT_CONFIG = {
         # A child pinned by provider, endpoint, or model gets no fallback unless this
         # setting declares one explicitly.
         "fallback_providers": None,
+        # Unattended delegation/cron/background runs retry transient provider failures on the
+        # same route before consuming the next fallback. 0 restores immediate failover.
+        "fallback": {
+            "transient_retry_window_seconds": 180.0,
+        },
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |

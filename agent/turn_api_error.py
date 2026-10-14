@@ -289,6 +289,10 @@ def settle_unrecovered_error(
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
     # balance. Mirrors 401/403.
     is_local_validation_error = _is_local_validation_error(api_error)
+    from agent.fallback_cooldown import hold_noninteractive_transient_retry
+    _hold_noninteractive_transient = hold_noninteractive_transient_retry(
+        agent, classified, error_message=error_msg,
+    )
     # ``recover_after_classification`` sets ``image_shrink_retry_attempted`` BEFORE it runs the shrink,
     # so an image-size rejection reaching this point with the flag set had nothing left to shrink (the
     # excess is text on a host whose cap is payload-scoped, or an unshrinkable image). Re-sending the
@@ -309,7 +313,8 @@ def settle_unrecovered_error(
         or shrink_spent
         or reasoning_spent
         or (
-            not classified.retryable
+            not _hold_noninteractive_transient
+            and not classified.retryable
             and not classified.should_compress
             and classified.reason not in RETRYABLE_CLIENT_REASONS
         )
@@ -383,6 +388,16 @@ def settle_unrecovered_error(
         logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
                     agent.log_prefix, retry_count)
         retry_count = max_retries
+
+    from agent.fallback_cooldown import hold_noninteractive_transient_retry
+    _hold_noninteractive_transient = hold_noninteractive_transient_retry(
+        agent, classified, error_message=error_msg,
+    )
+    # Billing and other non-retryable client failures still move immediately.  For an
+    # unattended transient outage, the normal retry loop is allowed to finish the configured
+    # same-provider window before this exhaustion path switches routes.
+    if retry_count >= max_retries and _hold_noninteractive_transient:
+        max_retries = retry_count + 1
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for

@@ -1825,6 +1825,7 @@ def route_classified_error(
     chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
     from agent.conversation_compression import conversation_history_after_compression
     from agent.conversation_loop import _arm_fallback_restart, _ra
+    from agent.fallback_cooldown import hold_noninteractive_transient_retry
     from agent.model_metadata import estimate_request_tokens_rough
 
     _provider_overflow_recovery_pending = False
@@ -1957,15 +1958,19 @@ def route_classified_error(
             # (e.g. a rate limit from an active fallback) must leave terminal exhaustion its window.
             if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at) is not None:
                 _retry.shared_cooldown_arm_attempted = True
+    _hold_noninteractive_transient = hold_noninteractive_transient_retry(
+        agent, classified, error_message=error_msg,
+    )
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
     # directly so the long backoff runs, and raise the ceiling to reach it.
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
-        (is_rate_limited and _wrapped_output_cap_budget is None)
+        not _hold_noninteractive_transient
+        and ((is_rate_limited and _wrapped_output_cap_budget is None)
         or _provider_wide_overload
-        or (_is_transport_failure and retry_count >= 2)
+        or (_is_transport_failure and retry_count >= 2))
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
@@ -1987,6 +1992,7 @@ def route_classified_error(
     if (
         classified.is_auth
         and not _retry.auth_failover_attempted
+        and not hold_noninteractive_transient_retry(agent, classified, error_message=error_msg)
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True
