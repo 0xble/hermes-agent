@@ -1208,9 +1208,10 @@ class TurnRunner:
         return out
 
     def _release_evicted_agent(self, agent) -> None:
-        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop."""
+        """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop. The same
+        session continues on the fresh agent, so no session-end commit (base behavior)."""
         self._runner._spawn_release_thread(
-            self._runner._commit_then_release_soft, (agent, self._ctx.session_key),
+            self._runner._release_evicted_agent_soft, (agent,),
             f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
             inline_fallback=True, session_key=self._ctx.session_key,
         )
