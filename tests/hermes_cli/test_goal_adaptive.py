@@ -448,6 +448,23 @@ def test_a_real_quote_is_shown_with_its_full_message_for_the_judge_to_weigh(herm
     assert "user-authorized" not in history
 
 
+def test_a_quoted_revise_is_not_a_scope_resetting_replacement(hermes_home, monkeypatch):
+    """Only a user-authority goal replacement resets scope; a revise that cites the user does not."""
+    mgr = GoalManager(session_id="rev-quoted-not-replace")
+    mgr.set("Ship X", contract=GoalContract(constraints="Never publish secrets"))
+    result = mgr.revise(reason="loosen", contract={"constraints": ""}, user_quote="Please keep going",
+                        user_messages=["Please keep going"])
+    assert result["ok"]
+    prompts = _capture(monkeypatch, ['{"verdict":"continue","reason":"r"}'])
+    mgr.evaluate_after_turn("working")
+    history = prompts[0].split("Revision history")[1]
+    assert "earlier constraints: Never publish secrets" in history
+    assert "superseded constraints" not in history
+    assert "superseded history (no longer binding)" not in history
+    assert "replaced with user authority" in prompts[0]  # the only marker the reset rule names
+    assert "A revision that merely cites the user is not a replacement" in prompts[0]
+
+
 def test_optional_quote_must_meet_the_minimum_length(hermes_home):
     mgr = GoalManager(session_id="rev-short")
     mgr.set("Ship X")

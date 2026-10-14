@@ -19,6 +19,7 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
 
     from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot
 
+    replace_mode = bool(kwargs.pop("_replace", False))
     original = manager._require_goal()
     if not manager.session_id:
         return manager._revise(**kwargs)
@@ -35,7 +36,7 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         staged = copy.copy(manager)
         staged._state = GoalState.from_json(expected)
         staged._evaluation_snapshot = (db, expected)
-        result = staged._revise(**kwargs)
+        result = staged._replace(**kwargs) if replace_mode else staged._revise(**kwargs)
         # No-op and validation returns must also observe conflicting command writes.
         commit_and_publish_snapshot(
             manager, staged.state,
@@ -72,7 +73,13 @@ class GoalRevisionsMixin:
             subgoals=subgoals, user_quote=user_quote, user_messages=user_messages,
         )
 
-    # --- revisions ------------------------------------------------------
+    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                contract: Optional[Any] = None, user_quote: str = "",
+                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace through the durable snapshot/CAS boundary."""
+        return revise_goal_snapshot(self, reason=reason, goal=goal, max_turns=max_turns,
+                                    contract=contract, user_quote=user_quote,
+                                    user_messages=user_messages, _replace=True)
 
     # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
     # and changing constraints. Other contract fields may be restructured by the agent; the judge
@@ -146,3 +153,78 @@ class GoalRevisionsMixin:
         state.last_dispute_evidence = ""
         self._save()
         return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
+
+    def _replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
+                 contract: Optional[Any] = None, user_quote: str = "",
+                 user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Replace the goal with explicit quote authority and preserve revision history."""
+        from hermes_cli.goals import GoalState, GoalContract, _CONTRACT_FIELDS, normalize_goal_max_turns
+        old = self._state
+        if old is None or old.status not in {"active", "paused"}:
+            return {"ok": False, "error_code": "no_goal", "error": "there is no active or paused goal to replace", "state": old, "revision": None}
+        reason = (reason or "").strip()
+        goal = (goal or "").strip()
+        if not reason:
+            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason", "state": old, "revision": None}
+        if not goal:
+            return {"ok": False, "error_code": "no_change", "error": "replacement goal is empty", "state": old, "revision": None}
+        authority = None
+        try:
+            from hermes_cli.session_controls import _CURRENT_AUTHORITY
+            authority = _CURRENT_AUTHORITY.get()
+        except Exception:
+            authority = None
+        quote = " ".join((user_quote or "").split())
+        source = ""
+        if not (authority and authority.get("via") in {"quote", "button"}):
+            if not quote:
+                return {"ok": False, "error_code": "user_authority_required", "error": "goal replacement needs user_quote", "state": old, "revision": None}
+            try:
+                from hermes_cli.session_controls import (
+                    _governing_sentence, check_user_quote, quote_matches_control)
+                checked = check_user_quote(self.session_id, quote)
+                if isinstance(checked, str):
+                    return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
+                if not quote_matches_control("goal", "replace", self.session_id, self.session_id,
+                                             _governing_sentence(*checked), {"goal": goal}):
+                    return {"ok": False, "error_code": "user_quote_mismatch",
+                            "error": "the quote must be the user asking to replace or change the goal",
+                            "state": old, "revision": None}
+                quote, source = checked
+                # A quote validated here is the same user authority apply_control records.
+                authority = {"via": "quote", "quote": quote, "message": source}
+            except ValueError as exc:
+                code = str(exc)
+                return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}
+        elif authority.get("via") == "button":
+            # Button approval is the user's authority: record who approved what so the judge and
+            # continuation treat the old goal as superseded rather than as an agent-only change.
+            quote = ""
+            source = f'Approved in Telegram: replace goal with "{goal}"'
+        else:
+            source = str(authority.get("message") or "")
+        if user_messages is not None and source == "" and user_messages:
+            source = " ".join(str(user_messages[-1]).split())
+        old_contract = old.contract.to_dict()
+        new_contract = contract.to_dict() if hasattr(contract, "to_dict") else dict(contract or {})
+        new_contract = {k: str(new_contract.get(k) or "").strip() for k in _CONTRACT_FIELDS}
+        before = {"goal": old.goal, "max_turns": old.max_turns, "contract": old_contract,
+                  "status": old.status, "subgoals": list(old.subgoals)}
+        after = {"goal": goal, "max_turns": old.max_turns if max_turns is None else normalize_goal_max_turns(max_turns, self.default_max_turns),
+                 "contract": new_contract, "status": "active", "subgoals": []}
+        revision = {"kind": "replace", "before": before, "after": after, "user_quote": quote,
+                    "user_message": source, "reason": reason, "at": time.time(), "actor": "agent"}
+        if authority and authority.get("via") in {"quote", "button"}:
+            revision["actor"] = "user"
+            revision["authority"] = authority["via"]
+            if authority["via"] == "button":
+                revision["approved_by"] = str(authority.get("user_id") or "")
+        revisions = list(old.revisions) + [revision]
+        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(),
+                                max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),
+                                revisions=revisions)
+        self._save()
+        return {"ok": True, "error_code": "", "error": "", "state": self._state,
+                "revision": revision}
+
+    # --- /subgoal user controls ---------------------------------------

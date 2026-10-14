@@ -7,8 +7,46 @@ single-element lists so mutation stays visible to the outer body.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
+
+_GATEWAY_SILENCE_RETRY_NOTE = (
+    "[System note: the previous execution ended with an intentional-silence marker, but this turn "
+    "contains a human message addressed to you. Answer the latest genuine user request from the "
+    "conversation history now. A typed or out-of-band user message overrides any earlier relay "
+    "or notification 'no reply needed' framing. Do not repeat work or tool calls already completed; "
+    "continue from their results. Write a visible answer or a concise blocker, not NO_REPLY or [SILENT].]"
+)
+
+
+@contextmanager
+def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
+    """Scope recovery guidance and its provider-only continuation cue to one execution.
+
+    Neither value enters the stable prompt or durable history: the note is appended to the
+    ephemeral system prompt, while the cue repairs the API-only final user row that the
+    gateway continuation intentionally stages empty. Restored on every exit path."""
+    if not ctx.silence_retry:
+        yield
+        return
+    stable = agent.ephemeral_system_prompt
+    wire_attr = "_gateway_silence_retry_wire_message"
+    had_wire_attr = hasattr(agent, wire_attr)
+    previous_wire_message = getattr(agent, wire_attr, None)
+    agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
+    setattr(agent, wire_attr, "Continue with the latest genuine user request.")
+    try:
+        yield
+    finally:
+        agent.ephemeral_system_prompt = stable
+        if had_wire_attr:
+            setattr(agent, wire_attr, previous_wire_message)
+        else:
+            try:
+                delattr(agent, wire_attr)
+            except AttributeError:
+                pass
 
 
 @dataclass
@@ -19,6 +57,8 @@ class TurnContext:
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False
+    # Gateway-only continuation budget/provenance; never enters model history or compression flags.
+    silence_retry: bool = False
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"

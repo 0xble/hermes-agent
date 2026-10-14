@@ -24,6 +24,13 @@ No upstream equivalent exists. Upstream PRs adding Telegram topic creation were 
 
 Required-create-icon preflight: upstream `NousResearch/hermes-agent` guidance pinned at `c57331677d7fc46298a7159cf3a650853f0966c5` (2026-10-10). Root guidance directs changes to existing owners and requires tests; root contribution and subsystem guidance files were absent at that revision. Related upstream PRs [#130641](https://github.com/NousResearch/hermes-agent/pull/130641) and [#119907](https://github.com/NousResearch/hermes-agent/pull/119907) concern automatic rename icon selection, not an agent-callable create contract. This fix stays in the existing topic-session owner, retains native-set validation, fails open only when the catalog is unavailable, and does not change auto-titling. Brian explicitly chose caller-selected icons over extending the deterministic fallback.
 
+Icon matching uses `agent.topic_icons.normalize_emoji` so catalog presentation
+selectors do not change identity. Unsupported identities still fail before any
+Telegram mutation, with the valid catalog and a nearest-spelling suggestion;
+suggestions never select an icon automatically. `tests/gateway/test_topic_icon_recovery.py`
+pins this boundary for create and edit. Retain it when adopting upstream topic
+work; ZWJ sequences and skin tones must not collapse to a different icon.
+
 ## Dependencies
 
 Consumes `gateway-session-reasoning-persistence` for reasoning picks that survive restarts. Do not add a second persistence path.

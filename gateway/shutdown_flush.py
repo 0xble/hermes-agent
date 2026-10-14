@@ -485,6 +485,31 @@ CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapte
 DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without transcript append
 
 
+def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    """Shutdown follow-ups are independent future turns even when the answered predecessor's
+    resume marker was cleared by delivery recovery. Upgrade legacy spools at read time too:
+    False from the deferral callback otherwise appends them to history and deletes the spool."""
+    if payload.get("reason") == "shutdown_follow_up":
+        return {**data, "drain_deferred": True, "shutdown_follow_up": True}
+    return data
+
+
+def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any]) -> bool:
+    """An expired drain arrival, or a spooled built-in control command, is never replayed."""
+    if time.time() - path.stat().st_mtime > 24 * 60 * 60:
+        logger.warning("Dropping expired drain-deferred message from %s", path)
+        return True
+    from gateway.platforms.event import MessageEvent
+    from hermes_cli.commands import resolve_command
+    command = MessageEvent(
+        text=text, allow_gateway_control=data.get("allow_gateway_control") is not False,
+    ).get_command()
+    if command and resolve_command(command) is not None:
+        logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
+        return True
+    return False
+
+
 def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                          session_resolver=None, deferred_followup=None,
                          blocked_sessions: Dict[str, int]) -> bool | object:
@@ -517,19 +542,10 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             raise
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
+    data = _upgrade_shutdown_follow_up(payload, data)
     text = data.get("text", "")
-    if data.get("drain_deferred") is True:
-        if time.time() - path.stat().st_mtime > 24 * 60 * 60:
-            logger.warning("Dropping expired drain-deferred message from %s", path)
-            return DROP_PENDING
-        from gateway.platforms.event import MessageEvent
-        from hermes_cli.commands import resolve_command
-        command = MessageEvent(
-            text=text, allow_gateway_control=data.get("allow_gateway_control") is not False,
-        ).get_command()
-        if command and resolve_command(command) is not None:
-            logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
-            return DROP_PENDING
+    if data.get("drain_deferred") is True and _drop_drain_deferred(path, text, data):
+        return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
                        "the flush file has been preserved", path)

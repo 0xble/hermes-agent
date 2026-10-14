@@ -112,7 +112,8 @@ class CLICommandsSessionToolsMixin:
             print(f"  {_t('stop.stopped', count=process_registry.kill_all(source='cli.stop'))}")
         if n_async:
             from tools.async_delegation import interrupt_all
-            print(f"  {_t('stop.interrupted_delegations', count=interrupt_all(reason='/stop'))}")
+            count = interrupt_all(reason='/stop', parent_session_id=getattr(self, "session_id", "") or "")
+            print(f"  {_t('stop.interrupted_delegations', count=count)}")
 
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status."""
