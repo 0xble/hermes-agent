@@ -1,5 +1,7 @@
 """Background-process completions paint a compact title while the model keeps the raw wall."""
+import json
 import queue
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7,8 +9,10 @@ from unittest.mock import Mock
 import pytest
 
 from cli import HermesCLI
+from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.process_registry_notifications import (
-    PROCESS_COMPLETE_DISPLAY_KIND, format_process_notification, process_completion_display_text)
+    PROCESS_COMPLETE_DISPLAY_KIND, ProcessNotificationBatch, format_process_notification,
+    process_completion_display_text)
 from tui_gateway import server
 
 def _registry(events):
@@ -19,6 +23,39 @@ def _registry(events):
 def _event(sid, exit_code, command="cd /tmp && bash long-build.sh"):
     return {"type": "completion", "session_id": sid, "session_key": "display-session", "command": command,
             "exit_code": exit_code, "completion_reason": "exited", "output": "web tsc=0\nSECRET_OUTPUT_LINE"}
+
+@pytest.mark.parametrize("mode", ["concise", "off"])
+def test_cli_survivor_batch_renders_after_drain(tmp_path, monkeypatch, mode):
+    home = tmp_path / "home"
+    monkeypatch.setattr("tools.process_registry.get_hermes_home", lambda: home)
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_cli_survivor", command="make test", task_id="display-session",
+        session_key="display-session", survive_restart=True,
+        delivered_path=str(home / "process-runs" / "proc_cli_survivor" / "delivered"),
+    )
+    registry._running[session.id] = session
+    event = _event(session.id, 3, command="make test")
+    registry.completion_queue.put(event)
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr("cli.CLI_CONFIG", {"display": {"background_process_notifications": mode}})
+    monkeypatch.setattr("tools.async_delegation.claim_event_delivery", lambda *a: "claimed")
+    monkeypatch.setattr("tools.async_delegation.complete_event_delivery", lambda *a: None)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "display-session"
+    cli._pending_input = queue.Queue()
+    cli._drain_process_notifications("cli-post-turn")
+    if mode == "off":
+        assert cli._pending_input.empty()
+    else:
+        batch = cli._pending_input.get_nowait()
+        rendered = batch.render(registry)
+        assert rendered is not None and "exit code 3" in rendered
+        assert json.loads(Path(session.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "claimed"
+        unwrapped, _is_voice, _is_seeded = cli._tui_unwrap_input(batch)
+        assert unwrapped is not None
+    assert json.loads(Path(session.delivered_path).read_text(encoding="utf-8-sig"))["state"] == "delivered"
+
 
 @pytest.mark.parametrize("mode,expect_injected", [("off", False), ("concise", True), ("all", True)])
 def test_drain_honors_background_process_notifications_off(monkeypatch, mode, expect_injected):

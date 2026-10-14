@@ -188,10 +188,19 @@ class ProcessTerminationMixin:
         if deadline is not None:
             settle_deadline = min(settle_deadline, deadline)
         while True:
+            # A probe walks psutil's full host ppid map, which can itself outlast the
+            # settle window under load. Its "alive" answer then predates the reap it was
+            # waiting for, so only a probe that began after the window closed is final.
+            probe_started = time.monotonic()
             survivors = self._probe_survivors(session)
-            if not survivors or time.monotonic() >= settle_deadline:
+            if not survivors or probe_started >= settle_deadline:
                 return survivors
-            time.sleep(min(0.05, max(0.0, settle_deadline - time.monotonic())))
+            now = time.monotonic()
+            if now >= settle_deadline:
+                if deadline is not None and now >= deadline:
+                    return survivors
+                continue
+            time.sleep(min(0.05, max(0.0, settle_deadline - now)))
 
     def _probe_survivors(self, session: "ProcessSession") -> List[int]:
         survivors: List[int] = []

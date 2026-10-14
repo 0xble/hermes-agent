@@ -2444,6 +2444,13 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         self._running = False
         self._clear_plugin_message_injector()
         self._draining = True
+        # Fence restart-survivor pollers before agent-close/finalize drains can lose a
+        # completion claimed into this gateway's in-memory queue.
+        try:
+            from tools.process_registry import process_registry
+            process_registry.stop_survivor_pollers()
+        except Exception:
+            logger.debug("Could not fence survivor pollers during shutdown", exc_info=True)
         self._mark_api_runs_shutdown_requested()
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
