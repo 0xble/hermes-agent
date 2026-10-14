@@ -1,6 +1,19 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility`.
+**Patch identity:** `hindsight-retain-visibility` and `evict-memory-shutdown`.
+
+Soft agent-cache eviction must commit pending memory, drain and shut down the
+agent's memory manager (including Hindsight's writer and the mem-sync executor),
+then release clients off the gateway event loop. Eviction removes the cache entry
+first, so a refetched turn builds a fresh manager while retirement completes.
+Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
+discard and shutdown fence both the pending query and the worker's publication.
+Proof: `scripts/run_tests.sh tests/gateway/test_agent_cache_memory_lifetime.py`
+and `scripts/run_tests.sh tests/plugins/memory/test_hindsight_prefetch_lifetime.py`.
+Retire when upstream soft eviction retires memory providers and Hindsight
+prefetch is single-flight. Roll back by reverting the commits carrying
+`Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
+mem-sync threads until process exit again.
 
 Accepted asynchronous retain operations remain tracked after the first prefetch
 visibility wait expires. Later prefetches do not repeat that wait. The existing
