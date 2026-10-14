@@ -68,6 +68,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Loop lifecycle | Versioned agent-authorized /loop revisions preserve user authority, cadence state, and cross-surface wakeup persistence | LoopManager revisions, loop wakeup prompts, stale loop-manager caches, or loop receipts | [Loop lifecycle](maintenance/loop-lifecycle.md) |
 | Loop completion display | Hide trailing top-level `LOOP_COMPLETE` control text on gateway, TUI, and CLI surfaces while preserving raw loop-stop detection | Loop completion marker filtering, streaming holds, or cross-surface display regressions | [Loop completion display](maintenance/loop-complete-display.md) |
 | Internal notification silence | Internal process/delegation turns use an exact silence contract; parked-goal notices are durable and state-change deduplicated | Internal notification footer, process/delegation wake delivery, parked-goal status notices, or their regressions | [Internal notification silence](maintenance/internal-notification-silence.md) |
+| Gateway human-turn silence re-prompt | Human-addressed gateway turns get one fresh gateway continuation after a rejected bare `NO_REPLY`/`[SILENT]`; retry guidance stays API-only, machinery silence and the second-marker fallback remain unchanged | Gateway recursive followups, synthetic provenance, end-of-turn stream filtering, or human-turn silence regressions | [Gateway human-turn silence re-prompt](maintenance/gateway-silence-reprompt.md) |
 | Goal status flood retry | Meaningful outcomes/control receipts are quota-protected; routine notices stay expendable; bounded flood retry does not block the turn pipeline | Goal status notice delivery, flood-control classification, or shared cron/notice retry budgets | [Goal status flood retry](maintenance/goal-notice-flood-retry.md) |
 | External-wait goal backoff | Back off external/no-progress waits, re-arm live barriers, and keep unchanged silent re-parks and age-only rechecks quiet | Goal judge WAIT semantics, persistent no-progress state, barrier liveness, or idle wake behavior | [External-wait goal backoff](maintenance/goal-external-wait-backoff.md) |
 | Auto-recovery ladder notice buffering | Keep post-exhaustion provider countdown notices non-durable during recovery, flush them only on terminal failure, and preserve live wait/interrupt behavior | Auto-recovery ladder notices, retry-status buffering, or recovery-surface regressions | [Auto-recovery ladder notice buffering](maintenance/auto-recovery-ladder-notice.md) |
@@ -197,6 +198,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `HERMES_HEAVY_SLOT=off HERMES_HOME=<isolated-home> /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest -q tests/gateway/test_trailing_silence_marker.py tests/gateway/test_response_filters.py tests/gateway/test_stream_consumer_silence.py`.
 - **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
 - **Rollback:** Revert the trailing-silence-marker fix commit.
+
+## Active patch record: gateway human-turn silence re-prompt
+
+- **Patch identity:** `gateway-silence-reprompt`.
+- **Behavior:** Before a gateway turn closes, an exact `NO_REPLY`/`[SILENT]` final visible response on a user-typed turn receives one bounded gateway recovery execution for a short visible status. Only the retry guidance is ephemeral (API-only, applied to the cached agent for the recovery execution and restored afterwards); the first execution's messages, including its marker, continue as history. Internal notification turns, `reply_expected=False` turns, non-gateway lanes, and a second marker are not re-prompted. A recovery redirect preserves the newer human inbound ledger identity without changing the original silence contract.
+- **Source surfaces:** `gateway/run_turn.py`, `gateway/run_turn_runner.py`, `gateway/turn_context.py`, `gateway/stream_consumer.py`, `gateway/stream_consumer_fallback.py`, and gateway silence regression tests.
+- **Upstream status:** related merged PR [NousResearch/hermes-agent#111624](https://github.com/NousResearch/hermes-agent/pull/111624) adds the downstream fallback for a human silence marker; no upstream gateway re-prompt equivalent found.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_folded_steer_silence_reprompt.py tests/gateway/test_silence_retry_lifecycle.py tests/gateway/test_stream_consumer_wecom_native.py`.
+- **Retirement:** Remove when released upstream re-prompts a user-typed gateway silence marker once before applying its fallback.
+- **Rollback:** Revert commits carrying `Fork-Patch: gateway-silence-reprompt`.
 
 ## Active patch record: goal continuation silence
 

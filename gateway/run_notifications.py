@@ -1838,19 +1838,18 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         while len(self._completion_deliveries_delivered) > self._completion_delivery_retention:
             self._completion_deliveries_delivered.popitem(last=False)
 
-    def _completion_identity_seen(self, identity, *, claim: bool = False) -> bool:
-        """True when ``identity`` is inflight or already delivered this gateway lifecycle.
-
-        With ``claim`` an unseen identity is atomically marked inflight (same lock hold).
-        """
+    def _completion_identity_state(self, identity, *, claim: bool = False) -> str | None:
+        """``"delivered"`` (admitted earlier this gateway lifecycle), ``"inflight"`` (another delivery
+        holds it), else ``None``. With ``claim`` an unseen identity is atomically marked inflight under
+        the same lock hold and ``"claimed"`` is returned, so two callers never both own it."""
         with self._completion_delivery_lock:
-            seen = (
-                identity in self._completion_deliveries_inflight
-                or identity in self._completion_deliveries_delivered
-            )
-            if claim and not seen:
+            if identity in self._completion_deliveries_delivered:
+                return "delivered"
+            if identity in self._completion_deliveries_inflight:
+                return "inflight"
+            if claim:
                 self._completion_deliveries_inflight.add(identity)
-            return seen
+            return "claimed" if claim else None
 
     async def _settle_ended_compression_tip(self, session_db: Any, parent_session_id: str) -> str:
         """Terminal-report verdict for a compression lineage whose tip has itself ENDED.
@@ -2131,7 +2130,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             if not claim.proceed:
                 return claim.early_result
             if identity is not None:
-                if self._completion_identity_seen(identity, claim=True):
+                if self._completion_identity_state(identity, claim=True) != "claimed":
                     return None
                 identity_claimed = True
             if claim.owner_session_id:
@@ -2217,7 +2216,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         current_task = asyncio.current_task()
         tasks, releases = self._completion_notification_batch_tasks, self._completion_notification_batch_releases
         entries: list[tuple[str, dict, asyncio.Future]] = []
-        sibling_claims: list = []
+        claimed_identities: list = []
         delivered: Optional[bool] = False
         try:
             await self._wait_batch_window(delay, release)
@@ -2231,35 +2230,34 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             if consumed:
                 self._settle_batch_waiters(consumed, None)
                 entries = [e for e in entries if e not in consumed]
-            # Claim every sibling identity inflight before the (slow) delivery so a duplicate copy
-            # arriving meanwhile is deduplicated instead of starting a second turn. The primary
-            # claims its own inside _deliver_completion_notification.
-            for entry in list(entries[1:]):
+            # Claim every identity, primary included, before the slow delivery: a copy arriving meanwhile
+            # is deduplicated, and an already-delivered one (True) never stands in for a fresh sibling.
+            for entry in list(entries):
                 identity = self._completion_delivery_identity(entry[1])
                 if identity is None:
                     continue
-                if self._completion_identity_seen(identity, claim=True):
-                    self._settle_batch_waiters([entry], None)
+                identity_state = self._completion_identity_state(identity, claim=True)
+                if identity_state != "claimed":
+                    self._settle_batch_waiters([entry], True if identity_state == "delivered" else None)
                     entries.remove(entry)
                 else:
-                    sibling_claims.append(identity)
+                    claimed_identities.append(identity)
             if not entries:
                 return
             synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
-            # A duplicate primary returns None from the dedupe seam; try the next identity so a fresh
-            # sibling is never discarded with it.
+            # None is now a terminal/routeless carrier, not a delivered duplicate: try the next entry.
             delivered = None
             for _text, candidate_evt, _future in entries:
                 candidate_identity = self._completion_delivery_identity(candidate_evt)
-                if candidate_identity in sibling_claims:
-                    # Promoted to primary: it claims its own identity in the delivery seam.
-                    sibling_claims.remove(candidate_identity)
+                if candidate_identity in claimed_identities:
+                    # Promoted to carrier: it claims its own identity in the delivery seam.
+                    claimed_identities.remove(candidate_identity)
                     with self._completion_delivery_lock:
                         self._completion_deliveries_inflight.discard(candidate_identity)
                 delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
                 if delivered is not None:
                     break
-            if delivered is True and len(entries) > 1:
+            if delivered is True:  # only a real adapter admission covers the coalesced siblings
                 self._record_coalesced_completion_siblings([evt for _text, evt, _future in entries])
         except asyncio.CancelledError:
             # Shutdown cancellation: recover undetached entries and resolve every waiter as retryable.
@@ -2271,9 +2269,9 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             logger.exception("Coalesced process completion delivery failed")
             delivered = False
         finally:
-            if sibling_claims and delivered is not True:
+            if claimed_identities and delivered is not True:
                 with self._completion_delivery_lock:
-                    for identity in sibling_claims:
+                    for identity in claimed_identities:
                         self._completion_deliveries_inflight.discard(identity)
             # A failure while stopping has no watcher retry left: spool it rather than drop it.
             if delivered is False and self._completion_notification_batches_stopping:
@@ -2508,7 +2506,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
                 await self._deliver_completion_notification(synth_text, evt)
                 continue
             identity = self._completion_delivery_identity(evt)
-            if identity is not None and self._completion_identity_seen(identity):
+            if identity is not None and self._completion_identity_state(identity):
                 continue
             deliverable.append((evt, synth_text))
         if not deliverable:

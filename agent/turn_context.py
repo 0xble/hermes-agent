@@ -1331,6 +1331,18 @@ def build_api_messages(
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
 
+        # Gateway silence recovery stages an empty internal row, not a new human ask.
+        # Give only its final wire copy a continuation cue; never stamp api_content
+        # or mutate history, which persistence and compression consume independently.
+        retry_wire_message = getattr(agent, "_gateway_silence_retry_wire_message", None)
+        if (
+            retry_wire_message and isinstance(api_msg, dict) and msg is current_turn_message
+            and idx == len(canonical_messages) - 1 and msg.get("role") == "user"
+            and msg.get("display_kind") == "internal_notification"
+            and not api_msg.get("content")
+        ):
+            api_msg["content"] = retry_wire_message
+
         # Replay stored reasoning on every carrier the active route reads (and strip the
         # rest): message_sanitization.reasoning_replay_route owns the decision.
         agent._copy_reasoning_content_for_api(msg, api_msg)

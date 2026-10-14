@@ -330,6 +330,7 @@ gateway:
     title_empty_untitled: "\n⚠️ Title is empty after cleanup — session started untitled."
     tip: "\n✦ Tip: {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
     in_progress: "⏳ Gateway restart already in progress..."
     restarting: "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
   resume:

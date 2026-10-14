@@ -326,6 +326,7 @@ gateway:
     title_empty_untitled: "\n⚠️ Il titolo è vuoto dopo la pulizia — sessione avviata senza titolo."
     tip: "\n✦ Suggerimento: {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
     in_progress: "⏳ Riavvio del gateway già in corso..."
     restarting: "♻ Riavvio del gateway. Se non ricevi una notifica entro 60 secondi, riavvia dalla console con `hermes gateway restart`."
   resume:

@@ -326,6 +326,7 @@ gateway:
     title_empty_untitled: "\n⚠️ العنوان فارغ بعد التنظيف — بدأت الجلسة دون عنوان."
     tip: "\n✦ نصيحة: {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
     in_progress: "⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل..."
     restarting: "♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`."
   resume:

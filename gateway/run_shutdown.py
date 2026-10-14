@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from agent.i18n import t
+from gateway.run_interrupted_notes import InterruptionNotesMixin
 from hermes_loop_guard import set_loop_thread
 from gateway.config import Platform
 from gateway.restart import (
@@ -204,7 +205,7 @@ def _persist_shutdown_pending_messages(runner):
     return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -1025,6 +1026,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 # into an ordinary notice.
                 if note and note[3]:
                     note_id = str(note[3])
+                    self._record_interruption_note_receipt(session_key, note_id)
                     if not (reclaim_pending and note_id.startswith("pending:")):
                         if note_id.startswith("sending:"):
                             logger.warning(
@@ -1032,7 +1034,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                                 session_key,
                             )
                             return 0
-                        getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
                         return 0
                 target = await self._shutdown_notification_target(session_key)
                 if note_claims.get(session_key) == ("fallback",):
@@ -1105,7 +1106,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 if await self.async_session_store.set_restart_note_message_id(
                     session_key, str(note_id), expected_marker=marker,
                 ):
-                    getattr(self, "_s2_note_delivered_keys", set()).add(session_key)
+                    self._record_interruption_note_receipt(session_key, str(note_id))
                     claim_kept = True
                     return 1
                 # The transport accepted the note but the local record could not be updated. Keep
@@ -1317,28 +1318,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if notified:
             logger.info("Shutdown: delivered %d interrupted-cron-job notice(s)", len(notified))
         return len(notified)
-
-    async def _shutdown_notification_target(self, session_key: str):
-        """``(source, platform_str, chat_id, thread_id, profile)``: persisted origin > cached source >
-        parsed key. ``profile`` is the owning profile from the source or the ``agent:<profile>:`` key
-        namespace (``None`` = default) so the notice leaves through that profile's bot."""
-        from gateway.run import _parse_session_key
-        source = None
-        try:
-            if getattr(self, "session_store", None) is not None:
-                await self.async_session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
-                source = getattr(entry, "origin", None) if entry else None
-        except Exception as e:
-            logger.debug("Failed to load session origin for shutdown notification %s: %s", session_key, e)
-        if source is None:
-            source = self._get_cached_session_source(session_key)
-        if source is not None:
-            return source, source.platform.value, str(source.chat_id), source.thread_id, getattr(source, "profile", None)
-        _parsed = _parse_session_key(session_key)
-        if not _parsed:
-            return None
-        return None, _parsed["platform"], _parsed["chat_id"], _parsed.get("thread_id"), _parsed.get("profile")
 
     async def _send_shutdown_notice(
         self, adapter, chat_id: str, msg: str, kind: str, platform_str: str, **send_kwargs
