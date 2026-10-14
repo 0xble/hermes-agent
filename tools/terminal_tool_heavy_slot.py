@@ -62,6 +62,8 @@ _EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
 _SUITE_RUNNERS = {"tox", "nox"}
 # Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
 _LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
+_INFO_FLAGS = {"--version", "--help", "-h"}
+_WATCH_FLAGS = {"--watch", "-w"}
 # Options a targeted run may carry and still count as light. This is an allowlist on
 # purpose: any other option (pytest -n/--dist, jest --maxWorkers, vitest --pool, a
 # runner's own --workers or --jobs) may fan out, so it falls back to the slot.
@@ -137,16 +139,25 @@ def _script_label(word: str) -> Optional[str]:
     return prefix if prefix in {"test", "build", "check", "lint", "typecheck"} else None
 
 
+def _is_watch_script(word: str) -> bool:
+    return word == "watch" or word.endswith(":watch")
+
+
 def _heavy_script(args: list[str]) -> Optional[str]:
-    """Ignore option values such as the package named by --filter."""
+    """Ignore package names and watch modes when finding a heavy package script."""
+    if any(arg == "--watch" or arg.startswith("--watch=") for arg in args):
+        return None
     skip = False
     for arg in args:
         if skip:
             skip = False
         elif arg in _PACKAGE_VALUE_OPTIONS:
             skip = True  # `pnpm --filter test build`: `test` names a package
-        elif not arg.startswith("-") and (label := _script_label(arg)):
-            return label
+        elif not arg.startswith("-"):
+            if _is_watch_script(arg):
+                return None
+            if label := _script_label(arg):
+                return label
     return None
 
 
@@ -221,6 +232,12 @@ def classify_words(words: list[str]) -> Optional[str]:
         return None
     executable, args = words[0], words[1:]
     name = _basename(executable)
+    if any(arg in _INFO_FLAGS for arg in args):
+        return None
+    if name in {"tsc", "vitest", "jest"} and any(
+        arg in _WATCH_FLAGS or arg.startswith("--watch=") for arg in args
+    ):
+        return None
 
     if name in _SHELLS and args:
         if args[0].startswith("-") and "c" in args[0] and len(args) > 1:

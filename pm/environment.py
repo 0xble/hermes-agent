@@ -275,9 +275,9 @@ class PythonEnvironment:
         env = _base_environment(self.env)
         # uv's install concurrency also sizes its bytecode compiler pool. The
         # ambient UV_* knobs are stripped above; bind both CPU-heavy pools here.
-        workers = env.get("HERMES_TEST_WORKERS", "4")
+        workers = env.get("HERMES_TEST_WORKERS") or "4"
         if not workers.isascii() or not workers.isdecimal() or int(workers) < 1:
-            raise InstallError("venv", "HERMES_TEST_WORKERS must be a positive integer")
+            workers = "4"
         env.update(UV_CONCURRENT_BUILDS=workers, UV_CONCURRENT_INSTALLS=workers)
         if self.no_config:
             # --no-config only removes config files; the pip-mirror bridge

@@ -122,6 +122,34 @@ def test_leaves_light_commands_alone(command):
     assert classify_command(command) is None
 
 
+@pytest.mark.parametrize(("command", "label"), [
+    ("tsc --watch", None),
+    ("tsc -b --watch", None),
+    ("tsc -w", None),
+    ("vitest --watch", None),
+    ("vitest -w", None),
+    ("jest --watch", None),
+    ("jest -w", None),
+    ("pnpm build --watch", None),
+    ("npm run build:watch", None),
+    ("pnpm watch", None),
+    ("turbo run watch", None),
+    ("tsc --version", None),
+    ("vitest --help", None),
+    ("jest -h", None),
+    ("pytest --version", None),
+    ("./bin/ci --help", None),
+    ("pnpm build", "build"),
+])
+def test_watch_info_and_non_watch_build_classification(command, label, helper):
+    assert classify_command(command) == label
+    wrapped = wrap_heavy_command(command, env_type="local")
+    if label is None:
+        assert wrapped == command
+    else:
+        assert f"hermes {label}" in wrapped
+
+
 def test_routes_only_the_heavy_simple_command(helper):
     wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
     dispatcher, body = wrapped.split("\n", 1)

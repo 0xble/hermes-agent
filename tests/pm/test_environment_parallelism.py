@@ -11,7 +11,10 @@ from pm.environment import PythonEnvironment
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize(("workers", "expected"), [(None, "4"), ("2", "2"), ("4", "4")])
+@pytest.mark.parametrize(("workers", "expected"), [
+    (None, "4"), ("", "4"), ("banana", "4"), ("0", "4"), ("1.5", "4"),
+    ("2", "2"), ("4", "4"),
+])
 def test_uv_child_uses_per_job_budget_without_changing_parent(tmp_path, workers, expected):
     uv = tmp_path / "uv"
     log = tmp_path / "child.json"
