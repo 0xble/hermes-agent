@@ -41,13 +41,41 @@ class RestartRecoveryMixin:
         if spool is not None:
             spool.unlink(missing_ok=True)
 
+    @staticmethod
+    def _recovery_probe_events(event):
+        """Yield the recovered event and any merged successor/absorbed events once each."""
+        pending = [event]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            yield candidate
+            successor = getattr(candidate, "_hermes_absorbed_into", None)
+            if successor is not None:
+                pending.append(successor)
+            pending.extend(getattr(candidate, "_hermes_absorbed_events", ()) or ())
+
     async def _recovered_input_durable(self, event) -> bool:
-        """Whether the turn has written this replayed input's own transcript row."""
+        """Whether this replayed input or its merged successor has written a durable user row."""
         from gateway.run_pending_recovery import input_already_durable
-        return await asyncio.to_thread(
-            input_already_durable, getattr(self, "session_store", None),
-            getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None),
-            getattr(event, "text", None), getattr(event, "_hermes_recovery_spool_ts", None))
+        recovery_session_id = getattr(event, "_hermes_recovery_session_id", None)
+        recovery_spool_ts = getattr(event, "_hermes_recovery_spool_ts", None)
+        for candidate in self._recovery_probe_events(event):
+            session_id = getattr(candidate, "_hermes_recovery_session_id", None)
+            if session_id is None:
+                session_id = recovery_session_id
+            spool_ts = getattr(candidate, "_hermes_recovery_spool_ts", None)
+            if spool_ts is None:
+                spool_ts = recovery_spool_ts
+            if await asyncio.to_thread(
+                input_already_durable, getattr(self, "session_store", None), session_id,
+                getattr(candidate, "message_id", None), getattr(candidate, "text", None), spool_ts,
+            ):
+                return True
+        return False
 
     async def _retire_spool_once_input_durable(self, event) -> None:
         """Retire the replay copy at the turn's durable start, not at adapter admission.

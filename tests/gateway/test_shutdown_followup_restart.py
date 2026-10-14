@@ -153,6 +153,58 @@ async def test_internal_recovered_followup_consumed_by_successor_reports_result(
 
 
 @pytest.mark.asyncio
+async def test_merged_internal_recovery_spool_retires_after_successor_input_is_durable(
+    tmp_path, monkeypatch
+):
+    """A merged successor's durable input retires the recovered event's spool before completion."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(
+        text="internal completion", source=source, user_id=source.user_id,
+        internal=True, message_type=MessageType.PHOTO,
+    )
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+    recovered = runner._startup_restore_queue.pop()
+    spool = recovered._hermes_recovery_spool
+    consumed = MessageEvent(
+        text="existing photo", source=source, user_id=source.user_id,
+        internal=True, message_type=MessageType.PHOTO,
+    )
+    adapter._pending_messages[entry.session_key] = consumed
+    merge_pending_message_event(adapter._pending_messages, entry.session_key, recovered)
+    assert getattr(recovered, "_hermes_absorbed_into", None) is consumed
+
+    persisted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def successor():
+        runner.session_store.append_to_transcript(
+            entry.session_id, {"role": "user", "content": consumed.text}
+        )
+        persisted.set()
+        await release.wait()
+        consumed._agent_turn_succeeded = True
+
+    task = asyncio.create_task(successor())
+    task._hermes_event = consumed
+    adapter._session_tasks[entry.session_key] = task
+    observer = asyncio.create_task(
+        runner._observe_recovered_followup(adapter, recovered, entry.session_key, task=task)
+    )
+    await asyncio.wait_for(persisted.wait(), 2)
+    for _ in range(40):
+        if not spool.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert not spool.exists(), "merged successor durability must retire the replay copy mid-turn"
+    release.set()
+    await asyncio.wait_for(observer, 2)
+
+
+@pytest.mark.asyncio
 async def test_recovery_ignores_unrelated_inflight_result_before_merged_successor(
     tmp_path, monkeypatch, caplog
 ):

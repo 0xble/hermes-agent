@@ -1906,6 +1906,10 @@ def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) 
     for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
         if candidate is not existing and not any(item is candidate for item in absorbed):
             absorbed.append(candidate)
+        if candidate is not existing:
+            # Recovery may be watching an absorbed event while the successor persists the
+            # merged slot. Keep the live successor reachable for its durability probe.
+            setattr(candidate, "_hermes_absorbed_into", existing)
 
 
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,
