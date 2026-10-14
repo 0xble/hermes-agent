@@ -245,6 +245,12 @@ def test_cli_streaming_tts_never_speaks_a_wakeup_marker(monkeypatch):
         monkeypatch, quiet=True, chunks=["[SILENT]\nLOOP_COMPLETE"]) == ""
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["[SIL", "ENT]\nLO", "OP_COMPLETE"]) == ""
+    # A paragraph break between the marker and LOOP_COMPLETE re-arms the segment hold; it
+    # must not release (and speak) the held marker.
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["[SILENT]", "\n\n", "LOOP_COMPLETE"]) == ""
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["[SILENT]", "\n\nLOOP_COMPLETE\nLOOP_COMPLETE"]) == ""
     assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["NO"]) == "NO"
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["Queue", " is 2."]) == "Queue is 2."

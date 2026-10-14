@@ -168,6 +168,32 @@ async def test_loop_wakeup_control_suffix_is_suppressed_but_raw_loop_stop_surviv
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final",
+    [
+        "Queue depth changed to 2." + chr(10) + "[SILENT]" + chr(10) + "LOOP_COMPLETE",
+        "Queue depth changed to 2." + chr(10) + "LOOP_COMPLETE" + chr(10) + "NO_REPLY",
+        "Queue depth changed to 2." + chr(10) + "[SILENT]" + chr(10) + "LOOP_COMPLETE" + chr(10) + "LOOP_COMPLETE",
+    ],
+)
+async def test_loop_wakeup_prose_before_a_control_run_delivers_prose_only(
+    hermes_home, monkeypatch, final,
+):
+    """Normal lane: prose then any trailing silence/LOOP_COMPLETE run never leaks a marker,
+    and loop detection still sees LOOP_COMPLETE in the raw response."""
+    from hermes_cli.loops import response_signals_complete
+
+    event = GatewayRunner._synthetic_prompt_event(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42"),
+        "[loop wakeup]" + chr(10) + "Check the queue",
+        reply_expected=False,
+    )
+    event.internal = True
+    assert await _deliver(event, final, monkeypatch) == "Queue depth changed to 2."
+    assert response_signals_complete(event._raw_final_response)
+
+
+@pytest.mark.asyncio
 async def test_human_loop_complete_silence_gets_existing_fallback(hermes_home, monkeypatch):
     event = MessageEvent(
         text="typed request",

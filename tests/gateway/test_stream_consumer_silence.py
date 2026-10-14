@@ -45,9 +45,11 @@ def test_partial_predicate_agrees_with_exact_on_full_markers():
 
 
 def test_partial_predicate_holds_through_a_trailing_loop_complete_line():
-    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n"):
+    # Leading blank lines are ignored, and a control run may open with LOOP_COMPLETE.
+    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n",
+                 "\n\n[SILENT]\n\nLOOP", "\nLOOP", "LOOP_COMPLETE\n[SIL"):
         assert is_partial_silence_marker(text) is True
-    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "\nLOOP"):
+    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "[SILENT]\nNO_REPLY", "\n\n"):
         assert is_partial_silence_marker(text) is False
 
 
@@ -121,6 +123,31 @@ class TestStreamedSilenceSuppression:
         assert all("[SILENT]" not in text and "LOOP_COMPLETE" not in text for text in _sent_and_edited(adapter))
         assert consumer.final_content_delivered is False
         assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["Queue is 2.\n[SILENT]\nLOOP_COMPLETE"],
+            ["Queue is 2.", "\n[SIL", "ENT]\nLOOP", "_COMPLETE"],
+            ["Queue is 2.\nLOOP_COMPLETE\n", "NO_REPLY"],
+        ],
+    )
+    async def test_prose_before_a_control_run_finalizes_prose_only(self, chunks):
+        """Stream lane: the final edit drops the whole trailing silence/LOOP_COMPLETE run."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        for chunk in chunks:
+            consumer.on_delta(chunk)
+        consumer.finish()
+        await consumer.run()
+
+        texts = _sent_and_edited(adapter)
+        assert texts and texts[-1].strip() == "Queue is 2."
+        assert all("SILENT" not in t and "NO_REPLY" not in t and "LOOP_COMPLETE" not in t for t in texts)
 
     @pytest.mark.asyncio
     async def test_partial_marker_preview_is_retracted(self):

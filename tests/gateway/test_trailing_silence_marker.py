@@ -165,6 +165,16 @@ def test_consecutive_trailing_marker_lines_are_all_removed():
     assert strip_trailing_silence_marker("Done.\n\nNO_REPLY\n[SILENT]") == "Done."
 
 
+def test_marker_before_loop_complete_is_stripped_in_the_finalizer(monkeypatch):
+    """Persisted and final text drop the silence marker but keep LOOP_COMPLETE for detection."""
+    agent = _PersistenceAgent()
+    verdict = _run_finish(monkeypatch, agent, "Done.\n[SILENT]\nLOOP_COMPLETE")
+
+    assert verdict.action == "break"
+    assert verdict.final_response == "Done.\nLOOP_COMPLETE"
+    assert "[SILENT]" not in agent.persisted_messages[-1]["content"]
+
+
 def _run_finish(monkeypatch, agent, content):
     _stub_conversation_loop(monkeypatch)
     _stub_runtime_helpers(monkeypatch)

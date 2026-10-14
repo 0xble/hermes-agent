@@ -326,7 +326,7 @@ class CLIStreamMixin:
             # marker candidate is content there: release it through the normal display path.
             silence_held, self._silence_hold = getattr(self, "_silence_hold", ""), ""
             if silence_held:
-                self._emit_unheld(silence_held)
+                self._feed_loop_complete_hold(silence_held)
             held = getattr(self, "_loop_complete_hold", "")
             self._loop_complete_hold = ""
             if held:
@@ -352,6 +352,14 @@ class CLIStreamMixin:
             if is_partial_silence_marker(self._silence_hold):
                 return
             text, self._silence_hold, self._silence_hold_active = self._silence_hold, "", False
+        self._feed_loop_complete_hold(text)
+
+    def _feed_loop_complete_hold(self, text: str) -> None:
+        """Send text through the trailing ``LOOP_COMPLETE`` hold, then the display path.
+
+        Text released from the silence hold comes through here too, so a held reply such as
+        ``No.\\nLOOP_COMPLETE`` never reaches the screen with its control line.
+        """
         from gateway.response_filters import (
             ends_with_partial_loop_complete_marker,
             split_trailing_loop_complete_marker,
@@ -582,7 +590,8 @@ class CLIStreamMixin:
         if silence_held:
             from gateway.response_filters import is_intentional_silence_response
             if not is_intentional_silence_response(silence_held):
-                self._emit_unheld(silence_held)
+                # Not silent, but it may still end in LOOP_COMPLETE: the loop hold resolves it.
+                self._feed_loop_complete_hold(silence_held)
         # End of turn: a held complete top-level LOOP_COMPLETE is control text and is dropped;
         # anything else held (a partial prefix, a marker inside an open fence) is content.
         self._resolve_loop_complete_hold()
