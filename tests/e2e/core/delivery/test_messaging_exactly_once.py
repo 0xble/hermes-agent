@@ -442,13 +442,21 @@ CRASH_MATRIX = [("completed_not_ledgered", "fk_ne"),  # streaming finals are sen
                 ("stream_accepted_edit_unpersisted", "fk_tg")]
 
 
+STREAM_CONTINUE_POINTS = {"stream_accepted_unpersisted", "stream_accepted_edit_unpersisted"}
+
+
 @pytest.fixture
-def fresh_gw(tmp_path, llm):
+def fresh_gw(request, tmp_path, llm):
     """A gateway on its OWN home: one unclean restart per home keeps the restart-loop breaker and
     the 120 s recency fallback of other scenarios out of the picture."""
     keep = os.environ.get("C12_SPOOL_ROOT")
     root = Path(keep) / f"crash-{tmp_path.name}" if keep else tmp_path / "gw"
-    proc = GatewayProcess(root, platforms=PLATFORMS, llm_base_url=llm.base_url, extra_config=EXTRA_CONFIG)
+    extra = EXTRA_CONFIG
+    if request.node.callspec.params.get("point") in STREAM_CONTINUE_POINTS:
+        # Preview adoption and recovery marking are a `continue`-policy contract; under the
+        # default `ask` the resume turn only asks, and the partial preview stays untouched.
+        extra += "restart_resume_policy: continue\n"
+    proc = GatewayProcess(root, platforms=PLATFORMS, llm_base_url=llm.base_url, extra_config=extra)
     proc.start()
     yield proc
     proc.stop()
