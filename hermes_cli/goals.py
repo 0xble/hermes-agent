@@ -50,13 +50,16 @@ DEFAULT_MAX_TURNS = 20
 # Goal text is a compact outcome contract, not a work log.  Keep this rule in
 # the core so the slash command and model-callable goal tool cannot drift.
 GOAL_AUTHORING_MAX_CHARS = 600
-GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS = 2200
+# The cap is on the complete goal contract. Keep this alias for callers that
+# imported the earlier name; a single field cannot exceed the total cap either.
+GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS = GOAL_AUTHORING_MAX_CHARS
 _GOAL_AUTHORING_FIELDS = ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when")
 _GOAL_AUTHORING_NUMBERED_STEP_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*]\s*\d+[.)])\s+")
 _GOAL_AUTHORING_BULLET_RE = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+")
 _GOAL_AUTHORING_STALE_REF_RES = (
-    re.compile(r"(?i)(?<![\w])(?:pr|pull\s+request|issue|run|ci|workflow|job|build)\s*#?\s*\d{2,}(?!\w)|(?:[\w./-]+)#\d{2,}(?!\w)"),
-    re.compile(r"(?<!\w)#\d{2,}(?!\w)"),
+    re.compile(r"(?i)(?<![\w])(?:pr|pull\s+request|issue|pull)\s*#?\s*\d+(?!\w)|(?:[\w./-]+)#\d+(?!\w)"),
+    re.compile(r"(?i)(?<![\w])run(?:\s+id)?\s*#?\s*\d{6,}(?!\w)"),
+    re.compile(r"(?<!\w)#\d+(?!\w)"),
 )
 _GOAL_AUTHORING_SHA_RE = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
 _GOAL_AUTHORING_READONLY_RE = re.compile(
@@ -112,12 +115,24 @@ def _goal_authoring_values(goal: Any, contract: Any) -> dict[str, str]:
 
 def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
     """Do not call a plan/file path a stale identifier merely because it has digits."""
-    before = text[max(0, start - 80):start]
-    after = text[end:min(len(text), end + 80)]
-    nearby = " ".join(before.split()[-1:] + after.split()[:1])
-    return "/" in nearby or bool(
-        re.search(r"(?:^|\s)(?:~?/|[A-Za-z]:[\\/])[^\s]+\.(?:md|markdown|txt|yaml|yml|json|toml)\b", before + text[start:end] + after)
+    token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
+    token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
+    token_end = min(token_end_candidates, default=len(text))
+    token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
+    return "/" in token or "\\" in token or bool(
+        re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
     )
+
+
+def _goal_authoring_is_ordinal_hash(text: str, start: int) -> bool:
+    """Allow ordinal rankings such as ``Ranked #1`` while rejecting bare receipts."""
+    return bool(re.search(r"(?i)\b(?:ranked|top)\s*$", text[max(0, start - 24):start]))
+
+
+def _goal_authoring_is_ordinary_identifier(text: str, start: int, end: int) -> bool:
+    """Allow human identifiers such as ``cafe5678`` when clearly naming a table."""
+    context = text[max(0, start - 32):min(len(text), end + 32)]
+    return bool(re.search(r"(?i)\b(?:table|column|record|dataset)\b", context))
 
 
 def goal_authoring_findings(
@@ -162,7 +177,9 @@ def goal_authoring_findings(
                 "keep this field outcome-shaped and move detail to the plan file",
             ))
         for pattern in _GOAL_AUTHORING_STALE_REF_RES:
-            match = pattern.search(value)
+            match = next((candidate for candidate in pattern.finditer(value)
+                          if not (pattern is _GOAL_AUTHORING_STALE_REF_RES[-1]
+                                  and _goal_authoring_is_ordinal_hash(value, candidate.start()))), None)
             if match and not _goal_authoring_text_is_path(value, match.start(), match.end()):
                 findings.append(GoalAuthoringFinding(
                     "stale_identifier", field_name,
@@ -174,7 +191,7 @@ def goal_authoring_findings(
             token = match.group(1)
             if not (any(char.isdigit() for char in token) and any(char in "abcdef" for char in token)):
                 continue
-            if _goal_authoring_text_is_path(value, match.start(), match.end()):
+            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
                 continue
             findings.append(GoalAuthoringFinding(
                 "stale_identifier", field_name,
@@ -205,7 +222,7 @@ def goal_authoring_findings(
                           _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
                           re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
         separators = len(re.findall(r"[,;]", verification))
-        if separators >= 2 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
+        if separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
             checklist = True
         if checklist:
             findings.append(GoalAuthoringFinding(

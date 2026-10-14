@@ -140,6 +140,7 @@ class TestGoalManager:
             ("Ship the release", {"verification": "PR #551 is merged"}, "stale_identifier"),
             ("Delete the obsolete topic", {"constraints": "Read-only; no changes"}, "readonly_mutation"),
             ("Ship the release", {"verification": "1. Run tests\n2. Read logs\n3. Review output"}, "verification_checklist"),
+            ("Ship the release", {"verification": "Fixes, flood evidence, restart logs, and closed or assigned plan items read back."}, "verification_checklist"),
         ],
     )
     def test_goal_authoring_rules_have_deterministic_findings(self, goal, contract, code):
@@ -149,14 +150,37 @@ class TestGoalManager:
         assert [finding.code for finding in findings] == [code]
 
     @pytest.mark.parametrize("goal", [
+        "Run 50 evals",
+        "Write docs for job 42 scheduling",
+        "Keep build 2026 green",
+        "Migrate the cafe5678 table",
+        "~/plans/a1b2c3d.md",
+        "The dashboard is green, the alert is quiet, and logs are clean.",
+    ])
+    def test_goal_authoring_allowed_numeric_labels_and_live_outcome(self, goal):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(goal) == []
+
+    @pytest.mark.parametrize("goal", [
         "Finish scoring the curated source lists using Brian's Round 3 calibration decisions, with the scoring skill deployed. Plan: ~/Workspace/projects/source-scoring/plan.md\nverify: Every list meets the calibration threshold or is marked for rework, and the deployed skill scores a fresh list.\nconstraints: Don't add, remove, or reclassify list entries.\nstop when: Brian's Round 3 calibration decisions are needed.",
         "The credential broker is retired and agents use 1Password directly through service accounts.\nverify: Agents read secrets from each non-Private vault without the broker, and no broker process or config remains.\nconstraints: Never print secrets, rotate credentials without Brian, or touch LPG or Meridian infrastructure.\nstop when: Brian needs to approve the service accounts on his Mac.",
     ])
     def test_goal_authoring_approved_shapes_are_clean(self, goal):
         from hermes_cli.goals import parse_contract, goal_authoring_findings
-
         headline, contract = parse_contract(goal)
         assert goal_authoring_findings(headline, contract) == []
+
+    def test_goal_authoring_revision_cap_preserves_legacy_small_fix(self):
+        from hermes_cli.goals import goal_authoring_findings
+        current = len("Keep the service healthy") + len("The service is healthy.")
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"verification": "x " * 400},
+            previous_total=current, changed_fields={"verification"},
+        )[0].code == "length"
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"constraints": "legacy " * 100, "verification": "X is live"},
+            previous_total=700, changed_fields={"verification"},
+        ) == []
 
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
