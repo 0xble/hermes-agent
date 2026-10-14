@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
@@ -104,10 +105,15 @@ def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> 
     "invalid authentication token"; a bare 400 only counts on a long session."""
     if not agent_result.get("failed"):
         return False
-    if agent_result.get("compression_exhausted"):
-        return True
+    # The classified reason wins over the historical text/length heuristic and any stale
+    # compression flag. Only a legacy/unclassified result retains the #1630 growth-loop guard.
     err = str(agent_result.get("error") or "").lower()
-    return any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES) or ("400" in err and history_len > 50)
+    return is_context_overflow_reason(
+        agent_result.get("failure_reason"),
+        unclassified_overflow=bool(agent_result.get("compression_exhausted"))
+        or any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES)
+        or ("400" in err and history_len > 50),
+    )
 
 
 # Setup/prefix rows rather than conversation: the agent rebuilds its own system prompt, and a
