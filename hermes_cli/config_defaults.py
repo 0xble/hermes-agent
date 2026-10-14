@@ -1362,22 +1362,17 @@ DEFAULT_CONFIG = {
         # session has moved past. 0 = no limit.
         "prefetch_max_age_seconds": 1800,
     },
-    # Subagent delegation — override the provider:model used by delegate_task so children run on a
-    # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
-    # every configured provider is supported.
+    # Subagent delegation — override delegate_task's provider:model so children run on a cheaper/faster
+    # model. Same runtime provider resolution as CLI/gateway startup: every configured provider works.
     "delegation": {
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
-        # Fallback chain for delegated children (same entry format as the top-level list).
-        # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
-        # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
+        # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
-        # Unattended delegation/cron/side-agent runs retry transient provider failures on the
-        # same route before consuming the next fallback. 0 restores immediate failover.
-        "fallback": {
-            "transient_retry_window_seconds": 180.0,
-        },
+        # Unattended (subagent/cron/side-agent) runs keep retrying transient provider errors on the same
+        # route for this many seconds before taking the fallback chain; 0 = fail over immediately.
+        "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |

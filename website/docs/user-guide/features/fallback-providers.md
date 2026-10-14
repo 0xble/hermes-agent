@@ -158,6 +158,14 @@ The fallback activates automatically when the primary model fails with:
 - **Not found** (HTTP 404) — immediately
 - **Invalid responses** — when the API returns malformed or empty responses repeatedly. An HTTP-200 body whose only assistant text is a router's `Connect timeout, please try again later.` with zero completion tokens counts as invalid too (streamed or not, in the main loop, the iteration-limit summary and auxiliary calls), so it is retried instead of shown as the answer. A streamed refusal (the model declining with an explanation on the refusal channel) is a terminal `content_filter` result, not an empty response, so it is surfaced rather than retried. On the native Anthropic wire a `stop_reason: refusal` arrives with an empty body; Hermes reports the reason from the response's `stop_details` (category and, when present, explanation) in the refusal message and in the log line (`native_stop_reason=… stop_details=…`).
 
+**Unattended runs wait out short outages first.** Subagent, cron and side-agent runs have no one waiting on the retry decision, so on a transient error (rate limit, overload, 5xx, timeout) they keep retrying the same provider for up to `delegation.fallback.transient_retry_window_seconds` (default `180`) before moving to the fallback chain. A provider `Retry-After` longer than what is left of the window ends the wait early. Set it to `0` to fail over immediately. Interactive sessions and billing errors (HTTP 402) always fail over immediately.
+
+```yaml
+delegation:
+  fallback:
+    transient_retry_window_seconds: 180   # 0 = fail over immediately
+```
+
 When triggered, Hermes:
 
 1. Resolves credentials for the fallback provider (including named custom providers using `key_cmd`)

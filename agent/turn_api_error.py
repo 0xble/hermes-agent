@@ -296,7 +296,7 @@ def settle_unrecovered_error(
     )
     from agent.fallback_cooldown import (
         hold_noninteractive_transient_retry, noninteractive_transient_retry_remaining,
-        noninteractive_transient_window_spent,
+        settle_noninteractive_retry_budget,
     )
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
@@ -410,29 +410,11 @@ def settle_unrecovered_error(
                     agent.log_prefix, retry_count)
         retry_count = max_retries
 
-    # Unattended transient outage still inside its window: keep retrying the same route instead of
-    # exhausting. The extended ``max_retries`` rides the verdict back to the loop state, so the
-    # retry loop runs another attempt; once the window ends the hold is False and this same
-    # exhaustion block activates the fallback. Billing / client errors never reach here held.
-    # The pre-hold budget is kept on ``_retry`` and restored the moment the hold ends, so the
-    # transport rebuild and every auto-recovery cycle after it run the ordinary budget.
-    if retry_count >= max_retries and hold_noninteractive_transient:
-        if _retry.noninteractive_hold_base_retries is None:
-            _retry.noninteractive_hold_base_retries = max_retries
-        max_retries = retry_count + 1
-    elif not hold_noninteractive_transient and _retry.noninteractive_hold_base_retries is not None:
-        max_retries = min(max_retries, _retry.noninteractive_hold_base_retries)
-        _retry.noninteractive_hold_base_retries = None
-    window_spent = not over_wait_cap and noninteractive_transient_window_spent(
-        agent, classified, error_message=error_msg,
+    # Unattended transient hold / spent window: extend or restore the retry budget (see helper).
+    max_retries, skip_to_fallback = settle_noninteractive_retry_budget(
+        agent, classified, _retry, retry_count=retry_count, max_retries=max_retries,
+        hold=hold_noninteractive_transient, over_wait_cap=over_wait_cap, error_message=error_msg,
     )
-    # A spent window only short-cuts to a pending fallback. With nothing to fall back to, the
-    # one-shot transport rebuild and the auto-recovery ladder still run as for any session.
-    skip_to_fallback = window_spent and agent._has_pending_fallback()
-    if skip_to_fallback and retry_count < max_retries:
-        # The window ran out before the ordinary retry budget did (long Retry-After waits): the
-        # route had its recovery time, so move to the fallback now instead of burning the rest.
-        max_retries = retry_count
 
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for

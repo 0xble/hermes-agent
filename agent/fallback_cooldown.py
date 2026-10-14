@@ -1,5 +1,9 @@
 """Primary rate-limit cooldown arming and per-session model rejection markers, shared by the
-fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers)."""
+fallback walk (chat_completion_helpers) and restore_primary_runtime (agent_runtime_helpers).
+
+Also owns the unattended transient-retry window policy: subagent, cron and side-agent sessions
+keep retrying the same route through transient provider errors for
+``delegation.fallback.transient_retry_window_seconds`` before the fallback chain runs."""
 import logging
 import math
 import time
@@ -172,6 +176,38 @@ def noninteractive_transient_window_spent(agent, classified, *, error_message: s
         return False
     now = _monotonic() if now is None else float(now)
     return now - started >= _effective_window_seconds(agent)
+
+
+def settle_noninteractive_retry_budget(
+    agent, classified, retry_state, *, retry_count, max_retries, hold, over_wait_cap, error_message="",
+) -> tuple:
+    """Apply the unattended window to the retry budget; return ``(max_retries, skip_to_fallback)``.
+
+    Still inside the window (``hold``): an exhausted budget grows by one attempt, so the retry
+    loop keeps hitting the same route; once the window ends the hold is False and the ordinary
+    exhaustion path activates the fallback. Billing / client errors never arrive held. The
+    pre-hold budget is kept on ``retry_state`` and restored the moment the hold ends, so the
+    transport rebuild and every auto-recovery cycle after it run the ordinary budget.
+
+    ``skip_to_fallback`` is True when the window is spent and a fallback is pending: the route had
+    its recovery time, so the caller skips the transport rebuild. If the window ran out before the
+    ordinary budget did (long Retry-After waits), the budget is cut to ``retry_count`` so the
+    fallback runs now. With nothing to fall back to, the rebuild and recovery ladder still run.
+    """
+    if retry_count >= max_retries and hold:
+        if retry_state.noninteractive_hold_base_retries is None:
+            retry_state.noninteractive_hold_base_retries = max_retries
+        max_retries = retry_count + 1
+    elif not hold and getattr(retry_state, "noninteractive_hold_base_retries", None) is not None:
+        max_retries = min(max_retries, retry_state.noninteractive_hold_base_retries)
+        retry_state.noninteractive_hold_base_retries = None
+    window_spent = not over_wait_cap and noninteractive_transient_window_spent(
+        agent, classified, error_message=error_message,
+    )
+    skip_to_fallback = window_spent and agent._has_pending_fallback()
+    if skip_to_fallback and retry_count < max_retries:
+        max_retries = retry_count
+    return max_retries, skip_to_fallback
 
 
 def clear_noninteractive_transient_retry(agent) -> None:
