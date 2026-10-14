@@ -46,6 +46,9 @@ class TurnRetryState:
     affordable_402_clamp_attempted: bool = False
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
+    # Shared primary cooldown has been armed for this turn; prevents repeated durable-write
+    # failures from escalating the local rate-limit backoff on every retry.
+    shared_cooldown_arm_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
 
