@@ -155,12 +155,13 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
-    # Relay accepts one guarded CLI address: prefer the reachable topic ancestor.
-    # Preserve an inherited address across later spawns.
+    # Relay accepts one guarded CLI address, so an in-process child stamps its
+    # reachable topic ancestor (else its immediate parent) and names it over any
+    # inherited value, matching the terminal wrapper's export. Outside an
+    # in-process child, inherited values pass through untouched.
     from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
-    if RELAY_PARENT_ADDRESS_ENV not in cleaned:
-        if parent_address := in_process_child_relay_parent_address():
-            cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
+    if parent_address := in_process_child_relay_parent_address():
+        cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
     return cleaned
 
 

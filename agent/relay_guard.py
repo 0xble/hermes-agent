@@ -52,27 +52,41 @@ def child_parent_relay_address() -> str:
     return f"hermes:{profile}/{parent_session_id}"
 
 
+_TOPIC_BY_PARENT: dict[tuple[str, str], str] = {}
+
+
 def child_topic_relay_address() -> str:
-    """Reuse MCP caller lineage resolution without weakening the immediate-parent guard."""
+    """The nearest topic session at or above the immediate parent, else ``""``.
+
+    The walk starts at the parent, never the caller: child rows can carry the
+    surface's source (TUI, desktop) instead of ``subagent``, and starting at the
+    caller would resolve the child itself. Resolved topics are cached per
+    parent because a session's ancestry is fixed once written.
+    """
     from agent.delegation_context import is_delegated_child_process_context
 
     if not is_delegated_child_process_context():
         return ""
+    parent_session_id = _parent_session_id()
+    profile = _profile_name().strip()
+    if not parent_session_id or not profile:
+        return ""
+    key = (profile, parent_session_id)
+    if cached := _TOPIC_BY_PARENT.get(key):
+        return cached
     try:
-        from gateway.session_context import bound_session_env
         from hermes_constants import get_hermes_home
         from tools.mcp_tool_caller import _topic_session_id
 
-        session_id = bound_session_env("HERMES_SESSION_ID")
-        profile = _profile_name().strip()
-        if session_id and profile:
-            topic = _topic_session_id(session_id, get_hermes_home() / "state.db")
-            if topic:
-                return f"hermes:{profile}/{topic}"
+        topic = _topic_session_id(parent_session_id, get_hermes_home() / "state.db")
     except Exception:
         # Persistence/thread startup may fail; the context-local parent still holds.
         return ""
-    return ""
+    if not topic:
+        return ""
+    address = f"hermes:{profile}/{topic}"
+    _TOPIC_BY_PARENT[key] = address
+    return address
 
 
 def child_parent_relay_error(target: Any) -> str | None:

@@ -16,6 +16,14 @@ from gateway import session_context
 from tools import mcp_tool_handlers
 
 
+
+@pytest.fixture(autouse=True)
+def _fresh_topic_cache():
+    from agent import relay_guard
+    relay_guard._TOPIC_BY_PARENT.clear()
+    yield
+    relay_guard._TOPIC_BY_PARENT.clear()
+
 def _bind(session_id: str, profile: str = "default"):
     return session_context.set_session_vars(session_id=session_id, profile=profile)
 
@@ -89,8 +97,35 @@ def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, d
                 for target in ("hermes:default/peer", "hermes:default/old-topic", "hermes:other/parent-session"):
                     assert send({"address": target, "body": "allowed"}) == "peer reached"
             assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+            # The in-process child names its own guard over an inherited outer value,
+            # matching the terminal wrapper's export.
             inherited = {RELAY_PARENT_ADDRESS_ENV: "hermes:default/inherited"}
-            assert delegated_child_subprocess_env(inherited)[RELAY_PARENT_ADDRESS_ENV] == inherited[RELAY_PARENT_ADDRESS_ENV]
+            assert delegated_child_subprocess_env(inherited)[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize("surface", ["tui", "desktop", "telegram"])
+def test_child_rows_labelled_with_the_surface_still_guard_the_parent(tmp_path, monkeypatch, surface):
+    # TUI and desktop bind a session source that child rows inherit instead of
+    # "subagent"; topic resolution must never resolve the child itself.
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="parent-session", source=surface)
+        db.create_session(session_id="child-session", source=surface, parent_session_id="parent-session")
+    finally:
+        db.close()
+    tokens = _bind("parent-session")
+    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
+    try:
+        with delegated_child_context("child-session"):
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+            with patch("tools.mcp_tool_handlers._acquire_call_server", side_effect=AssertionError("transport reached")):
+                assert CHILD_PARENT_RELAY_ERROR in send({"address": PARENT_ADDRESS, "body": "do not send"})
     finally:
         session_context.clear_session_vars(tokens)
 
