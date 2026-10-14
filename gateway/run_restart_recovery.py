@@ -375,7 +375,7 @@ class RestartRecoveryMixin:
             self._persist_active_agents()
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
             event = self._build_startup_resume_event(source, resume_marker)
-            logger.warning(
+            logger.debug(
                 "startup resume event constructed: session=%s marker=%r admission=%r internal=%r",
                 entry.session_key, resume_marker, getattr(event, "_outbox_admission_id", None),
                 getattr(event, "internal", None),

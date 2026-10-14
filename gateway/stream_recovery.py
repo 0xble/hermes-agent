@@ -9,6 +9,7 @@ honestly marked re-answer. Normal completion persists the real answer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -23,6 +24,8 @@ _PREVIEW_RETENTION_SECONDS = 86400 * 7
 # State DB paths whose table this process has created and purged once (not per write).
 _prepared_paths: set[str] = set()
 _prepared_lock = threading.Lock()
+_SPLIT_PREVIEW_PREFIX = "\x00hermes-split-preview:"
+_REPLACEMENT_PREVIEW_PREFIX = "\x00hermes-replacement-preview:"
 
 
 def _prepare_journal(conn):
@@ -78,11 +81,39 @@ def discard_preview(turn_id):
     _journal(lambda conn: conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (turn_id,)))
 
 
+def record_split_preview(*, turn_id, session_key, session_id, message_ids):
+    """Durably fence a split-send window until its sealed heads are retired.
+
+    The marker is deliberately kept in the same preview table: recovery can see
+    that accepted head messages exist, but must never adopt one as the editable
+    live preview.
+    """
+    payload = _SPLIT_PREVIEW_PREFIX + json.dumps([str(mid) for mid in message_ids if mid])
+    _journal(lambda conn: conn.execute("""INSERT INTO streamed_previews
+        (turn_id, session_key, session_id, content, message_id, updated_at)
+        VALUES (?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(turn_id) DO UPDATE SET content=excluded.content,
+            message_id=NULL, updated_at=excluded.updated_at""",
+        (turn_id, session_key, session_id, payload, time.time())))
+
+
 def load_preview(session_key, session_id, turn_id):
-    row = _journal(lambda conn: conn.execute("""SELECT content, message_id FROM streamed_previews
+    row = _load_preview_row(session_key, session_id, turn_id)
+    return {"content": row["content"], "message_id": row["message_id"]} if row else None
+
+
+def _load_preview_row(session_key, session_id, turn_id):
+    row = _journal(lambda conn: conn.execute("""SELECT turn_id, content, message_id FROM streamed_previews
         WHERE turn_id = ? AND session_key = ? AND session_id = ?""",
         (turn_id, session_key, session_id)).fetchone())
-    return {"content": row[0], "message_id": row[1]} if row else None
+    return {"turn_id": row[0], "content": row[1], "message_id": row[2]} if row else None
+
+
+def _load_session_preview_rows(session_key, session_id):
+    rows = _journal(lambda conn: conn.execute("""SELECT turn_id, content, message_id FROM streamed_previews
+        WHERE session_key = ? AND session_id = ? ORDER BY updated_at DESC""",
+        (session_key, session_id)).fetchall())
+    return [{"turn_id": row[0], "content": row[1], "message_id": row[2]} for row in rows]
 
 
 def _turn_event(runner, ctx):
@@ -102,6 +133,14 @@ def preview_recorder(runner, ctx):
         return None
 
     async def record(content, message_id):
+        if isinstance(content, str) and content.startswith(_SPLIT_PREVIEW_PREFIX):
+            try:
+                message_ids = json.loads(content[len(_SPLIT_PREVIEW_PREFIX):])
+            except (TypeError, ValueError):
+                message_ids = []
+            await asyncio.to_thread(record_split_preview, turn_id=token, session_key=ctx.session_key,
+                                    session_id=ctx.session_id, message_ids=message_ids)
+            return
         if not content:
             await asyncio.to_thread(discard_preview, token)
             return
@@ -136,18 +175,73 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
             return
     if getattr(event, "_outbox_admission_id", None) != resume_admission_id(token):
         return
-    preview = load_preview(ctx.session_key, ctx.session_id, token)
+    preview = _load_preview_row(ctx.session_key, ctx.session_id, token)
+    # If the process died after publishing the successor active-turn token but
+    # before the preview re-key transaction, the predecessor is no longer named
+    # by resume_turn_id. Keep it reachable by session identity until re-owning it.
     if not preview:
+        rows = _load_session_preview_rows(ctx.session_key, ctx.session_id)
+        if len(rows) == 1:
+            preview = rows[0]
+    if not preview:
+        return
+    if isinstance(preview.get("content"), str) and preview["content"].startswith(_REPLACEMENT_PREVIEW_PREFIX):
+        try:
+            intent = json.loads(preview["content"][len(_REPLACEMENT_PREVIEW_PREFIX):])
+        except (TypeError, ValueError):
+            intent = {}
+        stale_ids = list(intent.get("stale_ids") or [])
+        if preview.get("message_id"):
+            stale_ids.append(preview["message_id"])
+        delete = getattr(consumer, "_delete_previews", None)
+        if delete and stale_ids:
+            try:
+                asyncio.run(delete(list(dict.fromkeys(stale_ids)), label="Recovered replacement preview",
+                                    skip_sentinel=False))
+            except Exception:
+                logger.warning("Could not clean recovered replacement preview for %s", ctx.session_key,
+                               exc_info=True)
+        discard_preview(preview["turn_id"])
+        consumer._recovered_send_uncertain = True
+        consumer.cfg.buffer_only = True
+        return
+    if isinstance(preview.get("content"), str) and preview["content"].startswith(_SPLIT_PREVIEW_PREFIX):
+        try:
+            head_ids = json.loads(preview["content"][len(_SPLIT_PREVIEW_PREFIX):])
+        except (TypeError, ValueError):
+            head_ids = []
+        # A crash in the split-send window leaves sealed heads on screen. Remove
+        # those owned messages before the resumed answer is allowed to send.
+        delete = getattr(consumer, "_delete_previews", None)
+        if delete and head_ids:
+            try:
+                asyncio.run(delete(head_ids, label="Recovered split heads", skip_sentinel=False))
+            except Exception:
+                logger.warning("Could not clean recovered split heads for %s", ctx.session_key, exc_info=True)
+        discard_preview(token)
+        consumer._recovered_split_delivery = True
         return
     # Re-own the row under this resumed turn's own active token: if it crashes too,
     # promotion makes that token the next resume_turn_id and recovery still finds it.
     successor = getattr(event, "_gateway_active_turn_token", None)
-    if successor and successor != token:
+    predecessor = preview["turn_id"]
+    if successor and successor != predecessor:
         try:
-            record_preview(turn_id=successor, session_key=ctx.session_key, session_id=ctx.session_id,
-                           content=preview["content"], message_id=preview["message_id"])
-            # Only once the successor owns it: a failed re-record keeps the predecessor row.
-            discard_preview(token)
+            # Re-key and retire the predecessor in one SQLite transaction. A
+            # failed transaction leaves the predecessor reachable for the next
+            # recovery attempt instead of publishing an unreachable successor.
+            def _reown(conn):
+                now = time.time()
+                conn.execute("""INSERT INTO streamed_previews
+                    (turn_id, session_key, session_id, content, message_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(turn_id) DO UPDATE SET session_key=excluded.session_key,
+                        session_id=excluded.session_id, content=excluded.content,
+                        message_id=excluded.message_id, updated_at=excluded.updated_at""",
+                    (successor, ctx.session_key, ctx.session_id, preview["content"],
+                     preview["message_id"], now))
+                conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (predecessor,))
+            _journal(_reown)
         except Exception:
             logger.warning("Could not re-own streamed preview for %s", ctx.session_key, exc_info=True)
     if not preview["message_id"]:

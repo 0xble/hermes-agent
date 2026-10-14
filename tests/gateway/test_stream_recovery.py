@@ -110,7 +110,7 @@ def restore(runner, consumer, policy="continue"):
 
 @pytest.mark.parametrize("pending,session_id,token,restored", [
     (True, "sid", "old", True), (False, "sid", "old", False),
-    (True, "reset-sid", "old", False), (True, "sid", "successor", False),
+    (True, "reset-sid", "old", False), (True, "sid", "successor", True),
 ])
 def test_resume_reuses_only_exact_predecessor(pending, session_id, token, restored):
     record()
@@ -179,14 +179,86 @@ def test_double_crash_reowns_preview_under_resumed_token():
 def test_failed_reown_keeps_the_predecessor_row(monkeypatch):
     record(content="partial", message_id="m1")
 
-    def locked(**kwargs):
-        raise RuntimeError("state.db is locked")
+    real_journal = recovery._journal
+    calls = 0
 
-    monkeypatch.setattr(recovery, "record_preview", locked)
+    def locked(op):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # the re-own transaction, after the preview read
+            raise RuntimeError("state.db is locked")
+        return real_journal(op)
+
+    monkeypatch.setattr(recovery, "_journal", locked)
     consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
     restore(make_runner(event=resume_event("old", active="turn-2")), consumer)
     assert consumer.message_id == "m1"
+    monkeypatch.setattr(recovery, "_journal", real_journal)
     assert recovery.load_preview("key", "sid", "old") == dict(content="partial", message_id="m1")
+
+
+def test_successor_resume_finds_predecessor_if_reown_crashed_after_marker_publish():
+    """The successor active marker may survive while the preview row is still keyed by its predecessor."""
+    record(content="partial", message_id="m1")
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    # The next process sees resume_turn_id=successor, but the row was never re-keyed.
+    restore(make_runner(token="successor", event=resume_event("successor", active="successor-2")), consumer)
+    assert consumer.message_id == "m1"
+    assert recovery.load_preview("key", "sid", "successor-2") == dict(content="partial", message_id="m1")
+    assert recovery.load_preview("key", "sid", "old") is None
+
+
+@pytest.mark.asyncio
+async def test_fresh_final_crash_after_ack_keeps_replacement_intent_not_old_owner():
+    """An accepted fresh replacement whose ACK journaling is interrupted must not re-adopt the old preview."""
+    calls = 0
+
+    async def journal(content, message_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            record(content=content, message_id=message_id)
+        else:
+            raise RuntimeError("crash after replacement ACK")
+
+    async def send(**kwargs):
+        return SendResult(success=True, message_id="fresh-id")
+
+    async def delete_message(chat_id, message_id):
+        return True
+
+    adapter = SimpleNamespace(send=send, delete_message=delete_message)
+    consumer = GatewayStreamConsumer(adapter, "chat", config=StreamConsumerConfig(cursor=""),
+                                     on_preview=journal)
+    consumer._message_id = "old-id"
+    consumer._preview_message_ids = {"old-id"}
+    consumer._last_sent_text = "partial"
+    assert await consumer._try_fresh_final("complete answer")
+    row = recovery.load_preview("key", "sid", "old")
+    assert row["message_id"] == "old-id"
+    assert row["content"].startswith(recovery._REPLACEMENT_PREVIEW_PREFIX)
+    resumed = GatewayStreamConsumer(adapter, "chat")
+    restore(make_runner(), resumed)
+    assert resumed.message_id is None
+    assert resumed._recovered_send_uncertain is True
+    assert recovery.load_preview("key", "sid", "old") is None
+
+
+@pytest.mark.asyncio
+async def test_split_head_ack_is_journaled_before_split_send_returns():
+    """An accepted sealed head is owned durably before the caller can advance the split state."""
+    async def journal(content, message_id):
+        record(content=content, message_id=message_id)
+
+    async def send(**kwargs):
+        return SendResult(success=True, message_id="head-id")
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(send=send), "chat", on_preview=journal)
+    consumer._split_delivery_journal_pending = True
+    assert await consumer._send_new_chunk("sealed head", None) == "head-id"
+    row = recovery.load_preview("key", "sid", "old")
+    assert row["content"].startswith(recovery._SPLIT_PREVIEW_PREFIX)
+    assert "head-id" in row["content"]
 
 
 def test_schema_and_purge_run_once_per_process(monkeypatch):
@@ -436,7 +508,10 @@ async def test_fresh_final_re_records_replacement_before_deleting_preview():
     consumer._message_id = "m1"
     consumer._last_sent_text = "partial"
     assert await consumer._try_fresh_final("complete answer")
-    assert events == [("journal", "complete answer", "fresh-id"), ("delete", "m1")]
+    assert events[0][0] == "journal"
+    assert events[0][1].startswith(recovery._REPLACEMENT_PREVIEW_PREFIX)
+    assert events[0][2] == "m1"
+    assert events[1:] == [("journal", "complete answer", "fresh-id"), ("delete", "m1")]
     assert recovery.load_preview("key", "sid", "old") == dict(content="complete answer", message_id="fresh-id")
 
 

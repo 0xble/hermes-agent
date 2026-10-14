@@ -172,6 +172,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
         self._last_edit_overflowed = False  # last _send_or_edit split into continuations
+        self._split_delivery_journal_pending = False
         self._flood_strikes = 0
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
@@ -863,12 +864,19 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
         reply_to = self._initial_reply_to_id
         heads_delivered = len(chunks) > 1
+        sealed_head_ids = []
+        # The first head send is already visible before _enter_split_delivery can
+        # retire the normal preview row. Fence that whole window durably.
+        self._split_delivery_journal_pending = True
+        await self._journal_split_delivery(sealed_head_ids)
         for chunk in chunks[:-1]:
             new_id = await self._send_new_chunk(chunk, reply_to, final=tick.got_done)
             if new_id is None or new_id == reply_to:
                 heads_delivered = False  # keep the full text intact for the gateway fallback
                 break
             reply_to = new_id
+            sealed_head_ids.append(new_id)
+            await self._journal_split_delivery(sealed_head_ids)
 
         if heads_delivered:
             # truncate_message suffixes multi-chunk output with " (n/n)"; the tail is the LIVE
@@ -917,9 +925,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # finalize=True: the sealed chunk is never edited again, so it needs its
             # rich-text pass now.  is_turn_final=False: a split head is not the
             # answer, so fresh-final must not mark the turn delivered on it.
+            self._split_delivery_journal_pending = True
+            await self._journal_split_delivery([self._message_id])
             ok = await self._send_or_edit(chunk, finalize=True, is_turn_final=False)
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
+            await self._journal_split_delivery(self._preview_message_ids | {self._message_id})
             self._accumulated = self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""

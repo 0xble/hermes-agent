@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 from typing import Any, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
+from gateway.stream_recovery import _REPLACEMENT_PREVIEW_PREFIX, _SPLIT_PREVIEW_PREFIX
 from hermes_cli.observability.shared_metrics_gateway import stops_reply_clock
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -282,17 +284,28 @@ class StreamTransportMixin:
         if self._turn_split_delivery:
             return False
         stale_ids = self._stale_preview_ids()
+        # The old row must stop naming the editable preview before a replacement
+        # send is issued.  If the process dies after the platform accepts the new
+        # message but before its ACK can be journaled, recovery treats this as an
+        # uncertain fresh send instead of editing the retired preview.
+        replacement_intent = _REPLACEMENT_PREVIEW_PREFIX + json.dumps({
+            "text": text,
+            "stale_ids": list(stale_ids),
+        })
+        await self._journal_preview(replacement_intent, self._message_id, force=True)
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
+            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
         if not getattr(result, "success", False):
+            await self._journal_preview(self._last_sent_text, self._message_id, force=True)
             return False
         new_message_id = getattr(result, "message_id", None)
         # Journal the replacement before deleting what the old row points at.
-        await self._journal_preview(text, new_message_id)
+        await self._journal_preview(text, new_message_id, force=True)
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
@@ -476,11 +489,20 @@ class StreamTransportMixin:
             else:
                 logger.debug("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
 
+    async def _journal_split_delivery(self, message_ids) -> None:
+        """Record accepted sealed heads while a split send is still in flight."""
+        await self._journal_preview(
+            _SPLIT_PREVIEW_PREFIX + json.dumps([str(mid) for mid in message_ids if mid]),
+            None,
+            force=True,
+        )
+
     async def _enter_split_delivery(self) -> None:
         """Mark the turn split and forget its preview row: the row names a now-sealed head,
         which a crash recovery must never adopt and overwrite with the whole answer."""
         self._turn_split_delivery = True
         await self._journal_preview("", force=True)
+        self._split_delivery_journal_pending = False
 
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
@@ -538,11 +560,13 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
-        await self._journal_preview(text, self._message_id)
+        if not getattr(self, "_split_delivery_journal_pending", False):
+            await self._journal_preview(text, self._message_id)
         result = await self._edit_message(message_id=self._message_id, content=text,
                                           finalize=finalize)
         if not result.success:
-            await self._journal_preview(self._last_sent_text, self._message_id)
+            if not getattr(self, "_split_delivery_journal_pending", False):
+                await self._journal_preview(self._last_sent_text, self._message_id)
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
         raw_response = getattr(result, "raw_response", None)

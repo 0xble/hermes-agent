@@ -487,6 +487,8 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
     gw.inject(platform, f"[in:{token}] question", message_id=f"in-{token}", chat_id=chat)
     wait_until(lambda: any(footer(aid) in h["content"] for h in gw.holds()), f"{token} to reach the crash point",
                proc=gw.proc, log=gw.log)
+    preview_ids = [m.message_id for m in gw.platform_view().visible(platform, chat)
+                   if header(aid) in m.text] if point == "stream_accepted_edit_unpersisted" else []
     if point == "sent_ack_lost":  # the stream's footer edit can land before the turn is persisted
         wait_until(lambda: persisted_answers(gw.db_path, aid), f"{token} answer persisted before the kill",
                    proc=gw.proc, log=gw.log)
@@ -501,14 +503,27 @@ def test_crash_between_completion_and_send(fresh_gw, director, point, platform):
                proc=gw.proc, log=gw.log)
     gw.wait_idle([chat], f"{token} to settle after restart")
     wait_until(lambda: ledger_quiescent(gw.db_path, chat), f"{token} ledger to settle", proc=gw.proc, log=gw.log)
-    _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming)
+    _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming,
+                               preview_ids=preview_ids)
 
 
-def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming) -> None:
+def _assert_single_final_reply(gw, director, platform, chat, token, aid, point, streaming,
+                               *, preview_ids=None) -> None:
     ctx = dump(gw, platform, chat)
     originals, resumes = _replies(gw, platform, chat, token, aid)
     complete = [c for c in originals + resumes if c.complete]
     unmarked = [c for c in complete if not c.marked]
+    if point == "stream_accepted_edit_unpersisted":
+        # The acknowledged preview ID is the durable edit target across the
+        # restart. The resumed complete copy must finish that message in place;
+        # an old incomplete preview must not remain beside it.
+        assert preview_ids, f"no acknowledged preview captured before crash\n{ctx}"
+        assert len(complete) == 1, f"expected one resumed complete copy\n{ctx}"
+        assert complete[0].message_ids == preview_ids, (
+            f"resumed completion changed platform message ownership: "
+            f"preview={preview_ids}, complete={complete[0].message_ids}\n{ctx}")
+        assert not [c for c in originals + resumes if not c.complete], ctx
+        return
     if point == "stream_accepted_unpersisted":
         # The first send's ACK died with the gateway, so its ID cannot be edited.
         # The docstring's honest at-least-once contract governs this one cell:

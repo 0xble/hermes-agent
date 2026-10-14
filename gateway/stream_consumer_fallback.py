@@ -32,6 +32,13 @@ class StreamFallbackMixin:
                 return reply_to_id
             self._message_id = str(result.message_id)
             self._track_preview_ids_from_result(result)
+            if getattr(self, "_split_delivery_journal_pending", False):
+                # The ACKed head must be in the split fence before control returns
+                # to the caller; a crash in that gap otherwise leaves an owned,
+                # visible chunk with no durable owner.
+                await self._journal_split_delivery(self._preview_message_ids)
+            else:
+                await self._journal_preview(text, str(result.message_id), force=True)
             self._already_sent = True
             self._last_sent_text = text
             self._notify_new_message()
