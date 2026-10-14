@@ -144,6 +144,36 @@ class TestLogicalLineStreaming:
         plain = _strip_ansi("\n".join(emitted))
         assert "LOOP" in plain
 
+    @pytest.mark.parametrize("chunks", [
+        ["No.\nLOOP_COMPLETE"],
+        ["No", ".\nLOOP_COMPLETE\n"],
+    ])
+    def test_wakeup_reply_released_from_silence_hold_drops_loop_complete(self, cli_stub, chunks):
+        """Text the silence hold releases still goes through the LOOP_COMPLETE hold."""
+        cli, emitted = cli_stub
+        cli._quiet_wakeup_turn = True
+        cli._reset_stream_state()
+        for chunk in chunks:
+            cli._stream_delta(chunk)
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert "No." in plain
+        assert "LOOP_COMPLETE" not in plain
+
+    @pytest.mark.parametrize("chunks", [
+        ["[SILENT]", "\nLOOP_COMPLETE"],
+        ["\n\n[SIL", "ENT]\n\n", "LOOP_COMPLETE"],
+    ])
+    def test_wakeup_silent_reply_shows_nothing(self, cli_stub, chunks):
+        cli, emitted = cli_stub
+        cli._quiet_wakeup_turn = True
+        cli._reset_stream_state()
+        for chunk in chunks:
+            cli._stream_delta(chunk)
+        cli._flush_stream()
+        plain = _strip_ansi("\n".join(emitted))
+        assert "SILENT" not in plain and "LOOP_COMPLETE" not in plain
+
     def test_unbreakable_run_stays_single_line(self, cli_stub):
         cli, emitted = cli_stub
         blob = "x" * 300  # no spaces

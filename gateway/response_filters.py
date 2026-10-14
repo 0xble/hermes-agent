@@ -427,22 +427,20 @@ def _is_silence_run_prefix(text: str) -> bool:
     """The one streaming hold rule: ``text`` may still become a silent response.
 
     Leading whitespace and blank lines are ignored (the agent opens the first text after a
-    tool round with ``"\\n\\n"``). What remains must be a prefix of the control run the exact
-    verdict accepts: one silence-marker line plus any number of blank and ``LOOP_COMPLETE``
-    lines, in any order (see :func:`_split_trailing_control_run`). Complete lines must already
-    be such lines; the unterminated last line only needs to be on its way to one. A blank
-    buffer is a prefix too.
+    tool round with ``"\\n\\n"``). The complete lines must form, on their own, the trailing
+    control run of :func:`_split_trailing_control_run` (the definition
+    :func:`strip_trailing_control_markers` uses) with at most one silence-marker line; the
+    unterminated last line only needs to be on its way to a ``LOOP_COMPLETE`` line, or to the
+    marker line when none is complete yet. A blank buffer is a prefix too.
     """
-    lines = text.lstrip().split("\n")
-    tail = lines.pop().strip()
-    markers = 0
-    for line in lines:
-        if _is_silence_marker_line(line):
-            markers += 1
-        elif line.strip() and not is_loop_complete_marker(line):
-            return False
+    complete, _, tail = text.lstrip().rpartition("\n")
+    prefix, run = _split_trailing_control_run(complete)
+    if prefix.strip():
+        return False
+    markers = sum(1 for line in run if not is_loop_complete_marker(line))
     if markers > 1:
         return False
+    tail = tail.strip()
     if not tail or is_loop_complete_marker(tail) or _LOOP_COMPLETE_MARKER.startswith(tail.upper()):
         return True
     return not markers and _is_partial_marker_line(tail)
