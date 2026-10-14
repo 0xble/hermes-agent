@@ -266,6 +266,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             self._queue_startup_restore_event(event)
             return None
 
+        # Adapter admission can precede this task by an arbitrary delay on an idle lane.
+        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
+        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
+                internal_wake_is_current, event):
+            return None
         if is_internal:
             await _admit_outbox_event(self, event, source)
             return event, source, True
@@ -1498,6 +1503,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1530,6 +1536,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
                 await self._run_post_turn_hooks(
