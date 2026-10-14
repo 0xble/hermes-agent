@@ -119,6 +119,60 @@ async def test_restored_followup_failed_real_turn_gets_no_preserved_notice(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_internal_recovered_followup_consumed_by_successor_reports_result(tmp_path, monkeypatch, caplog):
+    """A pending-slot successor owns the turn result, not the parked recovery event."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+                          deferred_followup=partial(_defer_followup, runner, {}, None))
+    recovered = runner._startup_restore_queue.pop()
+    recovered._gateway_accepted = True
+    consumed = MessageEvent(text=recovered.text, source=source, user_id=source.user_id, internal=True)
+    adapter._pending_messages[entry.session_key] = consumed
+
+    async def successor():
+        runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": consumed.text})
+        consumed._agent_turn_succeeded = True
+
+    task = asyncio.create_task(successor())
+    task._hermes_event = consumed
+    adapter._session_tasks[entry.session_key] = task
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._observe_recovered_followup(adapter, recovered, entry.session_key, task=task)
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+    outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
+    assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=resumed"]
+
+
+def test_idless_recovered_followup_whose_input_is_already_durable_is_dropped(tmp_path, monkeypatch):
+    """An internal follow-up has no platform id, so dedupe must use its durable user row."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": event.text})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
+    assert runner._startup_restore_queue == []
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_path, monkeypatch):
+    """The durability watcher must retire a no-id spool at turn start, before the result."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="internal side effect", source=source, user_id=source.user_id, internal=True)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+                          deferred_followup=partial(_defer_followup, runner, {}, None))
+    spool = next((tmp_path / "pending_messages").glob("*.json"))
+    runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": event.text})
+    await asyncio.wait_for(runner._retire_spool_once_input_durable(runner._startup_restore_queue[0]), 2)
+    assert not spool.exists()
+
+
+@pytest.mark.asyncio
 async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_path, monkeypatch):
     """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
     from gateway import run

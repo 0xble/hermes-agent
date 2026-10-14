@@ -543,6 +543,7 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     data = _upgrade_shutdown_follow_up(payload, data)
+    data = {**data, "_recovery_spool_ts": payload.get("ts")}
     text = data.get("text", "")
     if data.get("drain_deferred") is True and _drop_drain_deferred(path, text, data):
         return DROP_PENDING

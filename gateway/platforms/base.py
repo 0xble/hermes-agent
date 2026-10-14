@@ -5139,6 +5139,12 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            # Restart recovery follows session-task successors. Keep the event that each shared
+            # background task actually consumes so a merged pending-slot event can report its
+            # terminal result back to the parked recovery observer.
+            setattr(current_task, "_hermes_event", event)
         deferred_session = getattr(event, "_deferred_session_key", None)
         if deferred_session is not None:
             current_generation = self._session_generations.get(session_key, 0)

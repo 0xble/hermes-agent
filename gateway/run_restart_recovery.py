@@ -46,7 +46,8 @@ class RestartRecoveryMixin:
         from gateway.run_pending_recovery import input_already_durable
         return await asyncio.to_thread(
             input_already_durable, getattr(self, "session_store", None),
-            getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None))
+            getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None),
+            getattr(event, "text", None), getattr(event, "_hermes_recovery_spool_ts", None))
 
     async def _retire_spool_once_input_durable(self, event) -> None:
         """Retire the replay copy at the turn's durable start, not at adapter admission.
@@ -75,13 +76,22 @@ class RestartRecoveryMixin:
     @staticmethod
     async def _follow_startup_resume_turn(adapter, event, session_key: str, task, *, on_task_done=None) -> None:
         """Await the task that runs *event*. A busy or bounced event is parked and run by a
-        successor session task, so follow ``_session_tasks`` until the event reports a result."""
+        successor session task, so follow ``_session_tasks`` until the event reports a result.
+
+        The adapter may consume a recovered event by merging it into an already pending slot. In
+        that case the successor owns the result and the parked recovery event is not the object on
+        which ``run_turn`` writes ``_agent_turn_succeeded``. Session tasks are tagged with their
+        event by the shared background runner; copy that terminal result across the handoff."""
         seen = set()
         while isinstance(task, asyncio.Task) and task not in seen:
             seen.add(task)
             await asyncio.shield(task)
             if on_task_done is not None:
                 on_task_done(task)
+            task_event = getattr(task, "_hermes_event", None)
+            task_result = getattr(task_event, "_agent_turn_succeeded", None)
+            if isinstance(task_result, bool) and not isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
+                event._agent_turn_succeeded = task_result
             if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
                 return
             task = getattr(adapter, "_session_tasks", {}).get(session_key)

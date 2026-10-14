@@ -101,7 +101,13 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
 def _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events):
     """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
     followup = data.get("shutdown_follow_up") is True
-    if followup and input_already_durable(runner.session_store, session_id, data.get("message_id")):
+    if followup and input_already_durable(
+        runner.session_store,
+        session_id,
+        data.get("message_id"),
+        data.get("text"),
+        data.get("_recovery_spool_ts"),
+    ):
         # A previous boot's turn persisted this input before the restart cut it: the turn's own
         # resume_pending marker owns it now, and replaying the prompt could repeat tool effects.
         logger.info("Dropping recovered follow-up for %s: its turn already persisted it", key)
@@ -112,6 +118,7 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     if followup:
         setattr(event, "_hermes_recovery_session_key", key)
         setattr(event, "_hermes_recovery_session_id", session_id)
+        setattr(event, "_hermes_recovery_spool_ts", data.get("_recovery_spool_ts"))
     if recovered_events is not None:
         recovered_events.append(event)
     else:
@@ -120,14 +127,29 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     return True
 
 
-def input_already_durable(store, session_id, message_id) -> bool:
-    """True when a turn already wrote this platform message as a user row of *session_id*.
+def input_already_durable(store, session_id, message_id, content=None, spool_ts=None) -> bool:
+    """True when a turn already wrote this replayed input as a user row of *session_id*.
 
-    The agent stamps the raw inbound id on the turn's user row at turn start, before the first
-    model call, so this is the turn's durable-start point for a replayed input.
+    Platform-backed events use their exact id. Internal events have no transport id, so their
+    exact user content is the durable identity available to recovery; this prevents a spool left
+    behind by a crash between the transcript write and unlink from replaying on the next boot.
     """
+    if not session_id:
+        return False
+    if message_id is None:
+        probe = getattr(store, "has_user_message_content", None)
+        if not content or not callable(probe):
+            return False
+        try:
+            tip_for = getattr(store, "_compression_tip_for_session_id", None)
+            tip = tip_for(session_id) if callable(tip_for) else session_id
+            return any(bool(probe(sid, str(content), min_timestamp=spool_ts))
+                       for sid in dict.fromkeys((session_id, tip)) if sid)
+        except Exception:
+            logger.debug("Recovered id-less follow-up durability probe failed for %s", session_id, exc_info=True)
+            return False
     probe = getattr(store, "has_platform_message_id", None)
-    if not session_id or message_id is None or not callable(probe):
+    if not callable(probe):
         return False
     try:
         tip_for = getattr(store, "_compression_tip_for_session_id", None)
