@@ -332,7 +332,7 @@ class TestAgentCacheBoundedGrowth:
 
         commit_calls: list = []
         release_calls: list = []
-        runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
+        runner._release_evicted_agent_soft = lambda agent, retired=None: release_calls.append(agent)
 
         runner.session_store = MagicMock()
         runner.session_store._entries = {"old": MagicMock(), "new": MagicMock()}

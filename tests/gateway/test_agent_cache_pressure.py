@@ -271,7 +271,7 @@ class TestGatewayPressureSweep:
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
         released: list = []
-        runner._commit_then_release_soft = lambda agent, key: (
+        runner._commit_then_release_soft = lambda agent, key, retired=None: (
             released.append(key),
             setattr(agent, "_session_messages", []),
         )
@@ -291,7 +291,7 @@ class TestGatewayPressureSweep:
     def test_mid_turn_session_is_never_evicted(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         active = self._cached_agent()
         runner._agent_cache["s-active"] = (active, "sig")
@@ -310,7 +310,7 @@ class TestGatewayPressureSweep:
     def test_lagging_persistence_blocks_eviction(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         runner._agent_cache["s-lagging"] = (
             self._cached_agent(persisted=False), "sig",
@@ -336,7 +336,7 @@ class TestGatewayPressureSweep:
     def test_all_candidates_skipped_reports_zero_without_raising(self, monkeypatch):
         runner = self._runner()
         self._at_rss(monkeypatch, 4000)
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
         for i in range(3):
             runner._agent_cache[f"s{i}"] = (
                 self._cached_agent(persisted=False), "sig",
@@ -377,8 +377,8 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent: None
-        runner._commit_then_release_soft = lambda agent, key: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None: None
+        runner._commit_then_release_soft = lambda agent, key, retired=None: None
 
         with runner._agent_cache_lock:
             for i in range(5):
@@ -395,7 +395,7 @@ class TestConfiguredBoundsReachTheCache:
         runner._agent_cache = OrderedDict()
         runner._agent_cache_lock = threading.Lock()
         runner._running_agents = {}
-        runner._release_evicted_agent_soft = lambda agent: None
+        runner._release_evicted_agent_soft = lambda agent, retired=None: None
         runner.session_store = None
 
         stale = MagicMock()

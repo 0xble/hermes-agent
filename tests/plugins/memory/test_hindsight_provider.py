@@ -1039,9 +1039,10 @@ class TestPrefetchServerRetainVisibility:
 
 
 class TestPrefetchSupersession:
-    def test_superseded_slow_worker_cannot_overwrite_newer_result(self, provider):
-        """A worker that outlives prefetch()'s capped join must not publish over a newer
-        request's completed recall in the same session."""
+    def test_query_queued_during_slow_recall_wins_over_it(self, provider):
+        """Prefetches are coalesced: a query queued while an older recall is still in flight
+        takes the single pending slot and runs after it on the same worker, so the slow older
+        recall must not publish over (or survive alongside) the newer query's result."""
         release_old = threading.Event()
         old_started = threading.Event()
 
