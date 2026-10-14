@@ -183,8 +183,8 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     return flushed
 
 
-# A queue checkpoint that outlives this bound is retired unreplayed: a crash between turn
-# admission and retirement cannot replay the same input forever.
+# Older queue checkpoints leave automatic replay, but their only durable input copy survives
+# in the existing quarantine for manual recovery.
 QUEUE_CHECKPOINT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
@@ -700,8 +700,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         age = time.time() - path.stat().st_mtime
         limit = QUEUE_CHECKPOINT_MAX_AGE_SECONDS if data.get("queue_accepted") is True else 24 * 60 * 60
         if age > limit:
-            logger.warning("Dropping expired drain-deferred message from %s", path)
-            return DROP_PENDING
+            quarantine_pending_spool(path, "expired drain-deferred input")
+            return False
         from gateway.platforms.event import MessageEvent
         from hermes_cli.commands import resolve_command
         command = MessageEvent(

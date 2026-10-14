@@ -133,7 +133,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         reply_to_is_own_message=data.get("reply_to_is_own_message") is True,
         internal=bool(data.get("internal", False)),
         allow_gateway_control=bool(data.get("allow_gateway_control", True)),
-        metadata=data.get("metadata") or {},
+        metadata={**(data.get("metadata") or {}), "gateway_session_key": key,
+                  "gateway_session_id": session_id, "gateway_session_strict": True},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
     setattr(event, "_hermes_recovered_followup", True)

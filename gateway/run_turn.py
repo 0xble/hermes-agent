@@ -467,15 +467,15 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            if (session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id
+                    or getattr(session_entry, "suspended", False)):
                 logger.warning(
-                    "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
+                    "Dropping internally routed event: expected owner id=%s is changed, missing or stopped for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
         else:
-            # Internal wakes observe reset policy without counting as user activity, or periodic
-            # notifications keep the routing key alive across every daily/idle boundary.
+            # Internal wakes must not keep a routing key alive across idle/reset boundaries.
             session_entry = await self.async_session_store.get_or_create_session(
                 source, touch_activity=not bool(getattr(event, "internal", False)),
             )

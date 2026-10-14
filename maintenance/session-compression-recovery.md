@@ -39,8 +39,10 @@ session-id lookup, at exactly one of these points:
   the overflow (`_clear_conversation_scope`), adapter cancel/stale-lock heal
   (`_discard_pending_message`), a pending slash command refused as agent input,
   or a follow-up merged into the head's refreshed checkpoint;
-- expired: `QUEUE_CHECKPOINT_MAX_AGE_SECONDS` (7 days) bounds any crash window
-  between admission and retirement;
+- expired: `QUEUE_CHECKPOINT_MAX_AGE_SECONDS` (7 days) bounds automatic replay.
+  Expired input moves to the existing `*.bad` quarantine intact for manual
+  recovery, including older drain arrivals with the legacy 24-hour bound.
+  Age never deletes the only durable copy of accepted input;
 - unauthorized owner at recovery: quarantined to `*.bad`, never replayed. Any
   declined accepted-queue claim stops recovery for that checkpoint; it never
   falls through to a naked transcript row.
@@ -96,6 +98,10 @@ on spool recovery. Failed unlink cannot replay an admitted occurrence into a
 rotated successor. Real transport ids still require matching content. A failed
 binding refresh retains input and starts no provider work. Retirement callbacks
 remain retryable on `False` or exception, but are cleared at the turn boundary.
+Recovered follow-ups use the gateway's existing strict key/session metadata.
+The normal dispatch resolver checks that original owner again after recovery
+claims the event, and refuses changed or stopped owners before provider work.
+An unused event attribute is not a routing fence.
 
 After the configured native auxiliary summarizer/fallback route cannot fit a
 hard-window request, a no-network mechanical candidate may excerpt oversized
@@ -197,6 +203,11 @@ settings, consumed goal budgets, a stopped control lane and one completed effect
 The parent owns candidate review, exact merge, native source updater, live
 adoption and Telegram inbound/send/readback/restart canary. Source or a healthy
 process alone is not end-to-end completion.
+The same process harness also makes the pending publish location unavailable
+after a real `/queue` admission. It verifies no queued provider work starts,
+the input survives, and one queued reply arrives after storage recovery and
+restart. Expiry regressions verify byte-for-byte preservation outside automatic
+replay for accepted checkpoints and legacy drain payloads.
 
 ## Retirement and rollback
 

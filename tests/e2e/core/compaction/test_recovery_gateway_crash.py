@@ -9,6 +9,7 @@ import hashlib
 import json
 import shlex
 import sqlite3
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -199,5 +200,59 @@ def test_committed_recovery_crash_keeps_queue_identity_settings_and_effects(tmp_
             assert wire_input + output_cap + 6400 < 128000
         db.close()
     finally:
+        gateway.stop()
+        server.stop()
+
+
+def test_failed_queued_checkpoint_refresh_remains_resumable_after_restart(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    queued_calls = []
+
+    def model(record):
+        users = "\n".join(str(row.get("content", "")) for row in record["body"].get("messages", [])
+                          if row.get("role") == "user")
+        if "QUEUED-REFRESH-93" in users:
+            queued_calls.append(record)
+            return Text("QUEUED-REFRESH-FINAL-93")
+        entered.set()
+        assert release.wait(90), "seed request did not release"
+        return Text("FIRST-REFRESH-FINAL-93")
+
+    server = FakeLLMServer(model)
+    server.start()
+    gateway = GatewayProcess(tmp_path / "gateway", platforms={"fk_tg": "discord"},
+                             llm_base_url=server.base_url,
+                             extra_config="display:\n  platforms:\n    fk_tg:\n      streaming: false\n")
+    chat, thread = "queue-refresh-topic", "93"
+    pending_dir = gateway.hermes_home / "pending_messages"
+    held_dir = pending_dir.with_name("pending_messages.held")
+    try:
+        gateway.start()
+        gateway.inject("fk_tg", "FIRST-REFRESH-93", "first-refresh-93", chat, thread)
+        assert entered.wait(30)
+        gateway.inject("fk_tg", "/queue QUEUED-REFRESH-93", "queued-refresh-93", chat, thread)
+        wait_until(lambda: any("QUEUED-REFRESH-93" in path.read_text() for path in pending_dir.glob("*.json")),
+                   "queued input admitted before refresh fault", timeout=30, proc=gateway.proc, log=gateway.log)
+        # Keep the admitted input intact while making its publish location unavailable.
+        # chmod is not a fault here: _get_flush_dir restores the owner's 0700 mode.
+        pending_dir.rename(held_dir)
+        pending_dir.write_text("temporarily unavailable")
+        release.set()
+        gateway.wait_idle([chat], "failed refresh settles without provider work")
+        assert queued_calls == [], "provider ran without durable original-session binding"
+        assert any("QUEUED-REFRESH-93" in path.read_text() for path in held_dir.glob("*.json"))
+        pending_dir.unlink()
+        held_dir.rename(pending_dir)
+        gateway.stop()
+        gateway.start()
+        gateway.wait_idle([chat], "accepted queued input resumes after storage recovers")
+        replies = gateway.platform_view().visible("fk_tg", chat)
+        assert sum("QUEUED-REFRESH-FINAL-93" in reply.text for reply in replies) == 1, replies
+        assert len(queued_calls) == 1
+    finally:
+        release.set()
+        if held_dir.exists():
+            pending_dir.unlink(missing_ok=True)
+            held_dir.rename(pending_dir)
         gateway.stop()
         server.stop()

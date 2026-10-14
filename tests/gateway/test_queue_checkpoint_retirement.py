@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -207,6 +208,45 @@ def test_recovered_idless_checkpoint_restores_occurrence_identity(home):
     assert restored[0].session_id == "sid" and restored[0].message_id is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["current", "rotated", "stopped"])
+async def test_recovered_checkpoint_cannot_cross_new_or_stop_before_dispatch(home, boundary):
+    from gateway.run_pending_recovery import _defer_followup
+    from gateway.run_turn import GatewayTurnMixin
+
+    event = _event("background job finished", None, internal=True)
+    assert shutdown_flush.checkpoint_queued_event("k", event)
+    shutdown_flush.prepare_queued_turn_checkpoint(SimpleNamespace(), event, "k", "sid", None)
+    data = json.loads(event._hermes_recovery_spool.read_text())["data"]
+    entry = SimpleNamespace(origin=event.source, session_key="k", session_id="sid",
+                            suspended=False, resume_pending=False)
+    store = SimpleNamespace(_lock=threading.Lock(), _entries={"k": entry}, _ensure_loaded_locked=lambda: None)
+    runner = SimpleNamespace(session_store=store, _startup_restore_queue=[], _draining=False,
+                             _is_session_running=lambda key: False, _restored_source=lambda e: event.source,
+                             _resume_owner_authorized=lambda key, source: True,
+                             _delivery_adapter_for=lambda source: _Adapter())
+    restored = []
+    assert _defer_followup(runner, {}, None, "k", "sid", data, event._hermes_recovery_spool,
+                           recovered_events=restored) is True
+    # The owner changes AFTER recovery claims the event, before the gateway resolves it.
+    current = SimpleNamespace(origin=event.source, session_key="k",
+                              session_id="successor" if boundary == "rotated" else "sid",
+                              suspended=boundary == "stopped")
+    store._entries["k"] = current
+    runner.async_session_store = SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=current),
+                                                get_or_create_session=AsyncMock(return_value=current))
+    runner._recover_telegram_topic_thread_id = lambda source: None
+    runner._session_key_for_source = lambda source: "k"
+    runner._cache_session_source = lambda key, source: None
+    runner._is_telegram_topic_lane = lambda source: False
+    resolved = await GatewayTurnMixin._hmwa_resolve_session(runner, restored[0], event.source)
+    if boundary == "current":
+        assert resolved[1].session_id == "sid"
+    else:
+        assert resolved is None, "an old recovered event reactivated or crossed its owner boundary"
+    assert event._hermes_recovery_spool.exists()  # retained, never replayed into a successor
+
+
 def test_idless_admitted_input_does_not_replay_when_unlink_fails_and_owner_rotates(home, monkeypatch):
     from pathlib import Path
 
@@ -370,15 +410,25 @@ def test_discarded_pending_slash_command_retires_checkpoint(home):
 
 # ── bounded expiry ──
 
-def test_queue_checkpoint_has_a_bounded_expiry(home):
+@pytest.mark.parametrize("accepted", [True, False])
+def test_expired_drain_input_is_preserved_outside_automatic_replay(home, accepted):
     event = _event("ancient", "old1")
-    assert shutdown_flush.checkpoint_queued_event("k", event)
+    if accepted:
+        assert shutdown_flush.checkpoint_queued_event("k", event)
+        path = event._hermes_recovery_spool
+    else:
+        event._drain_deferred = True
+        assert shutdown_flush.flush_pending_to_file({"k": event}) == 1
+        path = _spools(home)[0]
+    original = path.read_bytes()
     old = time.time() - shutdown_flush.QUEUE_CHECKPOINT_MAX_AGE_SECONDS - 60
-    os.utime(event._hermes_recovery_spool, (old, old))
+    os.utime(path, (old, old))
     db = SessionDB(db_path=home / "state.db")
     db.create_session("successor", "telegram")
     assert _boot(db, home) == []
     assert _spools(home) == []
+    assert path.with_name(path.name + shutdown_flush.QUARANTINE_SUFFIX).read_bytes() == original
+    assert _boot(db, home) == []  # preserved input must not reenter an automatic boot loop
     db.close()
 
 
