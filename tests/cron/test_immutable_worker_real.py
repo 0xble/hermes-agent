@@ -96,6 +96,7 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
         # Exercise the candidate's scheduler and its job/deadline dependencies
         # together; copying only the facade mixes it with the cloned base API.
         for relative in ("cron/scheduler.py", "cron/scheduler_detached_worker.py", "cron/jobs.py",
+                         "cron/scheduler_session_store.py", "cron/job_run_retry.py",
                          "hermes_cli/immutable_releases.py"):
             shutil.copy2(repo / relative, release / relative)
         (release / "cron" / "s2_release_probe.py").write_text(f"IDENTITY = {name!r}\n", encoding="utf-8")

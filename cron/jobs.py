@@ -2616,6 +2616,7 @@ def mark_job_run(
     ladder_rung: bool = False,
     quota_hold_seconds: Optional[float] = None,
     recover_consumed_fire: bool = False,
+    run_not_started: bool = False,
 ) -> bool:
     """Mark a job as run: update last_run_at/last_status, bump completed, recompute next_run_at,
     and retire the record as a terminal completion when the repeat limit is reached.
@@ -2636,7 +2637,8 @@ def mark_job_run(
     ``retry after <N>s``). Recurring jobs are parked through the window instead of re-firing into
     it on every tick. ``recover_consumed_fire`` lets a scheduled sparse cron recover its
     consumed fire when the provider reopens; manual runs retain the natural schedule
-    (cron/quota_hold.py, #89376).
+    (cron/quota_hold.py, #89376). ``run_not_started`` records a pre-start failure without spending
+    repeat budget. Finite one-shots refund their preclaim and retry on the next tick.
     """
     def apply(jobs, _i, job):
         if expected_fire_owner is not None:
@@ -2648,7 +2650,11 @@ def mark_job_run(
                 return False
         now = _hermes_now().isoformat()
         _record_run_outcome(job, success, error, delivery_error, status, now)
-        _advance_after_run(job, now, ladder_rung=ladder_rung)
+        if run_not_started:
+            from cron.job_run_retry import preserve_unstarted_run
+            preserve_unstarted_run(job, now, ladder_rung=ladder_rung)
+        else:
+            _advance_after_run(job, now, ladder_rung=ladder_rung)
         from cron import quota_hold
         from cron.unreachable_retry import clear_state, plan_retry
 
