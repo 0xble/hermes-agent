@@ -393,6 +393,31 @@ def test_typed_approval_survives_more_than_500_runtime_rows(hermes_home):
     assert "Yes, approved" in block
 
 
+def test_paging_is_stable_when_rows_arrive_between_pages(hermes_home, monkeypatch):
+    sid = "keyset-typed"
+    db = _db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("send only with approval")
+    db.append_message(sid, "user", "Yes, approved")
+    for i in range(505):
+        db.append_message(sid, "user", f"runtime row {i}", display_kind="internal_notification")
+    real = db.messages_by_role
+    calls = []
+
+    def reader(*args, **kwargs):
+        page = real(*args, **kwargs)
+        if not calls:
+            for i in range(10):
+                db.append_message(sid, "user", f"late runtime {i}", display_kind="internal_notification")
+        calls.append(kwargs.get("before_id"))
+        return page
+
+    monkeypatch.setattr(db, "messages_by_role", reader)
+
+    assert "Yes, approved" in goals._render_user_messages_block(sid, state.created_at)
+    assert len(calls) >= 2 and calls[1] > 0
+
+
 def test_same_timestamp_sender_message_after_delivery_is_excluded(hermes_home):
     sender, target = "same-time-sender", "same-time-goal"
     sender_db, target_db = _db(sender), _db(target)

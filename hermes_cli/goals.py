@@ -2358,17 +2358,17 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
     try:
         wanted = max(int(limit), 1)
         page_size = 500
-        offset = 0
+        before_id = 0
         typed: List[Dict[str, Any]] = []
         while len(typed) < wanted:
-            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "offset": offset}
+            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "before_id": before_id}
             if until > 0:
                 kwargs["until"] = until
             page = reader(session_id, "user", **kwargs)
             typed.extend(row for row in page if _is_user_typed(row))
             if len(page) < page_size:
                 break
-            offset += len(page)
+            before_id = int(page[-1]["id"])
         return typed[:wanted]
     except Exception as exc:
         logger.debug("goal judge: user message read failed: %s", exc)
@@ -2376,17 +2376,22 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
 
 
 def _relay_rows(db: Any, session_id: str, since: float, *, limit: int = 500) -> List[Dict[str, Any]]:
-    """Page raw user rows until the bounded set of relay deliveries is complete."""
+    """Keyset-page raw user rows until the bounded set of relay deliveries is complete."""
     wanted = max(int(limit), 1)
     page_size = 500
-    offset = 0
+    before_id = 0
     relays: List[Dict[str, Any]] = []
     while len(relays) < wanted:
-        page = db.messages_by_role(session_id, "user", since=since, limit=page_size, offset=offset)
+        try:
+            page = db.messages_by_role(session_id, "user", since=since, limit=page_size,
+                                       before_id=before_id)
+        except Exception as exc:
+            logger.debug("goal judge: relay row read failed: %s", exc)
+            break
         relays.extend(row for row in page if _relay_sender(str(row.get("content") or "")) is not None)
         if len(page) < page_size:
             break
-        offset += len(page)
+        before_id = int(page[-1]["id"])
     return relays[:wanted]
 
 
