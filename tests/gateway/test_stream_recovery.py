@@ -7,7 +7,10 @@ import pytest
 
 from gateway import delivery_ledger as ledger
 from gateway import stream_recovery as recovery
+from gateway.config import Platform
 from gateway.platforms.base import SendResult
+from gateway.run_startup import GatewayStartupMixin
+from gateway.session import SessionSource
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -72,6 +75,20 @@ async def test_edit_write_ahead_retains_known_platform_id():
     consumer._message_id = "m1"
     consumer._last_sent_text = "partial"
     assert await consumer._edit_existing("complete answer", finalize=False, is_turn_final=False)
+
+
+def test_schedule_resume_event_identity_restores_preview():
+    record()
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", chat_type="private", user_id="user", message_id="inbound",
+    )
+    event = GatewayStartupMixin._build_startup_resume_event(source, "old")
+    assert event.internal is True
+    assert getattr(event, "_outbox_admission_id") == "resume:old"
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(event=event), consumer)
+    assert consumer.message_id == "m1"
+    assert consumer._already_sent is True
 
 
 def resume_event(token="old", *, active="successor-token", internal=True, admission=None):

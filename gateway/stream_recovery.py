@@ -24,8 +24,13 @@ def _ensure_table(conn):
     )""")
 
 
+def _preview_connect():
+    """Open the shared state DB without making a stream edit wait on a long writer lock."""
+    return ledger._connect(busy_timeout_ms=250)
+
+
 def record_preview(*, turn_id, session_key, session_id, content, message_id):
-    with ledger._connect() as conn:
+    with _preview_connect() as conn:
         _ensure_table(conn)
         conn.execute("""INSERT INTO streamed_previews
             (turn_id, session_key, session_id, content, message_id, updated_at)
@@ -37,13 +42,13 @@ def record_preview(*, turn_id, session_key, session_id, content, message_id):
 
 
 def discard_preview(turn_id):
-    with ledger._connect() as conn:
+    with _preview_connect() as conn:
         _ensure_table(conn)
         conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (turn_id,))
 
 
 def load_preview(session_key, session_id, turn_id):
-    with ledger._connect() as conn:
+    with _preview_connect() as conn:
         _ensure_table(conn)
         row = conn.execute("""SELECT content, message_id FROM streamed_previews
             WHERE turn_id = ? AND session_key = ? AND session_id = ?""",
@@ -89,17 +94,9 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
     worker thread, not the gateway loop.
     """
     if policy != "continue" or not ctx.session_key or not ctx.session_id:
-        logger.warning(
-            "stream recovery gate rejected prerequisites: policy=%r session=%r session_id=%r",
-            policy, ctx.session_key, ctx.session_id,
-        )
         return
     event = _turn_event(runner, ctx)
     if event is None or not getattr(event, "internal", False):
-        logger.warning(
-            "stream recovery gate rejected before event identity: policy=%r session=%s event=%r internal=%r",
-            policy, ctx.session_key, event, getattr(event, "internal", None),
-        )
         return
     store = runner.session_store
     with store._lock:
@@ -109,11 +106,6 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         if not token or not getattr(entry, "resume_pending", False) or entry.session_id != ctx.session_id:
             return
     if getattr(event, "_outbox_admission_id", None) != resume_admission_id(token):
-        logger.warning(
-            "stream recovery gate rejected admission: policy=%r session=%s token=%r event_admission=%r expected=%r",
-            policy, ctx.session_key, token, getattr(event, "_outbox_admission_id", None),
-            resume_admission_id(token),
-        )
         return
     preview = load_preview(ctx.session_key, ctx.session_id, token)
     if not preview:

@@ -638,6 +638,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     await self._finalize_turn(tick)
+                    if self._final_response_sent:
+                        await self._journal_preview("")
                     return
 
                 if tick.commentary_text is not None:
