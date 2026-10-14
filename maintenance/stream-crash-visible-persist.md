@@ -88,8 +88,19 @@ Current verification on `d71da74fe3d9`:
 - Python compile check: passed for all changed gateway and harness/test modules.
 
 Preview journal connections use a 250 ms busy timeout so state-db contention
-cannot hold a stream edit behind the delivery ledger's 10 s timeout. Successful
-stream finalization discards the durable preview row.
+cannot hold a stream edit behind the delivery ledger's 10 s timeout. Every
+journal open goes through `hermes_cli.sqlite_util.transaction`, which commits
+and always closes. A bare `with conn:` leaked the db/-wal/-shm fds on every
+stream edit (#69567 class); `tests/gateway/test_stream_recovery_fd_leak.py`
+guards record, load, discard and the error path. The table is created and the
+7-day purge runs once per DB path per process. A table dropped underneath is
+re-prepared once. A journal-failure warning fires at most once per 60 s.
+
+Successful stream finalization discards the durable preview row. A split or
+overflow turn discards it as soon as it enters split delivery and again at
+finalize, so a crash after the split never adopts a sealed head chunk. A
+double-crash re-own discards the predecessor row only after the successor row
+is written; a failed re-record keeps the predecessor row.
 
 ## Retirement
 
