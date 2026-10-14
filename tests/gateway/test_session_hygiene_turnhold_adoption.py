@@ -171,6 +171,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     release_worker = threading.Event()
     committed = threading.Event()
     cleanup_done = threading.Event()
+    worker_gave_up = threading.Event()
     fake_db = MagicMock()
     fake_db.get_compression_failure_cooldown.return_value = None
 
@@ -205,7 +206,8 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
             # would hang at interpreter exit joining executor threads).
             _spin_started = time.monotonic()
             while not release_worker.is_set():
-                if time.monotonic() - _spin_started > 20:
+                if time.monotonic() - _spin_started > 120:
+                    worker_gave_up.set()
                     return (messages, None)
                 if commit_fence is not None:
                     commit_fence.touch_progress()
@@ -232,14 +234,18 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db)
 
-    started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    elapsed = time.monotonic() - started
+    # Generous outer bound only, kept under the 60s hygiene timeout so that path cannot pass for
+    # this one: the release is proven by ordering below, not by wall-clock speed.
+    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=45)
 
-    # #90845/#92318 invariant intact: the turn is released at the budget.
+    # #90845/#92318 invariant intact: the turn is released at the budget, i.e. it completed
+    # while the worker was still streaming. The worker only ends once the test releases it,
+    # so a turn that waited for it could not have returned with these events unset.
     assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
     assert worker_started.is_set()
+    assert not release_worker.is_set() and not committed.is_set() and not worker_gave_up.is_set(), (
+        "turn returned only after the worker finished despite the turn-hold budget"
+    )
     assert runner._run_agent.await_count == 1
 
     # (b) NO retry-after was armed while the attempt is still running —
@@ -505,3 +511,62 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     # Cancelled: nothing will be adopted, so the deferral notice is the user's only signal.
     from agent.i18n import t
     assert [m["content"] for m in adapter.sent] == [t("gateway.compress.turnhold_deferred")]
+
+
+class _OrderedStore:
+    """``update_session`` in completion order, like the off-loop facade. *during_first_write* runs while the
+    turn's own write is in flight, before it lands."""
+
+    def __init__(self, during_first_write=None):
+        self.last_prompt_tokens = None
+        self.writes = []
+        self._during_first_write = during_first_write
+
+    async def update_session(self, _key, last_prompt_tokens=None, touch_activity=True):
+        hook, self._during_first_write = self._during_first_write, None
+        if hook is not None:
+            await hook(self)
+        self.writes.append(last_prompt_tokens)
+        self.last_prompt_tokens = last_prompt_tokens
+
+
+def _bare_runner():
+    gateway_run = importlib.import_module("gateway.run")
+    return object.__new__(gateway_run.GatewayRunner)
+
+
+@pytest.mark.asyncio
+async def test_adoption_landing_while_the_turn_count_is_written_still_ends_at_zero():
+    """The turn checks the adoption epoch, then writes its count off-loop. An adoption that lands in that
+    window bumps the epoch and its own ``last_prompt_tokens=0`` write can finish FIRST; the turn's stale
+    pre-compaction count then lands on top and re-fires hygiene next turn. The re-check after the write
+    must leave 0."""
+    runner = _bare_runner()
+    key = "agent:main:telegram:dm:12345"
+
+    async def _adoption_lands(store):
+        runner._note_hygiene_deferred_adoption(key)
+        store.writes.append(0)
+        store.last_prompt_tokens = 0
+
+    store = _OrderedStore(during_first_write=_adoption_lands)
+    await runner._hmwa_store_turn_prompt_tokens(store, key, key, 91_000, 0, touch_activity=True)
+    assert store.writes == [0, 91_000, 0]
+    assert store.last_prompt_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_turn_count_is_kept_when_no_adoption_lands():
+    runner = _bare_runner()
+    store = _OrderedStore()
+    await runner._hmwa_store_turn_prompt_tokens(store, "k", "k", 91_000, 0, touch_activity=True)
+    assert store.writes == [91_000]
+
+
+@pytest.mark.asyncio
+async def test_adoption_before_the_write_stores_zero_once():
+    runner = _bare_runner()
+    runner._note_hygiene_deferred_adoption("k")
+    store = _OrderedStore()
+    await runner._hmwa_store_turn_prompt_tokens(store, "k", "k", 91_000, 0, touch_activity=True)
+    assert store.writes == [0]

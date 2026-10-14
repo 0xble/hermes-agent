@@ -15,11 +15,15 @@ deferred summary adoption, the hygiene token count stored on the session entry, 
 - Deferred adoption resets `last_prompt_tokens` to 0 on the entry and in the store, and it bumps a per-session
   adoption epoch. When a turn's epoch moved while it ran, that turn's end-of-turn prompt count measured the
   pre-compaction transcript, so the turn stores 0 instead. The next hygiene check then estimates the compacted
-  transcript and does not re-fire on it.
+  transcript and does not re-fire on it. The turn's count is written off-loop, so the epoch is checked again after
+  that write lands and the count is re-zeroed if an adoption landed meanwhile; otherwise the turn's stale count can
+  overwrite the adoption's 0.
 - A lease-less `archive_and_compact` caller passes `held_messages`. If an active summary row is absent from the held
   history, the commit raises `StaleHeldHistory` inside the write transaction and writes nothing. That rewrite was built
   from the generation a compaction already replaced, and committing it would re-insert the whole old transcript beside
-  the summary.
+  the summary. Gateway history carries no `_row_id`, so the summary is matched by role and loaded-view content;
+  `held_messages` must therefore be a per-dict snapshot taken before any in-place rewrite. Micro-compaction defrag
+  edits the live marker dict, and an aliased snapshot would refuse every defrag of the current generation as stale.
 
 Fork patch identity: `hygiene-deferred-adoption`.
 
@@ -32,11 +36,11 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 
 ## Verification
 
-- `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py`
+- `scripts/run_tests.sh tests/gateway/test_session_hygiene_turnhold_adoption.py tests/hermes_state/test_stale_held_generation_guard.py tests/agent/test_micro_compaction.py`
 - Live: a deferred adoption logs `summary adopted at the watermark-fenced commit boundary` and sends no chat notice.
   The next turn's hygiene check does not report a pre-compaction `actual` token count.
 
 ## Retirement
 
 Retire after upstream silences adopted turn-holds and fences lease-less rewrites against a newer summary generation.
-Roll back the patch commit and both regression files. No persistent-data migration is required.
+Roll back the patch commits and their regression tests. No persistent-data migration is required.

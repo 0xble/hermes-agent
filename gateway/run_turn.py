@@ -1173,6 +1173,10 @@ class GatewayTurnMixin:
             await self._hmwa_hygiene_record_failure_cooldown(hs, session_key, session_id, _reason)
         except Exception as _cd_err:
             logger.debug("hygiene failure cooldown after deferred abort failed: %s", _cd_err)
+        self._hmwa_hygiene_stamp(
+            agent, "session hygiene compression aborted after turn-hold",
+            "AGENT_COMPRESSION_COOLDOWN", "hygiene deferred compression abort activity stamp failed",
+        )
         _err = redact_sensitive_text(_reason or t("gateway.shared.unknown_error"), force=True)
         logger.warning("Session hygiene compression aborted after the turn-hold was released: %s", _err)
         await self._hmwa_hygiene_notify(
@@ -2017,6 +2021,24 @@ class GatewayTurnMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    async def _hmwa_store_turn_prompt_tokens(
+        self, store, entry_key, session_key, last_prompt_tokens, turn_epoch, *, touch_activity,
+    ):
+        """Store this turn's prompt-token count for hygiene, unless a deferred hygiene summary was
+        adopted while the turn ran: that count measured the pre-compaction transcript and would
+        re-trigger hygiene on the compacted one, so 0 (fall back to the estimate) is stored instead.
+
+        The write runs off-loop, so an adoption can land between the epoch check and the write, and
+        its own off-loop ``last_prompt_tokens=0`` may finish first and be overwritten by this stale
+        count. The epoch is bumped on the loop before the adoption schedules its write, so a second
+        check after this write lands closes the window: unchanged means any later adoption writes
+        its 0 after ours; changed means re-zero here."""
+        if self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            last_prompt_tokens = 0
+        await store.update_session(entry_key, last_prompt_tokens=last_prompt_tokens, touch_activity=touch_activity)
+        if last_prompt_tokens and self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            await store.update_session(entry_key, last_prompt_tokens=0, touch_activity=False)
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -2100,13 +2122,9 @@ class GatewayTurnMixin:
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
-        _last_prompt_tokens = agent_result.get("last_prompt_tokens", 0)
-        if self._hygiene_deferred_adoption_epoch(session_key) != getattr(prepared, "hygiene_adoption_epoch", 0):
-            # A deferred hygiene summary landed mid-turn: this count measured the pre-compaction
-            # transcript and would re-trigger hygiene on the compacted one. Fall back to the estimate.
-            _last_prompt_tokens = 0
-        await store.update_session(
-            session_entry.session_key, last_prompt_tokens=_last_prompt_tokens,
+        await self._hmwa_store_turn_prompt_tokens(
+            store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+            getattr(prepared, "hygiene_adoption_epoch", 0),
             touch_activity=not bool(getattr(event, "internal", False)),
         )
 
