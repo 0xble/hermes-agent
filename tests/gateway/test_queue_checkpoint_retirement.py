@@ -492,7 +492,9 @@ def test_unauthorized_accepted_spool_is_quarantined(home):
     assert _spools(home) == []
 
 
-def test_declined_accepted_checkpoint_is_quarantined_without_transcript_row(home):
+@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize("quarantine_fails", [True, False])
+def test_declined_drain_input_is_quarantined_without_transcript_row(home, accepted, quarantine_fails, monkeypatch):
     """Recovery must stop at a declined claim: no naked user row for rejected input."""
     from functools import partial
 
@@ -522,14 +524,23 @@ def test_declined_accepted_checkpoint_is_quarantined_without_transcript_row(home
     db = SessionDB(db_path=home / "state.db")
     db.create_session("sid", "telegram")
     event = _event("accepted queued input", "u1")
-    assert shutdown_flush.checkpoint_queued_event("k", event)
-    path = event._hermes_recovery_spool
+    if accepted:
+        assert shutdown_flush.checkpoint_queued_event("k", event)
+        path = event._hermes_recovery_spool
+    else:
+        event._drain_deferred = True
+        assert shutdown_flush.flush_pending_to_file({"k": event}) == 1
+        path = _spools(home)[0]
+    original = path.read_bytes()
+    if quarantine_fails:
+        monkeypatch.setattr(shutdown_flush, "quarantine_pending_spool", lambda *args: False)
     recovered, _held = shutdown_flush.recover_pending_spool(
         session_db=db, session_resolver=lambda *a, **k: ("sid", db),
         deferred_followup=partial(run_pending_recovery._defer_followup, Runner(), {}, None,
                                   recovered_events=[]))
     assert recovered == 0
-    assert not path.exists()
-    assert path.with_name(path.name + shutdown_flush.QUARANTINE_SUFFIX).exists()
+    retained = path if quarantine_fails else path.with_name(path.name + shutdown_flush.QUARANTINE_SUFFIX)
+    assert path.exists() is quarantine_fails
+    assert retained.read_bytes() == original
     assert [m for m in db.get_messages("sid") if m.get("role") == "user"] == []
     db.close()

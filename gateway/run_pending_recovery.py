@@ -8,7 +8,7 @@ from hermes_constants import get_routing_process_hermes_home
 from agent.turn_context import _same_trigger_content
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
-    DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
+    OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
     recovered_message_type,
 )
 
@@ -88,14 +88,10 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         if drain_deferred:
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
-            if data.get("queue_accepted") is True:
-                # Accepted user input is never silently deleted, and an owner who stays
-                # unauthorized must not hold it in the replay set forever: quarantine it.
-                from gateway.shutdown_flush import quarantine_pending_spool
-                quarantine_pending_spool(path, "resume owner not authorized")
-                return False
-            logger.warning("Dropping unauthorized drain-deferred message from %s", path)
-            return DROP_PENDING
+            # Legacy drain arrivals are also future input whose only copy may be this spool.
+            from gateway.shutdown_flush import quarantine_pending_spool
+            quarantine_pending_spool(path, "resume owner not authorized")
+            return False
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))

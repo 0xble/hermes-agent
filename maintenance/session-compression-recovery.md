@@ -44,8 +44,15 @@ session-id lookup, at exactly one of these points:
   recovery, including older drain arrivals with the legacy 24-hour bound.
   Age never deletes the only durable copy of accepted input;
 - unauthorized owner at recovery: quarantined to `*.bad`, never replayed. Any
-  declined accepted-queue claim stops recovery for that checkpoint; it never
+  declined accepted or legacy drain claim stops recovery for that input; it never
   falls through to a naked transcript row.
+
+Quarantine retention follows the lossless-input contract: age alone cannot
+delete a sole copy. Manual cleanup may remove a payload only after verifying a
+complete, byte-identical durable replacement and its recoverable session/topic
+identity. Profile storage maintenance owns capacity management. Quarantine is
+outside every automatic replay glob, so holding a payload does not create a
+restart loop or re-execute it.
 
 Every pending-slot content merge (running photos, setup-time input, non-queue
 Telegram grace and adapter batching) uses the same copy-then-checkpoint admission
@@ -99,6 +106,9 @@ rotated successor. Real transport ids still require matching content. A failed
 binding refresh retains input and starts no provider work. Retirement callbacks
 remain retryable on `False` or exception, but are cleared at the turn boundary.
 Recovered follow-ups use the gateway's existing strict key/session metadata.
+Unauthorized legacy drain arrivals and accepted checkpoints keep their full
+payload in native quarantine. A declined future-turn claim never becomes a
+transcript instruction, including when quarantine storage is unavailable.
 The normal dispatch resolver checks that original owner again after recovery
 claims the event, and refuses changed or stopped owners before provider work.
 An unused event attribute is not a routing fence.
