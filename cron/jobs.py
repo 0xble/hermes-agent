@@ -1630,6 +1630,11 @@ def _parse_removed_at(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _read_removed_jobs_lines(path: Path) -> List[str]:
+    """Read the delete journal while preserving every decodable line."""
+    return path.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
+
+
 def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
     """Return intentionally removed job ids, optionally limited to a time window.
 
@@ -1639,7 +1644,9 @@ def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
     """
     path = _removed_jobs_file()
     try:
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        lines = _read_removed_jobs_lines(path)
+    except FileNotFoundError:
+        return set()
     except (OSError, ValueError) as exc:
         logger.warning(
             "Could not read intentional cron job delete journal %s; "
@@ -1678,14 +1685,8 @@ def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
     cutoff = now_utc - _REMOVED_JOBS_RETENTION
     retained: List[Dict[str, str]] = []
     try:
-        existing = removed_file.read_text(encoding="utf-8-sig").splitlines()
+        existing = _read_removed_jobs_lines(removed_file)
     except FileNotFoundError:
-        existing = []
-    except (OSError, ValueError) as exc:
-        logger.warning(
-            "Could not read intentional cron job delete journal %s; "
-            "rewriting it before recording new deletes: %s",
-            removed_file, exc)
         existing = []
     for line in existing:
         try:
