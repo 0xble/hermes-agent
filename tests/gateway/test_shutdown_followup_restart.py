@@ -1,13 +1,15 @@
 """A shutdown follow-up is its own future turn, not the predecessor's resume marker."""
 
 import asyncio
+import json
 from functools import partial
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.base import merge_pending_message_event
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_pending_recovery import _defer_followup
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
@@ -122,14 +124,19 @@ async def test_restored_followup_failed_real_turn_gets_no_preserved_notice(tmp_p
 async def test_internal_recovered_followup_consumed_by_successor_reports_result(tmp_path, monkeypatch, caplog):
     """A pending-slot successor owns the turn result, not the parked recovery event."""
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
-    event = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True)
+    event = MessageEvent(
+        text="internal completion", source=source, user_id=source.user_id,
+        internal=True, message_type=MessageType.PHOTO,
+    )
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
     recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
                           deferred_followup=partial(_defer_followup, runner, {}, None))
     recovered = runner._startup_restore_queue.pop()
     recovered._gateway_accepted = True
-    consumed = MessageEvent(text=recovered.text, source=source, user_id=source.user_id, internal=True)
+    consumed = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True,
+                             message_type=MessageType.PHOTO)
     adapter._pending_messages[entry.session_key] = consumed
+    merge_pending_message_event(adapter._pending_messages, entry.session_key, recovered)
 
     async def successor():
         runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": consumed.text})
@@ -145,12 +152,88 @@ async def test_internal_recovered_followup_consumed_by_successor_reports_result(
     assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=resumed"]
 
 
+@pytest.mark.asyncio
+async def test_recovery_ignores_unrelated_inflight_result_before_merged_successor(
+    tmp_path, monkeypatch, caplog
+):
+    """The real busy merge follows the successor, not an unrelated predecessor result."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    recovered_source_event = MessageEvent(
+        text="internal completion", message_type=MessageType.PHOTO,
+        source=source, user_id=source.user_id, internal=True,
+    )
+    assert flush_pending_to_file(
+        {entry.session_key: recovered_source_event}, reason="shutdown_follow_up"
+    ) == 1
+    recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+    recovered = runner._startup_restore_queue.pop()
+    predecessor = MessageEvent(
+        text="predecessor", message_type=MessageType.PHOTO,
+        source=source, user_id=source.user_id, internal=True,
+    )
+    successor_event = MessageEvent(
+        text="successor", message_type=MessageType.PHOTO,
+        source=source, user_id=source.user_id, internal=True,
+    )
+    predecessor_done, successor_done = asyncio.Event(), asyncio.Event()
+
+    async def handle(event):
+        if event is predecessor:
+            await predecessor_done.wait()
+            event._agent_turn_succeeded = False
+        elif event is successor_event:
+            await successor_done.wait()
+            event._agent_turn_succeeded = True
+
+    adapter.set_message_handler(handle)
+    adapter._start_typing_refresh = lambda *args, **kwargs: None
+    adapter._stop_typing_refresh = AsyncMock()
+    adapter._run_processing_hook = AsyncMock()
+    adapter._release_turn_marker = AsyncMock()
+    adapter._fire_post_delivery_callback = AsyncMock()
+    adapter._flush_text_debounce_now = AsyncMock()
+
+    adapter._pending_messages[entry.session_key] = successor_event
+    merge_pending_message_event(adapter._pending_messages, entry.session_key, recovered)
+    assert recovered in getattr(successor_event, "_hermes_absorbed_events", [])
+    predecessor_task = asyncio.create_task(
+        adapter._process_message_background(predecessor, entry.session_key)
+    )
+    successor_task = asyncio.create_task(
+        adapter._process_message_background(successor_event, entry.session_key)
+    )
+    adapter._session_tasks[entry.session_key] = predecessor_task
+    with caplog.at_level("INFO", logger="gateway.run"):
+        observer = asyncio.create_task(
+            runner._observe_recovered_followup(
+                adapter, recovered, entry.session_key, task=predecessor_task
+            )
+        )
+        predecessor_done.set()
+        await asyncio.sleep(0)
+        adapter._session_tasks[entry.session_key] = successor_task
+        successor_done.set()
+        await asyncio.gather(observer, predecessor_task, successor_task)
+
+    assert getattr(recovered, "_agent_turn_succeeded", None) is True
+    outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
+    assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=resumed"]
+
+
 def test_idless_recovered_followup_whose_input_is_already_durable_is_dropped(tmp_path, monkeypatch):
     """An internal follow-up has no platform id, so dedupe must use its durable user row."""
     runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True)
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
-    runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": event.text})
+    spool = next((tmp_path / "pending_messages").glob("*.json"))
+    synthetic_id = json.loads(spool.read_text())["data"]["message_id"]
+    assert synthetic_id.startswith("hermes-recovery-")
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "internal completion", "platform_message_id": synthetic_id,
+    })
     assert recover_pending_to_db(
         Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
         deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
@@ -167,8 +250,15 @@ async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_
     recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
                           deferred_followup=partial(_defer_followup, runner, {}, None))
     spool = next((tmp_path / "pending_messages").glob("*.json"))
-    runner.session_store.append_to_transcript(entry.session_id, {"role": "user", "content": event.text})
-    await asyncio.wait_for(runner._retire_spool_once_input_durable(runner._startup_restore_queue[0]), 2)
+    payload = json.loads(spool.read_text())
+    synthetic_id = payload["data"]["message_id"]
+    assert synthetic_id.startswith("hermes-recovery-")
+    recovered = runner._startup_restore_queue[0]
+    assert recovered.message_id == synthetic_id
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": event.text, "platform_message_id": synthetic_id,
+    })
+    await asyncio.wait_for(runner._retire_spool_once_input_durable(recovered), 2)
     assert not spool.exists()
 
 

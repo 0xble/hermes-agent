@@ -361,7 +361,6 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 ## Update
 
-
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
 condition; there is no central ledger. Every non-merge commit after the trailer floor recorded in
 `scripts/check_fork_patches.py` carries one `Fork-Patch: <identity>; ...` trailer per

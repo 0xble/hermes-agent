@@ -54,10 +54,10 @@ class RestartRecoveryMixin:
 
         ``handle_message`` returns once the session task exists, before the turn has leased the
         session or persisted anything, so the spool is the only copy until the turn writes its
-        input row (``_persist_turn_start`` stamps the inbound id before the first model call).
-        After that row exists, a restart falls to the turn's ``resume_pending`` marker and boot
-        recovery drops the spool instead of replaying a prompt that may have had effects. An input
-        without a platform id is retired when its turn reports a result.
+        input row (``_persist_turn_start`` stamps the inbound id before the first model call). After
+        that row exists, a restart falls to the turn's ``resume_pending`` marker and boot recovery
+        drops the spool instead of replaying a prompt that may have had effects. Legacy payloads
+        without a synthetic id retire when their turn reports a result.
         """
         while not await self._recovered_input_durable(event):
             await asyncio.sleep(_INPUT_DURABLE_POLL_S)
@@ -81,7 +81,9 @@ class RestartRecoveryMixin:
         The adapter may consume a recovered event by merging it into an already pending slot. In
         that case the successor owns the result and the parked recovery event is not the object on
         which ``run_turn`` writes ``_agent_turn_succeeded``. Session tasks are tagged with their
-        event by the shared background runner; copy that terminal result across the handoff."""
+        event by the shared background runner; copy a terminal result only when that task consumed
+        this event directly or recorded it as an absorbed pending event. Never borrow a result from
+        an unrelated predecessor that happened to own the session while this event was parked."""
         seen = set()
         while isinstance(task, asyncio.Task) and task not in seen:
             seen.add(task)
@@ -90,7 +92,12 @@ class RestartRecoveryMixin:
                 on_task_done(task)
             task_event = getattr(task, "_hermes_event", None)
             task_result = getattr(task_event, "_agent_turn_succeeded", None)
-            if isinstance(task_result, bool) and not isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
+            from gateway.platforms.base import _task_event_covers_recovered_event
+            if (
+                _task_event_covers_recovered_event(task_event, event)
+                and isinstance(task_result, bool)
+                and not isinstance(getattr(event, "_agent_turn_succeeded", None), bool)
+            ):
                 event._agent_turn_succeeded = task_result
             if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
                 return

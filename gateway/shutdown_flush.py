@@ -82,6 +82,11 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         serialised = _serialise_value(value)
         if serialised is None or not has_user_content(serialised):
             return False
+        # Internal follow-ups have no transport id, but their durable user row still needs a
+        # stable dedupe key. Stamp it into the replay payload at flush time so the recovered
+        # event carries the same value through ``_hmwa_user_transcript_entry``.
+        if serialised.get("internal") is True and not serialised.get("message_id"):
+            serialised["message_id"] = f"hermes-recovery-{uuid.uuid4().hex}"
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
