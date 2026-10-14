@@ -3834,6 +3834,7 @@ class BasePlatformAdapter(ABC):
         response = await self._message_handler(event)
         # The handler ran the command: that is this event's admission, whatever the reply's fate.
         # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
+        event._gateway_inline_command_handled = True
         event._gateway_accepted = True
         from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
         token = bind_event_turn(event)

@@ -149,7 +149,7 @@ class GatewayLoopWakeMixin:
         """Revalidate the one admission token before preparation, hooks or command dispatch."""
         metadata = getattr(event, "metadata", None) or {}
         stamped_wake = bool(metadata.get("loop_wakeup") or metadata.get("hermes_loop_wakeup"))
-        if stamped_wake and not metadata.get("gateway_session_key") and not getattr(
+        if metadata.get("loop_wakeup") and not metadata.get("gateway_session_key") and not getattr(
             event, "_gateway_loop_execution_fence", None
         ):
             return True

@@ -846,7 +846,7 @@ async def test_loop_wake_never_answers_clarification_registered_after_claim(cont
 @pytest.mark.asyncio
 @pytest.mark.parametrize("control", ["pause", "clear", "replace", "session_reset"])
 async def test_command_fence_survives_profile_hydration(control_home, monkeypatch, control):
-    """A control landing while the native profile secret loader hydrates must win."""
+    """A legacy-stamped wake without a session key still installs a fence before hydration."""
     runner, _adapter, source, entry = native_runner(control_home)
     runner.config.multiplex_profiles = True
     runner._resolve_profile_home_for_source = lambda _source: control_home
@@ -889,6 +889,7 @@ async def test_command_fence_survives_profile_hydration(control_home, monkeypatc
     release_hydration.set()
     result = await dispatch
     assert result == (True, None)
+    assert event._gateway_loop_execution_fence[:2] == (entry.session_id, tick)
     assert effects == []
     assert not _owns_started_tick(loops.load_loop(entry.session_id), tick)
     runner.session_store.close_all_db_handles()

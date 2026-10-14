@@ -1043,8 +1043,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                     rebound_sid, tick, generation, rebound_control,
                 )
             # Native adapters settle command-only ticks at the handled-command boundary;
-            # rewriting commands retain their claim until the model-turn hooks run.
-            if is_command and getattr(event, "_gateway_accepted", None) is True:
+            # rewriting commands retain their claim until the model-turn hooks run. Legacy
+            # direct adapters have no dispatch lifecycle, so preserve their inline settlement.
+            if ((not has_admission_receipt or getattr(event, "_gateway_inline_command_handled", False))
+                    and is_command
+                    and getattr(event, "_gateway_accepted", None) is True):
                 settled_sid = (event.metadata or {}).get("loop_wakeup_session_id", sid)
                 settled_mgr = mgr if settled_sid == sid else LoopManager(session_id=settled_sid)
                 await self._run_in_executor_with_context(
