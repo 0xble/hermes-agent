@@ -1868,10 +1868,11 @@ class TurnRunner:
                 result["final_response"], result.get("messages", []), history_offset=len(agent_history),
             )
         from gateway.stream_recovery import mark_recovered_reply
-        mark_recovered_reply(result, stream_consumer)
+        # A marked delivered copy: the agent's own result (and its messages) stay unlabelled.
+        result = mark_recovered_reply(result, stream_consumer)
         ctx.result_holder[0] = result
         if stream_consumer is None:
-            return
+            return result
         # Pass final_response as the authoritative finalize payload: it includes post-stream
         # augmentation (verifier footer, explainer) the accumulator never saw. Adopt ONLY a genuinely
         # completed final: interrupt paths return {interrupted: True, completed: False} with a
@@ -1887,12 +1888,13 @@ class TurnRunner:
                 _final_for_stream = fr
         if _final_for_stream is None:
             stream_consumer.finish()
-            return
+            return result
         # Duck-type safe: test doubles / older consumers may expose a zero-arg finish().
         try:
             stream_consumer.finish(_final_for_stream)
         except TypeError:
             stream_consumer.finish()
+        return result
 
     def _restore_telegram_thread_id_after_split(self, agent_session_id) -> None:
         """Telegram DM whose source.thread_id was lost in the session split (synthetic/recovered
@@ -2078,8 +2080,9 @@ class TurnRunner:
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
         from hermes_cli.goal_turn_outcome import model_final_response
+        # Judge goals on the model's own text, before stream finish may add a recovery marker.
         model_response = model_final_response(result)
-        self._finish_stream_consumer(result, agent_history, stream_consumer)
+        result = self._finish_stream_consumer(result, agent_history, stream_consumer)
         final_response = result.get("final_response")
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]
@@ -2102,6 +2105,7 @@ class TurnRunner:
             "error": result.get("error"),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
+            "recovered_reply": result.get("recovered_reply", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,

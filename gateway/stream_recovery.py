@@ -159,20 +159,34 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         return
     consumer._adopt_message_id(preview["message_id"])
     consumer._last_sent_text = preview["content"]
+    # The row is written BEFORE the edit it names, so the user may never have seen it:
+    # an identical re-answer must still be edited onto the message.
+    consumer._force_next_edit = True
     consumer._already_sent = True
     consumer._first_message_sent_at = time.monotonic()
 
 
 def mark_recovered_reply(result, consumer):
-    """Label delivery, not model history: normal persistence keeps the real re-answer.
+    """Label delivery, not model history: return a delivered COPY whose final_response
+    carries the marker, flagged ``recovered_reply`` so persistence strips it again.
 
-    Never convert an interrupted/failed result or a journaled preview into a
-    completed reply. This runs only after the resumed model call has returned.
+    The caller's dict is never mutated. Never convert an interrupted/failed result or
+    a journaled preview into a completed reply. Runs only after the resumed model call
+    has returned.
     """
     if getattr(consumer, "_recovered_send_uncertain", False) is not True or not isinstance(result, dict):
-        return
+        return result
     if result.get("failed") or result.get("interrupted") or result.get("completed") is False:
-        return
+        return result
     text = result.get("final_response")
     if isinstance(text, str) and text.strip() and text != "(empty)" and not text.startswith(ledger.RECOVERED_MARKER):
-        result["final_response"] = ledger.RECOVERED_MARKER + text
+        return {**result, "final_response": ledger.RECOVERED_MARKER + text, "recovered_reply": True}
+    return result
+
+
+def unmark_recovered_reply(text, agent_result):
+    """The transcript keeps the model's answer, not the delivery label."""
+    if (isinstance(agent_result, dict) and agent_result.get("recovered_reply") is True
+            and isinstance(text, str)):
+        return text.replace(ledger.RECOVERED_MARKER, "", 1)
+    return text

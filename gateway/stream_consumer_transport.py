@@ -298,6 +298,7 @@ class StreamTransportMixin:
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
+        self._force_next_edit = False
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
@@ -494,7 +495,9 @@ class StreamTransportMixin:
             await self._journal_preview("")
             self._edit_supported = False
             return False
-        await self._journal_preview(text, result.message_id)
+        if result.message_id:
+            # The write-ahead row already holds (text, None): only a new ID is worth a write.
+            await self._journal_preview(text, result.message_id)
         self._already_sent = True
         self._last_sent_text = text
         if result.message_id:
@@ -511,7 +514,10 @@ class StreamTransportMixin:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
         # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
         # unchanged; everyone else short-circuits.
-        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
+        # An adopted crash preview's text is write-ahead: the platform may never have shown
+        # it, so the first edit after adoption always goes out, even byte-identical.
+        if (text == self._last_sent_text and not getattr(self, "_force_next_edit", False)
+                and not (finalize and self._adapter_requires_finalize)):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
         # the adapter prefers it (Telegram's send path renders richer markdown).  An
@@ -541,6 +547,7 @@ class StreamTransportMixin:
             await self._journal_preview(self._last_sent_text, self._message_id)
             return True
         self._already_sent = True
+        self._force_next_edit = False
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset

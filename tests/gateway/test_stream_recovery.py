@@ -141,8 +141,7 @@ def test_only_the_synthetic_resume_turn_adopts(event, message_id):
     assert consumer._recovered_send_uncertain is False
     assert consumer.cfg.buffer_only is False
     result = {"final_response": "answer to the new question", "completed": True}
-    recovery.mark_recovered_reply(result, consumer)
-    assert result["final_response"] == "answer to the new question"
+    assert recovery.mark_recovered_reply(result, consumer)["final_response"] == "answer to the new question"
     # The predecessor row is untouched and still owned by the pending resume.
     assert recovery.load_preview("key", "sid", "old")["message_id"] == message_id
 
@@ -156,8 +155,7 @@ def test_ask_policy_leaves_partial_preview_untouched(policy, message_id):
     assert consumer.message_id is None and consumer._already_sent is False
     assert consumer._recovered_send_uncertain is False and consumer.cfg.buffer_only is False
     result = {"final_response": "Carry on with the pending step?", "completed": True}
-    recovery.mark_recovered_reply(result, consumer)
-    assert result["final_response"] == "Carry on with the pending step?"
+    assert recovery.mark_recovered_reply(result, consumer)["final_response"] == "Carry on with the pending step?"
     assert recovery.load_preview("key", "sid", "successor-token") is None
 
 
@@ -247,18 +245,102 @@ def test_ack_lost_first_send_does_not_invent_platform_id():
     assert consumer.cfg.buffer_only is True
     messages = [{"role": "assistant", "content": "real re-answer"}]
     result = {"final_response": "real re-answer", "completed": True, "messages": messages}
-    recovery.mark_recovered_reply(result, consumer)
-    assert result["final_response"] == ledger.RECOVERED_MARKER + "real re-answer"
+    delivered = recovery.mark_recovered_reply(result, consumer)
+    assert delivered["final_response"] == ledger.RECOVERED_MARKER + "real re-answer"
+    assert delivered["recovered_reply"] is True
+    # The agent's own result is never mutated: only the delivered copy carries the label.
+    assert result == {"final_response": "real re-answer", "completed": True, "messages": messages}
     assert messages == [{"role": "assistant", "content": "real re-answer"}]
     for flags in ({"failed": True}, {"interrupted": True}, {"completed": False}):
         unfinished = {"final_response": "diagnostic", **flags}
-        recovery.mark_recovered_reply(unfinished, consumer)
+        assert recovery.mark_recovered_reply(unfinished, consumer) is unfinished
         assert unfinished["final_response"] == "diagnostic"
     ordinary = {"final_response": "ordinary", "completed": True}
-    recovery.mark_recovered_reply(ordinary, GatewayStreamConsumer(SimpleNamespace(), "chat"))
-    assert ordinary["final_response"] == "ordinary"
-    recovery.mark_recovered_reply(result, consumer)
-    assert result["final_response"] == ledger.RECOVERED_MARKER + "real re-answer"
+    assert recovery.mark_recovered_reply(ordinary, GatewayStreamConsumer(SimpleNamespace(), "chat")) is ordinary
+    # Idempotent: an already-marked copy is not marked twice.
+    assert recovery.mark_recovered_reply(delivered, consumer)["final_response"] == delivered["final_response"]
+
+
+@pytest.mark.asyncio
+async def test_adopted_preview_is_edited_even_when_the_re_answer_is_identical():
+    # The row is write-ahead: a crash between the journal write and the edit leaves text
+    # the user never saw. A byte-identical re-answer must still reach the message.
+    record(content="complete answer", message_id="m1")
+    edits = []
+
+    async def edit_message(**kwargs):
+        edits.append((kwargs["message_id"], kwargs["content"]))
+        return SendResult(success=True, message_id=kwargs["message_id"])
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(edit_message=edit_message), "chat",
+                                     config=StreamConsumerConfig(cursor=""))
+    restore(make_runner(), consumer)
+    assert consumer.message_id == "m1" and consumer._last_sent_text == "complete answer"
+    assert await consumer._edit_existing("complete answer", finalize=False, is_turn_final=False)
+    assert edits == [("m1", "complete answer")]
+    # Only the first edit is forced; afterwards identical text is skipped as usual.
+    assert await consumer._edit_existing("complete answer", finalize=False, is_turn_final=False)
+    assert edits == [("m1", "complete answer")]
+
+
+@pytest.mark.asyncio
+async def test_post_ack_journal_write_skipped_when_message_id_is_unchanged():
+    writes = []
+
+    async def journal(content, message_id):
+        writes.append((content, message_id))
+
+    async def send(**kwargs):
+        return SendResult(success=True, message_id=None)  # ACK carries no platform id
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(send=send), "chat",
+                                     config=StreamConsumerConfig(cursor=""), on_preview=journal)
+    assert await consumer._first_send("answer", finalize=False)
+    assert writes == [("answer", None)]
+
+
+@pytest.mark.asyncio
+async def test_recovered_marker_never_reaches_the_fallback_transcript(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.session import AsyncSessionStore, SessionStore
+    from hermes_state import SessionDB
+    from unittest.mock import AsyncMock
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = SessionDB(db_path=tmp_path / "state.db")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    entry = store.get_or_create_session(source)
+    store._db.create_session(session_id=entry.session_id, source="telegram", user_id="u1")
+    history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    store._db.replace_messages(entry.session_id, history)
+    try:
+        runner = object.__new__(GatewayTurnMixin)
+        runner.async_session_store = AsyncSessionStore(store)
+        runner._session_db = None
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+        consumer._recovered_send_uncertain = True
+        agent_result = {"final_response": "real re-answer", "completed": True,
+                        "messages": history, "history_offset": len(history)}
+        delivered = recovery.mark_recovered_reply(agent_result, consumer)
+        assert agent_result["final_response"] == "real re-answer"
+        prepared = SimpleNamespace(history=history, persist_user_message=None, message_text="continue",
+                                   persist_user_timestamp=None, persist_user_display_kind=None,
+                                   persistence_owner=None)
+        # No new agent messages: persistence falls back to the delivered response text.
+        await runner._hmwa_persist_turn_transcript(
+            event=SimpleNamespace(message_id="msg-1", internal=False), source=source, session_entry=entry,
+            session_key=entry.session_key, agent_result=delivered, agent_messages=history, prepared=prepared,
+            response=delivered["final_response"], agent_failed_early=False,
+            hidden_reasoning_incomplete=False, is_context_overflow_failure=False,
+        )
+        transcript = await runner.async_session_store.load_transcript(entry.session_id)
+        assert transcript[-1]["role"] == "assistant"
+        assert transcript[-1]["content"] == "real re-answer"
+        assert all(ledger.RECOVERED_MARKER not in str(row.get("content")) for row in transcript)
+    finally:
+        store._db.close()
 
 
 @pytest.mark.asyncio
@@ -359,9 +441,17 @@ async def test_split_delivery_leaves_no_preview_row():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prestreamed", [True, False], ids=["seal-existing", "split-first-send"])
-async def test_crash_after_split_never_adopts_a_sealed_head(prestreamed):
+async def test_crash_after_split_never_adopts_a_sealed_head(prestreamed, monkeypatch):
     consumer = GatewayStreamConsumer(_split_adapter(), "chat", StreamConsumerConfig(
         edit_interval=0.01, buffer_threshold=5, cursor=""), on_preview=_journal_to_db)
+    # SIGKILL runs no Python: run() swallows CancelledError into _on_cancelled(), whose
+    # best-effort finalize a real kill never reaches. Stub it so cancel only stops the loop.
+    killed = []
+
+    async def sigkill():
+        killed.append(True)
+
+    monkeypatch.setattr(consumer, "_on_cancelled", sigkill)
     consumer.on_delta(HEAD if prestreamed else HEAD + TAIL)
     task = asyncio.create_task(consumer.run())
     if prestreamed:
@@ -373,10 +463,12 @@ async def test_crash_after_split_never_adopts_a_sealed_head(prestreamed):
         await asyncio.sleep(0.01)
     assert consumer._turn_split_delivery is True
     await asyncio.sleep(0.05)  # the tail preview goes out after the split
-    # kill -9 here: no finalize ever runs; the next process sees only the journal.
+    # The crash point: what the next process reads is whatever is durable right now.
+    at_crash = recovery.load_preview("key", "sid", "old")
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    await asyncio.wait_for(task, timeout=10)  # run() swallows the cancel and returns
+    assert killed == [True] and consumer._final_response_sent is False  # no finalize ran
+    assert at_crash is None
     assert recovery.load_preview("key", "sid", "old") is None
     resumed = GatewayStreamConsumer(SimpleNamespace(), "chat")
     restore(make_runner(), resumed)

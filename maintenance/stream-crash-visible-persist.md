@@ -39,9 +39,14 @@ resumed turn's own active token so a second crash still finds the message.
 `gateway/stream_recovery.py` journals exact wire text before real send/edit I/O
 and the message ID after ACK, in the existing profile-scoped `state.db`. It
 restores only the active resume token's known ID, or flags an uncertain first
-send. `TurnRunner` marks only a completed recovery result's delivery text;
-model history and normal persistence retain the actual re-answer without the
-transport marker. Failed/interrupted results are not fabricated completions.
+send. `TurnRunner` marks only a delivered copy of a completed recovery result,
+never the agent's own dict; the copy carries `recovered_reply`, and the
+no-new-messages transcript fallback strips the marker, so model history and
+persistence retain the actual re-answer. Failed/interrupted results are not
+fabricated completions. The journal row is write-ahead, so an adopted preview
+may name text the user never saw: the first edit after adoption is forced even
+when the re-answer is byte-identical. An ACK without a message ID skips the
+post-ACK write, which would only repeat the write-ahead row.
 Ephemeral native draft frames are not journaled. Journal writes are
 best-effort: a failure is logged and never changes delivery. Every path that
 replaces or deletes the on-screen preview re-records or discards first:
@@ -98,7 +103,10 @@ re-prepared once. A journal-failure warning fires at most once per 60 s.
 
 Successful stream finalization discards the durable preview row. A split or
 overflow turn discards it as soon as it enters split delivery and again at
-finalize, so a crash after the split never adopts a sealed head chunk. A
+finalize, so a crash after the split never adopts a sealed head chunk. The
+regression test models SIGKILL by stubbing `_on_cancelled` (run() swallows
+`CancelledError` into a best-effort finalize a real kill never reaches) and
+reads the journal at the crash point. A
 double-crash re-own discards the predecessor row only after the successor row
 is written; a failed re-record keeps the predecessor row.
 
