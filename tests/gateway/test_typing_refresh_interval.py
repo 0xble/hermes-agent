@@ -89,5 +89,43 @@ async def test_keep_typing_send_timeout_stays_inside_telegram_interval(monkeypat
     monkeypatch.setattr("gateway.platforms.base.asyncio.wait_for", capture_wait_for)
     await adapter._keep_typing("123", interval=adapter.typing_refresh_interval, stop_event=stop_event)
 
-    assert timeouts == [1.5]
-    assert timeouts[0] < adapter.typing_refresh_interval
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] < adapter.typing_refresh_interval
+
+
+@pytest.mark.asyncio
+async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
+    """A tick shed because a delivery holds the chat send lock is retried in ~0.5s, not 4.5s later."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = AsyncMock()
+    adapter._bot.send_chat_action = AsyncMock(return_value=None)
+    adapter._telegram_chat_outbound_slot_secs = 0.0
+    adapter.stop_typing = AsyncMock()
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    sent_at = []
+
+    async def record(**kwargs):
+        sent_at.append(loop.time())
+        stop_event.set()
+
+    adapter._bot.send_chat_action = AsyncMock(side_effect=record)
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delivery():
+        async with adapter._chat_send_lock("123"):
+            holding.set()
+            await release.wait()
+
+    holder = asyncio.create_task(delivery())
+    await holding.wait()
+    loop.call_later(0.2, release.set)
+    started = loop.time()
+    await asyncio.wait_for(
+        adapter._keep_typing("123", interval=adapter.typing_refresh_interval, stop_event=stop_event), timeout=3)
+    await holder
+
+    assert len(sent_at) == 1
+    assert sent_at[0] - started < 1.0
+

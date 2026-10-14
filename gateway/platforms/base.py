@@ -3604,6 +3604,11 @@ class BasePlatformAdapter(ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _typing_tick_retry_delay(self, result: Any, *, timed_out: bool, failed: bool) -> Optional[float]:
+        """Seconds before retrying one ``_keep_typing`` tick, or ``None`` to wait for the next tick.
+        The 2s default cadence already re-covers a missed tick, so the base adapter never retries."""
+        return None
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
         """Refresh the typing indicator every ``interval`` seconds until cancelled (platform typing
@@ -3620,13 +3625,27 @@ class BasePlatformAdapter(ABC):
                 # refresh cadence beyond the configured interval.
                 deadline = loop.time() + interval
                 if chat_id not in self._typing_paused:
-                    try:
-                        await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
-                                               timeout=_send_typing_timeout)
-                    except asyncio.TimeoutError:
-                        pass  # Slow network — abandon this tick, stay on schedule.
-                    except Exception as typing_err:
-                        logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                    retry_used = False
+                    while True:
+                        timed_out = failed = False
+                        result = None
+                        try:
+                            result = await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
+                                                           timeout=_send_typing_timeout)
+                        except asyncio.TimeoutError:
+                            timed_out = True
+                        except Exception as typing_err:
+                            failed = True
+                            logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                        retry_delay = self._typing_tick_retry_delay(
+                            result, timed_out=timed_out, failed=failed)
+                        remaining = deadline - loop.time()
+                        if retry_used or retry_delay is None or remaining <= 0:
+                            break
+                        retry_used = True
+                        await asyncio.sleep(min(retry_delay, remaining))
+                        if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
+                            break
                 if stop_event is None:
                     await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue
@@ -3643,7 +3662,7 @@ class BasePlatformAdapter(ABC):
             cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
             if cancel_retrigger is not None:
                 with contextlib.suppress(Exception):
-                    cancel_retrigger(chat_id)
+                    cancel_retrigger(chat_id, metadata)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
@@ -3657,7 +3676,7 @@ class BasePlatformAdapter(ABC):
         cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
         if cancel_retrigger is not None:
             with contextlib.suppress(Exception):
-                cancel_retrigger(chat_id)
+                cancel_retrigger(chat_id, metadata)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():

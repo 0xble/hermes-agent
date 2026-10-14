@@ -6,8 +6,10 @@ Load this unit when changing Telegram typing refresh cadence or the post-send ty
 
 - Telegram refresh requests use the adapter's bounded 4.5s default (1.0–4.75s override); other platforms retain the 2.0s base default.
 - The refresh deadline is anchored at tick start, so a slow `sendChatAction` does not extend the configured request spacing.
-- Intermediate sends schedule typing re-arms off the send path. The per-chat limiter (default 2s, configurable via `typing_retrigger_min_interval_seconds`; 0 disables it) emits one immediate re-arm and defers one trailing re-arm for requests inside the window; later requests coalesce into it.
-- Final replies, turn cleanup, and `pause_typing_for_chat` cancel any pending trailing re-arm, and a trailing re-arm that wakes while the chat is paused does not send. The pause path covers edit-only finalization, which never reaches the notify send. There is never more than one re-arm request in flight for a chat.
+- A Telegram refresh tick dropped because a delivery holds the per-chat send lock, or because the send timed out or failed, is retried once about 0.5s later, never past the next regular deadline. Budget, flood and cooldown sheds are not retried. Other adapters never retry a tick.
+- The per-tick send timeout stays below the refresh interval.
+- Intermediate sends schedule typing re-arms off the send path. The limiter is keyed per topic, `(chat_id, thread_id)`, with `thread_id` taken from `thread_id` or `message_thread_id` metadata like `send_typing`. It defaults to 2s, is configurable via `typing_retrigger_min_interval_seconds`, and 0 disables it. It emits one immediate re-arm and defers one trailing re-arm for requests inside the window. Later requests coalesce into that trailing re-arm only while it is still waiting. Once its send starts, a new request schedules another trailing re-arm after it. There is never more than one re-arm request in flight per topic.
+- Final replies, `_keep_typing` cleanup and `_stop_typing_refresh` cancel only their own topic's re-arms. `pause_typing_for_chat` is chat-level by base design, because `_typing_paused` holds chat ids and the pause API carries no metadata. It therefore cancels every topic's re-arms for that chat, and a trailing re-arm that wakes while the chat is paused does not send. The pause path covers edit-only finalization, which never reaches the notify send.
 
 ## Provenance
 
