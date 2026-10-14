@@ -351,6 +351,22 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove once upstream ships a precise macOS shell producer and strict own-PID validation, and these regressions pass there without the fork patch.
 - **Rollback:** Revert the commits carrying `Fork-Patch: updater-pid-incarnation`. Revert all of them together: restoring the strict rule without the precise producer would break macOS hand-offs.
 
+## Additional maintenance units
+
+The following units are part of the enrolled maintenance surface and are linked here
+so the root contract remains the complete discovery index:
+
+- [CI slow-file timeouts](maintenance/ci-slow-file-timeouts.md)
+- [Fallback mid-turn restore](maintenance/fallback-mid-turn-restore.md)
+- [Gate flake quarantine](maintenance/gate-flake-quarantine.md)
+- [Goal continuation quiet](maintenance/goal-continuation-quiet.md)
+- [Install and scratch GC](maintenance/install-and-scratch-gc.md)
+- [One-shot task governing skill loading](maintenance/oneshot-task-governing-skill-loading.md)
+- [Portable CI](maintenance/portable-ci.md)
+- [Repository CI contract](maintenance/repository-ci-contract.md)
+- [Shared primary cooldown](maintenance/shared-primary-cooldown.md)
+- [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md)
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement

@@ -62,6 +62,12 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   parked marker and still shows a running gateway.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_parked_status_still_reports_a_forced_gateway`).
+- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
+  `f974222e69278b856b1b75053774e10014c4797b` contains the same runtime-snapshot
+  guard and the equivalent forced-gateway regression.
+- **Retirement:** The fork's status implementation is already source-equivalent for
+  this behavior; retain the shared implementation and record only this ledger
+  retirement.
 
 ## Stale Bot Desktop lease survives a rename
 
@@ -110,6 +116,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   restart path.
 - Guard: `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`
   (`test_restart_after_stop_unparks_and_serves_the_profile`).
+- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
+  `f974222e69278b856b1b75053774e10014c4797b` contains the same parked-profile
+  restart path and regression.
+- **Retirement:** `hermes_cli/gateway_profile_lifecycle.py` is already identical
+  to upstream for this identity; record the retirement without source changes.
 
 ## Launchd restart tests depend on the host gateway
 
@@ -871,5 +882,9 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   years before and after wall time, keep a six-day-old pending receipt, then
   delete it unreported at eight days. Keep
   `test_unreadable_and_week_old_receipts_are_deleted_unreported` unchanged.
-- Retire the production patch when an accepted upstream release contains the
-  clock fix. Preserve equivalent past/future-clock coverage during that sync.
+- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
+  `f974222e69278b856b1b75053774e10014c4797b` contains the production clock fix;
+  the fork-only `_stale` divergence is removed while the explicit
+  wall-clock-disagreement regression is retained.
+- **Retirement:** The production source now matches upstream's store-clock
+  implementation. Preserve the past/future-clock guard during future syncs.
