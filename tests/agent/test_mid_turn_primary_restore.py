@@ -680,6 +680,8 @@ def test_fallback_bind_failure_after_client_install_restores_the_original_route(
     # A provider-specific setup failure after the swap installed the candidate client must not
     # leave the agent marked as on fallback while pointing at a closed, half-bound route.
     agent = tool_loop_agent
+    agent._reasoning_echo_flag = False
+    agent._fallback_chain[0]["reasoning_echo"] = True
     original = (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client)
 
     compressor = getattr(agent, "context_compressor", None)
@@ -702,6 +704,7 @@ def test_fallback_bind_failure_after_client_install_restores_the_original_route(
         assert vars(compressor) == compressor_state
 
     assert (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client) == original
+    assert agent._reasoning_echo_flag is False  # the candidate's echo policy must not survive
     assert not agent._fallback_activated
     assert getattr(agent, "_active_fallback_entry", None) is None
     original[-1].close.assert_not_called()
