@@ -1,52 +1,25 @@
-"""Cancellation-safe Telegram updater handover teardown."""
+"""Bot-token lock ownership for the opt-in zero-cut Telegram handover."""
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from typing import Awaitable, Callable
 
-logger = logging.getLogger("plugins.platforms.telegram")
+from gateway.config import is_zero_cut_handover_enabled
 
 
-def arm_abort_release(adapter, task) -> None:
-    """Release an opt-in retained lock if disconnect aborts before updater.stop()."""
-    def release_on_abort(done_task) -> None:
-        if done_task.cancelled():
-            adapter._release_platform_lock()
-            return
-        try:
-            failed = done_task.exception() is not None
-        except asyncio.CancelledError:
-            failed = True
-        if failed:
-            adapter._release_platform_lock()
+async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) -> None:
+    """Run Telegram teardown and, with zero-cut handover on, release the retained lock on any exit.
 
-    task.add_done_callback(release_on_abort)
-
-
-async def stop_updater_for_handover(
-    adapter, updater, await_step: Callable[[Awaitable, float, str], Awaitable[bool]], timeout: float,
-) -> bool:
-    """Stop PTB and release the retained token lock at completion or the bounded abort boundary."""
-    task = asyncio.ensure_future(updater.stop())
-
-    def release(done_task) -> None:
-        try:
-            done_task.exception()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.debug("Telegram updater stop failed after handover detach", exc_info=True)
-        adapter._release_platform_lock()
-
-    task.add_done_callback(release)
+    The handover path keeps the bot-token lock until ``updater.stop()`` is done so a successor
+    cannot poll beside the old updater. A try/finally in the calling coroutine, not a task
+    callback, also covers inline callers such as the reconnect watcher, and holds no reference to
+    the adapter once the call returns.
+    """
+    runner_config = getattr(getattr(adapter, "gateway_runner", None), "config", None)
+    if not is_zero_cut_handover_enabled(runner_config):
+        await disconnect(zero_cut_handover=False)
+        return
     try:
-        stopped = await await_step(asyncio.shield(task), timeout, "updater.stop()")
-    except asyncio.CancelledError:
+        await disconnect(zero_cut_handover=True)
+    finally:
         adapter._release_platform_lock()
-        raise
-    if not stopped:
-        logger.warning("[%s] updater.stop() timed out; releasing the bot-token lock", adapter.name)
-        adapter._release_platform_lock()
-    return stopped

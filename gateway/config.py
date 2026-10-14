@@ -926,7 +926,7 @@ def is_zero_cut_handover_enabled(config: "GatewayConfig | Mapping[str, Any] | No
     if not isinstance(gateway, Mapping):
         return False
     setting = gateway.get("zero_cut_handover", {})
-    return bool(setting.get("enabled", False)) if isinstance(setting, Mapping) else False
+    return _coerce_bool(setting.get("enabled"), False) if isinstance(setting, Mapping) else False
 
 
 def validate_outbox_retention_days(value: Any) -> int:

@@ -2160,6 +2160,7 @@ DEFAULT_CONFIG = {
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "zero_cut_handover": {"enabled": False},
         "guardian": {"enabled": False},
+        # Seconds a SIGTERM-interrupted agent unwinds before teardown; short to fit the stop budget.
         "signal_interrupt_grace_timeout": 1,
         # In-band restart wait cap for live background delegation units. 0 = do not wait for delegations.
         "restart_delegation_timeout": 900,

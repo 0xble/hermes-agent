@@ -1,4 +1,4 @@
-"""PR1 contracts for the opt-in zero-cut gateway handover seams."""
+"""Contracts for the opt-in zero-cut gateway handover seams."""
 
 import asyncio
 import threading
@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_cli import gateway_launchd
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, is_zero_cut_handover_enabled
 from gateway.config_loader import bridge_toplevel_keys
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -17,6 +17,12 @@ def test_zero_cut_handover_defaults_off():
     assert GatewayConfig.from_dict(
         {"gateway": {"zero_cut_handover": {"enabled": True}}}
     ).zero_cut_handover_enabled is True
+
+
+def test_raw_mapping_flag_uses_config_bool_coercion():
+    assert is_zero_cut_handover_enabled({"gateway": {"zero_cut_handover": {"enabled": "false"}}}) is False
+    assert is_zero_cut_handover_enabled({"zero_cut_handover": {"enabled": "true"}}) is True
+    assert is_zero_cut_handover_enabled(None) is False
 
 
 def test_real_yaml_gateway_section_is_bridged_before_schema_parse():
@@ -127,7 +133,8 @@ def test_disconnect_flag_on_releases_lock_when_updater_stop_times_out(monkeypatc
 
     async def bounded_timeout(awaitable, _timeout, step):
         if step == "updater.stop()":
-            # The real stop task remains detached and observed, but teardown must not deadlock.
+            # The bound expired: the step owner cancels the stop, so it never runs here.
+            awaitable.close()
             return False
         if asyncio.iscoroutine(awaitable):
             await awaitable
@@ -147,6 +154,7 @@ def test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels(monkeypatc
 
     async def cancel_on_updater_stop(awaitable, _timeout, step):
         if step == "updater.stop()":
+            awaitable.close()
             raise asyncio.CancelledError
         if asyncio.iscoroutine(awaitable):
             await awaitable
@@ -219,13 +227,61 @@ def test_disconnect_flag_on_releases_lock_when_quota_flush_cancels(monkeypatch):
     assert "release" in events
 
 
-__all__ = [
-    "test_zero_cut_handover_defaults_off",
-    "test_launchd_slot_labels_reuse_default_label_convention",
-    "test_disconnect_flag_off_keeps_lock_release_before_updater_stop",
-    "test_disconnect_flag_on_releases_lock_after_updater_stop",
-    "test_disconnect_flag_on_releases_lock_when_updater_stop_times_out",
-    "test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels",
-    "test_disconnect_flag_on_releases_lock_when_cancelled_before_updater",
-    "test_disconnect_flag_on_releases_lock_when_quota_flush_cancels",
-]
+def test_disconnect_flag_on_inline_caller_releases_on_error_and_keeps_no_task_callback(monkeypatch):
+    """The reconnect watcher awaits disconnect() inline and survives its errors; the lock must still
+    be released, and nothing may stay attached to the long-lived caller task."""
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+
+    async def fail_on_lifecycle(awaitable, _timeout, step):
+        if step == "lifecycle-task cancel":
+            raise RuntimeError("boom")
+        if asyncio.iscoroutine(awaitable):
+            await awaitable
+        events.append(step)
+        return True
+
+    monkeypatch.setattr(adapter, "_await_disconnect_step", fail_on_lifecycle)
+    monkeypatch.setattr(
+        adapter, "_collect_live_tasks",
+        lambda *_: [asyncio.get_running_loop().create_future()],
+    )
+
+    async def watcher():
+        host = asyncio.current_task()
+        before = len(getattr(host, "_callbacks", None) or [])
+        try:
+            await adapter.disconnect()
+        except RuntimeError:
+            pass
+        assert "release" in events
+        assert len(getattr(host, "_callbacks", None) or []) == before
+
+    asyncio.run(watcher())
+
+
+def test_disconnect_flag_on_cancels_and_releases_when_updater_stop_times_out(monkeypatch):
+    """A wedged updater.stop() is cancelled at the bound, as on the legacy path, before the lock goes."""
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+    stop_cancelled = []
+
+    async def wedged_stop():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            stop_cancelled.append(True)
+            raise
+
+    setattr(adapter._app, "updater", SimpleNamespace(running=True, stop=wedged_stop))
+    monkeypatch.setattr(adapter, "_await_disconnect_step", TelegramAdapter._await_disconnect_step.__get__(adapter))
+    monkeypatch.setattr("plugins.platforms.telegram.adapter._UPDATER_STOP_TIMEOUT", 0.05)
+    monkeypatch.setattr("plugins.platforms.telegram.adapter._DISCONNECT_STEP_TIMEOUT", 0.05)
+
+    async def scenario():
+        await adapter.disconnect()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert stop_cancelled == [True]
+    assert events.index("release") < events.index("app.stop")
