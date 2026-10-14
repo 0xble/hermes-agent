@@ -130,64 +130,62 @@ async def test_base_keep_typing_deadline_starts_after_send_returns(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
-    """A tick shed because a delivery holds the chat send lock is retried in ~0.5s, not 4.5s later."""
+async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly(monkeypatch):
+    """A skipped tick is retried at the hook delay instead of the next 4.5s deadline."""
+    from gateway.platforms import base as base_module
+    from plugins.platforms.telegram.adapter import _TYPING_SKIPPED_LOCK_BUSY, _TYPING_TICK_RETRY_SECS
+
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
-    adapter._bot = AsyncMock()
-    adapter._bot.send_chat_action = AsyncMock(return_value=None)
-    adapter._telegram_chat_outbound_slot_secs = 0.0
     adapter.stop_typing = AsyncMock()
     stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    sent_at = []
+    clock = [0.0]
+    sleep_delays = []
+    attempts = []
+    real_sleep = asyncio.sleep
 
-    async def record(**kwargs):
-        sent_at.append(loop.time())
-        stop_event.set()
+    class _Clock:
+        def time(self):
+            return clock[0]
 
-    adapter._bot.send_chat_action = AsyncMock(side_effect=record)
-    holding = asyncio.Event()
-    release = asyncio.Event()
-    released = asyncio.Event()
+    async def capture_sleep(delay):
+        sleep_delays.append(delay)
+        clock[0] += delay
+        await real_sleep(0)
 
-    async def delivery():
-        async with adapter._chat_send_lock("123"):
-            holding.set()
-            await release.wait()
+    async def typing(chat_id, metadata=None):
+        attempts.append(clock[0])
+        if len(attempts) == 2:
+            return _TYPING_SKIPPED_LOCK_BUSY
+        if len(attempts) == 3:
+            stop_event.set()
+        return None
 
-    holder = asyncio.create_task(delivery())
-    await holding.wait()
-    async def release_delivery():
-        await asyncio.sleep(0.2)
-        release.set()
-        released.set()
+    adapter.send_typing = typing
+    monkeypatch.setattr(base_module.asyncio, "get_running_loop", lambda: _Clock())
+    monkeypatch.setattr(base_module.asyncio, "sleep", capture_sleep)
 
-    releaser = asyncio.create_task(release_delivery())
-    await asyncio.wait_for(
-        adapter._keep_typing("123", interval=adapter.typing_refresh_interval, stop_event=stop_event), timeout=3)
-    await holder
-    await releaser
+    await adapter._keep_typing("123", interval=adapter.typing_refresh_interval, stop_event=stop_event)
 
-    assert len(sent_at) == 1
-    assert released.is_set()
+    assert attempts == [pytest.approx(0.0), pytest.approx(4.5), pytest.approx(5.0)]
+    assert any(delay == pytest.approx(_TYPING_TICK_RETRY_SECS) for delay in sleep_delays)
+    assert attempts[-1] < 9.0
 
 
 @pytest.mark.asyncio
 async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick(monkeypatch):
     """At a 1s interval a 0.5s retry plus a 0.75s send cannot fit, so the next regular tick covers it."""
-    from plugins.platforms.telegram.adapter import _TYPING_SKIPPED_LOCK_BUSY
+    from plugins.platforms.telegram.adapter import _TYPING_SKIPPED_LOCK_BUSY, _TYPING_TICK_RETRY_SECS
 
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter.stop_typing = AsyncMock()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     sent_at = []
-    retry_sleep = asyncio.Event()
+    sleep_delays = []
     real_sleep = asyncio.sleep
 
     async def capture_sleep(delay):
-        if delay < 0.75:
-            retry_sleep.set()
+        sleep_delays.append(delay)
         await real_sleep(delay)
 
     monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", capture_sleep)
@@ -204,4 +202,4 @@ async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick(mo
     monkeypatch.undo()
 
     assert len(sent_at) == 2
-    assert not retry_sleep.is_set()
+    assert not any(delay == pytest.approx(_TYPING_TICK_RETRY_SECS) for delay in sleep_delays)

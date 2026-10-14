@@ -74,8 +74,8 @@ async def test_streaming_burst_defers_one_trailing_rearm():
 
     assert adapter._bot.send_chat_action.await_count == 4
     chat_ids = [call.kwargs["chat_id"] for call in adapter._bot.send_chat_action.await_args_list]
-    assert chat_ids.count("123") == 2
-    assert chat_ids.count("456") == 2
+    assert [str(chat_id) for chat_id in chat_ids].count("123") == 2
+    assert [str(chat_id) for chat_id in chat_ids].count("456") == 2
 
 
 @pytest.mark.asyncio
