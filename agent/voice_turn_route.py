@@ -31,7 +31,10 @@ _REJECTION_FIELDS = ("_reasoning_disable_rejected", "_reasoning_floor_required",
 _REASONING_FIELDS = ("reasoning_config", "reasoning_override", "_pre_fallback_reasoning_override")
 _EXTRA_FIELDS = (
     "_fallback_activated", "_fallback_index", "_provider_fallback_active", "_provider_fallback_route",
+    "_active_fallback_entry", "_fallback_stay_started_at", "_fallback_episode_cooled",
     "_rate_limit_backoff_count", "_credential_pool", "_credential_pool_entry_id", "_config_context_length",
+    "_bedrock_region", "_bedrock_guardrail_config", "_codex_reasoning_replay_enabled",
+    "_codex_reasoning_replay_rejected", "_transport_cache",
     *_REJECTION_FIELDS,
 )
 
@@ -108,10 +111,13 @@ def _voice_reasoning(agent: Any, effort: Optional[Dict[str, Any]]) -> Optional[D
 
 def _capture(agent: Any) -> Dict[str, Any]:
     from agent.agent_runtime_helpers import _build_primary_runtime_snapshot
-    return {
+    state = {
         "snapshot": _build_primary_runtime_snapshot(agent, agent.api_mode),
         **{name: getattr(agent, name, None) for name in _EXTRA_FIELDS},
     }
+    if hasattr(agent, "_transport_cache"):
+        state["_transport_cache"] = dict(getattr(agent, "_transport_cache", {}) or {})
+    return state
 
 
 def _restore_reasoning(agent: Any, state: Dict[str, Any]) -> None:
@@ -124,7 +130,10 @@ def _reinstall(agent: Any, state: Dict[str, Any]) -> None:
     try:
         reinstall_runtime_snapshot(agent, state["snapshot"])
         for name in _EXTRA_FIELDS:
-            setattr(agent, name, state[name])
+            if name == "_transport_cache":
+                setattr(agent, name, dict(state[name] or {}))
+            else:
+                setattr(agent, name, state[name])
     finally:
         # Also restore picks when a rejected route's runtime reinstatement raises.
         _restore_reasoning(agent, state)
