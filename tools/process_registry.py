@@ -46,6 +46,9 @@ from tools.process_registry_results import (
     save_cut_pending_result,
 )
 from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_wait import (
+    monotonic as _monotonic, wait_plan as _wait_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2181,7 +2184,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     def wait(self, session_id: str, timeout: int = None) -> dict:
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
-        ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
+        ``timeout`` defaults to 30 seconds only when the process has notify_on_complete and
+        its notice can reach this session, otherwise to TERMINAL_TIMEOUT; it is clamped by
+        TERMINAL_TIMEOUT. Returns a dict
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
@@ -2193,16 +2198,17 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         # falsy and would silently fall through to the default wait.
         if timeout is not None and timeout <= 0:
             return {"status": "error", "error": f"timeout must be positive (got {timeout})"}
-        timeout_note = None
-        effective_timeout = timeout or max_timeout
-        if timeout and timeout > max_timeout:
-            effective_timeout = max_timeout
-            timeout_note = f"Requested wait of {timeout}s was clamped to configured limit of {max_timeout}s"
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        deadline = time.monotonic() + effective_timeout
-        while time.monotonic() < deadline:
+        timeout_note = None
+        default_timeout, guidance = _wait_plan(bool(session.notify_on_complete), max_timeout)
+        effective_timeout = default_timeout if timeout is None else timeout
+        if timeout and timeout > max_timeout:
+            effective_timeout = max_timeout
+            timeout_note = f"Requested wait of {timeout}s was clamped to configured limit of {max_timeout}s"
+        deadline = _monotonic() + effective_timeout
+        while _monotonic() < deadline:
             session = self._refresh_detached_session(session)
             if session is None:
                 return _not_found(session_id)
@@ -2230,7 +2236,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 if timeout_note:
                     result["timeout_note"] = timeout_note
                 return result
-            remaining = deadline - time.monotonic()
+            remaining = deadline - _monotonic()
             if remaining <= 0:
                 break
             session._completion_event.wait(timeout=min(1.0, remaining))
@@ -2242,11 +2248,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
         if session.started_at:
             base_note += f" Uptime: {int(time.time() - session.started_at)}s."
-        base_note += (
-            " notify_on_complete is set: you will be notified on exit — do more work instead of waiting again."
-            if session.notify_on_complete else
-            " Poll again later or use terminal(background=true, "
-            "notify_on_complete=true) next time for automatic notification.")
+        base_note += guidance
         result["timeout_note"] = f"{timeout_note}. {base_note}" if timeout_note else base_note
         return result
 
@@ -3249,7 +3251,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait'.",
+                "description": "Max seconds for 'wait' (default 30 when the process has notify_on_complete and this session can receive the notice later, else TERMINAL_TIMEOUT; clamped by TERMINAL_TIMEOUT).",
                 "minimum": 1
             },
             "offset": {

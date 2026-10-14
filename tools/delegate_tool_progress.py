@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 import enum
+import json
+import logging
 import os
 import threading
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
+
+from tools import delegate_tool_registry as _registry
 from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+from tools.process_registry_wait import can_receive_later
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -28,6 +32,39 @@ def _quiet(log_message: Optional[str], *log_args: Any, exc_info: bool = False):
         if log_message.count("%") > len(log_args):
             log_args = log_args + (exc,)
         logger.debug(log_message, *log_args, exc_info=exc_info)
+
+def _list_observation(parent_agent: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if parent_agent is None:
+        return payload
+    # Elapsed time is not progress. Keep just the last meaningful observation on
+    # the owner, so sessions cannot suppress each other's lists or leak a cache.
+    snapshot = sorted(
+        [{k: v for k, v in entry.items() if k != "running_seconds"}
+         for entry in payload["subagents"]],
+        key=lambda entry: str(entry["subagent_id"]),
+    )
+    fingerprint = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
+    session_id = str(getattr(parent_agent, "session_id", "") or "")
+    with _active_subagents_lock:
+        previous = getattr(parent_agent, "_delegate_list_observation", None)
+        if previous is not None and previous[:2] == (session_id, fingerprint):
+            since = previous[2]
+            if not snapshot:
+                note = f"Unchanged since {since}. {payload['note']}"
+            elif can_receive_later():
+                note = (f"Unchanged since {since}; results arrive as a new message. "
+                        "End the turn instead of polling.")
+            else:
+                note = f"Unchanged since {since}."
+            return {
+                "action": "list", "status": "unchanged", "unchanged_since": since,
+                "count": len(snapshot),
+                "subagent_ids": [entry["subagent_id"] for entry in snapshot],
+                "note": note,
+            }
+        parent_agent._delegate_list_observation = (session_id, fingerprint, _registry._now())
+    return payload
+
 
 def _safe_progress(cb: Any, event_type: Any, *args: Any, **kwargs: Any) -> None:
     """Invoke a child progress callback; relay failures never reach the run."""
