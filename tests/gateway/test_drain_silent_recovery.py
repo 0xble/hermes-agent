@@ -80,6 +80,8 @@ def _recover(tmp_path, monkeypatch, runner, adapter, key, expected):
 
 @pytest.mark.asyncio
 async def test_busy_drain_silently_recovers_internal_and_human_events(tmp_path, monkeypatch):
+    # Queue admission checkpoints into HERMES_HOME, so the home must be fixed before enqueue.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     runner, adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)

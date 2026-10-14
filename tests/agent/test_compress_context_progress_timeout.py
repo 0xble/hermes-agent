@@ -704,10 +704,12 @@ class TestCompressContextForwarderOwnsTimeout:
 
     def test_caller_fence_bypasses_owned_wrapper(self, monkeypatch):
         from run_agent import AIAgent
+        from types import SimpleNamespace
 
         agent = object.__new__(AIAgent)
         agent.session_id = "s1"
         agent._cached_system_prompt = "sys"
+        agent.context_compressor = SimpleNamespace(context_length=None)
         agent._conversation_root_id = MagicMock(return_value=None)
 
         seen = {}

@@ -24,7 +24,7 @@ def run_preflight_gate(
     compression_attempts: Any, max_compression_attempts: Any, effective_task_id: Any,
     final_response: Any, failed: Any, _turn_exit_reason: Any, _compression_timeout_exhausted: Any,
     _preflight_compression_blocked: Any, _provider_overflow_recovery_pending: Any,
-    _last_preflight_pressure: Any,
+    _last_preflight_pressure: Any, api_messages: Any = None, tools_for_api: Any = None,
 ) -> PreflightGateVerdict:
     """Run the pre-API guard chain in the original order. ``_last_preflight_pressure`` is
     consumed here (set to None) and re-armed only by a compression pass, so a blocked
@@ -54,6 +54,46 @@ def run_preflight_gate(
         agent._api_call_count = v.api_call_count
         with suppress(Exception):
             agent.iteration_budget.refund()
+        v.action = "break"
+        return v
+
+    # A known hard-window breach cannot defer to real usage: some servers truncate
+    # instead of rejecting. Measure the final request, not a stale usage anchor.
+    from agent.compression_recovery import request_fits
+    window = getattr(agent.context_compressor, "context_length", None)
+    if (api_messages is not None and isinstance(window, int) and window > 0
+            and getattr(agent, "api_mode", None) != "codex_app_server"
+            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
+        from agent.conversation_compression import conversation_history_after_compression
+        from agent.turn_context_compaction import _refund_api_call
+        v.api_call_count = _refund_api_call(agent, v.api_call_count)
+        before = list(messages)
+        recovered, prompt = messages, active_system_prompt
+        if getattr(agent, "compression_enabled", True):
+            try:
+                recovered, prompt = agent._compress_context(
+                    messages, system_message, task_id=effective_task_id,
+                    approx_tokens=request_pressure_tokens,
+                )
+            except Exception:
+                logger.warning("Hard-window recovery failed; retaining the same session", exc_info=True)
+        if recovered != before:
+            v.messages = recovered
+            v.active_system_prompt = prompt
+            v.conversation_history = conversation_history_after_compression(agent, recovered)
+            if request_fits(agent, recovered, prompt):
+                v._preflight_compression_blocked = False
+                v._last_preflight_pressure = request_pressure_tokens
+                v.action = "continue"
+                return v
+        v.final_response = (
+            "The complete request cannot safely fit the model window. No provider call was sent. "
+            "This session, its history and accepted input are retained; retry /compress "
+            "when the summary route is available."
+        )
+        v.failed = True
+        v._turn_exit_reason = "context_compression_timeout"
+        v._compression_timeout_exhausted = True
         v.action = "break"
         return v
 

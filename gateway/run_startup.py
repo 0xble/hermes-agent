@@ -118,6 +118,73 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 source.chat_id if source else "unknown",
             )
 
+    async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
+        """Replay ready inbound, leaving sessions owned by another restore in order."""
+        drained = 0
+        queue = getattr(self, "_startup_restore_queue", None) or []
+        # Topic recovery behind the session key reads state.db: resolve keys off the loop, once per
+        # event (by identity; the queue keeps each event alive while it is listed).
+        resolved: dict[int, tuple] = {}
+
+        def session_keys(events):
+            return [self._session_key_for_source(self._normalize_source_for_session_key(event.source))
+                    for event in events]
+
+        async def resolve_keys():
+            # Repeat until no await is left between resolution and the scan: inbound queued while a
+            # batch resolved is resolved too, so ``ready`` below always has every key.
+            while pending := [event for event in queue if resolved.get(id(event), (None,))[0] is not event]:
+                for event, key in zip(pending, await asyncio.to_thread(session_keys, pending)):
+                    resolved[id(event)] = (event, key)
+
+        def ready(event):
+            key = resolved[id(event)][1]
+            if keys is not None and key not in keys:
+                return False
+            # Our own gate permits one claimant; every other owner's gate must be fully open.
+            limit = 1 if owned_keys and key in owned_keys else 0
+            return getattr(self, "_reconnect_restore_keys", {}).get(key, 0) <= limit
+
+        while True:
+            await resolve_keys()
+            index = next((i for i, event in enumerate(queue) if ready(event)), None)
+            if index is None:
+                break
+            event = queue.pop(index)
+            try:
+                source = getattr(event, "source", None)
+                adapter = self._intake_adapter_for(source)
+                if adapter is None and getattr(event, "_hermes_recovered_followup", False):
+                    adapter = self._delivery_adapter_for(source)
+                if adapter is None:
+                    logger.debug(
+                        "Dropping startup-restore queued message: adapter unavailable for %s",
+                        getattr(getattr(source, "platform", None), "value", None),
+                    )
+                    continue
+                # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
+                with suppress(Exception):
+                    setattr(event, "_hermes_startup_restore_replay", True)
+                # A normal return can be an admission refusal. Retire the only
+                # durable copy only after this replay acquires an explicit receipt.
+                event._gateway_accepted = False
+                await adapter.handle_message(event)
+                if getattr(event, "_gateway_accepted", False) is not True:
+                    continue
+                spool = getattr(event, "_hermes_recovery_spool", None)
+                if spool is not None and not getattr(event, "_hermes_queue_checkpoint", False):
+                    spool.unlink(missing_ok=True)
+            except Exception:
+                # One bad replay must not abort the drain: the remaining queued
+                # events still deserve their turn, and a raise here used to skip
+                # the gate release in _finish_startup_restore entirely.
+                logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
+                continue
+            drained += 1
+        if queue and keys is None:
+            logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
+        return drained
+
     @staticmethod
     def _start_free_tier_bootstrap() -> None:
         """One bootstrap per process. `run_bootstrap` already records its own failure in the boot record
@@ -736,6 +803,108 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         return await asyncio.to_thread(
             self._resume_pending_candidates, platform, record_boot=record_boot,
         )
+
+
+    def _resume_owner_authorized(self, session_key: str, source) -> bool | None:
+        """True for an authorized owner, False for denial, None when checking failed."""
+        try:
+            if self._is_user_authorized_for_source(source):
+                return True
+            logger.warning(
+                "Skipping auto-resume for %s: session owner is no "
+                "longer authorized under the current allowlist", session_key,
+            )
+        except Exception as exc:
+            logger.warning("Skipping auto-resume for %s: authorization check failed: %s", session_key, exc)
+            return None
+        return False
+
+    def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
+        """Shared admission for deferred follow-ups and synthetic resume turns."""
+        from gateway.run import (
+            _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+            _resume_pending_marker_timestamp,
+        )
+        marker = _resume_pending_marker_timestamp(entry)
+        if not getattr(entry, "resume_pending", True):
+            return None
+        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
+            return None
+        if self._is_session_running(entry.session_key):
+            return None
+        source = self._restored_source(entry)
+        adapter = self._delivery_adapter_for(source)
+        if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
+            return None
+        return adapter, source
+
+    def _startup_interrupted_note_candidates(self, candidates) -> list[str]:
+        """Return fresh, eligible feature-version rows that may receive a startup note.
+
+        ``resume_pending`` predates S2 and is not sufficient evidence for a note: legacy rows have no
+        ``resume_turn_id``. Keep the note admission identical to auto-resume so stale or unavailable
+        sessions remain recoverable without producing an orphan notice.
+        """
+        return [
+            entry.session_key for entry in (candidates or [])
+            if getattr(entry, "resume_turn_id", None) and self._auto_resume_ready(entry) is not None
+        ]
+
+    def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
+                                          candidates=_NOT_SUPPLIED) -> int:
+        """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
+        ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
+        ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
+        sessions with a running agent are skipped so none is resumed twice."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
+        if candidates is None:
+            return 0
+        scheduled = 0
+        for entry in candidates:
+            # Epoch math: the marker was stamped naive-local by the previous process, possibly
+            # on the other side of a DST change; wall-clock subtraction is off by the shift.
+
+            if platform is not None and entry.origin.platform != platform:
+                continue
+            ready = self._auto_resume_ready(entry)
+            if ready is None:
+                continue
+            adapter, source = ready
+            # Claim the slot *before* spawning so an inbound message arriving before the task's first
+            # await queues instead of building a duplicate AIAgent.
+            _resume_state = self._session_state(entry.session_key)
+            _resume_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _resume_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            # Empty-text internal event: the _is_resume_pending branch prepends the reason-aware note.
+            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
+                                 message_id=getattr(source, "message_id", None), internal=True)
+            # This event owns the sentinel claimed above. Other input must still queue, but the
+            # resume itself must enter the turn instead of bouncing into its own pending slot.
+            _resume_state.turn.event = event
+            event._startup_resume_claim = True
+            resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
+            if resume_marker:
+                # Keep the transport reply anchor for threading, but admit each interruption marker
+                # independently so a second restart cannot dedupe the next synthetic resume.
+                event._outbox_admission_id = f"resume:{resume_marker}"
+            task = self._retain_background_task(
+                asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
+            )
+            if restore_tasks is not None:
+                restore_tasks.append(task)
+            if restore_keys is not None:
+                restore_keys.add(entry.session_key)
+            if getattr(self, "_startup_restore_in_progress", False):
+                tasks = getattr(self, "_startup_restore_tasks", None)
+                if tasks is None:
+                    tasks = self._startup_restore_tasks = []
+                tasks.append(task)
+            scheduled += 1
+        if scheduled:
+            logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
+        return scheduled
 
     def _schedule_auto_resume_delegations(self) -> int:
         """Queue bounded parent notices for eligible abandoned single-task rows.

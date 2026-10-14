@@ -45,6 +45,11 @@ def approval_input_words(input_key: str) -> Tuple[str, ...]:
     return tuple(seen)
 
 
+QUEUE_ADMISSION_FAILURE = (
+    "Queue admission could not be durably acknowledged. "
+    "No queued work was started; retry when storage is available."
+)
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
@@ -98,17 +103,31 @@ class GatewayBusySessionMixin:
         state = self._peek_session_state(session_key)
         return state.conversation.queued_events if state else None
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
-            return
+            return False
+        from gateway.shutdown_flush import checkpoint_queued_event
+        message_id = getattr(queued_event, "message_id", None)
+        duplicate = next((item for item in [pending_slot.get(session_key), *(self._overflow_queue(session_key) or ())]
+            if message_id and getattr(item, "message_id", None) == message_id
+            and getattr(item, "text", None) == getattr(queued_event, "text", None)
+            and list(getattr(item, "media_urls", None) or []) == list(getattr(queued_event, "media_urls", None) or [])), None)
+        if duplicate is not None:
+            if not checkpoint_queued_event(session_key, duplicate):
+                return False
+            queued_event._gateway_accepted = True
+            return True
+        if not checkpoint_queued_event(session_key, queued_event):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
             pending_slot[session_key] = queued_event
         queued_event._gateway_accepted = True
         self._prefetch_queued_voice_transcript(queued_event, adapter)
+        return True
 
     def _promote_queued_event(
         self, session_key: str, adapter: Any, pending_event: Optional["MessageEvent"]
@@ -373,7 +392,7 @@ class GatewayBusySessionMixin:
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         """Return whether this event actually entered the adapter slot or FIFO."""
-        from gateway.platforms.base import merge_pending_message_event
+        from gateway.platforms.base import checkpointed_merge_pending_message_event
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
             return False
@@ -408,10 +427,11 @@ class GatewayBusySessionMixin:
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
-            merge_pending_message_event(
+            if not checkpointed_merge_pending_message_event(
                 adapter._pending_messages, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
-            )
+            ):
+                return False
             event._gateway_accepted = True
             return True
 
@@ -422,9 +442,12 @@ class GatewayBusySessionMixin:
             )
             return False
 
-        self._enqueue_fifo(session_key, event, adapter)
-        return ((isinstance(pending_slot, dict) and pending_slot.get(session_key) is event)
-                or any(item is event for item in (self._overflow_queue(session_key) or ())))
+        admitted = self._enqueue_fifo(session_key, event, adapter)
+        if not admitted:
+            return False
+        # A duplicate retry is logically admitted even though it is intentionally not
+        # inserted into the slot/overflow a second time.
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Steerable text for a busy follow-up, transcribing voice-message media first.
@@ -874,13 +897,11 @@ class GatewayBusySessionMixin:
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if self._draining and event.internal and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(session_key, event)
-            return True
+            return bool(self._preserve_drain_event(session_key, event))
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
-                self._queue_or_replace_pending_event(session_key, event)
-                return True
+                return bool(self._queue_or_replace_pending_event(session_key, event))
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
@@ -904,8 +925,7 @@ class GatewayBusySessionMixin:
             event._gateway_accepted = True  # consumed by the blocked approval, an admission
             return True
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(session_key, event)
-            return True
+            return bool(self._preserve_drain_event(session_key, event))
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:
             # A command not bypassed by the adapter still uses the ordinary busy
@@ -925,8 +945,7 @@ class GatewayBusySessionMixin:
         # steer; they surface as a NEW turn when idle. Plugin events carry untrusted payload text, so
         # queue them through the FIFO (security metadata kept apart).
         if getattr(event, "internal", False):
-            self._queue_or_replace_pending_event(session_key, event)
-            return True
+            return bool(self._queue_or_replace_pending_event(session_key, event))
         _busy_state = self._peek_session_state(session_key)
         preempt = effective_mode == "queue" and self._human_preempts_autonomous_turn(event, _busy_state)
         if preempt:
@@ -947,7 +966,9 @@ class GatewayBusySessionMixin:
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
-            self._queue_or_replace_pending_event(session_key, event)
+            if not self._queue_or_replace_pending_event(session_key, event):
+                await self._send_busy_ack_reply(event, adapter, QUEUE_ADMISSION_FAILURE)
+                return True
         else:
             event._gateway_accepted = True  # folded into the running turn: admitted, not queued
         # Store the message so it's processed as the next turn after the current run finishes (or is
@@ -1167,7 +1188,8 @@ class GatewayBusySessionMixin:
                 internal=event.internal, timestamp=event.timestamp,
                 reply_expected=event.reply_expected,
             )
-            self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+            if not self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter):
+                return "Queue admission could not be durably acknowledged. No queued work was started; retry when storage is available."
             if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                 return None
         depth = self._queue_depth(quick_key, adapter=adapter)
@@ -1192,7 +1214,8 @@ class GatewayBusySessionMixin:
                     message_id=event.message_id, channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context, reply_expected=event.reply_expected,
                 )
-                self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter)
+                if not self._enqueue_fifo(quick_key, apply_agent_origin_reply_expectation(queued_event), adapter):
+                    return "Queue admission could not be durably acknowledged. No queued work was started; retry when storage is available."
                 if is_agent_origin_text(queued_event.text) and queued_event.reply_expected is False:
                     return None
             return reply

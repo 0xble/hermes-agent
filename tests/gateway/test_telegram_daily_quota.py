@@ -256,7 +256,7 @@ async def test_busy_voice_echo_survives_background_daily_pressure(tmp_path, path
         with outbound_class(OUTBOUND_NOTICE):  # inherit the busy background turn's outbound context too
             if path == "prefetch":
                 adapter.send = AsyncMock(wraps=adapter.send)
-                runner._enqueue_fifo(session_key, event, adapter)
+                assert runner._enqueue_fifo(session_key, event, adapter)
                 await event._gateway_pending_stt_prefetch
                 assert adapter._pending_messages[session_key] is event
                 assert adapter.send.await_args.kwargs["metadata"]["_interim_send"] is True

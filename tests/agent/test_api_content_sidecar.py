@@ -635,6 +635,12 @@ class TestPrologueMoaAndInPlaceBackfill:
         agent.compression_enabled = True
         agent._session_db = MagicMock()
 
+        def acknowledge_admission(messages, history=None):
+            messages[-1]["_db_persisted"] = True
+            return True
+
+        agent._flush_messages_to_session_db = acknowledge_admission
+
         calls = {"n": 0}
 
         def _should_compress(_tokens):
