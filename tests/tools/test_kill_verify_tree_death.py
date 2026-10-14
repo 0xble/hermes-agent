@@ -124,6 +124,9 @@ def test_escalated_kill_of_sigterm_ignoring_child_reports_killed(tmp_path, monke
             s.process.wait(timeout=2)
     assert result["status"] == "killed", result
     assert s.completion_reason == "killed"
+    # The reader thread may own finalization (it saw the exit first); it files the
+    # session into _finished after its receipt IO, then sets the completion event.
+    assert s._completion_event.wait(5)
     assert s.id in reg._finished
 
 

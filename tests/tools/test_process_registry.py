@@ -271,6 +271,11 @@ def test_bounded_kill_all_receipt_lock_contention_does_not_block_signals(registr
 
     home = tmp_path / "home"
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    # A leaf child: a real recursive children() walk scans every host process on
+    # macOS and alone can spend the 0.4s budget under load before any signal is sent.
+    import psutil
+
+    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
     proc = _spawn_python_sleep(30)
     held = threading.Event()
     release = threading.Event()
