@@ -2841,6 +2841,45 @@ class TestRestoreCronJobsIfEmptied:
         restored = json.loads(jobs_path.read_text())
         assert len(restored["jobs"]) == 19
 
+    def test_does_not_resurrect_job_removed_after_snapshot(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}, {"id": "c"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is None
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"b", "c"}
+
+    def test_restores_missing_job_without_reverting_survivor_change(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(
+            jobs_path,
+            [{"id": "a", "last_run_at": None}, {"id": "b"}, {"id": "c"}],
+        )
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        with use_cron_store(hermes_home):
+            assert remove_job("c") is True
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "last_run_at": "new"}]}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 1
+        restored = {job["id"]: job for job in json.loads(jobs_path.read_text())["jobs"]}
+        assert restored["a"]["last_run_at"] == "new"
+        assert set(restored) == {"a", "b"}
+
 
 # ---------------------------------------------------------------------------
 # Cron agent-job prompt field degradation across update (issue #82990)

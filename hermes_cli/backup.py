@@ -1493,8 +1493,9 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
 def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     """Safety net for silent cron-job loss across ``hermes update``.
 
-    Conservative: restores only when the snapshot had MORE jobs than the live file (a user who
-    deleted jobs is never second-guessed); an unreadable live file is left so corruption surfaces.
+    Conservative: restores only snapshot jobs missing from a smaller live file and not marked as
+    deliberately removed during the snapshot window. An unreadable live file is left so corruption
+    surfaces. Existing live records are preserved rather than replaced wholesale.
 
     Config-version migrations have been observed to leave ``cron/jobs.json`` valid-but-empty after an
     update, silently dropping every scheduled job (issue #34600). The desktop scheduler can also overwrite
@@ -1513,17 +1514,61 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
     # (1 vs 19) — the desktop scheduler can overwrite jobs.json with its own small set.
     if not snap_count or live_count >= snap_count:  # None or 0 — nothing worth restoring
         return None
+    snap_doc = _load_cron_jobs_doc(snap_path)
+    if snap_doc is None:
+        return None
+
+    manifest_path = _quick_snapshot_root(home) / snapshot_id / "manifest.json"
+    snapshot_created_at: Optional[datetime] = None
     try:
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(snap_path, live_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(manifest, dict):
+            raise ValueError("snapshot manifest is not an object")
+        raw_created_at = manifest.get("created_at") or manifest.get("timestamp")
+        if isinstance(raw_created_at, str):
+            try:
+                snapshot_created_at = datetime.fromisoformat(raw_created_at)
+            except ValueError:
+                snapshot_created_at = datetime.strptime(raw_created_at, "%Y%m%d-%H%M%S")
+            if snapshot_created_at.tzinfo is None:
+                snapshot_created_at = snapshot_created_at.replace(tzinfo=timezone.utc)
+            snapshot_created_at = snapshot_created_at.astimezone(timezone.utc)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # An unavailable creation time makes every retained delete record
+        # conservative: it may belong to this snapshot's window.
+        snapshot_created_at = None
+
+    from cron import jobs as cron_jobs
+
+    try:
+        with cron_jobs.use_cron_store(home):
+            with cron_jobs._jobs_lock():
+                live_jobs = cron_jobs.load_jobs()
+                live_ids = {
+                    str(job.get("id")) for job in live_jobs
+                    if isinstance(job, dict) and job.get("id")
+                }
+                removed_ids = cron_jobs.get_removed_job_ids(since=snapshot_created_at)
+                restored_jobs = []
+                for job in _cron_jobs_list(snap_doc):
+                    if not isinstance(job, dict) or not job.get("id"):
+                        continue
+                    job_id = str(job["id"])
+                    if job_id in live_ids or job_id in removed_ids:
+                        continue
+                    restored_jobs.append(job)
+                    live_ids.add(job_id)
+                if not restored_jobs:
+                    return None
+                cron_jobs.save_jobs(live_jobs + restored_jobs)
     except (OSError, PermissionError) as exc:
         logger.error("Cron jobs were emptied during update but auto-restore failed: %s", exc)
         return None
     logger.warning(
         "Restored %d cron job(s) from pre-update snapshot %s "
-        "(live file had %d job(s), snapshot had %d — jobs were lost during migration)",
-        snap_count, snapshot_id, live_count, snap_count)
-    return {"restored": True, "job_count": snap_count, "snapshot_id": snapshot_id}
+        "(live file had %d job(s), snapshot had %d — missing jobs were restored during migration)",
+        len(restored_jobs), snapshot_id, live_count, snap_count)
+    return {"restored": True, "job_count": len(restored_jobs), "snapshot_id": snapshot_id}
 
 
 def _sibling_profile_homes(invoking_home: Path) -> list[tuple[str, Path]]:

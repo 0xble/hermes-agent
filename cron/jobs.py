@@ -1610,6 +1610,93 @@ def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
     return tmp_path
 
 
+_REMOVED_JOBS_RETENTION = timedelta(days=7)
+
+
+def _removed_jobs_file() -> Path:
+    """Return the durable intentional-delete journal for the active cron store."""
+    return _current_cron_store().cron_dir / "removed_jobs.jsonl"
+
+
+def _parse_removed_at(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
+    """Return intentionally removed job ids, optionally limited to a time window.
+
+    This is a best-effort read of the small per-profile journal used by the
+    update restore safety net. Invalid lines are ignored so a damaged journal
+    cannot block normal cron operation.
+    """
+    path = _removed_jobs_file()
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return set()
+    boundary = since
+    if boundary is not None:
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=timezone.utc)
+        boundary = boundary.astimezone(timezone.utc)
+    removed: Set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        removed_at = _parse_removed_at(record.get("removed_at"))
+        if removed_at is None or boundary is None or removed_at >= boundary:
+            removed.add(str(record["id"]))
+    return removed
+
+
+def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
+    """Append intentional deletes while pruning journal entries older than seven days."""
+    ids = {str(job_id) for job_id in removed_ids if job_id}
+    if not ids:
+        return
+    removed_file = _removed_jobs_file()
+    now = _hermes_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_utc = now.astimezone(timezone.utc)
+    cutoff = now_utc - _REMOVED_JOBS_RETENTION
+    retained: List[Dict[str, str]] = []
+    try:
+        existing = removed_file.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        existing = []
+    for line in existing:
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        removed_at = _parse_removed_at(record.get("removed_at"))
+        if removed_at is not None and removed_at >= cutoff:
+            retained.append({"id": str(record["id"]), "removed_at": removed_at.isoformat()})
+    retained.extend({"id": job_id, "removed_at": now_utc.isoformat()} for job_id in sorted(ids))
+    atomic_write_text(
+        removed_file,
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in retained),
+        tmp_prefix=".removed_jobs_",
+        mode=0o600,
+    )
+    _secure_file(removed_file)
+
+
 _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
@@ -1621,6 +1708,7 @@ def _save_jobs_unlocked(
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
     rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
     jobs_file = _current_cron_store().jobs_file
+    removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
     _stat_before = None
@@ -1655,6 +1743,15 @@ def _save_jobs_unlocked(
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
             store_health.note_writable(jobs_file.parent)
+            if removed_ids:
+                try:
+                    _record_removed_jobs_unlocked(removed_ids)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not record intentional cron job delete(s) in %s; "
+                        "the deletion remains applied: %s",
+                        _removed_jobs_file(), exc,
+                    )
             return
     except BaseException:
         _unlink_quiet(tmp_path)
