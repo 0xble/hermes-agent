@@ -866,6 +866,9 @@ TELEGRAM_RICH_MESSAGES_HINT = (
     "real Markdown tables and task lists over hand-built bullet substitutes when presenting structured data; these "
     "degrade gracefully (tables become readable bullet groups) when rich rendering is unavailable, but advanced "
     "constructs like math and collapsible details may render as plain source text in that case. "
+    "Put dense secondary content (evidence, logs, ID/SHA lists, long verification detail, diffs) in "
+    "<details><summary>Label</summary>...</details> toggles with the outcome stated above them, so the main reply "
+    "stays short; keep short answers unwrapped. "
 )
 
 # Environment hints — the machine/OS the agent's tools actually run on
