@@ -373,6 +373,19 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
             kernel.proc.wait(timeout=10)
             self.assertFalse(kernel.alive())
 
+    def test_lru_eviction_reports_state_reset(self):
+        with _kernel_config(max_session_kernels=1):
+            first = self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self.assertFalse(first["kernel"]["state_reset"])
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            after = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+        self.assertEqual(after["status"], "error", after)
+        self.assertIn("NameError", after.get("error", ""))
+        self.assertFalse(after["kernel"]["reused"])
+        self.assertTrue(after["kernel"]["state_reset"])
+        self.assertIn("kernel evicted", after["kernel"]["note"])
+        self.assertIn("re-create variables", after["kernel"]["note"])
+
     def test_idle_kernels_are_reaped(self):
         import time as time_module
 
