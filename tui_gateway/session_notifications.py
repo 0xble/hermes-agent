@@ -644,11 +644,13 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
                 queue.put(evt)
             raise
         emitted.add(dedup_key)
-        if evt_type != "async_delegation" and _background_notifications_off(session):
-            # Status-only delivery has completed without an agent turn.
-            acknowledge_survivor_notifications(registry, ((evt, text),))
-            _notif_reset_retry(session, evt)
-            return True
+    if evt_type != "async_delegation" and _background_notifications_off(session):
+        # The user opted out of process-driven agent wakes: the status row is the whole
+        # delivery, on every offer (a repeated or re-offered dedup key must not start a turn).
+        # Subagent results are not process notifications and still land.
+        acknowledge_survivor_notifications(registry, ((evt, text),))
+        _notif_reset_retry(session, evt)
+        return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
         return True

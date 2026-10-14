@@ -232,3 +232,21 @@ def test_poller_path_acks_survivor_after_status_emission(tmp_path, monkeypatch):
     assert not worker.is_alive()
     assert any("3" in payload["text"] and "make test" in payload["text"] for payload in status)
     assert Path(process.delivered_path).exists()
+
+
+def test_notifications_off_mutes_repeated_dedup_key(tmp_path, monkeypatch):
+    """`background_process_notifications: off` mutes every offer, not only a first-seen dedup key."""
+    registry, _process, event = _survivor_registry(tmp_path, monkeypatch)
+    session = {"history_lock": threading.RLock(), "running": False, "history": [], "session_key": "tui-session"}
+    dispatched = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda _: True)
+    monkeypatch.setattr(server, "_notif_claim_turn", lambda current: True)
+    monkeypatch.setattr(server, "_notif_dispatch_event", lambda *args: dispatched.append(args) or True)
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    match = dict(event, type="watch_match", pattern="FAIL", output="FAIL: same line")
+    emitted = set()
+    for _ in range(2):
+        assert server._notif_handle_event("tui-sid", session, dict(match), emitted, registry,
+                                          lambda evt: "watch matched", None)
+    assert dispatched == []
