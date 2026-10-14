@@ -968,9 +968,15 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
     if executable == "heavy-slot":
         # A bare name does NOT earn the exception. Resolve it only to keep the fallback strict,
         # including a different script on PATH; use the existing passive resolver, never execute it.
-        from hermes_platform.resolver import locate_command
+        # Relative and empty PATH entries resolve from the command's cwd, as the shell does.
+        from hermes_platform.resolver import LookupContext, locate_command
 
-        resolution = locate_command(executable)
+        search = os.environ.get("PATH")
+        if search and cwd:
+            search = os.pathsep.join(
+                entry if os.path.isabs(entry) else os.path.join(cwd, entry) for entry in search.split(os.pathsep)
+            )
+        resolution = locate_command(executable, LookupContext(path=search))
         if resolution.command:
             yield from _resolved_or_nothing(resolution.command[0], cwd)
         return

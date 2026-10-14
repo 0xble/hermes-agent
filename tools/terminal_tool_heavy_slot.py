@@ -344,6 +344,62 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
     return found
 
 
+def pin_bare_heavy_slot(command: str, *, env_type: str) -> str:
+    """Rewrite each top-level bare ``heavy-slot`` command word to the installed helper's absolute path.
+
+    The lifecycle guard trusts the helper only by absolute-path identity: it cannot know the PATH a
+    login shell with persisted exports will search. Pinning the command word before the guard runs
+    makes the scanned file and the executed file the same by construction. Only the command word of
+    a top-level simple command qualifies (start, or after ``&&``, ``||``, ``;`` or a newline), after
+    optional ``VAR=val`` and ``env [-u VAR] [VAR=val]`` prefixes. Quoted words, heredoc bodies,
+    subshells, substitutions, pipeline stages and nested payloads are left alone and stay strict.
+    """
+    if env_type != "local" or "heavy-slot" not in command:
+        return command
+    installed = Path.home() / ".local" / "bin" / "heavy-slot"
+    if not (installed.is_file() and os.access(installed, os.X_OK)):
+        return command
+    from tools.self_repo_guard import _mask_heredocs
+    from tools.terminal_tool_sudo import _scan_shell
+
+    masked, _ = _mask_heredocs(command)  # same length: body characters become spaces
+    if len(masked) != len(command):
+        return command
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    state = "start"  # start | env | env-operand | done
+    for kind, start, end, _at_start in _scan_shell(masked):
+        text = masked[start:end]
+        if kind == "op":
+            depth = max(0, depth + (text == "(") - (text == ")"))
+            state = "start" if text in {"&&", "||", ";"} else "done"
+            continue
+        if kind == "ws" and text == "\n":
+            state = "start"
+            continue
+        if kind != "word" or depth or state == "done":
+            continue
+        if state == "env-operand":
+            state = "env"
+        elif text == "heavy-slot":
+            spans.append((start, end))
+            state = "done"
+        elif _ASSIGNMENT.match(text):
+            continue
+        elif state == "start" and text == "env":
+            state = "env"
+        elif state == "env" and text in {"-u", "--unset"}:
+            state = "env-operand"
+        else:
+            state = "done"
+    rewritten = command
+    for start, end in reversed(spans):
+        if masked[end:].lstrip(" \t").startswith("("):
+            continue  # `heavy-slot() { ...; }` defines a function; it is not a command word
+        rewritten = rewritten[:start] + shlex.quote(str(installed)) + rewritten[end:]
+    return rewritten
+
+
 def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     """The host helper: the terminal's PATH first, then ``~/.local/bin`` (absent from minimal service PATHs)."""
     from hermes_platform.resolver.core import LookupContext, locate_command

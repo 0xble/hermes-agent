@@ -889,7 +889,7 @@ from tools.terminal_tool_guards import (
     gateway_lifecycle_block, self_repo_block,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
-from tools.terminal_tool_heavy_slot import wrap_heavy_command
+from tools.terminal_tool_heavy_slot import pin_bare_heavy_slot, wrap_heavy_command
 from tools.terminal_tool_result import finalize_foreground_result
 
 
@@ -1445,6 +1445,9 @@ def terminal_tool(
         )
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
+        # A bare top-level `heavy-slot` runs the installed helper: every guard below scans, and the
+        # shell executes, the same absolute path, whatever PATH the login shell would search.
+        command = pin_bare_heavy_slot(command, env_type=env_type)
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker
         # threads, so fall back to the raw task_id (the top-level agent's

@@ -16,6 +16,187 @@ from tools import terminal_tool_heavy_slot as heavy
 from tools.terminal_tool_heavy_slot import classify_command, wrap_heavy_command
 
 HELPER = "/opt/heavy/bin/heavy-slot"
+LPG_COMMAND = (
+    "env -u HEAVY_SLOT_HELD /Users/brianle/.local/bin/heavy-slot --label lpg-v2-fresh-copy-old-vs-batched-recovery "
+    "-- bash /Users/brianle/.hermes/cache/scratch/lpg-v2-retry-proof-20261012/run-recovery.sh"
+)
+RESTART_SCRIPT = "#!/bin/sh\nhermes gateway restart\n"
+
+
+def _lifecycle_blocked(result) -> bool:
+    return isinstance(result, dict) and str(result.get("error", "")).startswith("Blocked:")
+
+
+def _executable(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+@pytest.fixture
+def gateway_terminal(tmp_path, monkeypatch):
+    """Drive the real ``terminal_tool`` entry point and lifecycle guard inside a supervised gateway.
+
+    Only planning, env acquisition, approval and the final execution are stubbed; ``run(command)``
+    returns the exact string handed to the shell, or the parsed blocked result.
+    """
+    import json
+    from types import SimpleNamespace
+
+    import tools.terminal_tool as terminal_module
+    from tools import process_registry
+
+    home = tmp_path / "home"
+    installed = _executable(home / ".local" / "bin" / "heavy-slot", '#!/usr/bin/env python3\n"""/dev/null"""\n')
+    shadow = _executable(tmp_path / "shadow" / "heavy-slot", RESTART_SCRIPT)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shadow.parent), str(installed.parent), "/usr/bin", "/bin"]))
+    monkeypatch.setenv("HEAVY_SLOT_HELD", "1")  # keep wrap_heavy_command out of the executed string
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: True)
+    monkeypatch.setattr(terminal_module, "_PRE_EXEC_GUARD_MIN_TIMEOUT_S", 0)
+    monkeypatch.setattr(
+        terminal_module, "_run_approval_guards", lambda *_a, **_k: terminal_module._ApprovalVerdict(),
+    )
+    executed: list[str] = []
+
+    def _foreground(command, *_a, execution_command=None, **_k):
+        executed.append(execution_command or command)
+        return "ran"
+
+    monkeypatch.setattr(terminal_module, "_run_foreground", _foreground)
+
+    def run(command: str, *, overrides: dict | None = None):
+        plan = SimpleNamespace(
+            config={}, env_type="local", effective_task_id="heavy-slot-pin", cwd=str(tmp_path),
+            effective_timeout=30, promoted_from_foreground_timeout=None,
+        )
+        env = SimpleNamespace(cwd=str(tmp_path), host_cwd=None, env=dict(overrides or {}))
+        monkeypatch.setattr(terminal_module, "_plan_execution", lambda *_a, **_k: plan)
+        monkeypatch.setattr(terminal_module, "_acquire_env", lambda *_a, **_k: env)
+        executed.clear()
+        result = terminal_module.terminal_tool(command)
+        return executed[-1] if result == "ran" else json.loads(result)
+
+    return SimpleNamespace(run=run, installed=installed, shadow=shadow, tmp_path=tmp_path)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize(("command", "expected"), [
+    ("heavy-slot --label x -- true", "{h} --label x -- true"),
+    ("  heavy-slot --label x -- true", "  {h} --label x -- true"),
+    ("cd /tmp && heavy-slot --label x -- true", "cd /tmp && {h} --label x -- true"),
+    ("true; heavy-slot --label x -- true", "true; {h} --label x -- true"),
+    ("false || heavy-slot --label x -- true", "false || {h} --label x -- true"),
+    ("true\nheavy-slot --label x -- true", "true\n{h} --label x -- true"),
+    ("FOO=1 heavy-slot --label x -- true", "FOO=1 {h} --label x -- true"),
+    ("env -u HEAVY_SLOT_HELD heavy-slot --label x -- true", "env -u HEAVY_SLOT_HELD {h} --label x -- true"),
+])
+def test_bare_top_level_heavy_slot_runs_the_installed_helper(gateway_terminal, command, expected):
+    """The guard allows the command and the shell receives the absolute installed helper."""
+    assert gateway_terminal.run(command) == expected.format(h=gateway_terminal.installed)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("prefix", ["", "export PATH={shadow}:$PATH; ", "PATH={shadow} ", "source {profile}; "])
+def test_path_state_cannot_change_which_helper_runs(gateway_terminal, prefix):
+    """A shadow earlier on PATH, a login-profile export or a prior PATH export never reaches the shell."""
+    profile = gateway_terminal.tmp_path / "profile.sh"
+    profile.write_text(f"export PATH={gateway_terminal.shadow.parent}:$PATH\n", encoding="utf-8")
+    prefix = prefix.format(shadow=gateway_terminal.shadow.parent, profile=profile)
+    executed = gateway_terminal.run(prefix + "heavy-slot --label x -- true")
+    assert executed == prefix + f"{gateway_terminal.installed} --label x -- true"
+    assert str(gateway_terminal.shadow) not in executed
+
+
+@pytest.mark.platforms("posix")
+def test_terminal_path_override_cannot_change_which_helper_runs(gateway_terminal):
+    executed = gateway_terminal.run(
+        "heavy-slot --label x -- true", overrides={"PATH": str(gateway_terminal.shadow.parent)},
+    )
+    assert executed == f"{gateway_terminal.installed} --label x -- true"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("command", [
+    "heavy-slot --label x -- bash {restart}",
+    "cd /tmp && heavy-slot --label x -- bash {restart}",
+    "heavy-slot --label x -- {restart}",
+])
+def test_bare_heavy_slot_wrapping_a_restart_is_blocked(gateway_terminal, command):
+    restart = _executable(gateway_terminal.tmp_path / "restart.sh", RESTART_SCRIPT)
+    result = gateway_terminal.run(command.format(restart=restart))
+    assert _lifecycle_blocked(result)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("command", [
+    "bash -c 'heavy-slot --label x -- true'",
+    'sh -c "heavy-slot --label x -- true"',
+    "env -S 'heavy-slot --label x -- true'",
+    "(heavy-slot --label x -- true)",
+    "echo $(heavy-slot --label x -- true)",
+    "true | heavy-slot --label x -- true",
+])
+def test_nested_and_unpinned_bare_heavy_slot_stays_strict(gateway_terminal, command):
+    """Not rewritten; the strict walk reads the PATH-shadowing helper and refuses the command."""
+    result = gateway_terminal.run(command)
+    assert _lifecycle_blocked(result)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("command", [
+    "echo heavy-slot --label x -- true",
+    "echo 'heavy-slot --label x -- true'",
+    "'heavy-slot' --label x -- true",
+    "cat <<'EOF'\nheavy-slot --label x -- true\nEOF",
+    "heavy-slot() { true; }",
+    "./heavy-slot --label x -- true",
+    "command -v heavy-slot",
+    "eval 'heavy-slot --label x -- true'",
+    "env -i heavy-slot --label x -- true",
+])
+def test_non_command_word_heavy_slot_text_is_not_rewritten(command, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _executable(home / ".local" / "bin" / "heavy-slot", "#!/bin/sh\n")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    assert heavy.pin_bare_heavy_slot(command, env_type="local") == command
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("env_type", ["docker", "ssh", "modal"])
+def test_non_local_backends_are_not_pinned(tmp_path, monkeypatch, env_type):
+    home = tmp_path / "home"
+    _executable(home / ".local" / "bin" / "heavy-slot", "#!/bin/sh\n")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    command = "heavy-slot --label x -- true"
+    assert heavy.pin_bare_heavy_slot(command, env_type=env_type) == command
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mode", [None, 0o644])
+def test_missing_or_non_executable_helper_is_not_pinned(tmp_path, monkeypatch, mode):
+    home = tmp_path / "home"
+    if mode is not None:
+        _executable(home / ".local" / "bin" / "heavy-slot", "#!/bin/sh\n").chmod(mode)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    command = "heavy-slot --label x -- true"
+    assert heavy.pin_bare_heavy_slot(command, env_type="local") == command
+
+
+@pytest.mark.platforms("posix")
+def test_lpg_absolute_command_is_allowed_through_the_local_terminal(gateway_terminal, monkeypatch):
+    """Locally the remote-read callback is not passed, so absolute identity peeling still applies."""
+    from cron.lifecycle_guard import scan_gateway_lifecycle
+
+    home = gateway_terminal.installed.parents[2]
+    command = LPG_COMMAND.replace("/Users/brianle/.local/bin/heavy-slot", str(gateway_terminal.installed))
+    _executable(home / "run-recovery.sh", "#!/bin/sh\nprintf 'proof\\n'\n")
+    command = command.replace(
+        "/Users/brianle/.hermes/cache/scratch/lpg-v2-retry-proof-20261012/run-recovery.sh", str(home / "run-recovery.sh"),
+    )
+    assert scan_gateway_lifecycle(command) == (False, None)
+    assert gateway_terminal.run(command) == command
 
 
 @pytest.fixture
