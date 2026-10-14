@@ -116,7 +116,45 @@ def test_collect_goal_evidence_matches_one_grant_to_one_identical_send(hermes_ho
     assert [row["voice_send_granted"] for row in rows] == [True, False]
 
 
-# ──────────────────────────────────────────────────────────────────────
+def test_collect_goal_evidence_fails_closed_on_unclassifiable_send_row(hermes_home, monkeypatch):
+    from hermes_cli import goals
+    from tools import voice_send_gate
+
+    class DB:
+        def get_messages(self, *_args, **_kwargs):
+            return [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "bad-json", "function": {"name": "terminal", "arguments": "not-json"}},
+                    {"id": "class-fails", "function": {
+                        "name": "terminal", "arguments": json.dumps({"command": "slack message send hi"})}},
+                    {"id": "refused", "function": {
+                        "name": "terminal", "arguments": json.dumps({"command": "slack message send hi"})}},
+                ]},
+                {"role": "tool", "tool_call_id": "bad-json", "tool_name": "terminal",
+                 "content": "sent", "timestamp": 101.0},
+                {"role": "tool", "tool_call_id": "class-fails", "tool_name": "terminal",
+                 "content": "sent", "timestamp": 102.0},
+                {"role": "tool", "tool_call_id": "refused", "tool_name": "terminal",
+                 "content": json.dumps({"error": "BLOCKED: approval required before sending a message in Brian's voice"}),
+                 "timestamp": 103.0},
+            ]
+
+    monkeypatch.setattr(goals, "_get_session_db", lambda: DB())
+
+    def classifier_failure(*_args, **_kwargs):
+        raise RuntimeError("classifier failed")
+
+    monkeypatch.setattr(voice_send_gate, "classify_voice_send", classifier_failure)
+    rows = goals.collect_goal_evidence("sid")
+    assert rows[0]["voice_send_action_hash"].startswith("unclassified:")
+    assert rows[1]["voice_send_action_hash"].startswith("unclassified:")
+    assert rows[0]["voice_send_granted"] is False
+    assert rows[1]["voice_send_granted"] is False
+    assert "voice_send_action_hash" not in rows[2]
+    floor_hash = goals._ungranted_voice_send_in_evidence(rows)
+    assert floor_hash and floor_hash.startswith("unclassified:")
+
+
 
 
 class TestJudgeGoal:

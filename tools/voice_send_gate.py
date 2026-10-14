@@ -51,14 +51,48 @@ _INTERPRETER_NAMES = _SHELL_NAMES | frozenset({
     "python", "python3", "python2", "node", "ruby", "perl", "deno", "bun", "uv", "uvx",
 })
 _SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "(", ")"})
-# Options before a CLI subcommand need a small amount of option-shape knowledge:
-# these documented switches are booleans, while unknown options remain
-# value-taking by default so a value-taking flag cannot expose a send verb.
-_BOOLEAN_OPTIONS = {
-    "slack": frozenset({"--json", "--yes"}),
-    "telegram": frozenset({"--agent", "--yes", "--silent"}),
-    "gog": frozenset({"--json"}),
-    "wacli": frozenset({"--json"}),
+# These are the documented *long* options that take a value before a CLI
+# command/subcommand.  The sets were audited against each CLI's --help output;
+# short options and --name=value forms are deliberately not value-taking here.
+# Treating only known value-taking options as consumers prevents an omitted
+# boolean flag table from hiding the send verb.
+_VALUE_TAKING_OPTIONS = {
+    "slack": frozenset({"--fields", "--account", "--timeout", "--route", "--stale-after"}),
+    "imsg": frozenset(),
+    "gog": frozenset({
+        "--color", "--home", "--account", "--client", "--access-token", "--quota-project",
+        "--enable-commands", "--enable-commands-exact", "--disable-commands", "--select",
+    }),
+    "wacli": frozenset({"--account", "--lock-wait", "--store", "--timeout"}),
+    "quo": frozenset({"--fields", "--account", "--api-key", "--base-url", "--timeout", "--format", "--store"}),
+    "telegram": frozenset({"--fields", "--account", "--timeout"}),
+}
+# Known non-value-taking long options are parsed deterministically.  An
+# unrecognised long option is ambiguous, so the classifier also explores the
+# parse where it consumes the next token (fail closed) as well as the parse
+# where it does not.  This keeps known boolean flags such as --yes from making
+# a later read-only positional argument look like a send.
+_KNOWN_OPTIONS = {
+    "slack": frozenset({
+        "--help", "--json", "--agent", "--fields", "--yes", "--version", "--account", "--timeout",
+        "--route", "--explain-route", "--fresh", "--offline", "--stale-after",
+    }),
+    "imsg": frozenset({"--help", "--json", "--agent", "--fields", "--yes", "--version"}),
+    "gog": frozenset({
+        "--help", "--color", "--home", "--account", "--client", "--access-token", "--quota-project",
+        "--enable-commands", "--enable-commands-exact", "--disable-commands", "--gmail-no-send", "--readonly",
+        "--json", "--plain", "--wrap-untrusted", "--results-only", "--select", "--dry-run", "--force",
+        "--no-input", "--verbose", "--version",
+    }),
+    "wacli": frozenset({
+        "--account", "--events", "--full", "--help", "--json", "--lock-wait", "--read-only", "--store",
+        "--timeout", "--version",
+    }),
+    "quo": frozenset({
+        "--help", "--json", "--agent", "--fields", "--yes", "--version", "--account", "--api-key",
+        "--base-url", "--timeout", "--format", "--store", "--index", "--no-index",
+    }),
+    "telegram": frozenset({"--help", "--json", "--agent", "--fields", "--yes", "--version", "--account", "--timeout"}),
 }
 _MAX_SCRIPT_BYTES = 1_000_000
 
@@ -162,28 +196,53 @@ def _looks_like_shell_script(path: Path, content: str) -> bool:
     return bool(first_line and re.search(r"#!.*\b(?:bash|sh|zsh|dash|ksh|fish)\b", first_line[0], re.I))
 
 
-def _first_non_option(tokens: list[str], start: int, cli: Optional[str] = None) -> Optional[int]:
-    """Find the next command token, ignoring option switches but not their values.
+def _first_non_option_indices(tokens: list[str], start: int, cli: Optional[str] = None) -> tuple[int, ...]:
+    """Return every plausible next command-token index after CLI options.
 
-    CLI options before a subcommand are common (for example ``slack --account X
-    message send``). Known boolean flags do not consume the following token;
-    value-taking flags still do. Once the known prefix is matched, only the first
-    non-option token may be the verb; later positional arguments must not turn a
-    read-only command into a send.
+    Only documented long value-taking options consume the following token in the
+    primary parse.  Unknown long options are explored both ways so a malformed
+    or newly added flag cannot hide a send verb; known flags, short options, and
+    ``--name=value`` forms do not consume a following token.
     """
-    index = start
-    boolean_options = _BOOLEAN_OPTIONS.get((cli or "").lower(), frozenset())
-    while index < len(tokens):
+    cli_name = (cli or "").lower()
+    value_taking = _VALUE_TAKING_OPTIONS.get(cli_name, frozenset())
+    known_options = _KNOWN_OPTIONS.get(cli_name, frozenset())
+    pending = [start]
+    seen: set[int] = set()
+    candidates: set[int] = set()
+    while pending:
+        index = pending.pop()
+        if index in seen:
+            continue
+        seen.add(index)
+        if index >= len(tokens):
+            continue
         token = tokens[index]
         if not token.startswith("-"):
-            return index
-        # ``--name=value`` is self-contained. Known booleans are also
-        # self-contained; every other option conservatively consumes one value.
-        if "=" not in token and token.lower() not in boolean_options and index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
-            index += 2
-        else:
-            index += 1
-    return None
+            candidates.add(index)
+            continue
+        if token == "--":
+            candidates.add(index + 1)
+            continue
+        if token.startswith("--") and "=" not in token and token in value_taking:
+            pending.append(index + 2)
+            continue
+        if token.startswith("--") and "=" not in token and token not in known_options:
+            # Unknown long options are ambiguous: check both whether the next
+            # token was their value and whether it was the command token.
+            pending.append(index + 1)
+            pending.append(index + 2)
+            continue
+        # Known flags, short options, and --flag=value are self-contained for
+        # classification purposes.
+        pending.append(index + 1)
+    return tuple(sorted(candidates))
+
+
+def _first_non_option(tokens: list[str], start: int, cli: Optional[str] = None) -> Optional[int]:
+    """Backward-compatible first candidate for callers outside this module."""
+    candidates = _first_non_option_indices(tokens, start, cli)
+    return candidates[0] if candidates else None
 
 
 def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optional[str]]:
@@ -200,18 +259,22 @@ def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optio
     if "--help" in tail or "-h" in tail:
         return False, None, None
     for prefix, verbs in table.items():
-        prefix_index = _first_non_option(tokens, command_index + 1, cli)
-        if not prefix:
-            verb_index = prefix_index
-        else:
-            prefix_lower = tuple(part.lower() for part in prefix)
-            if prefix_index is None or tuple(
-                part.lower() for part in tokens[prefix_index:prefix_index + len(prefix_lower)]
-            ) != prefix_lower:
-                continue
-            verb_index = _first_non_option(tokens, prefix_index + len(prefix_lower), cli)
-        if verb_index is not None and tokens[verb_index].lower() in verbs:
-            return True, cli, _account_from_tokens(tokens)
+        prefix_indices = _first_non_option_indices(tokens, command_index + 1, cli)
+        for prefix_index in prefix_indices:
+            if not prefix:
+                verb_indices = (prefix_index,)
+            else:
+                prefix_lower = tuple(part.lower() for part in prefix)
+                if tuple(
+                    part.lower() for part in tokens[prefix_index:prefix_index + len(prefix_lower)]
+                ) != prefix_lower:
+                    continue
+                verb_indices = _first_non_option_indices(tokens, prefix_index + len(prefix_lower), cli)
+            if any(
+                verb_index < len(tokens) and tokens[verb_index].lower() in verbs
+                for verb_index in verb_indices
+            ):
+                return True, cli, _account_from_tokens(tokens)
     return False, None, None
 
 

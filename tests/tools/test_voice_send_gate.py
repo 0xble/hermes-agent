@@ -89,25 +89,45 @@ def test_classifier_shell_forms_and_read_only(tmp_path):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
 
 
-def test_classifier_known_boolean_flags_do_not_consume_subcommands():
-    commands = [
-        'slack --account ALIAS --json message send CHANNEL "$(cat file)" --yes',
-        'telegram --agent --yes send peer "$(cat file)" --topic 1 --silent',
-        "gog --json gmail send",
-        "wacli --json send text",
-    ]
-    for command in commands:
-        assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
+@pytest.mark.parametrize("command", [
+    "slack --agent message send",
+    "slack -j message send",
+    "slack message --agent send",
+    "imsg --agent send",
+    "imsg -j send",
+    "imsg --json send",
+    "imsg -y send",
+    "telegram -j send",
+    "telegram --json send",
+    "gog -j gmail send",
+    'slack --account ALIAS --json message send CHANNEL "$(cat file)" --yes',
+    'telegram --agent --yes send peer "$(cat file)" --topic 1 --silent',
+    "gog --json gmail send",
+    "wacli --json send text",
+    # The Quo send paths are retained in the classifier table for native/older
+    # Quo surfaces even when the installed CLI's top-level help omits them.
+    "quo send text",
+    "quo message send text",
+])
+def test_classifier_send_flag_regressions(command):
+    assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
 
-    # A value-taking option still consumes its value, and later positional
-    # arguments/read-only verbs remain negative.
+
+def test_classifier_known_value_taking_and_unknown_flag_paths():
+    # A documented value-taking option consumes its value. Known flags do not,
+    # while an unknown long option is fail-closed across both parses.
     for command in (
         "slack --account ALIAS message list",
         "gog --json gmail search reply",
         "telegram --yes chats send",
         "wacli --json list send",
+        "slack --account=ALIAS message list",
     ):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+
+    assert voice_send_gate.classify_voice_send(
+        "terminal", {"command": "telegram --new-flag chats send"}
+    ), "unknown options must fail closed"
 
 
 def test_classifier_scans_only_executed_script_files(tmp_path, monkeypatch):
@@ -168,6 +188,31 @@ def test_classifier_scans_executed_script_files(tmp_path, monkeypatch):
     ):
         found = voice_send_gate.classify_voice_send("terminal", {"command": command})
         assert found and found["action_hash"], command
+
+
+def test_one_shot_cli_approval_disables_session_scope(monkeypatch):
+    captured = {}
+
+    def prompt(*_args, **kwargs):
+        captured.update(kwargs)
+        return "once"
+
+    monkeypatch.setattr(voice_send_gate.approval, "prompt_dangerous_approval", prompt)
+    result = voice_send_gate.approval._human_decision(
+        voice_send_gate.approval._ACTION_GATE,
+        command="slack message send hi",
+        description="send",
+        pattern_key="voice_send:hash",
+        pattern_keys=["voice_send:hash"],
+        session_key="sid",
+        approval_callback=None,
+        is_cli=True,
+        is_gateway=False,
+        is_ask=False,
+        one_shot=True,
+    )
+    assert result["approved"] is True
+    assert captured["allow_session"] is False
 
 
 def test_native_send_tools_are_classified():

@@ -1544,6 +1544,19 @@ def _tail(text: str, limit: int) -> str:
 
 
 _VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS = 120.0
+_VOICE_SEND_CAPABLE_TOOLS = frozenset({"terminal", "execute_code", "execute_code_rpc"})
+
+
+def _voice_send_capable_tool(name: str) -> bool:
+    """Whether a stored tool row could have carried a voice send."""
+    normalized = str(name or "").strip().lower()
+    return normalized in _VOICE_SEND_CAPABLE_TOOLS or normalized.endswith(("_send", "__send"))
+
+
+def _unclassified_voice_send_hash(tool: str, call_text: str, timestamp: float) -> str:
+    """Stable opaque marker for a send-capable row whose arguments could not be classified."""
+    digest = hashlib.sha256(f"{tool}\0{timestamp:.6f}\0{call_text}".encode()).hexdigest()
+    return f"unclassified:{digest}"
 
 
 class _EvidenceRows(list):
@@ -1606,13 +1619,20 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False, default=str)
         call_text, output = _one_line(args, _EVIDENCE_CALL_CHARS), _tail(content.strip(), _EVIDENCE_OUTPUT_CHARS)
+        try:
+            row_timestamp = float(row.get("timestamp") or 0.0)
+        except (TypeError, ValueError):
+            row_timestamp = 0.0
         voice_fields = {}
         try:
             from tools.voice_send_gate import classify_voice_send, consumed_grant_timestamps
-            parsed_args = json.loads(args) if isinstance(args, str) and args.strip().startswith("{") else {}
+            if not isinstance(args, str) or not args.strip():
+                raise ValueError("stored tool arguments are not JSON")
+            parsed_args = json.loads(args)
+            if not isinstance(parsed_args, dict):
+                raise ValueError("stored tool arguments are not an object")
             classified = classify_voice_send(name, parsed_args)
             if classified:
-                row_timestamp = float(row.get("timestamp") or 0.0)
                 grant_times = consumed_grant_timestamps(db, str(session_id), classified["action_hash"])
                 matched = next(
                     (
@@ -1631,8 +1651,13 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
                     "voice_send_granted": granted,
                 }
         except Exception:
-            # The judge's deterministic floor treats an unclassifiable send as ungranted.
-            voice_fields = {}
+            # A malformed or otherwise unclassifiable row from a send-capable
+            # tool is a send for floor purposes unless the gate itself refused it.
+            if _voice_send_capable_tool(name) and not _is_voice_gate_refusal(output):
+                voice_fields = {
+                    "voice_send_action_hash": _unclassified_voice_send_hash(name, call_text, row_timestamp),
+                    "voice_send_granted": False,
+                }
         if redact_sensitive_text is not None:
             call_text = redact_sensitive_text(call_text, force=True)
             output = redact_sensitive_text(output, force=True)

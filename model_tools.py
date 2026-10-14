@@ -775,12 +775,12 @@ def _apply_request_middleware(
 def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
                          ids: _CallIds, middleware_trace: List[Dict[str, Any]],
                          ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
-    """Shared dispatch guards, including the voice-send floor, then ACP approval.
+    """Shared request/pre-dispatch guards for plugin hooks and ACP approval.
 
     ``(args, None)`` to proceed (args possibly plugin-modified), or
-    ``(args, (result, error_type, error_message))`` when blocked. This is the
-    common choke point for direct dispatches, agent calls, and execute_code
-    nested calls; callers that already ran outer hooks still pass through here.
+    ``(args, (result, error_type, error_message))`` when blocked. The voice-send
+    floor is enforced at ``tools/registry.py::ToolRegistry.dispatch`` so direct
+    registry callers and nested ``execute_code`` calls cannot bypass it.
     """
     # pre_tool_call fires exactly once per execution: one invoke_hook pass yields
     # both the block message and modified args. skip=True: caller already fired it.

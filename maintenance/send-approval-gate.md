@@ -8,11 +8,11 @@ is durable, one-shot, and consumed before dispatch; yolo, approval mode off,
 cron approve mode, session allowlists, relay/tool-output claims, and absent human
 bridges never bypass it. Read-only messaging commands are unchanged.
 
-The voice-send floor lives in `model_tools._pre_dispatch_guards`, the shared
-choke point used by direct registry dispatches, normal agent tool execution, and
-`execute_code` nested calls. The agent executor does not run a second voice gate,
-so one call gets one authorization decision. Nested calls inherit the current
-session identity where available.
+The voice-send floor lives in `tools/registry.py::ToolRegistry.dispatch`, the shared
+execution choke point used by direct registry dispatches, normal agent tool execution, and
+`execute_code` nested calls. Request middleware and pre-tool hooks in `model_tools._pre_dispatch_guards`
+run before registry dispatch; the agent executor does not run a second voice gate, so one call gets
+one authorization decision. Nested calls inherit the current session identity where available.
 
 The classifier covers the supported Slack, iMessage, gog Gmail, wacli, Quo, and
 Telegram CLI send verbs, including Slack message edits and Gmail `drafts send`.
@@ -40,8 +40,8 @@ continue through the existing LLM judge unchanged.
 
 - **Fork-Patch identity:** `send-approval-gate`.
 - **Source surfaces:** `tools/voice_send_gate.py`, `tools/approval.py`,
-  `model_tools.py`, `tools/code_execution_rpc.py`, `hermes_cli/goals.py`, and
-  focused regression tests.
+  `tools/registry.py`, `model_tools.py`, `tools/code_execution_rpc.py`,
+  `hermes_cli/goals.py`, and focused regression tests.
 - **Upstream status:** fork patch for the Io incident replay; no merge or live
   Hermes update is part of this unit.
 - **Rollback:** revert commits carrying `Fork-Patch: send-approval-gate`.
