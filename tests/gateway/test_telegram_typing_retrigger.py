@@ -97,22 +97,56 @@ async def test_retrigger_has_at_most_one_in_flight_per_chat():
     adapter._telegram_typing_retrigger_interval = 0.5
     started = asyncio.Event()
     release = asyncio.Event()
+    in_flight = 0
+    max_in_flight = 0
+    entries = 0
 
     async def blocking_typing(chat_id, metadata=None):
+        nonlocal in_flight, max_in_flight, entries
+        entries += 1
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
         started.set()
-        await release.wait()
+        try:
+            await release.wait()
+        finally:
+            in_flight -= 1
 
     adapter.send_typing = blocking_typing
 
     assert (await adapter.send("123", "chunk 0")).success
     await asyncio.wait_for(started.wait(), timeout=1)
     assert (await adapter.send("123", "chunk 1")).success
+    # Past the 0.5s window: the trailing re-arm is due but must still be waiting on the first call.
     await asyncio.sleep(0.7)
 
-    assert started.is_set()
-    assert len([t for t in adapter._background_tasks if not t.done()]) == 2
+    assert entries == 1
+    assert in_flight == 1
 
     release.set()
     await _drain(adapter)
 
+    assert entries == 2
+    assert max_in_flight == 1
     assert len([t for t in adapter._background_tasks if not t.done()]) == 0
+
+
+@pytest.mark.asyncio
+async def test_pause_before_edit_only_finalize_cancels_trailing_rearm():
+    """The stream consumer pauses typing, then finalizes by edit (no notify send): no re-arm may follow."""
+    adapter = _make_adapter()
+    adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=1))
+
+    assert (await adapter.send("123", "chunk 0")).success
+    await asyncio.sleep(0.5)
+    assert (await adapter.send("123", "chunk 1")).success
+    await asyncio.sleep(0)
+    assert "123" in adapter._telegram_typing_retrigger_trailing_tasks
+
+    adapter.pause_typing_for_chat("123")
+    calls_at_pause = adapter._bot.send_chat_action.await_count
+    await adapter.edit_message("123", "1", "final answer", finalize=True)
+    await asyncio.sleep(2.2)
+    await _drain(adapter)
+
+    assert adapter._bot.send_chat_action.await_count == calls_at_pause
