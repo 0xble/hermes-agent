@@ -511,6 +511,9 @@ class TestRegisteredHandlerForwardsAttachToSession:
         assert datetime.fromisoformat(skipped["job"]["next_run_at"]) == nxt + timedelta(days=14)
         refused = call(action="skip", job_id=job_id, count=-1)
         assert refused["success"] is False and "positive integer" in refused["error"]
+        zero = call(action="skip", job_id=job_id, count=0)
+        assert zero["success"] is False and "positive integer" in zero["error"]
+        assert datetime.fromisoformat(call(action="list")["jobs"][0]["next_run_at"]) == nxt + timedelta(days=14)
 
     def test_create_persists_attach_to_session(self):
         from cron.jobs import get_job

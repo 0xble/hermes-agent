@@ -206,6 +206,14 @@ class TestCronSkipMissed:
         assert datetime.fromisoformat(get_job(job["id"])["next_run_at"]) == self.NEXT + timedelta(days=14)
         assert "Skipped" in capsys.readouterr().out
 
+    def test_skip_count_zero_is_refused_not_rounded_up(self, tmp_cron_dir, monkeypatch, capsys):
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        job = create_job(prompt="weekly review", schedule="0 20 * * 2", deliver="local")
+        before = get_job(job["id"])["next_run_at"]
+        assert self._run("skip", job["id"], "--count", "0") == 1
+        assert get_job(job["id"])["next_run_at"] == before
+        assert "positive integer" in capsys.readouterr().out
+
     def test_edit_schedule_on_paused_job_recomputes(self, tmp_cron_dir, monkeypatch, capsys):
         jid = self._paused_over_slot(monkeypatch)
         assert self._run("edit", jid, "--schedule", "0 20 * * 2") == 0
