@@ -423,6 +423,26 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+_MEMORY_HANDOFF_GUARD = threading.Lock()
+
+
+def memory_handoff_lock(owner: Any) -> threading.Lock:
+    """Per-agent lock making "claim ``_memory_manager`` for shutdown" one atomic step.
+
+    ``AIAgent.shutdown_memory_provider()`` sets ``_memory_provider_shutdown`` and captures the manager under it;
+    gateway eviction reads both and detaches the manager under it, so exactly one side calls ``shutdown_all()``.
+    Created lazily (under a module guard) so ``__new__``-built and mock agents get one too. Hold it only for
+    those reads and writes, never across ``on_session_end`` or ``shutdown_all``."""
+    lock = vars(owner).get("_memory_handoff_lock")
+    if lock is None:
+        with _MEMORY_HANDOFF_GUARD:
+            lock = vars(owner).get("_memory_handoff_lock")
+            if lock is None:
+                lock = threading.Lock()
+                owner._memory_handoff_lock = lock
+    return lock
+
+
 class MemoryManager:
     """Builtin provider (always first) plus at most one external provider.
 

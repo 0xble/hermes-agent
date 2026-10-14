@@ -270,3 +270,55 @@ def test_pressure_batch_does_not_wait_on_slow_memory_shutdown(monkeypatch):
     for p in providers:
         assert p.shut_down.wait(4)
     assert all(p.shutdowns == 1 for p in providers)
+
+
+class _RecordingManager(MemoryManager):
+    def __init__(self):
+        super().__init__()
+        self.session_end_threads, self.shutdown_threads = [], []
+
+    def on_session_end(self, messages):
+        self.session_end_threads.append(threading.current_thread().name)
+
+    def shutdown_all(self):
+        self.shutdown_threads.append(threading.current_thread().name)
+        super().shutdown_all()
+
+
+@pytest.mark.parametrize("first", ["shutdown", "eviction"])
+def test_shutdown_claim_and_eviction_detach_are_one_atomic_handoff(first):
+    """Fire the other party exactly inside the first party's claim (after its first write). Without the shared
+    handoff lock, eviction landing between the shutdown flag and the manager capture leaked the manager."""
+    runner = _cache_runner()
+    manager = _RecordingManager()
+    racers = []
+
+    class _Racing(AIAgent):
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+            trigger = ("_memory_provider_shutdown", True) if first == "shutdown" else ("_memory_manager", None)
+            if racers or (name, value) != trigger:
+                return
+            other = (self.shutdown_memory_provider if first == "eviction"
+                     else lambda: runner._release_evicted_agent_soft(self))
+            racer = threading.Thread(target=other, name="racer", daemon=True)
+            racers.append(racer)
+            racer.start()
+            racer.join(0.2)
+            assert racer.is_alive(), "second party entered the handoff mid-claim"
+
+    agent = _Racing.__new__(_Racing)
+    agent.__dict__.update(_memory_manager=manager, _session_messages=[], session_id="sid",
+                          context_compressor=None, release_clients=lambda: None, close=lambda: None)
+    if first == "shutdown":
+        agent.shutdown_memory_provider([])
+    else:
+        runner._release_evicted_agent_soft(agent)
+    racers[0].join(5)
+    assert not racers[0].is_alive()
+
+    assert agent._memory_manager is None
+    if first == "shutdown":  # claimed: eviction only detaches; on_session_end then shutdown_all, both by us
+        assert (manager.session_end_threads, manager.shutdown_threads) == (["MainThread"], ["MainThread"])
+    else:  # detached first: eviction retires it; the late shutdown sees None and fires no session end
+        assert (manager.session_end_threads, manager.shutdown_threads) == ([], ["MainThread"])
