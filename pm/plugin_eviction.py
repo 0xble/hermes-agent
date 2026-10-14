@@ -14,6 +14,11 @@ requires_hermes is judged against a version identity that can lag (a checkout wi
 release tags), so a misfit there only sits out: config is untouched, boot skips it the same
 way, and it rejoins when the verdict flips. A secondary profile whose config cannot be read
 sits out until its config is fixed.
+
+Release-owned (bundled) memory providers under plugins/memory are the exception: they
+ship with the release, so they are never evicted. When the rest of the selection fails to
+build, they are seated first, and a conflicting third-party plugin is the one disabled. A
+bundled provider that cannot build even on its own fails the update loudly, like core.
 """
 from __future__ import annotations
 
@@ -38,7 +43,9 @@ def _is_bundled_provider(entry: Entry) -> bool:
     _plugins_dir, name, plugin_dir = entry
     from pm.paths import repo_root
 
-    return plugin_dir.resolve() == (repo_root() / "plugins" / "memory" / name).resolve()
+    # memory.provider names the bare provider; a plugins.enabled key may carry ``memory/<name>``.
+    bare = name.removeprefix("memory/")
+    return plugin_dir.resolve() == (repo_root() / "plugins" / "memory" / bare).resolve()
 
 
 def _interpreter_version() -> str:
@@ -159,8 +166,8 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
     """Build the discovered selection, disabling whatever plugin keeps it from building.
 
     Static misfits go first (no resolver needed). If the rest still fails, core alone is
-    built to prove the plugins are the cause, then members are re-added in config order
-    and each one that breaks the build is disabled too.
+    built to prove the plugins are the cause, then members are re-added (bundled providers
+    first, the rest in config order) and each one that breaks the build is disabled too.
     """
     from pm import receipt
     from pm.install import _commit_selection, _runtime_state_matches, _target_selection
@@ -214,7 +221,10 @@ def sync_evicting(package, facts, fact: dict, *, extras, shipped, frozen, explic
         except InstallError:
             raise failure from None
         fitting: list[Path] = []
-        for member in kept:
+        # Seat release-owned providers before third-party plugins, so a conflict between them
+        # evicts the third-party plugin instead of failing the update on the provider.
+        bundled = {entry[2].resolve() for entry in entries if _is_bundled_provider(entry)}
+        for member in sorted(kept, key=lambda member: member.resolve() not in bundled):
             reason = _trial(package, enabled, explicit, [*fitting, member])
             if reason:
                 entry = next(entry for entry in entries if entry[2].resolve() == member.resolve())

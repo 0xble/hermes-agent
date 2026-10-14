@@ -32,10 +32,25 @@ real replacement generation, verifies the provider client is importable, and
 checks that disabling the provider removes it from the next generation. It
 covers bundled, catalog-installed, and bundled-over-user-copy lookup.
 The focused guard is `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/pm/test_extras.py`.
-`tests/pm/test_plugin_survival_contract.py::test_update_sync_cannot_evict_bundled_memory_provider`
-checks resolver conflicts and static Python incompatibility through public sync,
-requiring a loud failure with the provider config unchanged. Bundled providers
-ship with the release and are not eligible for automatic plugin eviction.
+Bundled providers ship with the release and are not eligible for automatic
+plugin eviction. When the selection fails to build, update eviction seats them
+before third-party plugins, so a conflicting third-party plugin is disabled with
+the usual notice and the update completes
+(`tests/pm/test_plugin_survival_contract.py::test_update_sync_evicts_third_party_plugin_conflicting_with_bundled_provider`).
+Only a bundled provider that cannot fit the release on its own (a static
+misfit such as requires-python) fails the update loudly with the provider config
+unchanged (`::test_update_sync_cannot_evict_bundled_memory_provider`).
+`_is_bundled_provider` accepts both the bare key and the `memory/<name>` key
+(`::test_bundled_provider_recognised_by_bare_and_memory_prefixed_key`).
+
+The Hindsight manifest keeps the old `hindsight` extra's ceiling
+(`hindsight-client>=0.6.1,<1`), so the plugin-owned dependency contract is no
+looser than the removed extra's.
+
+Known and accepted: a bundled provider's member directory lives inside the
+release tree, so the members stamp changes with each immutable release and the
+first boot of a new release rebuilds the generation once. That is intended: the
+provider's manifest is release-owned and must be re-resolved with each release.
 
 Upstream-status: No equivalent immutable-release PM handoff or bundled-provider eviction guard was found in the upstream baseline; this remains fork-local until an equivalent released implementation exists upstream.
 
