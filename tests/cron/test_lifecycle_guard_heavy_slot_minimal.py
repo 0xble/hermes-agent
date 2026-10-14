@@ -131,8 +131,10 @@ def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
 def test_heavy_slot_device_path_predicate_is_exact():
     from cron.lifecycle_guard import _is_non_executable_device_path
 
-    assert _is_non_executable_device_path("/dev/fd/0")
-    assert _is_non_executable_device_path("/dev/fd/123")
+    assert _is_non_executable_device_path("/dev/null")
+    assert _is_non_executable_device_path("/dev/zero")
+    assert not _is_non_executable_device_path("/dev/fd/0")
+    assert not _is_non_executable_device_path("/dev/fd/123")
     assert not _is_non_executable_device_path("/dev/fd/../root/restart.sh")
     assert not _is_non_executable_device_path("/dev/fd/../cwd/restart.sh")
 

@@ -706,14 +706,14 @@ def _heavy_slot_fallback_command_index(
 ) -> tuple[Optional[int], Optional[str]]:
     """Find the command tail when heavy-slot's transparent grammar cannot be peeled.
 
-    The helper remains a strict source reference on this path. A delimiter makes the tail
-    unambiguous; without one, only known value-taking options may be consumed. Unknown options
-    make the command boundary ambiguous and therefore fail closed with a named refusal.
+    The helper remains a strict source reference on this path. Consume only exact known options
+    up to the command boundary: argparse accepts abbreviations, so skipping to a later delimiter
+    could hide a command already started by an abbreviated option. Refuse ambiguity by name.
     """
     if _executable_name(segment[index]) != "heavy-slot" and not _installed_heavy_slot_path(segment[index]):
         return None, None
     arguments = segment[index + 1:]
-    if not arguments or arguments == ["--help"]:
+    if not arguments or arguments in (["--help"], ["-h"]):
         return None, None
     position = index + 1
     while position < len(segment):
@@ -722,28 +722,26 @@ def _heavy_slot_fallback_command_index(
             if position + 1 >= len(segment):
                 return None, "heavy-slot wrapper has `--` but no wrapped command"
             return position + 1, None
-        if option in {"--label", "--gate-fd"}:
-            if position + 1 >= len(segment) or segment[position + 1].startswith("-"):
-                break
-            position += 2
-            continue
-        if option.startswith("--label=") or option.startswith("--gate-fd="):
+        name, equals, value = option.partition("=")
+        if name in {"--label", "--gate-fd"}:
+            if not equals:
+                position += 1
+                if position >= len(segment) or segment[position].startswith("-"):
+                    return None, f"heavy-slot wrapper has an incomplete option `{name}`"
+                value = segment[position]
+            if name == "--gate-fd" and re.fullmatch(r"[0-9]+", value) is None:
+                return None, f"heavy-slot wrapper has an invalid option `{option}`"
             position += 1
             continue
+        if option in {"-h", "--help"}:
+            return None, None
         if option.startswith("-"):
-            break
+            return None, f"heavy-slot wrapper has an unknown option `{option}`"
         # The delimiter may belong to the wrapped command itself. Once a command operand
         # starts, scan from here rather than skipping ahead to a later `--` in its argv.
         return position, None
 
-    if "--" in segment[index + 1:]:
-        delimiter = segment.index("--", index + 1)
-        if delimiter + 1 < len(segment):
-            return delimiter + 1, None
-        return None, "heavy-slot wrapper has `--` but no wrapped command"
-    if position < len(segment):
-        return None, "heavy-slot wrapper has an unknown or incomplete option without a command delimiter"
-    return None, None
+    return None, "heavy-slot wrapper has options but no wrapped command"
 
 
 def _prefix_positions(
@@ -889,23 +887,15 @@ def _direct_lifecycle_scan(command: str) -> bool:
 
 # --- path handling ----------------------------------------------------------------------------
 
-_NON_EXECUTABLE_DEVICE_PATHS = frozenset({
-    "/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr",
-})
+_NON_EXECUTABLE_DEVICE_PATHS = frozenset({"/dev/null", "/dev/zero"})
 
 
 def _is_non_executable_device_path(candidate: str) -> bool:
-    """True for POSIX device paths that cannot name an executable script.
+    """Only empty/NUL-producing devices are harmless as shell script operands.
 
-    They commonly occur as shell redirections or incidental prose in helper source. Treating them
-    as referenced scripts would turn a harmless token into a fail-closed refusal because devices
-    are deliberately not regular files.
+    Standard streams and /dev/fd aliases can carry executable text, so they stay fail-closed.
     """
-    return (
-        candidate in _NON_EXECUTABLE_DEVICE_PATHS
-        or candidate == "/dev/fd"
-        or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
-    )
+    return candidate in _NON_EXECUTABLE_DEVICE_PATHS
 
 
 def _resolve_lenient(path: Path) -> Path:
@@ -1068,9 +1058,21 @@ def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
             continue
         positions, complete = _prefix_positions(segment, index, allow_heavy_slot=False)
         if not complete and positions[-1] < len(segment):
-            # No operand after the peel limit may be silently discarded, even when the helper
-            # itself lies beyond that limit. Retain strict references below, then refuse.
-            yield "the command wrapper chain exceeds the prefix scan budget"
+            # Identify helpers even beyond the scan limit, without changing ordinary wrapper
+            # behavior. Each chunk advances strictly through the segment's finite token list.
+            chain = positions
+            while True:
+                if any(
+                    position < len(segment)
+                    and (_executable_name(segment[position]) == "heavy-slot"
+                         or _installed_heavy_slot_path(segment[position]))
+                    for position in chain
+                ):
+                    yield "the heavy-slot command wrapper chain exceeds the prefix scan budget"
+                    break
+                if complete or chain[-1] >= len(segment):
+                    break
+                chain, complete = _prefix_positions(segment, chain[-1], allow_heavy_slot=False)
         for position in positions:
             if position >= len(segment):
                 continue
