@@ -227,7 +227,8 @@ run_agent.AIAgent = AbandonedAgent
 scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt')
 scheduler._load_cron_job_config = lambda *args: SimpleNamespace(cfg={}, model='test')
 scheduler._resolve_cron_agent_setup = lambda *args: scheduler._CronAgentSetup(model='test')
-scheduler._open_cron_session_db = lambda *args: None
+scheduler._open_cron_session_db = lambda *args: SimpleNamespace()
+scheduler._finalize_cron_session = lambda *args, **kwargs: None
 scheduler._construct_cron_agent = lambda *args, **kwargs: AbandonedAgent()
 scheduler._FireAudit = lambda *args: SimpleNamespace(write=lambda *args: None)
 scheduler._cron_inactivity_seconds = lambda: .1
