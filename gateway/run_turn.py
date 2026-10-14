@@ -1052,9 +1052,13 @@ class GatewayTurnMixin:
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
 
     async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
-        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
-        notify the user, and re-raise; returns the compressed transcript only when the worker
-        was already committing.
+        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission
+        and re-raise; returns the compressed transcript only when the worker was already committing.
+
+        The user hears about it only when nothing will be adopted: a kept-admission worker's summary
+        is adopted later at its fenced commit, so its turn-hold is internal lifecycle (INFO log only).
+        The cancel path still posts the deferral notice; a kept-admission worker that later fails its
+        summary posts the ordinary hygiene-failure warning from the done-callback.
 
         Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
         only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
@@ -1073,8 +1077,10 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _meta = attempt.meta
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
+                _exc = None
                 try:
                     _exc = _fut.exception()
                 except (asyncio.CancelledError, Exception):
@@ -1084,16 +1090,37 @@ class GatewayTurnMixin:
                         bool(getattr(_agent, "_last_compaction_in_place", False))
                         or getattr(_agent, "session_id", _sid) != _sid
                     )
+                _comp = getattr(_agent, "context_compressor", None)
+                _summary_failed = (
+                    not _committed and _exc is None and _comp is not None
+                    and bool(getattr(_comp, "_last_compress_aborted", False))
+                )
                 if _committed:
                     logger.info(
                         "Session hygiene compression for session %s finished after the "
                         "turn-hold was released — summary adopted at the watermark-fenced "
                         "commit boundary (#97963)", _sid,
                     )
+                    # The prompt-token count on the entry measured the pre-compaction transcript:
+                    # left in place, the next hygiene check re-fires on the compacted one. Mirror
+                    # the inline adoption reset and fence out this turn's stale end-of-turn count.
+                    session_entry.last_prompt_tokens = 0
+                    _gw._note_hygiene_deferred_adoption(_skey)
+                    _gw._retain_background_task(asyncio.ensure_future(
+                        _gw.async_session_store.update_session(
+                            _skey, last_prompt_tokens=0, touch_activity=False,
+                        )
+                    ))
                     try:
                         _reset_hygiene_failure_streak(_gw, _skey)
                     except Exception as _rs_err:
                         logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                elif _summary_failed:
+                    # A real summary failure, not a turn-hold: same escalation and warning as the
+                    # inline abort path, which this deferred attempt never reaches.
+                    _gw._retain_background_task(asyncio.ensure_future(
+                        _gw._hmwa_hygiene_deferred_failure(hs, _skey, _sid, _agent, source, _meta)
+                    ))
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
@@ -1108,6 +1135,7 @@ class GatewayTurnMixin:
                 " — the watermark-fenced worker keeps its commit admission and the summary "
                 "will be adopted when it finishes"
             )
+            _notify_user = False
         else:
             _adopted = await self._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene turn-hold")
             if _adopted is not None:
@@ -1119,6 +1147,7 @@ class GatewayTurnMixin:
                 "summary was still streaming",
             )
             _log_suffix = ""
+            _notify_user = True
         self._hmwa_hygiene_stamp(
             attempt.agent, "session hygiene compression turn-hold",
             "AGENT_COMPRESSION_TURNHOLD", "hygiene compression turn-hold activity stamp failed",
@@ -1128,10 +1157,45 @@ class GatewayTurnMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-        )
+        if _notify_user:
+            # Cancelled: nothing will be adopted this time, so the user learns why the turn ran long.
+            await self._hmwa_hygiene_notify(
+                source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            )
         raise
+
+    async def _hmwa_hygiene_deferred_failure(self, hs, session_key, session_id, agent, source, meta):
+        """A kept-admission worker whose summary failed after the turn-hold: escalate the failure
+        cooldown and warn the user, as the inline abort path in ``_hmwa_hygiene_apply_result`` does."""
+        from agent.redact import redact_sensitive_text
+        _comp = getattr(agent, "context_compressor", None)
+        _reason = getattr(_comp, "_last_summary_error", None)
+        try:
+            await self._hmwa_hygiene_record_failure_cooldown(hs, session_key, session_id, _reason)
+        except Exception as _cd_err:
+            logger.debug("hygiene failure cooldown after deferred abort failed: %s", _cd_err)
+        self._hmwa_hygiene_stamp(
+            agent, "session hygiene compression aborted after turn-hold",
+            "AGENT_COMPRESSION_COOLDOWN", "hygiene deferred compression abort activity stamp failed",
+        )
+        _err = redact_sensitive_text(_reason or t("gateway.shared.unknown_error"), force=True)
+        logger.warning("Session hygiene compression aborted after the turn-hold was released: %s", _err)
+        await self._hmwa_hygiene_notify(
+            source, meta, t("gateway.compress.hygiene_failed"), "compression-failure warning",
+        )
+
+    def _note_hygiene_deferred_adoption(self, session_key):
+        """Bump the session's deferred-adoption epoch (see ``_hygiene_deferred_adoption_epoch``)."""
+        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
+        if not isinstance(epochs, dict):
+            epochs = self._hygiene_deferred_adoption_epochs = {}
+        epochs[session_key] = epochs.get(session_key, 0) + 1
+
+    def _hygiene_deferred_adoption_epoch(self, session_key):
+        """How many deferred hygiene summaries this process adopted for ``session_key``. A turn that
+        sees the epoch move ran on the pre-compaction transcript, so its prompt-token count is stale."""
+        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
+        return epochs.get(session_key, 0) if isinstance(epochs, dict) else 0
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
         """``except asyncio.TimeoutError`` body: cancel at the commit fence, record the failure
@@ -1925,6 +1989,24 @@ class GatewayTurnMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    async def _hmwa_store_turn_prompt_tokens(
+        self, store, entry_key, session_key, last_prompt_tokens, turn_epoch, *, touch_activity,
+    ):
+        """Store this turn's prompt-token count for hygiene, unless a deferred hygiene summary was
+        adopted while the turn ran: that count measured the pre-compaction transcript and would
+        re-trigger hygiene on the compacted one, so 0 (fall back to the estimate) is stored instead.
+
+        The write runs off-loop, so an adoption can land between the epoch check and the write, and
+        its own off-loop ``last_prompt_tokens=0`` may finish first and be overwritten by this stale
+        count. The epoch is bumped on the loop before the adoption schedules its write, so a second
+        check after this write lands closes the window: unchanged means any later adoption writes
+        its 0 after ours; changed means re-zero here."""
+        if self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            last_prompt_tokens = 0
+        await store.update_session(entry_key, last_prompt_tokens=last_prompt_tokens, touch_activity=touch_activity)
+        if last_prompt_tokens and self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            await store.update_session(entry_key, last_prompt_tokens=0, touch_activity=False)
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -2013,8 +2095,9 @@ class GatewayTurnMixin:
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
-        await store.update_session(
-            session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+        await self._hmwa_store_turn_prompt_tokens(
+            store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+            getattr(prepared, "hygiene_adoption_epoch", 0),
             touch_activity=not bool(getattr(event, "internal", False)),
         )
 
@@ -2230,6 +2313,8 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        # Deferred hygiene adoptions seen before the agent ran; persist compares it to drop a stale count.
+        hygiene_adoption_epoch: int = 0
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2336,6 +2421,7 @@ class GatewayTurnMixin:
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            hygiene_adoption_epoch=self._hygiene_deferred_adoption_epoch(session_key),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):

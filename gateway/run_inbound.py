@@ -1513,7 +1513,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.run import _AGENT_PENDING_SENTINEL
 
         pending_state = self._peek_session_state(_quick_key)
-        if _quick_key in getattr(self, "_startup_resume_started", set()):
+        if is_internal and id(event) in getattr(self, "_startup_resume_event_ids", set()):
             logger.warning("Rejecting duplicate startup-resume event for session %s", _quick_key)
             return QUEUE_ADMISSION_FAILURE
         owns_startup_claim = (
@@ -1588,10 +1588,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     return _consumer_reply
             try:
                 if getattr(event, "_startup_resume_dispatched", False):
-                    started = getattr(self, "_startup_resume_started", None)
-                    if started is None:
-                        started = self._startup_resume_started = set()
-                    started.add(_quick_key)
+                    event_ids = getattr(self, "_startup_resume_event_ids", None)
+                    if event_ids is None:
+                        event_ids = self._startup_resume_event_ids = set()
+                    event_ids.add(id(event))
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
@@ -1626,7 +1626,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # sentinel/agent and lease. Reset/stop release their stale slot before installing a
             # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
             self._release_running_agent_state(_quick_key, run_generation=_run_generation)
-            getattr(self, "_startup_resume_started", set()).discard(_quick_key)
+            getattr(self, "_startup_resume_event_ids", set()).discard(id(event))
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
