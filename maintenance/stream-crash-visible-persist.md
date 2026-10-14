@@ -71,13 +71,25 @@ only unrelated cron handoff issue #109243. No upstream writes are authorized.
 
 ## Verification
 
-Strict original-cell RED on fork main `87d06eeb`:
-`1 failed, 57 deselected`; two unmarked complete replies.
-Strict original-cell GREEN with option B:
-`1 tests passed, 0 failed`; one held original plus the marked, persisted re-answer.
-Recovery units: `8 tests passed, 0 failed`.
-The six original crash cells, accepted-edit case, conformance outbox suite,
-delivery-ledger units and full delivery file remain required before closeout.
+The regression was reproduced at `3bbbc3f96897`: `5 passed, 2 failed` in
+`test_crash_between_completion_and_send`, with two unmarked complete replies in
+both stream cells. The real child harness built `GatewayConfig` directly and
+never forwarded the `restart_resume_policy: continue` written by `fresh_gw`, so
+those resume turns resolved to `ask`; the journal row and resume token were
+correct. The harness now carries the global policy and per-platform `extra`
+through its child config.
+
+Current verification on `d71da74fe3d9`:
+
+- E2E crash matrix: `7 passed, 0 failed` (`161.9s`):
+  `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/e2e/core/delivery/test_messaging_exactly_once.py -k test_crash_between_completion_and_send`
+- Stream recovery and consumer units: `105 passed, 0 failed` (`26.1s`):
+  `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/gateway/test_stream_recovery.py tests/gateway/test_stream_consumer.py tests/gateway/test_stream_consumer_transport.py`
+- Python compile check: passed for all changed gateway and harness/test modules.
+
+Preview journal connections use a 250 ms busy timeout so state-db contention
+cannot hold a stream edit behind the delivery ledger's 10 s timeout. Successful
+stream finalization discards the durable preview row.
 
 ## Retirement
 
