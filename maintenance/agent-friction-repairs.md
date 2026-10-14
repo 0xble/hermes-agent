@@ -10,7 +10,7 @@ dedupe and local execute_code session-kernel eviction reporting.
 
 ## Proof surface
 
-- `tests/agent/test_context_compressor.py::test_dedupe_does_not_stub_unread_pending_results`
+- `tests/agent/test_context_compressor.py::TestSummarizeToolResultRefusals::test_dedupe_does_not_stub_unread_pending_results`
 - `tests/tools/test_code_kernel.py::TestKernelOwnershipAndLifecycle::test_lru_eviction_reports_state_reset`
 - `tests/agent/test_protected_tail_pressure.py`
 - `tests/tools/test_code_kernel.py`

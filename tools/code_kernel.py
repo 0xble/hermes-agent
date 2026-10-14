@@ -447,9 +447,21 @@ def _resolve_owner(task_id: str) -> str:
     return owner
 
 
+def _forget_kernel_evictions(owner_matches: Optional[Callable[[str], bool]] = None) -> None:
+    """Forget eviction notes that cannot apply after a lifecycle boundary."""
+    with _REGISTRY.lock:
+        if owner_matches is None:
+            _EVICTED_KERNELS.clear()
+        else:
+            for key in list(_EVICTED_KERNELS):
+                if owner_matches(key[0]):
+                    _EVICTED_KERNELS.pop(key, None)
+
+
 def shutdown_all_kernels() -> None:
     """Kill every session kernel. Registered via atexit; also used by tests."""
     _REGISTRY.shutdown()
+    _forget_kernel_evictions()
 
 
 def shutdown_kernels_for_owner(owner: str) -> None:
@@ -460,6 +472,7 @@ def shutdown_kernels_for_owner(owner: str) -> None:
     """
     if owner:
         _REGISTRY.shutdown(owner)
+        _forget_kernel_evictions(lambda candidate: candidate == owner)
 
 
 def delegated_child_owner_matcher(child_session_id: str) -> Callable[[str], bool]:
@@ -478,6 +491,7 @@ def shutdown_kernels_for_delegated_child(child_session_id: str) -> None:
         return
     matcher = delegated_child_owner_matcher(child_session_id)
     _REGISTRY.shutdown(owner_matches=matcher)
+    _forget_kernel_evictions(matcher)
     from tools.code_kernel_remote import shutdown_remote_kernels_where
     shutdown_remote_kernels_where(matcher)
 
@@ -930,6 +944,10 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
             from tools.code_execution_tool import _error_result
             logger.error("session kernel failed: %s: %s", type(exc).__name__, exc, exc_info=True)
             _REGISTRY.discard(key, kernel)
+            if state_reset_note:
+                with _REGISTRY.lock:
+                    _EVICTED_KERNELS[key] = state_reset_note
+                    _EVICTED_KERNELS.move_to_end(key)
             return _error_result(str(exc), tool_calls_made=kernel.tool_call_counter[0],
                                  duration=round(time.monotonic() - exec_start, 2))
         finally:
