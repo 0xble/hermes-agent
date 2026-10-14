@@ -346,10 +346,13 @@ def _migrate_earlier_maintenance_keys(repo_root: Path) -> None:
 
 
 def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
-    """Remove aborted-transfer temp pack files; same contract as clear_stale_git_locks.
+    """Remove aged aborted-transfer pack files with conservative liveness checks.
 
-    Resolves ``.git/objects/pack`` for a checkout and ``objects/pack`` for a bare repo such as
-    the checkpoint store — a ``git gc`` killed by a timeout strands the same debris there."""
+    Non-Linux keeps the system-wide Git-process guard. Linux scopes Git ownership
+    to the target/shared repository and visible pack holders, while unknown or
+    inaccessible evidence still vetoes removal. Resolves ``.git/objects/pack``
+    for a checkout and ``objects/pack`` for a bare repo such as the checkpoint
+    store — a ``git gc`` killed by a timeout strands the same debris there."""
     pack_dir = _pack_dir(repo_root)
 
     def _candidates():
