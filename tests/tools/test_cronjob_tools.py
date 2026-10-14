@@ -489,6 +489,29 @@ class TestRegisteredHandlerForwardsAttachToSession:
         monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
         monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
 
+    def test_resume_skip_missed_and_skip_count_through_registry(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+        from tools.registry import registry
+        now = datetime(2026, 10, 13, 21, 0, 0, tzinfo=timezone.utc)
+        nxt = datetime(2026, 10, 20, 20, 0, 0, tzinfo=timezone.utc)
+
+        def call(**args):
+            return json.loads(registry.dispatch("cronjob_manage", args))
+
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now - timedelta(days=1))
+        job_id = call(action="create", prompt="Weekly", schedule="0 20 * * 2")["job_id"]
+        call(action="pause", job_id=job_id)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        resumed = call(action="resume", job_id=job_id, skip_missed=True)
+        assert resumed["success"] is True
+        assert datetime.fromisoformat(resumed["job"]["next_run_at"]) == nxt
+        skipped = call(action="skip", job_id=job_id, count=2)
+        assert skipped["success"] is True
+        assert datetime.fromisoformat(skipped["job"]["next_run_at"]) == nxt + timedelta(days=14)
+        refused = call(action="skip", job_id=job_id, count=-1)
+        assert refused["success"] is False and "positive integer" in refused["error"]
+
     def test_create_persists_attach_to_session(self):
         from cron.jobs import get_job
         from tools.registry import registry
