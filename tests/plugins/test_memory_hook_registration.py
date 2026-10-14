@@ -112,3 +112,25 @@ def test_reexported_register_uses_plugin_source(tmp_path, monkeypatch, order):
         assert _contexts(manager) == [{"context": "first"}, {"context": "second"}]
     finally:
         manager.unload()
+
+
+@pytest.mark.parametrize("order", ["plugin-first", "memory-first", "memory-only"])
+def test_memory_provider_forwards_hook_tool_matchers(tmp_path, monkeypatch, order):
+    manager = _install(tmp_path, monkeypatch, enabled=order != "memory-only")
+    plugin = tmp_path / "plugins" / "dual" / "__init__.py"
+    plugin.write_text(plugin.read_text() + '\n    ctx.register_hook("pre_tool_call", '
+                      'lambda tool_name: {"action": "block", "message": tool_name}, tools={"terminal"})\n')
+    try:
+        if order == "plugin-first":
+            manager.discover_and_load()
+        assert load_memory_provider("dual") is not None
+        if order == "memory-first":
+            manager.discover_and_load()
+        assert manager.invoke_hook("pre_tool_call", tool_name="read_file") == []
+        assert manager.invoke_hook("pre_tool_call", tool_name="terminal") == [
+            {"action": "block", "message": "terminal"},
+        ]
+        manager.unload()
+        assert manager.invoke_hook("pre_tool_call", tool_name="terminal") == []
+    finally:
+        manager.unload()

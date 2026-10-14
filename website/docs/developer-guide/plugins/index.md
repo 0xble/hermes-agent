@@ -661,10 +661,14 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", check_writes, tools={"write_file", "patch"})
 ```
 
-`pre_tool_call` accepts an optional `tools=` declaration: pass an iterable of exact
-tool names or a predicate such as `lambda tool_name: tool_name.startswith("write")`.
+`pre_tool_call`, `post_tool_call` and `transform_tool_result` accept an optional
+`tools=` declaration: pass an iterable of exact tool names (set form preferred) or
+a predicate such as `lambda tool_name: tool_name.startswith("write")`. Other hooks
+do not carry `tool_name` and raise `ValueError` if registered with `tools=`.
 The dispatcher skips non-matching tools before timeout and suppression handling.
-Omitting the declaration keeps the callback subscribed to every tool call.
+Predicates run on the caller thread outside callback timeouts and must be cheap,
+pure and non-blocking. Omitting the declaration keeps the callback subscribed to
+every tool call.
 
 **What `register()` does:**
 - Called exactly once at startup

@@ -202,6 +202,21 @@ def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
     return True
 
 
+def _hook_matches_tool(hook_name: str, cb: Callable, tool_name: Optional[str]) -> bool:
+    """Keep a broken applicability declaration from bypassing a policy callback."""
+    matcher = getattr(cb, "hermes_tool_matcher", None)
+    if matcher is None:
+        return True
+    try:
+        return bool(matcher(tool_name))
+    except Exception:
+        logger.warning(
+            "Hook '%s' callback %s tool matcher raised; treating the tool as matched",
+            hook_name, _callback_identity(cb), exc_info=True,
+        )
+        return True
+
+
 def _callback_identity(cb: Callable) -> str:
     """An attributable callback label without inspecting its arguments or instance state."""
     module = getattr(cb, "__module__", type(cb).__module__)
@@ -395,19 +410,8 @@ class PluginDispatchMixin:
         for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
             cb_timeout, cb_fail_closed = timeout, fail_closed
             try:
-                matcher = getattr(cb, "hermes_tool_matcher", None)
-                if matcher is not None:
-                    try:
-                        matches = bool(matcher(kwargs.get("tool_name")))
-                    except Exception:
-                        # A broken declaration must not turn a policy callback into a bypass.
-                        logger.warning(
-                            "Hook '%s' callback %s tool matcher raised; treating the tool as matched",
-                            hook_name, _callback_identity(cb), exc_info=True,
-                        )
-                        matches = True
-                    if not matches:
-                        continue
+                if not _hook_matches_tool(hook_name, cb, kwargs.get("tool_name")):
+                    continue
                 spec = getattr(cb, "hermes_shell_hook_spec", None)
                 if spec is not None:
                     from agent import shell_hooks
@@ -703,6 +707,8 @@ class PluginDispatchMixin:
         for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
+                if not _hook_matches_tool(hook_name, cb, kwargs.get("tool_name")):
+                    continue
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
                 if inspect.isawaitable(ret):
                     ret = await (asyncio.wait_for(ret, timeout) if use_timeout else ret)

@@ -970,10 +970,15 @@ class PluginContext:
     ) -> PluginRegistration:
         """Register a lifecycle hook callback.
 
-        For ``pre_tool_call``, ``tools`` may be a collection of exact tool names or a predicate
-        receiving the tool name. Declared callbacks are skipped before timeout/suppression handling
-        for non-matching tools. Omitting ``tools`` preserves the callback's all-tools behavior.
+        Only ``pre_tool_call``, ``post_tool_call`` and ``transform_tool_result`` carry ``tool_name``
+        and accept ``tools``: exact names (set form preferred) or a predicate. Predicates run on
+        the caller thread outside callback timeouts and must be cheap, pure and non-blocking.
+        Non-matching callbacks skip timeout/suppression handling. Omitting ``tools`` keeps the
+        callback's all-tools behavior; other hooks reject a declaration with ``ValueError``.
         """
+        if tools is not None and hook_name not in {"pre_tool_call", "post_tool_call", "transform_tool_result"}:
+            raise ValueError("register_hook(tools=...) requires a hook carrying tool_name: "
+                             "pre_tool_call, post_tool_call or transform_tool_result")
         matcher = _build_hook_tool_matcher(tools)
         if matcher is not None:
             callback = _wrap_hook_with_tool_matcher(callback, matcher)
