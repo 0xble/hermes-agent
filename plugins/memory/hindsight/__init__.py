@@ -411,6 +411,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._mission_banks: dict[str, threading.Event] = {}
         self._mission_lock = threading.Lock()
         self._prefetch_thread = None
+        self._prefetch_worker_lock = threading.Lock()
+        self._prefetch_running = False
+        self._prefetch_pending = None
         self._last_recall_returned, self._last_recall_count = False, 0
         self._apply_recall_settings({})
 
@@ -1241,32 +1244,53 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def discard_prefetch(self) -> None:
         """Drop the buffered result; a worker still in flight belongs to a superseded generation."""
-        self._prefetch_generation.discard(self._reset_prefetch_result)
+        with self._prefetch_worker_lock:
+            self._prefetch_pending = None
+            self._prefetch_generation.discard(self._reset_prefetch_result)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
-        if self._recall_sync or self._recall_disabled():
+        if self._recall_sync or self._recall_disabled() or self._shutting_down.is_set():
             return
 
         # Each queued request is its own generation: a worker that outlived prefetch()'s capped
         # join must not publish over a newer request's result, not only across session switches.
         # An older worker's result that landed after prefetch()'s capped join belongs to a
         # superseded query; it must not be injected for this one.
-        generation = self._prefetch_generation.begin(self._reset_prefetch_result)
+        with self._prefetch_worker_lock:
+            if self._shutting_down.is_set():
+                return
+            generation = self._prefetch_generation.begin(self._reset_prefetch_result)
+            self._prefetch_pending = (query, generation)
+            if self._prefetch_running:
+                return
+            self._prefetch_running = True
+            self._prefetch_thread = spawn_context_thread(self._run_prefetch, name="hindsight-prefetch")
+            try:
+                self._prefetch_thread.start()
+            except Exception:
+                self._prefetch_running = False
+                self._prefetch_thread = None
+                raise
 
-        def _run():
-            # Wait (bounded, off the reply path) for the just-completed turn's
-            # retain to be recall-visible so the warmed context includes it.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            text, count = self._do_recall(query)
-            # Publish the current generation's result even when empty: an empty recall is an answer.
-            with self._prefetch_generation.publishing(generation) as current:
-                if current:
-                    self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
-
-        self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
-        self._prefetch_thread.start()
+    def _run_prefetch(self) -> None:
+        """One in-flight recall plus one latest-wins slot, rather than a thread per turn."""
+        while True:
+            with self._prefetch_worker_lock:
+                pending, self._prefetch_pending = self._prefetch_pending, None
+                if pending is None or self._shutting_down.is_set():
+                    self._prefetch_running = False
+                    return
+            query, generation = pending
+            try:
+                if self._prefetch_waits_for_retain:
+                    self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+                text, count = self._do_recall(query)
+                with self._prefetch_generation.publishing(generation) as current:
+                    if current:
+                        self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
+            except Exception:
+                logger.debug("Hindsight prefetch failed", exc_info=True)
 
     # -- retain ------------------------------------------------------------------
 
@@ -1607,6 +1631,7 @@ class HindsightMemoryProvider(MemoryProvider):
             ))
         # Stop accepting retain jobs so late sync_turn() calls are dropped.
         self._shutting_down.set()
+        self.discard_prefetch()
         # The writer finishes in-flight work then exits on the sentinel; the
         # bounded join keeps shutdown predictable even if the daemon is wedged.
         if (writer := self._writer_thread) is not None and writer.is_alive():

@@ -1059,6 +1059,7 @@ class TestPrefetchSupersession:
         old_worker = provider._prefetch_thread
         assert old_started.wait(5.0)
         provider.queue_prefetch("new")
+        release_old.set()
         provider._prefetch_thread.join(timeout=5.0)
         assert "new memory" in provider._prefetch_result
 
