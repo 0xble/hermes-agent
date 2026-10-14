@@ -1886,52 +1886,6 @@ def _init_cron_mcp_tools(job_id: str) -> None:
         logger.warning("Job '%s': MCP initialization failed (non-fatal): %s", job_id, _mcp_exc)
 
 
-def _open_cron_session_db(job: dict):
-    """Open the SQLite session store under its own timeout (HERMES_CRON_TIMEOUT only watches
-    run_conversation). A wedged sqlite3.connect returns None (no session store) instead of
-    wedging the worker thread."""
-    # Initialize the SQLite session store so cron job messages are persisted and discoverable via
-    # session_search (same pattern as gateway/run.py) — only now, after every early-return path (wake-gate,
-    # prompt validation, drift skip) has passed, so a gated run never opens state.db just to abandon the
-    # handle (#96290). Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT, which only watches
-    # the agent's run_conversation below): SessionDB.__init__ opens/migrates state.db synchronously and has
-    # no timeout of its own against a wedged sqlite3.connect (e.g. a stale flock left by a crashed sibling
-    # process). An unbounded hang here would wedge the job's worker thread, so the init is bounded and a
-    # timeout proceeds without a session store instead of blocking the run forever.
-    _session_db_timeout = _get_session_db_timeout()
-    try:
-        from hermes_state_registry import acquire
-
-        if _session_db_timeout <= 0:
-            return acquire()
-        _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Copy the context so a profile run resolves ITS OWN home/state.db on the worker thread
-        # instead of the process-global default.
-        _session_db_context = contextvars.copy_context()
-        _session_db_future = _session_db_pool.submit(_session_db_context.run, acquire)
-        try:
-            return _session_db_future.result(timeout=_session_db_timeout)
-        except concurrent.futures.TimeoutError:
-            # The abandoned worker may still finish; close its late result or its SQLite FDs leak.
-            # The worker is abandoned (shutdown below doesn't wait for it). If SessionDB() later completes
-            # inside it, the future's result would be orphaned and its SQLite FDs (.db, WAL, SHM) leak until
-            # process exit. Register a done-callback that retrieves and closes any eventual late result
-            # (#72782).
-            from cron.scheduler_detached_worker import _close_late_session_db_result
-            _session_db_future.add_done_callback(_close_late_session_db_result)
-            raise
-        finally:
-            # Abandon a wedged connect() rather than blocking shutdown on it.
-            _session_db_pool.shutdown(wait=False)
-    except concurrent.futures.TimeoutError:
-        logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-            "without a session store for this run instead of blocking it forever",
-            job.get("id", "?"), _session_db_timeout)
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-    return None
-
 
 def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
     """Log the agent's last activity, hard-interrupt it and raise TimeoutError."""
@@ -2258,23 +2212,18 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
-    """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
-    result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
-    injection block, empty prompt); otherwise ``prompt`` is set."""
+    """Run every pre-agent gate of an agent job and build the prompt. Returns
+    ``(early_result, prompt)``: an early result short-circuits ``run_job`` (empty payload, monitor
+    gate, wake gate, injection block, empty prompt); otherwise ``prompt`` is set."""
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
-    # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
-    if not job.get("no_agent"):
-        from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
+    # user never chose. no_agent jobs never reach here. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
+    from hermes_cli.config import InvalidUserConfigError, require_parseable_user_config
 
-        try:
-            require_parseable_user_config()
-        except InvalidUserConfigError as exc:
-            logger.error("Job '%s': refusing to run — %s", job_id, exc)
-            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
-
-    # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
-    if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError as exc:
+        logger.error("Job '%s': refusing to run — %s", job_id, exc)
+        return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
@@ -2288,11 +2237,8 @@ def _prepare_job_prompt(
 
     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
     # _build_job_prompt so the script runs only once.
-    # NOTE: the SQLite session store used to be initialized here, BEFORE the wake-gate and prompt-validation
-    # early returns below. Every gated run (``wakeAgent: false``, blocked prompt) opened state.db and
-    # returned without reaching the finally that closes it, relying on GC to release the handle. Init now
-    # happens inside the main try, right before the agent is constructed — after every early-return path
-    # (#96290).
+    # run_job acquires its session store before entering this gate so acknowledgements
+    # cannot be consumed by a run that cannot persist its session.
     prerun_script = None
     script_path = job.get("script")
     if script_path:
@@ -2581,14 +2527,14 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
-    if early is not None:
-        return early
-    from run_agent import AIAgent
+    # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
+    if job.get("no_agent"):
+        return _run_no_agent_job(job, job_id, job_name, cancel_event)
+    job.pop("_session_store_unavailable", None)
+    prompt = str(job.get("prompt") or "")
 
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
-    logger.info("Prompt: %s", prompt[:100])
 
     agent = None
     model = ""
@@ -2598,6 +2544,14 @@ def run_job(
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         scope.enter()
+        # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
+        # cannot consume their state, with every early return covered by this finally.
+        _session_db = _open_cron_session_db(job)
+        early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+        if early is not None:
+            return early
+        from run_agent import AIAgent
+        logger.info("Prompt: %s", prompt[:100])
         if scope.workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, scope.workdir)
         _reload_dotenv_and_publish_delivery_target(job)
@@ -2610,8 +2564,6 @@ def run_job(
             return setup.blocked
         model = setup.model
 
-        # Open state.db only after every early-return gate has passed.
-        _session_db = _open_cron_session_db(job)
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
@@ -2642,6 +2594,8 @@ def run_job(
         return True, output, final_response, None
 
     except Exception as e:
+        if isinstance(e, CronSessionStoreUnavailable):
+            job["_session_store_unavailable"] = True
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
@@ -2649,7 +2603,7 @@ def run_job(
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
         try:
             from cron.unreachable_retry import is_model_unreachable_failure
-            if is_model_unreachable_failure(e, agent):
+            if not isinstance(e, CronSessionStoreUnavailable) and is_model_unreachable_failure(e, agent):
                 job["_model_unreachable"] = True
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
@@ -2676,8 +2630,14 @@ def run_job(
             workdir=scope.workdir)
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
-            _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
-                                   workdir=scope.workdir)
+            if agent is None:
+                from hermes_state_registry import release_or_close
+                _run_cron_cleanup_with_timeout(
+                    lambda: release_or_close(_session_db), job_id=job_id,
+                    label="unused session store release")
+            else:
+                _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
+                                       workdir=scope.workdir)
         # Tear down the ephemeral agent or the gateway leaks fds per tick (EMFILE). With deferred
         # teardown, hand the live agent back: delivery needs a live async client.
         # Release subprocesses, terminal sandboxes, browser daemons, and the main OpenAI/httpx client held
@@ -3272,6 +3232,8 @@ def _finish_completed_run(
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    if not d.success and job.pop("_session_store_unavailable", False):
+        mark_kwargs["run_not_started"] = True
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
@@ -4606,6 +4568,9 @@ def _sweep_mcp_orphans_when_all_done(futures: list) -> None:
 
 
 from cron.scheduler_tick import tick  # noqa: E402
+from cron.scheduler_session_store import (  # noqa: E402
+    CronSessionStoreUnavailable, _open_cron_session_db,
+)
 
 
 # ---------------------------------------------------------------------------
