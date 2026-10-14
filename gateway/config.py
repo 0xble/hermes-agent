@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Mapping
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
@@ -694,6 +694,7 @@ class GatewayConfig:
     profile_routes: list = field(default_factory=list)  # gateway/profile_routing.py
     durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
     durable_outbox_retention_days: int = 7
+    zero_cut_handover_enabled: bool = False  # gateway.zero_cut_handover.enabled, opt-in
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -777,6 +778,7 @@ class GatewayConfig:
             "session_store_max_age_days": self.session_store_max_age_days,
             "durable_outbox": {"enabled": self.durable_outbox_enabled,
                                "retention_days": self.durable_outbox_retention_days},
+            "zero_cut_handover": {"enabled": self.zero_cut_handover_enabled},
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -862,6 +864,7 @@ class GatewayConfig:
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
+        zero_cut_handover = _coerce_dict(nested_gateway.get("zero_cut_handover"))
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -889,6 +892,7 @@ class GatewayConfig:
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
             durable_outbox_enabled=outbox.get("enabled", False),
             durable_outbox_retention_days=retention,
+            zero_cut_handover_enabled=_coerce_bool(zero_cut_handover.get("enabled"), False),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
@@ -910,6 +914,19 @@ class GatewayConfig:
         """Effective notice-delivery mode ("public"/"private") for a platform."""
         choice = self._extra_choice(platform, "notice_delivery", {"public", "private"}, "public")
         return "public" if choice is None else choice
+
+
+def is_zero_cut_handover_enabled(config: "GatewayConfig | Mapping[str, Any] | None") -> bool:
+    """Return the opt-in zero-cut handover flag from an effective gateway config."""
+    if isinstance(config, GatewayConfig):
+        return bool(config.zero_cut_handover_enabled)
+    if not isinstance(config, Mapping):
+        return False
+    gateway = config.get("gateway", config)
+    if not isinstance(gateway, Mapping):
+        return False
+    setting = gateway.get("zero_cut_handover", {})
+    return bool(setting.get("enabled", False)) if isinstance(setting, Mapping) else False
 
 
 def validate_outbox_retention_days(value: Any) -> int:

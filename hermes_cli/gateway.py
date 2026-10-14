@@ -4176,6 +4176,7 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 
 from hermes_cli.gateway_launchd import (  # noqa: E402,F401 — facade re-exports; tests patch here
     get_launchd_label,
+    get_launchd_slot_labels,
     _probe_launchd_domain_for_label,
     _launchd_domain,
     _LAUNCHD_JOB_UNLOADED_EXIT_CODES,

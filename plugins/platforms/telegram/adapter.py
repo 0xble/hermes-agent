@@ -152,7 +152,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
-from gateway.config import Platform, PlatformConfig, normalize_telegram_rich_messages
+from gateway.config import Platform, PlatformConfig, is_zero_cut_handover_enabled, normalize_telegram_rich_messages
 from agent.i18n import get_language, t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
@@ -4054,9 +4054,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
-        # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
-        # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        zero_cut_handover = is_zero_cut_handover_enabled(
+            getattr(getattr(self, "gateway_runner", None), "config", None))
+        # Legacy behavior releases the bot-token lock before teardown so a wedged close cannot block
+        # the reconnect watcher. The opt-in handover path retains ownership until updater.stop() has
+        # completed (or its existing bounded timeout expires). See #80598.
+        if not zero_cut_handover:
+            self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
@@ -4094,17 +4098,31 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
                     try:
-                        await self._await_disconnect_step(self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
+                        updater_stopped = await self._await_disconnect_step(
+                            self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
+                        if zero_cut_handover and not updater_stopped:
+                            logger.warning(
+                                "[%s] zero-cut handover releasing the bot-token lock after updater.stop() timeout",
+                                self.name)
                     except Exception as stop_error:
                         logger.warning(
                             "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
+                if zero_cut_handover:
+                    # Handover keeps the token exclusively owned until polling has stopped. If the
+                    # bounded stop failed or timed out, release here rather than deadlocking B.
+                    self._release_platform_lock()
                 # app.stop()/shutdown() can also block on a half-dead httpx pool.
                 # Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
                     await self._await_disconnect_step(self._app.stop(), _DISCONNECT_STEP_TIMEOUT, "app.stop()")
                 await self._await_disconnect_step(self._app.shutdown(), _DISCONNECT_STEP_TIMEOUT, "app.shutdown()")
             except Exception as e:
+                if zero_cut_handover:
+                    self._release_platform_lock()
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
+        elif zero_cut_handover:
+            # No app/updater exists to await, but the handover path still must not strand the lock.
+            self._release_platform_lock()
         self._app = None
         self._bot = None
         # Land the last completed receipts before a replacement adapter reads them.

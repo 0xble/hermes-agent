@@ -2158,6 +2158,8 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        # Opt-in zero-cut handover. The legacy single-slot drain/restart path remains the default.
+        "zero_cut_handover": {"enabled": False},
         "guardian": {"enabled": False},
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
