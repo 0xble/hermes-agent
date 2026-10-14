@@ -89,6 +89,10 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
     worker thread, not the gateway loop.
     """
     if policy != "continue" or not ctx.session_key or not ctx.session_id:
+        logger.warning(
+            "stream recovery gate rejected prerequisites: policy=%r session=%r session_id=%r",
+            policy, ctx.session_key, ctx.session_id,
+        )
         return
     event = _turn_event(runner, ctx)
     if event is None or not getattr(event, "internal", False):
