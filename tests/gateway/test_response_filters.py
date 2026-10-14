@@ -49,6 +49,67 @@ def test_silence_predicate_uses_display_text_without_loop_completion_marker(resp
     assert is_intentional_silence_response(response) is expected
 
 
+@pytest.mark.parametrize(
+    ("response", "display"),
+    [
+        ("Update.\n[SILENT]\nLOOP_COMPLETE", "Update."),
+        ("Update.\nLOOP_COMPLETE\n[SILENT]", "Update."),
+        ("Update.\n\nNO_REPLY\n\nLOOP_COMPLETE\nLOOP_COMPLETE", "Update."),
+        ("Update.\nLOOP_COMPLETE", "Update."),
+        ("[SILENT]\nLOOP_COMPLETE\nLOOP_COMPLETE", "[SILENT]"),
+        ("LOOP_COMPLETE\nLOOP_COMPLETE", ""),
+        # Fenced control lines are content.
+        ("```\n[SILENT]\nLOOP_COMPLETE\n```", "```\n[SILENT]\nLOOP_COMPLETE\n```"),
+    ],
+)
+def test_trailing_control_run_is_stripped_as_one_unit(response, display):
+    """A trailing run of silence and LOOP_COMPLETE lines, in any order, never leaks a marker."""
+    assert response_filters.strip_trailing_control_markers(response) == display
+
+
+def test_webhook_lane_keeps_autonomous_silence_and_strips_only_loop_complete():
+    assert response_filters.strip_trailing_control_markers(
+        "Update.\n[SILENT]\nLOOP_COMPLETE", strip_silence=False,
+    ) == "Update.\n[SILENT]"
+
+
+def test_silence_strip_removes_marker_from_a_run_that_ends_in_loop_complete():
+    """The marker before a trailing LOOP_COMPLETE is stripped; the completion line stays for detection."""
+    stripped = response_filters.strip_trailing_silence_marker("Update.\n[SILENT]\nLOOP_COMPLETE")
+    assert stripped == "Update.\nLOOP_COMPLETE"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "[SILENT]\nLOOP_COMPLETE\nLOOP_COMPLETE",
+        "NO_REPLY\n\nLOOP_COMPLETE\nLOOP_COMPLETE\n",
+        "[SILENT]\nLOOP_COMPLETE\nLOOP",
+    ],
+)
+def test_partial_and_exact_silence_agree_on_repeated_loop_complete(response):
+    assert response_filters.is_partial_silence_marker(response) is True
+    if not response.endswith("LOOP"):
+        assert is_intentional_silence_response(response) is True
+
+
+def test_hold_keeps_a_silence_marker_across_a_paragraph_break_before_loop_complete():
+    """CLI streaming TTS: [SILENT], \\n\\n, LOOP_COMPLETE as chunks must never release the marker."""
+    hold = {"buf": "", "held": ""}
+    released = [response_filters.hold_silence_delta(hold, d) for d in ("[SILENT]", "\n\n", "LOOP_COMPLETE")]
+    assert released == ["", "", ""]
+    assert is_intentional_silence_response(hold["held"])
+
+
+def test_hold_still_releases_a_held_prefix_when_the_next_segment_is_prose():
+    hold = {"buf": "", "held": ""}
+    released = "".join(response_filters.hold_silence_delta(hold, d) for d in ("Ok", "\n\nQueue is 2."))
+    assert released == "Ok\n\nQueue is 2."
+    hold = {"buf": "", "held": ""}
+    released = "".join(response_filters.hold_silence_delta(hold, d) for d in ("NO", "\n\nmore text"))
+    assert released == "NO\n\nmore text"
+
+
 def test_autonomous_silence_accepts_marker_with_own_line_note():
     """The loose rule for cron/webhook lanes: marker + explanation suppresses."""
     assert is_autonomous_silence_response("[SILENT]")

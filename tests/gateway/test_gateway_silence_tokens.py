@@ -277,6 +277,32 @@ async def test_queued_first_response_strips_loop_complete_but_keeps_raw_result()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final",
+    [
+        "CI is green.\n[SILENT]\nLOOP_COMPLETE",
+        "CI is green.\nLOOP_COMPLETE\nNO_REPLY",
+        "CI is green.\n[SILENT]\nLOOP_COMPLETE\nLOOP_COMPLETE",
+    ],
+)
+async def test_queued_first_response_strips_the_whole_trailing_control_run(final):
+    """Queued lane: prose before a silence/LOOP_COMPLETE run sends only the prose."""
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    turn_ctx = SimpleNamespace(
+        session_key="session", stream_consumer_holder=[None], mute_notification_reply=False,
+        persist_user_display_kind="internal_notification", reply_expected=False, source=_source(),
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="loop-msg-3",
+        run_generation=1,
+    )
+    runner._deliver_queued_first_response = AsyncMock(return_value=True)
+    result = {"final_response": final, "failed": False}
+
+    assert await runner._run_agent_deliver_first_response(turn_ctx, None, result, result, None)
+    assert runner._deliver_queued_first_response.await_args.args[0] == "CI is green."
+    assert result["final_response"] == final
+
+
+@pytest.mark.asyncio
 async def test_queued_bare_loop_complete_sends_nothing():
     runner = gateway_run.GatewayRunner(GatewayConfig())
     turn_ctx = SimpleNamespace(

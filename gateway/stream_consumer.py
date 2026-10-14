@@ -32,8 +32,7 @@ from gateway.response_filters import (
     ends_with_partial_silence_marker as _ends_with_partial_silence_marker,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
-    strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
-    strip_trailing_silence_marker as _strip_trailing_silence_marker)
+    strip_trailing_control_markers as _strip_trailing_control_markers)
 from gateway.copy_blocks import CopyMarkerStreamFilter, adapter_sends_copy_blocks, copy_free_text_for
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
@@ -332,7 +331,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""
         return ensure_closed_code_fences(
-            self._strip_final_loop_complete_marker(self._clean_for_display(text or ""))
+            self._strip_final_control_markers(self._clean_for_display(text or ""))
         ).strip()
 
     def _record_turn_final_payload(self, text: str) -> None:
@@ -719,23 +718,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             self._accumulated += tail
             self._stream_ledger += tail
 
-    def _strip_final_silence_marker(self, text: str) -> str:
-        """Apply the interactive trailing-marker filter at the final delivery boundary."""
-        if not self.cfg.strip_trailing_silence_markers:
-            return text
-        return _strip_trailing_silence_marker(text)
-
-    @staticmethod
-    def _strip_final_loop_complete_marker(text: str) -> str:
-        """Remove the loop stop sentinel from user-visible final text."""
-        return _strip_trailing_loop_complete_marker(text)
+    def _strip_final_control_markers(self, text: str) -> str:
+        """The shared trailing control-run display filter (silence markers and LOOP_COMPLETE)."""
+        return _strip_trailing_control_markers(
+            text, strip_silence=self.cfg.strip_trailing_silence_markers,
+        )
 
     def _strip_final_marker_from_state(self) -> None:
         """Remove trailing control markers from all final-state buffers before delivery."""
-        self._accumulated = self._strip_final_silence_marker(self._accumulated)
-        self._stream_ledger = self._strip_final_silence_marker(self._stream_ledger)
-        self._accumulated = self._strip_final_loop_complete_marker(self._accumulated)
-        self._stream_ledger = self._strip_final_loop_complete_marker(self._stream_ledger)
+        self._accumulated = self._strip_final_control_markers(self._accumulated)
+        self._stream_ledger = self._strip_final_control_markers(self._stream_ledger)
 
     def _adopt_final_text(self, final_raw: str) -> None:
         """Adopt the authoritative final (see finish()) as the finalize content — only if this
@@ -746,8 +738,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
         final_raw = copy_free_text_for(self.adapter, final_raw)  # the buffers never hold copy blocks
-        final_raw = self._strip_final_silence_marker(final_raw)
-        final_raw = self._strip_final_loop_complete_marker(final_raw)
+        final_raw = self._strip_final_control_markers(final_raw)
         if not self._turn_split_delivery:
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):

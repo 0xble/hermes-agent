@@ -1979,8 +1979,10 @@ class GatewayTurnMixin:
         # copy stashed here instead (see _final_text_for_post_turn_hooks).
         with suppress(Exception):
             event._raw_final_response = str(raw_response or "")
-        from gateway.response_filters import strip_trailing_loop_complete_marker
-        response = strip_trailing_loop_complete_marker(response)
+        from gateway.response_filters import strip_trailing_control_markers
+        response = strip_trailing_control_markers(
+            response, strip_silence=source.platform != Platform.WEBHOOK,
+        )
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
@@ -2421,8 +2423,10 @@ class GatewayTurnMixin:
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
             raw_response_for_delivery = response
-            from gateway.response_filters import strip_trailing_loop_complete_marker
-            response = strip_trailing_loop_complete_marker(response)
+            from gateway.response_filters import strip_trailing_control_markers
+            response = strip_trailing_control_markers(
+                response, strip_silence=source.platform != Platform.WEBHOOK,
+            )
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
@@ -3983,10 +3987,14 @@ class GatewayTurnMixin:
             turn_ctx.source.platform, _delivery_result.get("final_response", ""),
             interrupted=bool(_delivery_result.get("interrupted") or (result or {}).get("interrupted")),
         )
-        # LOOP_COMPLETE is /loop control text: this lane sends before the normal completion
-        # filter runs, so strip it here too. Loop detection reads the untouched result dict.
-        from gateway.response_filters import strip_trailing_loop_complete_marker
-        first_response = strip_trailing_loop_complete_marker(first_response)
+        # LOOP_COMPLETE and a trailing silence marker are control text: this lane sends before
+        # the normal completion filter runs, so strip the whole trailing control run here too
+        # (``Update.\n[SILENT]\nLOOP_COMPLETE`` must not leak the marker). Loop detection reads
+        # the untouched result dict.
+        from gateway.response_filters import strip_trailing_control_markers
+        first_response = strip_trailing_control_markers(
+            first_response, strip_silence=turn_ctx.source.platform != Platform.WEBHOOK,
+        )
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )

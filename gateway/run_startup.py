@@ -1193,11 +1193,13 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
         images, rest = BasePlatformAdapter.extract_images(rest)
         if media or images or BasePlatformAdapter.extract_local_files(rest)[0]:
             return None
-        from gateway.response_filters import strip_trailing_loop_complete_marker
-        # Sanitize first (provider terminal tokens), then hide the /loop marker, matching the
-        # normal and queued delivery lanes. Markers stay so redelivery can split or inline them.
-        sanitized = strip_trailing_loop_complete_marker(
-            _sanitize_gateway_final_response(origin.platform, last["content"]))
+        from gateway.response_filters import strip_trailing_control_markers
+        # Sanitize first (provider terminal tokens), then hide the trailing control run (/loop
+        # marker and any silence marker beside it), matching the normal and queued delivery
+        # lanes. Copy markers stay so redelivery can split or inline them.
+        sanitized = strip_trailing_control_markers(
+            _sanitize_gateway_final_response(origin.platform, last["content"]),
+            strip_silence=origin.platform != Platform.WEBHOOK)
         return map_outside_copy_blocks(sanitized, _strip_media_directives, keep_markers=True).strip() or None
 
     @staticmethod
