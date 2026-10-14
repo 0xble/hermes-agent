@@ -40,8 +40,8 @@ async def _deliver_sigterm(monkeypatch):
     runner._post_interrupt_grace_timeout = lambda: 0.01
     sweeps = []
 
-    async def _sweep(phase, *, timeout=None):
-        sweeps.append((phase, timeout))
+    async def _sweep(phase, *, timeout=None, restart=False):
+        sweeps.append((phase, timeout, restart))
         return []
 
     monkeypatch.setattr(
@@ -75,7 +75,8 @@ async def test_sigterm_with_planned_restart_marker_takes_bounded_restart_path(mo
     runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch)
 
     assert runner._restart_requested and runner._restart_via_service
-    post_interrupt = [timeout for phase, timeout in sweeps if phase == "post-interrupt"]
+    post_interrupt = [timeout for phase, timeout, restart in sweeps if phase == "post-interrupt" and restart]
+    assert all(restart for _phase, _timeout, restart in sweeps)
     assert len(post_interrupt) == 1 and post_interrupt[0] is not None and post_interrupt[0] <= 2.0
     with pytest.raises(SystemExit) as exc:
         _resolve_gateway_exit_verdict(runner, signal_initiated)
@@ -89,7 +90,7 @@ async def test_sigterm_without_marker_keeps_signal_shutdown_exit_1(monkeypatch):
     runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch)
 
     assert not runner._restart_requested
-    assert ("post-interrupt", None) in sweeps
+    assert ("post-interrupt", None, False) in sweeps
     assert signal_initiated is True
     # False => start_gateway's caller exits 1 so the service manager revives the gateway.
     assert _resolve_gateway_exit_verdict(runner, signal_initiated) is False

@@ -18,6 +18,23 @@ GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_T
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
 
 
+def _cut_is_user_stop(reason) -> bool:
+    """Load stop classification lazily to avoid the delegation notification cycle."""
+    from tools.delegation_resume import is_user_cancel_reason
+    return is_user_cancel_reason(reason or "")
+
+
+def _cut_is_trusted_restart(reason) -> bool:
+    """Keep the canonical producer token useful for wording, not authority."""
+    from tools.delegation_resume import is_trusted_restart_cut
+    return is_trusted_restart_cut(reason)
+
+
+def _cut_is_recoverable(reason) -> bool:
+    """Every lifecycle cut remains recoverable unless it proves a user stop."""
+    return bool(reason) and not _cut_is_user_stop(reason)
+
+
 def acknowledge_survivor_notifications(registry, notifications) -> None:
     """Record durable delivery only after a notification consumer rendered/admitted it."""
     acknowledge = getattr(registry, "acknowledge_survivor_completion", None)
@@ -238,6 +255,54 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
+def _resume_offered(evt: dict) -> bool:
+    """Durable resume admission stamped where the event was built (``stamp_resume_availability``).
+
+    Formatting never reads state.db: a busy ledger must not make a drain raise and lose
+    unrelated completions, or block an event loop. A missing stamp fails closed."""
+    return evt.get("resume_available") is True
+
+
+def _cut_recovery_lines(evt: dict, results: list, *, offer_resume: bool = True) -> "list[str]":
+    """Offer cut recovery only when durable admission permitted the claim at build time.
+
+    ``offer_resume=False`` when a retry note follows: that note is the notice's one instruction."""
+    cut_reason = evt.get("cut_reason")
+    if not cut_reason:
+        return []
+    reason = str(cut_reason).strip()
+    goals = evt.get("goals") or []
+    indexes = evt.get("task_indexes") or list(range(len(goals))) or [0]
+    recorded = {r.get("task_index", i): r for i, r in enumerate(results)}
+    unfinished = [str(index + 1) for index in indexes
+                  if str(recorded.get(index, {}).get("status") or "").lower() not in (*_DONE, "succeeded")]
+    if len(goals) > 1:
+        detail = f"Unfinished children: {', '.join(unfinished)}." if unfinished else "No unfinished children."
+    else:
+        detail = "The task did not finish." if unfinished else "The task finished before the cut."
+    if _cut_is_user_stop(reason):
+        return [f"Stopped ({_outcome_only_stop_detail(reason)}). {detail}"]
+    when = evt.get("completed_at") or time.time()
+    stamp = time.strftime("%H:%M", time.localtime(when))
+    label = _cut_label(reason)
+    lines = [f"Cut by {label} at {stamp}. {detail}"]
+    if unfinished and offer_resume and _resume_offered(evt):
+        lines.append(
+            f"To continue from current state call delegate_task(action='resume', subagent_id='{evt['delegation_id']}').")
+    if len(goals) > 1:
+        lines.append("Do not rerun completed children.")
+    return lines
+
+
+def _cut_label(reason: str) -> str:
+    """Preserve the producer identity rather than describing every exit as a gateway cut."""
+    if _cut_is_trusted_restart(reason):
+        return "gateway restart"
+    if reason.casefold() in {"cli shutdown", "oneshot shutdown", "stopped before finishing"}:
+        return "CLI exit"
+    return "gateway shutdown/lifecycle" if reason.casefold().startswith("gateway") else "lifecycle shutdown"
+
+
 def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> str:
     """Consolidated block for a delegate_task fan-out that finished as one unit."""
     results, goals = evt.get("results") or [], evt.get("goals") or []
@@ -255,8 +320,19 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
-    if evt.get("status") == "interrupted" or any(r.get("status") == "interrupted" for r in results):
-        lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+    lines += _cut_recovery_lines(evt, results, offer_resume=not evt.get("_retry_note_shown"))
+    restart_cut = _cut_is_recoverable(evt.get("cut_reason"))
+    if evt.get("cut_reason"):
+        lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
+        lines.append(
+            "This unit was cut before its terminal result was trustworthy. "
+            "Resume only the unfinished children after verifying recorded results and side effects."
+            if restart_cut else
+            "This unit was stopped before its terminal result was trustworthy; no continuation was requested."
+        )
+    if evt.get("status") == "interrupted" or evt.get("cut_reason") or any(r.get("status") == "interrupted" for r in results):
+        if not evt.get("cut_reason") or restart_cut:
+            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
     if evt.get("error") and not results:
         lines += ["--- ERROR ---", f"The batch did not complete successfully: {_outcome_only_stop_detail(evt['error'])}"]
         return "\n".join(lines)
@@ -309,6 +385,13 @@ def _process_accounting_lines(r: dict) -> list:
     return lines
 
 
+def _retry_notice_suffix(evt: dict) -> str:
+    """A serialized cut retry note must not bypass the admission stamped on the event."""
+    if evt.get("cut_reason") and not _resume_offered(evt):
+        return ""
+    return f"\nRETRY: {evt['retry_note']}"
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the original task
     source (goal, bounded context, toolsets, role, model), dispatch time, status
@@ -319,7 +402,11 @@ def _format_async_delegation(evt: dict) -> str:
         return _format_task_failure_notice(evt, deleg_id)
     if evt.get("retry_note"):
         # Durable retry status (tools/delegation_resume.retry_note): tells the parent not to duplicate.
-        return _format_async_delegation({**evt, "retry_note": None}) + f"\nRETRY: {evt['retry_note']}"
+        # A rendered note is the notice's single instruction (resume, or "Hermes will retry; do not
+        # re-dispatch"), so the body omits its own resume line. An omitted note leaves the body's.
+        suffix = _retry_notice_suffix(evt)
+        body = {**evt, "retry_note": None, **({"_retry_note_shown": True} if suffix else {})}
+        return _format_async_delegation(body) + suffix
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), _outcome_only_stop_detail(evt.get("error"))
@@ -331,7 +418,7 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
-    lines += _notice_lines([evt]) + [
+    lines += _notice_lines([evt]) + _cut_recovery_lines(evt, [evt], offer_resume=not evt.get("_retry_note_shown")) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
         "--- RESULT ---"]
@@ -342,7 +429,8 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         if status == "interrupted":
             lines.append("The subagent was interrupted before completing" + (f": {error}" if error else "."))
-            lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
+            if not evt.get("cut_reason") or _cut_is_recoverable(evt.get("cut_reason")):
+                lines.append("Before retrying unfinished work, reconcile any non-idempotent effect first.")
         else:  # error / timeout / failed / unknown (owner died)
             lines.append(
                 f"The subagent did not complete successfully (status={status})." + (f"\n{error}" if error else ""))

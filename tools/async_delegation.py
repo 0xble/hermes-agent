@@ -242,7 +242,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -420,6 +420,9 @@ def _prune_durable_records() -> None:
                 conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks}) AND NOT {_RETENTION_OWED_SQL}",
                              evict)
                 _log_pruned_ids("pending-cap", evict)
+        conn.execute("DELETE FROM async_delegation_child_recovery WHERE NOT EXISTS "
+                     "(SELECT 1 FROM async_delegations a WHERE a.delegation_id="
+                     "async_delegation_child_recovery.delegation_id)")
         conn.execute(
             """DELETE FROM async_delegation_events
                WHERE delivery_state IN ('delivered','dropped') AND updated_at < ?""",
@@ -462,11 +465,22 @@ def _attach_retry_note(evt: Dict[str, Any]) -> None:
             record = retry_status(delegation_id)
             if record and record["retry_state"] in {"scheduled", "terminal"}:
                 plan = {"retry_state": record["retry_state"], "reason": record["retry_reason"],
-                        "due_at": record["retry_due_at"], "attempt": record["retry_attempt"] + 1}
+                        "due_at": record["retry_due_at"], "attempt": record["retry_attempt"] + 1,
+                        "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
     except Exception:  # the retry sweep classifies later if the ledger is unavailable
         logger.debug("Async delegation %s: retry classification deferred", evt.get("delegation_id"), exc_info=True)
+    _stamp_resume_availability(evt)
+
+
+def _stamp_resume_availability(evt: Dict[str, Any], conn=None) -> None:
+    """Off-loop builders and claimers record cut-resume admission; formatters only read it."""
+    try:
+        from tools.delegation_resume import stamp_resume_availability
+        stamp_resume_availability(evt, conn)
+    except Exception:  # noqa: BLE001 - an unimportable resume module offers no resume line
+        evt["resume_available"] = False
 
 
 def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
@@ -669,6 +683,7 @@ def _replay_outbox_pending(conn, rows, target_queue, now: float) -> int:
         if isinstance(evt, dict):
             evt["_delivery_event_id"] = event_id
             evt["restored"] = True
+            _stamp_resume_availability(evt, conn)
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, event_id))
@@ -887,6 +902,7 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
         evt = json.loads(payload)
         if isinstance(evt, dict):
             evt["restored"] = True
+            _stamp_resume_availability(evt, conn)
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, delegation_id))
@@ -1766,6 +1782,7 @@ def _dispatch_admitted(
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
+    task_contexts: Optional[Dict[str, str]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
     cron_execution: Optional[Dict[str, str]] = None,
     max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
@@ -1792,7 +1809,8 @@ def _dispatch_admitted(
         "interrupt_fn": interrupt_fn, "cancel_fn": cancel_fn, "runner": runner, "classify": classify,
         "crash_result": crash_result, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
-        **(cron_execution or {}), **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
+        **(cron_execution or {}), **({"task_contexts": dict(task_contexts)} if task_contexts else {}),
+        **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         "_context": contextvars.copy_context(),
         "_worker_context_runner": propagate_context_to_thread(lambda worker: worker()), "_progress_token": None,
@@ -1841,19 +1859,24 @@ def _dispatch_admitted(
         # to become durable before taking the terminal transition.
         _persist_dispatch(record)
     except Exception as exc:
-        managed_retry = False
+        from tools.delegation_resume import RetryAdmissionError, claimed_retry_source, is_recovery_spawn, release_retry_dispatch
+        # An admission rejection means another dispatch already consumed this
+        # claim; it did not take the claim and must not re-arm it or release
+        # sibling claims. Only storage/insert failures unwind a claim taken by
+        # this dispatch.
+        retry_admission_rejected = isinstance(exc, RetryAdmissionError)
+        managed_recovery = is_recovery_spawn(record)
+        retry_rearmed = False
         try:
-            from tools.delegation_resume import RetryAdmissionError, claimed_retry_source, release_retry_dispatch
-            prior = claimed_retry_source(record)
-            if prior is not None:
-                managed_retry = True
-                release_retry_dispatch(prior)
+            if not retry_admission_rejected:
+                prior = claimed_retry_source(record)
+                if prior is not None:
+                    # Explicit CLI/TUI resume claims are re-armed for a later manual
+                    # resume, not scheduled for the automatic retry notice path.
+                    had_retry_claim = bool(prior.get("retry_claim"))
+                    released = release_retry_dispatch(prior)
+                    retry_rearmed = had_retry_claim and released
         except Exception:
-            # The ledger cannot say who owns this spawn. A recovery brief must then fail
-            # closed: running it inline would bypass lineage admission and leave the
-            # original claim live for a second dispatch.
-            from tools.delegation_resume import is_recovery_spawn
-            managed_retry = is_recovery_spawn(record)
             logger.warning("Failed to release managed retry claim after persistence failure", exc_info=True)
         with _records_lock:
             if _records.get(delegation_id) is record:
@@ -1862,10 +1885,12 @@ def _dispatch_admitted(
         record["_persist_done"].set()
         from tools.delegation_resume import RetryAdmissionError
         logger.error("Failed to persist new async delegation %s", delegation_id, exc_info=True)
-        no_inline_fallback = managed_retry or isinstance(exc, RetryAdmissionError)
+        no_inline_fallback = managed_recovery or isinstance(exc, RetryAdmissionError)
         error = f"Failed to persist async delegation{label}: {exc}"
-        if managed_retry:
-            error += "; managed retry was not started and will be retried later"
+        if managed_recovery:
+            error += "; recovery was not started"
+        if retry_rearmed:
+            error += " and will be retried later"
         return {"status": "rejected", "accepted": False, "no_inline_fallback": no_inline_fallback,
                 "error": error}
     cancel_after_persist = False
@@ -1941,6 +1966,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
     delegation_id: Optional[str] = None, progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
+    task_contexts: Optional[Dict[str, str]] = None,
     task_transcripts: Optional[Dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
@@ -1960,7 +1986,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         max_queued_delegations=max_queued_delegations, cancel_fn=cancel_fn,
-        task_indexes=task_indexes, task_transcripts=task_transcripts,
+        task_indexes=task_indexes, task_contexts=task_contexts, task_transcripts=task_transcripts,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -2068,6 +2094,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     if is_batch:
         payload = {
             "is_batch": True, "results": result.get("results") or [],
+            **({"task_indexes": list(record["task_indexes"])} if record.get("task_indexes") is not None else {}),
             "live_transcripts": result.get("live_transcripts"), "error": result.get("error"),
             "total_duration_seconds": result.get("total_duration_seconds"),
             **({"group": result["group"]} if result.get("group") is not None else {})}
@@ -2608,18 +2635,24 @@ def _cancel_pending_retries_safely(caller: str, **selectors: Any) -> set:
     if not is_user_cancel_reason(reason):
         return set()
     try:
-        return set(cancel_pending_retries(**selectors))
+        return set(cancel_pending_retries(**selectors, reason=reason))
     except Exception as exc:  # noqa: BLE001 - live child interruption is the safety path
         logger.warning("%s: durable retry cancellation failed: %s", caller, exc, exc_info=True)
         return set()
 
 
-def interrupt_all(reason: str = "shutdown") -> int:
-    """Signal every interruptible async delegation to stop (``/stop``, shutdown)."""
+def interrupt_all(reason: str = "shutdown", *, session_key: str = "", origin_ui_session_id: str = "",
+                  parent_session_id: str = "") -> int:
+    """Signal every interruptible async delegation to stop (``/stop``, shutdown).
+
+    Owed retries are cancelled everywhere. A claimed legacy recovery is revoked only for the
+    stopping session named by the selectors; another session's claim is never touched."""
     with _records_lock:
         targets = [r for r in _records.values() if r.get("status") in _INTERRUPTIBLE_STATES]
     live_count = _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
-    affected = _cancel_pending_retries_safely("interrupt_all", all_sessions=True, reason=reason)
+    affected = _cancel_pending_retries_safely(
+        "interrupt_all", all_sessions=True, session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id, parent_session_id=parent_session_id, reason=reason)
     return len(affected) if affected else live_count
 
 
