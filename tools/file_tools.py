@@ -964,6 +964,10 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    if mode == "replace" and not path:
+        return tool_error(
+            "Missing required parameter 'path': supply the file path to patch.",
+            missing_parameter="path")
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
     _entry_paths: list[str] = []
@@ -995,8 +999,6 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
             # Hand the shell layer the RESOLVED targets so both layers agree on
             # which file is edited even when the shell's cwd differs.
             if mode == "replace":
-                if not path:
-                    return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
                 _replace_target = _path_to_resolved.get(path) or path

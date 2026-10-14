@@ -519,9 +519,13 @@ class SearchMixin:
 
     def _path_not_found_result(self, path: str) -> SearchResult:
         """Error result for a missing search root, with nearby-entry suggestions."""
-        parent = os.path.dirname(path) or "."
+        resolved_cwd = _normalized_filename_search_root(self.env, ".", self.cwd)
+        resolved_path = _normalized_filename_search_root(self.env, path, self.cwd)
+        parent = os.path.dirname(resolved_path)
+        nearest_parent = self._nearest_existing_parent(parent)
         basename_query = os.path.basename(path)
-        hint_parts = [f"Path not found: {path}"]
+        hint_parts = [f"Path not found: {path}", f"Resolved cwd: {resolved_cwd}",
+                      f"Nearest existing parent: {nearest_parent or 'unknown'}"]
         parent_check = self._exec(f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no")
         if "yes" in parent_check.stdout and basename_query:
             ls_result = self._exec(f"ls -1 {self._escape_shell_arg(parent)} 2>/dev/null | head -20")
@@ -532,7 +536,26 @@ class SearchMixin:
                     if e and (lq in e.lower() or e.lower() in lq or e.lower().startswith(lq[:3]))]
                 if candidates:
                     hint_parts.append("Similar paths: " + ", ".join(candidates[:5]))
-        return SearchResult(error=". ".join(hint_parts), total_count=0)
+        return SearchResult(error=". ".join(hint_parts), total_count=0, resolved_cwd=resolved_cwd,
+                            resolved_path=resolved_path, nearest_existing_parent=nearest_parent)
+
+    def _nearest_existing_parent(self, parent: str) -> Optional[str]:
+        """Probe the execution backend, not the controller filesystem for remote roots."""
+        while parent:
+            if self._native_read_enabled():
+                exists = os.path.isdir(parent)
+            else:
+                probe = self._exec(f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no")
+                if probe.cwd_error or probe.exit_code != 0:
+                    return None
+                exists = probe.stdout.strip() == "yes"
+            if exists:
+                return parent
+            ancestor = os.path.dirname(parent)
+            if ancestor == parent:
+                break
+            parent = ancestor
+        return None
 
     def _try_multi_path_search(self, pattern: str, path: str, target: str,
                                file_glob: Optional[str], limit: int, offset: int,
@@ -1066,7 +1089,16 @@ class SearchMixin:
             "Pattern contains \\n — multiline mode (-U) was enabled automatically "
             "so the regex can match across line boundaries."
         ) if multiline else None
-        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        result = self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        if result.error and re.search(r"(?m)^(?:Search failed: )?(?:rg: )?regex parse error:", result.error):
+            # Retry only a malformed regex, retaining the same root, globs and bounds.
+            cmd_parts.insert(1, "--fixed-strings")
+            note = "Invalid regex; retried once as a fixed-string (literal) search."
+            result = self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context,
+                                               warning=ml_note)
+            # Append to the multiline note (count mode does not carry it through).
+            result.warning = " ".join(part for part in (result.warning or ml_note, note) if part)
+        return result
 
     def _grep_cmd(self, head: list[str], pattern: str, output_mode: str, context: int,
                   file_glob: Optional[str] = None) -> list[str]:
