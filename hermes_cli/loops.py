@@ -1101,11 +1101,41 @@ class LoopManager:
         except Exception as exc:
             logger.debug("LoopManager: tick outcome write failed: %s", exc)
             return False
+        if settled is None and self._follow_compression():
+            # Compression migrated the loop (verbatim, same instance and tick) after this manager
+            # loaded it; the claim now lives on the continuation. Settle it there, under the same
+            # conditional fence, so an abandoned or completed tick never strands the child at
+            # awaiting_response. A user pause or stop on the child still rejects the outcome.
+            try:
+                settled = db._execute_write(write)
+            except Exception as exc:
+                logger.debug("LoopManager: tick outcome write failed: %s", exc)
+                return False
         if settled is None:
             self.refresh()
             return False
         self._state = settled
         self._mark_synced()
+        return True
+
+    def _follow_compression(self) -> bool:
+        """Rebind this manager to the compression continuation that now owns its loop.
+
+        ``migrate_loop_to_session`` copies the row verbatim and archives the parent as cleared,
+        so a manager loaded before the rotation would otherwise settle against the archived row.
+        Only a validated compression successor holding the same loop instance qualifies; a fork,
+        a user stop (no successor row), or an ambiguous lineage leaves the manager unchanged."""
+        s = self._state
+        if s is None or self._cursor is not None:
+            return False
+        from hermes_cli.session_controls import migrated_successor
+
+        successor = migrated_successor("loop", self.session_id)
+        moved = load_loop(successor) if successor else None
+        if moved is None or moved.created_at != s.created_at:
+            return False
+        logger.debug("LoopManager: following migrated loop %s -> %s", self.session_id, successor)
+        self.session_id = successor
         return True
 
     def _superseded_result(self) -> Dict[str, Any]:

@@ -973,3 +973,187 @@ async def test_fifo_continuation_superseded_inside_preparation_never_reaches_the
         runner, ctx, runner.adapter, event.text, event, "", {"interrupted": True, "messages": []}, None,
     )
     runner._run_agent.assert_not_awaited()
+
+
+# ── Compression between the scheduler's claim and adapter admission ─────────────────────────────
+# fire_tick() / the post-turn judge stamp the wake with the parent session; compression can migrate
+# the goal or loop to its continuation before admit_internal_event runs. Admission (no running
+# session id yet) must follow the compression successor, and a refused admission must roll the
+# claim back where it now lives, never leave the migrated loop awaiting a tick that never runs.
+
+def _loop_fire_runner(runner, *, accept=True):
+    from gateway.session import Platform, SessionSource
+
+    async def handle(event):
+        event._gateway_accepted = accept
+
+    runner.adapter.handle_message = AsyncMock(side_effect=handle)
+    runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: runner.adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.TELEGRAM, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"])
+    runner._session_key_for_source = lambda source: runner.target.session_key
+    runner._running_agents = {}
+    return runner
+
+
+async def _fire_then_compress(runner, state, prompt):
+    import time
+    from hermes_cli.loops import LoopManager
+
+    manager = LoopManager("target")
+    manager.set(prompt, interval_seconds=300, route={
+        "platform": "telegram", "chat_id": "target", "chat_type": "dm", "user_id": "1"})
+    manager.state.next_due_at = 0
+    manager._save()
+    real_fire = LoopManager.fire_tick
+
+    def fire_then_compress(self):
+        wakeup = real_fire(self)
+        _rotate_wake(state, "loop")  # compression lands between the claim and admission
+        return wakeup
+
+    with patch.object(LoopManager, "fire_tick", fire_then_compress):
+        await runner._loop_wakeup_fire_one("target", LoopManager("target").state, time.time(), set())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["check the queue", "/status"])
+async def test_admission_follows_loop_migrated_after_fire_tick_and_settles_on_child(state, prompt):
+    from hermes_cli.loops import LoopManager, load_loop
+
+    runner = _loop_fire_runner(_runner(state))
+    await _fire_then_compress(runner, state, prompt)
+    runner.adapter.handle_message.assert_awaited_once()
+    event = runner.adapter.handle_message.await_args.args[0]
+    assert event.metadata["loop_wakeup_session_id"] == "compression-child"
+    assert load_loop("target").status == "cleared"
+    if prompt.startswith("/"):
+        # A command tick is completed right after admission; that settlement must land on the child.
+        child = load_loop("compression-child")
+        assert child.awaiting_response is False and child.ticks_fired == 1
+        return
+    assert load_loop("compression-child").awaiting_response is True
+    identity = runner._post_turn_goal_identity(event)
+    await runner._post_turn_loop_completion(
+        session_entry=SimpleNamespace(session_id="compression-child"), source=None,
+        final_response="progress", loop_tick=identity["loop_tick"])
+    child = load_loop("compression-child")
+    assert child.awaiting_response is False and child.ticks_fired == 1
+    assert LoopManager("compression-child").fire_tick() is None  # rescheduled, not wedged
+
+
+@pytest.mark.asyncio
+async def test_admission_refused_after_compression_rolls_back_the_child_claim(state):
+    from hermes_cli.loops import LoopManager, load_loop
+
+    runner = _loop_fire_runner(_runner(state), accept=False)
+    await _fire_then_compress(runner, state, "check the queue")
+    runner.adapter.handle_message.assert_awaited_once()
+    child = load_loop("compression-child")
+    assert child.awaiting_response is False
+    assert child.ticks_fired == 0
+    manager = LoopManager("compression-child")
+    manager.state.next_due_at = 0
+    manager._save()
+    assert manager.fire_tick()  # the next scan fires the tick again
+    assert load_loop("compression-child").ticks_fired == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("producer", ["post_turn", "control"])
+async def test_admission_follows_goal_continuation_migrated_before_admit(state, producer):
+    from gateway.wake import admit_internal_event
+    from hermes_cli.goals import GoalManager
+
+    runner = _runner(state)
+    GoalManager("target").set("watch the build")
+    if producer == "control":
+        GoalManager("target").pause()
+        event = await _control_event(runner, _apply(state, "resume"))
+    else:
+        event = await _post_turn_event(runner)
+    child = _rotate_wake(state, "goal")
+
+    async def accept(current):
+        current._gateway_accepted = True
+
+    runner.adapter.handle_message = AsyncMock(side_effect=accept)
+    await admit_internal_event(runner.adapter, event)
+    runner.adapter.handle_message.assert_awaited_once_with(event)
+    assert event.metadata["goal_continuation_session_id"] == child
+    if producer == "control":
+        assert event.metadata["gateway_session_id"] == child
+
+
+def test_lifted_wait_clear_follows_goal_migrated_before_admission(state):
+    import time
+    from hermes_cli.goals import GoalManager, load_goal
+
+    manager = GoalManager("target")
+    manager.set("watch the build")
+    manager.state.waiting_until = time.time() - 1
+    manager.state.waiting_since = 123.0
+    manager._save()
+    _rotate_wake(state, "goal")
+    # The idle ticker loaded its manager on the parent; admission rebound the wake to the child.
+    assert manager.clear_lifted_wait(123.0) is True
+    assert not load_goal("compression-child").waiting_until
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_admission_inbound_preresolution_follows_migrated_wake(state, kind):
+    from gateway.run_inbound import GatewayInboundMixin
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, kind, False)
+    child = _rotate_wake(state, kind)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, source: event)
+    runner._is_user_authorized_for_source = lambda source: True
+    runner._admit_bot_message_for_source = lambda source: True
+    with patch("gateway.run_inbound._admit_outbox_event", new=AsyncMock()) as admit:
+        admitted = await GatewayInboundMixin._hm_admit_event(runner, event)
+    assert admitted is not None
+    admit.assert_awaited_once()
+    key = "goal_continuation_session_id" if kind == "goal" else "loop_wakeup_session_id"
+    assert event.metadata[key] == child
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    "pause_child", "stop_child", "stop_parent", "session_reset", "branch", "reset_marker", "ambiguous",
+])
+async def test_admission_still_drops_wake_superseded_by_user_or_non_compression(state, change):
+    from gateway.wake import WakeSuperseded, admit_internal_event
+    from hermes_cli.loops import LoopManager, load_loop
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, "loop", False)
+    if change == "stop_parent":
+        LoopManager("target").clear()
+    elif change in {"session_reset", "branch", "reset_marker"}:
+        _rotate_wake(state, "loop", reason="session_reset" if change == "session_reset" else "compression",
+                     marker={"branch": "_branched_from", "reset_marker": "_reset_from"}.get(change))
+    else:
+        child = _rotate_wake(state, "loop")
+        if change == "pause_child":
+            LoopManager(child).pause("user-paused")
+        elif change == "stop_child":
+            LoopManager(child).clear()
+        else:
+            state.create_session("stale-sibling", "telegram", parent_session_id="target",
+                                 profile_name="default", chat_id="target", chat_type="private",
+                                 session_key="agent:main:telegram:dm:target")
+    runner.adapter.handle_message = AsyncMock()
+    original = dict(event.metadata)
+    with pytest.raises(WakeSuperseded):
+        await admit_internal_event(runner.adapter, event)
+    runner.adapter.handle_message.assert_not_awaited()
+    assert event.metadata == original
+    if change in {"pause_child", "stop_child"}:
+        # A user stop/pause is not rolled back into a fresh claim either.
+        LoopManager("target").abandon_tick()
+        assert load_loop("compression-child").status == ("paused" if change == "pause_child" else "cleared")

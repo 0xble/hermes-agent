@@ -834,8 +834,10 @@ class GatewayGoalsMixin:
                 await self._run_in_executor_with_context(mgr.complete_tick, "")
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
+            # Off-loop: the rollback is a conditional SessionDB write and, when compression
+            # migrated the loop after fire_tick(), follows the claim to the continuation.
             with suppress(Exception):
-                mgr.abandon_tick()
+                await self._run_in_executor_with_context(mgr.abandon_tick)
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

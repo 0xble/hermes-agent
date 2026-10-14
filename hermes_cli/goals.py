@@ -2772,8 +2772,19 @@ class GoalManager:
     def clear_lifted_wait(self, waiting_since: float) -> bool:
         """Clear the barrier an idle surface just resumed, only if it is still that same wait
         (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
-        and parked again; a blind ``stop_waiting`` would erase that newer barrier."""
+        and parked again; a blind ``stop_waiting`` would erase that newer barrier.
+
+        Compression can migrate the goal between the barrier check and admission; admission then
+        rebinds the continuation to the successor, so the wait it lifted lives there too."""
         cleared, current = clear_goal_wait_if_since(self.session_id, waiting_since)
+        if not cleared and current is not None and current.status == "cleared":
+            from hermes_cli.session_controls import migrated_successor
+
+            successor = migrated_successor("goal", self.session_id or "", {"status": "cleared"})
+            moved = load_goal(successor) if successor else None
+            if moved is not None and moved.created_at == current.created_at:
+                self.session_id = successor
+                cleared, current = clear_goal_wait_if_since(successor, waiting_since)
         if current is not None:
             self._state = current
         return cleared

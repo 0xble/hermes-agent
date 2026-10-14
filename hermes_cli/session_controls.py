@@ -591,6 +591,60 @@ def _wake_session_matches(stamped_sid: str, session_id: str, *, cursor=None) -> 
     return row is not None
 
 
+def compression_successor(session_id: str, *, cursor=None) -> Optional[str]:
+    """Newest compression continuation of *session_id*, or None when there is none.
+
+    The forward twin of ``_wake_session_matches``: follows only compression edges with the same
+    predicates, so branch, delegate, reset and tool children never qualify. A step with more than
+    one candidate child, a cycle, or a lineage deeper than the walk bound fails closed (None)."""
+    if not session_id:
+        return None
+    from hermes_state_common import _COMPRESSION_CHILD_SQL, _non_continuation_child_sql
+
+    db = _db() if cursor is None else None
+    if cursor is None and db is None:
+        return None
+    sql = (f"SELECT c.id FROM sessions c WHERE c.parent_session_id = ?\n"
+           f"  AND {_COMPRESSION_CHILD_SQL.format(a='c')}\n"
+           f"{_non_continuation_child_sql('c.', 'c.parent_session_id')} LIMIT 2")
+    current, seen = session_id, {session_id}
+    with (db._read_ctx() if cursor is None else nullcontext(cursor)) as conn:
+        for _ in range(64):
+            rows = conn.execute(sql, (current,)).fetchall()
+            if not rows:
+                return current if current != session_id else None
+            if len(rows) > 1 or rows[0][0] in seen:
+                return None
+            current = rows[0][0]
+            seen.add(current)
+    return None
+
+
+def migrated_successor(kind: str, session_id: str, stored: Any = ...) -> Optional[str]:
+    """The compression successor that now owns *session_id*'s ``goal`` or ``loop`` row.
+
+    Only when the stamped row was archived (``cleared``) or is missing; callers validate the
+    successor's own row exactly as an in-place wake. A user/control stop also writes ``cleared``,
+    but then compression never migrated the row, so no successor row exists and this returns None.
+    Lookup failures fail closed (None). ``stored`` is the already-read stamped row, if any."""
+    try:
+        db = _db()
+        if db is None:
+            return None
+        if stored is ...:
+            raw = db.get_meta(_definition_key(kind, session_id))
+            stored = json.loads(raw) if raw else None
+        if isinstance(stored, dict) and stored.get("status") != "cleared":
+            return None
+        successor = compression_successor(session_id)
+        if not successor or not db.get_meta(_definition_key(kind, successor)):
+            return None
+        return successor
+    except Exception:
+        logger.debug("%s wake successor lookup failed for %s", kind, session_id, exc_info=True)
+        return None
+
+
 def _rebind_wake_session(metadata: Dict[str, Any], key: str, session_id: str) -> None:
     """Publish the validated child's identity for execution and post-turn settlement."""
     old_sid = metadata[key]
@@ -629,7 +683,14 @@ def goal_continuation_is_current(metadata: Any, session_id: str = "", *, cursor=
         raw = _meta_value(cursor, _definition_key("goal", target_sid)) if cursor is not None else (
             db.get_meta(_definition_key("goal", target_sid)) if db is not None else None
         )
-        if not _goal_continuation_matches(metadata, session_id, json.loads(raw) if raw else None, cursor=cursor):
+        definition = json.loads(raw) if raw else None
+        if not session_id and cursor is None:
+            # Admission runs before any session resolved: compression may have migrated the goal
+            # after the continuation was stamped. Follow the validated successor, never a fork.
+            successor = migrated_successor("goal", sid, definition)
+            if successor:
+                return goal_continuation_is_current(metadata, successor)
+        if not _goal_continuation_matches(metadata, session_id, definition, cursor=cursor):
             return False
         _rebind_wake_session(metadata, "goal_continuation_session_id", target_sid)
         return True
@@ -664,6 +725,12 @@ def loop_wake_is_current(metadata: Any, session_id: str = "", *, cursor=None) ->
     sid = metadata.get("loop_wakeup_session_id")
     if not isinstance(sid, str) or not sid:
         return False
+    if not session_id and cursor is None:
+        # Admission runs before any session resolved: compression may have migrated the loop
+        # between fire_tick() and here. Validate the successor's row, never a fork's.
+        successor = migrated_successor("loop", sid)
+        if successor:
+            return loop_wake_is_current(metadata, successor)
     target_sid = session_id or sid
     rebinding = sid != target_sid
     try:
