@@ -184,7 +184,7 @@ def test_busy_inference_controls_reconfigure_live_requests():
     agent = runner._running_agents[key]
     agent.reasoning_config = {"enabled": True, "effort": "low"}
     agent.service_tier = None
-    agent.model, agent.provider, agent.base_url = "gpt-5.1", "openai", "https://api.openai.com/v1"
+    agent.model, agent.provider, agent.base_url = "gpt-6.1-sol", "openai", "https://api.openai.com/v1"
     agent._gateway_base_request_overrides = {"extra_body": {"custom": "keep"}}
     agent.request_overrides = dict(agent._gateway_base_request_overrides)
     runner._agent_cache = {key: (agent,)}
@@ -196,6 +196,10 @@ def test_busy_inference_controls_reconfigure_live_requests():
     assert first_request == {"extra_body": {"custom": "keep"}}
     assert effective_request_overrides(agent) == {
         "extra_body": {"custom": "keep"}, "service_tier": "priority",
+    }
+    runner._apply_fast_selection(key, "ultrafast")
+    assert effective_request_overrides(agent) == {
+        "extra_body": {"custom": "keep"}, "service_tier": "ultrafast",
     }
     runner._apply_fast_selection(key, "normal")
     assert effective_request_overrides(agent) == first_request

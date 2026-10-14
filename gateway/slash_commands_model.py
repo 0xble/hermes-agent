@@ -822,7 +822,7 @@ class GatewayModelCommandsMixin:
             self._evict_idle_agent_after_session_control(session_key)
             return
         from hermes_cli.models import resolve_fast_mode_overrides
-        from agent.fast_mode import DEFAULT_WINDOW_SECONDS
+        from agent.fast_mode import DEFAULT_WINDOW_SECONDS, STATIC_TIERS
         import time
 
         baseline = getattr(agent, "_gateway_base_request_overrides", None)
@@ -830,10 +830,10 @@ class GatewayModelCommandsMixin:
             baseline = dict(getattr(agent, "request_overrides", None) or {})
             agent._gateway_base_request_overrides = dict(baseline)
         overrides = dict(baseline)
-        if tier == "priority":
+        if tier in STATIC_TIERS:
             overrides.update(resolve_fast_mode_overrides(
                 agent.model, provider=getattr(agent, "provider", None),
-                base_url=getattr(agent, "base_url", None),
+                base_url=getattr(agent, "base_url", None), tier=tier,
             ) or {})
         agent.request_overrides = overrides
         agent.service_tier = tier
