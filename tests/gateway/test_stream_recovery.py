@@ -284,6 +284,60 @@ async def test_adopted_preview_is_edited_even_when_the_re_answer_is_identical():
 
 
 @pytest.mark.asyncio
+async def test_failed_forced_edit_resends_the_whole_re_answer():
+    # The adopted text is write-ahead and the forced edit never landed: nothing is known to be
+    # on screen, so the fallback must send the complete re-answer, not suppress or trim it.
+    record(content="complete answer", message_id="m1")
+    sends = []
+
+    async def edit_message(**kwargs):
+        return SendResult(success=False, error="message not found")
+
+    async def send(**kwargs):
+        sends.append(kwargs["content"])
+        return SendResult(success=True, message_id="m2")
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(edit_message=edit_message, send=send), "chat",
+                                     config=StreamConsumerConfig(cursor=""))
+    restore(make_runner(), consumer)
+    assert not await consumer._edit_existing("complete answer", finalize=False, is_turn_final=False)
+    assert consumer._fallback_final_send and consumer._visible_prefix() == ""
+    assert not consumer.has_durably_delivered_text("complete answer")
+    assert consumer.delivered_final_matches("complete answer") is not True
+    await consumer._send_fallback_final("complete answer")
+    assert sends == ["complete answer"]
+
+
+@pytest.mark.asyncio
+async def test_adopted_preview_survives_a_leading_segment_boundary():
+    # A resumed turn that opens with a tool call or commentary must still finish in the
+    # adopted message, and the unconfirmed partial is never recorded as a delivered segment.
+    record(content="partial", message_id="m1")
+    edits, sends = [], []
+
+    async def edit_message(**kwargs):
+        edits.append((kwargs["message_id"], kwargs["content"]))
+        return SendResult(success=True, message_id=kwargs["message_id"])
+
+    async def send(**kwargs):
+        sends.append(kwargs["content"])
+        return SendResult(success=True, message_id="new")
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(edit_message=edit_message, send=send), "chat",
+                                     config=StreamConsumerConfig(cursor=""))
+    restore(make_runner(), consumer)
+    consumer._reset_segment_state(preserve_no_edit=True)
+    assert consumer.message_id == "m1" and consumer._delivered_segment_texts == []
+    assert not consumer.has_delivered_text("partial")
+    assert await consumer._send_or_edit("partial and the rest", finalize=False, is_turn_final=False)
+    assert edits == [("m1", "partial and the rest")] and sends == []
+    # Once confirmed, the next boundary is ordinary: the segment counts and the id is released.
+    consumer._reset_segment_state()
+    assert consumer.message_id is None
+    assert consumer._delivered_segment_texts == ["partial and the rest"]
+
+
+@pytest.mark.asyncio
 async def test_post_ack_journal_write_skipped_when_message_id_is_unchanged():
     writes = []
 

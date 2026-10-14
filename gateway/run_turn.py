@@ -1835,8 +1835,10 @@ class GatewayTurnMixin:
 
     async def _hmwa_post_turn_hooks(self, hook_ctx, agent_result, response):
         """agent:end hook, process-watcher scheduling, and watch-notification drain."""
+        from gateway.stream_recovery import unmark_recovered_reply
         await self.hooks.emit("agent:end", {
-            **hook_ctx, "response": (response or "")[:500], "model": agent_result.get("model", ""),
+            **hook_ctx, "response": unmark_recovered_reply(response or "", agent_result)[:500],
+            "model": agent_result.get("model", ""),
             "provider": agent_result.get("provider", ""),
         })
 
@@ -2161,7 +2163,8 @@ class GatewayTurnMixin:
         )
         # Paste-ready text is read, never spoken, on every platform.
         from gateway.copy_blocks import strip_copy_blocks
-        _spoken = strip_copy_blocks(response) if response else response
+        from gateway.stream_recovery import unmark_recovered_reply
+        _spoken = strip_copy_blocks(unmark_recovered_reply(response, agent_result)) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):

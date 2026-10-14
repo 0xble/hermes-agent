@@ -160,10 +160,10 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
     consumer._adopt_message_id(preview["message_id"])
     consumer._last_sent_text = preview["content"]
     # The row is written BEFORE the edit it names, so the user may never have seen it:
-    # an identical re-answer must still be edited onto the message.
-    consumer._force_next_edit = True
+    # until an edit lands, an identical re-answer is still edited onto the message and
+    # this text never counts as visible or delivered.
+    consumer._adopted_unconfirmed = consumer._message_id
     consumer._already_sent = True
-    consumer._first_message_sent_at = time.monotonic()
 
 
 def mark_recovered_reply(result, consumer):

@@ -298,12 +298,17 @@ class StreamTransportMixin:
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
-        self._force_next_edit = False
+        self._adopted_unconfirmed = None
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
             self._record_turn_final_payload(text)
         return True
+
+    def _adoption_unconfirmed(self) -> bool:
+        """An adopted crash preview is still the edit target and no edit to it has landed."""
+        adopted = getattr(self, "_adopted_unconfirmed", None)
+        return bool(adopted) and getattr(self, "_message_id", None) == adopted
 
     def _adopt_message_id(self, message_id) -> None:
         """Retarget edits at ``message_id``; None → "__no_edit__" sentinel so we never edit it."""
@@ -404,6 +409,7 @@ class StreamTransportMixin:
         if await self._try_frame(self._send_frame(text, finalize=finalize),
                                  "send_stream_frame raised, disabling native streaming: %s"):
             self._already_sent = True
+            self._adopted_unconfirmed = None  # a landed frame supersedes any adopted text
             self._last_sent_text = text
             self._native_last_pushed_len = len(text)
             if finalize:
@@ -516,7 +522,7 @@ class StreamTransportMixin:
         # unchanged; everyone else short-circuits.
         # An adopted crash preview's text is write-ahead: the platform may never have shown
         # it, so the first edit after adoption always goes out, even byte-identical.
-        if (text == self._last_sent_text and not getattr(self, "_force_next_edit", False)
+        if (text == self._last_sent_text and not self._adoption_unconfirmed()
                 and not (finalize and self._adapter_requires_finalize)):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
@@ -547,7 +553,7 @@ class StreamTransportMixin:
             await self._journal_preview(self._last_sent_text, self._message_id)
             return True
         self._already_sent = True
-        self._force_next_edit = False
+        self._adopted_unconfirmed = None
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset

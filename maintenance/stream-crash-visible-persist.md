@@ -44,9 +44,15 @@ never the agent's own dict; the copy carries `recovered_reply`, and the
 no-new-messages transcript fallback strips the marker, so model history and
 persistence retain the actual re-answer. Failed/interrupted results are not
 fabricated completions. The journal row is write-ahead, so an adopted preview
-may name text the user never saw: the first edit after adoption is forced even
-when the re-answer is byte-identical. An ACK without a message ID skips the
-post-ACK write, which would only repeat the write-ahead row.
+may name text the user never saw. Until an edit to the adopted message lands,
+that text is unconfirmed: the first edit is forced even when the re-answer is
+byte-identical, the visible prefix reads empty and durable-delivery checks
+ignore it, so a failed forced edit falls back to sending the whole re-answer.
+An unconfirmed adoption also survives the resumed turn's first segment boundary
+(tool call or commentary first): the adopted ID stays the edit target and the
+stale partial is not recorded as a delivered segment. An ACK without a message
+ID skips the post-ACK write, which would only repeat the write-ahead row. The
+agent:end hook and TTS read the reply without the recovered-reply marker.
 Ephemeral native draft frames are not journaled. Journal writes are
 best-effort: a failure is logged and never changes delivery. Every path that
 replaces or deletes the on-screen preview re-records or discards first:

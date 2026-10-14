@@ -138,8 +138,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._on_before_finalize = on_before_finalize
         self._on_preview = on_preview
         self._recovered_send_uncertain = False
-        # Set when a crash-journaled preview is adopted; cleared by the first landed edit.
-        self._force_next_edit = False
+        # Set when a crash-journaled preview is adopted; cleared by the first landed edit. The
+        # row is write-ahead, so until then its text is not known to be on screen: it forces the
+        # first edit, counts as neither visible nor delivered, and the adopted id survives a
+        # segment boundary (see _reset_segment_state). Holds the adopted id: any path that
+        # retargets ``_message_id`` (fallback resend, split) ends it implicitly.
+        self._adopted_unconfirmed: Optional[str] = None
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -401,7 +405,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
         target = self._clean_for_display(copy_free_text_for(self.adapter, text or "")).strip()
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
-        if self._already_sent:
+        if self._already_sent and not self._adoption_unconfirmed():
             seen.append(self._visible_prefix())
         return bool(target) and any(sent.strip() == target for sent in seen)
 
@@ -481,13 +485,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        # An adopted crash preview nothing has confirmed yet is not delivered text, and it
+        # stays the edit target across the boundary so the resumed turn's first real content
+        # replaces it instead of leaving the stale partial frozen above a new message.
+        adopted = ((self._message_id, self._message_created_ts, self._last_sent_text)
+                   if self._adoption_unconfirmed() else None)
         # Retain the segment's visible text so has_delivered_text still matches.
-        finalized = self._clean_for_display(self._last_sent_text).strip()
+        finalized = "" if adopted else self._clean_for_display(self._last_sent_text).strip()
         if finalized:
             self._delivered_segment_texts.append(finalized)
         # Also clears the final flags: what we delivered was an interim preamble.  Safe:
         # got_done returns before any reset; run.py reads flags after the task exits.
         self._reset_message_state()
+        if adopted:
+            self._message_id, self._message_created_ts, self._last_sent_text = adopted
         # Telegram-shaped drafts: bump draft_id so the next segment animates as a fresh
         # preview below the tool-progress bubbles.  Stream-is-the-message adapters keep
         # ONE stream per turn — a bump there left one frozen message per segment.

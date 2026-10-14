@@ -42,6 +42,8 @@ class StreamFallbackMixin:
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
+        if self._adoption_unconfirmed():
+            return ""  # write-ahead crash text no edit has confirmed on screen
         prefix = self._last_sent_text or ""
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
             prefix = prefix[:-len(self.cfg.cursor)]
