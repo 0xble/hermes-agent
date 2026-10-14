@@ -471,6 +471,16 @@ def _attach_retry_note(evt: Dict[str, Any]) -> None:
             evt["retry_note"] = note
     except Exception:  # the retry sweep classifies later if the ledger is unavailable
         logger.debug("Async delegation %s: retry classification deferred", evt.get("delegation_id"), exc_info=True)
+    _stamp_resume_availability(evt)
+
+
+def _stamp_resume_availability(evt: Dict[str, Any], conn=None) -> None:
+    """Off-loop builders and claimers record cut-resume admission; formatters only read it."""
+    try:
+        from tools.delegation_resume import stamp_resume_availability
+        stamp_resume_availability(evt, conn)
+    except Exception:  # noqa: BLE001 - an unimportable resume module offers no resume line
+        evt["resume_available"] = False
 
 
 def _outbox_event_id(event: Dict[str, Any], event_kind: str) -> str:
@@ -673,6 +683,7 @@ def _replay_outbox_pending(conn, rows, target_queue, now: float) -> int:
         if isinstance(evt, dict):
             evt["_delivery_event_id"] = event_id
             evt["restored"] = True
+            _stamp_resume_availability(evt, conn)
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, event_id))
@@ -891,6 +902,7 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
         evt = json.loads(payload)
         if isinstance(evt, dict):
             evt["restored"] = True
+            _stamp_resume_availability(evt, conn)
         target_queue.put(evt)
         with _orphan_lock:
             _offered.add((home, delegation_id))
@@ -2618,12 +2630,18 @@ def _cancel_pending_retries_safely(caller: str, **selectors: Any) -> set:
         return set()
 
 
-def interrupt_all(reason: str = "shutdown") -> int:
-    """Signal every interruptible async delegation to stop (``/stop``, shutdown)."""
+def interrupt_all(reason: str = "shutdown", *, session_key: str = "", origin_ui_session_id: str = "",
+                  parent_session_id: str = "") -> int:
+    """Signal every interruptible async delegation to stop (``/stop``, shutdown).
+
+    Owed retries are cancelled everywhere. A claimed legacy recovery is revoked only for the
+    stopping session named by the selectors; another session's claim is never touched."""
     with _records_lock:
         targets = [r for r in _records.values() if r.get("status") in _INTERRUPTIBLE_STATES]
     live_count = _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
-    affected = _cancel_pending_retries_safely("interrupt_all", all_sessions=True, reason=reason)
+    affected = _cancel_pending_retries_safely(
+        "interrupt_all", all_sessions=True, session_key=session_key,
+        origin_ui_session_id=origin_ui_session_id, parent_session_id=parent_session_id, reason=reason)
     return len(affected) if affected else live_count
 
 

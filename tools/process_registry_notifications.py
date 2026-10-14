@@ -245,10 +245,18 @@ def _recovery_lines(evt: dict) -> "list[str]":
     return lines
 
 
-def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
-    """Offer cut recovery only when durable admission still permits the claim."""
-    from tools.delegation_resume import resume_available
+def _resume_offered(evt: dict) -> bool:
+    """Durable resume admission stamped where the event was built (``stamp_resume_availability``).
 
+    Formatting never reads state.db: a busy ledger must not make a drain raise and lose
+    unrelated completions, or block an event loop. A missing stamp fails closed."""
+    return evt.get("resume_available") is True
+
+
+def _cut_recovery_lines(evt: dict, results: list, *, offer_resume: bool = True) -> "list[str]":
+    """Offer cut recovery only when durable admission permitted the claim at build time.
+
+    ``offer_resume=False`` when a retry note follows: that note is the notice's one instruction."""
     cut_reason = evt.get("cut_reason")
     if not cut_reason:
         return []
@@ -268,7 +276,7 @@ def _cut_recovery_lines(evt: dict, results: list) -> "list[str]":
     stamp = time.strftime("%H:%M", time.localtime(when))
     label = _cut_label(reason)
     lines = [f"Cut by {label} at {stamp}. {detail}"]
-    if unfinished and resume_available(evt.get("delegation_id", "")):
+    if unfinished and offer_resume and _resume_offered(evt):
         lines.append(
             f"To continue from current state call delegate_task(action='resume', subagent_id='{evt['delegation_id']}').")
     if len(goals) > 1:
@@ -302,7 +310,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
         completed_at, with_goal=False)
     lines[-1] += f"   Total duration: {evt.get('total_duration_seconds', evt.get('duration_seconds', '?'))}s"
     lines += _recovery_lines(evt)
-    lines += _cut_recovery_lines(evt, results)
+    lines += _cut_recovery_lines(evt, results, offer_resume=not evt.get("_retry_note_shown"))
     restart_cut = _cut_is_recoverable(evt.get("cut_reason"))
     if evt.get("cut_reason"):
         lines += [f"Cut reason: {_outcome_only_stop_detail(evt['cut_reason'])}"]
@@ -368,10 +376,8 @@ def _process_accounting_lines(r: dict) -> list:
 
 
 def _retry_notice_suffix(evt: dict) -> str:
-    """A serialized cut retry note must not bypass the current admission gate."""
-    from tools.delegation_resume import resume_available
-
-    if evt.get("cut_reason") and not resume_available(evt.get("delegation_id", "")):
+    """A serialized cut retry note must not bypass the admission stamped on the event."""
+    if evt.get("cut_reason") and not _resume_offered(evt):
         return ""
     return f"\nRETRY: {evt['retry_note']}"
 
@@ -386,7 +392,11 @@ def _format_async_delegation(evt: dict) -> str:
         return _format_task_failure_notice(evt, deleg_id)
     if evt.get("retry_note"):
         # Durable retry status (tools/delegation_resume.retry_note): tells the parent not to duplicate.
-        return _format_async_delegation({**evt, "retry_note": None}) + _retry_notice_suffix(evt)
+        # A rendered note is the notice's single instruction (resume, or "Hermes will retry; do not
+        # re-dispatch"), so the body omits its own resume line. An omitted note leaves the body's.
+        suffix = _retry_notice_suffix(evt)
+        body = {**evt, "retry_note": None, **({"_retry_note_shown": True} if suffix else {})}
+        return _format_async_delegation(body) + suffix
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), _outcome_only_stop_detail(evt.get("error"))
@@ -398,7 +408,7 @@ def _format_async_delegation(evt: dict) -> str:
         "have moved on since dispatching it; the task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
         completed_at, with_goal=True)
-    lines += _notice_lines([evt]) + _cut_recovery_lines(evt, [evt]) + [
+    lines += _notice_lines([evt]) + _cut_recovery_lines(evt, [evt], offer_resume=not evt.get("_retry_note_shown")) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
         + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
         "--- RESULT ---"]

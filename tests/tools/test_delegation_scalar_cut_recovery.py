@@ -28,6 +28,24 @@ def ledger(tmp_path, monkeypatch):
     ad._reset_for_tests()
 
 
+def _await_completion(delegation_id, timeout=5.0):
+    """The shared queue may carry other events; wait for this unit's own completion."""
+    deadline, others = time.monotonic() + timeout, []
+    try:
+        while time.monotonic() < deadline:
+            try:
+                candidate = process_registry.completion_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if candidate.get("delegation_id") == delegation_id:
+                return candidate
+            others.append(candidate)
+    finally:
+        for other in others:
+            process_registry.completion_queue.put(other)
+    raise AssertionError(f"no completion for {delegation_id}")
+
+
 @pytest.mark.parametrize("origin", [
     {"session_key": "", "origin_ui_session_id": "tui-tab-1"},
     {"session_key": "agent:main:api_server:dm:1"},
@@ -50,8 +68,8 @@ def test_scalar_cut_notice_admits_one_recovery_from_current_state(origin, cut_re
         )
         assert handle["accepted"] and started.wait(5)
         assert ad.interrupt_all(cut_reason) == 1
-        event = process_registry.completion_queue.get(timeout=5)
         did = handle["delegation_id"]
+        event = _await_completion(did)
         assert dr.retry_status(did)["retry_state"] == "none"
         text = _format_async_delegation(event)
         assert f"delegate_task(action='resume', subagent_id='{did}')" in text
@@ -64,9 +82,11 @@ def test_scalar_cut_notice_admits_one_recovery_from_current_state(origin, cut_re
         if cut_reason == "stopped before finishing":
             assert "CLI exit" in text
             assert "gateway" not in text.lower()
-        # Rendering is read-only, and a later render must not promise a spent claim,
-        # including a retry note serialized before the claim was spent.
+        # Rendering is read-only, and a re-offered copy (restamped off-loop on replay or claim) must
+        # not promise a spent claim, including a retry note serialized before the claim was spent.
         event["retry_note"] = f"To continue call delegate_task(action='resume', subagent_id='{did}')."
+        dr.stamp_resume_availability(event)
+        assert event["resume_available"] is False
         assert "action='resume'" not in _format_async_delegation(event)
         assert json.loads(_handle_control_action("resume", did, None, Parent())).get("error")
         with ad._DB_LOCK, ad._transaction() as conn:
@@ -98,6 +118,7 @@ def test_successful_scalar_child_is_not_resumable_even_in_an_interrupted_row(chi
     _, reason = dr.inspect_resumable(did)
     assert reason is not None
     assert json.loads(_handle_control_action("resume", did, None, Parent())).get("error")
+    dr.stamp_resume_availability(event)
     assert "action='resume'" not in _format_async_delegation(event)
     record = dr.retry_status(did)
     assert record["resume_state"] == "none" and record["resume_attempts"] == 0

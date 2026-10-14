@@ -29,15 +29,19 @@ Scope (deliberately narrow — see ``maintenance/delegation-restart.md`` slice 2
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 # Boot-time automatic resume is a parent-facing trigger only. The gateway reads
 # ``gateway.auto_resume_on_boot`` from the active profile before queueing notices;
 # the explicit one-shot resume action is independent of that setting.
-# Persisted producer token: only this shutdown cause authorizes restart-cut recovery.
+# Persisted producer token for a planned gateway restart. It selects restart wording and the explicit
+# resume notice in place of an automatic rerun; recovery authority comes from the absence of user-stop evidence.
 GATEWAY_RESTART_CUT_REASON = "gateway shutdown (restart)"
 AUTO_RESUME_CLAIM_TTL_SECONDS = 300.0
 AUTO_RESUME_STATE_NONE = "none"
@@ -640,7 +644,11 @@ def is_user_cancel_reason(reason: str) -> bool:
 
 
 def is_trusted_restart_cut(reason: Any) -> bool:
-    """Only fixed gateway restart-producer reasons authorize cut recovery."""
+    """The canonical gateway-restart cut token.
+
+    Recovery authority does not depend on it: any cut without positive user-stop evidence is
+    recoverable (``_recovery_stopped``). It selects only restart wording and the single resume
+    notice that replaces the automatic retry for a restart cut."""
     return str(reason).strip().casefold() == GATEWAY_RESTART_CUT_REASON
 
 
@@ -686,30 +694,40 @@ def gateway_retry_origin(record: Dict[str, Any]) -> bool:
 def cancel_pending_retries(*, delegation_id: str = "", session_key: str = "", origin_ui_session_id: str = "",
                            parent_session_id: str = "", all_sessions: bool = False,
                            reason: str = "stop_command") -> set[str]:
-    """Cancel owed retries and revoke unadmitted legacy recovery claims in one stop transaction."""
+    """Cancel owed retries and revoke unadmitted legacy recovery claims in one stop transaction.
+
+    ``all_sessions`` cancels owed retries everywhere, but a claimed legacy recovery
+    (``retry_state='none'``) belongs to the session that claimed it: it is revoked only by
+    ``delegation_id`` or by the stopping session's selectors, never by an unscoped stop."""
     selectors = [(field, value) for field, value in (
         ("origin_session", session_key), ("origin_ui_session_id", origin_ui_session_id),
         ("parent_session_id", parent_session_id)) if value]
     cancel_reason = str(reason or "stop_command")
+    session_scope = "(" + " OR ".join(field + "=?" for field, _ in selectors) + ")"
+    session_values = [value for _, value in selectors]
+    placeholders = ",".join("?" for _ in RETRY_PENDING_STATES)
+    pending = f"retry_state IN ({placeholders})"
+    legacy = "(retry_state=? AND resume_state=? AND COALESCE(retry_replacement, '')='')"
+    pending_values, legacy_values = list(RETRY_PENDING_STATES), [RETRY_NONE, RESUME_STATE_CLAIMED]
     if delegation_id:
-        scope, values = "delegation_id=?", [delegation_id]
+        where = f"({pending} OR {legacy}) AND delegation_id=?"
+        values = [*pending_values, *legacy_values, delegation_id]
+    elif all_sessions and selectors:
+        where = f"({pending} OR ({legacy} AND {session_scope}))"
+        values = [*pending_values, *legacy_values, *session_values]
     elif all_sessions:
-        scope, values = "1", []
+        where, values = pending, pending_values
     elif selectors:
-        scope = "(" + " OR ".join(field + "=?" for field, _ in selectors) + ")"
-        values = [value for _, value in selectors]
+        where = f"({pending} OR {legacy}) AND {session_scope}"
+        values = [*pending_values, *legacy_values, *session_values]
     else:
         return set()  # an empty session selector never means everyone
     ad = _ad()
-    placeholders = ",".join("?" for _ in RETRY_PENDING_STATES)
     with ad._DB_LOCK, ad._transaction() as conn:
         rows = conn.execute(f"""UPDATE async_delegations SET retry_state='cancelled', retry_reason=?,
                        retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
-                       WHERE ((retry_state IN ({placeholders}))
-                              OR (retry_state=? AND resume_state=? AND COALESCE(retry_replacement, '')=''))
-                         AND {scope} RETURNING delegation_id""",
-                            (cancel_reason, time.time(), *RETRY_PENDING_STATES,
-                             RETRY_NONE, RESUME_STATE_CLAIMED, *values)).fetchall()
+                       WHERE {where} RETURNING delegation_id""",
+                            (cancel_reason, time.time(), *values)).fetchall()
     return {row[0] for row in rows}
 
 
@@ -1023,22 +1041,50 @@ def _retry_child_claim_eligibility(conn, record: Dict[str, Any]) -> Optional[str
     return None
 
 
+def _resume_available_in(conn, delegation_id: str) -> bool:
+    record = _load(conn, delegation_id)
+    if record is None:
+        return False
+    if record["retry_state"] in RETRY_PENDING_STATES + (RETRY_DISPATCHED, RETRY_REPORTED):
+        return (record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED)
+                and not _recovery_stopped(record)
+                and _retry_budget_reason(record, time.time()) is None
+                and _retry_child_claim_eligibility(conn, record) is None)
+    reason = _eligibility(record)
+    if reason == INELIGIBLE_BATCH:
+        reason = _batch_resume_eligibility(record)
+    return reason is None
+
+
 def resume_available(delegation_id: str) -> bool:
     """Read-only cut-notice admission; the control action rechecks before claiming."""
     ad = _ad()
     with ad._DB_LOCK, ad._transaction() as conn:
-        record = _load(conn, delegation_id)
-        if record is None:
-            return False
-        if record["retry_state"] in RETRY_PENDING_STATES + (RETRY_DISPATCHED, RETRY_REPORTED):
-            return (record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED)
-                    and not _recovery_stopped(record)
-                    and _retry_budget_reason(record, time.time()) is None
-                    and _retry_child_claim_eligibility(conn, record) is None)
-        reason = _eligibility(record)
-        if reason == INELIGIBLE_BATCH:
-            reason = _batch_resume_eligibility(record)
-        return reason is None
+        return _resume_available_in(conn, delegation_id)
+
+
+def stamp_resume_availability(evt: Dict[str, Any], conn=None) -> None:
+    """Record cut-notice resume admission on the event where it is built, off the event loop.
+
+    Notification formatters read only ``evt["resume_available"]`` and never touch state.db, so a
+    busy ledger cannot make a drain raise or block an event loop. Any failure stamps False (no
+    resume line); the resume control action rechecks durable admission before claiming anyway.
+    """
+    if evt.get("type") != "async_delegation" or not evt.get("cut_reason") or evt.get("task_failure_notice"):
+        return
+    delegation_id = str(evt.get("delegation_id") or "")
+    try:
+        if not delegation_id:
+            available = False
+        elif conn is not None:
+            available = _resume_available_in(conn, delegation_id)
+        else:
+            available = resume_available(delegation_id)
+    except Exception:  # noqa: BLE001 - fail closed; the notice must still be delivered
+        logger.warning("Async delegation %s: resume availability unreadable; omitting resume offer",
+                       delegation_id, exc_info=True)
+        available = False
+    evt["resume_available"] = bool(available)
 
 
 def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:

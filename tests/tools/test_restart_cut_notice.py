@@ -4,6 +4,7 @@ import time
 import pytest
 
 from tools import async_delegation as ad
+from tools.delegation_resume import stamp_resume_availability
 from tools.process_registry_notifications import _format_async_delegation
 
 
@@ -19,6 +20,7 @@ def _format_recorded_cut(evt):
     with ad._DB_LOCK, ad._transaction() as conn:
         conn.execute("UPDATE async_delegations SET state='interrupted', event_json=?, result_json=? "
                      "WHERE delegation_id=?", (json.dumps(evt), json.dumps(evt), evt["delegation_id"]))
+    stamp_resume_availability(evt)  # the producer stamps admission off-loop; formatting is DB-free
     return _format_async_delegation(evt)
 
 

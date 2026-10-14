@@ -65,6 +65,16 @@ result/transcript evidence for conservative recovery through the durable retry e
   only while the same durable scalar/fan-out/retry admission gates would allow it;
   missing rows, completed work, spent claims, user stops, and exhausted budgets
   cannot advertise recovery, including through a previously serialized retry note.
+  That admission is evaluated off the event loop where the event is built, claimed,
+  or replayed (`stamp_resume_availability` -> `evt["resume_available"]`); a ledger
+  read failure stamps False. Notification formatters read only that stamp and never
+  open state.db, so a locked ledger cannot raise inside a drain (losing unrelated,
+  already-popped completions) or block a gateway loop. A notice carries exactly one
+  instruction: a rendered retry note (resume, or "Hermes will retry; do not
+  re-dispatch") replaces the body's own resume line.
+  An unscoped stop (`interrupt_all`) cancels owed retries everywhere, but revokes a
+  claimed legacy recovery (`retry_state='none'`) only for the stopping session's
+  selectors; CLI `/stop` passes its own `parent_session_id`.
   CLI exits are labeled as CLI exits, not gateway shutdowns.
   `is_trusted_restart_cut` remains useful for canonical wording and the one-notice
   continuation path, but recovery authority is based on positive evidence of a user
