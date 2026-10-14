@@ -63,6 +63,8 @@ def shard_files(root: Path, count: int) -> list[list[str]]:
     files = [path for path in (root / 'tests').rglob('test_*.py')
              if not {'integration', 'docker'} & set(path.relative_to(root).parts)
              and not is_nightly_only(path, root)]
+    # Most files live in tests/; candidate-extensions is an additional ordinary root.
+    files.extend((root / 'candidate-extensions').rglob('test_*.py') if (root / 'candidate-extensions').is_dir() else ())
     timings = json.loads((ROOT / 'scripts/ci/python_shard_timings.json').read_text(encoding='utf-8-sig'))
     def weight(path: Path) -> float:
         relative = path.relative_to(root).as_posix()
