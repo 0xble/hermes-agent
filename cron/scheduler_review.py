@@ -218,10 +218,15 @@ def _select_review_candidate(job, content, subject, contract, receipt, deadline_
     if job.get("_review_decision"):
         decision, payload = job["_review_decision"]
         receipt["replayed"] = True
+    elif job.get("_review_prompt_sent"):
+        # A restart cut off the hop after its prompt may have reached the subject session.
+        receipt["replayed"] = True
+        raise RuntimeError("review prompt already sent before restart; not asking twice")
     else:
         remaining = deadline_epoch - time.time()
         if remaining <= 0:
             raise TimeoutError("review deadline expired before admission")
+        _record_review_progress(job, _review_prompt_sent=True)
         reply = _run_review_hop(subject, _review_wake_text(content, contract), None, None, remaining)
         decision, payload = parse_decision(reply)
         _record_review_progress(job, _review_decision=[decision, payload])

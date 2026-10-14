@@ -7,35 +7,35 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize("expired", [False, True])
-def test_restart_during_review_replays_report_and_writes_delivery_receipt(tmp_path, monkeypatch, expired):
+def test_restart_inside_review_hop_sends_original_without_a_second_prompt(tmp_path, monkeypatch):
     from cron import delivery_queue as queue, scheduler_review as review
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "cron/deliveries.db")
     monkeypatch.setattr(review, "_shutdown", threading.Event())
-    clock = [time.time()]
-    monkeypatch.setattr(review, "time", SimpleNamespace(time=lambda: clock[0],
-                       monotonic=time.monotonic, sleep=time.sleep))
     job = {"id": "report", "deliver": "local", "_review_run_id": "run",
-           "_review_deadline_epoch": clock[0] + 60,
+           "_review_deadline_epoch": time.time() + 600,
            "review": {"subject": "topic", "contract": "report"}}
     subject = {"session_key": "key", "session_id": "sid", "chat_id": "42",
                "thread_id": "123", "user_id": "42"}
     monkeypatch.setattr(review, "_resolve_review_subject", lambda _: subject)
     monkeypatch.setattr("cron.review.load_contract", lambda _: {})
+    monkeypatch.setattr("gateway.host_attach.host_gateway_serving", lambda *args: None)
+    prompts = []
     entered, release = threading.Event(), threading.Event()
-    def hold(*args):
+    def control(home, method, payload=None, params=None, timeout=None):
+        if method == "cron-review":
+            prompts.append(payload["text"])
+            return {"token": "t"}
         entered.set()
         assert release.wait(5)
-        raise review.ReviewAbandoned("gateway exited during review")
-    monkeypatch.setattr(review, "_run_review_hop", hold)
+        return {"status": "pending"}
+    monkeypatch.setattr("gateway.control_socket.query_gateway_control", control)
     workers = []
     thread = threading.Thread
     def spawn(*args, **kwargs):
-        worker = thread(*args, **kwargs)
-        workers.append(worker)
-        return worker
+        workers.append(thread(*args, **kwargs))
+        return workers[-1]
     monkeypatch.setattr(queue.threading, "Thread", spawn)
     sent = []
     def final_send(job, text, **kwargs):
@@ -50,31 +50,29 @@ def test_restart_during_review_replays_report_and_writes_delivery_receipt(tmp_pa
         assert entered.wait(5)
         assert queue.get_status("run")["status"] == "reviewing"
         assert queue._terminalize_wait_timeout("run") == ""
-        assert queue.get_status("run")["status"] == "reviewing"
+        review.stop_reviews()
     finally:
         release.set()
         workers[0].join(5)
         assert not workers[0].is_alive()
     assert sent == []
+    assert queue.get_status("run")["status"] == "reviewing"
     assert not (tmp_path / "cron/review-receipts.jsonl").exists()
+    monkeypatch.setattr(review, "_shutdown", threading.Event())
     monkeypatch.setattr(queue, "_PROCESS_ID", "replacement-gateway")
     monkeypatch.setattr(queue, "_owner_is_live", lambda *args: False)
     assert queue.recover_abandoned() == 1
     assert queue.get_status("run")["status"] == "pending"
-    if expired:
-        clock[0] += 61
-    def replay(*args):
-        assert not expired, "expired admission must skip review"
-        return "PRESENT"
-    monkeypatch.setattr(review, "_run_review_hop", replay)
     assert queue.drain(send) == 1
     workers[-1].join(5)
+    assert len(prompts) == 1
     assert not workers[-1].is_alive()
-    assert queue.get_status("run")["status"] == "delivered"
     assert sent == ["original"]
+    assert queue.get_status("run")["status"] == "delivered"
     receipt = json.loads((tmp_path / "cron/review-receipts.jsonl").read_text())
     assert receipt["run_id"] == "run"
-    assert receipt["decision"] == ("TIMEOUT_OR_ERROR" if expired else "PRESENT")
+    assert receipt["decision"] == "TIMEOUT_OR_ERROR"
+    assert receipt["replayed"] is True
     assert receipt["text_sent"] == "original"
     assert receipt["message_id"] == "message"
     assert queue.drain(send) == 0
@@ -221,3 +219,23 @@ def test_stopping_gateway_leaves_held_reports_pending(tmp_path, monkeypatch):
     assert queue.claim_next()["execution_id"] == "notice"
     assert queue.claim_next() is None
     assert queue.get_status("run")["status"] == "pending"
+
+
+def test_report_replayed_after_its_deadline_goes_out_without_review(tmp_path, monkeypatch):
+    from cron import delivery_queue as queue, scheduler_review as review
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "cron/deliveries.db")
+    monkeypatch.setattr(review, "_shutdown", threading.Event())
+    subject = {"session_key": "key", "session_id": "sid", "chat_id": "42",
+               "thread_id": "123", "user_id": "42"}
+    monkeypatch.setattr(review, "_resolve_review_subject", lambda _: subject)
+    monkeypatch.setattr("cron.review.load_contract", lambda _: {})
+    monkeypatch.setattr(review, "_run_review_hop", lambda *args: pytest.fail("expired admission must skip review"))
+    sent = []
+    monkeypatch.setattr("cron.scheduler_delivery._deliver_result", lambda job, text, **kwargs: sent.append(text))
+    job = {"id": "report", "deliver": "local", "_review_run_id": "run",
+           "_review_deadline_epoch": time.time() - 1, "review": {"subject": "topic", "contract": "report"}}
+    assert review._deliver_reviewed_result(job, "original", {}, None) is None
+    assert sent == ["original"]
+    receipt = json.loads((tmp_path / "cron/review-receipts.jsonl").read_text())
+    assert receipt["decision"] == "TIMEOUT_OR_ERROR"
