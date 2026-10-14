@@ -3096,6 +3096,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
+        if self._restart_requested:
+            # Stamp intent after the drain: the chat routing marker can already be older
+            # than the breaker chain gap by the time /restart finishes waiting for work.
+            from gateway.restart_loop_guard import record_planned_exit
+            record_planned_exit()
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
                 atomic_json_write(
