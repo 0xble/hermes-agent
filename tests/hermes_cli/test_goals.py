@@ -146,6 +146,25 @@ class TestGoalManager:
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
 
+    def test_goal_manager_passes_previous_turn_boundary_to_voice_floor(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="voice-floor-boundary", default_max_turns=5)
+        mgr.set("keep going")
+        calls = []
+
+        def judge(*_args, **kwargs):
+            calls.append(kwargs)
+            return "continue", "more work", False, None, False
+
+        with patch.object(goals, "judge_goal", side_effect=judge):
+            mgr.evaluate_after_turn("step 1")
+            mgr.evaluate_after_turn("step 2")
+
+        assert calls[0]["voice_send_since"] == 0.0
+        assert calls[1]["voice_send_since"] > calls[0]["voice_send_since"]
+
     def test_zero_budget_is_persistent_unlimited_and_continues(self, hermes_home):
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager, load_goal

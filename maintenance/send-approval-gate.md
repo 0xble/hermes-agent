@@ -16,10 +16,13 @@ session identity where available.
 
 The classifier covers the supported Slack, iMessage, gog Gmail, wacli, Quo, and
 Telegram CLI send verbs, including Slack message edits and Gmail `drafts send`.
-It recursively inspects shell `-c` payloads, shell operators, command paths,
-`env`/`nohup`/absolute-path forms, and existing regular script files up to 1 MiB.
-This is a best-effort guard against accidental sends, not an adversarial shell
-sandbox; it does not execute or emulate scripts.
+It recursively inspects shell `-c` payloads and shell operators. Script content
+is inspected only for an executed command word (including `env`/`nohup`/absolute
+path forms) or the first script argument of a supported interpreter; `python -m`
+module invocations do not scan their later test paths. The source-text regex
+fallback is limited to executed non-shell scripts. This is a best-effort guard
+against accidental sends, not an adversarial shell sandbox; it does not execute
+or emulate scripts.
 
 Unattended cron sends remain fail-closed: cron has no standing approvals and
 there is no `voice_send` configuration key.
@@ -28,7 +31,10 @@ The goal judge scans the current goal-window evidence before calling the LLM.
 An ungranted voice send returns `blocked` with a fixed deterministic reason. A
 row whose output begins with the gate's own `BLOCKED: approval required before
 sending a message in Brian` text is treated as a refused send, not a completed
-send. Granted sends continue through the existing LLM judge unchanged.
+send. GoalManager supplies the previous judged-turn timestamp to this floor, so
+an earlier-turn send cannot block every later evaluation; direct `judge_goal`
+callers retain whole-window checking when they use the default. Granted sends
+continue through the existing LLM judge unchanged.
 
 ## Provenance and adaptation
 

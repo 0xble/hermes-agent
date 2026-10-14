@@ -55,16 +55,46 @@ def test_classifier_shell_forms_and_read_only(tmp_path):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
 
 
-def test_classifier_scans_direct_and_python_script_files(tmp_path, monkeypatch):
+def test_classifier_scans_only_executed_script_files(tmp_path, monkeypatch):
+    read_files = {
+        "jobs.json": '{"message": "slack message send"}',
+        "voice_send_gate.py": "slack message send",
+        "SKILL.md": "slack message send",
+        "test_voice_send_gate.py": "slack message send",
+        "file.py": "slack message send",
+    }
+    paths = {name: tmp_path / name for name in read_files}
+    for name, content in read_files.items():
+        paths[name].write_text(content)
+    monkeypatch.chdir(tmp_path)
+
+    for command in (
+        f"cat {paths['jobs.json']}",
+        f"git diff {paths['voice_send_gate.py']}",
+        f"grep -n x {paths['SKILL.md']}",
+        f"sed -n 1,40p {paths['test_voice_send_gate.py']}",
+        f"pytest {paths['test_voice_send_gate.py']}",
+        f"python3 -m pytest {paths['file.py']}",
+    ):
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+
+
+def test_classifier_scans_executed_script_files(tmp_path, monkeypatch):
     shell_script = tmp_path / "send.sh"
     shell_script.write_text("slack --account lpg message send --text hi")
     python_script = tmp_path / "send.py"
     python_script.write_text("subprocess.run(['telegram', 'send', 'chat', 'hi'])")
     monkeypatch.chdir(tmp_path)
 
-    for command in ("./send.sh", str(shell_script), f"python3 {python_script}"):
+    for command in (
+        "bash ./send.sh",
+        "./send.sh",
+        "python3 send.py",
+        "python3.12 send.py",
+        "env A=1 ./send.sh",
+    ):
         found = voice_send_gate.classify_voice_send("terminal", {"command": command})
-        assert found and found["action_hash"]
+        assert found and found["action_hash"], command
 
 
 def test_native_send_tools_are_classified():
@@ -122,6 +152,36 @@ def test_shared_dispatch_choke_point_runs_voice_gate_once(monkeypatch):
     result = model_tools.handle_function_call("terminal", {"command": "slack message send C1 hi"})
     assert "blocked" in result
     assert len(calls) == 1
+
+
+def test_goal_judge_voice_send_floor_is_scoped_to_current_turn(monkeypatch):
+    from hermes_cli import goals
+
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: '{"verdict":"done","reason":"ok"}')
+    older = [{
+        "timestamp": 10.0,
+        "tool": "terminal",
+        "call": json.dumps({"command": "slack message send earlier"}),
+        "output": "sent",
+    }]
+    current = [{
+        "timestamp": 20.0,
+        "tool": "terminal",
+        "call": json.dumps({"command": "slack message send now"}),
+        "output": "sent",
+    }]
+
+    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=older, voice_send_since=20.0)
+    assert (verdict, reason) == ("done", "ok")
+
+    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=current, voice_send_since=20.0)
+    assert verdict == "blocked"
+    assert "deterministic voice-send floor" in reason
+
+    # Direct callers retain the incident-replay behavior of checking the whole window.
+    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=older)
+    assert verdict == "blocked"
+    assert "deterministic voice-send floor" in reason
 
 
 def test_goal_judge_ignores_gate_refusal_but_blocks_unapproved_send(monkeypatch):

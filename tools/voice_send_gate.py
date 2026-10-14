@@ -47,6 +47,9 @@ _NATIVE_SEND_TOOLS = {
 }
 _META_PREFIX = "voice_send_grant:"
 _SHELL_NAMES = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
+_INTERPRETER_NAMES = _SHELL_NAMES | frozenset({
+    "python", "python3", "python2", "node", "ruby", "perl", "deno", "bun", "uv", "uvx",
+})
 _SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "(", ")"})
 _MAX_SCRIPT_BYTES = 1_000_000
 
@@ -70,6 +73,84 @@ def _segments(tokens: list[str]) -> list[list[str]]:
         else:
             segments[-1].append(token)
     return [segment for segment in segments if segment]
+
+
+def _is_assignment(token: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token))
+
+
+def _command_word_index(tokens: list[str]) -> int:
+    """Return the command word after common launch prefixes."""
+    index = 0
+    while index < len(tokens):
+        name = Path(tokens[index]).name.lower()
+        if name == "env":
+            index += 1
+            while index < len(tokens) and (
+                tokens[index].startswith("-") or _is_assignment(tokens[index])
+            ):
+                index += 1
+            continue
+        if name in {"nohup", "exec", "command", "time", "sudo"}:
+            index += 1
+            continue
+        break
+    return index
+
+
+def _is_interpreter_name(name: str) -> bool:
+    return name in _INTERPRETER_NAMES or bool(re.fullmatch(r"python\d+(?:\.\d+)+", name))
+
+
+def _executed_file_targets(tokens: list[str]) -> list[tuple[str, bool]]:
+    """Return files whose contents are actually executed by a shell segment.
+
+    The boolean marks an invocation through a shell interpreter, where shell
+    tokenization is the useful fallback and source-text matching is not used.
+    """
+    targets: list[tuple[str, bool]] = []
+    for segment in _segments(tokens):
+        index = _command_word_index(segment)
+        if index >= len(segment):
+            continue
+        command = Path(segment[index]).name.lower()
+        if _is_interpreter_name(command):
+            arg = index + 1
+            while arg < len(segment):
+                token = segment[arg]
+                if token == "--":
+                    arg += 1
+                    break
+                if token == "-m" or token.startswith("-m"):
+                    # Module execution (notably ``python -m pytest file.py``)
+                    # does not execute the following path as a script.
+                    arg = len(segment)
+                    break
+                if token.startswith("-"):
+                    # ``-c``/``-e`` consume source text, not a script path.
+                    if token in {"-c", "-e"} or (command in _SHELL_NAMES and "c" in token[1:]):
+                        arg = len(segment)
+                        break
+                    arg += 1
+                    continue
+                if command == "uv" and token.lower() == "run":
+                    arg += 1
+                    continue
+                if command == "uv" and token.lower() != "run":
+                    arg = len(segment)
+                    break
+                targets.append((token, command in _SHELL_NAMES))
+                break
+            continue
+        targets.append((segment[index], False))
+    return targets
+
+
+def _looks_like_shell_script(path: Path, content: str) -> bool:
+    if path.suffix.lower() in {".sh", ".bash", ".zsh", ".dash", ".ksh", ".fish"}:
+        return True
+    first_line = content.lstrip().splitlines()[:1]
+    return bool(first_line and re.search(r"#!.*\b(?:bash|sh|zsh|dash|ksh|fish)\b", first_line[0], re.I))
 
 
 def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optional[str]]:
@@ -130,9 +211,11 @@ def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tupl
                     break
                 j += 1
 
-        # Inspect every existing regular file token. This catches ./send.sh,
-        # /path/send.sh, and python3 send.py without executing anything.
-        for token in segment:
+        # Inspect only files that this segment would execute: the command word
+        # itself, or the first script argument of an interpreter. Reading every
+        # existing path token makes ordinary ``git diff``/``pytest`` commands
+        # look like sends merely because their source contains send words.
+        for token, invoked_by_shell in _executed_file_targets(segment):
             try:
                 path = Path(token).expanduser()
                 key = str(path.resolve())
@@ -143,10 +226,11 @@ def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tupl
             except (OSError, ValueError):
                 continue
             found, cli, account = _find_send(_tokens(content), seen_paths)
-            if not found:
+            if not found and not invoked_by_shell and not _looks_like_shell_script(path, content):
                 # Python/JSON-like source often keeps the command words inside
                 # one quoted expression, which shell tokenization cannot see.
-                # Inspect source text without executing or importing it.
+                # Inspect source text without executing or importing it, but only
+                # for an actually executed non-shell script.
                 match = re.search(
                     r"(?i)(?:^|[\"'\[,(\s])"
                     r"(slack|imsg|gog|wacli|quo|telegram)"

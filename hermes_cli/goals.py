@@ -2040,6 +2040,7 @@ def judge_goal(
     last_visible_report: str = "",
     user_messages_block: str = "",
     resume_override: bool = False,
+    voice_send_since: float = 0.0,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -2054,7 +2055,19 @@ def judge_goal(
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
         return "continue", "empty response (nothing to evaluate)", False, None, False
-    ungranted_hash = _ungranted_voice_send_in_evidence(evidence)
+    voice_evidence = evidence
+    if voice_send_since > 0.0:
+        voice_evidence = []
+        for item in evidence or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = float(item.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            if timestamp >= voice_send_since:
+                voice_evidence.append(item)
+    ungranted_hash = _ungranted_voice_send_in_evidence(voice_evidence)
     if ungranted_hash:
         return "blocked", (
             "deterministic voice-send floor: an attempted message send had no consumed "
@@ -3558,6 +3571,7 @@ class GoalManager:
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
             evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
             resume_override=state.has_resume_override(),
+            voice_send_since=previous_turn_at,
             user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
             last_visible_report=visible_report,
         )
