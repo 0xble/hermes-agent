@@ -150,8 +150,11 @@ def test_legacy_child_persist_failure_never_runs_inline_or_consumes_claim(monkey
         receipts = conn.execute("SELECT task_index, replacement_delegation_id FROM "
                                 "async_delegation_child_recovery WHERE delegation_id=? ORDER BY task_index",
                                 (did,)).fetchall()
-    assert receipts == [(1, None), (2, None)]
-    replacement = dict(delegation_id=batch.live_deleg_id, goal=task["goal"], context=task["context"],
+    assert receipts == []
+    retry_payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert retry_payload["status"] == "recovery_claimed"
+    retry_task = retry_payload["tasks"][0]
+    replacement = dict(delegation_id=batch.live_deleg_id, goal=retry_task["goal"], context=retry_task["context"],
                        session_key="telegram:dm:1", parent_session_id=_Parent.session_id,
                        origin_session_id=_Parent.session_id, dispatched_at=time.time())
     original_persist(replacement)

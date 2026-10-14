@@ -1117,11 +1117,16 @@ def claim_retry_dispatch(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], 
 
 
 def claimed_retry_source(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return the retry row whose dispatch claim authorizes this recovery spawn."""
+    """Return the recovery row whose claim authorizes this recovery spawn."""
     ad = _ad()
     with ad._DB_LOCK, ad._transaction() as conn:
         prior = _replacement_source(conn, record, str(record.get("context") or ""))
-    if prior and prior["retry_state"] == RETRY_DISPATCHING:
+    if prior and (
+        prior["retry_state"] == RETRY_DISPATCHING
+        or (prior["retry_state"] == RETRY_NONE
+            and prior["resume_state"] == RESUME_STATE_CLAIMED
+            and prior.get("resume_claim"))
+    ):
         return prior
     return None
 
@@ -1149,11 +1154,29 @@ def _release_unspent_batch_children(conn, delegation_id: str, claim: str) -> Non
 
 
 def release_retry_dispatch(record: Dict[str, Any]) -> bool:
-    """Return a failed persist and its unspent child claims to the scheduler atomically."""
+    """Return a failed persist and its unspent recovery claims to the scheduler."""
     ad = _ad()
+    did = record["delegation_id"]
+    if (record.get("retry_state") == RETRY_NONE
+            and record.get("resume_state") == RESUME_STATE_CLAIMED):
+        claim = record.get("resume_claim", "")
+        if not claim:
+            return False
+        now = time.time()
+        with ad._DB_LOCK, ad._transaction() as conn:
+            changed = conn.execute(
+                "UPDATE async_delegations SET resume_state=?, resume_attempts=0, resume_claim=NULL, "
+                "resume_claimed_at=NULL, updated_at=? "
+                "WHERE delegation_id=? AND resume_state=? AND resume_claim=?",
+                (RESUME_STATE_NONE, now, did, RESUME_STATE_CLAIMED, claim),
+            ).rowcount
+            if changed:
+                _release_unspent_batch_children(conn, did, claim)
+            return changed == 1
+
     now = time.time()
     due = now + _backoff(int(record.get("retry_attempt") or 0))
-    did, claim = record["delegation_id"], record.get("retry_claim", "")
+    claim = record.get("retry_claim", "")
     with ad._DB_LOCK, ad._transaction() as conn:
         changed = conn.execute(
             "UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "

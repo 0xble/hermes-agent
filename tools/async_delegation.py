@@ -1865,7 +1865,11 @@ def _dispatch_admitted(
         try:
             prior = claimed_retry_source(record)
             if prior is not None:
-                retry_rearmed = release_retry_dispatch(prior)
+                # Explicit CLI/TUI resume claims are re-armed for a later manual
+                # resume, not scheduled for the automatic retry notice path.
+                had_retry_claim = bool(prior.get("retry_claim"))
+                released = release_retry_dispatch(prior)
+                retry_rearmed = had_retry_claim and released
         except Exception:
             logger.warning("Failed to release managed retry claim after persistence failure", exc_info=True)
         with _records_lock:

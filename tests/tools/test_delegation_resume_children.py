@@ -118,6 +118,79 @@ def _persist_child(did, task):
                              origin_session_id="sess-owner", dispatched_at=time.time()))
 
 
+def _scalar_row(did="deleg_scalar_resume"):
+    now = time.time()
+    record = {
+        "delegation_id": did,
+        "goal": "finish the scalar task",
+        "context": "shared context",
+        "toolsets": None,
+        "role": "leaf",
+        "model": "m",
+        "session_key": "telegram:dm:1",
+        "origin_session_id": "sess-owner",
+        "parent_session_id": "sess-owner",
+        "dispatched_at": now - 60,
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET retry_state='none', state='interrupted', completed_at=?, "
+            "updated_at=?, result_json=?, event_json=? WHERE delegation_id=?",
+            (now, now, json.dumps({"status": "interrupted"}),
+             json.dumps({"status": "interrupted"}), did),
+        )
+    return did
+
+
+@pytest.mark.parametrize("shape", ["scalar", "batch"])
+def test_explicit_resume_claim_released_after_failed_persist_then_resume(shape, monkeypatch):
+    """A replacement INSERT failure must not permanently spend an explicit resume claim."""
+    if shape == "scalar":
+        did = _scalar_row()
+        payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+        goal = payload["goal"]
+        context = payload["recovery_context"]
+    else:
+        did = _batch_row("deleg_batch_explicit_resume")
+        payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+        assert [task["goal"] for task in payload["tasks"]] == ["second", "third"]
+        # The first child is genuinely consumed; a later failed sibling persist must
+        # preserve it while releasing only the still-unspent child claim.
+        _persist_child("deleg_explicit_consumed", payload["tasks"][0])
+        goal = payload["tasks"][1]["goal"]
+        context = payload["tasks"][1]["context"]
+
+    with monkeypatch.context() as m:
+        m.setattr(ad, "_persist_dispatch", lambda record: (_ for _ in ()).throw(OSError("persist failed")))
+        result = ad.dispatch_async_delegation(
+            goal=goal, context=context, role="leaf", model="m", toolsets=None,
+            session_key="telegram:dm:1", parent_session_id="sess-owner",
+            runner=lambda: pytest.fail("failed recovery ran inline"),
+            delegation_id=f"deleg_{shape}_explicit_failed", max_async_children=1,
+        )
+
+    assert result["status"] == "rejected"
+    assert result["no_inline_fallback"] is True
+    prior = dr.retry_status(did)
+    assert prior["resume_state"] == dr.RESUME_STATE_NONE
+    assert prior["resume_attempts"] == 0
+    assert not prior["resume_claim"]
+
+    retry = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    assert retry["status"] == "recovery_claimed"
+    if shape == "scalar":
+        assert retry["goal"] == goal
+    else:
+        assert [task["goal"] for task in retry["tasks"]] == ["third"]
+        with ad._DB_LOCK, ad._transaction() as conn:
+            consumed = conn.execute(
+                "SELECT replacement_delegation_id FROM async_delegation_child_recovery "
+                "WHERE delegation_id=? AND task_index=1", (did,)
+            ).fetchone()
+        assert consumed == ("deleg_explicit_consumed",)
+
+
 def test_batch_failed_persist_releases_child_claims_then_resume(monkeypatch):
     did = _scheduled_batch()
     payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
