@@ -68,6 +68,17 @@ recovery substrate. The journal must be idempotent by source update identity;
 this PR does not claim arbitrary-crash exactly-once transport delivery from a
 local receipt alone.
 
+## Acceptance split
+
+For a planned handover, the drill must show 0 cut turns, 0 duplicate finals,
+and 0 lost messages. For SIGKILL or crash drills, the pass criteria are 0 lost
+inbound messages, 0 duplicate finals, and no parking. A turn killed in memory is
+reported as interrupted and recovered by today's restart-recovery path without
+automatically replaying a non-idempotent turn. Telegram has no idempotency key,
+so a kill after a final is accepted but before Hermes records its receipt cannot
+prove both zero duplicate and zero loss; that boundary is a diagnostic, not a
+planned-handover guarantee.
+
 ## Explicitly rejected
 
 - A permanent router/worker split. That is the S4.2 design that failed spikes
