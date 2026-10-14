@@ -2262,7 +2262,7 @@ def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id:
 
     Requires a typed-shaped row (no runtime display_kind, not a synthetic/continuation prompt), a
     Hermes header naming this profile, a ledger receipt with the same sender delivered to this goal
-    session (and this row when recorded), and a sender that is a human topic session."""
+    session at this exact row, and a sender that is a human topic session."""
     content = str(relay.get("content") or "")
     if str(relay.get("display_kind") or "") not in _USER_TYPED_KINDS or relay.get("compressed_summary"):
         return None
@@ -2278,8 +2278,10 @@ def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id:
         return None
     if receipt.get("target") != f"hermes:{profile}/{goal_session_id}":
         return None
+    # The header is agent-writable text, so only a receipt bound to this exact transcript row proves
+    # delivery; an unbound (legacy) receipt could be replayed under a forged header. Fail closed.
     row_id = receipt.get("target_user_row")
-    if row_id is not None and str(row_id) != str(relay.get("id")):
+    if row_id is None or str(row_id) != str(relay.get("id")):
         return None
     try:
         info = db.get_session(sender[1]) or {}
