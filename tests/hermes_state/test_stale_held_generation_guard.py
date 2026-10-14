@@ -1,0 +1,78 @@
+"""A lease-less rewrite of a stale generation must not re-insert the replaced transcript.
+
+Gateway hygiene compacts a session in place while the live turn keeps running on the transcript it
+loaded before the commit. A lease-less rewrite from that turn (proactive tool-result prune,
+micro-compaction) passes ``held_messages``: when the store already has a summary the held history does
+not carry, the rewrite was built from the replaced generation, and committing it would archive the
+summary and re-insert the whole pre-compaction transcript beside it. The commit refuses instead.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from agent.context_compressor import StaleHeldHistory
+from hermes_state import SessionDB
+
+
+@pytest.fixture
+def db(tmp_path: Path):
+    handle = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
+def _active(db: SessionDB, sid: str):
+    conn = sqlite3.connect(db.db_path)
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT role, content, _compressed_summary FROM messages WHERE session_id = ? AND active = 1 "
+            "ORDER BY id", (sid,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def _seed(db: SessionDB, sid: str, turns: int = 6):
+    db.create_session(sid, source="telegram")
+    for i in range(turns):
+        db.append_message(sid, "user" if i % 2 == 0 else "assistant", f"m{i}", timestamp=1727000000.0 + i)
+
+
+def test_stale_lease_less_rewrite_is_refused_after_a_summary_lands(db):
+    sid = "s-stale"
+    _seed(db, sid)
+    stale = db.get_messages_as_conversation(sid, include_row_ids=True)  # the live turn's view
+    # Hygiene commits a summary in place.
+    db.archive_and_compact(sid, [{"role": "user", "content": "[summary]", "_compressed_summary": True},
+                                 *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    after_hygiene = _active(db, sid)
+    assert after_hygiene[0] == ("user", "[summary]", 1)
+
+    pruned = [dict(m, content=f"{m['content']}-pruned") for m in stale]
+    with pytest.raises(StaleHeldHistory):
+        db.archive_and_compact(sid, pruned, held_messages=stale)
+    assert _active(db, sid) == after_hygiene  # nothing written
+
+
+def test_current_generation_rewrite_still_commits(db):
+    sid = "s-current"
+    _seed(db, sid)
+    db.archive_and_compact(sid, [{"role": "user", "content": "[summary]", "_compressed_summary": True},
+                                 *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    current = db.get_messages_as_conversation(sid, include_row_ids=True)  # carries the summary
+    db.archive_and_compact(sid, [*current[:-1], {"role": "assistant", "content": "m5-pruned"}],
+                           held_messages=current)
+    assert [row[1] for row in _active(db, sid)] == ["[summary]", "m4", "m5-pruned"]
+
+
+def test_no_summary_yet_is_never_stale(db):
+    sid = "s-fresh"
+    _seed(db, sid, turns=4)
+    held = db.get_messages_as_conversation(sid, include_row_ids=True)
+    db.archive_and_compact(sid, [*held[:-1], {"role": "assistant", "content": "m3-pruned"}], held_messages=held)
+    assert [row[1] for row in _active(db, sid)] == ["m0", "m1", "m2", "m3-pruned"]

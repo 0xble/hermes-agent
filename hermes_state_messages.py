@@ -1005,7 +1005,8 @@ class SessionMessagesMixin:
         lock_holder: Optional[str] = None, tail_count: int = 0,
         carried_messages: Optional[List[Dict[str, Any]]] = None,
         covered_ids: Optional[List[int]] = None,
-        unresolved_held: Optional[List[Dict[str, Any]]] = None) -> int:
+        unresolved_held: Optional[List[Dict[str, Any]]] = None,
+        held_messages: Optional[List[Dict[str, Any]]] = None) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -1022,6 +1023,11 @@ class SessionMessagesMixin:
         timestamp. Those originals and the clones' originals are superseded duplicates and get rewind flags
         (``active=0, compacted=0``) so search doesn't return each carried message once per compaction.
         ``model_config_patch`` merges in the same txn (``None`` removes a key).
+
+        *held_messages*: the history a LEASE-LESS caller (proactive prune, micro-compaction) rewrote. Checked
+        inside the transaction: an active summary row it does not hold means another compaction committed
+        after it loaded that history, so publishing would put a stale generation beside the winner (the
+        whole pre-compaction transcript re-inserted). Raises ``StaleHeldHistory`` and writes nothing.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the value of
         :meth:`get_active_message_watermark` captured at compression START), rows that arrived during the
@@ -1040,6 +1046,8 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
+            if held_messages is not None:
+                self._raise_if_unheld_summary(conn, session_id, held_messages)
             patch = model_config_patch is not None
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
@@ -1089,6 +1097,33 @@ class SessionMessagesMixin:
                 (inserted, tool_calls_total, *((patched_model_config,) if patch else ()), session_id))
             return inserted
         return self._execute_transcript_write(_do, compacted_messages)
+
+    def _raise_if_unheld_summary(self, conn, session_id: str, held_messages: List[Dict[str, Any]]) -> None:
+        """Raise ``StaleHeldHistory`` when an active summary row is missing from *held_messages*.
+
+        Every summary-producing compaction leaves its summary active, and a history loaded after that
+        commit carries it. A lease-less rewrite whose history lacks it was built from the generation the
+        compaction replaced. Matched by row id, else by role and loaded-view content."""
+        rows = conn.execute(
+            "SELECT id, role, content FROM messages WHERE session_id = ? AND active = 1 AND _compressed_summary = 1",
+            (session_id,)).fetchall()
+        if not rows:
+            return
+        def _view(role: Any, content: Any) -> Any:
+            return self._loaded_view_content(str(role or "unknown"), content)
+
+        held_ids = {message.get("_row_id") for message in held_messages if isinstance(message, dict)}
+        held = {
+            (message.get("role"), _view(message.get("role"), message["content"]))
+            for message in held_messages
+            if isinstance(message, dict) and isinstance(message.get("content"), str)
+        }
+        if any(row["id"] not in held_ids
+               and (row["role"], _view(row["role"], self._decode_content(row["content"]))) not in held
+               for row in rows):
+            from agent.context_compressor import StaleHeldHistory
+            raise StaleHeldHistory(
+                f"session {session_id} has a compaction summary the held history does not carry")
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""
