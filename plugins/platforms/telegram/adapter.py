@@ -150,6 +150,7 @@ except ImportError:
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from plugins.platforms.telegram.disconnect_handover import arm_abort_release, stop_updater_for_handover
 
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig, is_zero_cut_handover_enabled, normalize_telegram_rich_messages
@@ -4010,7 +4011,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         except asyncio.CancelledError:
             # asyncio.wait does NOT cancel its futures when itself cancelled; don't orphan the inner task.
             task.cancel()
-            # Mirror the pattern used by GatewayRunner._await_adapter_cleanup_with_timeout. See #80598.
             task.add_done_callback(_consume_abandoned_task)
             raise
         if task in done:
@@ -4039,16 +4039,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
-
-        # Persist the day's volume first, so a restart cannot forget the last minute of calls.
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is not None:
             try:
-                # SQLite stays off the event loop.
                 await asyncio.to_thread(quota.flush)
             except Exception:
                 logger.debug("[%s] daily volume flush on disconnect failed", self.name, exc_info=True)
-        # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
         self._mark_disconnected()
         self._polling_teardown_started = True
         self._polling_progress_accepting = False
@@ -4057,13 +4053,10 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._send_path_degraded = True
         zero_cut_handover = is_zero_cut_handover_enabled(
             getattr(getattr(self, "gateway_runner", None), "config", None))
-        # Legacy behavior releases the bot-token lock before teardown so a wedged close cannot block
-        # the reconnect watcher. The opt-in handover path retains ownership until updater.stop() has
-        # completed (or its existing bounded timeout expires). See #80598.
         if not zero_cut_handover:
             self._release_platform_lock()
-        # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
-        # await lets them start a new generation.
+        else:
+            arm_abort_release(self, asyncio.current_task())
         current_task = asyncio.current_task()
         lifecycle_tasks = self._collect_live_tasks(
             [getattr(self, "_polling_error_task", None), getattr(self, "_polling_progress_verifier_task", None)], current_task)
@@ -4074,55 +4067,27 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             await self._await_disconnect_step(
                 asyncio.gather(*lifecycle_tasks, return_exceptions=True), _DISCONNECT_STEP_TIMEOUT, "lifecycle-task cancel")
         self._clear_task_attrs_except(current_task, "_polling_error_task", "_polling_progress_verifier_task")
-        # Cancellation callbacks may have run while awaited; the fence stays authoritative.
         self._polling_progress_accepting = False
         self._send_path_degraded = True
-        # Cancel deferred post-connect housekeeping so it cannot fire into a half-torn-down bot client.
-        # Cancel deferred post-connect housekeeping (command-menu / DM-topic / status-indicator Bot API
-        # calls) so it cannot fire into a half-torn-down bot client (#46298). getattr guards the
-        # object.__new__ test pattern where __init__ (which sets this attr) is never called.
         post_connect_task = getattr(self, "_post_connect_task", None)
         if post_connect_task and not post_connect_task.done():
             post_connect_task.cancel()
             await self._await_disconnect_step(
                 asyncio.gather(post_connect_task, return_exceptions=True), _DISCONNECT_STEP_TIMEOUT, "post-connect cancel")
         self._post_connect_task = None
-        # Cancel the heartbeat (and webhook-mode identity loop) before tearing down the app.
         await self._cancel_task_attr("_polling_heartbeat_task", "heartbeat cancel")
         await self._cancel_task_attr("_bot_identity_refresh_task", "identity-refresh cancel")
-        # Mark the bot "Offline" while its HTTP client is still alive. Opt-in, non-fatal.
         with contextlib.suppress(Exception):
             await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
         if self._app:
             try:
-                # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
                     try:
                         if zero_cut_handover:
-                            # Keep the actual PTB stop task alive past bounded adapter teardown. The
-                            # lock callback is attached to that task, not to the shield/wait wrapper.
-                            updater_stop_task = asyncio.ensure_future(self._app.updater.stop())
-                            def release_after_updater_stop(task) -> None:
-                                _consume_abandoned_task(task)
-                                self._release_platform_lock()
-                            updater_stop_task.add_done_callback(release_after_updater_stop)
-                            try:
-                                updater_stopped = await self._await_disconnect_step(
-                                    asyncio.shield(updater_stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
-                            except asyncio.CancelledError:
-                                # The outer bounded teardown is detaching us. Do not strand the
-                                # successor on a wedged stop task; the callback remains harmless.
-                                self._release_platform_lock()
-                                raise
-                            if not updater_stopped:
-                                logger.warning(
-                                    "[%s] updater.stop() timed out; releasing the bot-token lock after the bounded stop window",
-                                    self.name)
-                                self._release_platform_lock()
+                            await stop_updater_for_handover(
+                                self, self._app.updater, self._await_disconnect_step, _UPDATER_STOP_TIMEOUT)
                         else:
-                            # Preserve the legacy path exactly: its direct bounded await and ordering
-                            # remain unchanged when the feature flag is off.
                             await self._await_disconnect_step(
                                 self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
                     except Exception as stop_error:
@@ -4132,8 +4097,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                             "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
                 elif zero_cut_handover:
                     self._release_platform_lock()
-                # app.stop()/shutdown() can also block on a half-dead httpx pool.
-                # Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
                     await self._await_disconnect_step(self._app.stop(), _DISCONNECT_STEP_TIMEOUT, "app.stop()")
                 await self._await_disconnect_step(self._app.shutdown(), _DISCONNECT_STEP_TIMEOUT, "app.shutdown()")
@@ -4142,11 +4105,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                     self._release_platform_lock()
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         elif zero_cut_handover:
-            # No app/updater exists to await, but the handover path still must not strand the lock.
             self._release_platform_lock()
         self._app = None
         self._bot = None
-        # Land the last completed receipts before a replacement adapter reads them.
         flush = getattr(self, "_update_receipt_flush", None)
         if flush is not None and not flush.done():
             await self._await_disconnect_step(asyncio.shield(flush), _DISCONNECT_STEP_TIMEOUT, "update-receipt flush")

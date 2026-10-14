@@ -163,9 +163,39 @@ def test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels(monkeypatc
     assert "release" in events
 
 
+def test_disconnect_flag_on_releases_lock_when_cancelled_before_updater(monkeypatch):
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+
+    async def cancel_before_updater(awaitable, _timeout, step):
+        if step == "lifecycle-task cancel":
+            raise asyncio.CancelledError
+        if asyncio.iscoroutine(awaitable):
+            await awaitable
+        events.append(step)
+        return True
+
+    monkeypatch.setattr(adapter, "_await_disconnect_step", cancel_before_updater)
+    monkeypatch.setattr(
+        adapter, "_collect_live_tasks",
+        lambda *_: [asyncio.get_running_loop().create_future()],
+    )
+    try:
+        asyncio.run(adapter.disconnect())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("disconnect should propagate outer cancellation")
+
+    assert "release" in events
+
+
 __all__ = [
     "test_zero_cut_handover_defaults_off",
     "test_launchd_slot_labels_reuse_default_label_convention",
     "test_disconnect_flag_off_keeps_lock_release_before_updater_stop",
     "test_disconnect_flag_on_releases_lock_after_updater_stop",
+    "test_disconnect_flag_on_releases_lock_when_updater_stop_times_out",
+    "test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels",
+    "test_disconnect_flag_on_releases_lock_when_cancelled_before_updater",
 ]

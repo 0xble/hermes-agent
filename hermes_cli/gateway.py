@@ -4168,7 +4168,6 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
             log_cmd.append("-l")
         subprocess.run(log_cmd, timeout=10)
 
-
 # =============================================================================
 # Launchd (macOS)
 # =============================================================================
