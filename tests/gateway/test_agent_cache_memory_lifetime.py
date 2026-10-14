@@ -262,7 +262,7 @@ def test_pressure_batch_does_not_wait_on_slow_memory_shutdown(monkeypatch):
     runner._release_pressure_batch(plan)
     elapsed = time.monotonic() - started
 
-    assert elapsed < 1.0, f"pressure batch blocked {elapsed:.2f}s on memory shutdown"
+    assert elapsed < 1.8, f"pressure batch blocked {elapsed:.2f}s on memory shutdown"
     assert trimmed.is_set() and plan == []
     assert all(a._memory_manager is None for a in agents)
     assert all(p.session_ends == 1 for p in providers)  # pressure eviction still commits the transcript

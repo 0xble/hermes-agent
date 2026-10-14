@@ -965,6 +965,7 @@ class GatewayAgentCacheMixin:
                 evicted = _cache.pop(session_key, None)
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
+        # Not covered yet: fallback drift and mid-turn /model evict a running agent and return here (leak).
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
         # No on_session_end here: /model, fallback drift and similar callers continue the SAME session,
