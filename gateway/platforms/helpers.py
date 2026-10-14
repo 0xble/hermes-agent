@@ -24,7 +24,9 @@ def consume_detached_handler_exception(task: "asyncio.Task") -> None:
         return
     exc = task.exception()
     if exc is not None:
-        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
+        # Logged under the adapter base name so existing log filters and alerts keep matching.
+        logging.getLogger("gateway.platforms.base").error(
+            "Detached fatal-error handler task failed: %s", exc, exc_info=exc)
 
 
 class MessageDeduplicator:
