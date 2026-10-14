@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_cli import gateway_launchd
 from gateway.config import GatewayConfig, Platform
+from gateway.config_loader import bridge_toplevel_keys
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -15,6 +16,16 @@ def test_zero_cut_handover_defaults_off():
     assert GatewayConfig.from_dict(
         {"gateway": {"zero_cut_handover": {"enabled": True}}}
     ).zero_cut_handover_enabled is True
+
+
+def test_real_yaml_gateway_section_is_bridged_before_schema_parse():
+    gw_data = {}
+    bridge_toplevel_keys(
+        {"gateway": {"zero_cut_handover": {"enabled": True}}},
+        {"zero_cut_handover": {"enabled": True}},
+        gw_data,
+    )
+    assert GatewayConfig.from_dict(gw_data).zero_cut_handover_enabled is True
 
 
 def test_launchd_slot_labels_reuse_default_label_convention(monkeypatch, tmp_path):

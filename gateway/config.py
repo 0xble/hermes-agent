@@ -864,7 +864,7 @@ class GatewayConfig:
         if type(outbox.get("enabled", False)) is not bool:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
-        zero_cut_handover = _coerce_dict(nested_gateway.get("zero_cut_handover"))
+        zero_cut_handover = _coerce_dict(pick("zero_cut_handover"))
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),

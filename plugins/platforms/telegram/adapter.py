@@ -4039,6 +4039,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+
         # Persist the day's volume first, so a restart cannot forget the last minute of calls.
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is not None:
@@ -4098,18 +4099,27 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
                     try:
+                        # Keep the actual PTB stop task alive past the bounded adapter teardown. The
+                        # lock callback is attached to that task, not to the shield/wait wrapper, so an
+                        # outer disconnect timeout or cancellation cannot release the token early.
+                        updater_stop_task = asyncio.ensure_future(self._app.updater.stop())
+                        if zero_cut_handover:
+                            def release_after_updater_stop(task) -> None:
+                                _consume_abandoned_task(task)
+                                self._release_platform_lock()
+                            updater_stop_task.add_done_callback(release_after_updater_stop)
                         updater_stopped = await self._await_disconnect_step(
-                            self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
+                            asyncio.shield(updater_stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
                         if zero_cut_handover and not updater_stopped:
                             logger.warning(
-                                "[%s] zero-cut handover releasing the bot-token lock after updater.stop() timeout",
+                                "[%s] updater.stop() timed out; retaining the bot-token lock until the stop task completes",
                                 self.name)
                     except Exception as stop_error:
+                        if zero_cut_handover:
+                            self._release_platform_lock()
                         logger.warning(
                             "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
-                if zero_cut_handover:
-                    # Handover keeps the token exclusively owned until polling has stopped. If the
-                    # bounded stop failed or timed out, release here rather than deadlocking B.
+                elif zero_cut_handover:
                     self._release_platform_lock()
                 # app.stop()/shutdown() can also block on a half-dead httpx pool.
                 # Detach-on-timeout so disconnect always returns (#80598).
