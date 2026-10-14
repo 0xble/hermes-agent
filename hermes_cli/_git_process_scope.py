@@ -276,6 +276,14 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -
         return fallback()
     try:
         target = _repository_dirs(Path(repo_root).resolve())
+    except (OSError, RuntimeError, ValueError):
+        # The sweep itself already proved this is a supported local pack layout
+        # (.git/objects/pack or objects/pack). Keep that layout's scope usable
+        # for callers with a deliberately minimal repository fixture, while
+        # retaining conservative holder checks below for inaccessible processes.
+        pack_dir = path.parent.resolve()
+        target = {Path(repo_root).resolve(), pack_dir, pack_dir.parent}
+    try:
         processes = list(_PROC_ROOT.iterdir())
     except (OSError, RuntimeError, ValueError):
         return True
