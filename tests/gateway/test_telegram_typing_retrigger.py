@@ -29,10 +29,10 @@ def _make_adapter():
     return adapter
 
 
-async def _drain(adapter):
+async def _drain(adapter, timeout=3):
     pending = [t for t in adapter._background_tasks if not t.done()]
     if pending:
-        await asyncio.wait(pending, timeout=2)
+        await asyncio.wait(pending, timeout=timeout)
 
 
 @pytest.mark.asyncio
@@ -55,13 +55,64 @@ async def test_send_returns_without_waiting_on_typing():
 
 
 @pytest.mark.asyncio
-async def test_streaming_burst_collapses_to_one_chat_action_per_chat():
-    """Every streamed chunk re-arms typing; within the interval that is one API call per chat."""
+async def test_streaming_burst_defers_one_trailing_rearm():
+    """A burst spaced 0.5s apart gets one immediate and one trailing re-arm."""
     adapter = _make_adapter()
 
-    for i in range(20):
-        assert (await adapter.send("123", f"chunk {i}")).success
-        assert (await adapter.send("456", f"chunk {i}")).success
+    assert (await adapter.send("123", "chunk 0")).success
+    await asyncio.sleep(0.5)
+    assert (await adapter.send("123", "chunk 1")).success
+    await asyncio.sleep(0.5)
+    assert (await adapter.send("123", "chunk 2")).success
+
+    # The trailing re-arm is due two seconds after the immediate one.
+    await asyncio.sleep(1.3)
     await _drain(adapter)
 
     assert adapter._bot.send_chat_action.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_final_reply_cancels_pending_trailing_rearm():
+    """The final reply must prevent a deferred intermediate re-arm from firing."""
+    adapter = _make_adapter()
+
+    assert (await adapter.send("123", "chunk 0")).success
+    await asyncio.sleep(0.5)
+    assert (await adapter.send("123", "chunk 1")).success
+    await asyncio.sleep(0)
+    assert "123" in getattr(adapter, "_telegram_typing_retrigger_trailing_tasks", {})
+
+    assert (await adapter.send("123", "final", metadata={"notify": True})).success
+    await asyncio.sleep(2.2)
+    await _drain(adapter)
+
+    assert adapter._bot.send_chat_action.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retrigger_has_at_most_one_in_flight_per_chat():
+    """A trailing re-arm waits for the immediate call instead of overlapping it."""
+    adapter = _make_adapter()
+    adapter._telegram_typing_retrigger_interval = 0.5
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_typing(chat_id, metadata=None):
+        started.set()
+        await release.wait()
+
+    adapter.send_typing = blocking_typing
+
+    assert (await adapter.send("123", "chunk 0")).success
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert (await adapter.send("123", "chunk 1")).success
+    await asyncio.sleep(0.7)
+
+    assert started.is_set()
+    assert len([t for t in adapter._background_tasks if not t.done()]) == 2
+
+    release.set()
+    await _drain(adapter)
+
+    assert len([t for t in adapter._background_tasks if not t.done()]) == 0

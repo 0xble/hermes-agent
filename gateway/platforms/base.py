@@ -3611,10 +3611,14 @@ class BasePlatformAdapter(ABC):
         setStatus disables the compose box). Each ``send_typing`` is bounded by a sub-interval
         timeout so one slow round-trip is abandoned before the next tick, not the bubble lapsing."""
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
+                # Anchor the next deadline before the request so a slow send does not stretch the
+                # refresh cadence beyond the configured interval.
+                deadline = loop.time() + interval
                 if chat_id not in self._typing_paused:
                     try:
                         await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
@@ -3624,10 +3628,8 @@ class BasePlatformAdapter(ABC):
                     except Exception as typing_err:
                         logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
                 if stop_event is None:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + interval
                 while not stop_event.is_set():
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -3638,6 +3640,10 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+            if cancel_retrigger is not None:
+                with contextlib.suppress(Exception):
+                    cancel_retrigger(chat_id)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
@@ -3648,6 +3654,10 @@ class BasePlatformAdapter(ABC):
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+        if cancel_retrigger is not None:
+            with contextlib.suppress(Exception):
+                cancel_retrigger(chat_id)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():
