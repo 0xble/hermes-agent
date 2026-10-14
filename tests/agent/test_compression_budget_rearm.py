@@ -129,7 +129,7 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     compressor.protect_first_n = 3
     compressor.protect_last_n = 20
     compressor.threshold_tokens = 100
-    compressor.context_length = 1_000
+    compressor.context_length = 256_000
     compressor.last_prompt_tokens = -1
     compressor._verify_compaction_cleared_threshold = False
     compressor.awaiting_real_usage_after_compression = False
@@ -199,6 +199,10 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     with (
         patch(
             "agent.turn_context.estimate_request_tokens_rough",
+            return_value=10,
+        ),
+        patch(
+            "agent.compression_recovery.estimate_request_tokens_rough",
             return_value=10,
         ),
         patch(

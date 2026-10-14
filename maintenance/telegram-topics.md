@@ -48,6 +48,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
   `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
   icon recorded there is never replaced by an automatic rename.
+- Compression exhaustion is not a conversation reset: retain the same session/topic,
+  exact title, icon and manual provenance. `/new`, idle and daily resets remain explicit
+  conversation boundaries. See [same-session compression recovery](session-compression-recovery.md).
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. Upstream
   #117296 defers the title until the turn settles whenever both share a self-hosted base URL,

@@ -417,7 +417,8 @@ def _fail_closed_on_insufficient_progress(agent, request_tokens: int) -> None:
     raise PreflightCompressionTimedOut(
         "Context compression could not bring this session under the model's context window "
         f"(~{request_tokens:,} tokens vs {window:,}). The provider call was not "
-        "sent. Start a new session with /new; this session is too large to compress further."
+        "sent. This session and its accepted input are retained. Retry /compress "
+        "when the summary route is available; no new session is required."
     )
 
 
@@ -704,6 +705,16 @@ def _stage_turn_user_message(
     if persist_user_platform_id is not None:
         user_msg["platform_message_id"] = persist_user_platform_id
     return user_msg, pending_cli_message
+
+
+def _same_trigger_content(row_content: Any, user_message: Any, persist_user_message: Any) -> bool:
+    """True when a historical user row carries this turn's input (API or persisted variant),
+    compared after surrounding-whitespace normalization for text."""
+    def norm(value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+    row = norm(row_content)
+    return any(row == norm(candidate) for candidate in (user_message, persist_user_message)
+               if candidate is not None)
 
 
 def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]]) -> None:
@@ -1131,8 +1142,23 @@ def build_turn_context(
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
     # Append the user message now that close persistence is safe.
-    append_message(messages, user_msg)
-    current_turn_user_idx = len(messages) - 1
+    # Recovery can resume the same accepted logical input. Keep its original tail
+    # (including completed tool receipts), rather than appending a second trigger.
+    # SessionDB replays expose the id as ``message_id`` (JSONL compat) as well as
+    # ``platform_message_id``; match either so a DB-replayed trigger is not re-appended.
+    # Reuse only an identical retry: a row sharing the id but carrying different content is
+    # distinct input (FIFO admission treats it so) and must not be replaced by the older text.
+    accepted_idx = next((i for i, row in enumerate(messages)
+        if persist_user_platform_id is not None and isinstance(row, dict) and row.get("role") == "user"
+        and str(persist_user_platform_id) in (
+            str(row.get("platform_message_id") or ""), str(row.get("message_id") or ""))
+        and _same_trigger_content(row.get("content"), user_message, persist_user_message)), None)
+    if accepted_idx is None:
+        append_message(messages, user_msg)
+        current_turn_user_idx = len(messages) - 1
+    else:
+        current_turn_user_idx = accepted_idx
+        user_msg = messages[accepted_idx]
     agent._persist_user_message_idx = current_turn_user_idx
 
     agent._user_turn_count += 1
@@ -1178,6 +1204,9 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
+    from agent.compression_recovery import admit_before_compaction
+    admit_before_compaction(agent, messages, conversation_history, user_msg)
+
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -1220,6 +1249,13 @@ def build_turn_context(
             )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+    # Durable turn admission: the native transcript now owns this input (no-op if the
+    # pre-compaction admission already fired, or if the flush did not land).
+    from agent.compression_recovery import notify_input_admitted
+    _anchor = messages[current_turn_user_idx] if 0 <= current_turn_user_idx < len(messages) else None
+    for _admitted in (_anchor, user_msg):
+        if isinstance(_admitted, dict) and _admitted.get("role") == "user":
+            notify_input_admitted(agent, _admitted)
 
     return TurnContext(
         user_message=user_message, original_user_message=original_user_message, messages=messages,

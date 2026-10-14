@@ -56,7 +56,7 @@ async def test_accepted_steer_and_events_drain_once_in_order(kind):
             for i in range(3)
         ]
         for event in events:
-            runner._enqueue_fifo(key, event, adapter)
+            assert runner._enqueue_fifo(key, event, adapter)
     result = {"final_response": "done", "pending_steer": "accepted correction"}
     expected = ["accepted correction", *[event.text for event in events]]
     if kind == "interrupt":

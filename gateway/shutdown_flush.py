@@ -13,6 +13,7 @@ on success), ``flush_agent_history_to_file`` (DB flush raised),
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
@@ -54,32 +55,102 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path."""
+def _fsync_directory(flush_dir: Path) -> None:
+    """Durably publish directory-entry changes, raising on failure."""
+    directory_fd = os.open(flush_dir, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[Path] = None,
+                   require_durable: bool = False) -> Path:
+    """Atomically write one private, uniquely named recovery payload; return its path.
+
+    Durable queue admission stages the payload under a non-eligible name. A directory-fsync failure
+    therefore cannot leave a new replayable file behind or replace an already accepted checkpoint.
+    """
     from utils import atomic_json_write
-    final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
-    atomic_json_write(final_path, payload, mode=0o600, default=str)
-    if os.name == "posix":
-        # Persist the directory entry too; keep the published file (the only recovery copy) even if
-        # fsync fails.
-        try:
-            directory_fd = os.open(flush_dir, os.O_RDONLY)
-        except OSError as exc:
-            logger.debug("Failed to fsync pending-message directory: %s", exc)
-        else:
+    final_path = path if path is not None else flush_dir / f"pending-{uuid.uuid4().hex}.json"
+    if not require_durable:
+        atomic_json_write(final_path, payload, mode=0o600, default=str)
+        if os.name == "posix":
             try:
-                os.fsync(directory_fd)
+                _fsync_directory(flush_dir)
             except OSError as exc:
                 logger.debug("Failed to fsync pending-message directory: %s", exc)
-            finally:
-                os.close(directory_fd)
-    return final_path
+        return final_path
+
+    stage_path = flush_dir / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
+    backup_path = flush_dir / f".{final_path.name}.{uuid.uuid4().hex}.backup"
+    had_previous = final_path.exists()
+    try:
+        atomic_json_write(stage_path, payload, mode=0o600, default=str)
+        if os.name == "posix":
+            _fsync_directory(flush_dir)
+        if had_previous:
+            # Keep the previously accepted payload available until the staged replacement is
+            # fully published. The backup is intentionally non-eligible and is fsynced first.
+            with open(final_path, "rb") as source, open(backup_path, "wb") as backup:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    backup.write(chunk)
+                backup.flush()
+                os.fsync(backup.fileno())
+            if os.name == "posix":
+                _fsync_directory(flush_dir)
+        stage_path.replace(final_path)
+        try:
+            if os.name == "posix":
+                _fsync_directory(flush_dir)
+        except OSError:
+            if had_previous:
+                backup_path.replace(final_path)
+            else:
+                final_path.unlink(missing_ok=True)
+            if os.name == "posix":
+                with contextlib.suppress(OSError):
+                    _fsync_directory(flush_dir)
+            raise
+        backup_path.unlink(missing_ok=True)
+        return final_path
+    except Exception:
+        stage_path.unlink(missing_ok=True)
+        if not had_previous:
+            final_path.unlink(missing_ok=True)
+        backup_path.unlink(missing_ok=True)
+        raise
+
+
+
+def _payload_fingerprint(data: Any) -> str:
+    """Stable content identity used to detect in-memory mutations after queue admission."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
     try:
         serialised = _serialise_value(value)
+        checkpoint = getattr(value, "_hermes_recovery_spool", None)
+        if checkpoint is not None and checkpoint.exists():
+            if serialised is None:
+                return True
+            fingerprint = _payload_fingerprint(serialised)
+            if fingerprint == getattr(value, "_hermes_recovery_fingerprint", None):
+                return True
+            if getattr(value, "_hermes_queue_checkpoint", False):
+                return checkpoint_queued_event(session_key, value, refresh=True)
+            _write_payload(
+                flush_dir, {"session_key": session_key, **extra, "data": serialised},
+                path=checkpoint, require_durable=True,
+            )
+            value._hermes_recovery_fingerprint = fingerprint
+            return True
         if serialised is None or not has_user_content(serialised):
             return False
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
@@ -110,6 +181,110 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
+
+
+# Older queue checkpoints leave automatic replay, but their only durable input copy survives
+# in the existing quarantine for manual recovery.
+QUEUE_CHECKPOINT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def queue_checkpoint_exempt(event: Any) -> bool:
+    """Re-derivable gateway wakes are not durably checkpointed.
+
+    Goal continuations and heartbeat ticks are re-derived from their own durable owners (goal
+    state, the heartbeat poller); a checkpoint for them could only replay a stale wake. Internal
+    completions (delegation/watch notifications) are claim-settled at admission, so their
+    checkpoint is the only durable copy and stays; like id-less human input (leftover
+    ``/steer``), consumption retires it by path, not by platform-id lookup."""
+    from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
+    if getattr(event, "_heartbeat_session_id", None):
+        return True
+    return bool((getattr(event, "metadata", None) or {}).get(GOAL_CONTINUATION_METADATA_KEY))
+
+
+def retire_queue_checkpoint(event: Any, *, reason: str) -> bool:
+    """Delete the accepted-queue spool owned by *event* (consumed or discarded).
+
+    Keyed by the checkpoint's own path, never by session lookup, so a rotation (/new, reset,
+    compression) cannot leave it behind to replay into the successor session."""
+    path = getattr(event, "_hermes_recovery_spool", None)
+    if path is None or not getattr(event, "_hermes_queue_checkpoint", False):
+        return False
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not retire queue checkpoint %s (%s): %s", path, reason, exc)
+        return False
+    event._hermes_recovery_spool = None
+    event._hermes_queue_checkpoint = False
+    logger.debug("Retired queue checkpoint %s (%s)", path, reason)
+    return True
+
+
+def quarantine_pending_spool(path: Path, why: str) -> bool:
+    """Move a pending spool out of every replay glob, keeping it on disk for manual recovery."""
+    target = path.with_name(path.name + QUARANTINE_SUFFIX)
+    try:
+        path.replace(target)
+    except OSError as exc:
+        logger.error("Could not quarantine pending message %s (%s): %s", path, why, exc)
+        return False
+    logger.warning("Quarantined pending message %s to %s (%s); it will not be replayed", path, target, why)
+    return True
+
+
+def retire_queue_checkpoints(events, *, reason: str) -> int:
+    """Retire every checkpoint in *events* (None entries and plain strings are skipped)."""
+    return sum(retire_queue_checkpoint(event, reason=reason) for event in events if event is not None)
+
+
+def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = False) -> bool:
+    """Admit through the native pending spool before a memory-only queue can lose input.
+
+    Exempt wakes (see :func:`queue_checkpoint_exempt`) are accepted without a checkpoint."""
+    checkpoint = getattr(event, "_hermes_recovery_spool", None)
+    if not refresh and checkpoint is not None and checkpoint.exists():
+        return True
+    if checkpoint is None and queue_checkpoint_exempt(event):
+        return True
+    try:
+        # Id-less notifications need an occurrence receipt even if spool retirement fails.
+        # Reuse the native admission identity without inventing a transport/reply anchor.
+        if not getattr(event, "message_id", None) and not getattr(event, "_outbox_admission_id", None):
+            event._outbox_admission_id = f"queue:{uuid.uuid4().hex}"
+        data = _serialise_value(event)
+        if data is None or not has_user_content(data):
+            return False
+        data["drain_deferred"] = True
+        data["queue_accepted"] = True
+        event._hermes_recovery_spool = _write_payload(_get_flush_dir(), {
+            "session_key": session_key, "reason": "queue_accepted",
+            "ts": _pending_arrival_ts(event, int(time.time())),
+            "seq": next(_TRANSCRIPT_SPOOL_SEQ), "data": data,
+        }, path=checkpoint if refresh else None, require_durable=True)
+        event._hermes_recovery_fingerprint = _payload_fingerprint(_serialise_value(event))
+        event._hermes_queue_checkpoint = True
+        return True
+    except Exception:
+        logger.warning("Queue admission checkpoint failed for %s", session_key, exc_info=True)
+        return False
+
+
+def prepare_queued_turn_checkpoint(agent, event, session_key: str, session_id: str, inbound_id):
+    """Bind the accepted spool to the actual transcript before provider work.
+
+    Routing can rotate after admission. An original-session receipt must still suppress
+    replay when retirement fails, without changing the event's transport or reply anchor.
+    """
+    platform_id = str(inbound_id) if inbound_id is not None else None
+    if not getattr(event, "_hermes_queue_checkpoint", False):
+        return platform_id
+    event.session_id = session_id
+    if not session_id or not checkpoint_queued_event(session_key, event, refresh=True):
+        raise RuntimeError("Queued input checkpoint could not bind to its session. "
+                           "The provider call was not sent; the input is retained.")
+    agent._input_admitted_callback = lambda: retire_queue_checkpoint(event, reason="turn_admitted")
+    return platform_id or getattr(event, "_outbox_admission_id", None)
 
 
 def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -241,6 +416,9 @@ def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        admission_id = getattr(value, "_outbox_admission_id", None)
+        if isinstance(admission_id, str) and admission_id:
+            result["_outbox_admission_id"] = admission_id
         for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
@@ -519,9 +697,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")
     if data.get("drain_deferred") is True:
-        if time.time() - path.stat().st_mtime > 24 * 60 * 60:
-            logger.warning("Dropping expired drain-deferred message from %s", path)
-            return DROP_PENDING
+        age = time.time() - path.stat().st_mtime
+        limit = QUEUE_CHECKPOINT_MAX_AGE_SECONDS if data.get("queue_accepted") is True else 24 * 60 * 60
+        if age > limit:
+            quarantine_pending_spool(path, "expired drain-deferred input")
+            return False
         from gateway.platforms.event import MessageEvent
         from hermes_cli.commands import resolve_command
         command = MessageEvent(
@@ -529,6 +709,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         ).get_command()
         if command and resolve_command(command) is not None:
             logger.warning("Dropping spooled built-in control command /%s from %s", command, path)
+            # Both accepted-queue checkpoints and drain arrivals discard commands
+            # terminally. Retaining an eligible file here re-warns on every boot.
             return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
@@ -553,6 +735,25 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
         return False
+    if data.get("queue_accepted") is True:
+        from types import SimpleNamespace as _NS
+        if queue_checkpoint_exempt(_NS(metadata=data.get("metadata") or {})):
+            # Goal continuations are re-derived by their own owner; an older build's checkpoint
+            # of one cannot be deduped by id and would otherwise replay every boot.
+            logger.info("Dropping stale gateway-authored queue checkpoint %s", path)
+            return DROP_PENDING
+        # Admission dedupe is not a completed reply/effect receipt. Once admitted,
+        # the native transcript/resume owner retains continuation.
+        message_id = data.get("message_id") or data.get("_outbox_admission_id")
+        if target_db is not None and message_id:
+            from agent.turn_context import _same_trigger_content
+            prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
+            if any(not data.get("message_id") or
+                   _same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
+                   for row in prior_rows):
+                return True
+        if deferred_followup is None:
+            return False
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data, path)
         if claim is DROP_PENDING:
@@ -566,6 +767,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             return False
         if claim:
             return CLAIMED_FOLLOWUP
+        if data.get("queue_accepted") is True or data.get("drain_deferred") is True:
+            # Both accepted checkpoints and legacy drain arrivals are future turns, not history.
+            # A declined owner claim cannot become a naked user row, even if quarantine failed.
+            logger.warning("Queued input for %s declined by its follow-up owner; "
+                           "not appended to the transcript", session_key)
+            return False
     # Keep a machinery notice machinery in the transcript too, so a later reader (crash-left
     # reply judgement, display filters) does not treat it as a human prompt.
     row_display: Dict[str, Any] = {}

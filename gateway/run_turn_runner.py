@@ -1836,14 +1836,18 @@ class TurnRunner:
                 kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
-            # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
-            # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
-            if ctx.inbound_message_id is not None:
-                kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            from gateway.shutdown_flush import prepare_queued_turn_checkpoint
+            platform_id = prepare_queued_turn_checkpoint(
+                agent, ctx.queued_event, session_key, ctx.session_id, ctx.inbound_message_id)
+            if platform_id is not None:
+                kwargs["persist_user_platform_id"] = platform_id
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 return agent.run_conversation(api_message, **kwargs)
         finally:
+            # One-shot and turn-scoped: a cached agent must never fire it for a later turn.
+            with suppress(Exception):
+                agent._input_admitted_callback = None
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

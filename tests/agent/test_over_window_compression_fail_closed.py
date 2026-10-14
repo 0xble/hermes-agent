@@ -45,7 +45,7 @@ def _preflight(agent, request_tokens):
 
 
 def test_no_progress_preflight_fails_closed_only_when_the_request_exceeds_the_window():
-    with pytest.raises(PreflightCompressionTimedOut, match="Start a new session with /new"):
+    with pytest.raises(PreflightCompressionTimedOut, match="no new session is required"):
         _preflight(_agent(context_length=131_072), 356_113)
 
     # Over threshold but inside the window: sent as-is (blocked so the loop does not retry).
