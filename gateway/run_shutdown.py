@@ -913,6 +913,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Bulk-mark running turns durably; return all interruption candidates for notes."""
+        from gateway.cron_review import is_review_event
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         markers = []
@@ -925,6 +926,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 _state = getattr(self, "_peek_session_state", lambda _key: None)(_sk)
                 _event = getattr(getattr(_state, "turn", None), "event", None)
+                if is_review_event(_event):
+                    continue  # the delivery queue replays a cut review; resuming it would post its reply
                 _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
                 _entry = getattr(self.session_store, "_entries", {}).get(_sk)
                 _turn_id = getattr(_entry, "active_turn_token", None)
