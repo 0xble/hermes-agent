@@ -437,7 +437,8 @@ class GatewayGoalsMixin:
         return await self._run_in_executor_with_context(factory, sid)
 
     async def _pause_goal_for_stop(
-        self, session_key: str, source: Any, *, run_generation: Optional[int] = None,
+        self, session_key: str, source: Any, *, expected_session_id: Optional[str] = None,
+        expected_generation: Optional[int] = None, expected_session_entry: Any = None,
     ) -> bool:
         """``/stop`` pauses the standing goal and drops its queued continuations (CLI Ctrl+C parity).
 
@@ -451,10 +452,14 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("goal stop: session lookup failed for %s: %s", session_key, exc)
             session_id = None
-        def is_current():
-            return run_generation is None or self._is_session_run_current(session_key, run_generation)
-
-        if not is_current():
+        # Fast rejection only. Warm-up and executor admission still await below, so ownership
+        # is revalidated under locks at the goal mutation, not assumed stable from here.
+        if expected_session_entry is None and expected_session_id and session_id != expected_session_id:
+            logger.info("goal stop: route %s moved to another session; skipping pause", session_key)
+            return False
+        if (expected_generation is not None
+                and self._current_session_run_generation(session_key) != expected_generation):
+            logger.info("goal stop: run generation for %s advanced; skipping pause", session_key)
             return False
         adapter = self._delivery_adapter_for(source)
         with suppress(Exception):
@@ -462,32 +467,56 @@ class GatewayGoalsMixin:
         if not session_id:
             return False
         from hermes_cli.goals import GoalManager
+        from hermes_cli.goals_pause import pause_goal_if_current
+
+        persistent = self._session_state(session_key).persistent
+
+        def _is_current() -> bool:
+            # No store lookup, serialization, or DB I/O while holding the loop-side claim lock.
+            with persistent.run_generation_lock:
+                return (expected_generation is None
+                        or persistent.run_generation == expected_generation)
 
         def _pause() -> Optional[str]:
-            mgr = GoalManager(
-                session_id=str(session_id),
-                default_max_turns=self._goal_max_turns_from_config(),
-                min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
-            )
-            if not mgr.has_goal():
-                return None
-            if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
-                return None
-            if not is_current():
-                return None
-            mgr.pause(reason=_GOAL_STOP_PAUSE_REASON)
-            return mgr.state.goal
+            # Lock order: route -> goal DB -> SHORT generation check. Route replacement stays
+            # fenced off-loop; SQLite's transaction serializes successor goal writes, without
+            # blocking a synchronous generation claim on the asyncio ingress thread.
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
+                entry = self.session_store._entries.get(session_key)
+                if entry is None or not _is_current():
+                    return None
+                if expected_session_entry is not None:
+                    if entry is not expected_session_entry:
+                        return None
+                elif entry.session_id != session_id:
+                    return None
+                current_id = str(entry.session_id)
+                mgr = GoalManager(
+                    session_id=current_id,
+                    default_max_turns=self._goal_max_turns_from_config(),
+                    min_continuation_gap_seconds=self._goal_min_continuation_gap_from_config(),
+                )
+                if not mgr.has_goal():
+                    return None
+                if mgr.state.status == "paused" and mgr.state.paused_reason == _GOAL_STOP_PAUSE_REASON:
+                    return None
+                paused = pause_goal_if_current(
+                    current_id, mgr.state.to_json(), reason=_GOAL_STOP_PAUSE_REASON,
+                    is_current=_is_current,
+                )
+                return paused.goal if paused is not None else None
 
         with self._profile_scope_for_source(source):
             await self._warm_goals_session_db("goal stop")
-            if not is_current():
+            if not _is_current():
                 return False
             try:
                 goal = await self._run_in_executor_with_context(_pause)
             except Exception as exc:
                 logger.warning("goal stop: pause failed for session %s: %s", session_id, exc)
                 return False
-            if not goal or not is_current():
+            if not goal or not _is_current():
                 return False
             logger.info("goal stop: paused standing goal for session %s", session_id)
             try:
