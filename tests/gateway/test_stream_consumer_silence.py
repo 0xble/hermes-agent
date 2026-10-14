@@ -44,6 +44,13 @@ def test_partial_predicate_agrees_with_exact_on_full_markers():
         assert is_intentional_silence_response(marker) is True
 
 
+def test_partial_predicate_holds_through_a_trailing_loop_complete_line():
+    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n"):
+        assert is_partial_silence_marker(text) is True
+    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "\nLOOP"):
+        assert is_partial_silence_marker(text) is False
+
+
 # --------------------------------------------------------------------------
 # GatewayStreamConsumer — end-to-end suppression through run()
 # --------------------------------------------------------------------------

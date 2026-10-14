@@ -159,7 +159,6 @@ async def test_loop_wakeup_control_suffix_is_suppressed_but_raw_loop_stop_surviv
         reply_expected=False,
     )
     event.internal = True
-    assert event.internal is True
     assert await _deliver(event, "[SILENT]" + chr(10) + "LOOP_COMPLETE", monkeypatch) == ""
     assert await _deliver(event, "NO_REPLY" + chr(10) + "LOOP_COMPLETE", monkeypatch) == ""
     assert await _deliver(event, "LOOP_COMPLETE", monkeypatch) == ""
