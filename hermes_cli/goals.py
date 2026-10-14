@@ -2233,7 +2233,7 @@ def _relay_ledger_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
     path = os.path.join(state_dir, "receipts.jsonl")
     found: Optional[Dict[str, Any]] = None
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             for line in handle:
                 if receipt_id not in line:
                     continue
