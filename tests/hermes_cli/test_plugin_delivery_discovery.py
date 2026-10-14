@@ -35,6 +35,10 @@ def test_policy_delivery_waits_past_short_background_discovery_timeout(monkeypat
         _discovered = True
         _discovery_complete = False
 
+    class LiveWorker:
+        def is_alive(self):
+            return not manager._discovery_complete
+
     manager = Manager()
     seen = []
 
@@ -45,10 +49,38 @@ def test_policy_delivery_waits_past_short_background_discovery_timeout(monkeypat
         manager._discovery_complete = True
 
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", LiveWorker())
     monkeypatch.setattr(plugins, "_join_background_discovery", join)
 
     assert plugins._delivery_manager() is manager
     assert seen == [None]
+
+
+@pytest.mark.parametrize("sweep_error", [None, RuntimeError("transient startup sweep failure")])
+def test_finished_startup_sweep_still_allows_lazy_discovery(monkeypatch, sweep_error):
+    """Once the startup worker has exited, the strict dead-worker check must not refuse a fresh
+    (e.g. profile-scoped) manager or a retry after a failed sweep: lazy discovery owns those."""
+    import threading
+
+    import hermes_cli.plugins as plugins
+
+    class Manager:
+        _discovered = False
+        _discovery_complete = False
+
+        def discover_and_load(self, force=False):
+            self._discovered = self._discovery_complete = True
+
+    manager = Manager()
+    finished = threading.Thread(target=lambda: None)
+    finished.start()
+    finished.join()
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(plugins, "_background_discovery_thread", finished)
+    monkeypatch.setattr(plugins, "_background_discovery_error", sweep_error)
+
+    assert plugins._delivery_manager() is manager
+    assert manager._discovery_complete
 
 
 def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypatch):
