@@ -379,6 +379,20 @@ def test_sender_approval_before_delivery_survives_later_traffic(hermes_home, mon
     assert "later chatter" not in block
 
 
+def test_typed_approval_survives_more_than_500_runtime_rows(hermes_home):
+    sid = "paged-typed"
+    db = _db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("send only with approval")
+    db.append_message(sid, "user", "Yes, approved")
+    for i in range(505):
+        db.append_message(sid, "user", f"runtime row {i}", display_kind="internal_notification")
+
+    block = goals._render_user_messages_block(sid, state.created_at)
+
+    assert "Yes, approved" in block
+
+
 def test_same_timestamp_sender_message_after_delivery_is_excluded(hermes_home):
     sender, target = "same-time-sender", "same-time-goal"
     sender_db, target_db = _db(sender), _db(target)

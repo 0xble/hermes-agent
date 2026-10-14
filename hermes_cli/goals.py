@@ -2349,21 +2349,45 @@ def _active_profile_name() -> str:
 
 def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
                        limit: int = 500) -> List[Dict[str, Any]]:
-    """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). The strict upper
-    bound is applied in the query, so a busy session cannot push an earlier message out of the row
-    limit or let a same-timestamp post-delivery message become authority."""
+    """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). Page raw rows
+    until the typed bound is satisfied, so runtime rows cannot evict an approval from the window."""
     db = _get_session_db()
     reader = getattr(db, "messages_by_role", None) if db is not None else None
     if not session_id or reader is None:
         return []
     try:
-        kwargs: Dict[str, Any] = {"since": since, "limit": limit}
-        if until > 0:
-            kwargs["until"] = until
-        return [row for row in reader(session_id, "user", **kwargs) if _is_user_typed(row)]
+        wanted = max(int(limit), 1)
+        page_size = 500
+        offset = 0
+        typed: List[Dict[str, Any]] = []
+        while len(typed) < wanted:
+            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "offset": offset}
+            if until > 0:
+                kwargs["until"] = until
+            page = reader(session_id, "user", **kwargs)
+            typed.extend(row for row in page if _is_user_typed(row))
+            if len(page) < page_size:
+                break
+            offset += len(page)
+        return typed[:wanted]
     except Exception as exc:
         logger.debug("goal judge: user message read failed: %s", exc)
         return []
+
+
+def _relay_rows(db: Any, session_id: str, since: float, *, limit: int = 500) -> List[Dict[str, Any]]:
+    """Page raw user rows until the bounded set of relay deliveries is complete."""
+    wanted = max(int(limit), 1)
+    page_size = 500
+    offset = 0
+    relays: List[Dict[str, Any]] = []
+    while len(relays) < wanted:
+        page = db.messages_by_role(session_id, "user", since=since, limit=page_size, offset=offset)
+        relays.extend(row for row in page if _relay_sender(str(row.get("content") or "")) is not None)
+        if len(page) < page_size:
+            break
+        offset += len(page)
+    return relays[:wanted]
 
 
 def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
@@ -2386,11 +2410,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
                                 f"- Brian (this session):\n{content}"))
 
     active_profile = _active_profile_name()
-    relay_rows = []
-    try:
-        relay_rows = db.messages_by_role(session_id, "user", since=since, limit=500)
-    except Exception:
-        relay_rows = []
+    relay_rows = _relay_rows(db, session_id, since, limit=500)
     receipts = _relay_ledger_receipts(
         _relay_receipt_id(str(r.get("content") or "")) for r in relay_rows
         if _relay_sender(str(r.get("content") or "")) is not None)
