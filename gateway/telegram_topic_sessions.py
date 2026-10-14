@@ -55,11 +55,34 @@ def _icon_choices(options) -> str:
     return " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
 
 
+# Joiners, variation selectors and skin-tone modifiers are not base identities.
+_NON_BASE_CODEPOINTS = frozenset({"\u200d", "\ufe0e", "\ufe0f"} | {chr(c) for c in range(0x1F3FB, 0x1F400)})
+
+
+def _closest_icon(valid, normalized: str) -> Optional[str]:
+    """Catalog icon sharing the most base codepoints with the input, else None."""
+    from agent.topic_icons import normalize_emoji
+
+    wanted = set(normalized) - _NON_BASE_CODEPOINTS
+    best, best_shared = None, 0
+    for item in valid:
+        shared = len(wanted & (set(normalize_emoji(item)) - _NON_BASE_CODEPOINTS))
+        if shared > best_shared:
+            best, best_shared = item["emoji"], shared
+    return best
+
+
 def _match_icon(options, emoji: str) -> str:
-    match = next((item for item in options if item.get("emoji") == emoji), None)
-    if match is None or not match.get("custom_emoji_id"):
+    from agent.topic_icons import normalize_emoji
+
+    normalized = normalize_emoji(emoji)
+    valid = [item for item in options if item.get("emoji") and item.get("custom_emoji_id")]
+    match = next((item for item in valid if normalize_emoji(item) == normalized), None)
+    if match is None:
+        closest = _closest_icon(valid, normalized)
+        hint = f". Closest spelling: {closest}" if closest else ""
         raise TopicRequestError(
-            f"Unsupported topic icon {emoji!r}. Available icons: {_icon_choices(options) or 'none'}")
+            f"Unsupported topic icon {emoji!r}{hint}. Available icons: {_icon_choices(valid) or 'none'}")
     return str(match["custom_emoji_id"])
 
 
