@@ -968,7 +968,7 @@ class GatewayAgentCacheMixin:
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
         self._spawn_release_thread(
-            self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
+            self._commit_then_release_soft, (agent, session_key), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,
         )
 
@@ -1043,6 +1043,15 @@ class GatewayAgentCacheMixin:
         resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance."""
         if agent is None:
             return
+        # Already removed from the cache: the next turn builds its own manager. Detach
+        # before shutdown so a later soft release/close cannot retire providers twice.
+        manager = getattr(agent, "_memory_manager", None)
+        if manager is not None:
+            agent._memory_manager = None
+            try:
+                manager.shutdown_all()
+            except Exception:
+                logger.warning("Evicted agent memory shutdown failed", exc_info=True)
         with suppress(Exception):
             if hasattr(agent, "release_clients"):
                 agent.release_clients()

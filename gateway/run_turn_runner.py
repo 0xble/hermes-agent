@@ -1163,7 +1163,11 @@ class TurnRunner:
             return out
         with cache_lock:
             cached = cache.get(ctx.session_key)
-            if not (cached and cached[1] == sig):
+            if not cached:
+                return out
+            if cached[1] != sig:
+                # Overwriting the slot would orphan the old instance's memory workers.
+                out.evicted = self._pop_cached_agent_for_eviction()
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1206,8 +1210,9 @@ class TurnRunner:
     def _release_evicted_agent(self, agent) -> None:
         """Off-lock soft release on a daemon thread so teardown never blocks the gateway loop."""
         self._runner._spawn_release_thread(
-            self._runner._release_evicted_agent_soft, (agent,), f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
-            inline_fallback=True,
+            self._runner._commit_then_release_soft, (agent, self._ctx.session_key),
+            f"agent-xproc-evict-{str(self._ctx.session_key)[:24]}",
+            inline_fallback=True, session_key=self._ctx.session_key,
         )
 
     def _build_fresh_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations,
