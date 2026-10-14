@@ -176,40 +176,37 @@ class GatewayBusySessionMixin:
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
-        text = getattr(event_or_text, "text", event_or_text) or ""
-        try:
-            from hermes_cli.goals import is_goal_continuation_text
-            return is_goal_continuation_text(str(text))
-        except Exception:
-            return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        from gateway.platforms.event import is_goal_continuation_event
+        return is_goal_continuation_event(event_or_text)
 
-    def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
-        """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
+    def _clear_goal_pending_continuations(
+        self, session_key: str, adapter: Any, before: Optional[float] = None,
+    ) -> int:
+        """Remove continuations predating a control; keep real items and later resumptions."""
+        def remove(event):
+            if not self._is_goal_continuation_event(event):
+                return False
+            metadata = getattr(event, "metadata", None) or {}
+            try:
+                created_at = float(metadata.get("goal_continuation_created_at", 0))
+            except (TypeError, ValueError):
+                created_at = 0
+            return before is None or created_at <= before
+
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
-            if self._is_goal_continuation_event(pending_event):
+            if remove(pending_event) and pending_slot.get(session_key) is pending_event:
                 pending_slot.pop(session_key, None)
                 removed += 1
 
         overflow = self._overflow_queue(session_key)
         if overflow:
-            kept = [e for e in overflow if not self._is_goal_continuation_event(e)]
+            kept = [e for e in overflow if not remove(e)]
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
         return removed
-
-    def _goal_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued continuation."""
-        if not session_id:
-            return False
-        try:
-            from hermes_cli.goals import GoalManager
-            return GoalManager(session_id=session_id).is_active()
-        except Exception as exc:
-            logger.debug("goal continuation: active-state recheck failed: %s", exc)
-            return False
 
     def _get_max_concurrent_sessions(self) -> Optional[int]:
         """Return the configured active chat session cap, if enabled."""
@@ -370,7 +367,8 @@ class GatewayBusySessionMixin:
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict",
-        "notification_category",
+        "notification_category", "goal_continuation", "goal_continuation_session_id",
+        "goal_continuation_fingerprint", "goal_continuation_instance", "goal_continuation_created_at",
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
@@ -864,6 +862,15 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
+        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
+                internal_wake_is_current, event):
+            return True
+        # Handled without a receipt: a strict event whose pinned session lost its key is dropped,
+        # not queued behind (and later run in) the conversation that replaced it.
+        from gateway.run_turn import GatewayTurnMixin
+        if not await GatewayTurnMixin._strict_session_pin_holds(self, event):  # type: ignore[arg-type]
+            return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if self._draining and event.internal and not self._hm_is_registered_command(event):
@@ -894,6 +901,7 @@ class GatewayBusySessionMixin:
         event._bot_loop_admitted = True
 
         if await self._route_plaintext_approval_while_busy(event, session_key):
+            event._gateway_accepted = True  # consumed by the blocked approval, an admission
             return True
         if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
@@ -940,6 +948,8 @@ class GatewayBusySessionMixin:
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
             self._queue_or_replace_pending_event(session_key, event)
+        else:
+            event._gateway_accepted = True  # folded into the running turn: admitted, not queued
         # Store the message so it's processed as the next turn after the current run finishes (or is
         # interrupted). Skip this for a successful steer — the text already landed inside the run and must
         # NOT also be replayed as a next-turn user message. Route through _queue_or_replace_pending_event
