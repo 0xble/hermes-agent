@@ -225,6 +225,16 @@ def test_string_wrapper_payload_after_heavy_slot_is_scanned(tmp_path, trusted_sl
     assert scan_gateway_lifecycle(f"{trusted_slot} --label proof -- env -S {payload}") == (True, None)
 
 
+@pytest.mark.parametrize("option", ["-S{payload}", "--split-string={payload}"])
+def test_attached_env_split_string_payload_after_heavy_slot_is_scanned(
+    tmp_path, trusted_slot, option,
+):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    command = f"{trusted_slot} --label=proof -- env {option.format(payload=payload)} -- true"
+    assert scan_gateway_lifecycle(command) == (True, None)
+
+
 @pytest.mark.parametrize(
     ("outer_nohups", "tail"),
     [

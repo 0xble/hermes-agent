@@ -1009,7 +1009,7 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 # --- referenced-script discovery --------------------------------------------------------------
 
 def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
-    """Yield values given to *option*, in both ``--opt v`` and ``--opt=v`` form."""
+    """Yield values given to *option*, including env's attached ``-S<command>`` form."""
     prefix = option + "="
     for position in range(start + 1, len(segment)):
         token = segment[position]
@@ -1017,6 +1017,10 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield segment[position + 1]
         elif token.startswith(prefix):
             yield token[len(prefix):]
+        elif option == "-S" and token.startswith("-S") and len(token) > len(option):
+            # env accepts ``-S'bash script'`` as one shell token; shlex removes the
+            # quote and leaves the command attached to the short option.
+            yield token[len(option):]
 
 
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
