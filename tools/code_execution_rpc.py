@@ -36,10 +36,13 @@ def nested_tool_call_id(task_id) -> str:
 
 def _default_dispatch(task_id):
     from model_tools import handle_function_call
+    from gateway.session_context import get_session_env
+    session_id = get_session_env("HERMES_SESSION_ID", "")
     return lambda tool_name, tool_args: handle_function_call(
         tool_name,
         tool_args,
         task_id=task_id,
+        session_id=session_id,
         tool_call_id=nested_tool_call_id(task_id),
     )
 

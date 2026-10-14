@@ -775,11 +775,31 @@ def _apply_request_middleware(
 def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip_pre_tool_call_hook: bool,
                          ids: _CallIds, middleware_trace: List[Dict[str, Any]],
                          ) -> Tuple[Dict[str, Any], Optional[Tuple[Any, str, Optional[str]]]]:
-    """Plugin pre_tool_call hook, then ACP edit approval.
+    """Shared dispatch guards, including the voice-send floor, then ACP approval.
 
     ``(args, None)`` to proceed (args possibly plugin-modified), or
-    ``(args, (result, error_type, error_message))`` when blocked.
+    ``(args, (result, error_type, error_message))`` when blocked. This is the
+    common choke point for direct dispatches, agent calls, and execute_code
+    nested calls; callers that already ran outer hooks still pass through here.
     """
+    try:
+        from types import SimpleNamespace
+        from tools.voice_send_gate import authorize_voice_send
+        from gateway.session_context import get_session_env
+        from hermes_cli.goals import _get_session_db
+        session_id = ids.session_id or get_session_env("HERMES_SESSION_ID", "")
+        voice_block = authorize_voice_send(
+            SimpleNamespace(session_id=session_id, _session_db=_get_session_db() if session_id else None),
+            function_name,
+            function_args,
+        )
+        if voice_block:
+            return function_args, (tool_error(voice_block), "voice_send_block", voice_block)
+    except Exception as _voice_err:
+        logger.debug("voice-send approval guard error: %s", _voice_err)
+        return function_args, (tool_error("BLOCKED: voice-send approval policy unavailable; message send refused."),
+                               "voice_send_error", "voice-send approval policy unavailable")
+
     # pre_tool_call fires exactly once per execution: one invoke_hook pass yields
     # both the block message and modified args. skip=True: caller already fired it.
     if not skip_pre_tool_call_hook:

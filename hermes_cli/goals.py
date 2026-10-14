@@ -1694,8 +1694,13 @@ def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_a
 
 def _ungranted_voice_send_in_evidence(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Deterministic judge floor: never ask the LLM to decide whether a send was approved."""
+    blocked_prefix = "BLOCKED: approval required before sending a message in Brian"
     for item in evidence or []:
         if not isinstance(item, dict):
+            continue
+        # A gate refusal is evidence that no send happened; do not block the
+        # judge a second time on the refused action.
+        if str(item.get("output") or "").startswith(blocked_prefix):
             continue
         if "voice_send_action_hash" in item and not item.get("voice_send_granted"):
             return str(item.get("voice_send_action_hash"))

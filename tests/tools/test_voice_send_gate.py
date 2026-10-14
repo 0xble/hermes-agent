@@ -17,28 +17,70 @@ class MetaDB:
         self.data[key] = value
 
 
-def _agent(db):
-    return SimpleNamespace(session_id="sid", _session_db=db)
+def _agent(db, session_id="sid"):
+    return SimpleNamespace(session_id=session_id, _session_db=db)
 
 
-def test_classifier_send_table_and_read_only(tmp_path):
-    assert voice_send_gate.classify_voice_send("terminal", {"command": "slack message send --text hi"})
-    assert voice_send_gate.classify_voice_send("terminal", {"command": "slack message list"}) is None
-    assert voice_send_gate.classify_voice_send("terminal", {"command": "gog gmail draft create"}) is None
-    assert voice_send_gate.classify_voice_send("terminal", {"command": "quo message list"}) is None
-    script = tmp_path / "send.sh"
-    script.write_text("slack --account lpg message send --text hi")
-    found = voice_send_gate.classify_voice_send("terminal", {"command": f"bash {script}"})
-    assert found and found["action_hash"]
+def test_classifier_shell_forms_and_read_only(tmp_path):
+    commands = [
+        "slack message send --text hi",
+        "sh -c 'slack message send --text hi'",
+        'bash -lc "slack message send --text hi"',
+        "zsh -c 'slack message send --text hi'",
+        "env FOO=1 slack message send --text hi",
+        "nohup slack message send --text hi",
+        "/abs/path/slack message send --text hi",
+        "echo before && slack message send --text hi",
+        "printf x | slack message send --text hi",
+        "( slack message send --text hi )",
+        "imsg send hi",
+        "gog gmail send --to x",
+        "gog gmail reply --to x",
+        "gog gmail drafts send --to x",
+        "wacli send hi",
+        "quo message send hi",
+        "telegram send chat hi",
+    ]
+    for command in commands:
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
+
+    for command in (
+        "slack message list",
+        "slack message send --help",
+        "gog gmail draft create",
+        "gog gmail drafts list",
+        "quo message list",
+        "telegram chats",
+    ):
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+
+
+def test_classifier_scans_direct_and_python_script_files(tmp_path, monkeypatch):
+    shell_script = tmp_path / "send.sh"
+    shell_script.write_text("slack --account lpg message send --text hi")
+    python_script = tmp_path / "send.py"
+    python_script.write_text("subprocess.run(['telegram', 'send', 'chat', 'hi'])")
+    monkeypatch.chdir(tmp_path)
+
+    for command in ("./send.sh", str(shell_script), f"python3 {python_script}"):
+        found = voice_send_gate.classify_voice_send("terminal", {"command": command})
+        assert found and found["action_hash"]
+
+
+def test_native_send_tools_are_classified():
+    found = voice_send_gate.classify_voice_send("mcp__telegram__send", {"chat_id": "1", "text": "hi"})
+    assert found and found["cli"] == "mcp__telegram__send"
 
 
 def test_one_human_approval_consumes_exactly_one_send(monkeypatch):
     db = MetaDB()
     calls = []
     monkeypatch.setattr(voice_send_gate.approval, "_presence", lambda _cb: (None, True, False, False))
+
     def approve_once(*_a, **_kw):
         calls.append(1)
         return {"approved": len(calls) == 1}
+
     monkeypatch.setattr(voice_send_gate.approval, "_human_decision", approve_once)
     agent = _agent(db)
     command = {"command": "slack message send hi"}
@@ -46,7 +88,6 @@ def test_one_human_approval_consumes_exactly_one_send(monkeypatch):
     classified = voice_send_gate.classify_voice_send("terminal", command)
     assert classified is not None
     assert voice_send_gate.has_consumed_grant(db, "sid", classified["action_hash"])
-    # The consumed grant cannot authorize a replay; it must prompt again and deny.
     result = voice_send_gate.authorize_voice_send(agent, "terminal", command)
     assert result and "not approved" in result
     assert len(calls) == 2
@@ -63,33 +104,41 @@ def test_yolo_mode_off_allowlist_and_cron_do_not_bypass(monkeypatch):
     assert result and "no human approval bridge" in result
 
 
-def test_tool_executor_applies_floor_before_dispatch(monkeypatch):
-    from agent.tool_executor import _ToolCallRef, _pre_tool_block
+def test_shared_dispatch_choke_point_blocks_execute_code_style_call(monkeypatch):
+    import model_tools
 
-    db = MetaDB()
-    agent = _agent(db)
-    monkeypatch.setattr(voice_send_gate.approval, "_presence", lambda _cb: (None, False, False, False))
-    ref = _ToolCallRef("terminal", {"command": "slack message send hi"}, "task", "call", [])
-    block, final_args = _pre_tool_block(agent, ref)
-    assert block and "voice" in block.lower()
-    assert final_args == ref.args
+    dispatched = []
+    monkeypatch.setattr(model_tools, "_execute_tool", lambda *args, **kwargs: dispatched.append(1))
+    result = model_tools.handle_function_call("terminal", {"command": "slack message send C1 hi"})
+    assert "BLOCKED: approval required before sending a message in Brian" in result
+    assert not dispatched
 
 
-def test_judge_floor_blocks_before_llm(monkeypatch):
+def test_shared_dispatch_choke_point_runs_voice_gate_once(monkeypatch):
+    import model_tools
+
+    calls = []
+    monkeypatch.setattr(voice_send_gate, "authorize_voice_send", lambda *args: calls.append(args) or "blocked")
+    result = model_tools.handle_function_call("terminal", {"command": "slack message send C1 hi"})
+    assert "blocked" in result
+    assert len(calls) == 1
+
+
+def test_goal_judge_ignores_gate_refusal_but_blocks_unapproved_send(monkeypatch):
     from hermes_cli import goals
+
     called = []
-    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: called.append(1))
-    evidence = [{"tool": "terminal", "call": json.dumps({"command": "slack message send hi"}), "output": "ok"}]
-    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=evidence)
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: called.append(1) or '{"verdict":"done","reason":"ok"}')
+    refused = [{"tool": "terminal", "call": json.dumps({"command": "slack message send hi"}),
+                "output": "BLOCKED: approval required before sending a message in Brian's voice (not approved; action=abc)"}]
+    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=refused)
+    assert verdict == "done"
+    assert reason == "ok"
+    assert called == [1]
+
+    called.clear()
+    sent = [{"tool": "terminal", "call": json.dumps({"command": "slack message send hi"}), "output": "sent"}]
+    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=sent)
     assert verdict == "blocked"
     assert "deterministic voice-send floor" in reason
     assert not called
-
-
-def test_judge_floor_calls_llm_when_granted(monkeypatch):
-    from hermes_cli import goals
-    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: '{"verdict":"done","reason":"ok"}')
-    evidence = [{"tool": "terminal", "call": json.dumps({"command": "slack message send hi"}), "output": "ok", "voice_send_granted": True}]
-    verdict, reason, *_ = goals.judge_goal("send", "done", evidence=evidence)
-    assert verdict == "done"
-    assert reason == "ok"

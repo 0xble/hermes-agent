@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import time
 from pathlib import Path
@@ -19,81 +20,184 @@ from tools import approval
 
 # Keep this as the one classifier table. A match requires the CLI name and a send verb.
 _SEND_TABLE = {
-    "slack": {"message": {"send", "post", "reply"}},
-    "imsg": {"": {"send"}},
-    "gog": {"gmail": {"send", "reply"}},
-    "wacli": {"": {"send"}},
-    "quo": {"": {"send"}, "message": {"send"}},
+    "slack": {
+        ("message",): {"send", "post", "reply", "edit"},
+    },
+    "imsg": {
+        (): {"send"},
+    },
+    "gog": {
+        ("gmail",): {"send", "reply"},
+        ("gmail", "drafts"): {"send"},
+    },
+    "wacli": {
+        (): {"send"},
+    },
+    "quo": {
+        (): {"send"},
+        ("message",): {"send"},
+    },
+    "telegram": {
+        (): {"send"},
+    },
 }
 _NATIVE_SEND_TOOLS = {
     "mcp__telegram__send", "mcp__slack__send", "mcp__imsg__send",
     "mcp__quo__send", "telegram_send", "slack_send", "imsg_send", "quo_send",
 }
 _META_PREFIX = "voice_send_grant:"
+_SHELL_NAMES = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
+_SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "(", ")"})
+_MAX_SCRIPT_BYTES = 1_000_000
 
 
 def _tokens(command: str) -> list[str]:
+    """Tokenize shell syntax while retaining command separators for recursion."""
     try:
-        return shlex.split(command, posix=True)
-    except ValueError:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except (TypeError, ValueError):
         return []
 
 
-def _find_send(tokens: list[str]) -> bool:
+def _segments(tokens: list[str]) -> list[list[str]]:
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _SHELL_OPERATORS:
+            if segments[-1]:
+                segments.append([])
+        else:
+            segments[-1].append(token)
+    return [segment for segment in segments if segment]
+
+
+def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optional[str]]:
     for i, token in enumerate(tokens):
-        name = Path(token).name.lower()
-        table = _SEND_TABLE.get(name)
+        cli = Path(token).name.lower()
+        table = _SEND_TABLE.get(cli)
         if not table:
             continue
+        tail = [part.lower() for part in tokens[i + 1:]]
+        # CLI help is explicitly read-only, even when invoked on a send verb.
+        if "--help" in tail or "-h" in tail:
+            continue
         for prefix, verbs in table.items():
-            if prefix:
-                try:
-                    p = tokens.index(prefix, i + 1)
-                except ValueError:
+            if not prefix:
+                if any(part in verbs for part in tail):
+                    return True, cli, _account_from_tokens(tokens)
+                continue
+            prefix_lower = tuple(part.lower() for part in prefix)
+            for start in range(len(tail) - len(prefix_lower) + 1):
+                if tuple(tail[start:start + len(prefix_lower)]) != prefix_lower:
                     continue
-                tail = tokens[p + 1:]
-            else:
-                tail = tokens[i + 1:]
-            if any(v.lower() in verbs for v in tail):
-                return True
-    return False
+                after = tail[start + len(prefix_lower):]
+                if any(part in verbs for part in after):
+                    return True, cli, _account_from_tokens(tokens)
+    return False, None, None
 
 
-def _script_paths(tokens: list[str]) -> list[Path]:
-    paths: list[Path] = []
+def _account_from_tokens(tokens: list[str]) -> Optional[str]:
     for i, token in enumerate(tokens):
-        if token in {"bash", "sh", "zsh", "dash"} and i + 1 < len(tokens):
-            candidate = tokens[i + 1]
-            if not candidate.startswith("-"):
-                paths.append(Path(candidate).expanduser())
-    return paths
+        lower = token.lower()
+        if lower == "--account" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if lower.startswith("--account="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tuple[bool, Optional[str], Optional[str]]:
+    """Find sends in shell segments, ``*-c`` payloads, and bounded script files."""
+    seen_paths = set() if seen_paths is None else seen_paths
+    for segment in _segments(tokens):
+        found, cli, account = _find_send_in_segment(segment)
+        if found:
+            return True, cli, account
+
+        # Recurse into sh/bash/zsh -c '...' (including bash -lc / zsh -ic).
+        for i, token in enumerate(segment[:-1]):
+            if Path(token).name.lower() not in _SHELL_NAMES:
+                continue
+            j = i + 1
+            while j < len(segment) and segment[j].startswith("-") and segment[j] != "--":
+                option = segment[j][1:]
+                if "c" in option:
+                    if j + 1 < len(segment):
+                        found, cli, account = _find_send(_tokens(segment[j + 1]), seen_paths)
+                        if found:
+                            return True, cli, account or _account_from_tokens(segment)
+                    break
+                j += 1
+
+        # Inspect every existing regular file token. This catches ./send.sh,
+        # /path/send.sh, and python3 send.py without executing anything.
+        for token in segment:
+            try:
+                path = Path(token).expanduser()
+                key = str(path.resolve())
+                if key in seen_paths or not path.is_file() or path.stat().st_size > _MAX_SCRIPT_BYTES:
+                    continue
+                seen_paths.add(key)
+                content = path.read_text(errors="replace")
+            except (OSError, ValueError):
+                continue
+            found, cli, account = _find_send(_tokens(content), seen_paths)
+            if not found:
+                # Python/JSON-like source often keeps the command words inside
+                # one quoted expression, which shell tokenization cannot see.
+                # Inspect source text without executing or importing it.
+                match = re.search(
+                    r"(?i)(?:^|[\"'\[,(\s])"
+                    r"(slack|imsg|gog|wacli|quo|telegram)"
+                    r"(?:[\"'\],)\s]+|\s+)"
+                    r".{0,240}?\b(send|post|reply|edit)\b",
+                    content,
+                )
+                if match:
+                    found, cli, account = True, match.group(1).lower(), _account_from_tokens(segment)
+            if found:
+                return True, cli, account or _account_from_tokens(segment)
+    return False, None, None
+
+
+def _command_account(args: Any, token_account: Optional[str]) -> Optional[str]:
+    if token_account:
+        return token_account
+    if isinstance(args, dict):
+        for key in ("account", "profile"):
+            value = args.get(key)
+            if value is not None and str(value).strip():
+                return str(value)
+    return None
 
 
 def classify_voice_send(tool_name: str, args: Any) -> Optional[dict[str, str]]:
-    """Return ``command``/``action_hash`` for a known send, else ``None``."""
+    """Return normalized action metadata for a known send, else ``None``."""
     if tool_name in _NATIVE_SEND_TOOLS:
         normalized = json.dumps({"tool": tool_name, "args": args}, sort_keys=True, separators=(",", ":"), default=str)
-        return {"command": normalized, "action_hash": hashlib.sha256(normalized.encode()).hexdigest()}
+        return {
+            "command": normalized,
+            "action_hash": hashlib.sha256(normalized.encode()).hexdigest(),
+            "cli": tool_name,
+            "account": _command_account(args, None) or "",
+        }
     if tool_name not in {"terminal", "shell"} or not isinstance(args, dict):
         return None
     command = args.get("command") or args.get("cmd")
     if not isinstance(command, str):
         return None
     tokens = _tokens(command)
-    is_send = _find_send(tokens)
-    if not is_send:
-        # Best-effort script inspection, deliberately bounded and read-only.
-        for path in _script_paths(tokens):
-            try:
-                if path.is_file() and path.stat().st_size <= 1_000_000 and _find_send(_tokens(path.read_text(errors="replace"))):
-                    is_send = True
-                    break
-            except OSError:
-                continue
+    is_send, cli, account = _find_send(tokens)
     if not is_send:
         return None
     normalized = " ".join(tokens)
-    return {"command": normalized, "action_hash": hashlib.sha256(normalized.encode()).hexdigest()}
+    return {
+        "command": normalized,
+        "action_hash": hashlib.sha256(normalized.encode()).hexdigest(),
+        "cli": cli or "",
+        "account": _command_account(args, account) or "",
+    }
 
 
 def _meta_key(session_id: str, action_hash: str) -> str:
@@ -137,6 +241,7 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
     session_id = str(getattr(agent, "session_id", "") or "")
     db = getattr(agent, "_session_db", None)
     action_hash = classified["action_hash"]
+
     existing = _read_grant(db, session_id, action_hash)
     if existing and existing.get("approved_at") and not existing.get("consumed_at"):
         existing["consumed_at"] = time.time()
