@@ -22,7 +22,6 @@
 // checkout because the build stamp has no branch to record.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { availableParallelism } from 'node:os'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
@@ -126,7 +125,11 @@ async function main() {
     return
   }
 
-  const concurrency = requestedConcurrency ?? Math.min(units.length, availableParallelism())
+  const budget = process.env.HERMES_TEST_WORKERS || '4'
+  if (requestedConcurrency === undefined && (!/^[1-9]\d*$/.test(budget) || !Number.isSafeInteger(Number(budget)))) {
+    throw new Error('HERMES_TEST_WORKERS requires a positive integer')
+  }
+  const concurrency = requestedConcurrency ?? Math.min(units.length, Number(budget))
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)
