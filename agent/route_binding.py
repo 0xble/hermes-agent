@@ -7,12 +7,25 @@ is the inverse that ``restore_primary_runtime`` runs once its gates pass.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any, Dict, Optional, Tuple
 
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+
+def _close_failed_route_client(agent: Any, client: Any) -> None:
+    if client is None:
+        return
+    close = getattr(agent, "_close_openai_client", None)
+    if callable(close):
+        with contextlib.suppress(Exception):
+            close(client, reason="failed_route_bind", shared=False)
+        return
+    with contextlib.suppress(Exception):
+        client.close()
 
 
 def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
@@ -60,6 +73,10 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    # Everything below mutates the live route; a failure restores the exact pre-bind objects so
+    # the caller never keeps a half-bound route pointing at a closed candidate client.
+    from agent.fallback_route_recovery import _capture_route_state
+    pre_bind = _capture_route_state(agent)
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -73,23 +90,42 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     reset_codex_reasoning_replay(agent)
     agent._fallback_activated = True
 
-    _rebind_fallback_credential_pool(agent, provider, model)
-    if provider == "moa":
-        from agent.moa_loop import bind_moa_runtime
-        bind_moa_runtime(agent, model)
-    else:
-        from agent.client_lifecycle import _swap_fallback_clients
-        _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_state = dict(vars(compressor)) if compressor is not None else None
+    try:
+        _rebind_fallback_credential_pool(agent, provider, model)
+        if provider == "moa":
+            from agent.moa_loop import bind_moa_runtime
+            bind_moa_runtime(agent, model)
+        else:
+            from agent.client_lifecycle import _swap_fallback_clients
+            _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
 
-    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-    sync_credential_pool_entry_id(agent)
+        from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+        sync_credential_pool_entry_id(agent)
 
-    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-        provider=provider, base_url=base_url, api_mode=api_mode, model=model)
-    agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-    _update_fallback_context_compressor(agent)
-    _reresolve_fallback_reasoning_config(agent, entry)
-    _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+        agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+            provider=provider, base_url=base_url, api_mode=api_mode, model=model)
+        agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
+        _update_fallback_context_compressor(agent)
+        _reresolve_fallback_reasoning_config(agent, entry)
+        _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+    except Exception:
+        # Restore the pre-bind route (retiring clients the swap installed), and close the resolved
+        # client too in case the failure came before it became reachable.
+        from agent.fallback_route_recovery import _restore_route_state
+        installed = getattr(agent, "client", None) is client
+        _restore_route_state(agent, pre_bind)  # retires the candidate client if it was installed
+        if compressor_state is not None:
+            vars(compressor).clear()
+            vars(compressor).update(compressor_state)
+        if not installed and client is not pre_bind.get("client"):
+            _close_failed_route_client(agent, client)
+        raise
+    # Start the optional stay clock only after the route was successfully bound.
+    from time import monotonic
+    agent._active_fallback_entry = entry
+    agent._fallback_stay_started_at = monotonic()
     return old_model, old_provider
 
 
@@ -169,5 +205,9 @@ def reinstall_primary_runtime(
             agent.reasoning_override = None
     agent._pre_fallback_reasoning_override = None
     agent._fallback_activated = False
+    agent._active_fallback_entry = None
+    agent._fallback_stay_started_at = None
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
+    agent._rate_limited_until = 0
+    agent._fallback_episode_cooled = False

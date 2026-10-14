@@ -91,6 +91,7 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = min(60 * (2 ** backoff_count), 14400)
         source = "exponential fallback"
     agent._rate_limited_until = time.monotonic() + backoff_seconds
+    agent._fallback_episode_cooled = True
     # The in-memory fields remain the hot-path cache, while this record is the source of truth
     # across gateway agent eviction, delegated children, cron workers and restarts.
     agent._shared_primary_cooldown_record = None

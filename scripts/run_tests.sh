@@ -161,7 +161,7 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
 TEST_ENV=()
-for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
+for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
@@ -196,8 +196,16 @@ cd "$REPO_ROOT"
 # Pre-building the bytecode cache once here (instead of each subprocess
 # compiling on first import) avoids redundant work across ~2000 processes.
 # Uses git to list tracked .py files (skips venv, node_modules, etc).
-echo "▶ pre-compiling bytecode cache"
-"$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
+# Whole-checkout compilation also happens on targeted runs. Keep it within the
+# same per-job budget as the file runner, including shells without host dotfiles.
+export HERMES_TEST_WORKERS="${HERMES_TEST_WORKERS:-4}"
+if [[ ! "$HERMES_TEST_WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: HERMES_TEST_WORKERS must be a positive integer" >&2
+  exit 1
+fi
+TEST_ENV+=("HERMES_TEST_WORKERS=$HERMES_TEST_WORKERS")
+echo "▶ pre-compiling bytecode cache (up to $HERMES_TEST_WORKERS workers)"
+"$PYTHON" -m compileall -q -j "$HERMES_TEST_WORKERS" -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
 exec env -i \

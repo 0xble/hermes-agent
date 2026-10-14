@@ -67,6 +67,44 @@ class FailoverReason(enum.Enum):
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 
+_OVERFLOW_REASONS = frozenset({
+    FailoverReason.context_overflow.value,
+    FailoverReason.payload_too_large.value,
+    FailoverReason.long_context_tier.value,
+})
+# These verdicts are intrinsically about the account, credential, provider policy, or request
+# content rather than the size of the transcript. Every other explicit verdict stays eligible for
+# the historical large-400 heuristic: ``format_error`` is a classifier catch-all, and a provider can
+# use it for an unrecognised context rejection (#1630).
+_NON_OVERFLOW_REASONS = frozenset({
+    FailoverReason.billing.value,
+    FailoverReason.auth.value,
+    FailoverReason.auth_permanent.value,
+    FailoverReason.rate_limit.value,
+    FailoverReason.upstream_rate_limit.value,
+    FailoverReason.content_policy_blocked.value,
+    FailoverReason.provider_policy_blocked.value,
+    FailoverReason.upstream_blocked.value,
+    FailoverReason.model_entitlement.value,
+    FailoverReason.model_not_found.value,
+})
+
+
+def is_context_overflow_reason(reason: Any, *, unclassified_overflow: bool = False) -> bool:
+    """Use the authoritative failure reason, retaining the growth guard when it is not decisive.
+
+    Billing/account/provider-policy failures must never be relabelled by message length. Overflow
+    reasons always win, while ``format_error``, ``unknown`` and missing reasons remain eligible for
+    the legacy heuristic because they can conceal an unrecognised provider context rejection.
+    """
+    value = getattr(reason, "value", reason)
+    if value in _OVERFLOW_REASONS:
+        return True
+    if value in _NON_OVERFLOW_REASONS:
+        return False
+    return unclassified_overflow
+
+
 @dataclass
 class ClassifiedError:
     """Structured classification of an API error with recovery hints."""
@@ -963,11 +1001,34 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
     return _STATUS_HANDLERS[status](c) if status in _STATUS_HANDLERS else default
 
 
-# Stage order: plugin hooks → the provider's own profile hook → provider-specific special cases →
-# HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
-# large session → transport types → unknown (retryable with backoff).
+def _proxy_upstream_verdict(c: _Ctx) -> Optional[Verdict]:
+    """CLIProxyAPI account failures outrank generic provider-profile 5xx verdicts."""
+    if c.status_code is None or not 500 <= c.status_code < 600 or "auth_unavailable" not in c.msg:
+        return None
+    _prefix, marker, upstream = c.msg.partition("last upstream error:")
+    if not marker:
+        return None
+    overflow = _first_match(upstream, _OVERFLOW_AS_5XX_RULES)
+    if overflow is not None:
+        return overflow
+    # A bare invalid_request_error is also used for billing; only an actual request
+    # validation detail should outrank that upstream account reason.
+    if any(pattern in upstream for pattern in _400_VALIDATION_PATTERNS):
+        return _V_FORMAT_ERROR
+    if any(pattern in upstream for pattern in _BILLING_PATTERNS):
+        return _billing_hints(upstream)
+    if "rate_limit_error" in upstream:
+        return _V_RATE_LIMIT
+    if any(pattern in upstream for pattern in _OVERLOADED_PATTERNS):
+        return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
+    return None
+
+
+# Stage order: plugin hooks → named proxy upstream failures → the provider's own profile hook →
+# provider-specific special cases → HTTP status → MoA shapes → structured error code → message
+# patterns → SSL → disconnect + large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
+    _plugin_verdict, _proxy_upstream_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
 
@@ -1089,12 +1150,23 @@ def _status_429(c: _Ctx) -> Verdict:
 
 
 def _status_5xx(c: _Ctx) -> Verdict:
+    verdict = _first_match(c.msg, _OVERFLOW_AS_5XX_RULES)
+    if verdict is not None:
+        return verdict
     # Request-validation errors as 5xx (codex.nekos.me) fail fast instead of
-    # retry-flooding — unless the parameter was injected server-side.
-    validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
+    # retry-flooding — unless the parameter was injected server-side. Overflow
+    # must be checked first because Anthropic wraps it in invalid_request_error.
+    # 503/529 are capacity signals. Proxies also wrap account-level outages in a bare
+    # invalid_request_error there, so only explicit parameter rejections fail fast.
+    if c.status_code in (503, 529):
+        validation = any(p in c.msg for p in _400_VALIDATION_PATTERNS) or c.code in _400_VALIDATION_CODES
+    else:
+        validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
-    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
+    if c.status_code == 529 or c.code == "overloaded_error":
+        return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
+    return _V_OVERLOADED if c.status_code == 503 else _V_SERVER_ERROR
 
 
 def _classify_402(error_msg: str, result_fn: Callable[..., Any]) -> Any:
@@ -1229,8 +1301,8 @@ _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
-    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: _status_5xx,
+    529: _status_5xx,
 }
 
 

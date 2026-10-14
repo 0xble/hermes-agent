@@ -393,7 +393,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
                 f"{agent.log_prefix}Output-cap error not routed into compression "
                 f"(max_tokens over provider cap): {error_msg[:200]}",
             ),
-            compression_exhausted=False,
+            compression_exhausted=False, reason=FailoverReason.format_error.value,
         )
 
     new_ctx = _adopt_provider_context_limit(st, error_msg, old_ctx)

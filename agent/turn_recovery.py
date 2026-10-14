@@ -21,7 +21,7 @@ from agent.conversation_compression import COMPRESSION_RETRY_CONTEXT_REDUCED_STA
 from agent.fast_mode import fast_mode_unprovisioned, mark_fast_mode_unavailable
 from agent.model_metadata import is_output_cap_error, parse_available_output_tokens_from_error
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import FailoverReason, classify_api_error, is_context_overflow_reason
 from agent.message_sanitization import (
     _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates, _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
@@ -1061,11 +1061,13 @@ def nonretryable_client_error_result(
             "        for localhost, or add the server's cert to your trust store.",
         )
     logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
-    # Skip persistence on likely context-overflow (400 + large session): persisting the
-    # failed message grows the session and repeats the failure.
-    # Persisting the failed user message would make the session even larger, causing the same failure on the
-    # next attempt. (#1630)
-    if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
+    # Skip persistence only for genuine context-overflow verdicts. A large 400 with no
+    # classified reason retains the historical #1630 guard; classified billing/auth/rate-limit
+    # failures must persist so the user turn is not lost.
+    if is_context_overflow_reason(
+        classified.reason,
+        unclassified_overflow=status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80),
+    ):
         _vlines(agent, "⚠️  Skipping session persistence for large failed session to prevent growth loop.")
     else:
         agent._persist_session(messages, conversation_history)
@@ -1883,6 +1885,35 @@ def route_classified_error(
         if classified.reason == FailoverReason.rate_limit else None
     )
     _is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
+    _provider_wide_overload = classified.reason == FailoverReason.overloaded and bool(
+        (getattr(classified, "error_context", None) or {}).get("provider_wide")
+    )
+    # A known account/provider outage must reach the cross-process breaker before any local
+    # backoff, even when the fallback chain is empty or its switch is deferred. Ordinary 5xx,
+    # timeouts and request-specific errors do not poison other sessions' primary route.
+    if (is_rate_limited and _wrapped_output_cap_budget is None) or _provider_wide_overload:
+        pool_may_recover = (
+            False if classified.reason == FailoverReason.upstream_rate_limit or _provider_wide_overload
+            else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+        )
+        reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+        if (
+            not pool_may_recover
+            and not getattr(_retry, "shared_cooldown_arm_attempted", False)
+            and (
+                agent._fallback_index >= len(agent._fallback_chain)
+                # try_activate_fallback returns before arming when the reset is near enough
+                # to wait out, so a deferred switch must reach the shared breaker here.
+                or switch_deferred_by_reset(agent, classified.reason, reset_at)
+            )
+        ):
+            # With no fallback candidate (or a deferred switch), arm once for this turn's retries.
+            # A durable-write failure still returns the local cooldown, so it never escalates
+            # backoff per retry. Mark the guard only when a cooldown was armed: an unarmed attempt
+            # (e.g. a rate limit from an active fallback) must leave terminal exhaustion its window.
+            if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at) is not None:
+                _retry.shared_cooldown_arm_attempted = True
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
     # directly so the long backoff runs, and raise the ceiling to reach it.
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
@@ -1890,6 +1921,7 @@ def route_classified_error(
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
     _should_fallback = (
         (is_rate_limited and _wrapped_output_cap_budget is None)
+        or _provider_wide_overload
         or (_is_transport_failure and retry_count >= 2)
     )
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -1898,7 +1930,8 @@ def route_classified_error(
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            False if _is_upstream or _provider_wide_overload
+            else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))

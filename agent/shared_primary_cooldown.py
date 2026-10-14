@@ -447,6 +447,8 @@ def complete_primary_recovery(agent) -> bool:
     if not outage_id or not clear_if_current(route, outage_id):
         return False
     agent._shared_primary_cooldown_record = None
+    agent._rate_limited_until = 0
+    agent._fallback_episode_cooled = False
     with contextlib.suppress(Exception):
         agent._emit_diagnostic_status(
             f"✅ Primary model restored: {record.get('model') or route[2]} via "
