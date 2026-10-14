@@ -59,3 +59,35 @@ def test_prefetch_coalesces_to_latest_query_and_fences_discard_and_shutdown(monk
     finally:
         release.set()
         provider.shutdown()
+
+
+class _WorkerAbort(BaseException):
+    pass
+
+
+def test_prefetch_worker_base_exception_resets_running_flag(monkeypatch):
+    """A BaseException escaping the worker must not leave every later prefetch waiting on it."""
+    provider = HindsightMemoryProvider()
+    provider._auto_recall = True
+    provider._prefetch_waits_for_retain = False
+    calls = []
+
+    def recall(query):
+        calls.append(query)
+        if query == "abort":
+            raise _WorkerAbort()
+        return query, 1
+
+    monkeypatch.setattr(provider, "_do_recall", recall)
+    monkeypatch.setattr(threading, "excepthook", lambda args: None)
+    try:
+        provider.queue_prefetch("abort")
+        provider._join_prefetch(5)
+        assert provider._prefetch_running is False
+        provider.queue_prefetch("after")
+        provider._join_prefetch(5)
+        assert calls == ["abort", "after"]
+        assert "after" in provider.prefetch("next")
+    finally:
+        provider.shutdown()
+

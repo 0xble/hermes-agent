@@ -9,9 +9,11 @@ import time
 import pytest
 
 from agent.memory_manager import MemoryManager
+from agent.memory_provider import MemoryProvider
 from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
 from plugins.memory.hindsight import HindsightMemoryProvider
+from run_agent import AIAgent
 
 
 @pytest.mark.parametrize("route", ["soft", "ttl", "cap", "signature", "cross_process"])
@@ -35,18 +37,27 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
     monkeypatch.setattr(provider, "_make_turn_retain_job", lambda *a, **kw: lambda: events.append("tail"))
     manager = MemoryManager()
     manager.add_provider(provider)
-    provider.shutdown = Mock(wraps=provider.shutdown)
+    retiring, resume_retirement = threading.Event(), threading.Event()
+    released = threading.Event()
+    real_shutdown = provider.shutdown
+
+    def blocked_shutdown():
+        assert runner._agent_cache.get(key, (None,))[0] is not agent
+        retiring.set()
+        assert resume_retirement.wait(5)
+        real_shutdown()
+
+    provider.shutdown = Mock(side_effect=blocked_shutdown)
     manager._submit_background(lambda: provider._enqueue_retain(lambda: events.append("queued")))
     executor = manager._sync_executor
     executor_threads = list(executor._threads)
-    committed, resume_retirement = threading.Event(), threading.Event()
-    released = threading.Event()
+    # Same-session evictions (/model, fallback drift, signature, cross-process) must not fire
+    # on_session_end; only idle TTL and the LRU cap commit the transcript first (base behavior).
+    commits_session = route in {"ttl", "cap"}
 
     def commit(messages=None):
         assert runner._agent_cache.get(key, (None,))[0] is not agent
         events.append("commit")
-        committed.set()
-        assert resume_retirement.wait(5)
 
     agent = SimpleNamespace(
         _memory_manager=manager, _session_messages=[{"role": "user", "content": "hello"}],
@@ -76,7 +87,7 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
         else:
             fresh, reused = turn._resolve_turn_agent({"model": "m", "runtime": {}}, "telegram", "", 5, {}, {})
             assert not reused and fresh._memory_manager is not manager
-        assert committed.wait(5), "eviction did not commit the removed instance"
+        assert retiring.wait(5), "eviction did not retire the removed instance"
         # Retirement is still blocked, but lookup must build a different manager.
         if route in {"soft", "ttl", "cap"}:
             fresh, reused = turn._resolve_turn_agent({"model": "m", "runtime": {}}, "telegram", "", 5, {}, {})
@@ -84,7 +95,11 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
         resume_retirement.set()
         assert released.wait(5)
         provider.shutdown.assert_called_once_with()
-        assert events.index("commit") < events.index("tail") < events.index("clients")
+        assert events.index("tail") < events.index("clients")
+        if commits_session:
+            assert events.count("commit") == 1 and events.index("commit") < events.index("tail")
+        else:
+            assert "commit" not in events
         assert "queued" in events
         assert not provider._writer_thread.is_alive()
         assert not provider._atexit_registered
@@ -98,3 +113,118 @@ def test_eviction_drains_memory_once_and_refetches_fresh_manager(route, monkeypa
     finally:
         resume_retirement.set()
         manager.shutdown_all()
+
+
+class _CountingProvider(MemoryProvider):
+    """Records lifecycle hooks; ``shutdown_delay`` models a slow bounded worker join."""
+
+    def __init__(self, shutdown_delay=0.0):
+        self.session_ends = 0
+        self.shutdowns = 0
+        self.shutdown_delay = shutdown_delay
+        self.shut_down = threading.Event()
+
+    @property
+    def name(self):
+        return "counting"
+
+    def is_available(self):
+        return True
+
+    def initialize(self, session_id="", **kwargs):
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def on_session_end(self, messages):
+        self.session_ends += 1
+
+    def shutdown(self):
+        time.sleep(self.shutdown_delay)
+        self.shutdowns += 1
+        self.shut_down.set()
+
+
+def _cache_runner():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._agent_cache = OrderedDict()
+    runner._agent_cache_lock = threading.Lock()
+    runner._running_agents = {}
+    return runner
+
+
+def _real_agent(provider):
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = manager
+    agent._session_messages = [{"role": "user", "content": "hello"}]
+    agent.session_id = "sid"
+    agent.context_compressor = None
+    agent.release_clients = lambda: None
+    agent.close = lambda: None  # tool teardown is out of scope; shutdown_memory_provider is real
+    return agent
+
+
+def _wait(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not predicate():
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_reset_cleanup_then_eviction_fires_session_end_and_shutdown_once():
+    """/new and /reset: _cleanup_agent_resources already ran shutdown_memory_provider()."""
+    runner = _cache_runner()
+    provider = _CountingProvider()
+    agent = _real_agent(provider)
+    key = "agent:main:reset"
+    runner._agent_cache[key] = (agent, "sig")
+
+    GatewayRunner._cleanup_agent_resources(runner, agent)
+    runner._evict_cached_agent(key)
+    assert _wait(lambda: agent._memory_manager is None)
+    # Also the commit-first routes (TTL / cap / pressure) must skip an already-shut-down agent.
+    runner._commit_then_release_soft(agent, key)
+    time.sleep(0.05)
+
+    assert (provider.session_ends, provider.shutdowns) == (1, 1)
+
+
+def test_model_switch_eviction_shuts_down_without_session_end():
+    """/model and fallback drift continue the SAME session: retire workers, no session-end hook."""
+    runner = _cache_runner()
+    provider = _CountingProvider()
+    agent = _real_agent(provider)
+    key = "agent:main:model"
+    runner._agent_cache[key] = (agent, "sig")
+
+    runner._evict_cached_agent(key)
+
+    assert provider.shut_down.wait(5)
+    assert (provider.session_ends, provider.shutdowns) == (0, 1)
+    assert agent._memory_manager is None
+
+
+def test_pressure_batch_does_not_wait_on_slow_memory_shutdown(monkeypatch):
+    """malloc_trim must not be held behind each evicted manager's bounded shutdown join."""
+    runner = _cache_runner()
+    trimmed = threading.Event()
+    monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", lambda **kw: trimmed.set())
+    providers = [_CountingProvider(shutdown_delay=2.0) for _ in range(3)]
+    plan = [(f"agent:main:p{i}", _real_agent(p)) for i, p in enumerate(providers)]
+    agents = [a for _, a in plan]
+
+    started = time.monotonic()
+    runner._release_pressure_batch(plan)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, f"pressure batch blocked {elapsed:.2f}s on memory shutdown"
+    assert trimmed.is_set() and plan == []
+    assert all(a._memory_manager is None for a in agents)
+    assert all(p.session_ends == 1 for p in providers)  # pressure eviction still commits the transcript
+    # Shutdowns run in parallel off the batch thread, so all three finish within ~one delay.
+    for p in providers:
+        assert p.shut_down.wait(4)
+    assert all(p.shutdowns == 1 for p in providers)

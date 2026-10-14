@@ -1275,22 +1275,30 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _run_prefetch(self) -> None:
         """One in-flight recall plus one latest-wins slot, rather than a thread per turn."""
-        while True:
+        try:
+            while True:
+                with self._prefetch_worker_lock:
+                    pending, self._prefetch_pending = self._prefetch_pending, None
+                    if pending is None or self._shutting_down.is_set():
+                        self._prefetch_running = False
+                        return
+                query, generation = pending
+                try:
+                    if self._prefetch_waits_for_retain:
+                        self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+                    text, count = self._do_recall(query)
+                    with self._prefetch_generation.publishing(generation) as current:
+                        if current:
+                            self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
+                except Exception:
+                    logger.debug("Hindsight prefetch failed", exc_info=True)
+        except BaseException:
+            # A BaseException escaping the worker must not leave ``_prefetch_running`` stuck True,
+            # or every later queue_prefetch() would wait on a worker that no longer exists.
             with self._prefetch_worker_lock:
-                pending, self._prefetch_pending = self._prefetch_pending, None
-                if pending is None or self._shutting_down.is_set():
+                if self._prefetch_thread is threading.current_thread():
                     self._prefetch_running = False
-                    return
-            query, generation = pending
-            try:
-                if self._prefetch_waits_for_retain:
-                    self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-                text, count = self._do_recall(query)
-                with self._prefetch_generation.publishing(generation) as current:
-                    if current:
-                        self._prefetch_result, self._prefetch_count = (text, count) if text else ("", 0)
-            except Exception:
-                logger.debug("Hindsight prefetch failed", exc_info=True)
+            raise
 
     # -- retain ------------------------------------------------------------------
 
