@@ -47,6 +47,8 @@ def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, b
     attempts = []
     accepted = []
     statuses = []
+    now = [100.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(server, "_emit", lambda method, sid, payload=None: statuses.append((method, payload)))
     monkeypatch.setattr(server, "_background_notifications_off", lambda _: False)
 
@@ -87,6 +89,11 @@ def test_failed_submit_retries_survivor_completion_once(tmp_path, monkeypatch, b
 
     retry = [registry.completion_queue.get_nowait() for _ in events]
     assert retry == events
+    handle(retry)
+    assert len(attempts) == 1 and not accepted
+    retry = [registry.completion_queue.get_nowait() for _ in events]
+    assert retry == events
+    now[0] += 0.5
     handle(retry)
     assert len(attempts) == 2 and len(accepted) == 1
     assert all(registry._survivor_delivery_state(proc) == "delivered" for proc in processes)
@@ -144,6 +151,56 @@ def test_owned_post_turn_drain_emits_and_acks_survivor(tmp_path, monkeypatch):
     assert submitted
     assert process.delivered_path
     assert Path(process.delivered_path).exists()
+
+
+def test_refused_survivor_poller_is_bounded_without_blocking_other_events(tmp_path, monkeypatch):
+    registry, process, event = _survivor_registry(tmp_path, monkeypatch)
+    session = {"history_lock": threading.RLock(), "running": False, "history": [], "session_key": "tui-session"}
+    stop = threading.Event()
+    first_attempt = threading.Event()
+    unrelated_seen = threading.Event()
+    attempts = []
+    statuses = []
+
+    def submit(*args, **kwargs):
+        attempts.append(args)
+        first_attempt.set()
+        server._notif_release_turn(session)
+        return False
+
+    def emit(method, sid, payload=None):
+        if method != "status.update":
+            return
+        statuses.append(payload)
+        if "unrelated output" in payload["text"]:
+            unrelated_seen.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    monkeypatch.setattr(server, "_emit", emit)
+    monkeypatch.setattr(server, "_background_notifications_off", lambda _: False)
+    for name in ("_poll_bot_live_delivery_guarded", "_maybe_fire_tui_loop_tick",
+                 "_maybe_fire_tui_heartbeat_tick", "_maybe_resume_tui_parked_goal", "_notif_poll_kanban"):
+        monkeypatch.setattr(server, name, lambda *args: None)
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr("tools.async_delegation.maybe_sweep_orphaned_completions", lambda queue: None)
+    registry.completion_queue.put(event)
+    worker = threading.Thread(target=server._notification_poller_scoped_loop, args=(stop, "tui-sid", session), daemon=True)
+    worker.start()
+    try:
+        assert first_attempt.wait(5), "poller never attempted admission"
+        registry.completion_queue.put(dict(event, type="watch_match", output="unrelated output", pattern="unrelated"))
+        assert unrelated_seen.wait(2), "parked survivor blocked another queued event"
+        stop.wait(1.0)
+    finally:
+        stop.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    print(f"refused poller: {len(attempts)} submit attempts, {len(statuses)} status emits")
+    assert 1 <= len(attempts) <= 5
+    assert len(statuses) <= 5
+    assert registry._survivor_delivery_pending(process)
+    assert registry._survivor_delivery_state(process) is None
+    assert registry.completion_queue.qsize() == 1
 
 
 def test_poller_path_acks_survivor_after_status_emission(tmp_path, monkeypatch):

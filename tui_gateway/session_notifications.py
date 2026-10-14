@@ -540,13 +540,26 @@ def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> bool
     return True
 
 
-def _notif_retry_survivor(evt, registry, emitted):
-    """A refused turn is not delivery: return only our lease and reset UI dedup."""
+def _notif_retry_survivor(evt, registry, emitted, session):
+    """Refund our lease, then park retries without delaying unrelated notifications."""
     if (evt.get("type", "completion") == "completion"
             and registry.release_survivor_completion(evt.get("session_id", ""))):
+        key = _notification_event_dedup_key(evt)
+        retries = session.setdefault("_notification_retry_backoff", {})
+        previous_delay, _ = retries.get(key, (0.25, 0.0))
+        delay = min(previous_delay * 2, 30.0)
+        retries[key] = (delay, time.monotonic() + delay)
         if emitted is not None:
-            emitted.discard(_notification_event_dedup_key(evt))
+            emitted.discard(key)
         registry.completion_queue.put(evt)
+
+
+def _notif_retry_not_before(session, evt):
+    return session.get("_notification_retry_backoff", {}).get(_notification_event_dedup_key(evt), (0.0, 0.0))[1]
+
+
+def _notif_reset_retry(session, evt):
+    session.get("_notification_retry_backoff", {}).pop(_notification_event_dedup_key(evt), None)
 
 
 def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, completions=None, *, owned=False) -> bool:
@@ -582,6 +595,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
             logger.debug("Dropping unowned %s notification during shutdown drain (origin=%r key=%r)", evt_type, origin, key)
         return True
     if evt_type == "completion" and registry.is_completion_consumed(evt.get("session_id", "")):
+        _notif_reset_retry(session, evt)
+        return True
+    if _notif_retry_not_before(session, evt) > time.monotonic():
+        (deferred.append if deferred is not None else queue.put)(evt)
         return True
     if is_delegation:
         # Before the status row below: a terminal result whose durable ownership is unproven
@@ -630,6 +647,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         if evt_type != "async_delegation" and _background_notifications_off(session):
             # Status-only delivery has completed without an agent turn.
             acknowledge_survivor_notifications(registry, ((evt, text),))
+            _notif_reset_retry(session, evt)
             return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
@@ -642,8 +660,9 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
         return True
     if _notif_dispatch_event(sid, session, evt, text):
         acknowledge_survivor_notifications(registry, ((evt, text),))
+        _notif_reset_retry(session, evt)
     else:
-        _notif_retry_survivor(evt, registry, emitted)
+        _notif_retry_survivor(evt, registry, emitted, session)
     return True
 
 
@@ -682,11 +701,12 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred,
     except Exception:
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
-            _notif_retry_survivor(event, registry, emitted)
+            _notif_retry_survivor(event, registry, emitted, session)
         return
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
         acknowledge_survivor_notifications(registry, ((event, _text),))
+        _notif_reset_retry(session, event)
 
 
 def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):
@@ -793,6 +813,28 @@ def _notification_poller_loop(stop_event: threading.Event, sid: str, session: di
         _notification_poller_scoped_loop(stop_event, sid, session)
 
 
+def _notif_poll_ready(queue, session, parked):
+    """Keep premature retry offers off the shared queue until their deadline."""
+    now = time.monotonic()
+    ready = [parked.pop(key) for key, evt in list(parked.items()) if _notif_retry_not_before(session, evt) <= now]
+    timeout = min([0.5, *[max(0.0, _notif_retry_not_before(session, evt) - now) for evt in parked.values()]])
+    try:
+        events = [queue.get(timeout=0.0 if ready else timeout)]
+    except Exception:
+        events = []
+    for _ in range(queue.qsize()):
+        try:
+            events.append(queue.get_nowait())
+        except Exception:
+            break
+    for evt in events:
+        if _notif_retry_not_before(session, evt) > time.monotonic():
+            parked[_notification_event_dedup_key(evt)] = evt
+        else:
+            ready.append(evt)
+    return ready
+
+
 def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, session: dict) -> None:
     """Daemon thread (started by _init_session()) that drains the process-global completion_queue for this session
     (ownership routing: _notif_handle_event) and polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` — the
@@ -811,6 +853,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
     handle = lambda events, deferred: _notif_handle_ready(  # noqa: E731
         sid, session, events, emitted, process_registry, format_process_notification, deferred)
     last_kanban_poll = last_loop_poll = last_bot_poll = 0.0
+    parked = {}
     while not stop_event.is_set() and not session.get("_finalized"):
         now = time.monotonic()
         # Completions whose owner process died after this one started (#97202); throttled per profile home.
@@ -831,16 +874,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
         if now - last_kanban_poll >= _KANBAN_POLL_SECONDS:
             last_kanban_poll = now
             _notif_poll_kanban(sid, session)
-        try:
-            evt = queue.get(timeout=0.5)
-        except Exception:
-            continue
-        ready = [evt]
-        for _ in range(queue.qsize()):
-            try:
-                ready.append(queue.get_nowait())
-            except Exception:
-                break
+        ready = _notif_poll_ready(queue, session, parked)
         try:
             handle(ready, None)
         except Exception as exc:
@@ -849,7 +883,7 @@ def _notification_poller_scoped_loop(stop_event: threading.Event, sid: str, sess
             _notif_log_failure("notification dispatch failed", exc)
     # Drain remaining events after the stop signal so nothing is lost on shutdown; foreign and orphaned-delegation
     # events are handed back to the shared queue afterwards.
-    deferred: list = []
+    deferred: list = list(parked.values())
     ready = []
     for _ in range(queue.qsize()):
         try:
