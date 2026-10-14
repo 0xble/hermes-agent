@@ -17,6 +17,17 @@ WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_o
 GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
 
+
+def acknowledge_survivor_notifications(registry, notifications) -> None:
+    """Record durable delivery only after a notification consumer rendered/admitted it."""
+    acknowledge = getattr(registry, "acknowledge_survivor_completion", None)
+    if acknowledge is None:
+        return
+    for event, _text in notifications:
+        if event.get("type", "completion") == "completion":
+            acknowledge(event.get("session_id", ""))
+
+
 _DONE = ("completed", "success")
 _REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
