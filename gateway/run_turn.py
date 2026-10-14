@@ -34,6 +34,7 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
+from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
@@ -3594,34 +3595,7 @@ class GatewayTurnMixin:
                 ),
             )
 
-    @staticmethod
-    def _run_agent_stream_confirmed_final_delivery(consumer, final_text: str, *, previewed: bool = False) -> bool:
-        """True only when the actual final reply reached the user: a finalize call may carry only the
-        last preview snapshot, so reconcile against the recorded payload — a demonstrable mismatch
-        (False) overrides the flag; None keeps legacy trust."""
-        if consumer is None:
-            return False
-        if getattr(consumer, "final_response_sent", False):
-            matcher = getattr(consumer, "delivered_final_matches", None)
-            if callable(matcher):
-                with suppress(Exception):
-                    if matcher(final_text) is False:
-                        return False
-            return True
-        # Exact-text match against what the consumer DURABLY delivered (commentary, segments, and the
-        # visible prefix only once a real send landed) — safe without the ``previewed`` flag. The codex
-        # app-server bridge delivers the final agentMessage through the commentary path and never sets
-        # response_previewed (#74248 / #80519); gating on the flag re-sent every such reply. Mismatching
-        # commentary still returns False, so a distinct final answer is never suppressed (#65919). Draft
-        # frames are ephemeral and must not count: after draft streaming + a failed finalize send this
-        # predicate must stay False so the fallback final send still fires (#51828 / #33793).
-        has_delivered_text = getattr(consumer, "has_durably_delivered_text", None)
-        if callable(has_delivered_text):
-            try:
-                return bool(has_delivered_text(final_text))
-            except Exception:
-                return False
-        return False
+    _run_agent_stream_confirmed_final_delivery = staticmethod(stream_confirmed_final_delivery)
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> "GatewayRunner._RunAgentWorker":
         """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
@@ -4570,51 +4544,8 @@ class GatewayTurnMixin:
                 logger.debug("Long-running notification error: %s", _ne)
 
     async def _run_agent_silence_followup(self, response: dict, turn_ctx: TurnContext) -> dict:
-        """One gateway continuation after a rejected marker, with a fresh stream and no human input.
-
-        The first execution and its stream have finished. Put recovery guidance in the existing
-        API-only ephemeral prompt, not in a user/nudge pair that tools or compression could retain.
-        The empty runtime row has existing internal provenance; it cannot become the latest human
-        ask, title, or reply anchor. The outer human contract still owns the terminal verdict.
-        """
-        from gateway.run import _preserve_queued_followup_history_offset
-        session_id = response.get("session_id") or turn_ctx.session_id
-        await self._refresh_agent_cache_message_count(turn_ctx.session_key, session_id)
-        if not turn_ctx._run_still_current():
-            return response
-        adapter = self._delivery_adapter_for(turn_ctx.source)
-        completed = getattr(adapter, "_streaming_tts_completed_turns", None)
-        key_fn = getattr(adapter, "_streaming_tts_turn_key", None)
-        if completed is not None and callable(key_fn):
-            key = key_fn(turn_ctx.session_key, turn_ctx.run_generation)
-            if key:
-                completed.discard(key)
-        logger.info("Rejected human-turn silence; re-prompting once for session %s", turn_ctx.session_key)
-        followup = await self._run_agent(
-            message="", context_prompt=turn_ctx.context_prompt,
-            history=response.get("messages", turn_ctx.history), source=turn_ctx.source,
-            session_id=session_id, session_key=turn_ctx.session_key, run_generation=turn_ctx.run_generation,
-            _interrupt_depth=turn_ctx._interrupt_depth, event_message_id=turn_ctx.event_message_id,
-            inbound_message_id=turn_ctx.inbound_message_id, channel_prompt=turn_ctx.channel_prompt,
-            moa_config=turn_ctx.moa_config, message_type="voice" if turn_ctx.voice_turn else None,
-            internal=True, title_user_message="", persist_user_message="",
-            persist_user_display_kind="internal_notification", reply_expected=turn_ctx.reply_expected,
-            persist_user_display_metadata=reply_expected_metadata(turn_ctx.reply_expected),
-            _post_delivery_adapter=turn_ctx._post_delivery_adapter or adapter, _silence_retry=True,
-        )
-        merged = _preserve_queued_followup_history_offset(response, followup)
-        # A real queued successor owns its own verdict. Otherwise the synthetic continuation must
-        # not launder a second marker into permitted machinery silence. Its execution may have
-        # been redirected onto a newer human message, so preserve that live terminal identity
-        # separately from the original turn's silence contract.
-        if isinstance(merged, dict) and "queued_terminal_display_kind" not in merged:
-            merged = {**merged, "queued_terminal_display_kind": turn_ctx.persist_user_display_kind,
-                      "queued_terminal_reply_expected": turn_ctx.reply_expected,
-                      "queued_terminal_inbound_id": (
-                          followup.get("_terminal_inbound_id") or turn_ctx.inbound_message_id
-                          if isinstance(followup, dict) else turn_ctx.inbound_message_id
-                      )}
-        return merged
+        from gateway.run_turn_silence_recovery import run_silence_followup
+        return await run_silence_followup(self, response, turn_ctx)
 
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
@@ -4721,13 +4652,9 @@ class GatewayTurnMixin:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
-            if (
-                not (_silence_retry or scheduled_heartbeat) and isinstance(response, dict)
-                and not response.get("interrupted") and response.get("completed") is not False
-                and self._is_intentional_silence(response, response.get("final_response", ""))
-                and not silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected)
-                and turn_ctx._run_still_current()
-            ):
+            from gateway.run_turn_silence_recovery import silence_recovery_due
+            if silence_recovery_due(self, response, turn_ctx, silence_retry=_silence_retry,
+                                    scheduled_heartbeat=scheduled_heartbeat):
                 # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.
                 if turn_ctx.stream_consumer_holder[0] is not None:
                     await self._await_stream_task(stream_task)
