@@ -67,8 +67,8 @@ class PluginDiscoveryIncomplete(RuntimeError):
 def _delivery_manager():
     """Only deliver from a complete registry; synchronous loop callers refuse instead of blocking.
 
-    Lazy foreground/background barriers preserve one-shot parity. Synchronous policy delivery
-    waits without a short timeout for the startup sweep; async callers acquire this manager off-loop,
+    Lazy foreground/background barriers preserve one-shot parity. Async callers acquire this
+    manager off-loop, then await callbacks on their original loop. Look up facade seams lazily
     so scoped managers and compatibility monkeypatches retain one authoritative import path.
     """
     from hermes_cli import plugins
@@ -84,15 +84,7 @@ def _delivery_manager():
                 or (worker is not None and worker.is_alive())):
             raise PluginDiscoveryIncomplete("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
         return manager
-    worker = plugins._background_discovery_thread
-    if worker is not None and worker.is_alive():
-        # An in-flight startup sweep is the availability boundary (per-plugin load deadlines
-        # bound it): wait it out instead of serving a partial registry after a short join.
-        plugins._join_background_discovery(timeout=None)
-    else:
-        # A finished sweep's strict completeness check would refuse a fresh scoped manager,
-        # a sibling reload or a retry after a transient failure; the lazy recovery below owns those.
-        plugins._join_background_discovery()
+    plugins._join_background_discovery()
     try:
         if not getattr(manager, "_discovered", True):
             manager.discover_and_load()

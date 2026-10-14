@@ -20,46 +20,16 @@ def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     monkeypatch.setattr(
         plugins,
         "_join_background_discovery",
-        lambda **_kwargs: joined.append(True),
+        lambda: joined.append(True),
     )
 
     assert plugins._delivery_manager() is manager
     assert joined == [True]
 
 
-def test_policy_delivery_waits_past_short_background_discovery_timeout(monkeypatch):
-    """A slow startup sweep must finish before the first policy hook, not be skipped."""
-    import hermes_cli.plugins as plugins
-
-    class Manager:
-        _discovered = True
-        _discovery_complete = False
-
-    class LiveWorker:
-        def is_alive(self):
-            return not manager._discovery_complete
-
-    manager = Manager()
-    seen = []
-
-    def join(*, timeout=30.0):
-        seen.append(timeout)
-        if timeout is not None:
-            raise plugins.PluginDiscoveryIncomplete("short discovery barrier expired")
-        manager._discovery_complete = True
-
-    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
-    monkeypatch.setattr(plugins, "_background_discovery_thread", LiveWorker())
-    monkeypatch.setattr(plugins, "_join_background_discovery", join)
-
-    assert plugins._delivery_manager() is manager
-    assert seen == [None]
-
-
 @pytest.mark.parametrize("sweep_error", [None, RuntimeError("transient startup sweep failure")])
 def test_finished_startup_sweep_still_allows_lazy_discovery(monkeypatch, sweep_error):
-    """Once the startup worker has exited, the strict dead-worker check must not refuse a fresh
-    (e.g. profile-scoped) manager or a retry after a failed sweep: lazy discovery owns those."""
+    """Once the startup worker has exited, lazy discovery may recover the manager."""
     import threading
 
     import hermes_cli.plugins as plugins
@@ -118,7 +88,7 @@ def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypa
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
     monkeypatch.setattr(model_tools.registry, "dispatch", execute)
     join = plugins._join_background_discovery
-    monkeypatch.setattr(plugins, "_join_background_discovery", lambda **_kwargs: join(timeout=0))
+    monkeypatch.setattr(plugins, "_join_background_discovery", lambda: join(timeout=0))
     worker = threading.Thread(target=manager.discover_and_load, daemon=True)
     monkeypatch.setattr(plugins, "_background_discovery_thread", worker)
     worker.start()
@@ -166,7 +136,7 @@ def _inflight_discovery(monkeypatch):
 
     join = plugins._join_background_discovery
 
-    def join_and_release(**_kwargs):
+    def join_and_release():
         release.set()
         join()
 
