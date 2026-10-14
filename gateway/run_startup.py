@@ -348,7 +348,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
         # S2 interruption notes have a stricter lifecycle than the other boot sends: a resumed turn
         # must not be scheduled until this bounded, cancel-on-timeout step has completed. The sender
-        # owns its timeout and _cancel_task_with_grace behavior, so keep it outside the detachable
+        # owns its timeout and cancel_task_with_grace behavior, so keep it outside the detachable
         # boot-send task below.
         if interrupted_note_keys:
             await self._send_interrupted_turn_notes(

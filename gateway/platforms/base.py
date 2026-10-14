@@ -30,16 +30,6 @@ from gateway.copy_blocks import (
 logger = logging.getLogger(__name__)
 
 
-def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
-    """Done-callback for a detached fatal-error handler task (carrier cancelled in
-    ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
-
-
 # Audio exts for native audio delivery; Telegram's narrower sets stay separate (.m2a is audio to
 # Hermes but not to sendAudio).
 _AUDIO_MIME_TYPES = {
@@ -444,7 +434,7 @@ import contextvars as _contextvars
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import fence_state_after
+from gateway.platforms.helpers import consume_detached_handler_exception, fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
@@ -2439,7 +2429,7 @@ class BasePlatformAdapter(ABC):
             except asyncio.CancelledError:
                 # Carrier cancelled (our own teardown inside the handler): let it finish detached.
                 if not task.done():
-                    task.add_done_callback(_consume_detached_handler_exception)
+                    task.add_done_callback(consume_detached_handler_exception)
                 raise
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
@@ -5245,12 +5235,15 @@ class BasePlatformAdapter(ABC):
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
+            # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
                 event=event) or "")
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE)
+            # Force-flush an unfired debounce timer so this task hands off to a fresh drain task.
+            # Clear the Event BEFORE the stop-typing await so concurrent inbound sees a live guard.
             await self._flush_text_debounce_now(session_key)
             # Deferred control mutations own the committed boundary before prompt text.
             delay = 0.0
@@ -5294,6 +5287,7 @@ class BasePlatformAdapter(ABC):
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
+            # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
 

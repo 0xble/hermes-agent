@@ -32,7 +32,7 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
-from agent.async_utils import consume_detached_task_result
+from agent.async_utils import cancel_task_with_grace
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -42,25 +42,6 @@ logger = logging.getLogger("gateway.run")
 # this short, non-zero bound (never above the restart-path bound) collects its result for the
 # interrupted-cron notice without letting a held fire fence stall ordinary teardown.
 _NONRESTART_CRON_MARK_BOUND_S = 0.5
-
-async def _cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
-    """Cancel ``task`` and wait only a short grace before detaching it.
-
-    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
-    without a bound wedges restart recovery forever; a task that misses the grace is detached
-    and its result is consumed when it eventually finishes.
-    """
-    task.cancel()
-    try:
-        done, _pending = await asyncio.wait({task}, timeout=grace)
-    except asyncio.CancelledError:
-        task.add_done_callback(consume_detached_task_result)
-        raise
-    if task not in done:
-        task.add_done_callback(consume_detached_task_result)
-        return False
-    return True
-
 
 def _exit_with_failure_verdict(runner) -> bool:
     """True (after logging the reason) when the runner asked for a failure exit."""
@@ -1203,7 +1184,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
                 completed = batch_task in done
                 if not completed:
-                    cancelled_in_grace = await _cancel_task_with_grace(batch_task)
+                    cancelled_in_grace = await cancel_task_with_grace(batch_task)
                     if cancelled_in_grace:
                         logger.warning(
                             "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
@@ -1220,7 +1201,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                         await _record_shutdown_misses(shutdown_fallback_keys)
                     return 0
             except asyncio.CancelledError:
-                await _cancel_task_with_grace(batch_task)
+                await cancel_task_with_grace(batch_task)
                 raise
         else:
             # A transport may accept a send just before the local 2s deadline while the durable claim
@@ -2438,6 +2419,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         return []
 
     async def _stop_begin_teardown(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+        """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
@@ -2453,6 +2435,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         self._mark_api_runs_shutdown_requested()
         from cron.scheduler_review import stop_reviews
         await asyncio.to_thread(stop_reviews)
+        # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
             try:

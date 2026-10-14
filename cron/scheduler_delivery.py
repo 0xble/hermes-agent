@@ -236,6 +236,13 @@ def _maybe_mirror_cron_delivery(
         return
     try:
         from gateway.mirror import mirror_to_session
+        # USER role + labelled prefix, NOT assistant: an assistant-role mirror lands
+        # assistant→assistant and breaks strict alternation; consecutive user turns merge safely.
+        # The brief is not the agent speaking; an assistant-role mirror lands as assistant→assistant after
+        # the agent's last turn and breaks strict alternation (issue #2221, the exact failure #2313
+        # removed). A user-role turn collapses safely via repair_message_sequence's consecutive-user merge
+        # on every provider, and the prefix preserves the "this came from cron" context that the dropped
+        # SQLite mirror metadata would otherwise lose on replay.
         # The invisible review already ends with an assistant decision. A labelled user
         # mirror keeps that protocol reply separate from the report on transcript replay.
         review_session = job.get("_review_mirror_session")

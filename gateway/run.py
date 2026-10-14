@@ -195,17 +195,6 @@ def hygiene_compaction_recovered(
     return compression_made_progress(msg_count, new_count, approx_tokens, new_tokens)
 
 
-def _hygiene_compression_timeout_message(
-    *, total_exhausted: bool, elapsed: float, idle_timeout: float, progress_observed: bool) -> str:
-    """Describe the host timeout that actually ended hygiene compression. Chat users cannot edit
-    model config, so the copy names /compress, /new and `hermes doctor`, never a config key or the
-    raw second counts (those stay in the gateway log)."""
-    lead = t("gateway.compress.hygiene_timeout")
-    if total_exhausted:
-        return lead
-    return lead + t("gateway.compress.hygiene_timeout_doctor_hint")
-
-
 def _cached_agent_for_hygiene(gateway, session_key: str):
     """The cached live AIAgent for ``session_key`` (or the pending sentinel / None), read under the cache lock."""
     cache = getattr(gateway, "_agent_cache", None)
@@ -5717,8 +5706,12 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
+        # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
+        # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
-        # cleanly, releasing venv handles. Marshal the executor request onto the main loop.
+        # cleanly — releasing every venv file handle — instead of being tree-killed mid-turn. Same drain
+        # path as SIGUSR1/service restarts (request_restart(via_service=True)); the updater (or the service
+        # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
         def _pause_for_update_handler() -> dict:
