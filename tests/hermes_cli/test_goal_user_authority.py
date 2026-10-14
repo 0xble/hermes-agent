@@ -140,11 +140,30 @@ def test_resume_after_block_records_user_override_in_revision_prompt(hermes_home
     # The waiver rule reaches the plain judge prompt, not only the contract prompt.
     assert goals.JUDGE_RESUME_OVERRIDE_RULE in prompts[0]
     assert "agent, no user authority" not in prompts[0]
-
     # The evaluator wires the structured flag, not the rendered text.
     prompts.clear()
     mgr.evaluate_after_turn("still working after the resume")
     assert goals.JUDGE_RESUME_OVERRIDE_RULE in prompts[0]
+
+
+def test_resume_override_does_not_survive_user_goal_replacement(hermes_home):
+    sid = "resume-replaced-goal"
+    db = _db(sid)
+    mgr = GoalManager(sid)
+    mgr.set("continue despite the blocker")
+    with patch.object(goals, "judge_goal", return_value=("blocked", "needs explicit approval", False, None, False)):
+        assert mgr.evaluate_after_turn("I cannot proceed")["verdict"] == "blocked"
+    assert mgr.resume() is not None
+
+    db.append_message(sid, "user", "Please replace the goal with ship the release")
+    result = mgr.replace(
+        reason="pivot", goal="ship the release",
+        user_quote="replace the goal with ship the release",
+    )
+
+    assert result["ok"] is True
+    assert mgr.state is not None
+    assert mgr.state.has_resume_override() is False
 
 
 def test_agent_revision_cannot_imitate_resume_override(hermes_home, monkeypatch):

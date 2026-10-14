@@ -825,10 +825,21 @@ class GoalState:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
+    def _replacement_boundary(self) -> int:
+        """Index of the latest user-authorized replacement revision, else -1."""
+        return max(
+            (i for i, rev in enumerate(self.revisions)
+             if rev.get("kind") == "replace" and rev.get("actor") == "user"
+             and rev.get("authority") in {"quote", "button"}),
+            default=-1,
+        )
+
     def has_resume_override(self) -> bool:
-        """Whether a /goal resume over a judge block is recorded. Only GoalManager.resume writes
-        ``user_command``; revise() never does, so an agent revision cannot set it."""
-        return any(rev.get("user_command") == "/goal resume" for rev in self.revisions)
+        """Whether a /goal resume over a judge block is recorded for the current goal. Only
+        GoalManager.resume writes ``user_command``; revise() never does, so an agent revision cannot
+        set it. A user-authorized replacement starts a new goal, so earlier waivers do not carry over."""
+        boundary = self._replacement_boundary()
+        return any(rev.get("user_command") == "/goal resume" for rev in self.revisions[boundary + 1:])
 
     def render_revisions_block(self) -> str:
         """Every revision with every requirement it replaced, in full; empty without revisions.
@@ -838,12 +849,7 @@ class GoalState:
         Derive that boundary from the audit entries rather than storing a second source of truth.
         """
         lines = []
-        replacement_boundary = max(
-            (i for i, rev in enumerate(self.revisions)
-             if rev.get("kind") == "replace" and rev.get("actor") == "user"
-             and rev.get("authority") in {"quote", "button"}),
-            default=-1,
-        )
+        replacement_boundary = self._replacement_boundary()
         for i, rev in enumerate(self.revisions, start=1):
             quote = str(rev.get("user_quote") or "").strip()
             source = str(rev.get("user_message") or "").strip()
