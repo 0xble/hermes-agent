@@ -656,7 +656,15 @@ def register(ctx):
 
     # This hook fires for ALL tool calls, not just ours
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+
+    # A policy hook can scope itself to the tools it actually gates
+    ctx.register_hook("pre_tool_call", check_writes, tools={"write_file", "patch"})
 ```
+
+`pre_tool_call` accepts an optional `tools=` declaration: pass an iterable of exact
+tool names or a predicate such as `lambda tool_name: tool_name.startswith("write")`.
+The dispatcher skips non-matching tools before timeout and suppression handling.
+Omitting the declaration keeps the callback subscribed to every tool call.
 
 **What `register()` does:**
 - Called exactly once at startup

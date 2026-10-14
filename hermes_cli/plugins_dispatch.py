@@ -395,6 +395,19 @@ class PluginDispatchMixin:
         for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
             cb_timeout, cb_fail_closed = timeout, fail_closed
             try:
+                matcher = getattr(cb, "hermes_tool_matcher", None)
+                if matcher is not None:
+                    try:
+                        matches = bool(matcher(kwargs.get("tool_name")))
+                    except Exception:
+                        # A broken declaration must not turn a policy callback into a bypass.
+                        logger.warning(
+                            "Hook '%s' callback %s tool matcher raised; treating the tool as matched",
+                            hook_name, _callback_identity(cb), exc_info=True,
+                        )
+                        matches = True
+                    if not matches:
+                        continue
                 spec = getattr(cb, "hermes_shell_hook_spec", None)
                 if spec is not None:
                     from agent import shell_hooks
