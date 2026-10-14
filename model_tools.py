@@ -799,24 +799,6 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 
-    try:
-        from types import SimpleNamespace
-        from tools.voice_send_gate import authorize_voice_send
-        from gateway.session_context import get_session_env
-        from hermes_cli.goals import _get_session_db
-        session_id = ids.session_id or get_session_env("HERMES_SESSION_ID", "")
-        voice_block = authorize_voice_send(
-            SimpleNamespace(session_id=session_id, _session_db=_get_session_db() if session_id else None),
-            function_name,
-            function_args,
-        )
-        if voice_block:
-            return function_args, (tool_error(voice_block), "voice_send_block", voice_block)
-    except Exception as _voice_err:
-        logger.debug("voice-send approval guard error: %s", _voice_err)
-        return function_args, (tool_error("BLOCKED: voice-send approval policy unavailable; message send refused."),
-                               "voice_send_error", "voice-send approval policy unavailable")
-
     # ACP/Zed edit approval before any file mutation. The requester is bound
     # via ContextVar only for ACP sessions, so CLI/gateway paths are unaffected.
     try:

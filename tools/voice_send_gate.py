@@ -413,6 +413,88 @@ def _append_consumed_at(record: dict) -> None:
     record["consumed_at"] = _consumed_timestamps(record) + [time.time()]
 
 
+def _transactional_grant_update(db: Any, key: str, update) -> Optional[bool]:
+    """Apply a grant update under the SessionDB write transaction.
+
+    ``SessionDB._execute_write`` takes BEGIN IMMEDIATE, so the read, decision,
+    and write are one atomic operation across concurrent callers and processes.
+    The small fallback keeps lightweight test doubles and older embedding
+    callers working; production SessionDB instances always take the durable
+    transaction path.
+    """
+    execute_write = getattr(db, "_execute_write", None)
+    if not callable(execute_write):
+        return None
+
+    def _apply(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        current = None
+        if row is not None and row[0]:
+            try:
+                current = json.loads(row[0])
+            except (TypeError, ValueError):
+                current = None
+        replacement = update(current)
+        if replacement is None:
+            return False
+        encoded = json.dumps(replacement, sort_keys=True)
+        if row is None:
+            conn.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)", (key, encoded))
+        else:
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (encoded, key))
+        return True
+
+    try:
+        return bool(execute_write(_apply))
+    except Exception:
+        # A real transactional store was present but could not complete. Fail
+        # closed; never fall back to a non-atomic read/write after contention.
+        return False
+
+
+def _consume_existing_grant(db: Any, session_id: str, action_hash: str) -> Optional[bool]:
+    key = _meta_key(session_id, action_hash)
+
+    def _consume(record):
+        if not isinstance(record, dict) or not record.get("approved_at"):
+            return None
+        if _consumed_timestamps(record):
+            return None
+        updated = dict(record)
+        _append_consumed_at(updated)
+        return updated
+
+    result = _transactional_grant_update(db, key, _consume)
+    if result is not None:
+        return result
+    existing = _read_grant(db, session_id, action_hash)
+    if existing and existing.get("approved_at") and not _consumed_timestamps(existing):
+        updated = dict(existing)
+        _append_consumed_at(updated)
+        if not _write_grant(db, session_id, action_hash, updated):
+            return None
+        return True
+    return False
+
+
+def _store_consumed_grant(db: Any, session_id: str, action_hash: str, record: dict) -> Optional[bool]:
+    key = _meta_key(session_id, action_hash)
+
+    def _store(existing):
+        # Two concurrent approvals for the same exact action must not both
+        # replace the record after one has already claimed it.
+        if isinstance(existing, dict) and _consumed_timestamps(existing):
+            return None
+        return record
+
+    result = _transactional_grant_update(db, key, _store)
+    if result is not None:
+        return result
+    if not _write_grant(db, session_id, action_hash, record):
+        return None
+    return True
+
+
 def _block(action: str, reason: str) -> str:
     return f"BLOCKED: approval required before sending a message in Brian's voice ({reason}; action={action[:12]})."
 
@@ -428,10 +510,14 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
 
     existing = _read_grant(db, session_id, action_hash)
     if existing and existing.get("approved_at") and not _consumed_timestamps(existing):
-        _append_consumed_at(existing)
-        if not _write_grant(db, session_id, action_hash, existing):
+        consumed = _consume_existing_grant(db, session_id, action_hash)
+        if consumed is True:
+            return None
+        if consumed is None:
             return _block(action_hash, "grant store unavailable")
-        return None
+        # Another concurrent caller claimed this one-shot grant. Do not open a
+        # second approval flow from the losing invocation.
+        return _block(action_hash, "grant already consumed")
 
     # A send cannot proceed without a durable grant store, even if a prompt exists.
     if db is None or not session_id:
@@ -457,11 +543,12 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
         "approver": os.getenv("HERMES_APPROVER_ID", "gateway-user"),
         "consumed_at": [],
     }
-    if not _write_grant(db, session_id, action_hash, record):
-        return _block(action_hash, "grant store unavailable")
     _append_consumed_at(record)
-    if not _write_grant(db, session_id, action_hash, record):
-        return _block(action_hash, "grant consumption failed")
+    stored = _store_consumed_grant(db, session_id, action_hash, record)
+    if stored is None:
+        return _block(action_hash, "grant store unavailable")
+    if stored is False:
+        return _block(action_hash, "grant already consumed")
     return None
 
 

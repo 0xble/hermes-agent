@@ -1,4 +1,6 @@
 import json
+import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,38 @@ class MetaDB:
 
     def set_meta(self, key, value):
         self.data[key] = value
+
+
+class TransactionalMetaDB(MetaDB):
+    """Small state_meta-shaped store exercising the transaction callback path."""
+
+    def __init__(self):
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
+        self.lock = threading.Lock()
+
+    def get_meta(self, key):
+        with self.lock:
+            row = self.conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key, value):
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            self.conn.commit()
+
+    def _execute_write(self, callback):
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = callback(self.conn)
+                self.conn.commit()
+                return result
+            except BaseException:
+                self.conn.rollback()
+                raise
 
 
 def _agent(db, session_id="sid"):
@@ -141,6 +175,58 @@ def test_one_human_approval_consumes_exactly_one_send(monkeypatch):
     assert len(calls) == 2
 
 
+def test_concurrent_identical_authorize_calls_consume_one_grant(monkeypatch):
+    db = TransactionalMetaDB()
+    agent = _agent(db)
+    command = {"command": "slack message send concurrently"}
+    classified = voice_send_gate.classify_voice_send("terminal", command)
+    assert classified is not None
+    key = voice_send_gate._meta_key("sid", classified["action_hash"])
+    db.set_meta(key, json.dumps({
+        "action_hash": classified["action_hash"], "session_id": "sid",
+        "approved_at": 1.0, "consumed_at": [],
+    }))
+
+    entered = threading.Barrier(2)
+    read_calls = 0
+    read_calls_lock = threading.Lock()
+    original_read = voice_send_gate._read_grant
+
+    def synchronized_read(store, session_id, action_hash):
+        nonlocal read_calls
+        result = original_read(store, session_id, action_hash)
+        if session_id == "sid" and action_hash == classified["action_hash"]:
+            with read_calls_lock:
+                read_calls += 1
+                wait_for_peers = read_calls <= 2
+            if wait_for_peers:
+                entered.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(voice_send_gate, "_read_grant", synchronized_read)
+    results = []
+    errors = []
+
+    def invoke():
+        try:
+            results.append(voice_send_gate.authorize_voice_send(agent, "terminal", command))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=invoke) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert results.count(None) == 1
+    monkeypatch.setattr(voice_send_gate, "_read_grant", original_read)
+    assert len(voice_send_gate.consumed_grant_timestamps(
+        db, "sid", classified["action_hash"])) == 1
+
+
 def test_yolo_mode_off_allowlist_and_cron_do_not_bypass(monkeypatch):
     db = MetaDB()
     agent = _agent(db)
@@ -165,16 +251,20 @@ def test_shared_dispatch_gate_hashes_plugin_modified_args(monkeypatch):
         lambda agent, tool, args: captured.append(args.copy()) or "blocked",
     )
     ids = model_tools._CallIds(None, "sid", None, None, None)
-    model_tools._pre_dispatch_guards("terminal", {"command": "slack message list"}, False, ids, [])
+    result = model_tools.handle_function_call("terminal", {"command": "slack message list"}, session_id="sid")
+    assert "blocked" in result
     assert captured == [{"command": "slack message send final"}]
 def test_shared_dispatch_choke_point_blocks_execute_code_style_call(monkeypatch):
     import model_tools
 
     dispatched = []
-    monkeypatch.setattr(model_tools, "_execute_tool", lambda *args, **kwargs: dispatched.append(1))
+    monkeypatch.setattr(
+        voice_send_gate, "authorize_voice_send",
+        lambda *args, **kwargs: "BLOCKED: approval required before sending a message in Brian's voice",
+    )
     result = model_tools.handle_function_call("terminal", {"command": "slack message send C1 hi"})
     assert "BLOCKED: approval required before sending a message in Brian" in result
-    assert not dispatched
+    assert dispatched == []
 
 
 def test_shared_dispatch_choke_point_runs_voice_gate_once(monkeypatch):

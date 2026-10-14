@@ -40,6 +40,34 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_direct_dispatch_enforces_voice_send_gate_once(self, monkeypatch):
+        reg = ToolRegistry()
+        executed = []
+        reg.register(
+            name="terminal", toolset="core", schema=_make_schema("terminal"),
+            handler=lambda args, **kwargs: executed.append(args.copy()) or json.dumps({"sent": True}),
+        )
+
+        approved_args = {"command": "slack message send --text exact"}
+
+        def authorize(agent, name, args):
+            assert name == "terminal"
+            assert agent.session_id == "sid"
+            return None if args == approved_args else "BLOCKED: approval required"
+
+        monkeypatch.setattr("tools.voice_send_gate.authorize_voice_send", authorize)
+
+        refused = json.loads(reg.dispatch(
+            "terminal", {"command": "slack message send --text other"},
+            session_id="sid", _session_db=object()))
+        assert refused["error"] == "BLOCKED: approval required"
+        assert executed == []
+
+        allowed = json.loads(reg.dispatch(
+            "terminal", approved_args, session_id="sid", _session_db=object()))
+        assert allowed == {"sent": True}
+        assert executed == [approved_args]
+
     def test_dispatch_withholds_injected_kwargs_from_narrow_plugin_handler(self):
         """model_tools injects task_id/session_id/user_task on every call; a third-party ``handle(args)``
         must receive only what its signature declares, and a ``**kwargs`` handler everything (#68318)."""

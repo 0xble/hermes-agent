@@ -900,6 +900,28 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        # This is the shared execution boundary.  model_tools still owns the
+        # request/pre-dispatch hooks (including hook-modified arguments), but a
+        # caller that invokes registry.dispatch() directly must not bypass the
+        # voice-send floor.  The model path supplies the same session identity
+        # and database through kwargs, so nested execute_code calls converge
+        # here without a second approval prompt.
+        try:
+            from types import SimpleNamespace
+            from gateway.session_context import get_session_env
+            from tools.voice_send_gate import authorize_voice_send
+            session_id = kwargs.get("session_id") or get_session_env("HERMES_SESSION_ID", "")
+            session_db = kwargs.get("_session_db")
+            if session_db is None and session_id:
+                from hermes_cli.goals import _get_session_db
+                session_db = _get_session_db()
+            voice_block = authorize_voice_send(
+                SimpleNamespace(session_id=session_id, _session_db=session_db), name, args)
+            if voice_block:
+                return tool_error(voice_block)
+        except Exception:
+            logger.exception("Voice-send approval guard failed at registry dispatch")
+            return tool_error("BLOCKED: voice-send approval policy unavailable; message send refused.")
         try:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
