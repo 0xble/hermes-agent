@@ -56,6 +56,16 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   `slash.stop`, and `process.stop`) still terminate them. This is the D3 operator-stop decision.
 - The terminal tool description limits restart survival to idempotent bounded
   work such as gates, tests, and builds, never external writes.
+- Local non-PTY `persist_on_release` jobs share the survivor wrapper's
+  file-backed `out.log` and exit file but none of its restart-safe dispatch
+  or delivery lease. A job that outlives the gateway that spawned it must never
+  write into that gateway's pipe: once the old gateway exits, the re-adopted job
+  dies of `BrokenPipeError` on its next write. Re-adoption polls the files like a
+  survivor. Shutdown kill semantics for `persist_on_release` are unchanged, and
+  the run directory is pruned together with the finished session.
+- Post-kill verification takes its verdict only from a probe that started after
+  the settle window closed. On a loaded macOS host, the psutil ppid scan alone
+  can outlast the window, and its "alive" answer predates the reap it waited for.
 
 ## Provenance and patches
 

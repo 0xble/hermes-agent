@@ -307,6 +307,7 @@ def test_survivor_spawn_failure_prunes_run_dir(tmp_path, monkeypatch):
     assert not list((home / "process-runs").glob("*/"))
 
 
+@pytest.mark.live_system_guard_bypass  # the wrapper's snapshotted child is SIGKILLed after reparenting to init
 def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeypatch):
     home = _home(monkeypatch, tmp_path)
     registry = ProcessRegistry()
@@ -322,6 +323,7 @@ def test_gateway_shutdown_sweep_skips_survive_restart_sessions(tmp_path, monkeyp
     assert (home / "process-runs" / session.id).exists()
 
 
+@pytest.mark.live_system_guard_bypass  # the wrapper's snapshotted child is SIGKILLed after reparenting to init
 def test_killed_survivor_replays_as_killed_after_restart(tmp_path, monkeypatch):
     home = _home(monkeypatch, tmp_path)
     producer = ProcessRegistry()
@@ -444,6 +446,7 @@ def test_recovered_survivor_gone_without_exit_file_reports_lost_once(tmp_path, m
     assert recovered.completion_queue.empty()
 
 
+@pytest.mark.live_system_guard_bypass  # the wrapper's snapshotted child is SIGKILLed after reparenting to init
 def test_stop_all_source_still_kills_survivors(tmp_path, monkeypatch):
     _home(monkeypatch, tmp_path)
     registry = ProcessRegistry()

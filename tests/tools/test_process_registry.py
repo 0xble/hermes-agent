@@ -4286,6 +4286,13 @@ def test_kill_all_signals_all_targets_before_shared_grace(registry, monkeypatch,
         "_daemon_term_grace_seconds",
         staticmethod(lambda: 0.2),
     )
+    # These leaf children have no descendants. A real recursive children() walk
+    # enumerates every host process on macOS (psutil builds a full ppid map, up to
+    # ~1s per sweep phase under load), which spends the 1.0s deadline before the
+    # shared grace is even measured and makes the fenced count 0.
+    import psutil
+
+    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
     command = [
         sys.executable,
         "-c",

@@ -1083,7 +1083,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
-        if session.survive_restart:
+        if self._file_backed(session):
             return session
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
@@ -1269,11 +1269,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         safe_command = _rewrite_bg(command)
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release, survive_restart=survive_restart)
-        if survive_restart:
+        if survive_restart or (persist_on_release and not use_pty and not _IS_WINDOWS):
             if use_pty:
                 raise ValueError("survive_restart is only supported for non-PTY commands")
+            # persist_on_release jobs outlive the gateway that spawned them, so they take
+            # the same file-backed stdout/stderr: a pipe owned by a dead gateway raises
+            # BrokenPipeError in the re-adopted job on its next write.
             try:
-                return self._spawn_local_survivor(session, safe_command, env_vars)
+                return self._spawn_local_survivor(
+                    session, safe_command, env_vars, restart_safe=survive_restart)
             except Exception:
                 self._remove_survivor_run_dir(session)
                 raise
@@ -2048,7 +2052,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         stdout pipe open, the reader blocks forever and poll() keeps returning "running" indefinitely (issue
         #17327 — 74 polls over 7 minutes on Feishu).
         """
-        if session is None or session.exited or session.survive_restart:
+        if session is None or session.exited or self._file_backed(session):
             return
         proc = getattr(session, "process", None)
         if proc is None:
@@ -2137,7 +2141,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 self._poll_observed.add(session_id)
         if session.detached:
             result["detached"] = True
-            if not session.survive_restart:
+            if not self._file_backed(session):
                 result["note"] = "Process recovered after restart -- output history unavailable"
         return result
 

@@ -25,38 +25,50 @@ _LIVE_CLAIM_NONCES: set[str] = set()
 class ProcessSurvivalMixin:
     """Keep restart survival separate from ordinary pipe/PTY process supervision."""
 
-    def _spawn_local_survivor(self, session: ProcessSession, safe_command: str, env_vars: dict) -> ProcessSession:
-        """Launch an explicitly restart-surviving local command without a gateway pipe."""
+    def _spawn_local_survivor(
+        self, session: ProcessSession, safe_command: str, env_vars: dict, *, restart_safe: bool = True,
+    ) -> ProcessSession:
+        """Launch a local command whose stdout/stderr never pass through a gateway pipe.
+
+        ``restart_safe`` (survive_restart) also claims restart survival: a restart-safe
+        dispatch and exactly-once delivery. ``restart_safe=False`` (persist_on_release)
+        keeps the ordinary dispatch and delivery and borrows only the file-backed I/O, so
+        a job outliving its gateway never writes into that gateway's closed pipe."""
         from tools import process_registry as registry
 
         if registry._IS_WINDOWS:
             raise ValueError("survive_restart is not supported on Windows")
         run_dir = registry.get_hermes_home() / "process-runs" / session.id
         run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        session.survive_restart = True
+        session.survive_restart = restart_safe
         session.log_path = str(run_dir / "out.log")
         session.exit_path = str(run_dir / "exit")
-        session.delivered_path = str(run_dir / "delivered")
+        session.delivered_path = str(run_dir / "delivered") if restart_safe else ""
         q = shlex.quote
         wrapped = (
             f"(\n{safe_command}\n) > {q(session.log_path)} 2>&1\n"
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(session.exit_path)}"
         )
-        command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
-        dispatch = registry.restart_safe_gateway_child_argv(
-            command_argv,
-            unit_suffix=session.id,
-            require_restart_safe_scope=True,
-            outlives_parent=False,
-        )
-        if dispatch.mode == "scoped":
-            session.systemd_unit = f"hermes-worker-{session.id}.scope"
+        if restart_safe:
+            command_argv = [registry._find_shell(), "-lic", f"set +m; {wrapped}"]
+            dispatch = registry.restart_safe_gateway_child_argv(
+                command_argv,
+                unit_suffix=session.id,
+                require_restart_safe_scope=True,
+                outlives_parent=False,
+            )
+            if dispatch.mode == "scoped":
+                session.systemd_unit = f"hermes-worker-{session.id}.scope"
+            spawn_argv, scoped = dispatch.argv, dispatch.mode == "scoped"
+        else:
+            spawn_argv = self._scope_argv(session, wrapped, session.id, "Local")
+            scoped = bool(session.systemd_unit)
         spawn_env = self._spawn_env(env_vars)
-        if dispatch.mode == "scoped":
+        if scoped:
             spawn_env = registry.systemd_user_bus_env(spawn_env)
         try:
             proc = subprocess.Popen(
-                dispatch.argv,
+                spawn_argv,
                 text=True,
                 cwd=session.cwd,
                 env=spawn_env,
@@ -290,9 +302,20 @@ class ProcessSurvivalMixin:
         except OSError:
             return
 
+    @staticmethod
+    def _file_backed(session: ProcessSession) -> bool:
+        """True when the job writes to its own log/exit files instead of a gateway pipe."""
+        return bool(getattr(session, "survive_restart", False) or getattr(session, "exit_path", ""))
+
     def prune_survivor_run_dir(self, session: ProcessSession) -> None:
-        """Prune an aged survivor only after its completion was delivered."""
-        if getattr(session, "survive_restart", False) and self._survivor_delivery_state(session) == "delivered":
+        """Prune an aged survivor only after its completion was delivered.
+
+        A file-backed persist_on_release job has no delivery marker: its run directory
+        goes when the finished session itself is pruned."""
+        if getattr(session, "survive_restart", False):
+            if self._survivor_delivery_state(session) == "delivered":
+                self._remove_survivor_run_dir(session)
+        elif getattr(session, "exit_path", ""):
             self._remove_survivor_run_dir(session)
 
     def _prune_delivered_survivor_runs(self) -> None:

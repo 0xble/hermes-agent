@@ -180,3 +180,43 @@ def test_checkpoint_carries_persist_on_release():
     """A crash-recovery checkpoint must carry the flag, or a persisted job
     resurrects as killable by the next session's release sweep (#41225)."""
     assert "persist_on_release" in _CHECKPOINT_FIELDS
+
+
+@pytest.mark.platforms("posix")
+def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch):
+    """A persisted job must not write into a pipe owned by the gateway that spawned it:
+    once that gateway exits the next write raises BrokenPipeError and the re-adopted job
+    dies. Its stdout/stderr go to a file-backed log that a successor can still read."""
+    import json
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    gate = tmp_path / "release"
+    producer = ProcessRegistry()
+    session = producer.spawn_local(
+        f"while [ ! -e '{gate}' ]; do sleep 0.02; done; printf 'PERSISTED_OK\\n'; exit 3",
+        cwd=str(tmp_path), task_id="task", session_key="session", persist_on_release=True,
+    )
+    try:
+        assert session.persist_on_release is True
+        assert session.process.stdout is None, "persisted job must not hold a gateway-owned pipe"
+        assert session.log_path and session.exit_path
+        assert session.log_path.startswith(str(home / "process-runs" / session.id))
+        session.notify_on_complete = True
+        producer._write_checkpoint()
+        entry = json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))[0]
+        assert entry["log_path"] == session.log_path
+        # The producing gateway goes away without reaping the job.
+        producer.stop_survivor_pollers()
+
+        successor = ProcessRegistry()
+        assert successor.recover_from_checkpoint() == 1
+        gate.touch()
+        adopted = successor.get(session.id)
+        assert adopted._completion_event.wait(10)
+        assert adopted.exit_code == 3
+        assert "PERSISTED_OK" in successor.read_log(session.id)["output"]
+    finally:
+        gate.touch()
+        session.process.wait(timeout=10)

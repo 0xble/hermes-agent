@@ -75,7 +75,9 @@ class ProcessCheckpointMixin:
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
-            survivor = bool(entry.get("survive_restart"))
+            # A file-backed job (survive_restart, or a local persist_on_release job) has a
+            # wrapper-written exit marker and log, so its result outlives the old gateway.
+            survivor = bool(entry.get("survive_restart") or entry.get("exit_path"))
             if not pid and not survivor:
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
@@ -167,7 +169,7 @@ class ProcessCheckpointMixin:
                     recorded_termination.get("termination_source", "") if recorded_exit is not None else "survivor_lost",
                 )
                 continue
-            if session.survive_restart:
+            if self._file_backed(session):
                 from contextvars import copy_context
                 poller = threading.Thread(
                     target=copy_context().run,
