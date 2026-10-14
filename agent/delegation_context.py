@@ -14,6 +14,9 @@ from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
 _DELEGATED_PARENT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_parent_session_id", default="")
+# The session that started the outermost delegation: its topic session. Carried in memory
+# because session rows cannot tell a nested child from a topic on every surface.
+_DELEGATED_ROOT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_root_session_id", default="")
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
@@ -42,12 +45,16 @@ def delegated_child_context(
     parent = str(parent_session_id or get_session_env("HERMES_SESSION_ID", "") or "").strip()
     if parent == str(session_id or "").strip():
         parent = ""
+    # A nested child keeps the outermost delegator; the first level records its parent.
+    root = _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else parent
     token = _DELEGATED_CHILD_CONTEXT.set(True)
     parent_token = _DELEGATED_PARENT_SESSION_ID.set(parent)
+    root_token = _DELEGATED_ROOT_SESSION_ID.set(root or parent)
     try:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_ROOT_SESSION_ID.reset(root_token)
         _DELEGATED_PARENT_SESSION_ID.reset(parent_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
@@ -55,6 +62,11 @@ def delegated_child_context(
 def delegated_child_parent_session_id() -> str:
     """Return the immediate parent session for the current child, if known."""
     return _DELEGATED_PARENT_SESSION_ID.get() or os.environ.get(DELEGATED_PARENT_SESSION_ENV, "") or ""
+
+
+def delegated_child_root_session_id() -> str:
+    """Return the session that started this in-process delegation chain, if known."""
+    return _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else ""
 
 
 def is_delegated_child_context() -> bool:

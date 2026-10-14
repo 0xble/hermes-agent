@@ -16,14 +16,6 @@ from gateway import session_context
 from tools import mcp_tool_handlers
 
 
-
-@pytest.fixture(autouse=True)
-def _fresh_topic_cache():
-    from agent import relay_guard
-    relay_guard._TOPIC_BY_PARENT.clear()
-    yield
-    relay_guard._TOPIC_BY_PARENT.clear()
-
 def _bind(session_id: str, profile: str = "default"):
     return session_context.set_session_vars(session_id=session_id, profile=profile)
 
@@ -105,24 +97,32 @@ def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, d
         session_context.clear_session_vars(tokens)
 
 
+@pytest.mark.parametrize("depth", [1, 2, 3])
 @pytest.mark.parametrize("surface", ["tui", "desktop", "telegram"])
-def test_child_rows_labelled_with_the_surface_still_guard_the_parent(tmp_path, monkeypatch, surface):
-    # TUI and desktop bind a session source that child rows inherit instead of
-    # "subagent"; topic resolution must never resolve the child itself.
+def test_surface_labelled_child_rows_do_not_change_the_guarded_topic(tmp_path, monkeypatch, surface, depth):
+    # TUI and desktop child rows inherit the surface source instead of "subagent", so
+    # session rows cannot tell a nested child from a topic. The topic comes from context.
+    from contextlib import ExitStack
     from hermes_state import SessionDB
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    children = [f"child-{i}" for i in range(depth)]
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(session_id="parent-session", source=surface)
-        db.create_session(session_id="child-session", source=surface, parent_session_id="parent-session")
+        parent = "parent-session"
+        for child in children:
+            db.create_session(session_id=child, source=surface, parent_session_id=parent)
+            parent = child
     finally:
         db.close()
     tokens = _bind("parent-session")
     send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
     try:
-        with delegated_child_context("child-session"):
+        with ExitStack() as stack:
+            for child in children:
+                stack.enter_context(delegated_child_context(child))
             assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
             with patch("tools.mcp_tool_handlers._acquire_call_server", side_effect=AssertionError("transport reached")):
                 assert CHILD_PARENT_RELAY_ERROR in send({"address": PARENT_ADDRESS, "body": "do not send"})
@@ -130,23 +130,21 @@ def test_child_rows_labelled_with_the_surface_still_guard_the_parent(tmp_path, m
         session_context.clear_session_vars(tokens)
 
 
-@pytest.mark.parametrize("lookup", [{"return_value": None}, {"side_effect": OSError("lineage unavailable")}])
-def test_lineage_lookup_failure_keeps_immediate_parent_guard(tmp_path, monkeypatch, lookup):
+def test_topic_guard_needs_no_session_database(tmp_path, monkeypatch):
+    # No state.db exists: the guard still refuses the topic and the immediate parent.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
     tokens = _bind("parent-session")
-    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
     try:
-        with delegated_child_context("child-session"), delegated_child_context("grandchild-session"), patch(
-            "tools.mcp_tool_caller._topic_session_id", **lookup
-        ), patch("tools.mcp_tool_handlers._acquire_call_server", return_value=(None, "transport reached")) as transport:
-            immediate = "hermes:default/child-session"
-            assert CHILD_PARENT_RELAY_ERROR in send({"address": immediate, "body": "do not send"})
-            transport.assert_not_called()
-            assert send({"address": "hermes:default/peer", "body": "allowed"}) == "transport reached"
-            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == immediate
+        with delegated_child_context("child-session"), delegated_child_context("grandchild-session"):
+            assert child_parent_relay_error(PARENT_ADDRESS) == CHILD_PARENT_RELAY_ERROR
+            assert child_parent_relay_error("hermes:default/child-session") == CHILD_PARENT_RELAY_ERROR
+            assert child_parent_relay_error("hermes:default/peer") is None
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+        assert child_parent_relay_error(PARENT_ADDRESS) is None
     finally:
         session_context.clear_session_vars(tokens)
+    assert not (tmp_path / "state.db").exists()
 
 
 PARENT_ADDRESS = "hermes:default/parent-session"
@@ -187,8 +185,11 @@ def test_child_subprocess_env_names_parent_and_top_level_does_not(tmp_path, monk
         with delegated_child_context("child-session"):
             assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
             with delegated_child_context("grandchild-session"):
-                # A nested child names its immediate parent.
-                assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == "hermes:default/child-session"
+                # Relay's CLI takes one address; a nested child names the chain root (the
+                # topic), since a subagent session has no topic of its own to relay into.
+                # MCP still refuses the immediate parent too.
+                assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+                assert child_parent_relay_error("hermes:default/child-session") == CHILD_PARENT_RELAY_ERROR
         assert RELAY_PARENT_ADDRESS_ENV not in delegated_child_subprocess_env({"PATH": "/bin"})
     finally:
         session_context.clear_session_vars(tokens)
