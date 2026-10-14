@@ -14,6 +14,9 @@ from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
 _DELEGATED_PARENT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_parent_session_id", default="")
+# The session that started the outermost delegation: its topic session. Carried in memory
+# because session rows cannot tell a nested child from a topic on every surface.
+_DELEGATED_ROOT_SESSION_ID: ContextVar[str] = ContextVar("hermes_delegated_root_session_id", default="")
 # Any in-process execution that is NOT the dispatcher-owned worker (cron jobs). Kept separate
 # so delegate_task-specific behaviour (subprocess env scrubbing, its error strings) is unchanged.
 _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatcher_owned_context", default=False)
@@ -30,6 +33,7 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 @contextmanager
 def delegated_child_context(
     session_id: str | None = None, parent_session_id: str | None = None,
+    root_session_id: object = None,
 ) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity.
 
@@ -42,12 +46,21 @@ def delegated_child_context(
     parent = str(parent_session_id or get_session_env("HERMES_SESSION_ID", "") or "").strip()
     if parent == str(session_id or "").strip():
         parent = ""
+    # The chain root is the session that started the outermost delegation. Child runs pass the
+    # root stamped on the child agent, because background children start in fresh threads that
+    # do not inherit this context; otherwise a nested context keeps its enclosing root.
+    stamped_root = root_session_id.strip() if isinstance(root_session_id, str) else ""
+    root = stamped_root or (
+        _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else parent
+    )
     token = _DELEGATED_CHILD_CONTEXT.set(True)
     parent_token = _DELEGATED_PARENT_SESSION_ID.set(parent)
+    root_token = _DELEGATED_ROOT_SESSION_ID.set(root or parent)
     try:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_ROOT_SESSION_ID.reset(root_token)
         _DELEGATED_PARENT_SESSION_ID.reset(parent_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
@@ -55,6 +68,11 @@ def delegated_child_context(
 def delegated_child_parent_session_id() -> str:
     """Return the immediate parent session for the current child, if known."""
     return _DELEGATED_PARENT_SESSION_ID.get() or os.environ.get(DELEGATED_PARENT_SESSION_ENV, "") or ""
+
+
+def delegated_child_root_session_id() -> str:
+    """Return the session that started this in-process delegation chain, if known."""
+    return _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else ""
 
 
 def is_delegated_child_context() -> bool:
@@ -155,9 +173,10 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
-    # relay's CLI refuses a send to this address (relay C27), so a child's
-    # `relay send` to its parent fails however the shell spells it. Inherited
-    # values pass through untouched; an in-process child names its own parent.
+    # Relay accepts one guarded CLI address, so an in-process child stamps its
+    # reachable topic ancestor (else its immediate parent) and names it over any
+    # inherited value, matching the terminal wrapper's export. Outside an
+    # in-process child, inherited values pass through untouched.
     from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
     if parent_address := in_process_child_relay_parent_address():
         cleaned[RELAY_PARENT_ADDRESS_ENV] = parent_address
@@ -165,14 +184,15 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
 
 
 def in_process_child_relay_parent_address() -> str:
-    """The parent relay address an in-process delegated child stamps on what it spawns, else ``""``.
+    """The topic (or immediate parent) address an in-process child stamps, else ``""``.
 
-    Subprocess env builders and the terminal command wrapper (which reaches remote
-    backends whose process env is not inherited) share this one decision."""
+    Relay accepts one address, so prefer the reachable topic ancestor for nested
+    children. Subprocess env builders and remote terminal wrappers share this decision.
+    """
     if not _DELEGATED_CHILD_CONTEXT.get():
         return ""
-    from agent.relay_guard import child_parent_relay_address
-    return child_parent_relay_address()
+    from agent.relay_guard import child_parent_relay_address, child_topic_relay_address
+    return child_topic_relay_address() or child_parent_relay_address()
 
 
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:

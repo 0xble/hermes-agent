@@ -58,6 +58,192 @@ def test_mcp_parent_relay_is_blocked_before_call_server_acquisition(tmp_path, mo
     assert other_result == "other target reached"
 
 
+@pytest.mark.parametrize("depth", [2, 3])
+def test_descendant_mcp_and_cli_guard_the_lineage_topic(tmp_path, monkeypatch, depth):
+    from contextlib import ExitStack
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    children = [f"child-{i}" for i in range(depth)]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="old-topic", source="telegram")
+        db.create_session(session_id="parent-session", source="telegram", parent_session_id="old-topic")
+        parent = "parent-session"
+        for child in children:
+            db.create_session(session_id=child, source="subagent", parent_session_id=parent)
+            parent = child
+    finally:
+        db.close()
+    tokens = _bind("parent-session")
+    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
+    try:
+        with ExitStack() as stack:
+            for child in children:
+                stack.enter_context(delegated_child_context(child))
+            with patch("tools.mcp_tool_handlers._acquire_call_server", side_effect=AssertionError("transport reached")):
+                for target in (PARENT_ADDRESS, f"hermes:default/{children[-2]}"):
+                    assert CHILD_PARENT_RELAY_ERROR in send({"address": target, "body": "do not send", "fyi": True})
+            with patch("tools.mcp_tool_handlers._acquire_call_server", return_value=(None, "peer reached")):
+                for target in ("hermes:default/peer", "hermes:default/old-topic", "hermes:other/parent-session"):
+                    assert send({"address": target, "body": "allowed"}) == "peer reached"
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+            # The in-process child names its own guard over an inherited outer value,
+            # matching the terminal wrapper's export.
+            inherited = {RELAY_PARENT_ADDRESS_ENV: "hermes:default/inherited"}
+            assert delegated_child_subprocess_env(inherited)[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("surface", ["tui", "desktop", "telegram"])
+def test_surface_labelled_child_rows_do_not_change_the_guarded_topic(tmp_path, monkeypatch, surface, depth):
+    # TUI and desktop child rows inherit the surface source instead of "subagent", so
+    # session rows cannot tell a nested child from a topic. The topic comes from context.
+    from contextlib import ExitStack
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    children = [f"child-{i}" for i in range(depth)]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="parent-session", source=surface)
+        parent = "parent-session"
+        for child in children:
+            db.create_session(session_id=child, source=surface, parent_session_id=parent)
+            parent = child
+    finally:
+        db.close()
+    tokens = _bind("parent-session")
+    send = mcp_tool_handlers._make_tool_handler("relay", "send", 30.0)
+    try:
+        with ExitStack() as stack:
+            for child in children:
+                stack.enter_context(delegated_child_context(child))
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+            with patch("tools.mcp_tool_handlers._acquire_call_server", side_effect=AssertionError("transport reached")):
+                assert CHILD_PARENT_RELAY_ERROR in send({"address": PARENT_ADDRESS, "body": "do not send"})
+    finally:
+        session_context.clear_session_vars(tokens)
+
+
+def test_topic_guard_needs_no_session_database(tmp_path, monkeypatch):
+    # No state.db exists: the guard still refuses the topic and the immediate parent.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    tokens = _bind("parent-session")
+    try:
+        with delegated_child_context("child-session"), delegated_child_context("grandchild-session"):
+            assert child_parent_relay_error(PARENT_ADDRESS) == CHILD_PARENT_RELAY_ERROR
+            assert child_parent_relay_error("hermes:default/child-session") == CHILD_PARENT_RELAY_ERROR
+            assert child_parent_relay_error("hermes:default/peer") is None
+            assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+        assert child_parent_relay_error(PARENT_ADDRESS) is None
+    finally:
+        session_context.clear_session_vars(tokens)
+    assert not (tmp_path / "state.db").exists()
+
+
+def test_chain_root_survives_a_child_worker_thread_without_the_parent_context(tmp_path, monkeypatch):
+    # Real child runs start in executor threads, and a background child's thread does not
+    # inherit the delegating turn's context. The root is stamped on each child agent at
+    # build time and re-entered by the run, so a grandchild still guards the topic.
+    import threading
+    from unittest.mock import MagicMock
+    from tools.delegate_tool import _build_child_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+
+    def build(parent):
+        with patch("run_agent.AIAgent") as agent_cls:
+            agent_cls.return_value = MagicMock()
+            return _build_child_agent(
+                task_index=0, goal="g", context=None, toolsets=None, model=None,
+                max_iterations=1, parent_agent=parent, task_count=1,
+            )
+
+    def parent_agent(session_id, depth, root=None):
+        parent = MagicMock(spec_set=None)
+        parent.session_id, parent._delegate_depth = session_id, depth
+        parent._session_db, parent._active_children = None, []
+        parent._active_children_lock = threading.Lock()
+        parent.base_url, parent.provider, parent.model = "https://example.invalid/v1", "openrouter", "m"
+        parent.api_key, parent.api_mode, parent.platform = "***", "chat_completions", "cli"
+        parent.providers_allowed = parent.providers_ignored = parent.providers_order = None
+        parent.provider_sort = parent._print_fn = parent.tool_progress_callback = None
+        parent.thinking_callback = None
+        if root is None:
+            del parent._delegation_root_session_id
+        else:
+            parent._delegation_root_session_id = root
+        return parent
+
+    child = build(parent_agent("parent-session", 0))
+    assert child._delegation_root_session_id == "parent-session"
+    grandchild = build(parent_agent("child-session", 1, root=child._delegation_root_session_id))
+    assert grandchild._delegation_root_session_id == "parent-session"
+
+    seen = {}
+
+    def run_grandchild():  # a fresh thread: no delegation or session context inherited
+        tokens = _bind("child-session")
+        try:
+            with delegated_child_context(
+                "grandchild-session", parent_session_id="child-session",
+                root_session_id=grandchild._delegation_root_session_id,
+            ):
+                seen["topic"] = child_parent_relay_error(PARENT_ADDRESS)
+                seen["parent"] = child_parent_relay_error("hermes:default/child-session")
+                seen["env"] = delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV]
+        finally:
+            session_context.clear_session_vars(tokens)
+
+    worker = threading.Thread(target=run_grandchild)
+    worker.start()
+    worker.join(10)
+    assert seen == {
+        "topic": CHILD_PARENT_RELAY_ERROR, "parent": CHILD_PARENT_RELAY_ERROR, "env": PARENT_ADDRESS,
+    }
+
+
+def test_child_run_enters_the_stamped_chain_root_on_its_worker_thread(tmp_path, monkeypatch):
+    # The real run path, not a hand-built context: _run_single_child runs the conversation on a
+    # worker thread, and the guard there must name the root stamped on the child.
+    from unittest.mock import MagicMock
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    seen = {}
+
+    def run_conversation(**_kwargs):
+        seen["topic"] = child_parent_relay_error(PARENT_ADDRESS)
+        seen["env"] = delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV]
+        return {"final_response": "done", "completed": True, "interrupted": False, "api_calls": 1, "messages": []}
+
+    child = MagicMock()
+    child.session_id, child._parent_session_id = "grandchild-session", "child-session"
+    child._delegation_root_session_id = "parent-session"
+    child._credential_pool = None
+    child.run_conversation.side_effect = run_conversation
+    parent = MagicMock()
+    parent.session_id, parent._delegate_depth, parent._session_db = "child-session", 1, None
+    parent._active_children, parent._print_fn, parent.tool_progress_callback = [], None, None
+    import threading
+    parent._active_children_lock = threading.Lock()
+    tokens = _bind("child-session")
+    try:
+        result = _run_single_child(task_index=0, goal="g", child=child, parent_agent=parent)
+    finally:
+        session_context.clear_session_vars(tokens)
+    assert result["status"] == "completed", result
+    assert seen == {"topic": CHILD_PARENT_RELAY_ERROR, "env": PARENT_ADDRESS}
+
+
 PARENT_ADDRESS = "hermes:default/parent-session"
 
 # Stands in for relay's CLI check (relay C27): refuse a send whose target is
@@ -96,8 +282,11 @@ def test_child_subprocess_env_names_parent_and_top_level_does_not(tmp_path, monk
         with delegated_child_context("child-session"):
             assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
             with delegated_child_context("grandchild-session"):
-                # A nested child names its immediate parent.
-                assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == "hermes:default/child-session"
+                # Relay's CLI takes one address; a nested child names the chain root (the
+                # topic), since a subagent session has no topic of its own to relay into.
+                # MCP still refuses the immediate parent too.
+                assert delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV] == PARENT_ADDRESS
+                assert child_parent_relay_error("hermes:default/child-session") == CHILD_PARENT_RELAY_ERROR
         assert RELAY_PARENT_ADDRESS_ENV not in delegated_child_subprocess_env({"PATH": "/bin"})
     finally:
         session_context.clear_session_vars(tokens)
