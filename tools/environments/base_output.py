@@ -6,6 +6,7 @@ stdout drain thread used by ``BaseEnvironment._wait_for_process``.
 """
 
 import codecs
+import logging
 import os
 import select
 import subprocess
@@ -19,11 +20,70 @@ from hermes_constants import get_hermes_home
 from tools.tool_output_truncate import head_tail_split, truncation_notice
 from hermes_cli._subprocess_compat import windows_hide_flags
 
+logger = logging.getLogger(__name__)
+
 # Sentinel capacity for full-fidelity capture: large enough that the collector
 # never evicts, so bounded and unbounded modes share one code path.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
 _SPILL_MAX_AGE_S = 7 * 86400
+# Spills live for 7 days, so a prune deferred by up to a minute is invisible to
+# retention while capping a full directory scan at once per minute per spill dir.
+_SPILL_PRUNE_INTERVAL_S = 60.0
+_monotonic = time.monotonic
+# Held for the whole scan, including on the worker thread: one prune per process.
+_spill_prune_lock = threading.Lock()
+# Last prune start per spill dir; one process serves several HERMES_HOME profiles.
+_spill_prune_last: dict[str, float] = {}
+_spill_prune_thread: threading.Thread | None = None
+
+
+def _prune_spill_dir(spill_dir: Path) -> None:
+    """Delete ``out-*.log`` spills older than ``_SPILL_MAX_AGE_S``; releases the prune lock."""
+    try:
+        cutoff = time.time() - _SPILL_MAX_AGE_S
+        with os.scandir(spill_dir) as entries:
+            for entry in entries:
+                if not (entry.name.startswith("out-") and entry.name.endswith(".log")):
+                    continue
+                try:
+                    if entry.stat(follow_symlinks=True).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                except OSError:
+                    pass  # Vanished or unreadable spill: skip it; the next prune retries.
+    except OSError:
+        logger.debug("terminal spill prune of %s failed", spill_dir, exc_info=True)
+    finally:
+        _spill_prune_lock.release()
+
+
+def _maybe_prune_spills(spill_dir: Path) -> None:
+    """Start a background prune of ``spill_dir`` unless one is running or one ran recently.
+
+    Collector creation is on the terminal critical path, so callers never scan,
+    never wait for an in-flight prune, and skip entirely within the interval.
+    The interval is reserved before the scan starts so a slow or failing scan
+    cannot turn a burst of terminal calls into a burst of scans.
+    """
+    global _spill_prune_thread
+    key = str(spill_dir)
+    if _monotonic() - _spill_prune_last.get(key, float("-inf")) < _SPILL_PRUNE_INTERVAL_S:
+        return
+    if not _spill_prune_lock.acquire(blocking=False):
+        return
+    try:
+        now = _monotonic()
+        if now - _spill_prune_last.get(key, float("-inf")) < _SPILL_PRUNE_INTERVAL_S:
+            _spill_prune_lock.release()
+            return
+        _spill_prune_last[key] = now
+        from agent.memory_provider import spawn_context_thread
+        thread = spawn_context_thread(_prune_spill_dir, args=(spill_dir,), name="terminal-spill-prune")
+        _spill_prune_thread = thread
+        thread.start()
+    except BaseException:
+        _spill_prune_lock.release()
+        raise
 
 
 class _BoundedOutputCollector:
@@ -183,14 +243,7 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     try:
         spill_dir = get_hermes_home() / "cache" / "terminal-output"
         spill_path = spill_dir / f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
-        if spill_dir.is_dir():
-            cutoff = time.time() - _SPILL_MAX_AGE_S
-            for old in spill_dir.glob("out-*.log"):
-                try:
-                    if old.stat().st_mtime < cutoff:
-                        old.unlink()
-                except OSError:
-                    pass
+        _maybe_prune_spills(spill_dir)
     except Exception:
         spill_path = None
     return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
