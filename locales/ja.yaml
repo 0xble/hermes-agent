@@ -756,6 +756,7 @@ gateway:
     drain_rejected: "⏳ ゲートウェイは{action}のため、現在は次のターンを受け付けていません。"
     drain_rejected_new_work: "⏳ ゲートウェイは{action}のため、現在は新しい作業を受け付けていません。"
     demoted_tail: " — メッセージは完了後に処理されるようキューしました (/stop ですべてキャンセルできます)。"
+    deferred_dropped: "⚠️ `/{command}` は実行されませんでした：その前に Hermes が再起動または再接続しました。まだ必要なら再送してください。"
     elapsed_min: "{minutes} 分経過"
     running_tool: "実行中: {tool}"
     ack_detail_wrap: " ({detail})"

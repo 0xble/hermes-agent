@@ -756,6 +756,7 @@ gateway:
     drain_rejected: "⏳ Шлюз {action} и сейчас не принимает ещё один ход."
     drain_rejected_new_work: "⏳ Шлюз {action} и сейчас не принимает новую работу."
     demoted_tail: " — ваше сообщение в очереди и будет обработано после завершения (используйте /stop, чтобы отменить всё)."
+    deferred_dropped: "⚠️ `/{command}` не выполнена: Hermes перед этим перезапустился или переподключился. Отправьте её снова, если она ещё нужна."
     elapsed_min: "прошло {minutes} мин"
     running_tool: "выполняется: {tool}"
     ack_detail_wrap: " ({detail})"
