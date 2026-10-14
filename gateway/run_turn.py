@@ -1052,8 +1052,13 @@ class GatewayTurnMixin:
 
     async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
         """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
-        notify the user, and re-raise; returns the compressed transcript only when the worker
-        was already committing.
+        notify the user when that is honest, and re-raise; returns the compressed transcript only
+        when the worker was already committing.
+
+        Notices say only what is true. The cancel branch really continues uncompressed, so it says
+        so now. The keep-admission branch is usually adopted moments later, so it stays silent and
+        notifies only if the detached attempt ends without committing (and the gateway is not
+        draining, where the restart notice already covers it).
 
         Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
         only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
@@ -1072,6 +1077,7 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _meta = attempt.meta
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
                 try:
@@ -1101,6 +1107,11 @@ class GatewayTurnMixin:
                         "hygiene compression deferred: turn-hold budget expired and the "
                         "detached attempt did not commit",
                     )
+                    if not getattr(_gw, "_draining", False):
+                        _gw._retain_background_task(asyncio.ensure_future(_gw._hmwa_hygiene_notify(
+                            source, _meta, t("gateway.compress.turnhold_failed"),
+                            "compression-turnhold failure notice",
+                        )))
 
             attempt.future.add_done_callback(_hyg_adopt_or_space_retry)
             _log_suffix = (
@@ -1127,9 +1138,10 @@ class GatewayTurnMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-        )
+        if not _hyg_keep_admission:
+            await self._hmwa_hygiene_notify(
+                source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            )
         raise
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):

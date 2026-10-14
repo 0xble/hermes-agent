@@ -34,6 +34,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from agent.i18n import t
 
 
 def _make_history(n_messages: int, content_size: int = 100) -> list:
@@ -271,11 +272,11 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     # advances it (the deferral is not a failure).
     assert not fake_db.increment_hygiene_failure_streak.called
     assert fake_db.reset_hygiene_failure_streak.called
-    # Deferral notice still reaches the user.
-    sent = [m["content"] for m in adapter.sent]
-    assert any(
-        "deferred" in c.lower() or "still streaming" in c.lower() for c in sent
-    ), f"turn-hold must send deferral notice, got: {sent}"
+    # The summary was adopted, so any "deferred / continuing without compression" notice
+    # would have been false: success stays silent.
+    assert adapter.sent == [], (
+        f"an adopted kept-admission attempt must not notify the user, got: {adapter.sent}"
+    )
 
 
 @pytest.mark.asyncio
@@ -357,6 +358,126 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     assert not fake_db.increment_hygiene_failure_streak.called, (
         "turn-hold deferral must never advance the failure streak"
     )
+    # Exactly one notice, sent only once the attempt really failed, with honest wording.
+    for _ in range(100):
+        if adapter.sent:
+            break
+        await asyncio.sleep(0.02)
+    sent = [m["content"] for m in adapter.sent]
+    assert sent == [t("gateway.compress.turnhold_failed")], sent
+
+
+@pytest.mark.asyncio
+async def test_turn_hold_kept_admission_sends_no_notice_before_the_outcome(
+    monkeypatch, tmp_path
+):
+    """The turn-hold release itself is silent on the keep-admission branch: the attempt
+    may still be adopted, so saying "continuing without compression" up front is false."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    fake_db = MagicMock()
+    fake_db.get_compression_failure_cooldown.return_value = None
+
+    class FencedPendingAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-97963")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            if commit_fence is not None:
+                commit_fence.mark_commit_watermark_fenced()
+            worker_started.set()
+            _spin_started = time.monotonic()
+            while not release_worker.is_set():
+                if time.monotonic() - _spin_started > 20:
+                    return (messages, None)
+                if commit_fence is not None:
+                    commit_fence.touch_progress()
+                time.sleep(0.01)
+            return (messages, None)
+
+    gateway_run = importlib.import_module("gateway.run")
+    _write_turnhold_config(tmp_path)
+    _install_fakes(monkeypatch, gateway_run, tmp_path, FencedPendingAgent)
+
+    adapter = _CaptureAdapter()
+    runner = _build_runner(gateway_run, adapter, fake_db)
+    try:
+        result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
+        assert result == "ok"
+        assert worker_started.is_set()
+        await asyncio.sleep(0.2)
+        assert adapter.sent == [], (
+            f"keep-admission turn-hold must not notify before the attempt ends, got: {adapter.sent}"
+        )
+    finally:
+        release_worker.set()
+        await _drain_deferred(runner)
+
+
+@pytest.mark.asyncio
+async def test_turn_hold_kept_admission_failure_during_shutdown_stays_silent(
+    monkeypatch, tmp_path
+):
+    """A kept-admission attempt that ends uncommitted because the gateway is draining (shutdown
+    interrupts deferred workers) sends no retry notice: the restart notice already covers it."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    fake_db = MagicMock()
+    fake_db.get_compression_failure_cooldown.return_value = None
+
+    class FencedNoCommitAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "sess-97963")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, commit_fence=None, **_kwargs):
+            if commit_fence is not None:
+                commit_fence.mark_commit_watermark_fenced()
+            worker_started.set()
+            _spin_started = time.monotonic()
+            while not release_worker.is_set():
+                if time.monotonic() - _spin_started > 20:
+                    return (messages, None)
+                if commit_fence is not None:
+                    commit_fence.touch_progress()
+                time.sleep(0.01)
+            return (messages, None)
+
+    gateway_run = importlib.import_module("gateway.run")
+    _write_turnhold_config(tmp_path)
+    _install_fakes(monkeypatch, gateway_run, tmp_path, FencedNoCommitAgent)
+
+    adapter = _CaptureAdapter()
+    runner = _build_runner(gateway_run, adapter, fake_db)
+    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
+    assert result == "ok"
+    runner._draining = True
+    release_worker.set()
+    await _drain_deferred(runner)
+    for _ in range(100):
+        if fake_db.record_compression_failure_cooldown.called:
+            break
+        await asyncio.sleep(0.05)
+    assert fake_db.record_compression_failure_cooldown.called
+    await asyncio.sleep(0.2)
+    assert adapter.sent == [], adapter.sent
 
 
 @pytest.mark.asyncio
@@ -430,3 +551,6 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     # Legacy path still records the flat retry-after immediately.
     assert fake_db.record_compression_failure_cooldown.called
     assert not fake_db.increment_hygiene_failure_streak.called
+    # The cancel branch really does continue uncompressed this turn: its notice is accurate.
+    sent = [m["content"] for m in adapter.sent]
+    assert sent == [t("gateway.compress.turnhold_deferred")], sent
