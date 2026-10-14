@@ -1596,11 +1596,24 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False, default=str)
         call_text, output = _one_line(args, _EVIDENCE_CALL_CHARS), _tail(content.strip(), _EVIDENCE_OUTPUT_CHARS)
+        voice_fields = {}
+        try:
+            from tools.voice_send_gate import classify_voice_send, has_consumed_grant
+            parsed_args = json.loads(args) if isinstance(args, str) and args.strip().startswith("{") else {}
+            classified = classify_voice_send(name, parsed_args)
+            if classified:
+                voice_fields = {
+                    "voice_send_action_hash": classified["action_hash"],
+                    "voice_send_granted": has_consumed_grant(db, str(session_id), classified["action_hash"]),
+                }
+        except Exception:
+            # The judge's deterministic floor treats an unclassifiable send as ungranted.
+            voice_fields = {}
         if redact_sensitive_text is not None:
             call_text = redact_sensitive_text(call_text, force=True)
             output = redact_sensitive_text(output, force=True)
         entries.append({"tool": name, "call": call_text, "output": output,
-                        "timestamp": float(row.get("timestamp") or 0.0)})
+                        "timestamp": float(row.get("timestamp") or 0.0), **voice_fields})
     selected = entries if max_entries is None else entries[-max_entries:]
     return _EvidenceRows(selected, truncated=scan_truncated)
 
@@ -1677,6 +1690,26 @@ def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_a
         if previous_turn_at <= 0.0 or timestamp > previous_turn_at:
             rows.append(item)
     return rows
+
+
+def _ungranted_voice_send_in_evidence(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Deterministic judge floor: never ask the LLM to decide whether a send was approved."""
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        if "voice_send_action_hash" in item and not item.get("voice_send_granted"):
+            return str(item.get("voice_send_action_hash"))
+        # Unit callers may provide evidence without the collector's derived fields.
+        try:
+            from tools.voice_send_gate import classify_voice_send
+            tool = str(item.get("tool") or "")
+            call = json.loads(str(item.get("call") or "{}"))
+            classified = classify_voice_send(tool, call)
+            if classified and not item.get("voice_send_granted", False):
+                return classified["action_hash"]
+        except Exception:
+            continue
+    return None
 
 
 def _evidence_scan_truncated_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> bool:
@@ -2016,6 +2049,12 @@ def judge_goal(
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
         return "continue", "empty response (nothing to evaluate)", False, None, False
+    ungranted_hash = _ungranted_voice_send_in_evidence(evidence)
+    if ungranted_hash:
+        return "blocked", (
+            "deterministic voice-send floor: an attempted message send had no consumed "
+            f"one-shot approval grant (action {ungranted_hash[:12]})."
+        ), False, None, False
     if timeout is None:
         timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
 

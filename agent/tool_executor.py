@@ -670,6 +670,14 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
     hook-modified args applied. Hook failures never block."""
     try:
+        from tools.voice_send_gate import authorize_voice_send
+        voice_block = authorize_voice_send(agent, ref.name, ref.args)
+        if voice_block:
+            return voice_block, ref.args
+    except Exception:
+        # The voice-send floor is fail-closed: a classifier/store failure must not become a send.
+        return "BLOCKED: voice-send approval policy unavailable; message send refused.", ref.args
+    try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
         block_msg, modified_args = _dispatch_pre_tool_call_hooks(
