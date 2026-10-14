@@ -76,3 +76,51 @@ def test_no_summary_yet_is_never_stale(db):
     held = db.get_messages_as_conversation(sid, include_row_ids=True)
     db.archive_and_compact(sid, [*held[:-1], {"role": "assistant", "content": "m3-pruned"}], held_messages=held)
     assert [row[1] for row in _active(db, sid)] == ["m0", "m1", "m2", "m3-pruned"]
+
+
+# Gateway shape: ``load_transcript`` hands the turn a history with no ``_row_id``s, so the guard can only
+# match the summary row by role and loaded-view content.
+
+def _gateway_load(db: SessionDB, sid: str):
+    held = db.get_messages_as_conversation(sid, repair_alternation=True)
+    assert all("_row_id" not in m for m in held)
+    return held
+
+
+def test_stale_rewrite_without_row_ids_is_refused(db):
+    sid = "s-stale-gw"
+    _seed(db, sid)
+    stale = _gateway_load(db, sid)
+    db.archive_and_compact(sid, [{"role": "user", "content": "[summary]", "_compressed_summary": True},
+                                 *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    after_hygiene = _active(db, sid)
+
+    pruned = [dict(m, content=f"{m['content']}-pruned") for m in stale]
+    with pytest.raises(StaleHeldHistory):
+        db.archive_and_compact(sid, pruned, held_messages=stale)
+    assert _active(db, sid) == after_hygiene
+
+
+def test_current_generation_rewrite_without_row_ids_commits(db):
+    sid = "s-current-gw"
+    _seed(db, sid)
+    db.archive_and_compact(sid, [{"role": "user", "content": "[summary]", "_compressed_summary": True},
+                                 *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    current = _gateway_load(db, sid)  # carries the summary by content only
+    db.archive_and_compact(sid, [*current[:-1], {"role": "assistant", "content": "m5-pruned"}],
+                           held_messages=current)
+    assert [row[1] for row in _active(db, sid)] == ["[summary]", "m4", "m5-pruned"]
+
+
+def test_rewritten_summary_is_judged_by_the_held_snapshot_not_the_rewrite(db):
+    """A rewrite of the summary itself (micro-compaction defrag) is the current generation as long as the
+    held history is the snapshot taken at load, not the live dicts the rewrite edited."""
+    sid = "s-defrag-gw"
+    _seed(db, sid)
+    db.archive_and_compact(sid, [{"role": "assistant", "content": "[summary v1]", "_compressed_summary": True},
+                                 *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    live = _gateway_load(db, sid)
+    held = [dict(m) for m in live]
+    live[0]["content"] = "[summary v2]"
+    db.archive_and_compact(sid, live, held_messages=held)
+    assert [row[1] for row in _active(db, sid)] == ["[summary v2]", "m4", "m5"]

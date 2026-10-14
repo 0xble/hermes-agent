@@ -1103,7 +1103,8 @@ class SessionMessagesMixin:
 
         Every summary-producing compaction leaves its summary active, and a history loaded after that
         commit carries it. A lease-less rewrite whose history lacks it was built from the generation the
-        compaction replaced. Matched by row id, else by role and loaded-view content."""
+        compaction replaced. Matched by row id, else by role and loaded-view content (gateway history has no
+        row ids), so *held_messages* must be the history as loaded, never dicts a pass has since rewritten."""
         rows = conn.execute(
             "SELECT id, role, content FROM messages WHERE session_id = ? AND active = 1 AND _compressed_summary = 1",
             (session_id,)).fetchall()
