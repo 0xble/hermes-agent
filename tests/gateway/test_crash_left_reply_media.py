@@ -16,9 +16,9 @@ def _history(content: str) -> list:
     ]
 
 
-def _reply(content: str):
+def _reply(content: str, *, platform=Platform.TELEGRAM):
     runner = object.__new__(GatewayRunner)
-    origin = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="1", thread_id=None)
+    origin = SimpleNamespace(platform=platform, chat_id="1", thread_id=None)
     return runner._crash_left_reply(_history(content), time.time() - 5, origin)
 
 
@@ -44,8 +44,12 @@ def test_text_reply_is_still_redelivered():
     assert _reply("Done, no attachment.") == "Done, no attachment."
 
 
-def test_redelivered_reply_hides_loop_complete_marker():
-    assert _reply("CI is green.\nLOOP_COMPLETE") == "CI is green."
+def test_redelivered_reply_strips_trailing_silence_marker():
+    assert _reply("Update.\n[SILENT]\nLOOP_COMPLETE") == "Update."
+
+
+def test_webhook_redelivery_keeps_autonomous_silence_marker():
+    assert _reply("Update.\n[SILENT]\nLOOP_COMPLETE", platform=Platform.WEBHOOK) == "Update.\n[SILENT]"
 
 
 def test_bare_loop_complete_reply_redelivers_nothing():

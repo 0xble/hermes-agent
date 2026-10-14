@@ -110,6 +110,22 @@ def test_hold_still_releases_a_held_prefix_when_the_next_segment_is_prose():
     assert released == "NO\n\nmore text"
 
 
+@pytest.mark.parametrize("marker", ("NO_REPLY", "[SILENT]"))
+def test_hold_rearms_after_break_before_a_fresh_marker(marker):
+    """A fresh marker after a paragraph break starts a new hold instead of being spoken."""
+    hold = {"buf": "", "held": ""}
+    released = [response_filters.hold_silence_delta(hold, d) for d in ("NO", "\n\n", marker)]
+    assert released == ["", "NO\n\n", ""]
+    assert hold["held"] == marker
+
+
+def test_hold_keeps_a_marker_and_loop_complete_together_across_a_break():
+    hold = {"buf": "", "held": ""}
+    released = [response_filters.hold_silence_delta(hold, d) for d in ("[SILENT]", "\n\n", "LOOP_COMPLETE")]
+    assert released == ["", "", ""]
+    assert hold == {"buf": "[SILENT]\n\nLOOP_COMPLETE", "held": "[SILENT]\n\nLOOP_COMPLETE"}
+
+
 def test_autonomous_silence_accepts_marker_with_own_line_note():
     """The loose rule for cron/webhook lanes: marker + explanation suppresses."""
     assert is_autonomous_silence_response("[SILENT]")

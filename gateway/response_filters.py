@@ -410,7 +410,10 @@ def is_partial_silence_marker(text: Any) -> bool:
     is held back so a raw marker is never shown and then retracted.  Divergence
     from every marker, or exceeding the cap, resumes normal streaming.  A trailing
     complete or partial ``LOOP_COMPLETE`` line is ignored, so ``[SILENT]\\nLOOP``
-    stays held on its way to a combined silent response.
+    stays held on its way to a combined silent response. Within the marker-size cap,
+    complete ``LOOP_COMPLETE`` lines anywhere in the buffer are also ignored while
+    checking the remaining silence-marker candidate; this is intentionally not the
+    same as the exact predicate's trailing-control-run view.
     """
     if isinstance(text, str):
         # Same control-run view as the exact verdict: every complete LOOP_COMPLETE line is
@@ -427,6 +430,22 @@ def is_partial_silence_marker(text: Any) -> bool:
     )
 
 
+def _is_partial_silence_control_run_prefix(text: str) -> bool:
+    """True when a complete silence marker may still be followed only by a LOOP_COMPLETE prefix."""
+    if not isinstance(text, str) or "\n" not in text:
+        return False
+    first, remainder = text.split("\n", 1)
+    if not _is_silence_marker_line(first):
+        return False
+    lines = [line.strip() for line in remainder.split("\n") if line.strip()]
+    if not lines:
+        return True
+    return all(
+        is_loop_complete_marker(line) or _LOOP_COMPLETE_MARKER.startswith(line.upper())
+        for line in lines
+    )
+
+
 def hold_silence_delta(hold: dict, delta: str) -> str:
     """Streamed text safe to release now while a bare silence marker stays withheld.
 
@@ -438,10 +457,17 @@ def hold_silence_delta(hold: dict, delta: str) -> str:
     ``LOOP_COMPLETE`` as separate chunks), which stays held as one response.
     """
     released = ""
+    if hold["held"] and hold["buf"].endswith("\n\n") and _is_silence_marker_line(
+        hold["buf"][:-2]
+    ) and not _is_partial_silence_control_run_prefix(hold["buf"] + delta):
+        released, hold["held"], hold["buf"] = hold["held"], "", ""
+        return released + hold_silence_delta(hold, delta)
     if delta.startswith("\n\n") and not (
-        hold["held"] and is_partial_silence_marker(hold["buf"] + delta)
+        hold["held"] and _is_partial_silence_control_run_prefix(hold["buf"] + delta)
     ):
         released, hold["held"], hold["buf"] = hold["held"], "", ""
+        if delta == "\n\n":
+            return released + delta
     hold["buf"] += delta
     if is_partial_silence_marker(hold["buf"]):
         hold["held"] += delta
