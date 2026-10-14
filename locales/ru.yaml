@@ -326,6 +326,7 @@ gateway:
     title_empty_untitled: "\n⚠️ После очистки название пусто — сеанс запущен без названия."
     tip: "\n✦ Совет: {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
     in_progress: "⏳ Перезапуск шлюза уже выполняется..."
     restarting: "♻ Перезапуск шлюза. Если уведомление не придёт в течение 60 секунд, перезапустите из консоли командой `hermes gateway restart`."
   resume:
