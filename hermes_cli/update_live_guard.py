@@ -86,7 +86,8 @@ def lookup_pr(branch: str, *, cwd: Path | None = None) -> PullRequest | None:
         result = subprocess.run(
             ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1",
              "--json", "number,state,url,headRefOid,mergeCommit"],
-            cwd=cwd, capture_output=True, text=True, timeout=_GH_TIMEOUT_SECONDS, check=False)
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            timeout=_GH_TIMEOUT_SECONDS, check=False)
         rows = json.loads(result.stdout or "[]") if result.returncode == 0 else []
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
