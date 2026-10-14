@@ -10,9 +10,16 @@ and memory-pressure evictions commit the transcript (`on_session_end`) first;
 same-session evictions (`/model`, fallback drift, config signature,
 cross-process) never do. An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
-a second commit or shutdown. A memory-pressure batch detaches managers inline and
-shuts them down on parallel daemon threads, so `malloc_trim` is not held behind
-their bounded joins.
+a second commit or shutdown: `shutdown_memory_provider()` holds the manager in a
+local, so a cleanup that outlived its 30s reset timeout still finishes with
+`shutdown_all()` after eviction nulls the attribute. `MemoryManager.shutdown_all()`
+is idempotent, so racing teardown paths retire providers once. A memory-pressure
+batch commits, detaches the manager, and calls `release_clients()` inline, then
+runs the deferred `shutdown_all()` on parallel daemon threads, so `malloc_trim` is
+not held behind their bounded joins. Releasing the agent's clients first is safe
+because no provider drain uses them: Hindsight's writer and shutdown use the
+provider's own `_client`, and query rewrite goes through the process-wide
+auxiliary client.
 Hindsight prefetch keeps one in-flight worker and one latest-wins pending query;
 discard and shutdown fence both the pending query and the worker's publication,
 and a `BaseException` leaving the worker clears its running flag.

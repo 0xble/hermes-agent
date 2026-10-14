@@ -90,4 +90,3 @@ def test_prefetch_worker_base_exception_resets_running_flag(monkeypatch):
         assert "after" in provider.prefetch("next")
     finally:
         provider.shutdown()
-

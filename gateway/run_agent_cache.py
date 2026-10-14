@@ -1049,7 +1049,9 @@ class GatewayAgentCacheMixin:
 
         Already removed from the cache, so the next turn builds its own manager. Detaching first means a
         later soft release or close() cannot retire providers twice, and an agent whose
-        shutdown_memory_provider() already ran (``_memory_provider_shutdown``) is not shut down again."""
+        shutdown_memory_provider() already started (``_memory_provider_shutdown``) is left to it: that call holds
+        the manager locally and always finishes with ``shutdown_all()``, even when a timed-out /new cleanup is
+        still inside ``on_session_end``. Shutting it down here instead would retire providers mid-session-end."""
         manager = getattr(agent, "_memory_manager", None)
         if manager is None:
             return None

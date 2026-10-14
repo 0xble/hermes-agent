@@ -870,12 +870,16 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager:
+        # Hold the manager locally: a gateway eviction may detach ``self._memory_manager`` while a timed-out
+        # /new cleanup is still inside on_session_end, and it leaves this flagged shutdown to finish the job.
+        manager = self._memory_manager
+        if manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
-            _quietly(lambda: self._memory_manager.shutdown_all())
+            finally:
+                _quietly(manager.shutdown_all)
         _notify_context_engine_session_end(self, messages)
 
     def commit_memory_session(self, messages: list = None) -> None:

@@ -192,6 +192,48 @@ def test_reset_cleanup_then_eviction_fires_session_end_and_shutdown_once():
     assert (provider.session_ends, provider.shutdowns) == (1, 1)
 
 
+def test_eviction_during_timed_out_reset_cleanup_still_shuts_down_once():
+    """/new cleanup timed out inside on_session_end; eviction detaches meanwhile, yet the manager retires once."""
+    runner = _cache_runner()
+    entered, release = threading.Event(), threading.Event()
+
+    class _BlockingEnd(_CountingProvider):
+        def on_session_end(self, messages):
+            entered.set()
+            assert release.wait(5)
+            super().on_session_end(messages)
+
+    provider = _BlockingEnd()
+    agent = _real_agent(provider)
+    manager = agent._memory_manager
+    manager._submit_background(lambda: None)
+    executor_threads = list(manager._sync_executor._threads)
+    key = "agent:main:reset-timeout"
+    runner._agent_cache[key] = (agent, "sig")
+
+    # The worker _cleanup_old_agent_for_reset leaves running once its 30s wait_for gives up.
+    cleanup = threading.Thread(target=GatewayRunner._cleanup_agent_resources, args=(runner, agent), daemon=True)
+    cleanup.start()
+    try:
+        assert entered.wait(5)
+        runner._evict_cached_agent(key)
+        assert _wait(lambda: agent._memory_manager is None)
+        time.sleep(0.05)
+        assert provider.shutdowns == 0, "eviction retired providers mid-on_session_end"
+    finally:
+        release.set()
+    cleanup.join(5)
+    assert not cleanup.is_alive()
+
+    assert provider.shut_down.wait(5)
+    manager.shutdown_all()  # idempotent: a racing second retirement is a no-op
+    assert (provider.session_ends, provider.shutdowns) == (1, 1)
+    assert manager._sync_executor is None and manager.shutdown_drain_state["status"] == "drained"
+    for worker in executor_threads:
+        worker.join(5)
+        assert not worker.is_alive()
+
+
 def test_model_switch_eviction_shuts_down_without_session_end():
     """/model and fallback drift continue the SAME session: retire workers, no session-end hook."""
     runner = _cache_runner()
