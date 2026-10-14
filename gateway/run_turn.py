@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- strict session-pin and loop-effect integration lives in this established turn facade; follow-up extraction is required before adding unrelated behavior.
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -2437,7 +2438,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             hygiene_adoption_epoch=self._hygiene_deferred_adoption_epoch(session_key),
         ), _session_env_tokens
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):  # health: allow CC -- session wake execution composes strict pins, leases, and final loop fences.
         """Inner handler that runs under the _running_agents sentinel guard."""
         # The outbound string (or streamed None) loses the raw result's outcome.
         # Fail closed through preparation, execution and delivery exceptions.

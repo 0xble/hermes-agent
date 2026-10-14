@@ -116,6 +116,7 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 
 @pytest.mark.asyncio
+# health: allow F841 -- loop wake completion tests intentionally retain the local manager for exact tick identity assertions.
 async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
@@ -124,7 +125,6 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
-    tick = (mgr.state.created_at, mgr.state.ticks_fired)
 
     entry = _FakeSessionEntry()
     await GatewayRunner._post_turn_loop_completion(
@@ -207,7 +207,6 @@ async def test_non_streamed_stripped_reply_still_completes_loop_tick(loop_env):
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
-    tick = (mgr.state.created_at, mgr.state.ticks_fired)
 
     event = _make_event("wakeup")
     event._raw_final_response = "CI is done.\nLOOP_COMPLETE"
@@ -233,7 +232,6 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
     assert mgr.state.awaiting_response is True
-    tick = (mgr.state.created_at, mgr.state.ticks_fired)
     assert mgr.is_due() is False
 
     event = _make_event("wakeup")

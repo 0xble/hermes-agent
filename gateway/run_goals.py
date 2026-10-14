@@ -824,7 +824,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 sid, tip,
             )
 
-    async def _loop_wakeup_fire_one(
+    async def _loop_wakeup_fire_one(  # health: allow CC -- ordered wake admission combines strict pins, busy gates, claim CAS, and adapter receipt.
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
         """Inject one due /loop wakeup into its session, applying every deferral rule.

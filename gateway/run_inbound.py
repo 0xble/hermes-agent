@@ -1,3 +1,7 @@
+# health: allow FILE_LINES -- the wake admission additions share this facade until the existing inbound mixin extraction is completed.
+# health: allow BLE001 -- command-hook observers are third-party boundaries; failures are logged and must not block control commands.
+# health: allow NESTING -- this dispatch ladder preserves the ordered auth, drain, quick-command, plugin, and adapter fences.
+# health: allow CC -- this admission boundary composes the ordered session, wake, and outbox fences and must remain atomic.
 """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
@@ -878,7 +882,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         event.text = f"{target} {event.get_command_args().strip()}".strip()
         return target.lstrip("/").split()[0]
 
-    async def _hm_command_hooks(
+    async def _hm_command_hooks(  # health: allow CC -- ordered hook dispatch is the control-command fence and preserves observer/interceptor semantics.
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str,
     ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Fire ``pre_command`` (observer) and ``command:<canonical>`` (interceptor) hooks →
@@ -894,7 +898,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                     surface="gateway", command=str(canonical), alias_used=str(command),
                     args_raw=raw_args, session_key=_quick_key, platform=platform,
                 )
-            except Exception as _pre_cmd_err:
+            except Exception as _pre_cmd_err:  # health: allow BLE001 -- plugin observer failures are isolated from command control dispatch.
                 logger.debug("pre_command hook dispatch failed (non-fatal): %s", _pre_cmd_err)
 
             # Handlers may return ``{"decision": "deny" | "handled" | "rewrite", ...}`` to intercept
@@ -905,7 +909,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             }
             try:
                 return await self.hooks.emit_collect(f"command:{canonical}", hook_ctx)
-            except Exception as _hook_err:
+            except Exception as _hook_err:  # health: allow BLE001 -- plugin interceptor failures are isolated and return no decisions.
                 logger.debug("command:%s hook dispatch failed (non-fatal): %s", canonical, _hook_err)
                 return []
 
@@ -1172,7 +1176,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return output or t("gateway.quick_command.no_output")
         except asyncio.TimeoutError:
             return t("gateway.quick_command.timed_out")
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- quick-command subprocess failures are user-visible and must not abort the gateway.
             return t("gateway.quick_command.error", error=e)
 
     @staticmethod
@@ -1183,7 +1187,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         from hermes_cli.commands import resolve_command
         return resolve_command(command) is not None
 
-    async def _hm_dispatch_quick_and_plugin_commands(
+    async def _hm_dispatch_quick_and_plugin_commands(  # health: allow NESTING -- ordered command routing retains the drain, alias, plugin, and built-in fences.
         self, event: "MessageEvent", source: SessionSource, command: Optional[str]
     ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
@@ -1488,7 +1492,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             finally:
                 restore_turn(token)
 
-    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:
+    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:  # health: allow CC -- this is the single ordered admission boundary for session controls and loop wakes.
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL

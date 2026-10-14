@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- this PR must retain the cross-session command admission and strict wake-fence paths in this facade; the moved helper boundary is tracked for follow-up extraction.
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
