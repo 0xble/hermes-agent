@@ -5361,8 +5361,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
 
         # Planned reload: a launchd bootout issued only to re-read the plist (update, guardian rollback).
         def _planned_restart() -> bool:
-            from gateway.status import consume_planned_restart_marker_for_self
-            return consume_planned_restart_marker_for_self()
+            from gateway.restart_loop_guard import consume_planned_restart_signal
+            return consume_planned_restart_signal()
 
         # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
         def _snapshot():
