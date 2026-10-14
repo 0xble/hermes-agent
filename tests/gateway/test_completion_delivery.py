@@ -153,12 +153,22 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     runner = _runner(adapter)
     event = _async_event()
     text = "completion"
+    identity_checked = asyncio.Event()
+    real_identity_state = runner._completion_identity_state
+
+    def _identity_state(identity, *, claim=False):
+        state = real_identity_state(identity, claim=claim)
+        if claim and state == "inflight":
+            identity_checked.set()
+        return state
+
+    runner._completion_identity_state = _identity_state
 
     async def _exercise():
         first = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
         await entered.wait()
         second = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
-        await asyncio.sleep(0)
+        await identity_checked.wait()
         release.set()
         return await asyncio.gather(first, second)
 
@@ -557,12 +567,25 @@ def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
     fresh = _completion_event(started_at=2.0, session_id="proc_fresh")
     duplicate_identity = runner._completion_delivery_identity(duplicate)
     runner._completion_deliveries_delivered[duplicate_identity] = None
+    fresh_queued = asyncio.Event()
+
+    async def _hold(evt, *, session_busy=False):
+        if evt is fresh:
+            # Let the fresh entry become the batch primary before the duplicate joins it.
+            fresh_queued.set()
+        return 0.0
+
+    runner._completion_hold_seconds = _hold
 
     async def _exercise():
-        return await asyncio.gather(
-            runner._enqueue_process_completion_notification("duplicate", duplicate),
-            runner._enqueue_process_completion_notification("fresh", fresh),
+        fresh_task = asyncio.create_task(
+            runner._enqueue_process_completion_notification("fresh", fresh)
         )
+        await fresh_queued.wait()
+        duplicate_task = asyncio.create_task(
+            runner._enqueue_process_completion_notification("duplicate", duplicate)
+        )
+        return await asyncio.gather(fresh_task, duplicate_task)
 
     assert asyncio.run(_exercise()) == [True, True]
     adapter.handle_message.assert_awaited_once()

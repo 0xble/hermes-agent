@@ -1933,12 +1933,7 @@ class GatewayNotificationsMixin:
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
-        """Return a producer-stable identity when one is available.
-
-        Delegation UUIDs identify one producer completion. Process session IDs include the
-        persisted spawn epoch so a reused ID is a distinct incarnation; legacy events without
-        ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
-        """
+        """Return a producer-stable identity, or ``None`` when unavailable."""
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
@@ -1965,19 +1960,17 @@ class GatewayNotificationsMixin:
         while len(self._completion_deliveries_delivered) > self._completion_delivery_retention:
             self._completion_deliveries_delivered.popitem(last=False)
 
-    def _completion_identity_seen(self, identity, *, claim: bool = False) -> bool:
-        """True when ``identity`` is inflight or already delivered this gateway lifecycle.
-
-        With ``claim`` an unseen identity is atomically marked inflight (same lock hold).
-        """
+    def _completion_identity_state(self, identity, *, claim: bool = False) -> str | None:
         with self._completion_delivery_lock:
-            seen = (
-                identity in self._completion_deliveries_inflight
-                or identity in self._completion_deliveries_delivered
-            )
-            if claim and not seen:
+            for state, seen in (
+                ("delivered", self._completion_deliveries_delivered),
+                ("inflight", self._completion_deliveries_inflight),
+            ):
+                if identity in seen:
+                    return state
+            if claim:
                 self._completion_deliveries_inflight.add(identity)
-            return seen
+            return "claimed" if claim else None
 
     async def _classify_completion_target(self, parent_session_id: str, *, settle_ended_tip: bool = False) -> str:
         """Classify an async-completion target before adapter acceptance: ``"deliver"`` (spawning
@@ -2184,8 +2177,8 @@ class GatewayNotificationsMixin:
     ) -> Optional[bool]:
         """Acknowledge one admitted batch, refund refusals, or release failed deliveries.
 
-        True means adapter admission, not model execution; None means deduplicated or
-        terminal. False remains retryable. Claims are settled together for every sibling.
+        True means adapter admission or a completion identity already delivered in this gateway
+        lifecycle; None means an in-flight deduplication or terminal result. False remains retryable.
         """
         async with self._completion_event_scope(evt):
             return await self._deliver_completion_notification_scoped(
@@ -2206,7 +2199,10 @@ class GatewayNotificationsMixin:
             if not claim.proceed:
                 return claim.early_result
             if identity is not None:
-                if self._completion_identity_seen(identity, claim=True):
+                identity_state = self._completion_identity_state(identity, claim=True)
+                if identity_state == "delivered":
+                    return True
+                if identity_state == "inflight":
                     return None
                 identity_claimed = True
             injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
@@ -2306,8 +2302,11 @@ class GatewayNotificationsMixin:
                 identity = self._completion_delivery_identity(entry[1])
                 if identity is None:
                     continue
-                if self._completion_identity_seen(identity, claim=True):
-                    self._settle_batch_waiters([entry], None)
+                identity_state = self._completion_identity_state(identity, claim=True)
+                if identity_state != "claimed":
+                    self._settle_batch_waiters(
+                        [entry], True if identity_state == "delivered" else None,
+                    )
                     entries.remove(entry)
                 else:
                     sibling_claims.append(identity)
@@ -2562,7 +2561,7 @@ class GatewayNotificationsMixin:
             if not synth_text:
                 continue
             identity = self._completion_delivery_identity(evt)
-            if identity is not None and self._completion_identity_seen(identity):
+            if identity is not None and self._completion_identity_state(identity):
                 continue
             deliverable.append((evt, synth_text))
         if not deliverable:
