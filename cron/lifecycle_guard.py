@@ -1172,6 +1172,7 @@ def _read_script_for_scanning(script_path: str) -> tuple[str, Optional[str]]:
 def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+    trust_installed_helper: bool = True,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1188,6 +1189,7 @@ def _contains_unsafe_gateway_action(
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed,
+            trust_installed_helper=trust_installed_helper,
         )
 
     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
@@ -1205,7 +1207,7 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    allow_heavy_slot = read_remote_script is None
+    allow_heavy_slot = trust_installed_helper
     candidates = [(path, executed) for path in _iter_referenced_shell_scripts(
         walk_command, cwd=cwd, allow_heavy_slot=allow_heavy_slot,
     )]
@@ -1268,6 +1270,7 @@ def _contains_unsafe_gateway_action(
 def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    trust_installed_helper: Optional[bool] = None,
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
@@ -1281,12 +1284,19 @@ def scan_gateway_lifecycle(
     boundary instead of per-syscall: a guard crash propagates out of ``tools/terminal_tool.py`` and breaks
     every terminal command until the gateway restarts (#77780, #78256), which is strictly worse than either
     verdict.
+
+    *trust_installed_helper* says whether an absolute path to the installed heavy-slot helper names
+    the file that will run. It defaults to "no remote reader": a remote backend's filesystem is not
+    the host's, so the host helper's identity proves nothing there. A local terminal passes True
+    while still supplying the reader for paths only its backend can see.
     """
+    if trust_installed_helper is None:
+        trust_installed_helper = read_remote_script is None
     budget = _LifecycleScanBudget()
     try:
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
-            read_remote_script=read_remote_script,
+            read_remote_script=read_remote_script, trust_installed_helper=trust_installed_helper,
         )
         return unsafe, budget.refusal if unsafe else None
     except Exception:

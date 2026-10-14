@@ -231,15 +231,13 @@ def gateway_lifecycle_block(
         mounted_host=getattr(env, "host_cwd", None),
         env=env,
     )
-    # Local commands read scripts from the host filesystem; the remote-read callback would
-    # disable the identity peel for an absolute installed helper path.
+    # Only a local backend runs the host's installed heavy-slot helper, so only there does its
+    # absolute path earn the identity peel. The backend reader stays on for every backend.
     unsafe, refusal = scan_gateway_lifecycle(
         command,
         cwd=guard_cwd,
-        read_remote_script=(
-            None if env_type == "local"
-            else lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES)
-        ),
+        read_remote_script=lambda p: _read_script_for_guard(env, guard_cwd, p, _MAX_REFERENCED_SCRIPT_BYTES),
+        trust_installed_helper=env_type == "local",
     )
     if unsafe and refusal:
         # Not a lifecycle command: a script the command EXECUTES could not be scanned (budget,
