@@ -2003,6 +2003,9 @@ class BasePlatformAdapter(ABC):
     supports_code_blocks: bool = False
     # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
+    # Platform adapters may override the regular typing heartbeat cadence. Telegram narrows this
+    # from its own Bot API expiry window; every other adapter keeps the historical 2s default.
+    typing_refresh_interval: float = 2.0
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
@@ -5002,7 +5005,7 @@ class BasePlatformAdapter(ABC):
         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
         if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
             return None
-        kwargs: Dict[str, Any] = {"metadata": metadata}
+        kwargs: Dict[str, Any] = {"interval": self.typing_refresh_interval, "metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event
         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
