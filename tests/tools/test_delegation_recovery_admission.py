@@ -76,8 +76,11 @@ def test_gateway_cut_notice_and_recovery_follow_restart_authority(reason):
             assert "error" in payload
             assert "tasks" not in payload and "recovery_context" not in payload
             return
-        assert "action='resume'" in text
         assert "no continuation was requested" not in text
+        # One instruction per notice: resume for a restart cut, automatic retry otherwise.
+        auto = "retry this automatically" in text
+        assert ("action='resume'" in text) is (reason == "gateway shutdown (restart)")
+        assert auto is (reason != "gateway shutdown (restart)")
         if reason == "gateway shutdown (restart)":
             claim = ad.claim_event_delivery(event, "test")
             assert ad.complete_completion_delivery(did, claim)

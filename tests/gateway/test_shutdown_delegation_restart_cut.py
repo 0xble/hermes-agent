@@ -70,7 +70,14 @@ async def test_real_shutdown_offers_resume_for_every_lifecycle_cut_except_user_s
         event = process_registry.completion_queue.get(timeout=5)
         assert event["cut_reason"] == ("gateway shutdown (restart)" if restart else f"gateway shutdown ({phase})")
         text = _format_async_delegation(event)
-        assert "delegate_task(action='resume'" in text
+        # Exactly one instruction: a restart cut offers explicit resume; other lifecycle cuts carry
+        # the scheduled automatic retry and must not also tell the parent to resume by hand.
+        if restart:
+            assert "delegate_task(action='resume'" in text
+            assert "retry this automatically" not in text
+        else:
+            assert "retry this automatically" in text and "Do not re-dispatch" in text
+            assert "action='resume'" not in text
         parent = type("Parent", (), {"session_id": "owner", "_session_db": None})()
         payload = json.loads(_handle_control_action("resume", handle["delegation_id"], None, parent))
         assert payload["status"] == "retry_claimed"
