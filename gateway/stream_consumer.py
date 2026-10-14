@@ -167,6 +167,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
         self._delivered_segment_texts: list[str] = []  # finalized text per past segment
+        # Native/draft transports retain cumulative prose across tool boundaries. Marker hold-back
+        # must judge only the newest segment, not that earlier substantive preamble.
+        self._segment_start = 0
+        self._final_is_silence_marker = False
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
         # Copy blocks are delivered as separate messages after the turn, so they never
@@ -208,6 +212,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # ``_stream_ledger`` mirrors ``_accumulated`` but is NOT truncated when
         # overflow splits seal head chunks (reconcilable turn-final payload).
         self._accumulated = self._stream_ledger = ""
+        # The marker-check offset indexes _accumulated, so it must reset with the buffer. A stale
+        # offset after a clarify/approval boundary would slice past the new text and let a bare
+        # silence marker stream out as a native frame.
+        self._segment_start = 0
         self._last_sent_text = ""    # skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
@@ -350,7 +358,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
         final_text = copy_free_text_for(self.adapter, final_text or "")  # buffers never hold copy blocks
-        target = self._display_payload(final_text)
+        target = self._display_payload(self._with_cumulative_prefix(final_text))
         if not target:
             return None
         if self._delivered_final_text is not None:
@@ -579,6 +587,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._eager_reopen_seed()
                     continue
 
+                if tick.got_segment_break and _is_intentional_silence_response(
+                    self._clean_for_display(self._accumulated[self._segment_start:])
+                ):
+                    await self._suppress_silence_marker(terminal=False)
+                    self._copy_filter.message_boundary()
+                    await self._end_segment(tick)
+                    self._signal_flush(tick.flush_event)
+                    continue
+
                 if tick.got_done:
                     self._flush_think_buffer()
                     self._flush_copy_filter()
@@ -588,7 +605,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    if self._final_is_silence_marker or _is_intentional_silence_response(
+                        self._clean_for_display(self._accumulated)
+                    ):
                         await self._suppress_silence_marker()
                         return
 
@@ -737,18 +756,30 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._accumulated = self._strip_final_loop_complete_marker(self._accumulated)
         self._stream_ledger = self._strip_final_loop_complete_marker(self._stream_ledger)
 
+    def _with_cumulative_prefix(self, final_text: str) -> str:
+        """Keep earlier tool segments when the final carries only the last answer."""
+        prefix = self._accumulated[:self._segment_start] if final_text else ""
+        if prefix and not self._turn_split_delivery and self._cumulative_transport():
+            if not final_text.startswith(prefix):
+                return prefix + final_text
+        return final_text
+
     def _adopt_final_text(self, final_raw: str) -> None:
         """Adopt the authoritative final (see finish()) as the finalize content — only if this
         consumer streamed something (a no-stream turn keeps the gateway's final-send
         ownership).  Split delivery: wholesale adoption would repeat sealed heads, refusing
         makes the gateway resend the ENTIRE body — so append only the suffix when the final
         strictly prefix-extends the ledger."""
+        if _is_intentional_silence_response(final_raw):
+            self._final_is_silence_marker = True
+            return  # keep any cumulative preamble until segment-scoped final suppression
         if not (self._accumulated or self._message_id or self._last_sent_text):
             return
         final_raw = copy_free_text_for(self.adapter, final_raw)  # the buffers never hold copy blocks
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:
+            final_raw = self._with_cumulative_prefix(final_raw)
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
                 self._accumulated = final_raw
@@ -798,7 +829,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # marker ("NO"→"NO_REPLY"), or while its last top-level line could be a trailing
         # marker after prose; got_done always resolves the buffer.
         _visible = self._clean_for_display(self._accumulated)
-        return should_edit and not _is_partial_silence_marker(_visible) and not (
+        _segment = self._clean_for_display(self._accumulated[self._segment_start:])
+        return should_edit and not _is_partial_silence_marker(_segment) and not (
             self.cfg.strip_trailing_silence_markers and _ends_with_partial_silence_marker(_visible)
         ) and not _ends_with_partial_loop_complete_marker(_visible)
 
@@ -980,7 +1012,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must keep its sentinel or every tool boundary posts a new message; the
         continuation goes out once via _send_fallback_final."""
         if self._cumulative_transport():
+            self._segment_start = len(self._accumulated)
             return
+        self._segment_start = 0
         # If the segment-break edit or send didn't land (flood control / fallback mode, or a
         # failed first send of a split tail with no message id yet), _accumulated holds unseen
         # pre-boundary text — flush it before the reset clears it.

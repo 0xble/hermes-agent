@@ -511,6 +511,7 @@ def _validate_child_output_schema(
         with delegated_child_context(
             str(getattr(child, "session_id", "") or ""),
             parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
+            root_session_id=getattr(child, "_delegation_root_session_id", None),
         ):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
@@ -877,6 +878,7 @@ class _ChildRun:
             with delegated_child_context(
                 str(getattr(child, "session_id", "") or ""),
                 parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
+                root_session_id=getattr(child, "_delegation_root_session_id", None),
             ):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,

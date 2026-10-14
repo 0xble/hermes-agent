@@ -153,12 +153,22 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     runner = _runner(adapter)
     event = _async_event()
     text = "completion"
+    identity_checked = asyncio.Event()
+    real_identity_state = runner._completion_identity_state
+
+    def _identity_state(identity, *, claim=False):
+        state = real_identity_state(identity, claim=claim)
+        if claim and state == "inflight":
+            identity_checked.set()
+        return state
+
+    runner._completion_identity_state = _identity_state
 
     async def _exercise():
         first = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
         await entered.wait()
         second = asyncio.create_task(runner._deliver_completion_notification(text, dict(event)))
-        await asyncio.sleep(0)
+        await identity_checked.wait()
         release.set()
         return await asyncio.gather(first, second)
 
@@ -550,24 +560,46 @@ def test_coalesced_format_redacts_before_truncating_output(monkeypatch):
     assert marker not in text
 
 
-def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
+@pytest.mark.parametrize("primary", ["duplicate", "fresh"])
+def test_duplicate_primary_does_not_discard_fresh_batch_sibling(primary):
+    """An already-delivered copy, as primary or sibling, never swallows a fresh completion."""
     adapter = SimpleNamespace(handle_message=AdmittingHandler())
     runner = _runner(adapter)
-    duplicate = _completion_event(started_at=1.0, session_id="proc_duplicate")
-    fresh = _completion_event(started_at=2.0, session_id="proc_fresh")
-    duplicate_identity = runner._completion_delivery_identity(duplicate)
-    runner._completion_deliveries_delivered[duplicate_identity] = None
+    events = {
+        "duplicate": _completion_event(started_at=1.0, session_id="proc_duplicate"),
+        "fresh": _completion_event(started_at=2.0, session_id="proc_fresh"),
+    }
+    runner._completion_deliveries_delivered[runner._completion_delivery_identity(events["duplicate"])] = None
+
+    async def _hold(_evt, *, session_busy=False):
+        return 0.0
+
+    runner._completion_hold_seconds = _hold
+    order = [primary, "fresh" if primary == "duplicate" else "duplicate"]
 
     async def _exercise():
-        return await asyncio.gather(
-            runner._enqueue_process_completion_notification("duplicate", duplicate),
-            runner._enqueue_process_completion_notification("fresh", fresh),
-        )
+        runner._ensure_completion_batch_state()
+        tasks = {}
+        for name in order:
+            tasks[name] = asyncio.create_task(
+                runner._enqueue_process_completion_notification(f"{name}-completion-text", events[name])
+            )
+            # Wait until this entry is queued so the batch order is exactly ``order``.
+            while sum(map(len, runner._completion_notification_batches.values())) < len(tasks):
+                await asyncio.sleep(0)
+        queued = next(iter(runner._completion_notification_batches.values()))
+        assert [evt["session_id"] for _text, evt, _future in queued] == [
+            events[name]["session_id"] for name in order
+        ]
+        return [await tasks["duplicate"], await tasks["fresh"]]
 
     assert asyncio.run(_exercise()) == [True, True]
     adapter.handle_message.assert_awaited_once()
-    fresh_identity = runner._completion_delivery_identity(fresh)
-    assert fresh_identity in runner._completion_deliveries_delivered
+    payload = adapter.handle_message.await_args.args[0].text
+    assert "fresh-completion-text" in payload
+    assert "duplicate-completion-text" not in payload and "proc_duplicate" not in payload
+    assert runner._completion_delivery_identity(events["fresh"]) in runner._completion_deliveries_delivered
+    assert not runner._completion_deliveries_inflight
 
 
 def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):

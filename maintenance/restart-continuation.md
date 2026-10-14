@@ -72,6 +72,70 @@ translated, and the retired cause-based keys were removed.
   `build_resume_recovery_note`, `_prepare_resume_pending_message`),
   `gateway/run_turn_runner.py` (`_resume_restart_policy`, `_prepare_turn_message`).
 
+## Observable restart recovery
+
+The shared recovery decision lives in `gateway/run_restart_recovery.py`; note
+receipts and persisted destinations live in `gateway/run_interrupted_notes.py`.
+Startup must retain the pending-session snapshot when the restart-loop breaker
+trips, so eligible human turns can still receive a bounded interruption note.
+The breaker decision must survive the asynchronous refresh and reconnect scans,
+including the pending-follow-up spool path. Do not bypass the breaker when note
+visibility is ambiguous: that can recreate the model-driven restart loop.
+
+Each candidate emits one `Restart recovery outcome: session=<key> outcome=<value>`
+record per boot. Values are `resumed` after the admitted turn completes,
+`noted` for an acknowledged/persisted visible interruption note, or
+`skipped:<reason>` for a policy, transport, or admission refusal. The startup
+pre-claim is handed to the adapter guard right after `handle_message` returns;
+otherwise the spawned task bounces the resume off its own sentinel into the
+pending slot and the real turn runs in a successor task. Both the resume and
+restored-follow-up observers follow `_session_tasks` successors until the event
+reports `_agent_turn_succeeded`; a real failed turn is `skipped:turn-failed` and
+gets no interruption note (it reported its own failure). Cover this with
+`tests/gateway/test_restart_resume_real_adapter.py`, which drives the real
+Telegram adapter, not planted `_session_tasks`. A merely
+scheduled task, unaccepted internal event, pending note token, or `sending:`
+claim is not proof of successful recovery. A dispatch failure releases the
+pre-claim and tries the existing bounded note path; it never replays user work.
+A `sending:` note is not retried, and ordinary eligible turn recovery remains
+available. If both breaker and ambiguous note block recovery, the outcome is
+explicitly `skipped:restart-loop-breaker:ambiguous-note`, not a fabricated
+`noted`/`resumed` result. Network unavailability and authorization revocation also
+remain real constraints; this unit does not promise unconditional visibility.
+
+`reason=shutdown_follow_up` is a future turn even if the predecessor's resume
+marker has been cleared. At read time, including for old spools, it uses the
+existing drain-deferred admission path instead of becoming a user row with no
+turn. A restored prompt owns recovery ahead of a synthetic empty resume. Its
+spool survives an admission refusal, and survives adapter admission too:
+`handle_message` returns once the session task exists, before the turn leases
+the session or persists anything, so the spool is still the only copy. It is
+retired at the turn's durable start, when the agent's turn-start flush writes
+the user row carrying the inbound `platform_message_id`
+(`_retire_spool_once_input_durable`), or when the turn reports a result. From
+that point a crash or restart falls to the turn's own `resume_pending` marker
+instead of replaying the whole prompt, because the prompt may already have
+caused tool effects. A boot that finds a follow-up spool whose input row is
+already durable (crash between the row and retirement) drops it
+(`input_already_durable`). A failed real turn is
+`skipped:turn-failed` with no recovery notice, since its spool is gone and it
+reported its own failure.
+
+Restored follow-ups use the same per-session outcome record. Refusal/no-task
+outcomes retain the spool, attempt a bounded platform notice, and log
+`skipped:<reason>:noted` or `skipped:<reason>:note-unavailable`; adapter admission
+without a real turn is explicitly `skipped:accepted-without-turn:<note-status>`.
+Run `tests/gateway/test_shutdown_followup_restart.py` as well as the recovery
+corpus. The queue drain now lives beside those decisions in
+`gateway/run_restart_recovery.py`.
+
+Run `tests/gateway/test_restart_recovery_outcomes.py` and
+`tests/gateway/test_restart_resume_admission_identity.py` in addition to the corpus
+below. Planned update classification is separately owned by `fix/breaker-update-planned`
+(PR #557); this unit does not duplicate it. Per-session admission identity was
+already present at the base. No new dependency, configuration, or persistence
+schema is introduced.
+
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py

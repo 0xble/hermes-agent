@@ -12,9 +12,10 @@ from unittest.mock import MagicMock, patch
 from tools.process_registry import ProcessRegistry, ProcessSession, _CHECKPOINT_FIELDS
 
 
-def _make_session(sid="proc_test123", task_id="t1", persist=False) -> ProcessSession:
+def _make_session(sid="proc_test123", task_id="t1", persist=False, survive=False) -> ProcessSession:
     s = ProcessSession(id=sid, command="sleep 60", task_id=task_id, started_at=0.0)
     s.persist_on_release = persist
+    s.survive_restart = survive
     return s
 
 
@@ -96,6 +97,33 @@ def test_agent_close_owned_loop_skips_persisted_sessions(registry, monkeypatch):
     assert persisted.exited is False
 
 
+def test_agent_close_owned_loop_skips_survive_restart_sessions(registry, monkeypatch):
+    """agent.close() must not kill a restart-surviving process before the shutdown sweep."""
+    from types import SimpleNamespace
+
+    from agent.client_lifecycle import ClientLifecycleMixin
+    import tools.process_registry as registry_module
+
+    survivor = _make_session(sid="proc_survivor", task_id="turn-1", survive=True)
+    volatile = _make_session(sid="proc_volatile", task_id="turn-1")
+    registry._running[survivor.id] = survivor
+    registry._running[volatile.id] = volatile
+    calls = _fake_kill_collector(registry)
+
+    agent = SimpleNamespace(_process_owner_task_ids=("turn-1",))
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    import run_agent as ra
+    monkeypatch.setattr(ra, "cleanup_vm", lambda *a, **k: None)
+    monkeypatch.setattr(ra, "cleanup_browser", lambda *a, **k: None)
+    import tools.computer_use.tool as cu
+    monkeypatch.setattr(cu, "release_computer_use_session", lambda *a, **k: None)
+
+    ClientLifecycleMixin._close_task_resources(agent, "turn-1")
+
+    assert [c[0] for c in calls] == ["proc_volatile"]
+    assert survivor.exited is False
+
+
 def test_explicit_operator_stop_still_reaches_persisted_sessions(registry):
     """persist_on_release is an agent-lifecycle opt-out, never a protection
     against being stopped on purpose: a caller-driven source still kills."""
@@ -152,3 +180,43 @@ def test_checkpoint_carries_persist_on_release():
     """A crash-recovery checkpoint must carry the flag, or a persisted job
     resurrects as killable by the next session's release sweep (#41225)."""
     assert "persist_on_release" in _CHECKPOINT_FIELDS
+
+
+@pytest.mark.platforms("posix")
+def test_persist_on_release_local_spawn_is_file_backed_and_readable_after_readoption(tmp_path, monkeypatch):
+    """A persisted job must not write into a pipe owned by the gateway that spawned it:
+    once that gateway exits the next write raises BrokenPipeError and the re-adopted job
+    dies. Its stdout/stderr go to a file-backed log that a successor can still read."""
+    import json
+    import tools.process_registry as registry_module
+
+    home = tmp_path / "home"
+    monkeypatch.setattr(registry_module, "get_hermes_home", lambda: home)
+    gate = tmp_path / "release"
+    producer = ProcessRegistry()
+    session = producer.spawn_local(
+        f"while [ ! -e '{gate}' ]; do sleep 0.02; done; printf 'PERSISTED_OK\\n'; exit 3",
+        cwd=str(tmp_path), task_id="task", session_key="session", persist_on_release=True,
+    )
+    try:
+        assert session.persist_on_release is True
+        assert session.process.stdout is None, "persisted job must not hold a gateway-owned pipe"
+        assert session.log_path and session.exit_path
+        assert session.log_path.startswith(str(home / "process-runs" / session.id))
+        session.notify_on_complete = True
+        producer._write_checkpoint()
+        entry = json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))[0]
+        assert entry["log_path"] == session.log_path
+        # The producing gateway goes away without reaping the job.
+        producer.stop_survivor_pollers()
+
+        successor = ProcessRegistry()
+        assert successor.recover_from_checkpoint() == 1
+        gate.touch()
+        adopted = successor.get(session.id)
+        assert adopted._completion_event.wait(10)
+        assert adopted.exit_code == 3
+        assert "PERSISTED_OK" in successor.read_log(session.id)["output"]
+    finally:
+        gate.touch()
+        session.process.wait(timeout=10)

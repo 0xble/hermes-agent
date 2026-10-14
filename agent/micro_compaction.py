@@ -228,7 +228,11 @@ class MicroCompactionMixin:
         # The history this pass rewrites, and the store's watermark, before the slow summary call: the commit
         # keeps what another surface or a concurrent write added instead of archiving it unseen. A watermark
         # the store could not answer for leaves the commit unbounded, so the pass does not run at all.
-        _held = list(messages)
+        # Snapshot each dict, not just the list: defrag and the user-turn merge rewrite live dicts in place,
+        # and the commit's stale-generation check must compare the store against the history as LOADED.
+        # Aliased, a defragged marker matches neither its row (gateway history carries no row ids) nor its
+        # loaded content, and every defrag of the current generation is refused as stale.
+        _held = [dict(m) if isinstance(m, dict) else m for m in messages]
         _skip, _start_watermark = self._micro_start_watermark(_held)
 
         def _telemetry(outcome: str, result: List[Dict[str, Any]], **extra: Any) -> None:
@@ -427,7 +431,8 @@ class MicroCompactionMixin:
                 covered_ids, unresolved_held = coverage_for_commit(session_db, session_id, held)
             session_db.archive_and_compact(
                 session_id, compacted_messages, carried_messages=carried_messages, watermark=watermark,
-                covered_ids=covered_ids, unresolved_held=unresolved_held)
+                covered_ids=covered_ids, unresolved_held=unresolved_held,
+                **({"held_messages": held} if held is not None else {}))
             # Shared post-commit stamp site with batch commit and proactive prune.
             # See #98450.
             _cc().stamp_db_persisted_markers(compacted_messages)

@@ -524,3 +524,43 @@ async def test_channel_override_turns_keep_one_cached_agent_and_the_pin(
     assert entry[0].model == expected_model
     assert _TurnAgent.instances == 1, f"agent rebuilt {_TurnAgent.instances - 1}x across 3 turns"
     assert runner._peek_session_state(KEY).conversation.ephemeral_pin is not None, "context pin cleared"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned", ["sess-wiring", "requester-before-new"], ids=("current", "rebound"))
+async def test_strict_queued_followup_runs_only_in_its_pinned_session(monkeypatch, pinned):
+    """A strict internal event admitted before /new or /resume rebound its key must never reach
+    ``_run_agent`` under another session id from the FIFO follow-up drain."""
+    runner = _make_runner(monkeypatch)
+    calls: list[dict] = []
+    _capture(runner, calls)
+    runner._run_agent_deliver_first_response = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="requester outcome")
+    runner._session_key_for_source = lambda source: KEY
+    runner.session_store.lookup_by_session_key.return_value = runner.session_store.get_or_create_session.return_value
+
+    source = _wake_source()
+    adapter = MagicMock()
+    adapter._active_sessions = {}
+    pending_event = MessageEvent(
+        text="requester outcome", source=source, internal=True, allow_gateway_control=False,
+        metadata={
+            "hermes_plugin_id": "session-controls", "hermes_plugin_injection": True,
+            "gateway_session_key": KEY, "gateway_session_id": pinned, "gateway_session_strict": True,
+        },
+    )
+    turn_ctx = TurnContext(
+        source=source, context_prompt="ctx", channel_prompt=None, session_key=KEY,
+        session_id="sess-wiring", run_generation=1, history=[],
+    )
+    result = {"final_response": "done", "messages": []}
+
+    await runner._run_agent_queued_followup(
+        turn_ctx, adapter, "requester outcome", pending_event, "done", result, None
+    )
+
+    if pinned == "sess-wiring":
+        assert [call["session_id"] for call in calls] == ["sess-wiring"]
+    else:
+        assert calls == []

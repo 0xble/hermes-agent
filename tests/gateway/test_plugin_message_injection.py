@@ -150,9 +150,31 @@ async def test_plugin_context_routes_through_live_gateway_to_existing_session(
         assert manager.has_gateway_message_injector is False
 
 
+def _admitting_adapter(accept: bool = True):
+    async def handle(event):
+        event._gateway_accepted = accept
+
+    return SimpleNamespace(handle_message=AsyncMock(side_effect=handle))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_reports_false_when_adapter_does_not_admit():
+    """A busy adapter can refuse the event without raising: callers must not see a delivery."""
+    adapter = _admitting_adapter(accept=False)
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key, content="outcome", plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_dispatch_uses_stored_origin_and_adapter_message_path():
-    adapter = SimpleNamespace(handle_message=AsyncMock())
+    adapter = _admitting_adapter()
     entry = _entry()
     runner = _runner(entry, adapter)
 
@@ -182,6 +204,44 @@ async def test_dispatch_uses_stored_origin_and_adapter_message_path():
         "gateway_session_id": entry.session_id,
         "gateway_session_strict": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_rebound_session_when_identity_is_pinned():
+    """A requester outcome must not follow a session key after /new or /resume rebinds it."""
+    adapter = _admitting_adapter()
+    old_entry = _entry()
+    rebound = _entry()
+    rebound.session_id = "new-session-after-reset"
+    runner = _runner(rebound, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key,
+        expected_session_id=old_entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_accepts_matching_pinned_session_identity():
+    adapter = _admitting_adapter()
+    entry = _entry()
+    runner = _runner(entry, adapter)
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=entry.session_key,
+        expected_session_id=entry.session_id,
+        content="outcome",
+        plugin_id="session-controls",
+    )
+
+    assert accepted is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.metadata["gateway_session_id"] == entry.session_id
 
 
 @pytest.mark.asyncio
@@ -457,3 +517,35 @@ def test_install_and_clear_gateway_injector_preserves_newer_owner():
     assert manager.has_gateway_message_injector is True
     assert manager.inject_gateway_message(value="kept") is True
     newer_injector.assert_called_once_with(value="kept")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", [True, False], ids=("busy", "idle"))
+async def test_rebound_requester_outcome_is_refused_at_admission(busy):
+    """/new or /resume rebinds the requester key between the injector's lookup and busy admission:
+    the strict outcome must be dropped (not admitted, not queued into the new conversation)."""
+    adapter = _RoutingAdapter()
+    adapter.set_message_handler(AsyncMock())
+    old_entry = _entry()
+    rebound = _entry()
+    rebound.session_id = "new-session"
+    runner = _runner(old_entry, adapter)
+    runner._async_session_store.lookup_by_session_key = AsyncMock(side_effect=[old_entry, rebound, rebound])
+    runner.config = GatewayConfig()
+    adapter.gateway_runner = runner
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    session_key = build_session_key(old_entry.origin)
+    assert session_key == old_entry.session_key
+    if busy:
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+    accepted = await runner._dispatch_plugin_message_injection(
+        session_key=old_entry.session_key, expected_session_id=old_entry.session_id,
+        content="requester outcome", plugin_id="session-controls",
+    )
+
+    assert accepted is False
+    assert session_key not in adapter._pending_messages
+    assert not runner._overflow_queue(session_key)
+    assert adapter._session_tasks.get(session_key) is None
+    adapter._message_handler.assert_not_awaited()
