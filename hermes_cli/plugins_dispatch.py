@@ -84,7 +84,15 @@ def _delivery_manager():
                 or (worker is not None and worker.is_alive())):
             raise PluginDiscoveryIncomplete("Plugin discovery incomplete; use async hook delivery to await discovery off-loop")
         return manager
-    plugins._join_background_discovery(timeout=None)
+    worker = plugins._background_discovery_thread
+    if worker is not None and worker.is_alive():
+        # An in-flight startup sweep is the availability boundary (per-plugin load deadlines
+        # bound it): wait it out instead of serving a partial registry after a short join.
+        plugins._join_background_discovery(timeout=None)
+    else:
+        # A finished sweep's strict completeness check would refuse a fresh scoped manager,
+        # a sibling reload or a retry after a transient failure; the lazy recovery below owns those.
+        plugins._join_background_discovery()
     try:
         if not getattr(manager, "_discovered", True):
             manager.discover_and_load()
