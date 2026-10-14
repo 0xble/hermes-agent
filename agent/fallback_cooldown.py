@@ -28,6 +28,11 @@ _NONINTERACTIVE_TRANSIENT_REASONS = frozenset({
 })
 
 
+def _monotonic() -> float:
+    """Window clock; a module seam so tests can drive a fake clock without patching ``time``."""
+    return time.monotonic()
+
+
 def noninteractive_transient_retry_window_seconds(agent) -> float:
     """Return the configured same-provider retry window for unattended sessions.
 
@@ -72,35 +77,104 @@ def is_noninteractive_transient(classified, error_message: str = "") -> bool:
     return reason == FailoverReason.auth and "auth_unavailable" in str(error_message or "").lower()
 
 
-def hold_noninteractive_transient_retry(agent, classified, *, error_message: str = "", now=None) -> bool:
-    """Record an outage start and return whether fallback must wait for this provider.
+def _effective_window_seconds(agent) -> float:
+    """The configured window, or 0 when a delegate route owner opted out.
 
-    The timestamp is keyed to the active route so a successful fallback switch starts a fresh
-    window.  Callers reset it after a successful response; the helper itself never sleeps — the
-    existing retry/backoff machinery remains the sole pacing mechanism.
+    A route owner that sets ``max_retry_wait_seconds`` (``agent._max_retry_wait_s``) owns this
+    child's retry timing: it fails the attempt fast so the owner can move to its own next route.
+    Holding the child on the same provider would defeat that, so the window does not apply.
     """
-    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
-        return False
-    window = noninteractive_transient_retry_window_seconds(agent)
-    if window <= 0:
-        return False
-    route = (
+    if getattr(agent, "_max_retry_wait_s", None) is not None:
+        return 0.0
+    return noninteractive_transient_retry_window_seconds(agent)
+
+
+def _active_route(agent) -> tuple:
+    return (
         str(getattr(agent, "provider", "") or ""),
         str(getattr(agent, "model", "") or ""),
         str(getattr(agent, "base_url", "") or ""),
     )
-    now = time.monotonic() if now is None else float(now)
+
+
+def hold_noninteractive_transient_retry(
+    agent, classified, *, error_message: str = "", now=None, declared_wait=None,
+) -> bool:
+    """Record an outage start and return whether fallback must wait for this provider.
+
+    The timestamp is keyed to the active route so a successful fallback switch starts a fresh
+    window.  It is cleared after a successful response and at every turn start, so a failed
+    turn's expired outage cannot cancel the next turn's window.  Call this once per API error
+    and reuse the result: the helper itself never sleeps.
+
+    ``declared_wait`` is the provider's own cooldown (Retry-After / reset time) in seconds. When
+    it outlasts what is left of the window the route cannot recover in time, so there is no hold.
+    """
+    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
+        return False
+    window = _effective_window_seconds(agent)
+    if window <= 0:
+        return False
+    route = _active_route(agent)
+    now = _monotonic() if now is None else float(now)
     prior_route = getattr(agent, "_noninteractive_transient_retry_route", None)
     started = getattr(agent, "_noninteractive_transient_retry_started_at", None)
-    if prior_route != route or not isinstance(started, (int, float)):
+    fresh = prior_route != route or not isinstance(started, (int, float)) or started > now
+    remaining = window if fresh else window - (now - float(started or 0.0))
+    if isinstance(declared_wait, (int, float)) and declared_wait >= remaining:
+        return False
+    if fresh:
         agent._noninteractive_transient_retry_route = route
         agent._noninteractive_transient_retry_started_at = now
         return True
-    return now - started < window
+    return remaining > 0
+
+
+def provider_declared_wait_seconds(api_error, error_context=None) -> float | None:
+    """The provider's own cooldown for this error in seconds (Retry-After, else reset time)."""
+    from agent.retry_utils import provider_retry_after_seconds
+    wait = provider_retry_after_seconds(api_error)
+    if wait is not None:
+        return float(wait)
+    reset = _provider_reset_epoch(error_context.get("reset_at")) if isinstance(error_context, dict) else None
+    return None if reset is None else max(0.0, reset - time.time())
+
+
+def _open_window_start(agent):
+    started = getattr(agent, "_noninteractive_transient_retry_started_at", None)
+    if not isinstance(started, (int, float)):
+        return None
+    if getattr(agent, "_noninteractive_transient_retry_route", None) != _active_route(agent):
+        return None
+    return float(started)
+
+
+def noninteractive_transient_retry_remaining(agent, *, now=None) -> float:
+    """Seconds left in the active route's window (0 when none is open)."""
+    started = _open_window_start(agent)
+    if started is None:
+        return 0.0
+    now = _monotonic() if now is None else float(now)
+    return max(0.0, _effective_window_seconds(agent) - (now - started))
+
+
+def noninteractive_transient_window_spent(agent, classified, *, error_message: str = "", now=None) -> bool:
+    """True when this route already used its whole same-provider window on this outage.
+
+    The exhaustion path then goes straight to the fallback chain: the route has had its
+    recovery time, so the one-shot primary transport rebuild would only restart the budget.
+    """
+    if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
+        return False
+    started = _open_window_start(agent)
+    if started is None:
+        return False
+    now = _monotonic() if now is None else float(now)
+    return now - started >= _effective_window_seconds(agent)
 
 
 def clear_noninteractive_transient_retry(agent) -> None:
-    """Forget a provider outage after a successful response or a route switch."""
+    """Forget a provider outage after a successful response or at turn start."""
     agent._noninteractive_transient_retry_route = None
     agent._noninteractive_transient_retry_started_at = None
 
