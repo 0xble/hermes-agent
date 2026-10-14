@@ -400,17 +400,39 @@ class StreamFallbackMixin:
 
     # Fresh send carried exactly ``text`` — record it so the gateway can reconcile the flag against the
     # completed response (#71643/#95382 content-vs-flag contract).
-    async def _suppress_silence_marker(self) -> None:
+    async def _suppress_silence_marker(self, *, terminal: bool = True) -> None:
         """Retract any streamed preview when the final reply is a bare silence marker.  Flags
         stay False so the gateway's whole-response filter owns what goes out next: "" for a
-        machinery turn, the visible fallback for a human one."""
+        machinery turn, the visible fallback for a human one.  ``terminal=False`` is a
+        segment-break marker: later segments still append to the same cumulative stream."""
+        # A cumulative transport's earlier tool preamble is not the rejected final segment. Keep
+        # it in the same append-only stream and close with those bytes, never an empty replacement.
+        cumulative = self._cumulative_transport()
+        prefix = self._accumulated[:self._segment_start] if cumulative else ""
+        if cumulative and not terminal:
+            # Remove the held-back marker in place; the live stream stays open for later segments.
+            self._accumulated = self._stream_ledger = prefix
+            self._clear_turn_final_flags()
+            return
+        if prefix:
+            self._accumulated = self._stream_ledger = prefix
+            if self._native_stream_opened:
+                # This is a transport close, not delivery of the rejected turn-final. Native
+                # segment flushes deliberately do not finalize, so use the boundary owner.
+                await self._finalize_boundary_stream("Silence-marker")
+                self._close_native_state()
+            else:
+                await self._send_or_edit(prefix, finalize=True, is_turn_final=False)
+            self._clear_turn_final_flags()
+            return
         # A native-stream bubble isn't a deletable message — close an open one
         # (e.g. from an eager re-seed) with an empty finalize so it doesn't hang.
         if self._native_stream_opened:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
-        await self._delete_previews(self._stale_preview_ids(), label="Silence-marker")
-        self._preview_message_ids = set()
+        stale_ids = self._stale_preview_ids(segment_only=True)
+        await self._delete_previews(stale_ids, label="Silence-marker")
+        self._preview_message_ids.difference_update(stale_ids)
         self._message_id = None
         self._accumulated = self._stream_ledger = self._last_sent_text = ""
         self._already_sent = False

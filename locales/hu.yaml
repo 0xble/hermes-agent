@@ -329,6 +329,7 @@ gateway:
     title_empty_untitled: "\n⚠️ Tisztítás után a cím üres — a munkamenet cím nélkül indult."
     tip: "\n✦ Tipp: {tip}"
   restart:
+    followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
     in_progress: "⏳ Az átjáró újraindítása már folyamatban van..."
     restarting: "♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal."
   resume:

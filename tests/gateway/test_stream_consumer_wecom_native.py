@@ -848,6 +848,37 @@ class TestClarifyEagerReseed:
         assert consumer.final_response_sent is False
         assert consumer._native_stream_opened is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", ["NO_REPLY", "[SILENT]"])
+    async def test_marker_after_segment_break_and_clarify_never_streams(self, marker):
+        """A tool boundary moves the marker-check offset to the end of the cumulative
+        preamble. The clarify boundary then clears the buffer, so the offset must reset
+        with it, or the next bare marker slices to nothing and streams as a native frame."""
+        adapter = _make_native_streaming_adapter()
+        cfg = StreamConsumerConfig(
+            chat_type="dm", cursor="", edit_interval=0.01, buffer_threshold=5,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
+        task = asyncio.create_task(consumer.run())
+        await self._drain(consumer, 0.03)
+
+        consumer.on_delta("Checking the brief.")
+        await self._drain(consumer, 0.05)
+        consumer.on_segment_break()
+        await self._drain(consumer, 0.05)
+        boundary = consumer.close_for_approval_prompt(reason="Clarify", reopen=True)
+        fut = boundary[0] if isinstance(boundary, tuple) else boundary
+        await asyncio.wait_for(fut, timeout=1.0)
+        assert consumer._segment_start == 0
+
+        consumer.on_delta(marker)
+        await self._drain(consumer, 0.1)
+        consumer.finish()
+        await task
+
+        assert not any(marker in f["text"] for f in adapter.frames), adapter.frames
+        assert consumer.final_content_delivered is False
+
     # === ROUND 2, POINT 1: 降级后 post-answer 内容落地为单气泡（补强 Point 5）===
 
     @pytest.mark.asyncio
