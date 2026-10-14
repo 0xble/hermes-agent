@@ -47,6 +47,27 @@ class RestartRecoveryMixin:
     def _interruption_note_delivered(self, session_key: str) -> bool:
         return session_key in getattr(self, "_s2_note_delivered_keys", ())
 
+    def _release_startup_preclaim(self, session_key: str) -> None:
+        """Drop the boot pre-claim sentinel; a real agent or a successor's claim is left alone."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(session_key)
+        if state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL:
+            self._release_running_agent_state(session_key)
+
+    @staticmethod
+    async def _follow_startup_resume_turn(adapter, event, session_key: str, task, *, on_task_done=None) -> None:
+        """Await the task that runs *event*. A busy or bounced event is parked and run by a
+        successor session task, so follow ``_session_tasks`` until the event reports a result."""
+        seen = set()
+        while isinstance(task, asyncio.Task) and task not in seen:
+            seen.add(task)
+            await asyncio.shield(task)
+            if on_task_done is not None:
+                on_task_done(task)
+            if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
+                return
+            task = getattr(adapter, "_session_tasks", {}).get(session_key)
+
     async def _finish_restart_recovery(self, session_key: str, reason: str) -> None:
         """A failed dispatch must not be mistaken for a completed turn; never replay work here."""
         if not self._interruption_note_delivered(session_key):
@@ -59,8 +80,6 @@ class RestartRecoveryMixin:
 
     async def _run_startup_resume_event(self, adapter, event: MessageEvent, session_key: str) -> None:
         """Wait for the admitted turn, not merely the adapter's quick task-spawn return."""
-        from gateway.run import _AGENT_PENDING_SENTINEL
-
         from gateway.run_startup import _STARTUP_RESUME_CONCURRENCY, _STARTUP_RESUME_OPENING_S
         slots = getattr(self, "_startup_resume_slots", None)
         if slots is None:
@@ -72,22 +91,22 @@ class RestartRecoveryMixin:
                 await adapter.handle_message(event)
                 session_tasks = getattr(adapter, "_session_tasks", {})
                 task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+                # Hand the pre-claim to the adapter guard before its task reaches the runner: a
+                # held sentinel bounces the resume into the pending slot, and every drain of it
+                # would bounce again until this coroutine released it.
+                self._release_startup_preclaim(session_key)
                 if task is not None:
                     await asyncio.wait({task}, timeout=_STARTUP_RESUME_OPENING_S)
-            if task is not None:
-                await asyncio.shield(task)
+            # A busy or bounced event still runs, later, in a successor task: follow it.
+            await self._follow_startup_resume_turn(adapter, event, session_key, task)
             # An adapter may decline admission without raising (no handler, wrong identity,
             # plugin veto). Inline adapters can demonstrate completion by clearing the marker.
             store = getattr(self, "session_store", None)
             entry = getattr(store, "_entries", {}).get(session_key)
             completed_inline = entry is not None and not entry.resume_pending
-            turn_completed = getattr(event, "_agent_turn_succeeded", None) is True
-            if not turn_completed:
-                turn_completed = completed_inline
-            if turn_completed:
-                outcome = "resumed"
-            else:
-                outcome = "skipped:not-admitted"
+            succeeded = getattr(event, "_agent_turn_succeeded", None)
+            outcome = "resumed" if succeeded is True or completed_inline else (
+                "skipped:turn-failed" if succeeded is False else "skipped:not-admitted")
         except asyncio.CancelledError:
             outcome = "skipped:cancelled"
             raise
@@ -95,10 +114,10 @@ class RestartRecoveryMixin:
             logger.warning("Startup auto-resume failed for %s", session_key, exc_info=True)
             raise
         finally:
-            state = self._peek_session_state(session_key)
-            if state is not None and state.turn.agent is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(session_key)
-            if outcome == "resumed":
+            self._release_startup_preclaim(session_key)
+            getattr(self, "_startup_resume_inflight", set()).discard(session_key)
+            if outcome in ("resumed", "skipped:turn-failed"):
+                # The turn ran and replied (or reported its failure) itself; no interruption note.
                 self._release_restart_followup_key(session_key)
                 self._record_restart_resume_outcome(session_key, outcome)
             elif outcome == "skipped:cancelled":
@@ -138,14 +157,9 @@ class RestartRecoveryMixin:
         reason = "not-admitted" if event._gateway_accepted is not True else "accepted-without-turn"
         try:
             self._retire_recovered_followup_spool(event, task=task)
-            seen = set()
-            while isinstance(task, asyncio.Task) and task not in seen:
-                seen.add(task)
-                await asyncio.shield(task)
-                self._retire_recovered_followup_spool(event, task=task)
-                if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
-                    break
-                task = getattr(adapter, "_session_tasks", {}).get(session_key)
+            await self._follow_startup_resume_turn(
+                adapter, event, session_key, task,
+                on_task_done=lambda done: self._retire_recovered_followup_spool(event, task=done))
             succeeded = getattr(event, "_agent_turn_succeeded", None)
             if isinstance(succeeded, bool):
                 # A failed real turn may have tool effects; never replay it just because it did
@@ -316,6 +330,10 @@ class RestartRecoveryMixin:
                 # The restored prompt owns this recovery. Do not admit an empty synthetic turn
                 # against it or log the predecessor's decision before its real follow-up finishes.
                 continue
+            if entry.session_key in getattr(self, "_startup_resume_inflight", ()):
+                # Its resume already runs; the pre-claim was handed to the adapter guard, so the
+                # running-session check below cannot see it.
+                continue
             if platform is not None and getattr(entry.origin, "platform", None) != platform:
                 continue
             if not allow_resume:
@@ -331,6 +349,10 @@ class RestartRecoveryMixin:
                 self._record_restart_resume_outcome(entry.session_key, outcome)
                 continue
             adapter, source = ready
+            inflight = getattr(self, "_startup_resume_inflight", None)
+            if inflight is None:
+                inflight = self._startup_resume_inflight = set()
+            inflight.add(entry.session_key)
             state = self._session_state(entry.session_key)
             state.turn.agent = _AGENT_PENDING_SENTINEL
             state.turn.started_ts = time.time()

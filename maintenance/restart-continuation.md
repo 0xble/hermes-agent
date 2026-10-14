@@ -83,9 +83,17 @@ including the pending-follow-up spool path. Do not bypass the breaker when note
 visibility is ambiguous: that can recreate the model-driven restart loop.
 
 Each candidate emits one `Restart recovery outcome: session=<key> outcome=<value>`
-record per boot. Values are `resumed` after the admitted adapter task completes,
+record per boot. Values are `resumed` after the admitted turn completes,
 `noted` for an acknowledged/persisted visible interruption note, or
-`skipped:<reason>` for a policy, transport, or admission refusal. A merely
+`skipped:<reason>` for a policy, transport, or admission refusal. The startup
+pre-claim is handed to the adapter guard right after `handle_message` returns;
+otherwise the spawned task bounces the resume off its own sentinel into the
+pending slot and the real turn runs in a successor task. Both the resume and
+restored-follow-up observers follow `_session_tasks` successors until the event
+reports `_agent_turn_succeeded`; a real failed turn is `skipped:turn-failed` and
+gets no interruption note (it reported its own failure). Cover this with
+`tests/gateway/test_restart_resume_real_adapter.py`, which drives the real
+Telegram adapter, not planted `_session_tasks`. A merely
 scheduled task, unaccepted internal event, pending note token, or `sending:`
 claim is not proof of successful recovery. A dispatch failure releases the
 pre-claim and tries the existing bounded note path; it never replays user work.
