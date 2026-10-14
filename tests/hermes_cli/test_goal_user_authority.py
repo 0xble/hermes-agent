@@ -424,6 +424,26 @@ def test_merged_refusal_row_ends_older_typed_approval(hermes_home):
     assert session_controls.check_user_quote(sid, "send the client email now") == "user_quote_not_found"
 
 
+@pytest.mark.parametrize("refusal", [
+    "No wait, do not send the client email",
+    "🚨 No wait, do not send",
+    "🛑 stop",
+])
+def test_symbol_led_refusal_merged_before_relay_is_a_barrier(hermes_home, refusal):
+    sid = "symbol-refusal"
+    db = _db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("send only with approval")
+    db.append_message(sid, "user", "Yes, send the client email now")
+    merged = f"{refusal}\n🔄 Review ready\nbody\nFrom: Some Agent\n[relay from=hermes:default/other receipt=r1]"
+    db.append_message(sid, "user", merged)
+
+    assert goals._is_authority_barrier({"content": merged, "display_kind": ""}) is True
+    assert "Yes, send the client email now" not in goals._render_user_messages_block(sid, state.created_at)
+    from hermes_cli import session_controls
+    assert session_controls.check_user_quote(sid, "send the client email now") == "user_quote_not_found"
+
+
 def test_typed_message_after_merged_row_still_counts(hermes_home):
     sid = "merged-then-typed"
     db = _db(sid)
@@ -443,6 +463,8 @@ def test_typed_message_after_merged_row_still_counts(hermes_home):
 
 @pytest.mark.parametrize("content", [
     "🔄 Review ready\nbody\nFrom: Some Agent\n[relay from=hermes:default/other receipt=r1]",
+    "🔄 Review ready\n🚨 Stop the deploy is a body line well past title length\nFrom: Some Agent\n"
+    "[relay from=hermes:default/other receipt=r1]",
     "[relay from=hermes:default/other receipt=r1]\nlegacy layout body",
 ])
 def test_clean_relay_delivery_is_not_a_barrier(hermes_home, content):

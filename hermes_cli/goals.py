@@ -2209,6 +2209,8 @@ _ANY_RELAY_HEADER_RE = re.compile(
 )
 _USER_MESSAGES_MAX = 20
 _USER_MESSAGES_MAX_CHARS = 8000
+# Relay titles are short (relay caps them near 28 characters); a longer symbol-led line is body text.
+_RELAY_TITLE_MAX_CHARS = 40
 
 
 def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
@@ -2489,11 +2491,18 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
     return JUDGE_USER_MESSAGES_BLOCK_TEMPLATE.format(user_message_lines="\n".join(kept)) if kept else ""
 
 
+def _is_relay_title(line: str) -> bool:
+    """A relay title line: symbol-led (relay titles open with an emoji) and title-length."""
+    line = line.strip()
+    return bool(line) and len(line) <= _RELAY_TITLE_MAX_CHARS and unicodedata.category(line[0]).startswith("S")
+
+
 def _is_clean_relay_shape(text: str) -> bool:
     """Whether ``text`` is one relay delivery and nothing else: a single header on the first line
-    (legacy layout), or the current layout of a symbol-led title line (relay titles open with an
-    emoji), body, ``From:`` signature and the header as the last line. Typed text merged before
-    or after a relay breaks either shape."""
+    (legacy layout), or the current layout of one title line, body, ``From:`` signature and the
+    header as the last line. Typed text merged after a relay leaves the header off the edge, and
+    typed text merged before one either replaces the title on the first line or leaves the relay's
+    own title in the middle, so both break the shape."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     headers = [i for i, line in enumerate(lines) if _ANY_RELAY_HEADER_RE.fullmatch(line)]
     if len(headers) != 1:
@@ -2501,8 +2510,9 @@ def _is_clean_relay_shape(text: str) -> bool:
     at = headers[0]
     if at == 0:
         return True
-    return (at == len(lines) - 1 and at >= 2 and lines[at - 1].startswith("From: ")
-            and unicodedata.category(lines[0][0]).startswith("S"))
+    if not (at == len(lines) - 1 and at >= 2 and lines[at - 1].startswith("From: ") and _is_relay_title(lines[0])):
+        return False
+    return not any(_is_relay_title(line) for line in lines[1:at - 1])
 
 
 def _is_authority_barrier(row: Dict[str, Any]) -> bool:
