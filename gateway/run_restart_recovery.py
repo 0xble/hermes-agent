@@ -379,6 +379,11 @@ class RestartRecoveryMixin:
             if resume_marker:
                 # Admission identity names the interruption, not the original Telegram reply anchor.
                 event._outbox_admission_id = f"resume:{resume_marker}"
+            logger.warning(
+                "startup resume event constructed: session=%s marker=%r admission=%r internal=%r",
+                entry.session_key, resume_marker, getattr(event, "_outbox_admission_id", None),
+                getattr(event, "internal", None),
+            )
             task = self._retain_background_task(
                 asyncio.create_task(self._run_startup_resume_event(adapter, event, entry.session_key))
             )

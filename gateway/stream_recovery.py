@@ -92,6 +92,10 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         return
     event = _turn_event(runner, ctx)
     if event is None or not getattr(event, "internal", False):
+        logger.warning(
+            "stream recovery gate rejected before event identity: policy=%r session=%s event=%r internal=%r",
+            policy, ctx.session_key, event, getattr(event, "internal", None),
+        )
         return
     store = runner.session_store
     with store._lock:
@@ -101,6 +105,11 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         if not token or not getattr(entry, "resume_pending", False) or entry.session_id != ctx.session_id:
             return
     if getattr(event, "_outbox_admission_id", None) != resume_admission_id(token):
+        logger.warning(
+            "stream recovery gate rejected admission: policy=%r session=%s token=%r event_admission=%r expected=%r",
+            policy, ctx.session_key, token, getattr(event, "_outbox_admission_id", None),
+            resume_admission_id(token),
+        )
         return
     preview = load_preview(ctx.session_key, ctx.session_id, token)
     if not preview:
