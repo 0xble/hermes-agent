@@ -238,6 +238,17 @@ def test_reply_revival_does_not_record_override(hermes_home, monkeypatch):
     assert not any("resumed over block" in str(r.get("reason")) for r in mgr.state.revisions)
 
 
+def test_rewound_user_approval_is_not_authority(hermes_home):
+    sid = "rewound-approval"
+    db = _db(sid)
+    mgr = GoalManager(sid)
+    state = mgr.set("send only with approval")
+    row = db.append_message(sid, "user", "Yes, approved")
+    db._execute_write(lambda conn: conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (row,)))
+
+    assert goals._render_user_messages_block(sid, state.created_at) == ""
+
+
 def test_unbound_legacy_receipt_imports_nothing(hermes_home):
     sender, target, target_db, _mgr, state = _forge_setup()
     target_db.append_message(target, "user", _relay(sender, receipt="legacy"))

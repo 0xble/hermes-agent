@@ -2363,7 +2363,8 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
         before_id = 0
         typed: List[Dict[str, Any]] = []
         while len(typed) < wanted:
-            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "before_id": before_id}
+            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "before_id": before_id,
+                                    "current_only": True}
             if until > 0:
                 kwargs["until"] = until
             page = reader(session_id, "user", **kwargs)
@@ -2386,7 +2387,7 @@ def _relay_rows(db: Any, session_id: str, since: float, *, limit: int = 500) -> 
     while len(relays) < wanted:
         try:
             page = db.messages_by_role(session_id, "user", since=since, limit=page_size,
-                                       before_id=before_id)
+                                       before_id=before_id, current_only=True)
         except Exception as exc:
             logger.debug("goal judge: relay row read failed: %s", exc)
             break
