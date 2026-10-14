@@ -66,7 +66,7 @@ def launch_native_update(
     A claimed marker is still an active admission marker: it is the pending file
     after the updater atomically takes ownership.  Do not overwrite its reason.
 
-    With a positive ``coalesce_window`` (seconds), a request that arrives while an install is
+    With a positive ``coalesce_window`` (seconds; None or 0 keeps the plain refusal), a request that arrives while an install is
     in flight, or within the window after the last launch, is deferred into
     ``.update_deferred.json`` (latest target wins) instead of refused, so a burst becomes one
     gateway restart. Gateway housekeeping launches it through ``launch_deferred_update``. A
@@ -76,9 +76,9 @@ def launch_native_update(
 
     home = Path(home)
     now = time.time() if now is None else now
-    # None reads ``updates.coalesce_window_seconds`` so every caller (``/update``, the agent-update
-    # socket, the request_update plugin) coalesces by default; tests and callers may pin it.
-    window = coalesce_window_seconds() if coalesce_window is None else max(0.0, float(coalesce_window))
+    # The admission primitive keeps its exclusive contract unless a caller opts in: the gateway
+    # entry points (``/update``, the agent-update socket) pass ``coalesce_window_seconds()``.
+    window = 0.0 if coalesce_window is None else max(0.0, float(coalesce_window))
     with locked_update_marker(home):
         last = _last_launch(home)
         # A queued request or a launch inside the window means a burst: join it instead of
@@ -428,7 +428,8 @@ def make_agent_update_handler(
         if profile_home is not None:
             pending["profile"] = payload["profile"]
         try:
-            result = launch_native_update(home=home, hermes_cmd=hermes_cmd, pending=pending, spawn=spawn)
+            result = launch_native_update(home=home, hermes_cmd=hermes_cmd, pending=pending, spawn=spawn,
+                                          coalesce_window=coalesce_window_seconds())
         except Exception:
             return {"accepted": False, "error": "native updater could not start"}
         if result["started"]:

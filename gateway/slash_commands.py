@@ -1403,10 +1403,10 @@ class GatewaySlashCommandsMixin(
         # The detached wrapper reports completion only through ``.update_process_exit_code``, so the
         # request must use the same v2 lifecycle as agent-requested updates: a legacy marker would
         # wait on ``.update_exit_code``, which the wrapper deletes.
-        from gateway.update_launcher import launch_native_update
+        from gateway.update_launcher import coalesce_window_seconds, launch_native_update
         try:
             result = launch_native_update(home=_hermes_home, hermes_cmd=hermes_cmd, pending=pending,
-                                          spawn=_spawn_detached_update)
+                                          spawn=_spawn_detached_update, coalesce_window=coalesce_window_seconds())
         except Exception as e:
             return t("gateway.update.start_failed", error=e)
         if result.get("coalesced"):

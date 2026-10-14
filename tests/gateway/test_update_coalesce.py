@@ -165,3 +165,44 @@ def test_spawn_accepts_update_args(tmp_path, monkeypatch):
                                           update_args=["--branch", "fix/x y"])
     script = calls[0][-1]
     assert "hermes update --gateway --branch 'fix/x y'" in script
+
+
+def test_admission_primitive_without_a_window_keeps_the_exclusive_refusal(tmp_path, monkeypatch):
+    """Coalescing is opt-in per caller; the bare primitive never defers even if config enables it."""
+    monkeypatch.setattr(launcher, "coalesce_window_seconds", lambda: 120.0)
+    spawn = Mock()
+    launcher.launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending=_request("first"), spawn=spawn)
+    assert launcher.launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending=_request("second"),
+                                         spawn=spawn) == {"started": False, "pending": True}
+    spawn.assert_called_once()
+    assert not (tmp_path / launcher.DEFERRED_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_slash_update_opts_into_the_configured_window(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    from gateway.config import Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters, runner._voice_mode, runner._update_prompt_pending = {}, {}, {}
+    runner._schedule_update_notification_watch = MagicMock()
+    root = tmp_path / "project"
+    (root / ".git").mkdir(parents=True)
+    (root / "gateway").mkdir()
+    (root / "gateway" / "run.py").touch()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch = Mock(return_value={"started": False, "pending": True, "coalesced": True, "merged": 1, "due_at": 1.0})
+    monkeypatch.setattr(launcher, "coalesce_window_seconds", lambda: 77.0)
+    monkeypatch.setattr(launcher, "launch_native_update", launch)
+    event = MessageEvent(text="/update", source=SessionSource(
+        platform=Platform.TELEGRAM, user_id="1", chat_id="2", user_name="u"))
+    with patch("gateway.run._hermes_home", home), patch("gateway.run.__file__", str(root / "gateway" / "run.py")), \
+         patch("hermes_cli.config.detect_install_method", return_value="git"), \
+         patch("shutil.which", return_value="/usr/bin/hermes"):
+        await runner._handle_update_command(event)
+    assert launch.call_args.kwargs["coalesce_window"] == 77.0
+    runner._schedule_update_notification_watch.assert_called_once()

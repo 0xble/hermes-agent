@@ -27,7 +27,11 @@ def _git(repo: Path, *args: str) -> str:
 def _commit(repo: Path, name: str, subject: str) -> str:
     (repo / name).write_text(subject + "\n", encoding="utf-8")
     _git(repo, "add", name)
-    _git(repo, "commit", "-q", "-m", subject)
+    # The subject goes through a file, not argv: the hermetic live-system guard treats any argv
+    # holding a bare ``update`` token under a ``hermes``-named tmp dir as ``hermes update``.
+    message = repo.parent / f".msg-{name}"
+    message.write_text(subject + "\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-F", str(message))
     return _git(repo, "rev-parse", "HEAD")
 
 
