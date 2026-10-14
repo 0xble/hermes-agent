@@ -140,6 +140,29 @@ def test_disconnect_flag_on_releases_lock_when_updater_stop_times_out(monkeypatc
     assert events.index("release") < events.index("app.stop")
 
 
+def test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels(monkeypatch):
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+
+    async def cancel_on_updater_stop(awaitable, _timeout, step):
+        if step == "updater.stop()":
+            raise asyncio.CancelledError
+        if asyncio.iscoroutine(awaitable):
+            await awaitable
+        events.append(step)
+        return True
+
+    monkeypatch.setattr(adapter, "_await_disconnect_step", cancel_on_updater_stop)
+    try:
+        asyncio.run(adapter.disconnect())
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("disconnect should propagate outer cancellation")
+
+    assert "release" in events
+
+
 __all__ = [
     "test_zero_cut_handover_defaults_off",
     "test_launchd_slot_labels_reuse_default_label_convention",

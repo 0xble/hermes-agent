@@ -4099,25 +4099,32 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 # Bounded: a CLOSE-WAIT socket can wedge updater.stop() forever; fall through on timeout.
                 if self._app.updater and self._app.updater.running:
                     try:
-                        # Keep the actual PTB stop task alive past the bounded adapter teardown. The
-                        # lock callback is attached to that task, not to the shield/wait wrapper, so an
-                        # outer disconnect timeout or cancellation cannot release the token early.
-                        updater_stop_task = asyncio.ensure_future(self._app.updater.stop())
                         if zero_cut_handover:
+                            # Keep the actual PTB stop task alive past bounded adapter teardown. The
+                            # lock callback is attached to that task, not to the shield/wait wrapper.
+                            updater_stop_task = asyncio.ensure_future(self._app.updater.stop())
                             def release_after_updater_stop(task) -> None:
                                 _consume_abandoned_task(task)
                                 self._release_platform_lock()
                             updater_stop_task.add_done_callback(release_after_updater_stop)
-                        updater_stopped = await self._await_disconnect_step(
-                            asyncio.shield(updater_stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
-                        if zero_cut_handover and not updater_stopped:
-                            logger.warning(
-                                "[%s] updater.stop() timed out; releasing the bot-token lock after the bounded stop window",
-                                self.name)
-                            # The existing bounded teardown contract must not deadlock a successor.
-                            # The abandoned stop task remains observed, and its completion callback is
-                            # harmless after this release because _release_platform_lock is idempotent.
-                            self._release_platform_lock()
+                            try:
+                                updater_stopped = await self._await_disconnect_step(
+                                    asyncio.shield(updater_stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
+                            except asyncio.CancelledError:
+                                # The outer bounded teardown is detaching us. Do not strand the
+                                # successor on a wedged stop task; the callback remains harmless.
+                                self._release_platform_lock()
+                                raise
+                            if not updater_stopped:
+                                logger.warning(
+                                    "[%s] updater.stop() timed out; releasing the bot-token lock after the bounded stop window",
+                                    self.name)
+                                self._release_platform_lock()
+                        else:
+                            # Preserve the legacy path exactly: its direct bounded await and ordering
+                            # remain unchanged when the feature flag is off.
+                            await self._await_disconnect_step(
+                                self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
                     except Exception as stop_error:
                         if zero_cut_handover:
                             self._release_platform_lock()
