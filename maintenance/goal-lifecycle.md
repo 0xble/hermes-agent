@@ -197,9 +197,11 @@ pauses remain authoritative.
   sender kind, also inside a /steer wrapper), are
   never user-typed, so they cannot satisfy a revision `user_quote`. The busy queue
   joins rapid follow-ups with a bare newline, so a relay and typed text can share
-  one row with no boundary. A row whose relay header is not in a clean delivery
-  shape (sole header on the first line, or one short symbol-led title, a body
-  with no other title-shaped line, `From:` signature and the header last) is an
+  one row with no boundary. Only one shape is a clean delivery: one short
+  symbol-led title, a body with no other title-shaped line, `From:` signature and
+  the header last. The legacy header-first layout has no end marker (and stopped
+  being delivered on 2026-10-10), so it is never clean. Any other row with a
+  relay header is an
   authority barrier: it grants nothing, and
   every older message in that session grants nothing either, in the judge block
   (shown as an "unattributable message" note), `user_messages_since` and

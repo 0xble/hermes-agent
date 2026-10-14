@@ -2498,18 +2498,17 @@ def _is_relay_title(line: str) -> bool:
 
 
 def _is_clean_relay_shape(text: str) -> bool:
-    """Whether ``text`` is one relay delivery and nothing else: a single header on the first line
-    (legacy layout), or the current layout of one title line, body, ``From:`` signature and the
-    header as the last line. Typed text merged after a relay leaves the header off the edge, and
-    typed text merged before one either replaces the title on the first line or leaves the relay's
-    own title in the middle, so both break the shape."""
+    """Whether ``text`` is one relay delivery and nothing else: one title line, body, ``From:``
+    signature and the header as the last line. Typed text merged after a relay leaves the header
+    off the edge, and typed text merged before one either replaces the title on the first line or
+    leaves the relay's own title in the middle, so both break the shape. The legacy layout with
+    the header first has no end marker, so typed text appended to it cannot be told apart; it
+    stopped being delivered on 2026-10-10 and is never clean."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     headers = [i for i, line in enumerate(lines) if _ANY_RELAY_HEADER_RE.fullmatch(line)]
     if len(headers) != 1:
         return False
     at = headers[0]
-    if at == 0:
-        return True
     if not (at == len(lines) - 1 and at >= 2 and lines[at - 1].startswith("From: ") and _is_relay_title(lines[0])):
         return False
     return not any(_is_relay_title(line) for line in lines[1:at - 1])
