@@ -1857,19 +1857,23 @@ def _dispatch_admitted(
         # to become durable before taking the terminal transition.
         _persist_dispatch(record)
     except Exception as exc:
-        from tools.delegation_resume import claimed_retry_source, is_recovery_spawn, release_retry_dispatch
-        # Recovery is managed regardless of retry state: CLI/TUI child claims use
-        # resume_claim, not RETRY_DISPATCHING. Never bypass their atomic consumption.
+        from tools.delegation_resume import RetryAdmissionError, claimed_retry_source, is_recovery_spawn, release_retry_dispatch
+        # An admission rejection means another dispatch already consumed this
+        # claim; it did not take the claim and must not re-arm it or release
+        # sibling claims. Only storage/insert failures unwind a claim taken by
+        # this dispatch.
+        retry_admission_rejected = isinstance(exc, RetryAdmissionError)
         managed_recovery = is_recovery_spawn(record)
         retry_rearmed = False
         try:
-            prior = claimed_retry_source(record)
-            if prior is not None:
-                # Explicit CLI/TUI resume claims are re-armed for a later manual
-                # resume, not scheduled for the automatic retry notice path.
-                had_retry_claim = bool(prior.get("retry_claim"))
-                released = release_retry_dispatch(prior)
-                retry_rearmed = had_retry_claim and released
+            if not retry_admission_rejected:
+                prior = claimed_retry_source(record)
+                if prior is not None:
+                    # Explicit CLI/TUI resume claims are re-armed for a later manual
+                    # resume, not scheduled for the automatic retry notice path.
+                    had_retry_claim = bool(prior.get("retry_claim"))
+                    released = release_retry_dispatch(prior)
+                    retry_rearmed = had_retry_claim and released
         except Exception:
             logger.warning("Failed to release managed retry claim after persistence failure", exc_info=True)
         with _records_lock:

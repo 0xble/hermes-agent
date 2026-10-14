@@ -191,6 +191,61 @@ def test_explicit_resume_claim_released_after_failed_persist_then_resume(shape, 
         assert consumed == ("deleg_explicit_consumed",)
 
 
+def test_scalar_duplicate_consumed_brief_does_not_rearm_resume_claim():
+    did = _scalar_row("deleg_scalar_consumed")
+    payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
+    ad._persist_dispatch(dict(
+        delegation_id="deleg_scalar_consumed_replacement", goal=payload["goal"],
+        context=payload["recovery_context"], role="leaf", session_key="telegram:dm:1",
+        parent_session_id="sess-owner", origin_session_id="sess-owner", dispatched_at=time.time(),
+    ))
+
+    result = ad.dispatch_async_delegation(
+        goal=payload["goal"], context=payload["recovery_context"], role="leaf", model="m", toolsets=None,
+        session_key="telegram:dm:1", parent_session_id="sess-owner",
+        runner=lambda: pytest.fail("consumed recovery ran inline"), max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["no_inline_fallback"] is True
+    assert "will be retried later" not in result["error"]
+    prior = dr.retry_status(did)
+    assert prior["resume_state"] == dr.RESUME_STATE_CLAIMED
+    assert prior["resume_claim"]
+    assert prior["retry_replacement"] == "deleg_scalar_consumed_replacement"
+    assert did not in {row["delegation_id"] for row in dr.list_boot_candidates()}
+    second = _handle_control_action("resume", did, None, _Parent())
+    assert "already" in second.lower() or "one-shot" in second.lower()
+
+
+def test_batch_duplicate_consumed_child_preserves_dispatch_and_sibling_claim():
+    did = _scheduled_batch("deleg_batch_consumed_duplicate")
+    payload, reason = dr.claim_retry_dispatch(did)
+    assert reason is None
+    child0, child1 = payload["recovery_tasks"]
+    _persist_child("deleg_batch_child_zero", child0)
+
+    duplicate = ad.dispatch_async_delegation(
+        goal=child0["goal"], context=child0["context"], role="leaf", model="m", toolsets=None,
+        session_key="telegram:dm:1", parent_session_id="sess-owner",
+        runner=lambda: pytest.fail("consumed recovery ran inline"), max_async_children=1,
+    )
+
+    assert duplicate["status"] == "rejected"
+    assert duplicate["no_inline_fallback"] is True
+    prior = dr.retry_status(did)
+    assert prior["retry_state"] == dr.RETRY_DISPATCHING
+    with ad._DB_LOCK, ad._transaction() as conn:
+        sibling = conn.execute(
+            "SELECT replacement_delegation_id FROM async_delegation_child_recovery "
+            "WHERE delegation_id=? AND task_index=2", (did,)
+        ).fetchone()
+    assert sibling == (None,)
+
+    _persist_child("deleg_batch_child_one", child1)
+    assert dr.retry_status(did)["retry_state"] == dr.RETRY_DISPATCHED
+
+
 def test_batch_failed_persist_releases_child_claims_then_resume(monkeypatch):
     did = _scheduled_batch()
     payload = json.loads(_handle_control_action("resume", did, None, _Parent()))
