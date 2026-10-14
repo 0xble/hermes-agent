@@ -150,6 +150,7 @@ class StreamFallbackMixin:
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
                 and not self._fallback_preserve_partial_messages and continuation == final_text):
+            await self._journal_preview("", force=True)  # forget before deleting what it names
             await self._delete_previews([stale_message_id], label="Fallback partial",
                                         skip_sentinel=False)
 
@@ -262,6 +263,7 @@ class StreamFallbackMixin:
             return "ambiguous" if self._send_failure_may_have_delivered(result) else "failed"
 
         new_message_id = getattr(result, "message_id", None)
+        await self._journal_preview("", force=True)  # forget before deleting what it names
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
@@ -431,6 +433,7 @@ class StreamFallbackMixin:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
         stale_ids = self._stale_preview_ids(segment_only=True)
+        await self._journal_preview("", force=True)  # forget before deleting what it names
         await self._delete_previews(stale_ids, label="Silence-marker")
         self._preview_message_ids.difference_update(stale_ids)
         self._message_id = None

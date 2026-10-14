@@ -289,6 +289,8 @@ class StreamTransportMixin:
         if not getattr(result, "success", False):
             return False
         new_message_id = getattr(result, "message_id", None)
+        # Journal the replacement before deleting what the old row points at.
+        await self._journal_preview(text, new_message_id)
         # Best-effort preview cleanup; never delete the message just sent.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Fresh-final")
         self._preview_message_ids = set()
@@ -446,11 +448,17 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _journal_preview(self, text: str, message_id=None) -> None:
-        if self._on_preview is not None and not self._turn_split_delivery:
-            if self.cfg.cursor:
-                text = text.removesuffix(self.cfg.cursor).rstrip()
-            await self._on_preview(text, message_id)
+    async def _journal_preview(self, text: str, message_id=None, *, force: bool = False) -> None:
+        """Best-effort crash journal: a failure is logged and never changes delivery."""
+        on_preview = getattr(self, "_on_preview", None)
+        if on_preview is None or (getattr(self, "_turn_split_delivery", False) and not force):
+            return
+        if self.cfg.cursor:
+            text = text.removesuffix(self.cfg.cursor).rstrip()
+        try:
+            await on_preview(text, message_id)
+        except Exception as err:
+            logger.warning("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
 
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""

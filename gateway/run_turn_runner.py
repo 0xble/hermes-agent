@@ -1062,7 +1062,11 @@ class TurnRunner:
                         initial_reply_to_id=ctx.event_message_id, run_still_current=ctx._run_still_current,
                         on_preview=preview_recorder(self._runner, ctx),
                     )
-                    restore_preview(self._runner, ctx, stream_consumer)
+                    try:
+                        restore_preview(self._runner, ctx, stream_consumer,
+                                        policy=self._resume_restart_policy())
+                    except Exception as err:  # recovery is best-effort; never block the turn
+                        logger.warning("Streamed preview restore failed: %s", err)
                     ctx.stream_consumer_holder[0] = stream_consumer
                     # #105341: a consumer created only for interim commentary (text streaming off)
                     # is never fed the final reply's deltas — mark it so the duplicate-risk

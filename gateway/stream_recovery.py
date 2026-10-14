@@ -9,9 +9,12 @@ honestly marked re-answer. Normal completion persists the real answer.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from gateway import delivery_ledger as ledger
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_table(conn):
@@ -48,11 +51,19 @@ def load_preview(session_key, session_id, turn_id):
     return {"content": row[0], "message_id": row[1]} if row else None
 
 
+def _turn_event(runner, ctx):
+    state = runner._peek_session_state(ctx.session_key) if ctx.session_key else None
+    return getattr(getattr(state, "turn", None), "event", None)
+
+
+def resume_admission_id(resume_turn_id) -> str:
+    """Admission identity ``_schedule_resume_pending_sessions`` stamps on its synthetic event."""
+    return f"resume:{resume_turn_id}"
+
+
 def preview_recorder(runner, ctx):
     """Capture this admitted turn's private identity, never a successor's."""
-    state = runner._peek_session_state(ctx.session_key) if ctx.session_key else None
-    event = getattr(getattr(state, "turn", None), "event", None)
-    token = getattr(event, "_gateway_active_turn_token", None)
+    token = getattr(_turn_event(runner, ctx), "_gateway_active_turn_token", None)
     if not token or not ctx.session_id:
         return None
 
@@ -65,14 +76,22 @@ def preview_recorder(runner, ctx):
     return record
 
 
-def restore_preview(runner, ctx, consumer):
-    """A resumed stream owns its predecessor's known editable preview.
+def restore_preview(runner, ctx, consumer, *, policy=None):
+    """The synthetic auto-resume turn owns its predecessor's known editable preview.
 
-    Reading happens on the existing agent worker thread, not the gateway loop.
-    Session ID and the exact resume-turn token fence reset/successor ownership.
-    An ACK-lost first send has no recoverable message ID and cannot be edited.
+    Only under ``restart_resume_policy: continue``: an ``ask`` turn's one-line question
+    is not the interrupted answer, so the partial preview stays untouched and nothing is
+    marked. Session-level ``resume_pending`` can outlive admission (breaker, stale marker,
+    offline adapter), so a real inbound while it lingers must never adopt: the CURRENT
+    turn must be the internal event admitted as ``resume:<resume_turn_id>``.
+    Session ID and that exact token fence reset/successor ownership. An ACK-lost
+    first send has no recoverable message ID and cannot be edited. Runs on the agent
+    worker thread, not the gateway loop.
     """
-    if not ctx.session_key or not ctx.session_id:
+    if policy != "continue" or not ctx.session_key or not ctx.session_id:
+        return
+    event = _turn_event(runner, ctx)
+    if event is None or not getattr(event, "internal", False):
         return
     store = runner.session_store
     with store._lock:
@@ -81,9 +100,20 @@ def restore_preview(runner, ctx, consumer):
         token = getattr(entry, "resume_turn_id", None)
         if not token or not getattr(entry, "resume_pending", False) or entry.session_id != ctx.session_id:
             return
+    if getattr(event, "_outbox_admission_id", None) != resume_admission_id(token):
+        return
     preview = load_preview(ctx.session_key, ctx.session_id, token)
     if not preview:
         return
+    # Re-own the row under this resumed turn's own active token: if it crashes too,
+    # promotion makes that token the next resume_turn_id and recovery still finds it.
+    successor = getattr(event, "_gateway_active_turn_token", None)
+    if successor and successor != token:
+        try:
+            record_preview(turn_id=successor, session_key=ctx.session_key, session_id=ctx.session_id,
+                           content=preview["content"], message_id=preview["message_id"])
+        except Exception:
+            logger.warning("Could not re-own streamed preview for %s", ctx.session_key, exc_info=True)
     if not preview["message_id"]:
         # The platform may hold this send, but without its ACK there is no ID
         # to reconcile. Re-run the unfinished turn and label its completed reply;
