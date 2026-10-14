@@ -184,6 +184,62 @@ def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, mo
     assert (tmp_path / "helper.log").read_text().count("--label") == 2
 
 
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_dispatcher_rechecks_expanded_single_test_targets(tmp_path, monkeypatch, shell):
+    """Per-file loops bypass the slot only after expansion proves one narrow target."""
+    if not shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
+    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    _fake_helper(tmp_path)
+    runner = tmp_path / ".venv" / "bin" / "pytest"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("#!/bin/sh\nprintf 'runner held=%s args=%s\\n' \"$HEAVY_SLOT_HELD\" \"$*\"\n")
+    runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+    (runner.parent / "python").symlink_to(runner.name)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "run_tests.sh").symlink_to(runner)
+    (tmp_path / "test_file.py").write_text("")
+    (tmp_path / "other.py").write_text("")
+    (tmp_path / "space file.py").write_text("")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "directory.py").mkdir()
+    environment = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    cases = [
+        ('for test in test_file.py other.py; do .venv/bin/pytest -q "$test" --tb=short; done', False, 2),
+        ('for f in test_file.py other.py; do .venv/bin/pytest -q $f; done', False, 2),
+        ('for file in test_file.py other.py; do .venv/bin/pytest -q "${file}"; done', False, 2),
+        ('for test in test_file.py::test_one other.py::TestGroup::test_two; '
+         'do .venv/bin/pytest -q "$test"; done', False, 2),
+        ('file="space file.py"; .venv/bin/pytest -q "$file"', False, 1),
+        ('file=test_file.py; .venv/bin/pytest -q "${file}::test_one" --tb short', False, 1),
+        ('file=test_file.py; .venv/bin/python -m pytest -q "$file"', False, 1),
+        ('file=test_file.py; scripts/run_tests.sh "$file"', False, 1),
+        ('file=test_file; .venv/bin/pytest -q "${file}.py"', False, 1),
+        ('file=directory; .venv/bin/pytest -q "${file}.py"', True, 1),
+        ('test=tests; .venv/bin/pytest -q "$test"', True, 1),
+        ('test=directory.py; .venv/bin/pytest -q "$test"', True, 1),
+        ('test=test_file.py; other=other.py; .venv/bin/pytest -q "$test" "$other"', True, 1),
+        ('test=test_file.py; .venv/bin/pytest -q "$test" tests', True, 1),
+        ('test=test_file.py; .venv/bin/pytest -n 8 "$test"', True, 1),
+        ('test=test_file.py; .venv/bin/pytest -k smoke "$test"', True, 1),
+        ('.venv/bin/pytest -k smoke', True, 1),
+        ('.venv/bin/pytest', True, 1),
+    ]
+    for command, uses_slot, runs in cases:
+        log = tmp_path / "helper.log"
+        log.unlink(missing_ok=True)
+        wrapped = wrap_heavy_command(command, env_type="local", environment=environment)
+        out = subprocess.run([shell, "-c", wrapped], capture_output=True, text=True, cwd=tmp_path,
+                             env=environment)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.count("runner held=") == runs, (command, out.stdout)
+        assert log.exists() is uses_slot, (command, out.stdout, out.stderr)
+        assert ("held=1" in out.stdout) is uses_slot, (command, out.stdout)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
 def test_wrapped_command_keeps_shell_state_and_runs_in_slot(tmp_path, monkeypatch):
     """cd and exports around the heavy command still reach the session shell."""
