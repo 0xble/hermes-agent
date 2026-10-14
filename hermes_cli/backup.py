@@ -13,7 +13,7 @@ import time
 import zipfile
 import zlib
 from contextlib import contextmanager, suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1533,6 +1533,10 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
             if snapshot_created_at.tzinfo is None:
                 snapshot_created_at = snapshot_created_at.replace(tzinfo=timezone.utc)
             snapshot_created_at = snapshot_created_at.astimezone(timezone.utc)
+            # Snapshot ids have one-second precision and the cron journal may use a clock that
+            # stepped forward/backward relative to this module. Bias the boundary backward so a
+            # delete near the snapshot is treated conservatively as deliberate.
+            snapshot_created_at -= timedelta(minutes=5)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         # An unavailable creation time makes every retained delete record
         # conservative: it may belong to this snapshot's window.
@@ -1561,7 +1565,7 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
                 if not restored_jobs:
                     return None
                 cron_jobs.save_jobs(live_jobs + restored_jobs)
-    except (OSError, PermissionError) as exc:
+    except (OSError, PermissionError, RuntimeError) as exc:
         logger.error("Cron jobs were emptied during update but auto-restore failed: %s", exc)
         return None
     logger.warning(

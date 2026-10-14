@@ -33,6 +33,17 @@ def _no_real_gateway_service(monkeypatch):
     monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def _restore_backup_datetime():
+    """Keep _advance_backup_clock's test shim local to one test."""
+    import datetime as _dt
+    import hermes_cli.backup as backup_mod
+
+    backup_mod.datetime = _dt.datetime
+    yield
+    backup_mod.datetime = _dt.datetime
+
+
 def _advance_backup_clock(seconds: float = 1.1) -> None:
     """Skew hermes_cli.backup's datetime forward instead of sleeping.
 
@@ -2837,9 +2848,10 @@ class TestRestoreCronJobsIfEmptied:
         assert result["restored"] is True
         assert result["job_count"] == 19
 
-        # The live file now has all 19 jobs back.
+        # The live desktop-owned job survives, and all 19 snapshot jobs are restored.
         restored = json.loads(jobs_path.read_text())
-        assert len(restored["jobs"]) == 19
+        assert len(restored["jobs"]) == 20
+        assert "desktop-watchdog" in {job["id"] for job in restored["jobs"]}
 
     def test_does_not_resurrect_job_removed_after_snapshot(self, tmp_path):
         from cron.jobs import remove_job, use_cron_store
@@ -2880,6 +2892,39 @@ class TestRestoreCronJobsIfEmptied:
         assert restored["a"]["last_run_at"] == "new"
         assert set(restored) == {"a", "b"}
 
+    def test_delete_before_snapshot_outside_tolerance_does_not_block_restore(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        (hermes_home / "cron" / "removed_jobs.jsonl").parent.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "cron" / "removed_jobs.jsonl").write_text(
+            '{"id":"a","removed_at":"2000-01-01T00:00:00+00:00"}\n')
+        snap_id = self._make_snapshot(hermes_home)
+        jobs_path.write_text(json.dumps({"jobs": []}))
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 2
+
+    def test_manifest_without_timestamp_treats_all_deletes_as_deliberate(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        manifest = hermes_home / "state-snapshots" / snap_id / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data.pop("timestamp", None)
+        data.pop("created_at", None)
+        manifest.write_text(json.dumps(data))
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+        jobs_path.write_text(json.dumps({"jobs": []}))
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+        assert result is not None
+        assert result["job_count"] == 1
+        assert {j["id"] for j in json.loads(jobs_path.read_text())["jobs"]} == {"b"}
 
 # ---------------------------------------------------------------------------
 # Cron agent-job prompt field degradation across update (issue #82990)

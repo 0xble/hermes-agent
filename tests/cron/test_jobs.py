@@ -342,6 +342,22 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_removed_job_journal_prunes_entries_older_than_seven_days(tmp_cron_dir, monkeypatch):
+    import json
+    from cron import jobs
+
+    fixed_now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    removed_file.write_text(json.dumps({
+        "id": "old", "removed_at": (fixed_now - timedelta(days=8)).isoformat(),
+    }) + "\n")
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: fixed_now)
+    jobs._record_removed_jobs_unlocked({"new"})
+    records = [json.loads(line) for line in removed_file.read_text().splitlines()]
+    assert {record["id"] for record in records} == {"new"}
+
+
 class TestJobCRUD:
     def test_cjk_and_emoji_round_trip_readable_in_jobs_json(self, tmp_cron_dir):
         """CJK/emoji job text must round-trip AND stay human-readable on disk.
