@@ -33,6 +33,16 @@ def _complete_loop_tick(manager, response: str, tick=None):
         return manager.complete_tick(response, tick=tick)
     return manager.complete_tick(response)
 
+
+def fire_tick(manager, generation: int, can_claim):
+    """Call the fenced claim seam while tolerating older plugin/test managers."""
+    params = inspect.signature(manager.fire_tick).parameters
+    if "can_claim" in params:
+        return manager.fire_tick(generation, can_claim=can_claim)
+    if params:
+        return manager.fire_tick(generation)
+    return manager.fire_tick()
+
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
 _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 
@@ -537,6 +547,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         loop_tick = None
         if metadata.get(LOOP_WAKE_METADATA_KEY):
             loop_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
+        else:
+            # Older in-process callers stamped the same exact identity under this name. Keep the
+            # compatibility path strict to a two-part tick; no text-only completion is accepted.
+            legacy_tick = metadata.get("gateway_loop_tick")
+            if isinstance(legacy_tick, (list, tuple)) and len(legacy_tick) == 2:
+                loop_tick = list(legacy_tick)
         return {"user_turn": self._is_user_turn_event(event),
                 "goal_instance": instance if type(instance) in (int, float) else None,
                 "loop_tick": loop_tick}
@@ -781,12 +797,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         mgr = await self._post_turn_manager(session_entry, "loop completion", "loops", _load)
         state = mgr.state if mgr is not None else None
-        if state is None or not state.awaiting_response or loop_tick is None:
+        if state is None or not state.awaiting_response:
             return
-        if loop_tick is None and state.last_fired_at >= getattr(self, "_gateway_started_at", 0.0):
-            # This turn ran no loop wake, and the in-flight tick was claimed by this process, so its
-            # own stamped wake will settle it. Only a tick claimed before this gateway started (whose
-            # wake was lost or carried no identity) is released by the next turn, never wedged.
+        if loop_tick is None:
+            if state.last_fired_at < getattr(self, "_gateway_started_at", 0.0):
+                # A tick left by an older gateway has no reliable response identity. Skip it rather
+                # than replaying an effect whose outcome is unknown; a tick claimed by this process
+                # remains owned by its stamped wake.
+                await self._run_in_executor_with_context(mgr.abandon_tick)
             return
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
@@ -915,7 +933,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if outcome:
                 logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
             return
-        if now < state.next_due_at or _turn_owner_exists():
+        if now < state.next_due_at or (
+            _turn_owner_exists() and not (state.prompt or "").lstrip().startswith("/")
+        ):
             # The adapter routes pending clarification replies before admission. A wake must
             # never enter that path as a fabricated human answer while another turn owns it.
             return
@@ -932,22 +952,32 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if check_paused("loop", logger) or _turn_owner_exists():
+        if check_paused("loop", logger) or (
+            _turn_owner_exists() and not (state.prompt or "").lstrip().startswith("/")
+        ):
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        generation = self._begin_session_run_generation(session_key)
+        generation = (
+            self._begin_session_run_generation(session_key)
+            if hasattr(self, "_begin_session_run_generation")
+            else (self._current_session_run_generation(session_key)
+                  if hasattr(self, "_current_session_run_generation") else 0)
+        )
+        is_run_current = getattr(self, "_is_session_run_current", None)
+        if not callable(is_run_current):
+            is_run_current = lambda _key, _generation: True
         wakeup = await self._run_in_executor_with_context(
             functools.partial(
-                mgr.fire_tick, generation,
-                can_claim=lambda: not _turn_owner_exists()
-                and self._is_session_run_current(session_key, generation),
+                fire_tick, mgr, generation,
+                lambda: (not _turn_owner_exists() or mgr.state.prompt.lstrip().startswith("/"))
+                and is_run_current(session_key, generation),
             )
         )
         if not wakeup:
             return
-        if _turn_owner_exists() or not self._is_session_run_current(session_key, generation):
+        if (_turn_owner_exists() and not wakeup.lstrip().startswith("/")) or not is_run_current(session_key, generation):
             # The claim was consumed. Recovery will skip it after the current owner releases.
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
@@ -956,17 +986,21 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # #85957: same client-owns-the-turn rule as the raw-key branch above — persist the completion as a
         # delivery row, never self-post it as a new role=user prompt.
         tick = (mgr.state.created_at, mgr.state.ticks_fired)
+        is_command = wakeup.lstrip().startswith("/")
         event = self._synthetic_prompt_event(
             source, wakeup, internal=True, reply_expected=False, goal_continuation=False,
         )
+        from hermes_cli.session_controls import loop_wake_metadata
         event.metadata.update({
             "gateway_session_key": session_key,
             "gateway_session_id": sid,
             "gateway_session_strict": True,
+            # Keep the legacy fields for adapters and standalone hosts that still use the original
+            # wake marker while the structured identity is carried alongside them.
             "hermes_loop_wakeup": True,
             "gateway_loop_tick": list(tick),
+            **loop_wake_metadata(sid, mgr.state, command=is_command),
         })
-        is_command = wakeup.lstrip().startswith("/")
         event._gateway_loop_execution_fence = (
             sid, tick, generation, mgr.state.control_generation,
         )
@@ -979,24 +1013,52 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             # The tick is already durably started before any adapter/turn preparation. Lightweight
             # native/plugin doubles without the adapter receipt surface retain the direct path.
             from gateway.wake import admit_internal_event
-            if hasattr(adapter, "_message_handler"):
+            has_admission_receipt = "_message_handler" in getattr(adapter, "__dict__", {})
+            if has_admission_receipt:
                 await admit_internal_event(adapter, event)
             else:
+                # Lightweight/plugin adapters predate the explicit admission-receipt surface, but
+                # they still need the same compression/control fence before handling a wake. The
+                # optional acceptance flag is honored when a test/plugin supplies it; absence keeps
+                # the legacy direct-handler contract.
+                from hermes_cli.session_controls import internal_wake_is_current
+                if not await self._run_in_executor_with_context(
+                    functools.partial(internal_wake_is_current, event)
+                ):
+                    raise RuntimeError("loop wake superseded before direct adapter admission")
                 await adapter.handle_message(event)
+                if getattr(event, "_gateway_accepted", None) is False:
+                    raise RuntimeError("loop wake not accepted by direct adapter")
+            rebound_sid = (event.metadata or {}).get("loop_wakeup_session_id")
+            if rebound_sid and rebound_sid != sid:
+                def _rebound_fence():
+                    child = LoopManager(session_id=rebound_sid).state
+                    if child is None or (child.created_at, child.ticks_fired) != tick:
+                        return None
+                    return int(getattr(child, "control_generation", 0) or 0)
+                rebound_control = await self._run_in_executor_with_context(_rebound_fence)
+                if rebound_control is None:
+                    raise RuntimeError("loop wake continuation missing its started tick")
+                event._gateway_loop_execution_fence = (
+                    rebound_sid, tick, generation, rebound_control,
+                )
             # Native adapters settle command-only ticks at the handled-command boundary;
             # rewriting commands retain their claim until the model-turn hooks run.
-            if not hasattr(adapter, "_message_handler") and is_command:
+            if is_command and getattr(event, "_gateway_accepted", None) is True:
+                settled_sid = (event.metadata or {}).get("loop_wakeup_session_id", sid)
+                settled_mgr = mgr if settled_sid == sid else LoopManager(session_id=settled_sid)
                 await self._run_in_executor_with_context(
-                    functools.partial(_complete_loop_tick, mgr, "", tick)
+                    functools.partial(_complete_loop_tick, settled_mgr, "", tick)
                 )
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
             # Do not refund a started tick after delivery failure. Recovery skips it and schedules
             # the next due time; only a pre-start claim can use the conditional abandon path.
             with suppress(Exception):
-                await self._run_in_executor_with_context(
-                    mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
-                )
+                if getattr(mgr.state, "claim_phase", "") == "claimed":
+                    await self._run_in_executor_with_context(
+                        mgr.abandon_tick, tick=tick, owns_turn=_turn_owner_exists,
+                    )
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.

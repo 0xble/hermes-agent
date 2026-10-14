@@ -553,6 +553,21 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         window. A goal continuation whose definition was edited since gets its refreshed prompt."""
         from gateway.platforms.event import is_goal_continuation_event
         from hermes_cli.session_controls import loop_wake_is_current, refresh_goal_continuation
+        metadata = getattr(event, "metadata", None) or {}
+        if metadata.get("gateway_session_strict"):
+            pin_check = getattr(self, "_strict_session_pin_holds", None)
+            if callable(pin_check):
+                if not await pin_check(event, session_id):
+                    return None
+            else:
+                lookup = getattr(getattr(self, "async_session_store", None), "lookup_by_session_key", None)
+                if callable(lookup):
+                    current = await lookup(metadata.get("gateway_session_key", ""))
+                    if (getattr(current, "session_id", None) != session_id
+                            or getattr(current, "session_id", None) != metadata.get("gateway_session_id")):
+                        from hermes_cli.session_controls import internal_wake_is_current
+                        if not internal_wake_is_current(event, session_id):
+                            return None
         if is_goal_continuation_event(event):
             before = event.text
             refreshed = await self._run_in_executor_with_context(refresh_goal_continuation, event, session_id)
@@ -560,9 +575,25 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 return None
             if refreshed != before:
                 message = message.replace(before, refreshed) if before and before in message else refreshed
-        if not await self._run_in_executor_with_context(
-                loop_wake_is_current, getattr(event, "metadata", None), session_id):
+        current = await self._run_in_executor_with_context(loop_wake_is_current, metadata, session_id)
+        if metadata.get("loop_wakeup_session_id"):
+            from hermes_cli.session_controls import migrated_successor
+            successor = await self._run_in_executor_with_context(
+                migrated_successor, "loop", metadata.get("loop_wakeup_session_id"),
+            )
+            if successor and successor != session_id:
+                current = await self._run_in_executor_with_context(
+                    loop_wake_is_current, metadata, successor,
+                )
+        if not current:
             return None
+        fence = getattr(event, "_gateway_loop_execution_fence", None)
+        rebound_sid = metadata.get("loop_wakeup_session_id")
+        if fence is not None and rebound_sid and fence[0] != rebound_sid:
+            from hermes_cli.loops import loop_control_generation
+            event._gateway_loop_execution_fence = (
+                rebound_sid, fence[1], fence[2], loop_control_generation(rebound_sid),
+            )
         return message
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):

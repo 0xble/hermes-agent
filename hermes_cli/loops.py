@@ -1029,9 +1029,14 @@ class LoopManager(LoopRevisionsMixin):
 
     @snapshot_control
     def abandon_tick(self, *, tick: Optional[Tuple[Any, Any]] = None, owns_turn=None) -> bool:
-        """Refund only an unstarted claim; started or unknown claims are never replayed."""
+        """Release a pre-start claim, or skip a started tick without replaying it.
+
+        ``fire_tick`` normally claims and starts in one CAS, so admission failures after that
+        boundary must clear ``awaiting_response`` while retaining ``ticks_fired``. The legacy
+        ``claimed`` phase remains refundable for recovery of rows written before the atomic CAS.
+        """
         s = self._state
-        if s is None or not s.awaiting_response or s.claim_phase != "claimed":
+        if s is None or not s.awaiting_response:
             return False
         if tick is not None:
             try:
@@ -1042,23 +1047,29 @@ class LoopManager(LoopRevisionsMixin):
                 if not self._follow_compression():
                     return False
                 s = self._state
-                if s is None or not s.awaiting_response or s.claim_phase != "claimed":
+                if s is None or not s.awaiting_response:
                     return False
                 if s.created_at != instance or s.ticks_fired != fired:
                     return False
         fired = s.ticks_fired
+        phase = s.claim_phase
+        if phase not in {"claimed", "started", ""}:
+            return False
 
         def settle(state: LoopState) -> None:
             state.awaiting_response = False
-            state.ticks_fired = max(0, fired - 1)
-            # Deterministic caps also govern a rolled-back tick (a revise may have lowered them).
+            if phase == "claimed":
+                state.ticks_fired = max(0, fired - 1)  # legacy pre-start claim: nothing ran
+            # Deterministic caps also govern a released tick (a revise may have lowered them).
             cap = self._cap_stop(state)
             if cap is not None:
                 self._apply_stop(state, cap[0], cap[1])
-            else:
+            elif phase == "claimed":
                 state.next_due_at = time.time()
+            else:
+                self._settle_continue(state, "", time.time())
 
-        return self._save_tick_outcome(fired, settle, expected_phase="claimed", owns_turn=owns_turn)
+        return self._save_tick_outcome(fired, settle, expected_phase=phase, owns_turn=owns_turn)
 
     def _tick_execution_current(self, tick: Tuple[Any, Any], *, control_generation: int,
                                 run_generation: int) -> bool:

@@ -26,9 +26,14 @@ class GatewayLoopWakeMixin:
     def _loop_wake_command_identity(event: Any) -> Optional[tuple]:
         """``(session_id, tick)`` for a gateway-authored /loop wake carrying an exact tick, else None."""
         metadata = getattr(event, "metadata", None) or {}
+        new_stamp = bool(metadata.get("loop_wakeup"))
         raw_tick = metadata.get("gateway_loop_tick")
         sid = metadata.get("gateway_session_id")
-        if (not getattr(event, "internal", False) or not metadata.get("hermes_loop_wakeup")
+        if new_stamp:
+            raw_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
+            sid = metadata.get("loop_wakeup_session_id") or sid
+        if (not getattr(event, "internal", False)
+                or (not new_stamp and not metadata.get("hermes_loop_wakeup"))
                 or not sid or not isinstance(raw_tick, (list, tuple)) or len(raw_tick) != 2):
             return None
         return sid, tuple(raw_tick)
@@ -49,11 +54,13 @@ class GatewayLoopWakeMixin:
         """
         from hermes_cli.loops import LoopManager
 
-        session_key = self._session_key_for_source(source)
+        key_for_source = getattr(self, "_session_key_for_source", None)
+        session_key = key_for_source(source) if callable(key_for_source) else None
 
         def _exact_started_tick() -> Optional[int]:
-            current = self.session_store.lookup_by_session_key(session_key)
-            if current is None or current.session_id != sid:
+            lookup = getattr(getattr(self, "session_store", None), "lookup_by_session_key", None)
+            current = lookup(session_key) if callable(lookup) and session_key else None
+            if callable(lookup) and session_key and (current is None or current.session_id != sid):
                 return None
             state = LoopManager(sid).state
             if not (
@@ -77,7 +84,11 @@ class GatewayLoopWakeMixin:
         work on the gateway loop thread.
         """
         if fence is None:
-            return self._loop_wake_command_identity(event) is None
+            metadata = getattr(event, "metadata", None) or {}
+            return (
+                self._loop_wake_command_identity(event) is None
+                or not metadata.get("gateway_session_key")
+            )
         try:
             sid, tick, run_generation, control_generation = fence
             if control_generation is None:
@@ -87,11 +98,15 @@ class GatewayLoopWakeMixin:
         if self._loop_wake_command_identity(event) != (sid, tick):
             return False
         from hermes_cli.loops import loop_control_generation
+        key_for_source = getattr(self, "_session_key_for_source", None)
+        current_run = getattr(self, "_is_session_run_current", None)
+        run_ok = (
+            current_run(key_for_source(event.source), int(run_generation or 0))
+            if callable(key_for_source) and callable(current_run) else True
+        )
         return (
             loop_control_generation(sid) == int(control_generation)
-            and self._is_session_run_current(
-                self._session_key_for_source(event.source), int(run_generation or 0),
-            )
+            and run_ok
         )
 
     async def _invoke_loop_wake_effect(self, event: Any, handler, *args, **kwargs):
@@ -132,13 +147,26 @@ class GatewayLoopWakeMixin:
 
     async def _prepare_loop_wake_execution(self, event: Any, source: Any) -> bool:
         """Revalidate the one admission token before preparation, hooks or command dispatch."""
+        metadata = getattr(event, "metadata", None) or {}
+        stamped_wake = bool(metadata.get("loop_wakeup") or metadata.get("hermes_loop_wakeup"))
+        if stamped_wake and not metadata.get("gateway_session_key") and not getattr(
+            event, "_gateway_loop_execution_fence", None
+        ):
+            return True
+        if stamped_wake and not callable(getattr(self, "_session_key_for_source", None)):
+            identity = self._loop_wake_command_identity(event)
+            if identity is not None:
+                from hermes_cli.loops import loop_control_generation
+                event._gateway_loop_execution_fence = (*identity, 0, loop_control_generation(identity[0]))
+            return True
         identity = self._loop_wake_command_identity(event)
         if identity is None:
-            return not (getattr(event, "metadata", None) or {}).get("hermes_loop_wakeup")
+            return not stamped_wake
         sid, tick = identity
         fence = getattr(event, "_gateway_loop_execution_fence", None)
-        generation = fence[2] if fence is not None else self._current_session_run_generation(
-            self._session_key_for_source(source),
+        generation = fence[2] if fence is not None else (
+            self._current_session_run_generation(self._session_key_for_source(source))
+            if hasattr(self, "_current_session_run_generation") else 0
         )
         control = await self._loop_wake_execution_current(
             sid, tick, source, run_generation=generation,

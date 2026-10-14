@@ -626,8 +626,8 @@ def test_final_capped_command_tick_still_runs(loop_env, cap):
 
 
 @pytest.mark.asyncio
-async def test_unaccepted_loop_wake_rolls_the_tick_back(loop_env):
-    """An adapter that refuses admission without raising must not leave the tick claimed."""
+async def test_unaccepted_loop_wake_skips_started_tick(loop_env):
+    """A refused wake stays started until the watcher recovers it, never replaying the tick."""
     runner = _make_runner()
     route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -654,4 +654,8 @@ async def test_unaccepted_loop_wake_rolls_the_tick_back(loop_env):
     state = loops.load_loop("sid-gateway-loop")
     await GatewayRunner._loop_wakeup_fire_one(runner, "sid-gateway-loop", state, 1e12, set())
     reloaded = loops.load_loop("sid-gateway-loop")
-    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 0
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
