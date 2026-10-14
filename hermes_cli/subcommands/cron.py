@@ -173,6 +173,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_resume.add_argument("job_id", help="Job ID to resume")
     cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
     _flag(cron_resume, "--run-now", help="Re-arm to run now")
+    _flag(cron_resume, "--skip-missed",
+          help="Drop occurrences that elapsed while paused and resume on the next future slot. "
+               "Default resume keeps that slot due so the next tick fires one catch-up run.")
+
+    cron_skip = cron_subparsers.add_parser(
+        "skip", help="Skip the next occurrence(s) of a scheduled recurring job")
+    cron_skip.add_argument("job_id", help="Job ID to skip")
+    cron_skip.add_argument("--count", type=int, default=1,
+                           help="Occurrences to drop, counting the pending next run as the first (default 1)")
 
     cron_run = cron_subparsers.add_parser("run", help="Run a job on the next scheduler tick")
     cron_run.add_argument("job_id", help="Job ID to trigger")
