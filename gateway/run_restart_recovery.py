@@ -10,6 +10,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
+_INPUT_DURABLE_POLL_S = 0.25
 
 
 class ResumeCandidates(list):
@@ -35,14 +36,31 @@ class RestartRecoveryMixin:
             keys.discard(session_key)
 
     @staticmethod
-    def _retire_recovered_followup_spool(event, *, task=None) -> None:
-        """Retire the replay copy once admission handed work to a real turn."""
-        started = task is not None or getattr(event, "_agent_turn_succeeded", None) is False
-        if not started:
-            return
+    def _retire_recovered_followup_spool(event) -> None:
         spool = getattr(event, "_hermes_recovery_spool", None)
         if spool is not None:
             spool.unlink(missing_ok=True)
+
+    async def _recovered_input_durable(self, event) -> bool:
+        """Whether the turn has written this replayed input's own transcript row."""
+        from gateway.run_pending_recovery import input_already_durable
+        return await asyncio.to_thread(
+            input_already_durable, getattr(self, "session_store", None),
+            getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None))
+
+    async def _retire_spool_once_input_durable(self, event) -> None:
+        """Retire the replay copy at the turn's durable start, not at adapter admission.
+
+        ``handle_message`` returns once the session task exists, before the turn has leased the
+        session or persisted anything, so the spool is the only copy until the turn writes its
+        input row (``_persist_turn_start`` stamps the inbound id before the first model call).
+        After that row exists, a restart falls to the turn's ``resume_pending`` marker and boot
+        recovery drops the spool instead of replaying a prompt that may have had effects. An input
+        without a platform id is retired when its turn reports a result.
+        """
+        while not await self._recovered_input_durable(event):
+            await asyncio.sleep(_INPUT_DURABLE_POLL_S)
+        self._retire_recovered_followup_spool(event)
 
     def _interruption_note_delivered(self, session_key: str) -> bool:
         return session_key in getattr(self, "_s2_note_delivered_keys", ())
@@ -155,18 +173,14 @@ class RestartRecoveryMixin:
     async def _observe_recovered_followup(self, adapter, event, session_key: str, *, task=None) -> None:
         """Observe the actual turn, following a busy adapter's successor rather than its receipt."""
         reason = "not-admitted" if event._gateway_accepted is not True else "accepted-without-turn"
+        watcher = asyncio.create_task(self._retire_spool_once_input_durable(event))
         try:
-            self._retire_recovered_followup_spool(event, task=task)
-            await self._follow_startup_resume_turn(
-                adapter, event, session_key, task,
-                on_task_done=lambda done: self._retire_recovered_followup_spool(event, task=done))
+            await self._follow_startup_resume_turn(adapter, event, session_key, task)
             succeeded = getattr(event, "_agent_turn_succeeded", None)
             if isinstance(succeeded, bool):
                 # A failed real turn may have tool effects; never replay it just because it did
                 # not produce a successful final. Its request remains in the durable transcript.
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None:
-                    spool.unlink(missing_ok=True)
+                self._retire_recovered_followup_spool(event)
                 # A real turn replied or reported its own failure; the "still preserved"
                 # notice would be false once the spool is gone, so neither path sends it.
                 self._release_restart_followup_key(session_key)
@@ -180,6 +194,8 @@ class RestartRecoveryMixin:
         except Exception:
             reason = "turn-failed"
             logger.warning("Restored follow-up failed for %s", session_key, exc_info=True)
+        finally:
+            watcher.cancel()
         await self._finish_recovered_followup(event, session_key, reason)
 
     async def _drain_startup_restore_queue(self, keys=None, *, owned_keys=None) -> int:
@@ -247,7 +263,6 @@ class RestartRecoveryMixin:
             await adapter.handle_message(event)
             if recovered:
                 owner = getattr(adapter, "_session_tasks", {}).get(recovery_key)
-                self._retire_recovered_followup_spool(event, task=owner)
                 self._retain_background_task(asyncio.create_task(
                     self._observe_recovered_followup(adapter, event, recovery_key, task=owner)))
             if getattr(event, "_gateway_accepted", False) is not True:

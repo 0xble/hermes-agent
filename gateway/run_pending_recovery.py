@@ -95,6 +95,51 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     adapter, source = ready
     if adapter is None:
         return None
+    return _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events)
+
+
+def _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events):
+    """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
+    followup = data.get("shutdown_follow_up") is True
+    if followup and input_already_durable(runner.session_store, session_id, data.get("message_id")):
+        # A previous boot's turn persisted this input before the restart cut it: the turn's own
+        # resume_pending marker owns it now, and replaying the prompt could repeat tool effects.
+        logger.info("Dropping recovered follow-up for %s: its turn already persisted it", key)
+        return DROP_PENDING
+    event = _recovered_followup_event(data, source, author_id)
+    setattr(event, "_hermes_recovered_followup", True)
+    setattr(event, "_hermes_recovery_spool", path)
+    if followup:
+        setattr(event, "_hermes_recovery_session_key", key)
+        setattr(event, "_hermes_recovery_session_id", session_id)
+    if recovered_events is not None:
+        recovered_events.append(event)
+    else:
+        # Compatibility for direct callers that are already on the gateway loop.
+        runner._queue_startup_restore_event(event)
+    return True
+
+
+def input_already_durable(store, session_id, message_id) -> bool:
+    """True when a turn already wrote this platform message as a user row of *session_id*.
+
+    The agent stamps the raw inbound id on the turn's user row at turn start, before the first
+    model call, so this is the turn's durable-start point for a replayed input.
+    """
+    probe = getattr(store, "has_platform_message_id", None)
+    if not session_id or message_id is None or not callable(probe):
+        return False
+    try:
+        tip_for = getattr(store, "_compression_tip_for_session_id", None)
+        tip = tip_for(session_id) if callable(tip_for) else session_id
+        return any(bool(probe(sid, str(message_id))) for sid in dict.fromkeys((session_id, tip)) if sid)
+    except Exception:
+        logger.debug("Recovered follow-up durability probe failed for %s", session_id, exc_info=True)
+        return False
+
+
+def _recovered_followup_event(data, source, author_id):
+    """Rebuild the spooled inbound as a MessageEvent bound to its restored source."""
     from gateway.platforms.event import MessageEvent
     from gateway.session_identity import replace_source
     message_id = data.get("message_id")
@@ -105,7 +150,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         is_bot=bool(data.get("source_is_bot", False)),
         role_authorized=bool(data.get("source_role_authorized", False)),
     )
-    event = MessageEvent(
+    return MessageEvent(
         text=data.get("text") or "", message_type=recovered_message_type(data), source=source,
         user_id=data.get("user_id") or author_id,
         user_name=data.get("user_name") or source.user_name,
@@ -123,16 +168,6 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         metadata=data.get("metadata") or {},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
-    setattr(event, "_hermes_recovered_followup", True)
-    setattr(event, "_hermes_recovery_spool", path)
-    if data.get("shutdown_follow_up") is True:
-        setattr(event, "_hermes_recovery_session_key", key)
-    if recovered_events is not None:
-        recovered_events.append(event)
-    else:
-        # Compatibility for direct callers that are already on the gateway loop.
-        runner._queue_startup_restore_event(event)
-    return True
 
 
 def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None, recovered_events=None) -> int:

@@ -157,34 +157,40 @@ async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_started_recovered_followup_retires_spool_before_later_restart(tmp_path, monkeypatch):
+async def test_recovered_followup_spool_retires_at_durable_turn_start_not_admission(tmp_path, monkeypatch):
+    """handle_message only schedules the turn; the spool is the only copy until the input row lands,
+    and is retired then (mid-turn), so a later restart never replays a prompt with tool effects."""
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
-    event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id)
+    event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id, message_id="m-7")
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
-    db = Mock()
-    recover_pending_to_db(
-        db,
-        session_resolver=lambda *args, **kwargs: (entry.session_id, db),
-        deferred_followup=partial(_defer_followup, runner, {}, None),
-    )
+    recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+                          deferred_followup=partial(_defer_followup, runner, {}, None))
     spool, = (tmp_path / "pending_messages").glob("*.json")
-    started = asyncio.Event()
-    release = asyncio.Event()
+    persist, release = asyncio.Event(), asyncio.Event()
 
-    async def turn():
-        started.set()
+    async def turn(recovered):
+        await persist.wait()  # lease, transcript load, hygiene, agent build: no durable input yet
+        runner.session_store.append_to_transcript(entry.session_id, {
+            "role": "user", "content": recovered.text, "platform_message_id": "m-7"})
         await release.wait()
 
     async def handle(recovered):
         recovered._gateway_accepted = True
-        recovered._agent_turn_succeeded = False
-        adapter._session_tasks[entry.session_key] = asyncio.create_task(turn())
+        adapter._session_tasks[entry.session_key] = asyncio.create_task(turn(recovered))
 
     adapter.handle_message = handle
     assert await runner._drain_startup_restore_queue() == 1
-    await asyncio.wait_for(started.wait(), 2)
+    for _ in range(5):
+        await asyncio.sleep(0.05)
+    assert spool.exists(), "a crash before the turn persisted its input would lose the follow-up"
+    persist.set()
+    for _ in range(40):
+        if not spool.exists():
+            break
+        await asyncio.sleep(0.05)
     assert not spool.exists()
 
+    # A second restart cuts the turn: the next boot must not replay the follow-up.
     observers = list(runner._background_tasks)
     for task in observers:
         task.cancel()
@@ -192,14 +198,25 @@ async def test_started_recovered_followup_retires_spool_before_later_restart(tmp
     owner = adapter._session_tasks.pop(entry.session_key)
     owner.cancel()
     await asyncio.gather(owner, return_exceptions=True)
-
     fresh_runner, _adapter, fresh_entry, _source = _setup(tmp_path, monkeypatch)
     assert recover_pending_to_db(
-        Mock(),
-        session_resolver=lambda *args, **kwargs: (fresh_entry.session_id, Mock()),
-        deferred_followup=partial(_defer_followup, fresh_runner, {}, None),
-    ) == 0
+        Mock(), session_resolver=lambda *args, **kwargs: (fresh_entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, fresh_runner, {}, None)) == 0
     assert fresh_entry.session_key not in runner._restart_followup_keys
+
+
+def test_followup_spool_whose_input_is_already_durable_is_dropped_not_replayed(tmp_path, monkeypatch):
+    """A crash between the durable input row and retirement must fall to resume_pending."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id, message_id="m-8")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "do the side effect", "platform_message_id": "m-8"})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
+    assert runner._startup_restore_queue == []
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
 def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_error(tmp_path, monkeypatch):

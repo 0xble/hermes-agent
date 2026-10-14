@@ -107,10 +107,17 @@ remain real constraints; this unit does not promise unconditional visibility.
 marker has been cleared. At read time, including for old spools, it uses the
 existing drain-deferred admission path instead of becoming a user row with no
 turn. A restored prompt owns recovery ahead of a synthetic empty resume. Its
-spool survives an admission refusal, but is retired once a real adapter task
-owns the turn: a crash or restart during that turn falls to the turn's own
-`resume_pending` marker instead of replaying the whole prompt, because the
-prompt may already have caused tool effects. A failed real turn is
+spool survives an admission refusal, and survives adapter admission too:
+`handle_message` returns once the session task exists, before the turn leases
+the session or persists anything, so the spool is still the only copy. It is
+retired at the turn's durable start, when the agent's turn-start flush writes
+the user row carrying the inbound `platform_message_id`
+(`_retire_spool_once_input_durable`), or when the turn reports a result. From
+that point a crash or restart falls to the turn's own `resume_pending` marker
+instead of replaying the whole prompt, because the prompt may already have
+caused tool effects. A boot that finds a follow-up spool whose input row is
+already durable (crash between the row and retirement) drops it
+(`input_already_durable`). A failed real turn is
 `skipped:turn-failed` with no recovery notice, since its spool is gone and it
 reported its own failure.
 
@@ -122,7 +129,8 @@ Run `tests/gateway/test_shutdown_followup_restart.py` as well as the recovery
 corpus. The queue drain now lives beside those decisions in
 `gateway/run_restart_recovery.py`.
 
-Run `tests/gateway/test_restart_recovery_outcomes.py` in addition to the corpus
+Run `tests/gateway/test_restart_recovery_outcomes.py` and
+`tests/gateway/test_restart_resume_admission_identity.py` in addition to the corpus
 below. Planned update classification is separately owned by `fix/breaker-update-planned`
 (PR #557); this unit does not duplicate it. Per-session admission identity was
 already present at the base. No new dependency, configuration, or persistence
