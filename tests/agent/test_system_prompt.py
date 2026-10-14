@@ -586,6 +586,7 @@ class TestTelegramRichMessagesHint:
         assert "Standard Markdown auto-converts" in stable
         assert "lean into it" not in stable
         assert "task lists" not in stable
+        assert "<details><summary>" not in stable
 
     def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
         """When rich_messages is True in gateway.platforms, the extension
@@ -599,6 +600,7 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" in stable
         assert "task lists" in stable
         assert "math/formulas" in stable
+        assert "dense secondary content" in stable
 
     def test_rich_hint_from_top_level_platforms(self):
         """Top-level ``platforms.telegram.extra.rich_messages`` is merged
