@@ -89,6 +89,27 @@ def test_classifier_shell_forms_and_read_only(tmp_path):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
 
 
+def test_classifier_known_boolean_flags_do_not_consume_subcommands():
+    commands = [
+        'slack --account ALIAS --json message send CHANNEL "$(cat file)" --yes',
+        'telegram --agent --yes send peer "$(cat file)" --topic 1 --silent',
+        "gog --json gmail send",
+        "wacli --json send text",
+    ]
+    for command in commands:
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
+
+    # A value-taking option still consumes its value, and later positional
+    # arguments/read-only verbs remain negative.
+    for command in (
+        "slack --account ALIAS message list",
+        "gog --json gmail search reply",
+        "telegram --yes chats send",
+        "wacli --json list send",
+    ):
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+
+
 def test_classifier_scans_only_executed_script_files(tmp_path, monkeypatch):
     read_files = {
         "jobs.json": '{"message": "slack message send"}',
@@ -173,6 +194,33 @@ def test_one_human_approval_consumes_exactly_one_send(monkeypatch):
     result = voice_send_gate.authorize_voice_send(agent, "terminal", command)
     assert result and "not approved" in result
     assert len(calls) == 2
+
+
+def test_production_sessiondb_allows_two_fresh_identical_grants(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    calls = []
+    monkeypatch.setattr(voice_send_gate.approval, "_presence", lambda _cb: (None, True, False, False))
+
+    def approve_twice(*_a, **_kw):
+        calls.append(1)
+        return {"approved": len(calls) <= 2}
+
+    monkeypatch.setattr(voice_send_gate.approval, "_human_decision", approve_twice)
+    agent = _agent(db)
+    command = {"command": "slack message send identical"}
+
+    assert voice_send_gate.authorize_voice_send(agent, "terminal", command) is None
+    assert voice_send_gate.authorize_voice_send(agent, "terminal", command) is None
+    third = voice_send_gate.authorize_voice_send(agent, "terminal", command)
+
+    classified = voice_send_gate.classify_voice_send("terminal", command)
+    assert classified is not None
+    assert third and "not approved" in third
+    assert len(voice_send_gate.consumed_grant_timestamps(
+        db, "sid", classified["action_hash"])) == 2
+    assert len(calls) == 3
 
 
 def test_concurrent_identical_authorize_calls_consume_one_grant(monkeypatch):
@@ -303,6 +351,34 @@ def test_goal_judge_voice_send_floor_is_scoped_to_current_turn(monkeypatch):
 
     # Direct callers retain the incident-replay behavior of checking the whole window.
     verdict, reason, *_ = goals.judge_goal("send", "done", evidence=older)
+    assert verdict == "blocked"
+    assert "deterministic voice-send floor" in reason
+
+
+def test_goal_judge_voice_send_floor_survives_display_cap(monkeypatch):
+    from hermes_cli import goals
+
+    send = {
+        "tool": "terminal",
+        "call": json.dumps({"command": "slack message send unapproved"}),
+        "output": "sent",
+        "timestamp": 20.0,
+        "voice_send_action_hash": "unapproved-hash",
+        "voice_send_granted": False,
+    }
+    later = [
+        {"tool": "terminal", "call": json.dumps({"command": f"printf status-{i}"}),
+         "output": "ok", "timestamp": 21.0 + i}
+        for i in range(8)
+    ]
+    # The display ledger contains only the last eight rows, but the hidden
+    # floor ledger retains the send and must still block before the LLM.
+    evidence = goals._EvidenceRows(later, voice_send_entries=[send] + later)
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: '{"verdict":"done","reason":"ok"}')
+
+    verdict, reason, *_ = goals.judge_goal(
+        "send", "done", evidence=evidence, voice_send_since=20.0,
+    )
     assert verdict == "blocked"
     assert "deterministic voice-send floor" in reason
 

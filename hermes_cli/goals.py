@@ -1547,11 +1547,17 @@ _VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS = 120.0
 
 
 class _EvidenceRows(list):
-    """Evidence entries plus whether the bounded SessionDB scan omitted rows."""
+    """Evidence entries plus bounded-scan and deterministic voice-send metadata."""
 
-    def __init__(self, entries: List[Dict[str, Any]], *, truncated: bool = False):
+    def __init__(self, entries: List[Dict[str, Any]], *, truncated: bool = False,
+                 voice_send_entries: Optional[List[Dict[str, Any]]] = None):
         super().__init__(entries)
         self.truncated = truncated
+        # The prompt ledger may be capped, but the approval floor must inspect
+        # every classified send from the current scan.
+        self.voice_send_entries = list(voice_send_entries if voice_send_entries is not None else (
+            item for item in entries if isinstance(item, dict) and "voice_send_action_hash" in item
+        ))
 
 
 def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
@@ -1633,7 +1639,8 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         entries.append({"tool": name, "call": call_text, "output": output,
                         "timestamp": float(row.get("timestamp") or 0.0), **voice_fields})
     selected = entries if max_entries is None else entries[-max_entries:]
-    return _EvidenceRows(selected, truncated=scan_truncated)
+    voice_send_entries = [item for item in entries if "voice_send_action_hash" in item]
+    return _EvidenceRows(selected, truncated=scan_truncated, voice_send_entries=voice_send_entries)
 
 
 def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
@@ -2084,10 +2091,10 @@ def judge_goal(
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
         return "continue", "empty response (nothing to evaluate)", False, None, False
-    voice_evidence = evidence
+    voice_evidence = getattr(evidence, "voice_send_entries", evidence)
     if voice_send_since > 0.0:
         voice_evidence = []
-        for item in evidence or []:
+        for item in getattr(evidence, "voice_send_entries", evidence) or []:
             if not isinstance(item, dict):
                 continue
             try:
@@ -3576,9 +3583,14 @@ class GoalManager:
                 return self._budget_pause(state, "gate_failed", gate_decision.get("reason", ""), note=" (a quality gate is still failing)")
             return gate_decision
 
-        # Keep the judge-facing ledger bounded even though progress classification needs the
-        # complete current-turn slice. A bounded scan that omitted rows fails closed below.
-        evidence = evidence[-_EVIDENCE_MAX_ENTRIES:]
+        # Keep the judge-facing ledger bounded while preserving every classified
+        # current-turn send for the deterministic approval floor.
+        voice_send_entries = getattr(evidence, "voice_send_entries", None)
+        evidence = _EvidenceRows(
+            list(evidence[-_EVIDENCE_MAX_ENTRIES:]),
+            truncated=bool(getattr(evidence, "truncated", False)),
+            voice_send_entries=voice_send_entries,
+        )
         # Gates that just passed are deterministic evidence too, but their timestamp is a
         # presentation detail and must not affect no-progress identity.
         now = time.time()

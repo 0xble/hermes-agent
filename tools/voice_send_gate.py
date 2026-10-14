@@ -51,6 +51,15 @@ _INTERPRETER_NAMES = _SHELL_NAMES | frozenset({
     "python", "python3", "python2", "node", "ruby", "perl", "deno", "bun", "uv", "uvx",
 })
 _SHELL_OPERATORS = frozenset({";", "&&", "||", "|", "(", ")"})
+# Options before a CLI subcommand need a small amount of option-shape knowledge:
+# these documented switches are booleans, while unknown options remain
+# value-taking by default so a value-taking flag cannot expose a send verb.
+_BOOLEAN_OPTIONS = {
+    "slack": frozenset({"--json", "--yes"}),
+    "telegram": frozenset({"--agent", "--yes", "--silent"}),
+    "gog": frozenset({"--json"}),
+    "wacli": frozenset({"--json"}),
+}
 _MAX_SCRIPT_BYTES = 1_000_000
 
 
@@ -153,23 +162,24 @@ def _looks_like_shell_script(path: Path, content: str) -> bool:
     return bool(first_line and re.search(r"#!.*\b(?:bash|sh|zsh|dash|ksh|fish)\b", first_line[0], re.I))
 
 
-def _first_non_option(tokens: list[str], start: int) -> Optional[int]:
+def _first_non_option(tokens: list[str], start: int, cli: Optional[str] = None) -> Optional[int]:
     """Find the next command token, ignoring option switches but not their values.
 
     CLI options before a subcommand are common (for example ``slack --account X
-    message send``). Once the known prefix is matched, only the first non-option
-    token may be the verb; later positional arguments must not turn a read-only
-    command into a send.
+    message send``). Known boolean flags do not consume the following token;
+    value-taking flags still do. Once the known prefix is matched, only the first
+    non-option token may be the verb; later positional arguments must not turn a
+    read-only command into a send.
     """
     index = start
+    boolean_options = _BOOLEAN_OPTIONS.get((cli or "").lower(), frozenset())
     while index < len(tokens):
         token = tokens[index]
         if not token.startswith("-"):
             return index
-        # Options in the CLI/prefix portion generally consume one value unless
-        # written as --name=value. This keeps ``--account lpg message`` from
-        # treating ``lpg`` as the subcommand.
-        if "=" not in token and index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+        # ``--name=value`` is self-contained. Known booleans are also
+        # self-contained; every other option conservatively consumes one value.
+        if "=" not in token and token.lower() not in boolean_options and index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
             index += 2
         else:
             index += 1
@@ -190,7 +200,7 @@ def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optio
     if "--help" in tail or "-h" in tail:
         return False, None, None
     for prefix, verbs in table.items():
-        prefix_index = _first_non_option(tokens, command_index + 1)
+        prefix_index = _first_non_option(tokens, command_index + 1, cli)
         if not prefix:
             verb_index = prefix_index
         else:
@@ -199,7 +209,7 @@ def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optio
                 part.lower() for part in tokens[prefix_index:prefix_index + len(prefix_lower)]
             ) != prefix_lower:
                 continue
-            verb_index = _first_non_option(tokens, prefix_index + len(prefix_lower))
+            verb_index = _first_non_option(tokens, prefix_index + len(prefix_lower), cli)
         if verb_index is not None and tokens[verb_index].lower() in verbs:
             return True, cli, _account_from_tokens(tokens)
     return False, None, None
@@ -401,8 +411,32 @@ def _consumed_timestamps(row: Optional[dict]) -> list[float]:
     return result
 
 
+def _grant_records(row: Optional[dict]) -> list[dict]:
+    """Return durable grant records, including the pre-multi-grant legacy shape."""
+    if not isinstance(row, dict):
+        return []
+    grants = row.get("grants")
+    if isinstance(grants, list):
+        return [grant for grant in grants if isinstance(grant, dict)]
+    if row.get("approved_at") or "consumed_at" in row:
+        return [row]
+    return []
+
+
+def _grant_container(records: list[dict]) -> dict:
+    return {"grants": records}
+
+
+def _has_available_grant(row: Optional[dict]) -> bool:
+    return any(record.get("approved_at") and not _consumed_timestamps(record)
+               for record in _grant_records(row))
+
+
 def consumed_grant_timestamps(db: Any, session_id: str, action_hash: str) -> list[float]:
-    return _consumed_timestamps(_read_grant(db, session_id, action_hash))
+    timestamps: list[float] = []
+    for record in _grant_records(_read_grant(db, session_id, action_hash)):
+        timestamps.extend(_consumed_timestamps(record))
+    return timestamps
 
 
 def has_consumed_grant(db: Any, session_id: str, action_hash: str) -> bool:
@@ -455,25 +489,29 @@ def _transactional_grant_update(db: Any, key: str, update) -> Optional[bool]:
 def _consume_existing_grant(db: Any, session_id: str, action_hash: str) -> Optional[bool]:
     key = _meta_key(session_id, action_hash)
 
-    def _consume(record):
-        if not isinstance(record, dict) or not record.get("approved_at"):
-            return None
-        if _consumed_timestamps(record):
-            return None
-        updated = dict(record)
-        _append_consumed_at(updated)
-        return updated
+    def _consume(row):
+        records = _grant_records(row)
+        for record in records:
+            if record.get("approved_at") and not _consumed_timestamps(record):
+                updated = [dict(item) for item in records]
+                index = records.index(record)
+                _append_consumed_at(updated[index])
+                return _grant_container(updated)
+        return None
 
     result = _transactional_grant_update(db, key, _consume)
     if result is not None:
         return result
     existing = _read_grant(db, session_id, action_hash)
-    if existing and existing.get("approved_at") and not _consumed_timestamps(existing):
-        updated = dict(existing)
-        _append_consumed_at(updated)
-        if not _write_grant(db, session_id, action_hash, updated):
-            return None
-        return True
+    records = _grant_records(existing)
+    for record in records:
+        if record.get("approved_at") and not _consumed_timestamps(record):
+            updated = [dict(item) for item in records]
+            index = records.index(record)
+            _append_consumed_at(updated[index])
+            if not _write_grant(db, session_id, action_hash, _grant_container(updated)):
+                return None
+            return True
     return False
 
 
@@ -481,16 +519,17 @@ def _store_consumed_grant(db: Any, session_id: str, action_hash: str, record: di
     key = _meta_key(session_id, action_hash)
 
     def _store(existing):
-        # Two concurrent approvals for the same exact action must not both
-        # replace the record after one has already claimed it.
-        if isinstance(existing, dict) and _consumed_timestamps(existing):
-            return None
-        return record
+        # A fresh approval is a new one-shot grant even when an earlier grant
+        # for this exact action was consumed. Appending inside the transaction
+        # preserves atomicity for concurrent approvals and sends.
+        return _grant_container([*(_grant_records(existing)), record])
 
     result = _transactional_grant_update(db, key, _store)
     if result is not None:
         return result
-    if not _write_grant(db, session_id, action_hash, record):
+    existing = _read_grant(db, session_id, action_hash)
+    records = [*(_grant_records(existing)), record]
+    if not _write_grant(db, session_id, action_hash, _grant_container(records)):
         return None
     return True
 
@@ -509,7 +548,7 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
     action_hash = classified["action_hash"]
 
     existing = _read_grant(db, session_id, action_hash)
-    if existing and existing.get("approved_at") and not _consumed_timestamps(existing):
+    if _has_available_grant(existing):
         consumed = _consume_existing_grant(db, session_id, action_hash)
         if consumed is True:
             return None
