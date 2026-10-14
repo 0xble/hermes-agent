@@ -2826,6 +2826,48 @@ class TestRestoreCronJobsIfEmptied:
         assert len(restored["jobs"]) == 3
 
 
+    def test_non_utf8_journal_does_not_stop_restore(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        (hermes_home / "cron" / "removed_jobs.jsonl").write_bytes(b"{\xff\n")
+        jobs_path.write_text(json.dumps({"jobs": []}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+
+        assert result is not None
+        assert result["restored"] is True
+        assert result["job_count"] == 2
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"a", "b"}
+
+
+    def test_append_after_corrupt_journal_excludes_deleted_job_from_restore(self, tmp_path):
+        from cron.jobs import remove_job, use_cron_store
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        self._seed_jobs(jobs_path, [{"id": "a"}, {"id": "b"}])
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        removed_file = hermes_home / "cron" / "removed_jobs.jsonl"
+        removed_file.write_bytes(b"{\xff\n")
+        with use_cron_store(hermes_home):
+            assert remove_job("a") is True
+        jobs_path.write_text(json.dumps({"jobs": []}))
+
+        result = restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home)
+
+        assert result is not None
+        assert result["restored"] is True
+        assert result["job_count"] == 1
+        assert {job["id"] for job in json.loads(jobs_path.read_text())["jobs"]} == {"b"}
+
+
     def test_restores_when_partial_job_loss(self, tmp_path):
         """Desktop scheduler overwrites jobs.json with its own small set,
         losing tool-created crons while keeping desktop-tracked ones."""

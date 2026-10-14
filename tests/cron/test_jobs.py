@@ -358,6 +358,18 @@ def test_removed_job_journal_prunes_entries_older_than_seven_days(tmp_cron_dir, 
     assert {record["id"] for record in records} == {"new"}
 
 
+def test_removed_job_journal_append_recovers_from_non_utf8_contents(tmp_cron_dir):
+    from cron import jobs
+
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    removed_file.write_bytes(b"{\xff\n")
+
+    jobs._record_removed_jobs_unlocked({"deleted"})
+
+    assert jobs.get_removed_job_ids() == {"deleted"}
+
+
 class TestJobCRUD:
     def test_cjk_and_emoji_round_trip_readable_in_jobs_json(self, tmp_cron_dir):
         """CJK/emoji job text must round-trip AND stay human-readable on disk.

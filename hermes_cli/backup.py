@@ -1566,7 +1566,7 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
                     return None
                 cron_jobs.save_jobs(live_jobs + restored_jobs)
     except (OSError, PermissionError, RuntimeError) as exc:
-        logger.error("Cron jobs were emptied during update but auto-restore failed: %s", exc)
+        logger.error("Cron auto-restore failed: %s", exc)
         return None
     logger.warning(
         "Restored %d cron job(s) from pre-update snapshot %s "

@@ -1640,7 +1640,11 @@ def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
     path = _removed_jobs_file()
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
-    except OSError:
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read intentional cron job delete journal %s; "
+            "treating deletes as unknown and restoring missing jobs: %s",
+            path, exc)
         return set()
     boundary = since
     if boundary is not None:
@@ -1676,6 +1680,12 @@ def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
     try:
         existing = removed_file.read_text(encoding="utf-8-sig").splitlines()
     except FileNotFoundError:
+        existing = []
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read intentional cron job delete journal %s; "
+            "rewriting it before recording new deletes: %s",
+            removed_file, exc)
         existing = []
     for line in existing:
         try:
