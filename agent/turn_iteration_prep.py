@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 from agent.display import KawaiiSpinner
+from agent.fallback_route_recovery import _maybe_recheck_fallback_route_for_iteration
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
 from agent.turn_context_compaction import _reanchor
 from agent.turn_truncation import boosted_output_cap
@@ -349,11 +350,13 @@ class IterationStart:
     api_call_count: Any
     interrupted: Any
     _turn_exit_reason: Any
+    active_system_prompt: Any = None
 
 
 def begin_iteration(
     agent: Any, *, messages: Any, conversation_history: Any, original_user_message: Any,
     api_call_count: Any, interrupted: Any, _turn_exit_reason: Any,
+    active_system_prompt: Any = None, restart_count: Any = 0,
 ) -> IterationStart:
     """Iteration entry in the original order: apply a pending redirect, reset the checkpoint
     dedup, then the interrupt / review-budget / iteration-budget exits. ``api_call_count`` is
@@ -362,11 +365,19 @@ def begin_iteration(
         _apply_active_turn_redirect, _review_input_budget_exhausted
     )
 
+    # A retry rebuild is still the same logical iteration: give a freshly
+    # activated provider fallback its pending request before probing recovery.
+    # Voice turns and explicit route bindings must remain pinned for the turn.
+    if restart_count == 0 and getattr(agent, "_provider_fallback_active", False):
+        active_system_prompt = _maybe_recheck_fallback_route_for_iteration(
+            agent, active_system_prompt
+        )
+
     def _verdict(action: str) -> IterationStart:
         return IterationStart(
             action=action, original_user_message=original_user_message,
             api_call_count=api_call_count, interrupted=interrupted,
-            _turn_exit_reason=_turn_exit_reason,
+            _turn_exit_reason=_turn_exit_reason, active_system_prompt=active_system_prompt,
         )
 
     _redirect_text = agent._drain_pending_redirect()
