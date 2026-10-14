@@ -81,8 +81,13 @@ def helper(monkeypatch):
     ("pytest -n 8 tests/tools/test_a.py", "pytest"),
     ("pytest --numprocesses=auto tests/tools/test_a.py", "pytest"),
     ("jest --maxWorkers=4 src/a.test.js", "jest"),
+    ("jest -w 8", "jest"),
     ("vitest --pool=threads src/a.test.ts", "vitest"),
     ("vitest run --maxWorkers 4 src/a.test.ts", "vitest"),
+    ("vitest --watch=false", "vitest"),
+    ("vitest run --watch=false", "vitest"),
+    ("jest --watch=false", "jest"),
+    ("pnpm test --watch=false", "test"),
     ("scripts/run_tests.sh --workers 8 tests/agent/test_foo.py", "run_tests"),
 ])
 def test_recognizes_heavy_commands(command, label, helper):
@@ -129,7 +134,6 @@ def test_leaves_light_commands_alone(command):
     ("vitest --watch", None),
     ("vitest -w", None),
     ("jest --watch", None),
-    ("jest -w", None),
     ("pnpm build --watch", None),
     ("npm run build:watch", None),
     ("pnpm watch", None),

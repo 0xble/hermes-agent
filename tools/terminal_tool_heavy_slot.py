@@ -63,7 +63,7 @@ _SUITE_RUNNERS = {"tox", "nox"}
 # Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
 _LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
 _INFO_FLAGS = {"--version", "--help", "-h"}
-_WATCH_FLAGS = {"--watch", "-w"}
+_WATCH_FLAGS = {"--watch", "--watch=true", "--watchAll", "--watchAll=true"}
 # Options a targeted run may carry and still count as light. This is an allowlist on
 # purpose: any other option (pytest -n/--dist, jest --maxWorkers, vitest --pool, a
 # runner's own --workers or --jobs) may fan out, so it falls back to the slot.
@@ -145,7 +145,7 @@ def _is_watch_script(word: str) -> bool:
 
 def _heavy_script(args: list[str]) -> Optional[str]:
     """Ignore package names and watch modes when finding a heavy package script."""
-    if any(arg == "--watch" or arg.startswith("--watch=") for arg in args):
+    if any(arg in _WATCH_FLAGS for arg in args):
         return None
     skip = False
     for arg in args:
@@ -235,7 +235,7 @@ def classify_words(words: list[str]) -> Optional[str]:
     if any(arg in _INFO_FLAGS for arg in args):
         return None
     if name in {"tsc", "vitest", "jest"} and any(
-        arg in _WATCH_FLAGS or arg.startswith("--watch=") for arg in args
+        arg in _WATCH_FLAGS or (arg == "-w" and name in {"tsc", "vitest"}) for arg in args
     ):
         return None
 

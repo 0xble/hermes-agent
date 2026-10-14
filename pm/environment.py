@@ -276,6 +276,7 @@ class PythonEnvironment:
         # uv's install concurrency also sizes its bytecode compiler pool. The
         # ambient UV_* knobs are stripped above; bind both CPU-heavy pools here.
         workers = env.get("HERMES_TEST_WORKERS") or "4"
+        # Invalid values intentionally fall back to 4 so ambient env can't break installs; test runners reject them.
         if not workers.isascii() or not workers.isdecimal() or int(workers) < 1:
             workers = "4"
         env.update(UV_CONCURRENT_BUILDS=workers, UV_CONCURRENT_INSTALLS=workers)
