@@ -757,6 +757,7 @@ gateway:
     drain_rejected: "⏳ Gateway {action} ve şu anda yeni bir tur kabul etmiyor."
     drain_rejected_new_work: "⏳ Gateway {action} ve şu anda yeni iş kabul etmiyor."
     demoted_tail: " — mesajınız, mevcut iş bitince işlenmek üzere sıraya alındı (her şeyi iptal etmek için /stop kullanın)."
+    deferred_dropped: "⚠️ `/{command}` çalışmadı: Hermes ondan önce yeniden başladı veya yeniden bağlandı. Hâlâ gerekiyorsa tekrar gönderin."
     elapsed_min: "{minutes} dk geçti"
     running_tool: "çalışıyor: {tool}"
     ack_detail_wrap: " ({detail})"

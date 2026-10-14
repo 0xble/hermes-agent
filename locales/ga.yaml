@@ -757,6 +757,7 @@ gateway:
     drain_rejected: "⏳ Tá an gateway {action} agus ní ghlacann sé le seal eile faoi láthair."
     drain_rejected_new_work: "⏳ Tá an gateway {action} agus ní ghlacann sé le hobair nua faoi láthair."
     demoted_tail: " — tá do theachtaireacht i scuaine go dtí go gcríochnóidh sé (úsáid /stop chun gach rud a chealú)."
+    deferred_dropped: "⚠️ Níor ritheadh `/{command}`: atosaíodh nó athcheanglaíodh Hermes roimhe sin. Seol arís é más gá duit fós."
     elapsed_min: "{minutes} nóim caite"
     running_tool: "ag rith: {tool}"
     ack_detail_wrap: " ({detail})"

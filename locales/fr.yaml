@@ -878,6 +878,7 @@ gateway:
     drain_rejected: "⏳ Le gateway est {action} et n'accepte pas d'autre tour pour le moment."
     drain_rejected_new_work: "⏳ Le gateway est {action} et n'accepte pas de nouveau travail pour le moment."
     demoted_tail: " — votre message est mis en file jusqu'à ce qu'il termine (utilisez /stop pour tout annuler)."
+    deferred_dropped: "⚠️ `/{command}` n'a pas été exécuté : Hermes a redémarré ou s'est reconnecté avant. Renvoyez-le si vous en avez encore besoin."
     elapsed_min: "{minutes} min écoulées"
     running_tool: "en cours : {tool}"
     ack_detail_wrap: " ({detail})"

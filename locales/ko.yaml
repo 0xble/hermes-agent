@@ -757,6 +757,7 @@ gateway:
     drain_rejected: "⏳ 게이트웨이가 {action}이어서 지금은 다른 턴을 받을 수 없어요."
     drain_rejected_new_work: "⏳ 게이트웨이가 {action}이어서 지금은 새 작업을 받을 수 없어요."
     demoted_tail: " — 메시지는 작업이 끝나면 처리되도록 대기열에 넣었어요 (모두 취소하려면 /stop을 사용하세요)."
+    deferred_dropped: "⚠️ `/{command}`이(가) 실행되지 않았습니다: 그 전에 Hermes가 재시작되거나 다시 연결되었습니다. 아직 필요하면 다시 보내 주세요."
     elapsed_min: "{minutes}분 경과"
     running_tool: "실행 중: {tool}"
     ack_detail_wrap: " ({detail})"

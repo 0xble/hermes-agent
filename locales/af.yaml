@@ -757,6 +757,7 @@ gateway:
     drain_rejected: "⏳ Gateway is {action} en aanvaar nie nou nog 'n beurt nie."
     drain_rejected_new_work: "⏳ Gateway is {action} en aanvaar nie nou nuwe werk nie."
     demoted_tail: " — jou boodskap is in die tou vir wanneer dit klaar is (gebruik /stop om alles te kanselleer)."
+    deferred_dropped: "⚠️ `/{command}` het nie geloop nie: Hermes het eers herbegin of herkoppel. Stuur dit weer as jy dit nog nodig het."
     elapsed_min: "{minutes} min verloop"
     running_tool: "loop: {tool}"
     ack_detail_wrap: " ({detail})"
