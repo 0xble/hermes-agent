@@ -102,7 +102,7 @@ def test_store_failure_preserves_one_shot_and_wake_gate(
         acquire.assert_called()
         script.assert_not_called()
         monitor_source.assert_not_called()
-        assert "monitor_state" not in current
+        assert current["monitor_state"] is None
         agent_class.assert_not_called()
         assert current["last_status"] == "error"
         assert "session store unavailable; run not started" in current["last_error"]
