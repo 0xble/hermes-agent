@@ -4112,8 +4112,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                             asyncio.shield(updater_stop_task), _UPDATER_STOP_TIMEOUT, "updater.stop()")
                         if zero_cut_handover and not updater_stopped:
                             logger.warning(
-                                "[%s] updater.stop() timed out; retaining the bot-token lock until the stop task completes",
+                                "[%s] updater.stop() timed out; releasing the bot-token lock after the bounded stop window",
                                 self.name)
+                            # The existing bounded teardown contract must not deadlock a successor.
+                            # The abandoned stop task remains observed, and its completion callback is
+                            # harmless after this release because _release_platform_lock is idempotent.
+                            self._release_platform_lock()
                     except Exception as stop_error:
                         if zero_cut_handover:
                             self._release_platform_lock()

@@ -120,6 +120,26 @@ def test_disconnect_flag_on_releases_lock_after_updater_stop(monkeypatch):
     assert events.index("release") < events.index("app.stop")
 
 
+def test_disconnect_flag_on_releases_lock_when_updater_stop_times_out(monkeypatch):
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+
+    async def bounded_timeout(awaitable, _timeout, step):
+        if step == "updater.stop()":
+            # The real stop task remains detached and observed, but teardown must not deadlock.
+            return False
+        if asyncio.iscoroutine(awaitable):
+            await awaitable
+        events.append(step)
+        return True
+
+    monkeypatch.setattr(adapter, "_await_disconnect_step", bounded_timeout)
+    asyncio.run(adapter.disconnect())
+
+    assert "release" in events
+    assert events.index("release") < events.index("app.stop")
+
+
 __all__ = [
     "test_zero_cut_handover_defaults_off",
     "test_launchd_slot_labels_reuse_default_label_convention",
