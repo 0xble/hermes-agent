@@ -646,6 +646,18 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     retry_replacement TEXT
 );
 
+CREATE TABLE IF NOT EXISTS async_delegation_child_recovery (
+    delegation_id TEXT NOT NULL,
+    task_index INTEGER NOT NULL,
+    claim TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    replacement_delegation_id TEXT,
+    PRIMARY KEY (delegation_id, task_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_async_delegation_child_recovery_claim
+    ON async_delegation_child_recovery(delegation_id, claimed_at);
+
 CREATE TABLE IF NOT EXISTS async_delegation_events (
     event_id TEXT PRIMARY KEY,
     delegation_id TEXT NOT NULL,
@@ -1209,7 +1221,7 @@ def _lock_holder_provably_dead(record) -> bool:
     if not persistent_record_pidns_checkable(record.get("pidns")):
         return False  # foreign namespace: a local reading is not proof — defer
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — called only by the POSIX flock acquisition path
     except ProcessLookupError:
         return True
     except OSError:

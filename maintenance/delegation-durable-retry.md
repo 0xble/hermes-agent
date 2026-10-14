@@ -86,9 +86,12 @@ authorization settles the obligation without delivery.
   including units whose interrupted child makes their lifecycle status `error`.
   Shutdown/stall reasons remain system interruptions, not user cancellations.
 - `action='stop'`, `/stop`, and session-ending stops also CAS still-owed durable
-  retries to `cancelled`, clear their claims, and suppress their notices/reports.
-  The same session selectors as live interruption apply, with owner checks on model
-  control. Gateway shutdown preserves retry obligations. Original completion/outbox
+  retries to `cancelled`, clear their claims, and suppress their notices. The sweep
+  records `retry_reason='stopped by user'`; if the row already owes a terminal
+  settlement, that report is claimed and emitted once before it settles. The same
+  session selectors as live interruption apply, with owner checks on model control.
+  Gateway shutdown/lifecycle cuts preserve retry obligations, including legacy
+  phase-specific reasons and unplanned shutdowns. Original completion/outbox
   delivery remains separate; its stale automatic-retry promise is recomputed.
 - Rows written before this unit (`retry_state='none'`) keep the legacy one-shot
   resume and boot notice. Boot notices skip retry-owned rows.
