@@ -100,6 +100,11 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
     expected_title = str(contract.get("title") or "").strip()
     if expected_title and _title(text) != expected_title:
         violations.append(f"title must be {expected_title!r}")
+    # The title is the only top-level heading a contract allows; a second H1
+    # would let a rewrite smuggle an undeclared section past the H2 checks.
+    top_level = [line for line in _contract_lines(text) if re.match(r"^ {0,3}#\s+\S", line)]
+    if len(top_level) > 1:
+        violations.append("contains an extra top-level heading")
 
     required_lines = contract.get("required_lines") or []
     for required in required_lines:

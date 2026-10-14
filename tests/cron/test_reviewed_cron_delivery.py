@@ -31,6 +31,14 @@ def test_contract_pass_and_rejects_order_unknown_and_cap():
     assert len(result["violations"]) >= 3
 
 
+@pytest.mark.parametrize("text, passed", [
+    (GOOD + "# Internal notes\n- hidden\n", False),
+    (GOOD + "```text\n# Quoted heading\n```\n", True),
+])
+def test_contract_rejects_a_second_top_level_heading(text, passed):
+    assert check_contract(text, CONTRACT)["passed"] is passed
+
+
 def test_silence_marker_is_a_contract_pass():
     result = check_contract("[SILENT]", CONTRACT)
     assert result["passed"] and result["silent"]
