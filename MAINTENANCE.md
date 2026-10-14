@@ -308,6 +308,17 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream or PTB proves first-poll health without an idle long poll. Review on any PTB 23+ upgrade (private `RequestParameter`).
 - **Rollback:** Revert the commit carrying `Fork-Patch: telegram-first-poll-health`.
 
+## Active patch record: update live-commit guard and coalescing
+
+- **Patch identity:** `update-live-guard-coalesce`.
+- **Behavior:** (A) An immutable-release update refuses to stage a target unless the live release SHA (`$HERMES_HOME/current`) is an ancestor of it, or every live commit has a patch-equivalent in it (`git log --cherry-pick`). The refusal lists the dropped commits and names the branch they came from: first the branch recorded when that release was installed (`release-branches.json`, written after staging), otherwise the remote branch that contains it, plus its PR from `gh` when available. It records stop class `live_commits_dropped`. `hermes update --allow-drop-live` is the rollback override. If the checkout cannot resolve the live commit, it cannot prove the commit is dropped, so the update passes. Descendant branch installs pass. (B) `launch_native_update` (`/update`, the agent-update socket, the `request_update` plugin) coalesces. A request that arrives while an install is in flight, or within `updates.coalesce_window_seconds` (default 120; 0 restores the old refusal) of the last launch, goes into `.update_deferred.json` (latest target wins, count kept) instead of starting another restart. Gateway housekeeping (`_launch_due_deferred_update`, every tick) launches it once when nothing is in flight and the window has passed, as an ordinary `hermes update --gateway [--branch X]`, so (A) still applies. A lone request still launches immediately. A retry of the in-flight request is not queued again. `/restart` is skipped while an update is in flight or queued, because that update restarts the gateway anyway.
+- **Why:** On 2026-10-13 Hermes restarted 19 times, and each restart cut 5-23 running sessions. At 18:36 a `request_update` from another session installed main `5b944834` over the live `fix/post-update-resume` (PR #567) and silently dropped that fix for 7 minutes. Three updates landed within 9 minutes.
+- **Source surfaces:** `hermes_cli/update_live_guard.py`, `hermes_cli/update_cmd.py` (`_apply_fetched_immutable_update`), `hermes_cli/subcommands/update.py` (`--allow-drop-live`), `gateway/update_launcher.py` (`launch_native_update`, `launch_deferred_update`, `restart_absorbed_by_update`, `coalesce_window_seconds`), `gateway/slash_commands.py` (`_spawn_detached_update` `update_args`, `/update`, `/restart`), `gateway/run.py` (`_launch_due_deferred_update` housekeeping chore), `hermes_cli/config_defaults.py` and `hermes_cli/config.py` (`updates.coalesce_window_seconds`), the update stop-class contract and schema, and `locales/*.yaml`.
+- **Upstream status:** Fork-only. Immutable releases and `request_update` do not exist upstream.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_cli/test_update_live_commit_guard.py tests/gateway/test_update_coalesce.py`.
+- **Retirement:** Remove with the immutable release layout, or when upstream gains an equivalent update queue.
+- **Rollback:** Revert the commits carrying `Fork-Patch: update-live-guard-coalesce`.
+
 ## Active patch record: update post-swap claim
 
 - **Patch identity:** `update-post-swap-claim`.

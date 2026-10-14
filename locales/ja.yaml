@@ -327,6 +327,7 @@ gateway:
     tip: "\n✦ ヒント: {tip}"
   restart:
     in_progress: "⏳ ゲートウェイの再起動はすでに進行中です..."
+    absorbed_by_update: "⏳ Restart skipped: {detail}."
     restarting: "♻ ゲートウェイを再起動しています。60 秒以内に通知が届かない場合は、コンソールで `hermes gateway restart` を実行してください。"
   resume:
     db_unavailable: "セッションデータベースは利用できません。"
@@ -507,6 +508,7 @@ gateway:
     not_git_repo: "✗ Git リポジトリではありません — 更新できません。"
     hermes_cmd_not_found: "✗ `hermes` コマンドが見つかりません。Hermes は実行中ですが、更新コマンドは PATH 上にも現在の Python インタープリタ経由でも実行可能ファイルを見つけられませんでした。ターミナルで `hermes update` を手動で実行してみてください。"
     start_failed: "✗ 更新の開始に失敗しました: {error}"
+    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
     starting: "☤ Hermes の更新を開始しています… 進捗をここにストリーミングします。"
     reply_failed: "✗ 更新プロセスへの応答送信に失敗しました: {error}"
     reply_sent: "✓ 更新プロセスに `{label}` を送信しました。"

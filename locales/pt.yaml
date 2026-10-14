@@ -327,6 +327,7 @@ gateway:
     tip: "\n✦ Dica: {tip}"
   restart:
     in_progress: "⏳ O reinício do gateway já está em curso..."
+    absorbed_by_update: "⏳ Restart skipped: {detail}."
     restarting: "♻ A reiniciar o gateway. Se não fores notificado em 60 segundos, reinicia a partir da consola com `hermes gateway restart`."
   resume:
     db_unavailable: "Base de dados de sessões indisponível."
@@ -507,6 +508,7 @@ gateway:
     not_git_repo: "✗ Não é um repositório git — não é possível atualizar."
     hermes_cmd_not_found: "✗ Não foi possível localizar o comando `hermes`. O Hermes está em execução, mas o comando de atualização não conseguiu encontrar o executável no PATH nem através do interpretador Python atual. Tenta executar `hermes update` manualmente no teu terminal."
     start_failed: "✗ Falha ao iniciar a atualização: {error}"
+    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
     starting: "☤ A iniciar a atualização do Hermes… Vou transmitir o progresso aqui."
     reply_failed: "✗ Falha ao enviar a resposta ao processo de atualização: {error}"
     reply_sent: "✓ `{label}` enviado ao processo de atualização."

@@ -2737,6 +2737,7 @@
                     "interrupted",
                     "local_changes_blocked",
                     "local_changes_parked",
+                    "live_commits_dropped",
                     "lock_held",
                     "managed_install",
                     "merge_conflict",

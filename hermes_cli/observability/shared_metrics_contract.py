@@ -501,6 +501,7 @@ UPDATE_STOP_CLASSES = frozenset({
     "git_index_locked",       # git refused: another git process's .git/index.lock exists
     "git_timeout",            # a network git call hit the updater's time limit
     "head_moved",             # a ref moved during the update; HEAD is not the selected commit
+    "live_commits_dropped",   # the target lacks commits the live release runs (needs --allow-drop-live)
     "local_changes_blocked",  # local changes git could not stash, or a dirty tree the ZIP will not overwrite
     "lock_held",              # (see above)
     "managed_install",        # (see above): HERMES_MANAGED installs refuse before any receipt

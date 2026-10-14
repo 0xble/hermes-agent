@@ -59,6 +59,11 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes).")
     update_parser.add_argument(
+        "--allow-drop-live", action="store_true", default=False,
+        help="Immutable releases: install the target even when it lacks commits the live release "
+             "runs (for example an unmerged --branch install). Without it the update refuses and "
+             "names the commits and branch it would drop. Use for an intentional rollback.")
+    update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "
             "override it for this run: switch to the update target and update "

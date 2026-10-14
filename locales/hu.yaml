@@ -330,6 +330,7 @@ gateway:
     tip: "\n✦ Tipp: {tip}"
   restart:
     in_progress: "⏳ Az átjáró újraindítása már folyamatban van..."
+    absorbed_by_update: "⏳ Restart skipped: {detail}."
     restarting: "♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal."
   resume:
     db_unavailable: "A munkamenet-adatbázis nem érhető el."
@@ -510,6 +511,7 @@ gateway:
     not_git_repo: "✗ Nem git-tárhely — frissítés nem lehetséges."
     hermes_cmd_not_found: "✗ Nem sikerült megtalálni a `hermes` parancsot. A Hermes fut, de a frissítőparancs nem találta a futtatható fájlt a PATH-on vagy a jelenlegi Python interpreteren keresztül. Próbáld futtatni a `hermes update` parancsot manuálisan a terminálban."
     start_failed: "✗ Nem sikerült elindítani a frissítést: {error}"
+    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
     starting: "☤ Hermes frissítés indítása… A folyamatot itt fogom közvetíteni."
     reply_failed: "✗ Nem sikerült elküldeni a választ a frissítési folyamatnak: {error}"
     reply_sent: "✓ `{label}` elküldve a frissítési folyamatnak."
