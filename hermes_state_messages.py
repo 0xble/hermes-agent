@@ -1637,19 +1637,30 @@ class SessionMessagesMixin:
                  "timestamp": row[4], "display_kind": row[5],
                  "display_metadata": self._decode_display_metadata(row[6])} for row in rows]
 
-    def messages_by_role(self, session_id: str, role: str, *, since: float = 0.0,
-                         limit: int = 500, cursor=None, current_only: bool = False) -> List[Dict[str, Any]]:
+    def messages_by_role(self, session_id: str, role: str, *, since: float = 0.0, until: float = 0.0,
+                         limit: int = 500, cursor=None, current_only: bool = False,
+                         before_id: int = 0) -> List[Dict[str, Any]]:
         """Newest-first ``{id, content, timestamp, display_kind, compressed_summary}`` rows of one role
-        at or after ``since``, every row state included (audit read, not display). ``display_kind`` and
-        ``compressed_summary`` are the provenance callers use to tell runtime rows from typed input.
-        ``current_only`` keeps live and compaction-archived rows but drops rewound (``/undo``) and
-        superseded ones, for callers that need what the conversation currently says."""
+        at or after ``since`` and strictly before ``until`` when positive, every row state included
+        (audit read, not display). ``display_kind`` and ``compressed_summary`` are the provenance
+        callers use to tell runtime rows from typed input. ``current_only`` keeps live and
+        compaction-archived rows but drops rewound (``/undo``) and superseded ones. ``before_id``
+        keyset-pages older rows, stable under concurrent inserts."""
         if not session_id:
             return []
         state_clause = _DISPLAY_ACTIVE_CLAUSE if current_only else ""
+        upper = float(until or 0.0)
+        before_clause = " AND id < ?" if int(before_id or 0) > 0 else ""
+        upper_clause = " AND (? <= 0 OR timestamp < ?)" if upper > 0 else ""
         sql = f"""SELECT id, content, timestamp, display_kind, _compressed_summary FROM messages
-                 WHERE session_id = ? AND role = ? AND timestamp >= ?{state_clause} ORDER BY id DESC LIMIT ?"""
-        params = (session_id, role, float(since or 0.0), max(int(limit), 1))
+                 WHERE session_id = ? AND role = ? AND timestamp >= ?{upper_clause}{before_clause}{state_clause}
+                 ORDER BY id DESC LIMIT ?"""
+        params = [session_id, role, float(since or 0.0)]
+        if upper > 0:
+            params.extend([upper, upper])
+        if int(before_id or 0) > 0:
+            params.append(int(before_id))
+        params.append(max(int(limit), 1))
         rows = cursor.execute(sql, params).fetchall() if cursor is not None else self._read_all(sql, params)
         return [{"id": row[0], "content": row[1], "timestamp": row[2], "display_kind": row[3],
                  "compressed_summary": bool(row[4])} for row in rows]

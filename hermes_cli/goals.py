@@ -22,7 +22,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_time import safe_strftime
@@ -2197,6 +2197,9 @@ _RELAY_HEADER_RE = re.compile(
     r"^\[relay from=hermes:(?P<profile>[^/\s\]]+)/(?P<session>[^\s\]]+) "
     r"receipt=[^\s\]]+(?: task=[^\s\]]+)?\]$"
 )
+_ANY_RELAY_HEADER_RE = re.compile(
+    r"^\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]$"
+)
 _USER_MESSAGES_MAX = 20
 _USER_MESSAGES_MAX_CHARS = 8000
 
@@ -2222,29 +2225,30 @@ def _relay_receipt_id(content: str) -> str:
     return ""
 
 
-def _relay_ledger_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
-    """The newest receipt row for ``receipt_id`` in relay's own ledger, or None.
+def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    """Newest receipt row per wanted id from relay's own ledger, read once.
 
     The header in a transcript is plain text any agent can write; the ledger is written by the relay
     transport at send time and records sender, target and the delivered transcript row."""
-    if not receipt_id:
-        return None
+    wanted = {rid for rid in receipt_ids if rid}
+    if not wanted:
+        return {}
     state_dir = os.environ.get("RELAY_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".local/state/relay")
     path = os.path.join(state_dir, "receipts.jsonl")
-    found: Optional[Dict[str, Any]] = None
+    found: Dict[str, Dict[str, Any]] = {}
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             for line in handle:
-                if receipt_id not in line:
+                if '"id"' not in line or not any(rid in line for rid in wanted):
                     continue
                 try:
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if isinstance(row, dict) and row.get("id") == receipt_id:
-                    found = row
+                if isinstance(row, dict) and row.get("id") in wanted:
+                    found[row["id"]] = row
     except OSError:
-        return None
+        return {}
     return found
 
 
@@ -2253,7 +2257,7 @@ _NON_HUMAN_SESSION_SOURCES = frozenset({"subagent", "cron", "tool", "kanban", "o
 
 
 def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id: str,
-                                profile: str) -> Optional[str]:
+                                profile: str, receipts: Dict[str, Dict[str, Any]]) -> Optional[str]:
     """The sender session of a relay row when relay's ledger proves this exact delivery, else None.
 
     Requires a typed-shaped row (no runtime display_kind, not a synthetic/continuation prompt), a
@@ -2267,7 +2271,7 @@ def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id:
     sender = _relay_sender(content)
     if sender is None or not profile or sender[0] != profile or sender[1] == goal_session_id:
         return None
-    receipt = _relay_ledger_receipt(_relay_receipt_id(content))
+    receipt = receipts.get(_relay_receipt_id(content))
     if not receipt or str(receipt.get("status") or "") not in ("delivered", "replied"):
         return None
     if receipt.get("sender") != f"hermes:{profile}/{sender[1]}":
@@ -2312,18 +2316,19 @@ def _unwrap_steer(content: str) -> str:
 
 
 def _is_agent_origin(content: str) -> bool:
-    """Any complete relay header on an edge line (any sender kind), matching the gateway's rule.
-    A relay delivered via /steer is checked inside its steer markers too."""
-    candidates = [content, _unwrap_steer(str(content or ""))]
+    """Whether a complete relay header line (any sender kind) appears anywhere in the row.
+
+    The gateway's edge-line rule is not enough here: the busy queue joins rapid follow-ups with a
+    bare newline, so a relay and Brian's next message can share one row with the header mid-text,
+    and nothing marks where the relay ends. Such a row is never authority, so fail closed."""
+    for text in (str(content or ""), _unwrap_steer(str(content or ""))):
+        for line in text.splitlines():
+            if _ANY_RELAY_HEADER_RE.fullmatch(line.strip()):
+                return True
     try:
         from gateway.response_filters import is_agent_origin_text
-        return any(bool(is_agent_origin_text(text)) for text in candidates)
+        return bool(is_agent_origin_text(content))
     except Exception:  # pragma: no cover - gateway ships with the runtime
-        for text in candidates:
-            lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-            if any(re.fullmatch(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]", line)
-                   for line in (lines[:1] + lines[-1:])):
-                return True
         return False
 
 
@@ -2342,13 +2347,19 @@ def _active_profile_name() -> str:
         return ""
 
 
-def _user_message_rows(session_id: str, since: float, *, limit: int = 500) -> List[Dict[str, Any]]:
+def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
+                       limit: int = 500) -> List[Dict[str, Any]]:
+    """Newest-first typed user rows in ``[since, until]`` (``until`` 0 means now). The upper bound is
+    applied in the query, so a busy session cannot push an earlier message out of the row limit."""
     db = _get_session_db()
     reader = getattr(db, "messages_by_role", None) if db is not None else None
     if not session_id or reader is None:
         return []
     try:
-        return [row for row in reader(session_id, "user", since=since, limit=limit) if _is_user_typed(row)]
+        kwargs: Dict[str, Any] = {"since": since, "limit": limit}
+        if until > 0:
+            kwargs["until"] = until
+        return [row for row in reader(session_id, "user", **kwargs) if _is_user_typed(row)]
     except Exception as exc:
         logger.debug("goal judge: user message read failed: %s", exc)
         return []
@@ -2379,8 +2390,11 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
         relay_rows = db.messages_by_role(session_id, "user", since=since, limit=500)
     except Exception:
         relay_rows = []
+    receipts = _relay_ledger_receipts(
+        _relay_receipt_id(str(r.get("content") or "")) for r in relay_rows
+        if _relay_sender(str(r.get("content") or "")) is not None)
     for relay in relay_rows:
-        sender_session = _authenticated_relay_sender(db, relay, session_id, active_profile)
+        sender_session = _authenticated_relay_sender(db, relay, session_id, active_profile, receipts)
         if sender_session is None:
             continue
         # Only what the user typed in the sender session before this delivery can be what it carries.
@@ -2393,9 +2407,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
         except Exception:
             pass
         label = title or sender_session
-        for row in _user_message_rows(sender_session, since):
-            if float(row.get("timestamp") or 0) > relay_at:
-                continue
+        for row in _user_message_rows(sender_session, since, until=relay_at):
             content = row.get("content")
             if not isinstance(content, str) or not content.strip():
                 continue
@@ -3530,7 +3542,7 @@ class GoalManager:
             return self._pause_decision(
                 f"{_BLOCKED_PAUSE_PREFIX}{reason}", "blocked", reason,
                 f"⏸ Goal blocked — paused: {reason} If input is needed, supply it to continue; "
-                "use /goal set to re-scope or /goal resume to retry.",
+                "use /goal set to re-scope or /goal resume to override this block (counts as your approval of it).",
             )
 
         if verdict == "done":

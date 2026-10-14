@@ -193,13 +193,17 @@ pauses remain authoritative.
   messages and stops at the first one that does not fit, marking it omitted rather
   than excerpting it, so a newer refusal can never be dropped while an older
   approval stays. Relay
-  deliveries, identified by a `[relay from=… receipt=…]` header on the first or last
-  line (the gateway agent-origin rule, any sender kind, also inside a /steer
-  wrapper), are
-  never user-typed, so they cannot satisfy a revision `user_quote`. An explicit
+  deliveries, identified by a `[relay from=… receipt=…]` header on any line (any
+  sender kind, also inside a /steer wrapper), are
+  never user-typed, so they cannot satisfy a revision `user_quote`. The busy queue
+  joins rapid follow-ups with a bare newline, so a header mid-row means a relay and
+  typed text were merged with no boundary; such rows fail closed and Brian restates
+  the approval. Sender rows are bounded by the delivery time in the query, and the
+  ledger is read once per render. An explicit
   `/goal resume` over a judge block records a user-command revision that renders
   as user authority with a waiver rule in every judge prompt; the judge does not
-  re-block on that reason but still blocks new breaches. The waiver comes from the
+  re-block on that reason but still blocks new breaches; the blocked
+  notice says resume counts as Brian's approval of that block. The waiver comes from the
   structured `user_command` field only `/goal resume` writes, never from rendered
   text, so an agent revision cannot imitate it. Profile matching uses the bound
   session profile first, as relay addresses do. Reviving on an
