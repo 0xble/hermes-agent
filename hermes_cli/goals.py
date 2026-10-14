@@ -2384,13 +2384,17 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
         return []
 
 
-def _relay_rows(db: Any, session_id: str, since: float, *, limit: int = 500) -> List[Dict[str, Any]]:
-    """Keyset-page raw user rows until the bounded set of relay deliveries is complete."""
-    wanted = max(int(limit), 1)
+def _relay_rows(db: Any, session_id: str, since: float, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Keyset-page relay deliveries in the goal window, scanning all rows by default.
+
+    Relay deliveries are sparse among user rows, so a raw-row cap can hide an older valid delivery
+    behind hundreds of newer notifications. The default scans the complete bounded goal window.
+    """
+    wanted = None if limit is None else max(int(limit), 1)
     page_size = 500
     before_id = 0
     relays: List[Dict[str, Any]] = []
-    while len(relays) < wanted:
+    while wanted is None or len(relays) < wanted:
         try:
             page = db.messages_by_role(session_id, "user", since=since, limit=page_size,
                                        before_id=before_id, current_only=True)
@@ -2401,7 +2405,7 @@ def _relay_rows(db: Any, session_id: str, since: float, *, limit: int = 500) -> 
         if len(page) < page_size:
             break
         before_id = int(page[-1]["id"])
-    return relays[:wanted]
+    return relays if wanted is None else relays[:wanted]
 
 
 def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
@@ -2424,7 +2428,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
                                 f"- Brian (this session):\n{content}"))
 
     active_profile = _active_profile_name()
-    relay_rows = _relay_rows(db, session_id, since, limit=500)
+    relay_rows = _relay_rows(db, session_id, since)
     receipts = _relay_ledger_receipts(
         _relay_receipt_id(str(r.get("content") or "")) for r in relay_rows
         if _relay_sender(str(r.get("content") or "")) is not None)

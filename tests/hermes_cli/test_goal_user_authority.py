@@ -430,6 +430,24 @@ def test_typed_approval_survives_more_than_500_runtime_rows(hermes_home):
     assert "Yes, approved" in block
 
 
+def test_relay_paging_reaches_older_valid_delivery(hermes_home):
+    sender, target = "paged-relay-sender", "paged-relay-target"
+    sender_db, target_db = _db(sender), _db(target)
+    mgr = GoalManager(target)
+    state = mgr.set("send only with approval")
+    sender_db.append_message(sender, "user", "Yes, approved")
+    _deliver(target_db, sender, target, receipt="old-valid-relay")
+
+    for i in range(505):
+        target_db.append_message(
+            target, "user", f"[relay from=hermes:default/noise-{i} receipt=noise-{i}]"
+        )
+
+    block = goals._render_user_messages_block(target, state.created_at)
+
+    assert "Yes, approved" in block
+
+
 def test_paging_is_stable_when_rows_arrive_between_pages(hermes_home, monkeypatch):
     sid = "keyset-typed"
     db = _db(sid)
