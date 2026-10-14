@@ -8,7 +8,7 @@
 - Persisted model-override hydration reads occur in a worker and commit through the existing epoch/edit-pending compare-and-set fence.
 - Session-store routing peeks reachable from async status, heartbeat, topic, webhook and API paths run off-loop.
 - Gateway teardown cancels pending tasks and shuts down async generators with a three-second total budget (two seconds for tasks, one for generators). It never joins the default executor or lingering non-daemon workers.
-- Loop-owned session state is created before `/fast` and API validation enter workers. API workers may read persisted overrides, but only the async loop-side prelude commits hydration.
+- API session-model workers use read-only, CPython-GIL-atomic single dictionary lookups of the loop-owned session view; they never iterate, create state, mutate overrides, or perform a worker-side compare-and-set. The epoch/edit-pending fence fails closed if a loop-owned edit races the fallback read.
 - New Telegram topic setup uses `AsyncSessionStore` for creation/title writes, `to_thread` for binding/reasoning sync writes, and async route resolution; it does not add a loop-thread store lock.
 
 ## Implementation

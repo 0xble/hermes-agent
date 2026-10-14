@@ -1026,7 +1026,6 @@ class GatewayModelCommandsMixin:
             reply = t("gateway.fast.ultrafast_not_supported", model=model)
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
-            self._session_state(session_key)
             reply = await asyncio.to_thread(
                 self._apply_fast_selection, session_key, args, persist=persist_global, route=route)
             return (expiry_notice + "\n\n" + reply) if expiry_notice else reply

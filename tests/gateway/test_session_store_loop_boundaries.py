@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 import subprocess
@@ -9,7 +10,7 @@ import sys
 import textwrap
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -389,6 +390,68 @@ async def test_api_run_agent_creation_reads_override_off_loop(persisted, tmp_pat
         hermes_loop_guard.set_loop_thread(None)
         if adapter._session_db is not None:
             adapter._session_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("boundary", "expected_status"),
+    [("stop", "cancelled"), ("shutdown", "interrupted")],
+)
+async def test_api_run_boundary_during_override_read_skips_agent_creation(
+    boundary, expected_status, monkeypatch,
+):
+    """A stop or shutdown that lands during override I/O must prevent turn startup."""
+    from gateway.platforms import api_server_runs
+
+    adapter = SimpleNamespace(
+        _run_streams={},
+        _run_statuses={},
+        _stopping_run_ids=set(),
+        _shutdown_interrupted_run_ids=set(),
+        _profile_scope=lambda *_args: contextlib.nullcontext(),
+    )
+    def set_run_status(run_id, status, **fields):
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": status, **fields}
+        return adapter._run_statuses[run_id]
+
+    adapter._set_run_status = set_run_status
+    monkeypatch.setattr(api_server_runs, "_retire_live_run", lambda *_args: None)
+    adapter._redact_api_error_text = str
+    adapter._ProviderAuthResolutionError = type("ProviderAuthResolutionError", (Exception,), {})
+    run_id = f"run-boundary-{boundary}"
+    stream = api_server_runs._RunStream()
+    adapter._run_streams[run_id] = stream
+    launch = api_server_runs._RunLaunch(
+        adapter, run_id, stream, "sid", "session-key", False, "hi", [], False,
+        agent_kwargs={"session_id": "sid", "gateway_session_key": "session-key"},
+        request_profile=None, browser_control_principal=None, browser_control_transport_family=None,
+    )
+    read_entered = threading.Event()
+    release_read = threading.Event()
+
+    def blocking_override_read(_session_key):
+        read_entered.set()
+        assert release_read.wait(5)
+        return None
+
+    adapter._session_model_override_for = blocking_override_read
+    create_agent = MagicMock(name="create_agent")
+    adapter._create_agent = create_agent
+    task = asyncio.create_task(
+        api_server_runs._execute_run(adapter, launch, _api_server=adapter))
+    try:
+        assert await asyncio.to_thread(read_entered.wait, 5)
+        if boundary == "stop":
+            adapter._stopping_run_ids.add(run_id)
+        else:
+            adapter._shutdown_interrupted_run_ids.add(run_id)
+        release_read.set()
+        await asyncio.wait_for(task, 5)
+        assert create_agent.call_count == 0
+        assert adapter._run_statuses[run_id]["status"] == expected_status
+    finally:
+        release_read.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,10 @@
-"""Session-model hydration at the API loop/worker boundary."""
+"""Session-model hydration at the API loop/worker boundary.
+
+Async request preludes hydrate and publish the authoritative override on the event loop before
+worker route validation. The synchronous fallback below is intentionally read-only: every runner
+view access is a single CPython-GIL-atomic dictionary lookup, with no iteration, get-or-create, or
+worker-side compare-and-set. Its epoch checks make a concurrent loop-owned edit fail closed.
+"""
 from __future__ import annotations
 
 import logging

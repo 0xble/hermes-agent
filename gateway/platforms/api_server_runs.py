@@ -978,6 +978,14 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 return self._session_model_override_for(override_key)
 
         session_override = await asyncio.to_thread(_read_session_override)
+        # The override read yields to a worker, so stop/shutdown may have landed while it ran.
+        # Re-run the same admission boundary before creating or registering the agent.
+        if run_id in self._shutdown_interrupted_run_ids:
+            _finish("interrupted")
+            return
+        if run_id in self._stopping_run_ids:
+            _finish("cancelled")
+            return
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
