@@ -196,9 +196,14 @@ pauses remain authoritative.
   deliveries, identified by a `[relay from=… receipt=…]` header on any line (any
   sender kind, also inside a /steer wrapper), are
   never user-typed, so they cannot satisfy a revision `user_quote`. The busy queue
-  joins rapid follow-ups with a bare newline, so a header mid-row means a relay and
-  typed text were merged with no boundary; such rows fail closed and Brian restates
-  the approval. Sender rows are bounded by the delivery time in the query, and the
+  joins rapid follow-ups with a bare newline, so a relay and typed text can share
+  one row with no boundary. A row whose relay header is not in a clean delivery
+  shape (sole header on the first line, or a symbol-led title, body, `From:`
+  signature and the header last) is an authority barrier: it grants nothing, and
+  every older message in that session grants nothing either, in the judge block
+  (shown as an "unattributable message" note), `user_messages_since` and
+  `check_user_quote`. Skipping it instead would let an older approval outlive a
+  newer refusal merged into it; Brian restates the approval. Sender rows are bounded by the delivery time in the query, and the
   ledger is read once per render. An explicit
   `/goal resume` over a judge block records a user-command revision that renders
   as user authority with a waiver rule in every judge prompt; the judge does not

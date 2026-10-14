@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -2358,7 +2359,9 @@ def _active_profile_name() -> str:
 def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
                        limit: int = 500) -> List[Dict[str, Any]]:
     """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). Page raw rows
-    until the typed bound is satisfied, so runtime rows cannot evict an approval from the window."""
+    until the typed bound is satisfied, so runtime rows cannot evict an approval from the window.
+    An unattributable row (see :func:`_is_authority_barrier`) ends the scan: it is returned last,
+    marked ``_barrier``, and nothing older is read."""
     db = _get_session_db()
     reader = getattr(db, "messages_by_role", None) if db is not None else None
     if not session_id or reader is None:
@@ -2374,7 +2377,13 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
             if until > 0:
                 kwargs["until"] = until
             page = reader(session_id, "user", **kwargs)
-            typed.extend(row for row in page if _is_user_typed(row))
+            for row in page:
+                if len(typed) >= wanted:
+                    break
+                if _is_authority_barrier(row):
+                    return typed + [{**row, "_barrier": True}]
+                if _is_user_typed(row):
+                    typed.append(row)
             if len(page) < page_size:
                 break
             before_id = int(page[-1]["id"])
@@ -2425,7 +2434,8 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
             if key not in seen:
                 seen.add(key)
                 entries.append((float(row.get("timestamp") or 0), int(row.get("id") or 0),
-                                f"- Brian (this session):\n{content}"))
+                                "- Brian (this session):\n" + (_AUTHORITY_BARRIER_NOTE if row.get("_barrier")
+                                                               else content)))
 
     active_profile = _active_profile_name()
     relay_rows = _relay_rows(db, session_id, since)
@@ -2455,12 +2465,14 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
                 continue
             seen.add(key)
             entries.append((float(row.get("timestamp") or 0), int(row.get("id") or 0),
-                            f"- Brian (in session {label}):\n{content}"))
+                            f"- Brian (in session {label}):\n" + (_AUTHORITY_BARRIER_NOTE if row.get("_barrier")
+                                                                    else content)))
     if not entries:
         return ""
     entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
     # Pack newest-first and stop at the first message that does not fit: skipping it could keep an
-    # older approval while dropping a newer refusal. Never excerpt an authority message.
+    # older approval while dropping a newer refusal. Never excerpt an authority message. An
+    # unattributable row is the same kind of stop: it is shown as a note and nothing older follows.
     kept: List[str] = []
     chars = 0
     for _timestamp, _id, text in entries[:_USER_MESSAGES_MAX]:
@@ -2471,8 +2483,50 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
             break
         kept.append(text)
         chars += len(text)
+        if text.endswith(_AUTHORITY_BARRIER_NOTE):
+            break
     kept.reverse()
     return JUDGE_USER_MESSAGES_BLOCK_TEMPLATE.format(user_message_lines="\n".join(kept)) if kept else ""
+
+
+def _is_clean_relay_shape(text: str) -> bool:
+    """Whether ``text`` is one relay delivery and nothing else: a single header on the first line
+    (legacy layout), or the current layout of a symbol-led title line (relay titles open with an
+    emoji), body, ``From:`` signature and the header as the last line. Typed text merged before
+    or after a relay breaks either shape."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    headers = [i for i, line in enumerate(lines) if _ANY_RELAY_HEADER_RE.fullmatch(line)]
+    if len(headers) != 1:
+        return False
+    at = headers[0]
+    if at == 0:
+        return True
+    return (at == len(lines) - 1 and at >= 2 and lines[at - 1].startswith("From: ")
+            and unicodedata.category(lines[0][0]).startswith("S"))
+
+
+def _is_authority_barrier(row: Dict[str, Any]) -> bool:
+    """Whether a user-role row may hold the person's words but cannot be attributed.
+
+    The busy queue joins rapid follow-ups with a bare newline, so a relay and the user's next
+    message can share one row with nothing marking where the relay ends. Such a row may carry a
+    refusal of an earlier approval, so it grants nothing and also ends the authority of every
+    older message: skipping it would let an older approval outlive a newer refusal."""
+    content = row.get("content")
+    if not isinstance(content, str) or row.get("compressed_summary"):
+        return False
+    if str(row.get("display_kind") or "") not in _USER_TYPED_KINDS:
+        return False
+    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
+        return False
+    text = _unwrap_steer(content)
+    if not any(_ANY_RELAY_HEADER_RE.fullmatch(line.strip()) for line in text.splitlines()):
+        return False
+    return not _is_clean_relay_shape(text)
+
+
+_AUTHORITY_BARRIER_NOTE = ("[an unattributable message (a relay merged with other text) is here; it and "
+                           "every older message are not shown and grant no authority]")
 
 
 def _is_user_typed(row: Dict[str, Any]) -> bool:
@@ -2532,7 +2586,14 @@ def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: in
     except Exception as exc:
         logger.debug("goal revise: user message read failed: %s", exc)
         return []
-    return [_REPLY_QUOTE_RE.sub("", row["content"], count=1) for row in rows if _is_user_typed(row)]
+    # Newest-first: an unattributable row may hold a newer refusal, so nothing older than it counts.
+    typed: List[str] = []
+    for row in rows:
+        if _is_authority_barrier(row):
+            break
+        if _is_user_typed(row):
+            typed.append(_REPLY_QUOTE_RE.sub("", row["content"], count=1))
+    return typed
 
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:

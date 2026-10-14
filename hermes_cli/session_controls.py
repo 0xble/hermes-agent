@@ -16,6 +16,7 @@ from hermes_cli.goals import (
     _REVISION_QUOTE_MIN_CHARS,
     _REVISION_SOURCE_MAX_CHARS,
     _get_session_db,
+    _is_authority_barrier,
     _is_user_typed,
 )
 
@@ -219,7 +220,14 @@ def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> T
                                    current_only=True)
     except Exception:
         return "user_quote_not_found"
-    latest = next((row for row in rows if _is_user_typed(row)), None)
+    latest = None
+    for row in rows:
+        # An unattributable merged row may carry a newer refusal: nothing older may stand in for it.
+        if _is_authority_barrier(row):
+            return "user_quote_not_found"
+        if _is_user_typed(row):
+            latest = row
+            break
     if latest is None:
         return "user_quote_not_found"
     source_raw = str(latest.get("content") or "")
