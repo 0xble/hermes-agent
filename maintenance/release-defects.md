@@ -882,9 +882,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   years before and after wall time, keep a six-day-old pending receipt, then
   delete it unreported at eight days. Keep
   `test_unreadable_and_week_old_receipts_are_deleted_unreported` unchanged.
-- **Status:** Retired in fork-audit bundle K. `upstream-live/main` at
-  `f974222e69278b856b1b75053774e10014c4797b` contains the production clock fix;
-  the fork-only `_stale` divergence is removed while the explicit
-  wall-clock-disagreement regression is retained.
-- **Retirement:** The production source now matches upstream's store-clock
-  implementation. Preserve the past/future-clock guard during future syncs.
+- **Retirement:** Retire the production patch when an accepted upstream release contains the
+  clock fix. Preserve equivalent past/future-clock coverage during that sync.
+- **Rollback:** Revert the commits carrying `Fork-Patch: install-run-clock`; keep the
+  wall-clock-disagreement regression with the active patch.
