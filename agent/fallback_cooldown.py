@@ -195,7 +195,7 @@ def settle_noninteractive_retry_budget(
     fallback runs now. With nothing to fall back to, the rebuild and recovery ladder still run.
     """
     if retry_count >= max_retries and hold:
-        if retry_state.noninteractive_hold_base_retries is None:
+        if getattr(retry_state, "noninteractive_hold_base_retries", None) is None:
             retry_state.noninteractive_hold_base_retries = max_retries
         max_retries = retry_count + 1
     elif not hold and getattr(retry_state, "noninteractive_hold_base_retries", None) is not None:
