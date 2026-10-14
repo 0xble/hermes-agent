@@ -212,7 +212,7 @@ async def test_post_interrupt_sweep_is_bounded_only_for_restart(
     runner._restart_shutdown_bound = lambda: 1.0
     observed = []
 
-    async def _fake_sweep(phase, *, timeout=None):
+    async def _fake_sweep(phase, *, timeout=None, restart=False):
         observed.append((phase, timeout))
         return []
 
