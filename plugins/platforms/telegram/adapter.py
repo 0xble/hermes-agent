@@ -4328,6 +4328,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         thread: a task owned by another thread's loop is cancelled on it."""
         chat_key = str(chat_id)
         topic_key = None if metadata is _ALL_TOPICS else self._typing_retrigger_key(chat_id, metadata)
+        # Drop the rate-limit stamps too, so per-topic keys do not accumulate for the adapter's life.
+        sent_at = self.__dict__.get("_telegram_typing_retrigger_at")
+        if sent_at:
+            for key in [key for key in sent_at
+                        if (key == topic_key if topic_key is not None else key[0] == chat_key)]:
+                sent_at.pop(key, None)
         for task_map in self._typing_retrigger_task_maps():
             keys = [key for key in task_map if key == topic_key] if topic_key is not None else [
                 key for key in task_map if key[0] == chat_key]

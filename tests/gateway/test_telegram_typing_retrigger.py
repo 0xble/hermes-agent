@@ -144,6 +144,7 @@ async def test_pause_before_edit_only_finalize_cancels_trailing_rearm():
     assert ("123", None) in adapter._telegram_typing_retrigger_trailing_tasks
 
     adapter.pause_typing_for_chat("123")
+    assert not [key for key in adapter._telegram_typing_retrigger_at if key[0] == "123"]
     calls_at_pause = adapter._bot.send_chat_action.await_count
     await adapter.edit_message("123", "1", "final answer", finalize=True)
     await asyncio.sleep(2.2)

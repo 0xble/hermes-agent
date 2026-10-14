@@ -129,3 +129,28 @@ async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
     assert len(sent_at) == 1
     assert sent_at[0] - started < 1.0
 
+
+@pytest.mark.asyncio
+async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick():
+    """At a 1s interval a 0.5s retry plus a 0.75s send cannot fit, so the next regular tick covers it."""
+    from plugins.platforms.telegram.adapter import _TYPING_SKIPPED_LOCK_BUSY
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter.stop_typing = AsyncMock()
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    sent_at = []
+
+    async def typing(chat_id, metadata=None):
+        sent_at.append(loop.time())
+        if len(sent_at) == 1:
+            return _TYPING_SKIPPED_LOCK_BUSY
+        stop_event.set()
+        return None
+
+    adapter.send_typing = typing
+    started = loop.time()
+    await asyncio.wait_for(adapter._keep_typing("123", interval=1.0, stop_event=stop_event), timeout=3)
+
+    assert len(sent_at) == 2
+    assert 0.9 <= sent_at[1] - started < 1.3

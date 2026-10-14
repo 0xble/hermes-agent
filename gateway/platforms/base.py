@@ -3639,11 +3639,14 @@ class BasePlatformAdapter(ABC):
                             logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
                         retry_delay = self._typing_tick_retry_delay(
                             result, timed_out=timed_out, failed=failed)
+                        # Retry only if the sleep plus a full bounded send still ends before the
+                        # next regular tick; otherwise low intervals send two actions back to back.
                         remaining = deadline - loop.time()
-                        if retry_used or retry_delay is None or remaining <= 0:
+                        if (retry_used or retry_delay is None
+                                or remaining <= retry_delay + _send_typing_timeout):
                             break
                         retry_used = True
-                        await asyncio.sleep(min(retry_delay, remaining))
+                        await asyncio.sleep(retry_delay)
                         if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
                             break
                 if stop_event is None:
