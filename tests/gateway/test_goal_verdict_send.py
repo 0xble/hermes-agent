@@ -80,7 +80,7 @@ class _CallbackRecordingAdapter(_RecordingAdapter):
         self.callback_registrations.append((session_key, generation, callback))
 
 
-def _make_runner_with_adapter(session_id: str = None, *, callbacks: bool = False):
+def _make_runner_with_adapter(session_id: str | None = None, *, callbacks: bool = False):
     from gateway.run import GatewayRunner
     import uuid
 

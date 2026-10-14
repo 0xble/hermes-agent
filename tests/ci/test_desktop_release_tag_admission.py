@@ -142,6 +142,7 @@ def _run_admission(clone: Path, tag: str, claim_tag: str) -> subprocess.Complete
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
 
 

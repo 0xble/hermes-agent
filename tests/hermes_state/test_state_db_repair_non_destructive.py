@@ -77,9 +77,9 @@ pytestmark = pytest.mark.usefixtures("adequate_repair_capacity")
 
 def _writer_after_stage(
     db_path: str,
-    ready: "multiprocessing.synchronize.Event",
-    start: "multiprocessing.synchronize.Event",
-    result: "multiprocessing.queues.Queue",
+    ready: multiprocessing.synchronize.Event,
+    start: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
 ) -> None:
     """Try one real cross-process write after staging has begun.
 
@@ -810,7 +810,6 @@ def test_stale_scratch_is_removed_before_health_check(tmp_path, monkeypatch):
     def fake_health(_path):
         checks.append("health")
         assert not scratch.exists()
-        return None
 
     monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", fake_health)
 

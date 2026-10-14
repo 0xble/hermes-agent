@@ -69,7 +69,7 @@ def test_runtime_lock_reports_a_lost_race(locked_install):
 def test_boot_activation_skips_while_the_install_is_locked(locked_install, monkeypatch):
     """A timed-out reader must not inspect or lease install state under a concurrent writer."""
     import pm.environments as runtime_paths
-    import hermes_cli.runtime_state as runtime_state
+    from hermes_cli import runtime_state
 
     repo, site = locked_install
     real_lock = runtime_state.runtime_lock

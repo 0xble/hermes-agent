@@ -133,7 +133,7 @@ def _browser_key(task_id: str) -> str:
     return _last_session_key(task_id)
 
 
-def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate NON-SECRET JS on the current page (inspection, origin reads).
 
     Prefers the supervisor's persistent CDP WebSocket, falls back to the
@@ -199,7 +199,7 @@ def _ensure_supervisor(task_id: str):
         return None
 
 
-def _eval_js_secret(task_id: str, expression: str) -> Dict[str, Any]:
+def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     """Evaluate a SECRET-BEARING JS expression. Supervisor CDP-WS only.
 
     Fails closed: there is deliberately NO fallback to the agent-browser CLI
@@ -427,7 +427,7 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             if isinstance(pinned, str) and pinned:
                 entry["browser_account"] = pinned
             items.append(entry)
-    out: Dict[str, Any] = {"success": True, "items": items}
+    out: dict[str, Any] = {"success": True, "items": items}
     if not items:
         out["hint"] = ("No matching vault items for this filter. Try another kind or origin." if kind is not None or origin is not None else
                        "No saved logins. On a login page, type a password you fetched yourself from an authorized store "
@@ -1270,12 +1270,12 @@ def _fenced_page_op(task_id: Optional[str], fn) -> str:
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
-def _handle_vault_enter_code(args: Dict[str, Any], **kwargs) -> str:
+def _handle_vault_enter_code(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     return _fenced_page_op(tid, lambda: browser_vault_enter_code(handle=str(args.get("handle") or ""), task_id=tid))
 
 
-def _handle_vault_save_login(args: Dict[str, Any], **kwargs) -> str:
+def _handle_vault_save_login(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     return _fenced_page_op(tid, lambda: browser_vault_save_login(label=str(args.get("label") or ""), task_id=tid))
 
@@ -1284,11 +1284,11 @@ def _handle_vault_list(args: Dict[str, Any], **kwargs) -> str:
     return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
 
 
-def _handle_vault_unlock(args: Dict[str, Any], **kwargs) -> str:
+def _handle_vault_unlock(args: dict[str, Any], **kwargs) -> str:
     return browser_vault_unlock(str(args.get("backend") or ""))
 
 
-def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
+def _handle_vault_fill(args: dict[str, Any], **kwargs) -> str:
     tid = kwargs.get("task_id")
     return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
 

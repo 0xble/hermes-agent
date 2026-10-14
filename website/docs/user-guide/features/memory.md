@@ -274,6 +274,7 @@ memory:
   write_approval: false     # false = write freely (default) | true = require approval
   recall_synthetic_turns: false  # external provider auto-recall on Hermes-generated turns
   prefetch_max_age_seconds: 1800 # oldest background recall still injected (0 = no limit)
+  prefetch_spill_enabled: false  # external recall stays intact unless explicitly enabled
 ```
 
 An external provider's automatic recall runs only for text a person wrote. Turns Hermes generates
@@ -309,6 +310,24 @@ it backs the profile store — but the system prompt swaps the full memory
 guidance for a narrower profile-only block. The tool schema advertises only the
 `user` target, and direct or staged writes to disabled `MEMORY.md` are rejected.
 The inverse configuration advertises only `memory` and rejects `USER.md` writes.
+
+### External recall size
+
+External memory providers return their full prefetched context by default,
+up to a safety ceiling of 10× `hooks.output_spill.max_chars` (at least 100,000
+characters); recall above that still spills so a runaway provider can't overflow
+the context window.
+`memory.prefetch_spill_enabled: true` opts the active profile into replacing
+oversized recall with a head/tail preview and a file path. This can reduce
+replayed context, but the relevance-ranked middle is no longer immediately
+visible to the model. Prefer your provider's own recall budget when available.
+
+The opt-in uses the shared `hooks.output_spill` threshold, preview lengths, and
+directory; `hooks.output_spill.enabled: false` still disables it. Normal plugin
+hooks continue to spill by default, independently of the memory opt-in. Settings
+are captured at provider registration: restart Hermes after changing them.
+See [oversized prefetch results](../../developer-guide/memory-provider-plugin.md#oversized-prefetch-results)
+for the configuration details.
 
 ## Controlling memory writes (`write_approval`)
 
@@ -527,7 +546,7 @@ Full details in [Gating agent skill writes](./skills.md#gating-agent-skill-write
 
 ## External Memory Providers
 
-For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 3 external memory provider plugins — Holographic, RetainDB and ByteRover — and more, such as Honcho, Hindsight, Supermemory, Mem0 and OpenViking, are available from the [plugin catalog](plugins.md) via `hermes plugins install <name>`.
+For deeper, persistent memory that goes beyond MEMORY.md and USER.md, Hermes ships with 2 external memory provider plugins — RetainDB and ByteRover — and more, such as Honcho, Hindsight, Supermemory, Mem0, OpenViking and Holographic, are available from the [plugin catalog](plugins.md) via `hermes plugins install <name>`.
 
 External providers run **alongside** built-in memory (never replacing it) and add capabilities like knowledge graphs, semantic search, automatic fact extraction, and cross-session user modeling.
 

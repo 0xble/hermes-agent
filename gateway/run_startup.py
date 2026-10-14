@@ -184,7 +184,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
                     continue
                 # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
                 with suppress(Exception):
-                    setattr(event, "_hermes_startup_restore_replay", True)
+                    event._hermes_startup_restore_replay = True
                 # A normal return can be an admission refusal. Retire the only
                 # durable copy only after this replay acquires an explicit receipt.
                 event._gateway_accepted = False
@@ -409,7 +409,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
         """Done-callback for boot-path tasks that outlive the startup-restore gate: surface a late
         failure otherwise swallowed once the task leaves ``_background_tasks``. Cancellation is
         expected (shutdown), not an error."""
-        def _report(task: "asyncio.Task") -> None:
+        def _report(task: asyncio.Task) -> None:
             if task.cancelled():
                 return
             exc = task.exception()
@@ -532,7 +532,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             # Claim only rows whose exact transport owner is connected: platform-only filtering would spend
             # a disconnected bot's retry budget because another bot on that platform is online.
             _profile_adapters = getattr(self, "_profile_adapters", None) or {}
-            _pval = lambda p: getattr(p, "value", str(p))  # noqa: E731
+            _pval = lambda p: getattr(p, "value", str(p))
             _deliverable_targets = {(_pval(p), "default") for p in self.adapters}
             # Legacy rows (no adapter_profile) are unambiguous only without multiplexing; else fail closed.
             if not _profile_adapters:
@@ -582,7 +582,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             # Remember refusals arriving during a threaded SELECT or a send. An empty stale
             # snapshot cannot retire this worker until it has observed the wake.
             wakes[key].set()
-            return None
+            return
         wake = wakes[key] = asyncio.Event()
 
         async def _redeliver_after_wait():
@@ -600,7 +600,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
                     try:
                         await asyncio.wait_for(wake.wait(), timeout=delay)
                         continue  # A shorter sibling may now be due first.
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                     if getattr(self, "_running", False):
                         await self._redeliver_failed_obligations_for_platform(target, profile=profile)
@@ -608,7 +608,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
                 pending.pop(key, None)
                 wakes.pop(key, None)
 
-        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:%s:%s" % key)
+        task = asyncio.create_task(_redeliver_after_wait(), name="flood-redelivery:{}:{}".format(*key))
         pending[key] = task
         # The gateway's ordinary shutdown drain must cancel sleeping timers too.
         background = getattr(self, "_background_tasks", None)
@@ -778,10 +778,10 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
     def _resume_pending_candidates(self, platform=None, *, record_boot=True) -> Optional[list]:
         """Snapshot resume-pending entries; only the boot path spends breaker budget."""
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
                 candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    entry for entry in self.session_store._entries.values()
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
@@ -816,7 +816,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
                     _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,
                 ):
                     return None
-            except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
+            except Exception as exc:
                 logger.debug("Restart-loop guard check skipped: %s", exc)
         return candidates
 
@@ -1080,12 +1080,12 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
 
     def _snapshot_active_turns_for_recovery(self) -> list:
         """Read active-turn recovery rows under the store lock off the gateway loop."""
-        with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+        with self.session_store._lock:
             self.session_store._ensure_loaded_locked()  # noqa: SLF001
             return [
                 (e.session_key, e.session_id, e.active_turn_token, e.active_turn_started_at, e.origin,
                  e.transport_profile)
-                for e in self.session_store._entries.values()  # noqa: SLF001
+                for e in self.session_store._entries.values()
                 if e.active_turn_token and e.active_turn_started_at and e.origin and not e.suspended
             ]
 
@@ -1203,7 +1203,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
     @staticmethod
     def _start_hosted_room_worker_sync():
         """Start the local Group Chat worker without importing the dashboard."""
-        import tui_gateway.server  # noqa: F401
+        import tui_gateway.server
         from tui_gateway import methods_groups
         service = methods_groups.get_hosted_room_service()
         if service is None:
@@ -1604,7 +1604,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 
-    async def _start_prefilter_platforms(self) -> Tuple[bool, int, list, list]:
+    async def _start_prefilter_platforms(self) -> tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
         from gateway.run import _platform_has_bot_credential
@@ -1674,7 +1674,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             )
             try:
                 ok = await self._connect_initial_adapter_with_timeout(adp, p)
-            except Exception as _exc:  # noqa: BLE001 - surfaced below as a retryable error
+            except Exception as _exc:
                 return (p, adp, p_cfg, "exception", _exc)
             return (p, adp, p_cfg, "ok" if ok else "failed", None)
 
@@ -1892,7 +1892,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
 
     async def _start_secondary_profiles(
         self, connected_count: int, _multiplex_skipped_platforms: list
-    ) -> Tuple[bool, int]:
+    ) -> tuple[bool, int]:
         """Bring up multiplexed secondary-profile adapters. Returns (aborted, connected_count)."""
         from gateway.run import MultiplexConfigError
         from tools.process_registry import process_registry as _pr
@@ -2149,7 +2149,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             else:
                 # Say WHY an OPTED-IN instance didn't arm (non-opted stays silent).
                 self._log_scale_to_zero_not_armed_reason()
-        except Exception:  # noqa: BLE001 - arming must never block startup
+        except Exception:
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
         # Drain-control watcher: reconciles new-turn acceptance with the dashboard's ``.drain_request.json``
         # marker (prior-instantiation markers are ignored via epoch).
@@ -2323,8 +2323,8 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             raise RuntimeError(f"could not load config for profile '{profile_name}': {exc}") from exc
 
     async def _handoff_resolve_destination(
-        self, row: Dict[str, Any], profile_name: Optional[str]
-    ) -> "GatewayStartupMixin._HandoffDestination":
+        self, row: dict[str, Any], profile_name: Optional[str]
+    ) -> GatewayStartupMixin._HandoffDestination:
         """Resolve platform, transport, home channel, thread and destination source for a row."""
         from gateway.delivery import resolve_delivery_transport
         cli_session_id = row["id"]
@@ -2435,7 +2435,7 @@ class GatewayStartupMixin(RuntimeDeliveryRecoveryMixin):
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False), profile=handoff_profile,
         )
 
-    async def _process_handoff(self, row: Dict[str, Any], profile_name: Optional[str] = None) -> None:
+    async def _process_handoff(self, row: dict[str, Any], profile_name: Optional[str] = None) -> None:
         """Execute one handoff row; raises on failure (caller marks failed). ``profile_name`` (None =
         root) is the profile whose store queued it — load-bearing under multiplex: secondaries live in
         ``_profile_adapters`` and the key must be namespaced ``agent:<profile>:...`` or nobody reads it."""

@@ -162,7 +162,7 @@ def arm_hard_wall_timeout(execution_id: str, profile_home, seconds: float) -> Ha
     return fence
 
 
-def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
+def _close_late_session_db_result(future: concurrent.futures.Future) -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's init timeout
     (worker abandoned via ``shutdown(wait=False)``), else its .db/WAL/SHM handles leak to EMFILE.
 

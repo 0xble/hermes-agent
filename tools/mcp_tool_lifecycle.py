@@ -13,15 +13,15 @@ logger = logging.getLogger("tools.mcp_tool")
 
 # Live stdio MCP children (pid -> server_name), added after connection and removed on normal
 # shutdown, so they can be force-killed if SDK teardown fails.
-_stdio_pids: Dict[int, str] = {}
+_stdio_pids: dict[int, str] = {}
 # PIDs that survived their session context exit (detected in _run_stdio's finally, reaped by
 # _kill_orphaned_mcp_children). Separate from _stdio_pids so sweeps never race active sessions.
 _orphan_stdio_pids: set = set()
-_orphan_stdio_pid_servers: Dict[int, str] = {}
+_orphan_stdio_pid_servers: dict[int, str] = {}
 # pid -> pgid captured at spawn. The SDK spawns with start_new_session=True (PGID == PID);
 # grandchildren keep that PGID after the direct child exits, so killpg still reaches them.
 # Separate from _stdio_pids so the PGID survives the child's removal. Empty on Windows.
-_stdio_pgids: Dict[int, int] = {}
+_stdio_pgids: dict[int, int] = {}
 # POSIX session IDs captured with the PGID reject positively foreign groups.
 # Matching numeric SID/PGID values are not process-incarnation evidence.
 _stdio_sessions: Dict[int, int] = {}
@@ -30,7 +30,7 @@ _stdio_sessions: Dict[int, int] = {}
 _stdio_processes: dict[int, dict] = {}
 # Upstream #43044/#117505: drift-tolerant leader fingerprints supplement the
 # incarnation ledger; missing/unreadable fingerprints never authorize a signal.
-_stdio_starttimes: Dict[int, int] = {}
+_stdio_starttimes: dict[int, int] = {}
 
 
 def _leader_start_time(pid: int) -> Optional[int]:
@@ -38,7 +38,7 @@ def _leader_start_time(pid: int) -> Optional[int]:
     from gateway.status import get_process_start_time
     try:
         return get_process_start_time(pid)
-    except Exception:  # noqa: BLE001 — the guard must never break signalling
+    except Exception:
         return None
 
 
@@ -384,7 +384,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None, names: Optional[set] = 
 
 def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[dict, dict, dict, dict, dict]:
     """Atomically pop owners, groups, session IDs, witnesses and leader fingerprints."""
-    def _owned(entries: Dict[int, str]) -> Dict[int, str]:
+    def _owned(entries: dict[int, str]) -> dict[int, str]:
         return {pid: owner for pid, owner in entries.items() if server_name is None or owner == server_name}
 
     with _core._lock:
@@ -459,14 +459,14 @@ def _kill_windows_process_tree(pid: int, sig: int, *, parent=None) -> None:
     for child in descendants:
         try:
             child.terminate()
-        except Exception:  # noqa: BLE001 - raced away or refused; sweep continues
+        except Exception:
             pass
     if sig == getattr(_signal, "SIGKILL", _signal.SIGTERM):  # force pass: don't wait for graceful exit
         _, alive = psutil.wait_procs(descendants, timeout=0)
         for child in alive:
             try:
                 child.kill()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
 
