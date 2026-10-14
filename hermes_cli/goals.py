@@ -2349,8 +2349,9 @@ def _active_profile_name() -> str:
 
 def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
                        limit: int = 500) -> List[Dict[str, Any]]:
-    """Newest-first typed user rows in ``[since, until]`` (``until`` 0 means now). The upper bound is
-    applied in the query, so a busy session cannot push an earlier message out of the row limit."""
+    """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). The strict upper
+    bound is applied in the query, so a busy session cannot push an earlier message out of the row
+    limit or let a same-timestamp post-delivery message become authority."""
     db = _get_session_db()
     reader = getattr(db, "messages_by_role", None) if db is not None else None
     if not session_id or reader is None:

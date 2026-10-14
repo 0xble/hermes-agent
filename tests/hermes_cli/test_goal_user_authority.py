@@ -379,6 +379,28 @@ def test_sender_approval_before_delivery_survives_later_traffic(hermes_home, mon
     assert "later chatter" not in block
 
 
+def test_same_timestamp_sender_message_after_delivery_is_excluded(hermes_home):
+    sender, target = "same-time-sender", "same-time-goal"
+    sender_db, target_db = _db(sender), _db(target)
+    mgr = GoalManager(target)
+    state = mgr.set("send only with approval")
+    relay_row = _deliver(target_db, sender, target, receipt="same-time")
+    with target_db._lock:
+        relay_at = target_db._conn.execute(
+            "SELECT timestamp FROM messages WHERE id = ?", (relay_row,)
+        ).fetchone()[0]
+    late_row = sender_db.append_message(sender, "user", "Yes, approved after delivery")
+    with sender_db._lock:
+        sender_db._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE id = ?", (relay_at, late_row)
+        )
+        sender_db._conn.commit()
+
+    assert "Yes, approved after delivery" not in goals._render_user_messages_block(
+        target, state.created_at
+    )
+
+
 def test_ledger_is_read_once_per_render(hermes_home, monkeypatch):
     sender, target = "once-sender", "once-goal"
     sender_db, target_db = _db(sender), _db(target)
