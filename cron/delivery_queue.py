@@ -359,6 +359,10 @@ def claim_next() -> Optional[dict]:
             "SELECT execution_id, job_json, for_failure, terminal_gate, created_at FROM deliveries WHERE status='pending' "
             "ORDER BY julianday(created_at), created_at, execution_id"
         ).fetchall()
+        from cron.scheduler_review import reviews_stopped
+        if reviews_stopped():
+            # A stopping gateway leaves held reports pending for the next gateway.
+            rows = [candidate for candidate in rows if not _is_review_row(candidate)]
         row = None
         suppressed_missing = False
         # Read all gated executions from one ledger connection rather than opening
@@ -422,8 +426,7 @@ def claim_next() -> Optional[dict]:
             _prune_terminal_unlocked(conn)
         if row is None:
             return None
-        job = json.loads(row["job_json"])
-        status = "reviewing" if job.get("review") and not row["for_failure"] else "delivering"
+        status = "reviewing" if _is_review_row(row) else "delivering"
         cur = conn.execute(
             """UPDATE deliveries SET status=?, owner_process_id=?,
                owner_pid=?, owner_started_at=?
@@ -439,6 +442,29 @@ def claim_next() -> Optional[dict]:
     result = dict(claimed)
     result["job"] = json.loads(result.pop("job_json"))
     return result
+
+
+def _is_review_row(row) -> bool:
+    return not row["for_failure"] and bool(json.loads(row["job_json"]).get("review"))
+
+
+def record_review_progress(execution_id: str, owner_process_id: str, **fields) -> bool:
+    """Persist review progress so a replay never repeats a decided review or a rerun."""
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT job_json FROM deliveries WHERE execution_id=? AND status='reviewing'
+                 AND owner_process_id=? AND owner_pid=?""",
+            (str(execution_id), owner_process_id, os.getpid()),
+        ).fetchone()
+        if row is None:
+            return False
+        job = json.loads(row["job_json"])
+        job.update(fields)
+        conn.execute(
+            "UPDATE deliveries SET job_json=? WHERE execution_id=?",
+            (json.dumps(job, ensure_ascii=False, sort_keys=True), str(execution_id)),
+        )
+    return True
 
 
 def begin_final_delivery(execution_id: str, owner_process_id: str) -> bool:
@@ -485,6 +511,7 @@ def recover_abandoned() -> int:
     """Replay abandoned reviews, but never replay uncertain final sends."""
     changed = 0
     terminal_ids: list[str] = []
+    unknown_receipts: list[dict] = []
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT execution_id, job_json, status, owner_process_id, owner_pid, owner_started_at "
@@ -513,12 +540,6 @@ def recover_abandoned() -> int:
                 if same_process
                 else "Gateway exited during delivery; send outcome is unknown and was not retried."
             )
-            job = json.loads(row["job_json"])
-            if job.get("review"):
-                from cron.review import append_receipt
-                append_receipt({"job_id": job.get("id"), "run_id": row["execution_id"],
-                    "subject": job["review"].get("subject"), "decision": "DELIVERY_UNKNOWN",
-                    "candidates": [], "text_sent": None, "message_id": None, "error": error})
             cur = conn.execute(
                 """UPDATE deliveries SET status='unknown', finished_at=?, error=?
                    WHERE execution_id=? AND status='delivering'""",
@@ -529,11 +550,24 @@ def recover_abandoned() -> int:
                 ),
             )
             changed += cur.rowcount
-            if cur.rowcount:
+            if cur.rowcount == 1:
                 terminal_ids.append(row["execution_id"])
+                job = json.loads(row["job_json"])
+                if job.get("review"):
+                    unknown_receipts.append({
+                        "job_id": job.get("id"), "run_id": row["execution_id"],
+                        "subject": job["review"].get("subject"), "decision": "DELIVERY_UNKNOWN",
+                        "candidates": [], "text_sent": None, "message_id": None, "error": error})
         _prune_terminal_unlocked(conn)
     _reflect_terminal_deliveries(terminal_ids, "unknown")
     _mark_terminal_projected(terminal_ids)
+    # The receipt file is an audit trail; a failed write must never stall the queue drain.
+    for receipt in unknown_receipts:
+        try:
+            from cron.review import append_receipt
+            append_receipt(receipt)
+        except Exception:
+            logger.exception("Cron review receipt for %s could not be written", receipt["run_id"])
     return changed
 
 

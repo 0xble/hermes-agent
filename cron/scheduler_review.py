@@ -19,8 +19,12 @@ class ReviewAbandoned(BaseException):
     """A held report must remain replayable when the gateway stops reviewing it."""
 
 
+def reviews_stopped() -> bool:
+    return _shutdown.is_set()
+
+
 def _check_review_active():
-    if _shutdown.is_set():
+    if reviews_stopped():
         raise ReviewAbandoned("gateway stopped reviewing reports")
 
 
@@ -198,14 +202,29 @@ def record_review_suppression(job, content, success):
                     "text_sent": None, "message_id": None, "timings_ms": {"total": 0}})
 
 
+def _record_review_progress(job, **fields):
+    """Persist before acting, so a replay after restart neither re-asks nor reruns."""
+    job.update(fields)
+    claim = job.get("_review_queue_claim")
+    if claim:
+        from cron.delivery_queue import record_review_progress
+        if not record_review_progress(*claim, **fields):
+            raise ReviewAbandoned("review delivery claim was abandoned")
+
+
 def _select_review_candidate(job, content, subject, contract, receipt, deadline_epoch):
     from cron.review import check_contract, parse_decision
 
-    remaining = deadline_epoch - time.time()
-    if remaining <= 0:
-        raise TimeoutError("review deadline expired before admission")
-    reply = _run_review_hop(subject, _review_wake_text(content, contract), None, None, remaining)
-    decision, payload = parse_decision(reply)
+    if job.get("_review_decision"):
+        decision, payload = job["_review_decision"]
+        receipt["replayed"] = True
+    else:
+        remaining = deadline_epoch - time.time()
+        if remaining <= 0:
+            raise TimeoutError("review deadline expired before admission")
+        reply = _run_review_hop(subject, _review_wake_text(content, contract), None, None, remaining)
+        decision, payload = parse_decision(reply)
+        _record_review_progress(job, _review_decision=[decision, payload])
     if decision == "PRESENT":
         return decision, content
     if decision == "FIX":
@@ -213,11 +232,13 @@ def _select_review_candidate(job, content, subject, contract, receipt, deadline_
         receipt["candidates"].append({"kind": "fix", **checked})
         return ("FIX", payload) if checked["passed"] and not checked["silent"] else ("FIX_REJECTED", content)
     review = job["review"]
-    if review.get("max_reruns", 1) == 0:
+    # A restart during the rerun must not spend a second one on the same report.
+    if review.get("max_reruns", 1) == 0 or job.get("_review_rerun_attempted"):
         return "RERUN_UNAVAILABLE", content
     # A full report run has its own budget, capped by the total hold deadline.
     budget = float(review.get("rerun_deadline_minutes", 20)) * 60
     total_remaining = deadline_epoch + budget - time.time()
+    _record_review_progress(job, _review_rerun_attempted=True)
     success, _output, text, error = _bounded_review_rerun(job, min(budget, total_remaining))
     checked = check_contract(text, contract) if success else {
         "passed": False, "violations": [error or "rerun failed"], "silent": False}
