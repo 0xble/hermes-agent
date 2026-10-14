@@ -19,6 +19,14 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Billing outage persistence and provider-wide classification
+
+- Fork patch identity: `billing-outage-recovery`.
+- A provider/account billing or rate-limit failure must retain the failed user turn, avoid the context-overflow auto-reset path, and classify provider-wide proxy `auth_unavailable` envelopes into the existing shared cooldown/fallback route. Explicit 5xx overload/529 signals arm the same breaker before local backoff. Generic server faults and request-specific validation/context failures do not create shared outages.
+- Both persistence layers share `is_context_overflow_reason`: known classifications are authoritative; only missing/unknown classifications may use the legacy large-400 growth guard. Proxy upstream text is considered only within a 5xx `auth_unavailable` envelope's `last upstream error:` suffix, before generic provider-profile status verdicts.
+- Guard: run `scripts/run_tests.sh` one file at a time for `tests/gateway/test_billing_failure_transcript.py`, `tests/agent/test_billing_proxy_error_classification.py`, and `tests/agent/test_billing_outage_shared_cooldown.py`. The latter drives two separate `AIAgent.run_conversation` processes against a loopback provider with the same `HERMES_HOME`; agent B makes no primary call after A records billing 400, proxy billing/rate-limit 503, or explicit overload. Also run the existing classifier, shared-primary-cooldown, fallback-exhaustion, and transient-transcript tests.
+- Retire only when the released upstream passes these regressions without this patch. Roll back the code and focused tests together; no state migration or alternate cooldown store is introduced.
+
 ## Production-only unused imports
 
 - Fork patch identity: `production-unused-imports`.
