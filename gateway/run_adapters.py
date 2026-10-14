@@ -23,6 +23,7 @@ from gateway.config import (
     ON_ALL_ADAPTERS_DOWN_POLICIES,
     SHARED_LISTENER_MIRROR_PLATFORMS,
     Platform,
+    is_zero_cut_handover_enabled,
     platform_binds_port as _platform_binds_port,
 )
 from gateway.platforms.base import BasePlatformAdapter
@@ -71,21 +72,20 @@ class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
     @staticmethod
-    async def _wait_or_detach(task: "asyncio.Future", timeout: float) -> bool:
-        """Wait up to ``timeout`` for ``task``; on deadline (or our own cancellation) detach it. Not
-        ``asyncio.wait_for``: that WAITS for the cancelled child, so a connect()/close() swallowing
-        ``CancelledError`` blocks recovery forever. True if it finished in time."""
+    async def _wait_or_detach(task: "asyncio.Future", timeout: float, *, cancel_on_timeout: bool = True) -> bool:
+        """Wait up to ``timeout`` for ``task``; optionally leave it running after a deadline."""
         done: set = set()
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         finally:
             if task not in done:  # timed out, or our own cancellation
-                task.cancel()
+                if cancel_on_timeout:
+                    task.cancel()
                 task.add_done_callback(consume_detached_task_result)
         return task in done
-
     async def _await_adapter_cleanup_with_timeout(
         self, awaitable: Awaitable[Any], timeout: Optional[float], *, deadline_expired: bool = False,
+        cancel_on_timeout: bool = True,
     ) -> bool:
         """Await adapter cleanup with a detach-on-deadline bound; True when it completed.
 
@@ -106,7 +106,7 @@ class GatewayAdapterLifecycleMixin:
             await awaitable
             return True
         task = asyncio.ensure_future(awaitable)
-        if not await self._wait_or_detach(task, timeout):
+        if not await self._wait_or_detach(task, timeout, cancel_on_timeout=cancel_on_timeout):
             return False
         await task
         return True
@@ -173,6 +173,12 @@ class GatewayAdapterLifecycleMixin:
         ):
             if await self._await_adapter_cleanup_with_timeout(
                 adapter.disconnect(), disconnect_timeout,
+                cancel_on_timeout=not (
+                    getattr(adapter, "platform", None) is Platform.TELEGRAM
+                    and is_zero_cut_handover_enabled(
+                        getattr(getattr(adapter, "gateway_runner", None), "config", None)
+                    )
+                ),
                 deadline_expired=disconnect_timeout is not None and disconnect_timeout <= 0,
             ):
                 logger.info(
