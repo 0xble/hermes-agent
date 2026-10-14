@@ -35,8 +35,9 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
+from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -3600,34 +3601,7 @@ class GatewayTurnMixin:
                 ),
             )
 
-    @staticmethod
-    def _run_agent_stream_confirmed_final_delivery(consumer, final_text: str, *, previewed: bool = False) -> bool:
-        """True only when the actual final reply reached the user: a finalize call may carry only the
-        last preview snapshot, so reconcile against the recorded payload — a demonstrable mismatch
-        (False) overrides the flag; None keeps legacy trust."""
-        if consumer is None:
-            return False
-        if getattr(consumer, "final_response_sent", False):
-            matcher = getattr(consumer, "delivered_final_matches", None)
-            if callable(matcher):
-                with suppress(Exception):
-                    if matcher(final_text) is False:
-                        return False
-            return True
-        # Exact-text match against what the consumer DURABLY delivered (commentary, segments, and the
-        # visible prefix only once a real send landed) — safe without the ``previewed`` flag. The codex
-        # app-server bridge delivers the final agentMessage through the commentary path and never sets
-        # response_previewed (#74248 / #80519); gating on the flag re-sent every such reply. Mismatching
-        # commentary still returns False, so a distinct final answer is never suppressed (#65919). Draft
-        # frames are ephemeral and must not count: after draft streaming + a failed finalize send this
-        # predicate must stay False so the fallback final send still fires (#51828 / #33793).
-        has_delivered_text = getattr(consumer, "has_durably_delivered_text", None)
-        if callable(has_delivered_text):
-            try:
-                return bool(has_delivered_text(final_text))
-            except Exception:
-                return False
-        return False
+    _run_agent_stream_confirmed_final_delivery = staticmethod(stream_confirmed_final_delivery)
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> "GatewayRunner._RunAgentWorker":
         """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
@@ -3992,7 +3966,10 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            # Runtime provenance describes the continuation row, not the original human's silence
+            # contract. A queued successor must not make the retry's second marker silently legal.
+            silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
+            if silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4572,6 +4549,10 @@ class GatewayTurnMixin:
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
+    async def _run_agent_silence_followup(self, response: dict, turn_ctx: TurnContext) -> dict:
+        from gateway.run_turn_silence_recovery import run_silence_followup
+        return await run_silence_followup(self, response, turn_ctx)
+
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str = None,
@@ -4586,11 +4567,14 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         title_user_message: Optional[str] = None,
+        _silence_retry: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            # Local-only recovery: the proxy API requires a new non-empty conversation row,
+            # not the empty internal continuation. Preserve its existing human silence fallback.
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -4617,13 +4601,15 @@ class GatewayTurnMixin:
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
-            channel_prompt=channel_prompt, moa_config=moa_config,
+            channel_prompt=channel_prompt, moa_config=moa_config, internal=internal,
+            event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            silence_retry=_silence_retry,
             _post_delivery_adapter=_post_delivery_adapter,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
@@ -4666,11 +4652,20 @@ class GatewayTurnMixin:
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+            # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+            from gateway.run_turn_silence_recovery import silence_recovery_due
+            if silence_recovery_due(self, response, turn_ctx, silence_retry=_silence_retry,
+                                    scheduled_heartbeat=scheduled_heartbeat):
+                # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.
+                if turn_ctx.stream_consumer_holder[0] is not None:
+                    await self._await_stream_task(stream_task)
+                if turn_ctx._run_still_current():
+                    return await self._run_agent_silence_followup(response, turn_ctx)
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
@@ -4679,4 +4674,8 @@ class GatewayTurnMixin:
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+        if isinstance(response, dict):
+            # Recovery may be redirected after it starts. The outer silence contract is separate
+            # from the inbound message that owns this execution's terminal delivery.
+            response["_terminal_inbound_id"] = turn_ctx.inbound_message_id
         return response
