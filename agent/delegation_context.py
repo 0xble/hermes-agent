@@ -33,6 +33,7 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 @contextmanager
 def delegated_child_context(
     session_id: str | None = None, parent_session_id: str | None = None,
+    root_session_id: object = None,
 ) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity.
 
@@ -45,8 +46,13 @@ def delegated_child_context(
     parent = str(parent_session_id or get_session_env("HERMES_SESSION_ID", "") or "").strip()
     if parent == str(session_id or "").strip():
         parent = ""
-    # A nested child keeps the outermost delegator; the first level records its parent.
-    root = _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else parent
+    # The chain root is the session that started the outermost delegation. Child runs pass the
+    # root stamped on the child agent, because background children start in fresh threads that
+    # do not inherit this context; otherwise a nested context keeps its enclosing root.
+    stamped_root = root_session_id.strip() if isinstance(root_session_id, str) else ""
+    root = stamped_root or (
+        _DELEGATED_ROOT_SESSION_ID.get() if _DELEGATED_CHILD_CONTEXT.get() else parent
+    )
     token = _DELEGATED_CHILD_CONTEXT.set(True)
     parent_token = _DELEGATED_PARENT_SESSION_ID.set(parent)
     root_token = _DELEGATED_ROOT_SESSION_ID.set(root or parent)

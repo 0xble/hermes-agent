@@ -147,6 +147,103 @@ def test_topic_guard_needs_no_session_database(tmp_path, monkeypatch):
     assert not (tmp_path / "state.db").exists()
 
 
+def test_chain_root_survives_a_child_worker_thread_without_the_parent_context(tmp_path, monkeypatch):
+    # Real child runs start in executor threads, and a background child's thread does not
+    # inherit the delegating turn's context. The root is stamped on each child agent at
+    # build time and re-entered by the run, so a grandchild still guards the topic.
+    import threading
+    from unittest.mock import MagicMock
+    from tools.delegate_tool import _build_child_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+
+    def build(parent):
+        with patch("run_agent.AIAgent") as agent_cls:
+            agent_cls.return_value = MagicMock()
+            return _build_child_agent(
+                task_index=0, goal="g", context=None, toolsets=None, model=None,
+                max_iterations=1, parent_agent=parent, task_count=1,
+            )
+
+    def parent_agent(session_id, depth, root=None):
+        parent = MagicMock(spec_set=None)
+        parent.session_id, parent._delegate_depth = session_id, depth
+        parent._session_db, parent._active_children = None, []
+        parent._active_children_lock = threading.Lock()
+        parent.base_url, parent.provider, parent.model = "https://example.invalid/v1", "openrouter", "m"
+        parent.api_key, parent.api_mode, parent.platform = "***", "chat_completions", "cli"
+        parent.providers_allowed = parent.providers_ignored = parent.providers_order = None
+        parent.provider_sort = parent._print_fn = parent.tool_progress_callback = None
+        parent.thinking_callback = None
+        if root is None:
+            del parent._delegation_root_session_id
+        else:
+            parent._delegation_root_session_id = root
+        return parent
+
+    child = build(parent_agent("parent-session", 0))
+    assert child._delegation_root_session_id == "parent-session"
+    grandchild = build(parent_agent("child-session", 1, root=child._delegation_root_session_id))
+    assert grandchild._delegation_root_session_id == "parent-session"
+
+    seen = {}
+
+    def run_grandchild():  # a fresh thread: no delegation or session context inherited
+        tokens = _bind("child-session")
+        try:
+            with delegated_child_context(
+                "grandchild-session", parent_session_id="child-session",
+                root_session_id=grandchild._delegation_root_session_id,
+            ):
+                seen["topic"] = child_parent_relay_error(PARENT_ADDRESS)
+                seen["parent"] = child_parent_relay_error("hermes:default/child-session")
+                seen["env"] = delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV]
+        finally:
+            session_context.clear_session_vars(tokens)
+
+    worker = threading.Thread(target=run_grandchild)
+    worker.start()
+    worker.join(10)
+    assert seen == {
+        "topic": CHILD_PARENT_RELAY_ERROR, "parent": CHILD_PARENT_RELAY_ERROR, "env": PARENT_ADDRESS,
+    }
+
+
+def test_child_run_enters_the_stamped_chain_root_on_its_worker_thread(tmp_path, monkeypatch):
+    # The real run path, not a hand-built context: _run_single_child runs the conversation on a
+    # worker thread, and the guard there must name the root stamped on the child.
+    from unittest.mock import MagicMock
+    from tools.delegate_tool import _run_single_child
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv(RELAY_PARENT_ADDRESS_ENV, raising=False)
+    seen = {}
+
+    def run_conversation(**_kwargs):
+        seen["topic"] = child_parent_relay_error(PARENT_ADDRESS)
+        seen["env"] = delegated_child_subprocess_env({})[RELAY_PARENT_ADDRESS_ENV]
+        return {"final_response": "done", "completed": True, "interrupted": False, "api_calls": 1, "messages": []}
+
+    child = MagicMock()
+    child.session_id, child._parent_session_id = "grandchild-session", "child-session"
+    child._delegation_root_session_id = "parent-session"
+    child._credential_pool = None
+    child.run_conversation.side_effect = run_conversation
+    parent = MagicMock()
+    parent.session_id, parent._delegate_depth, parent._session_db = "child-session", 1, None
+    parent._active_children, parent._print_fn, parent.tool_progress_callback = [], None, None
+    import threading
+    parent._active_children_lock = threading.Lock()
+    tokens = _bind("child-session")
+    try:
+        result = _run_single_child(task_index=0, goal="g", child=child, parent_agent=parent)
+    finally:
+        session_context.clear_session_vars(tokens)
+    assert result["status"] == "completed", result
+    assert seen == {"topic": CHILD_PARENT_RELAY_ERROR, "env": PARENT_ADDRESS}
+
+
 PARENT_ADDRESS = "hermes:default/parent-session"
 
 # Stands in for relay's CLI check (relay C27): refuse a send whose target is
