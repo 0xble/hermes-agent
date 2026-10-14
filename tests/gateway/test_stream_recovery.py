@@ -173,6 +173,68 @@ def test_double_crash_reowns_preview_under_resumed_token():
     assert second.message_id == "m1"
     assert second._last_sent_text == "partial"
     assert recovery.load_preview("key", "sid", "turn-3") == dict(content="partial", message_id="m1")
+    # Each re-own moves the row: predecessors are discarded once the successor holds it.
+    assert recovery.load_preview("key", "sid", "old") is None
+    assert recovery.load_preview("key", "sid", "turn-2") is None
+
+
+def test_failed_reown_keeps_the_predecessor_row(monkeypatch):
+    record(content="partial", message_id="m1")
+
+    def locked(**kwargs):
+        raise RuntimeError("state.db is locked")
+
+    monkeypatch.setattr(recovery, "record_preview", locked)
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(event=resume_event("old", active="turn-2")), consumer)
+    assert consumer.message_id == "m1"
+    assert recovery.load_preview("key", "sid", "old") == dict(content="partial", message_id="m1")
+
+
+def test_schema_and_purge_run_once_per_process(monkeypatch):
+    calls = []
+    real = recovery._prepare_journal
+    monkeypatch.setattr(recovery, "_prepare_journal", lambda conn: (calls.append(1), real(conn)))
+    for i in range(5):
+        record(content=f"edit {i}")
+    assert recovery.load_preview("key", "sid", "old")["content"] == "edit 4"
+    recovery.discard_preview("old")
+    assert len(calls) == 1
+
+
+def test_stale_rows_are_purged_when_the_journal_is_prepared(tmp_path):
+    record(turn_id="stale")
+    recovery._journal(lambda conn: conn.execute(
+        "UPDATE streamed_previews SET updated_at = 0 WHERE turn_id = 'stale'"))
+    recovery._prepared_paths.discard(str(ledger._db_path()))  # a fresh process
+    record(turn_id="fresh")
+    assert recovery.load_preview("key", "sid", "stale") is None
+    assert recovery.load_preview("key", "sid", "fresh") is not None
+
+
+def test_journal_reprepares_a_table_dropped_underneath():
+    record()
+    recovery._journal(lambda conn: conn.execute("DROP TABLE streamed_previews"))
+    record(content="after drop")
+    assert recovery.load_preview("key", "sid", "old")["content"] == "after drop"
+
+
+@pytest.mark.asyncio
+async def test_journal_failure_warning_is_rate_limited(monkeypatch, caplog):
+    import gateway.stream_consumer_transport as transport
+
+    monkeypatch.setattr(transport, "_last_journal_warning", float("-inf"))
+
+    async def journal(content, message_id):
+        raise RuntimeError("state.db is locked")
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat", config=StreamConsumerConfig(cursor=""),
+                                     on_preview=journal)
+    with caplog.at_level("DEBUG", logger="gateway.stream_consumer"):
+        for _ in range(5):
+            await consumer._journal_preview("text", "m1")
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "journal write failed" in r.message]
+    assert len(warnings) == 1
 
 
 def test_ack_lost_first_send_does_not_invent_platform_id():
@@ -258,3 +320,64 @@ async def test_silence_marker_forgets_the_deleted_preview():
     consumer._message_id = "m1"
     await consumer._suppress_silence_marker()
     assert recovery.load_preview("key", "sid", "old") is None
+
+
+def _split_adapter():
+    from tests.gateway.test_stream_consumer_oversized_leftover import _make_plain_adapter, _wire
+
+    adapter = _make_plain_adapter()
+    _wire(adapter)
+    return adapter
+
+
+async def _journal_to_db(content, message_id):
+    if not content:
+        recovery.discard_preview("old")
+    else:
+        record(content=content, message_id=message_id)
+
+
+HEAD = "head line\n" * 60
+TAIL = "".join(f"tail line {i:03d} filler filler filler filler filler\n" for i in range(240))
+
+
+@pytest.mark.asyncio
+async def test_split_delivery_leaves_no_preview_row():
+    consumer = GatewayStreamConsumer(_split_adapter(), "chat", StreamConsumerConfig(
+        edit_interval=0.01, buffer_threshold=5, cursor=""), on_preview=_journal_to_db)
+    consumer.on_delta(HEAD)
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.06)
+    assert recovery.load_preview("key", "sid", "old") is not None  # the head is journaled
+    consumer.on_delta(TAIL)
+    await asyncio.sleep(0.12)
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=10)
+    assert consumer._turn_split_delivery is True
+    assert recovery.load_preview("key", "sid", "old") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prestreamed", [True, False], ids=["seal-existing", "split-first-send"])
+async def test_crash_after_split_never_adopts_a_sealed_head(prestreamed):
+    consumer = GatewayStreamConsumer(_split_adapter(), "chat", StreamConsumerConfig(
+        edit_interval=0.01, buffer_threshold=5, cursor=""), on_preview=_journal_to_db)
+    consumer.on_delta(HEAD if prestreamed else HEAD + TAIL)
+    task = asyncio.create_task(consumer.run())
+    if prestreamed:
+        await asyncio.sleep(0.06)
+        consumer.on_delta(TAIL)
+    for _ in range(200):
+        if consumer._turn_split_delivery:
+            break
+        await asyncio.sleep(0.01)
+    assert consumer._turn_split_delivery is True
+    await asyncio.sleep(0.05)  # the tail preview goes out after the split
+    # kill -9 here: no finalize ever runs; the next process sees only the journal.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert recovery.load_preview("key", "sid", "old") is None
+    resumed = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(), resumed)
+    assert resumed.message_id is None and resumed._already_sent is False

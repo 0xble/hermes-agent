@@ -21,6 +21,8 @@ logger = logging.getLogger("gateway.stream_consumer")
 # until the interval elapses, so honouring a 30s Telegram retry_after costs nothing but a
 # stale preview; anything longer is left to the strike counter and the fallback send path.
 _MAX_EDIT_BACKOFF_SECS = 30.0
+_JOURNAL_WARNING_INTERVAL_SECS = 60.0
+_last_journal_warning = float("-inf")
 
 
 class StreamTransportMixin:
@@ -450,6 +452,7 @@ class StreamTransportMixin:
 
     async def _journal_preview(self, text: str, message_id=None, *, force: bool = False) -> None:
         """Best-effort crash journal: a failure is logged and never changes delivery."""
+        global _last_journal_warning
         on_preview = getattr(self, "_on_preview", None)
         if on_preview is None or (getattr(self, "_turn_split_delivery", False) and not force):
             return
@@ -458,7 +461,19 @@ class StreamTransportMixin:
         try:
             await on_preview(text, message_id)
         except Exception as err:
-            logger.warning("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
+            # A locked state DB fails every edit of every stream: warn at most once a minute.
+            now = time.monotonic()
+            if now - _last_journal_warning >= _JOURNAL_WARNING_INTERVAL_SECS:
+                _last_journal_warning = now
+                logger.warning("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
+            else:
+                logger.debug("Streamed preview journal write failed (chat=%s): %s", self.chat_id, err)
+
+    async def _enter_split_delivery(self) -> None:
+        """Mark the turn split and forget its preview row: the row names a now-sealed head,
+        which a crash recovery must never adopt and overwrite with the whole answer."""
+        self._turn_split_delivery = True
+        await self._journal_preview("", force=True)
 
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
@@ -533,7 +548,7 @@ class StreamTransportMixin:
         if ((getattr(result, "continuation_message_ids", ()) or ())
                 and result.message_id and result.message_id != self._message_id):
             self._last_edit_overflowed = True
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
             self._adopt_message_id(str(result.message_id))
             self._last_sent_text = ""
             self._notify_new_message()

@@ -214,12 +214,12 @@ def _db_path():
     return get_process_hermes_home() / "state.db"
 
 
-def _connect(*, busy_timeout_ms: int = 10_000) -> sqlite3.Connection:
+def _connect() -> sqlite3.Connection:
     from hermes_cli.sqlite_util import open_db
 
-    # Shared state.db: SessionDB owns the durable PRAGMA set. Preview journals use a
-    # short timeout so a contended state writer never stalls a stream edit for seconds.
-    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=busy_timeout_ms,
+    # Shared state.db: SessionDB owns the durable PRAGMA set; this opener keeps the plain-tuple rows
+    # and the 10 s busy timeout it always had.
+    return open_db(_db_path(), db_label="state.db (delivery_ledger)", busy_timeout_ms=10_000,
                    row_factory=None, initialize=_initialize_schema)
 
 

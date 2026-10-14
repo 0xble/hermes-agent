@@ -10,49 +10,78 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 
 from gateway import delivery_ledger as ledger
 
 logger = logging.getLogger(__name__)
 
+# A contended state writer must never hold a stream edit behind the ledger's 10 s timeout.
+_PREVIEW_BUSY_TIMEOUT_MS = 250
+_PREVIEW_RETENTION_SECONDS = 86400 * 7
+# State DB paths whose table this process has created and purged once (not per write).
+_prepared_paths: set[str] = set()
+_prepared_lock = threading.Lock()
 
-def _ensure_table(conn):
+
+def _prepare_journal(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS streamed_previews (
         turn_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, session_id TEXT NOT NULL,
         content TEXT NOT NULL, message_id TEXT, updated_at REAL NOT NULL
     )""")
+    conn.execute("DELETE FROM streamed_previews WHERE updated_at < ?",
+                 (time.time() - _PREVIEW_RETENTION_SECONDS,))
 
 
-def _preview_connect():
-    """Open the shared state DB without making a stream edit wait on a long writer lock."""
-    return ledger._connect(busy_timeout_ms=250)
+def _journal(op):
+    """Run ``op(conn)`` in one commit-and-ALWAYS-close transaction (#69567: ``with conn:`` leaks fds).
+
+    The table is created and the retention purge runs once per DB path per process, not on
+    every stream edit; a table dropped underneath (profile purge) is re-prepared once.
+    """
+    import sqlite3
+
+    from hermes_cli.sqlite_util import open_db, transaction
+
+    path = str(ledger._db_path())
+    for attempt in (0, 1):
+        with _prepared_lock:
+            prepare = path not in _prepared_paths
+        try:
+            with transaction(open_db(path, db_label="state.db (stream previews)", row_factory=None,
+                                     busy_timeout_ms=_PREVIEW_BUSY_TIMEOUT_MS,
+                                     initialize=_prepare_journal if prepare else None)) as conn:
+                result = op(conn)
+        except sqlite3.OperationalError as err:
+            if attempt or prepare or "no such table" not in str(err):
+                raise
+            with _prepared_lock:
+                _prepared_paths.discard(path)
+            continue
+        if prepare:
+            with _prepared_lock:
+                _prepared_paths.add(path)
+        return result
 
 
 def record_preview(*, turn_id, session_key, session_id, content, message_id):
-    with _preview_connect() as conn:
-        _ensure_table(conn)
-        conn.execute("""INSERT INTO streamed_previews
-            (turn_id, session_key, session_id, content, message_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(turn_id) DO UPDATE SET content=excluded.content,
-                message_id=excluded.message_id, updated_at=excluded.updated_at""",
-            (turn_id, session_key, session_id, content, message_id, time.time()))
-        conn.execute("DELETE FROM streamed_previews WHERE updated_at < ?", (time.time() - 86400 * 7,))
+    _journal(lambda conn: conn.execute("""INSERT INTO streamed_previews
+        (turn_id, session_key, session_id, content, message_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(turn_id) DO UPDATE SET content=excluded.content,
+            message_id=excluded.message_id, updated_at=excluded.updated_at""",
+        (turn_id, session_key, session_id, content, message_id, time.time())))
 
 
 def discard_preview(turn_id):
-    with _preview_connect() as conn:
-        _ensure_table(conn)
-        conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (turn_id,))
+    _journal(lambda conn: conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (turn_id,)))
 
 
 def load_preview(session_key, session_id, turn_id):
-    with _preview_connect() as conn:
-        _ensure_table(conn)
-        row = conn.execute("""SELECT content, message_id FROM streamed_previews
-            WHERE turn_id = ? AND session_key = ? AND session_id = ?""",
-            (turn_id, session_key, session_id)).fetchone()
+    row = _journal(lambda conn: conn.execute("""SELECT content, message_id FROM streamed_previews
+        WHERE turn_id = ? AND session_key = ? AND session_id = ?""",
+        (turn_id, session_key, session_id)).fetchone())
     return {"content": row[0], "message_id": row[1]} if row else None
 
 
@@ -117,6 +146,8 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         try:
             record_preview(turn_id=successor, session_key=ctx.session_key, session_id=ctx.session_id,
                            content=preview["content"], message_id=preview["message_id"])
+            # Only once the successor owns it: a failed re-record keeps the predecessor row.
+            discard_preview(token)
         except Exception:
             logger.warning("Could not re-own streamed preview for %s", ctx.session_key, exc_info=True)
     if not preview["message_id"]:

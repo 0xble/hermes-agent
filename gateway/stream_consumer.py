@@ -638,8 +638,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     await self._finalize_turn(tick)
-                    if self._final_response_sent:
-                        await self._journal_preview("")
+                    if self._final_response_sent or self._turn_split_delivery:
+                        # Split turns too: their row would point at a sealed head chunk.
+                        await self._journal_preview("", force=True)
                     return
 
                 if tick.commentary_text is not None:
@@ -865,7 +866,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # Flag BEFORE the tail send: fresh-final replaces every tracked preview
             # with one message, which is only valid while the active message holds
             # the whole answer — deleting sealed heads drops delivered text.
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
         # Heads are sealed (or a later head failed): never edit a sealed message with
         # the unsplit payload — the tail is sent fresh, or the fallback path retries.
         self._message_id = None
@@ -878,7 +879,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # ``_already_sent`` may be True from prior state — only heads + tail count.
             self._final_response_sent = heads_delivered and tail_delivered
             if self._final_response_sent:
-                self._turn_split_delivery = True
+                await self._enter_split_delivery()
                 self._mark_final_delivered(record=self._accumulated)
             return True
         if tick.got_segment_break:
@@ -909,7 +910,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             self._accumulated = self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
 
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""
