@@ -71,6 +71,46 @@ def test_route_owner_retry_wait_cap_opts_out_of_the_window():
     assert hold_noninteractive_transient_retry(agent, _classified(FailoverReason.server_error), now=0.0) is False
 
 
+def test_platforms_are_only_the_ones_hermes_sets():
+    """Background agents are unattended through ``side_agent``, not a platform name."""
+    assert is_noninteractive_session(_stub("subagent")) and is_noninteractive_session(_stub("cron"))
+    for platform in ("background", "goal", "telegram", "cli"):
+        assert is_noninteractive_session(_stub(platform)) is False
+    side = _stub("cli")
+    side.side_agent = True
+    assert is_noninteractive_session(side) is True
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(42, 42.0), (0, 0.0), (-5, 180.0)])
+def test_window_setting_is_read_from_config_yaml_through_load_config(tmp_path, monkeypatch, configured, expected):
+    """DEFAULT_CONFIG invariant: ``delegation.fallback.transient_retry_window_seconds`` in a real
+    config.yaml reaches the runtime reader through ``load_config``, and changes the hold."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    (tmp_path / "config.yaml").write_text(
+        f"delegation:\n  fallback:\n    transient_retry_window_seconds: {configured}\n", encoding="utf-8",
+    )
+    from hermes_cli.config import load_config
+    assert load_config()["delegation"]["fallback"]["transient_retry_window_seconds"] == configured
+
+    agent = _stub("subagent")  # no per-agent override: the config file decides
+    assert noninteractive_transient_retry_window_seconds(agent) == expected
+    error = _classified(FailoverReason.server_error)
+    assert hold_noninteractive_transient_retry(agent, error, now=0.0) is (expected > 0)
+    if expected > 0:
+        assert hold_noninteractive_transient_retry(agent, error, now=expected - 1) is True
+        assert hold_noninteractive_transient_retry(agent, error, now=expected) is False
+
+
+def test_window_setting_defaults_to_180_when_config_yaml_omits_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    (tmp_path / "config.yaml").write_text("model:\n  default: test/model\n", encoding="utf-8")
+    from hermes_cli.config import load_config
+    assert load_config()["delegation"]["fallback"]["transient_retry_window_seconds"] == 180.0
+    assert noninteractive_transient_retry_window_seconds(_stub("subagent")) == 180.0
+
+
 def test_delegation_fallback_window_has_three_minute_default_and_allows_zero_override():
     assert DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS == 180.0
     assert noninteractive_transient_retry_window_seconds(_stub("subagent")) == 180.0
@@ -112,7 +152,8 @@ def _ok(content):
     return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")], model="m", usage=None)
 
 
-def _agent(platform: str) -> AIAgent:
+def _agent(platform: str, *, with_fallback: bool = True) -> AIAgent:
+    fallback = [{"provider": FALLBACK[0], "model": FALLBACK[1], "base_url": _FALLBACK_BASE}] if with_fallback else None
     with (
         patch("model_tools.get_tool_definitions", return_value=[]),
         patch("model_tools.check_toolset_requirements", return_value={}),
@@ -121,7 +162,7 @@ def _agent(platform: str) -> AIAgent:
         agent = AIAgent(
             api_key="primary-key-abcdef12", base_url=_BASE, provider=PRIMARY[0], model=PRIMARY[1],
             platform=platform, quiet_mode=True, skip_context_files=True, skip_memory=True,
-            fallback_model=[{"provider": FALLBACK[0], "model": FALLBACK[1], "base_url": _FALLBACK_BASE}],
+            fallback_model=fallback,
         )
     agent.client = MagicMock()
     agent._api_max_retries = 3
@@ -271,3 +312,38 @@ def test_declared_cooldown_longer_than_the_window_falls_back_without_holding():
     assert result["final_response"] == "served by fallback"
     assert [route for route, _ in calls] == [PRIMARY, FALLBACK]
     assert sleeps == []
+
+
+class APIConnectionError(Exception):
+    """Named like the OpenAI SDK transport error so the primary transport rebuild applies."""
+
+
+def test_unattended_run_without_fallback_rebuilds_transport_then_ladders_on_the_base_budget():
+    """No fallback chain: once the window closes the one-shot transport rebuild still runs, and the
+    rebuild cycle plus every auto-recovery cycle use the ordinary budget, not the held one."""
+    agent = _agent("subagent", with_fallback=False)
+    agent._auto_recovery_cycles = 2
+    assert agent._has_pending_fallback() is False
+    base = agent._api_max_retries
+    attempts: list[float] = []
+    rebuilds: list[int] = []  # provider attempts made before each rebuild
+
+    def behaviour(_route, now):
+        attempts.append(now)
+        raise APIConnectionError("Connection error.")
+
+    with patch(
+        "agent.agent_runtime_helpers._rebuild_primary_client",
+        side_effect=lambda *_a, **_k: rebuilds.append(len(attempts)),
+    ):
+        result, calls, _sleeps = _drive(agent, behaviour)
+
+    primary = [t for route, t in calls if route == PRIMARY]
+    assert {route for route, _ in calls} == {PRIMARY}
+    assert result["completed"] is False
+    # The window held the route well past the ordinary budget before anything else ran.
+    assert len(rebuilds) == 1 and rebuilds[0] > base
+    held = rebuilds[0]
+    assert primary[held - 1] - primary[0] >= WINDOW
+    # One transport rebuild, then (1 post-rebuild cycle + 2 ladder cycles) x the base budget.
+    assert len(primary) - held == base * (1 + agent._auto_recovery_cycles)

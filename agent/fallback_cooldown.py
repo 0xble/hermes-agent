@@ -18,7 +18,8 @@ _SHARED_COOLDOWN_REASONS = _RATE_LIMIT_FAILOVER_REASONS | {FailoverReason.overlo
 # chance to recover before spending the next fallback route.  Three minutes is long enough to
 # cover the short 5xx/429 incidents seen in practice without parking a task indefinitely.
 DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS = 180.0
-_NONINTERACTIVE_PLATFORMS = frozenset({"subagent", "cron", "background", "goal"})
+# Background/side agents are covered by ``side_agent`` rather than a platform name.
+_NONINTERACTIVE_PLATFORMS = frozenset({"subagent", "cron"})
 _NONINTERACTIVE_TRANSIENT_REASONS = frozenset({
     FailoverReason.rate_limit,
     FailoverReason.upstream_rate_limit,
@@ -37,7 +38,7 @@ def noninteractive_transient_retry_window_seconds(agent) -> float:
     """Return the configured same-provider retry window for unattended sessions.
 
     The setting lives under ``delegation.fallback`` because delegated work is its primary
-    consumer; cron/background goal agents use the same policy.  A malformed or negative value
+    consumer; cron and side agents use the same policy.  A malformed or negative value
     falls back to the safe default, while zero deliberately restores immediate failover.
     """
     override = getattr(agent, "_noninteractive_transient_retry_window_seconds", None)
@@ -161,8 +162,8 @@ def noninteractive_transient_retry_remaining(agent, *, now=None) -> float:
 def noninteractive_transient_window_spent(agent, classified, *, error_message: str = "", now=None) -> bool:
     """True when this route already used its whole same-provider window on this outage.
 
-    The exhaustion path then goes straight to the fallback chain: the route has had its
-    recovery time, so the one-shot primary transport rebuild would only restart the budget.
+    With a fallback pending, the exhaustion path then goes straight to it: the route has had
+    its recovery time. With no fallback, the transport rebuild and recovery ladder still run.
     """
     if not is_noninteractive_session(agent) or not is_noninteractive_transient(classified, error_message):
         return False

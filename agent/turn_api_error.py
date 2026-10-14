@@ -414,12 +414,22 @@ def settle_unrecovered_error(
     # exhausting. The extended ``max_retries`` rides the verdict back to the loop state, so the
     # retry loop runs another attempt; once the window ends the hold is False and this same
     # exhaustion block activates the fallback. Billing / client errors never reach here held.
+    # The pre-hold budget is kept on ``_retry`` and restored the moment the hold ends, so the
+    # transport rebuild and every auto-recovery cycle after it run the ordinary budget.
     if retry_count >= max_retries and hold_noninteractive_transient:
+        if _retry.noninteractive_hold_base_retries is None:
+            _retry.noninteractive_hold_base_retries = max_retries
         max_retries = retry_count + 1
+    elif not hold_noninteractive_transient and _retry.noninteractive_hold_base_retries is not None:
+        max_retries = min(max_retries, _retry.noninteractive_hold_base_retries)
+        _retry.noninteractive_hold_base_retries = None
     window_spent = not over_wait_cap and noninteractive_transient_window_spent(
         agent, classified, error_message=error_msg,
     )
-    if window_spent and retry_count < max_retries and agent._has_pending_fallback():
+    # A spent window only short-cuts to a pending fallback. With nothing to fall back to, the
+    # one-shot transport rebuild and the auto-recovery ladder still run as for any session.
+    skip_to_fallback = window_spent and agent._has_pending_fallback()
+    if skip_to_fallback and retry_count < max_retries:
         # The window ran out before the ordinary retry budget did (long Retry-After waits): the
         # route had its recovery time, so move to the fallback now instead of burning the rest.
         max_retries = retry_count
@@ -427,9 +437,9 @@ def settle_unrecovered_error(
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
         # transient transport errors (stale pool, TCP reset). Not after a spent unattended
-        # window: the route already had its recovery time, so go straight to the fallback.
+        # window with a fallback pending: the route already had its recovery time.
         if (
-            not over_wait_cap and not window_spent and not _retry.primary_recovery_attempted
+            not over_wait_cap and not skip_to_fallback and not _retry.primary_recovery_attempted
             and agent._try_recover_primary_transport(api_error, retry_count=retry_count, max_retries=max_retries)
         ):
             _retry.primary_recovery_attempted = True
