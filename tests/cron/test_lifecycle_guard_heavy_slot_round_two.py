@@ -51,6 +51,17 @@ def test_only_heavy_slot_gets_new_budget_refusals_and_only_empty_devices_are_exe
     assert unsafe is blocked, (command, refusal)
 
 
+@pytest.mark.parametrize("spelling", ["//dev/stdin", "/dev//stdin", "/dev/./stdin", "/dev/fd/./0"])
+def test_alternate_stream_device_spellings_stay_fail_closed(tmp_path, spelling):
+    from cron.lifecycle_guard import _is_fail_closed_device_path
+
+    assert _is_fail_closed_device_path(spelling)
+    assert not _is_fail_closed_device_path("/dev/fd/../x/r.sh")
+    (tmp_path / "restart.sh").write_text("hermes gateway restart\n")
+    unsafe, _ = scan_gateway_lifecycle(f"bash {spelling} < restart.sh", cwd=str(tmp_path))
+    assert unsafe is True
+
+
 @pytest.mark.parametrize("command", [
     "echo hi 2>/dev/null",
     "echo hi </dev/null",

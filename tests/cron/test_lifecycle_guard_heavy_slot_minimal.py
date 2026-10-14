@@ -1,5 +1,6 @@
 """Only the installed helper's exact, explicit-path wrapper grammar is transparent."""
 
+import os
 import shlex
 from pathlib import Path
 
@@ -196,18 +197,16 @@ def test_remote_heavy_slot_fallback_scans_the_wrapped_command(tmp_path):
     ) == (True, None)
 
 
-def test_remote_callback_cannot_attest_local_helper_identity(trusted_slot):
-    remote = "/tmp/remote-script.sh"
-    source = {
-        str(trusted_slot): f'#!/usr/bin/env python3\n"""/dev/null"""\n{remote}\n',
-        remote: "x" * 1_048_577,
-    }
-    trusted_slot.unlink()
+def test_remote_callback_cannot_attest_local_helper_identity(tmp_path, trusted_slot):
+    # The helper stays installed, so only the remote-callback rule keeps it from being peeled.
+    blocked = tmp_path / "blocked-fifo"
+    os.mkfifo(blocked)
+    trusted_slot.write_text(f'#!/usr/bin/env python3\n"""/dev/null"""\n{blocked}\n', encoding="utf-8")
     unsafe, refusal = scan_gateway_lifecycle(
-        f"{trusted_slot} --label proof -- true", read_remote_script=source.get,
+        f"{trusted_slot} --label proof -- true", read_remote_script={}.get,
     )
     assert unsafe is True
-    assert refusal is not None and remote in refusal
+    assert refusal is not None and str(blocked) in refusal
 
 
 def test_peel_does_not_hide_an_untrusted_outer_wrapper(tmp_path, trusted_slot):

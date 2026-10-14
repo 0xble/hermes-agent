@@ -905,8 +905,13 @@ def _is_fail_closed_device_path(candidate: str) -> bool:
     Some hosts expose ``/dev/stdin`` or ``/dev/fd/<n>`` as regular-file descriptors (or make
     stdout/stderr unreadable), so relying only on ``fstat`` can accidentally allow them. The
     lexical guard keeps every device except the two empty devices fail-closed, while traversal
-    paths such as ``/dev/fd/../root/restart.sh`` remain ordinary script candidates.
+    paths such as ``/dev/fd/../root/restart.sh`` remain ordinary script candidates. Matching is
+    lexical after normalization (no symlink resolution), so ``//dev/stdin`` or ``/dev/./stdin``
+    cannot slip past.
     """
+    candidate = os.path.normpath(candidate)
+    if candidate.startswith("//"):
+        candidate = "/" + candidate.lstrip("/")
     return candidate in _FAIL_CLOSED_DEVICE_PATHS or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
 
 
