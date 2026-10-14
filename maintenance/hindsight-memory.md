@@ -10,8 +10,11 @@ and memory-pressure evictions commit the transcript (`on_session_end`) first;
 same-session evictions (`/model`, fallback drift, config signature,
 cross-process) never do. An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
-a second commit or shutdown: `shutdown_memory_provider()` holds the manager in a
-local, so a cleanup that outlived its 30s reset timeout still finishes with
+a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
+captures the manager under a per-agent handoff lock (`memory_handoff_lock`) that
+eviction's detach also takes, so exactly one side owns `shutdown_all()`. The
+lock covers only those reads and writes. The captured local means a cleanup
+that outlived its 30s reset timeout still finishes with
 `shutdown_all()` after eviction nulls the attribute. `MemoryManager.shutdown_all()`
 is idempotent, so racing teardown paths retire providers once. A memory-pressure
 batch commits, detaches the manager, and calls `release_clients()` inline, then

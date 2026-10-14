@@ -867,12 +867,15 @@ class AIAgent(
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine at session end (idempotent: gateway cleanup and
         ``close()`` may both call it)."""
-        if getattr(self, "_memory_provider_shutdown", False):
-            return
-        self._memory_provider_shutdown = True
-        # Hold the manager locally: a gateway eviction may detach ``self._memory_manager`` while a timed-out
-        # /new cleanup is still inside on_session_end, and it leaves this flagged shutdown to finish the job.
-        manager = self._memory_manager
+        from agent.memory_manager import memory_handoff_lock
+        # Flag + capture is one atomic claim against gateway eviction (_detach_memory_manager): either eviction
+        # detached first (we see None and leave its shutdown to it) or we claimed it and eviction leaves it to us.
+        # The local copy lets a timed-out /new cleanup still inside on_session_end finish after eviction detaches.
+        with memory_handoff_lock(self):
+            if getattr(self, "_memory_provider_shutdown", False):
+                return
+            self._memory_provider_shutdown = True
+            manager = getattr(self, "_memory_manager", None)
         if manager:
             try:
                 manager.on_session_end(messages or [])

@@ -1051,13 +1051,21 @@ class GatewayAgentCacheMixin:
         later soft release or close() cannot retire providers twice, and an agent whose
         shutdown_memory_provider() already started (``_memory_provider_shutdown``) is left to it: that call holds
         the manager locally and always finishes with ``shutdown_all()``, even when a timed-out /new cleanup is
-        still inside ``on_session_end``. Shutting it down here instead would retire providers mid-session-end."""
-        manager = getattr(agent, "_memory_manager", None)
-        if manager is None:
-            return None
-        with suppress(Exception):
-            agent._memory_manager = None
-        return None if getattr(agent, "_memory_provider_shutdown", False) is True else manager
+        still inside ``on_session_end``. Shutting it down here instead would retire providers mid-session-end.
+        The read, flag check and detach share shutdown_memory_provider()'s handoff lock, so exactly one side
+        calls ``shutdown_all()``."""
+        from agent.memory_manager import memory_handoff_lock
+        try:
+            lock = memory_handoff_lock(agent)
+        except Exception:  # no instance __dict__ (slotted test double): nothing can race the claim
+            lock = nullcontext()
+        with lock:
+            manager = getattr(agent, "_memory_manager", None)
+            if manager is None:
+                return None
+            with suppress(Exception):
+                agent._memory_manager = None
+            return None if getattr(agent, "_memory_provider_shutdown", False) is True else manager
 
     @staticmethod
     def _shutdown_memory_manager(manager: Any) -> None:
