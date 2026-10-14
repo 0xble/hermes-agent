@@ -51,17 +51,25 @@ def _list_observation(parent_agent: Any, payload: Dict[str, Any]) -> Dict[str, A
             since = previous[2]
             if not snapshot:
                 note = f"Unchanged since {since}. {payload['note']}"
-            elif can_receive_later():
+            elif can_receive_later() and not any(
+                str(entry.get("status") or "").startswith("retry_") for entry in snapshot
+            ):
                 note = (f"Unchanged since {since}; results arrive as a new message. "
                         "End the turn instead of polling.")
             else:
-                note = f"Unchanged since {since}."
-            return {
+                note = f"Unchanged since {since}. Retry/resume rows remain visible; inspect their status and retry fields."
+            response = {
                 "action": "list", "status": "unchanged", "unchanged_since": since,
                 "count": len(snapshot),
                 "subagent_ids": [entry["subagent_id"] for entry in snapshot],
                 "note": note,
             }
+            # Retry rows require a parent action (delegate_task(action='resume')) or
+            # may be terminal. Never collapse them into ids/counts, even when the
+            # current session can receive ordinary child completions later.
+            if any(str(entry.get("status") or "").startswith("retry_") for entry in snapshot):
+                response["subagents"] = snapshot
+            return response
         parent_agent._delegate_list_observation = (session_id, fingerprint, _registry._now())
     return payload
 

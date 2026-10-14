@@ -18,7 +18,7 @@ from tools.registry import registry
 CEILING = 180
 
 
-def _timed_out_wait(monkeypatch, *, notify, requested=None):
+def _timed_out_wait(monkeypatch, *, notify, requested=None, owner_task_id="", parent_session_id="", session_key=""):
     clock = SimpleNamespace(now=0.0)
     monkeypatch.setattr(processes, "_monotonic", lambda: clock.now)
     monkeypatch.setenv("TERMINAL_TIMEOUT", str(CEILING))
@@ -33,6 +33,7 @@ def _timed_out_wait(monkeypatch, *, notify, requested=None):
     store = processes.ProcessRegistry()
     session = processes.ProcessSession(
         id="proc_bounded_wait", command="bounded-work", task_id="owner", started_at=1,
+        owner_task_id=owner_task_id, parent_session_id=parent_session_id, session_key=session_key,
         notify_on_complete=notify,
     )
     session._completion_event = Completion()
@@ -89,6 +90,35 @@ def test_delegated_child_keeps_full_default_and_may_hand_off(monkeypatch, notify
         waited, note = _timed_out_wait(monkeypatch, notify=notify)
     _assert_must_collect(waited, note)
     assert "action='handoff'" in note
+
+
+def test_subagent_owned_process_keeps_full_default_and_wait_again(monkeypatch):
+    waited, note = _timed_out_wait(
+        monkeypatch, notify=True, owner_task_id="sa-child", parent_session_id="child-session",
+    )
+    _assert_must_collect(waited, note)
+
+
+def test_yield_release_uses_full_wait_guidance_for_unroutable_process(monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(processes, "_monotonic", lambda: clock.now)
+    monkeypatch.setenv("TERMINAL_TIMEOUT", str(CEILING))
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+    monkeypatch.setattr("tools.interrupt.consume_yield", lambda *_: True)
+    store = processes.ProcessRegistry()
+    session = processes.ProcessSession(
+        id="proc_yield_unroutable", command="bounded-work", task_id="owner", owner_task_id="sa-child",
+        parent_session_id="child-session", notify_on_complete=True,
+    )
+    store._running[session.id] = session
+    monkeypatch.setattr(processes, "process_registry", store)
+    raw = registry.dispatch("process_manage", {"action": "wait", "session_id": session.id})
+    result = json.loads(raw) if isinstance(raw, str) else raw
+    assert result["status"] == "interrupted"
+    note = result["note"].lower()
+    assert "wait again with a bounded timeout" in note
+    assert "will not be routed to this session" in note
+    assert "you will be notified on exit" not in note
 
 
 @pytest.fixture
@@ -165,3 +195,33 @@ def test_list_observations_are_session_scoped_and_include_queued_changes(observa
     assert _list(owner)["status"] == "unchanged"
     queued["queue_reason"] = "different reason"
     assert _list(owner)["subagents"][0]["queue_reason"] == "different reason"
+
+
+def test_unchanged_list_keeps_retry_rows_and_retry_metadata_visible(observations, monkeypatch):
+    from tools import delegation_resume
+
+    owner = SimpleNamespace(session_id="owner")
+    retry_rows = [
+        {
+            "delegation_id": "retry-due", "parent_session_id": "owner", "retry_state": "notified",
+            "retry_reason": "child exited before delivering", "retry_due_at": 1234.5,
+            "retry_attempt": 2, "task": {"goal": "recover this work"},
+        },
+        {
+            "delegation_id": "retry-terminal", "parent_session_id": "owner", "retry_state": "terminal",
+            "retry_reason": "retry budget exhausted", "retry_due_at": None,
+            "retry_attempt": 3, "task": {"goal": "report the terminal outcome"},
+        },
+    ]
+    monkeypatch.setattr(delegation_resume, "list_retry_pending", lambda: retry_rows)
+    from tools import delegate_tool_progress
+    monkeypatch.setattr(delegate_tool_progress, "can_receive_later", lambda: True)
+    first = _list(owner)
+    assert {entry["status"] for entry in first["subagents"]} == {"retry_notified", "retry_terminal"}
+    unchanged = _list(owner)
+    assert unchanged["status"] == "unchanged"
+    assert "end the turn" not in unchanged["note"].lower()
+    assert {entry["status"] for entry in unchanged["subagents"]} == {"retry_notified", "retry_terminal"}
+    due = next(entry for entry in unchanged["subagents"] if entry["subagent_id"] == "retry-due")
+    assert due["retry_reason"] == "child exited before delivering"
+    assert due["retry_due_at"] == 1234.5

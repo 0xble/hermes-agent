@@ -1904,6 +1904,32 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             return False
 
     @staticmethod
+    def _completion_reaches_current_session(session: ProcessSession) -> bool:
+        """Whether the registry's completion drain would route this process to this session.
+
+        Ordinary process completions are addressed by the spawning session key. Processes
+        owned by a delegated ``sa-`` task are suppressed by the drain (the child result is
+        the deliverable) and are killed at child teardown unless explicitly handed off, so
+        they must never get the short, end-the-turn wait plan in their parent.
+        """
+        if str(session.owner_task_id or session.task_id or "").startswith("sa-"):
+            return False
+        from gateway.session_context import get_session_env
+
+        current_session_id = str(get_session_env("HERMES_SESSION_ID", "") or "")
+        current_session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "")
+        parent_session_id = str(session.parent_session_id or "")
+        session_key = str(session.session_key or "")
+        if parent_session_id and current_session_id:
+            return parent_session_id == current_session_id
+        if session_key and current_session_key:
+            return session_key == current_session_key
+        # Legacy/CLI callers may have no session routing metadata at all. Preserve
+        # their existing local completion behavior, while failing closed whenever a
+        # process does carry an origin that is not the current session.
+        return not parent_session_id and not session_key
+
+    @staticmethod
     def _owns_event(evt: dict, session_key: str, owns_event, is_async_delegation: bool) -> bool:
         """Routing verdict for one drained event (see drain_notifications); False = requeue."""
         evt_session_key = str(evt.get("session_key") or "")
@@ -2202,7 +2228,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         if session is None:
             return _not_found(session_id)
         timeout_note = None
-        default_timeout, guidance = _wait_plan(bool(session.notify_on_complete), max_timeout)
+        default_timeout, guidance = _wait_plan(
+            bool(session.notify_on_complete), max_timeout,
+            completion_reaches_session=self._completion_reaches_current_session(session),
+        )
         effective_timeout = default_timeout if timeout is None else timeout
         if timeout and timeout > max_timeout:
             effective_timeout = max_timeout
@@ -2230,8 +2259,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 result = {
                     "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
                     "process_running": True,
-                    "note": ("User sent a new message -- wait released; the process is still "
-                             "running and you will be notified on exit. Respond to the user now.")}
+                    "note": ("User sent a new message -- wait released; the process is still running."
+                             f"{guidance} Respond to the user now.")}
             if result is not None:
                 if timeout_note:
                     result["timeout_note"] = timeout_note
@@ -3251,7 +3280,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds for 'wait' (default 30 when the process has notify_on_complete and this session can receive the notice later, else TERMINAL_TIMEOUT; clamped by TERMINAL_TIMEOUT).",
+                "description": "Max seconds for 'wait' (default 30 when the process has notify_on_complete, its completion routes to this session, and this session can receive the notice later, else TERMINAL_TIMEOUT; clamped by TERMINAL_TIMEOUT).",
                 "minimum": 1
             },
             "offset": {

@@ -26,15 +26,22 @@ def can_receive_later() -> bool:
     return async_delivery_supported() and not is_delegated_child_context()
 
 
-def wait_plan(notify_on_complete: bool, max_timeout: int) -> Tuple[int, str]:
+def wait_plan(
+    notify_on_complete: bool,
+    max_timeout: int,
+    *,
+    completion_reaches_session: bool = True,
+) -> Tuple[int, str]:
     """The single decision for a wait: (default window, guidance after it elapses).
 
     Deferring is safe only when a completion notice will actually arrive: the
-    process has notify_on_complete set AND this session can receive it later.
+    process has notify_on_complete set, its completion is routed to this session,
+    AND this session can receive it later.
     Anywhere else, ending the turn or not waiting again loses the result, so the
     caller keeps the full window and must collect or kill the process itself.
     """
-    if notify_on_complete and can_receive_later():
+    reachable = can_receive_later()
+    if notify_on_complete and completion_reaches_session and reachable:
         return (min(NOTIFIABLE_DEFAULT_TIMEOUT, max_timeout),
                 " You will be notified on completion; do not wait again. End the turn or do other work.")
     from agent.delegation_context import is_delegated_child_context
@@ -44,6 +51,12 @@ def wait_plan(notify_on_complete: bool, max_timeout: int) -> Tuple[int, str]:
                 " You are a subagent: no completion notice will reach you or your parent, and this process is "
                 "killed when you finish. Before finishing, wait again with a bounded timeout, kill it, or hand "
                 "it to your parent with process_manage(action='handoff', session_id=..., data='<purpose>').")
-    reason = ("Completion notification was not enabled for this process, so no notice will arrive."
-              if can_receive_later() else "This session cannot receive a later completion notice or turn.")
+    if not completion_reaches_session:
+        reason = "This process's completion will not be routed to this session."
+    elif not notify_on_complete:
+        reason = "Completion notification was not enabled for this process, so no notice will arrive."
+    elif not reachable:
+        reason = "This session cannot receive a later completion notice or turn."
+    else:
+        reason = "The completion notice is not available to this session."
     return (max_timeout, f" {reason} Before finishing, wait again with a bounded timeout or kill it.")
