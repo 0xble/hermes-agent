@@ -677,10 +677,11 @@ def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any]) -> bool:
     age = time.time() - path.stat().st_mtime
     limit = QUEUE_CHECKPOINT_MAX_AGE_SECONDS if data.get("queue_accepted") is True else 24 * 60 * 60
     if age > limit:
-        if data.get("queue_accepted") is True:
-            quarantine_pending_spool(path, "expired drain-deferred input")
-            return True
-        logger.warning("Dropping expired drain-deferred message from %s", path)
+        # Age never deletes the only durable copy (maintenance/session-compression-recovery.md):
+        # every expired drain arrival, accepted or legacy, moves to the *.bad quarantine intact.
+        # A failed quarantine raises so the per-file boundary keeps the spool in place.
+        if not quarantine_pending_spool(path, "expired drain-deferred input"):
+            raise OSError(f"could not quarantine expired drain-deferred input {path}")
         return True
     from gateway.platforms.event import MessageEvent
     from hermes_cli.commands import resolve_command
