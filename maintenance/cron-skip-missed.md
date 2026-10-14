@@ -15,8 +15,8 @@ Preserve:
 
 - Default resume is unchanged: a past stored instant survives resume and stays due.
 - `resume_job(skip_missed=True)` / `hermes cron resume --skip-missed` / `cronjob_manage`
-  `action=resume, skip_missed=true` drops the occurrences that elapsed while paused (each
-  INFO-logged) and resumes on the next future slot.
+  `action=resume, skip_missed=true` drops the occurrences that elapsed while paused (the
+  first 20 INFO-logged one by one, any rest as one count line) and resumes on the next future slot.
 - `skip_job(job_id, count=N)` / `hermes cron skip --count N` / `cronjob_manage action=skip`
   drops the next N occurrences of a *scheduled* recurring job, counting the pending
   `next_run_at` as the first. Paused jobs are refused: resume re-derives a future instant, so

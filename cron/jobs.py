@@ -2315,8 +2315,9 @@ def _skip_slots(job: Dict[str, Any], count: int, reason: str) -> Optional[str]:
 
     The pending occurrence (stored ``next_run_at``) is the first one skipped. When it has already
     elapsed, it and every other elapsed slot count together as that first skip, so ``count=1``
-    lands on the next future slot and ``count=N`` on the Nth. Each skipped slot is INFO-logged so
-    a deliberate skip is never silent (#113603's accounting contract).
+    lands on the next future slot and ``count=N`` on the Nth. The first ``_SKIP_LOG_LIMIT`` skipped
+    slots are INFO-logged one by one and the rest as a single count, so a deliberate skip is never
+    silent (#113603's accounting contract) and a long pause cannot flood the log.
     """
     schedule, tz = job["schedule"], job.get("timezone")
     now = _hermes_now()

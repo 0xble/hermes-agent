@@ -1013,7 +1013,8 @@ _JOB_ACTIONS = {
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
     "pause": _action_pause,
     "resume": lambda job, a: _job_state_result(resume_job(job["id"], skip_missed=bool(a.get("skip_missed")))),
-    "skip": lambda job, a: _job_state_result(skip_job(job["id"], a.get("count") or 1)),
+    "skip": lambda job, a: _job_state_result(
+        skip_job(job["id"], 1 if a.get("count") is None else a["count"])),
 }
 
 

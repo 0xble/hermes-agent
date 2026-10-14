@@ -943,7 +943,8 @@ def cron_skip(args) -> int:
     """Skip the next occurrence(s) of a scheduled recurring job."""
     from cron.jobs import AmbiguousJobReference, skip_job
     try:
-        job = skip_job(args.job_id, getattr(args, "count", 1) or 1)
+        count = getattr(args, "count", None)
+        job = skip_job(args.job_id, 1 if count is None else count)
     except (AmbiguousJobReference, ValueError) as exc:
         print(color(f"Failed to skip job: {exc}", Colors.RED))
         return 1
