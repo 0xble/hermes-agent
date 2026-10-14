@@ -1,6 +1,7 @@
 """PR1 contracts for the opt-in zero-cut gateway handover seams."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
@@ -190,6 +191,34 @@ def test_disconnect_flag_on_releases_lock_when_cancelled_before_updater(monkeypa
     assert "release" in events
 
 
+def test_disconnect_flag_on_releases_lock_when_quota_flush_cancels(monkeypatch):
+    events = []
+    adapter = _make_disconnect_adapter(monkeypatch, enabled=True, events=events)
+    started = threading.Event()
+    unblock = threading.Event()
+
+    class Quota:
+        def flush(self):
+            started.set()
+            unblock.wait(1)
+
+    setattr(adapter, "_telegram_daily_quota", Quota())
+
+    async def scenario():
+        task = asyncio.create_task(adapter.disconnect())
+        await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        unblock.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert "release" in events
+
+
 __all__ = [
     "test_zero_cut_handover_defaults_off",
     "test_launchd_slot_labels_reuse_default_label_convention",
@@ -198,4 +227,5 @@ __all__ = [
     "test_disconnect_flag_on_releases_lock_when_updater_stop_times_out",
     "test_disconnect_flag_on_releases_lock_when_outer_teardown_cancels",
     "test_disconnect_flag_on_releases_lock_when_cancelled_before_updater",
+    "test_disconnect_flag_on_releases_lock_when_quota_flush_cancels",
 ]

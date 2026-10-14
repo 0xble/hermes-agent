@@ -4039,6 +4039,10 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+        zero_cut_handover = is_zero_cut_handover_enabled(
+            getattr(getattr(self, "gateway_runner", None), "config", None))
+        if zero_cut_handover:
+            arm_abort_release(self, asyncio.current_task())
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is not None:
             try:
@@ -4051,12 +4055,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
-        zero_cut_handover = is_zero_cut_handover_enabled(
-            getattr(getattr(self, "gateway_runner", None), "config", None))
         if not zero_cut_handover:
             self._release_platform_lock()
-        else:
-            arm_abort_release(self, asyncio.current_task())
         current_task = asyncio.current_task()
         lifecycle_tasks = self._collect_live_tasks(
             [getattr(self, "_polling_error_task", None), getattr(self, "_polling_progress_verifier_task", None)], current_task)
