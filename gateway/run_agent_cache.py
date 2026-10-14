@@ -987,8 +987,10 @@ class GatewayAgentCacheMixin:
         except Exception:
             if not inline_fallback:
                 raise
-            with suppress(Exception):
+            try:
                 ctx.run(self._run_release_in_profile_scope, target, args, session_key)
+            except Exception:
+                logger.warning("Inline release %s failed for %s", name, session_key, exc_info=True)
 
     def _run_release_in_profile_scope(self, target, args: tuple, session_key: Optional[str]) -> None:
         """Call ``target(*args)`` under the profile that OWNS ``session_key``.
@@ -1220,8 +1222,8 @@ class GatewayAgentCacheMixin:
                 self._run_release_in_profile_scope(
                     lambda a, k: self._commit_then_release_soft(a, k, retired=retired), (agent, key), key,
                 )
-            except Exception as _e:
-                logger.debug("Pressure release failed for %s: %s", key, _e)
+            except Exception:
+                logger.warning("Pressure release failed for %s", key, exc_info=True)
             del agent
             for manager in retired:
                 with suppress(Exception):

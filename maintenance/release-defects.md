@@ -399,7 +399,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   as completion, so the recall-visibility barrier passed early. Each op now keeps the bank it was
   retained to.
 - Regression coverage: `test_hindsight_provider.py` (`test_pending_ops_are_polled_against_their_own_bank`,
-  `TestPrefetchSupersession::test_superseded_slow_worker_cannot_overwrite_newer_result`).
+  `TestPrefetchSupersession::test_query_queued_during_slow_recall_wins_over_it`).
 
 ## Hindsight self-parent lineage tag re-consolidated whole sessions
 
