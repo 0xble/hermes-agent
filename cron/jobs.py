@@ -998,6 +998,9 @@ def _job_is_stale_error_recurring(
     from cron.quota_hold import hold_active
     if hold_active(job, now):
         return False  # deliberately parked past a provider usage window, not wedged (#89376)
+    skipped_until = _parse_aware(job.get(SKIPPED_UNTIL_KEY)) if job.get(SKIPPED_UNTIL_KEY) else None
+    if skipped_until is not None and _instant_after(skipped_until, now):
+        return False  # an operator skipped the slots before this instant; re-arming would undo it
     if _job_running_in_this_process(str(job.get("id") or "")):
         return False
     # A fresh fire_claim means the job is running in ANOTHER process sharing this
@@ -2250,6 +2253,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # parked. The next fire re-parks (with a fresh notice) if the window is still closed.
             from cron.quota_hold import clear_state as _clear_quota_hold
             _clear_quota_hold(updated)
+            updated.pop(SKIPPED_UNTIL_KEY, None)  # the skip described the old schedule's slots
         elif "timezone" in updates and updated.get("state") != "paused":
             # The wall clock the expression is read in changed, so the stored instant is stale.
             updated["next_run_at"] = _next_run_or_reject_past_oneshot(
@@ -2310,6 +2314,11 @@ _SKIP_LOG_LIMIT = 20
 _SKIP_WALK_LIMIT = 10_000
 
 
+# Set by an explicit skip to the instant it landed on. Until then the stale-error re-arm leaves the
+# job alone, so an old persisted error cannot pull a deliberately skipped slot back to now.
+SKIPPED_UNTIL_KEY = "skipped_until"
+
+
 def _skip_slots(job: Dict[str, Any], count: int, reason: str) -> Optional[str]:
     """Return ``next_run_at`` after deliberately skipping ``count`` occurrences of a recurring job.
 
@@ -2368,7 +2377,7 @@ def skip_job(job_id: str, count: int = 1) -> Optional[Dict[str, Any]]:
     next_run_at = _skip_slots(job, count, f"operator skip, count={count}")
     if next_run_at is None:
         raise ValueError(f"Cannot skip: no next occurrence could be computed for job '{name}'.")
-    return update_job(job["id"], {"next_run_at": next_run_at})
+    return update_job(job["id"], {"next_run_at": next_run_at, SKIPPED_UNTIL_KEY: next_run_at})
 
 
 def resume_job(job_id: str, *, skip_missed: bool = False) -> Optional[Dict[str, Any]]:
@@ -2388,6 +2397,7 @@ def resume_job(job_id: str, *, skip_missed: bool = False) -> Optional[Dict[str, 
         return None
     stored_next = job.get("next_run_at")
     stored_dt = _parse_aware(stored_next) if stored_next else None
+    skipped_until = None
     if (
         job["schedule"].get("kind") in {"cron", "interval"}
         and stored_dt is not None
@@ -2395,6 +2405,7 @@ def resume_job(job_id: str, *, skip_missed: bool = False) -> Optional[Dict[str, 
     ):
         if skip_missed:
             next_run_at = _skip_slots(job, 1, "missed while paused; resumed with skip_missed")
+            skipped_until = next_run_at
         else:
             next_run_at = stored_next
             logger.info(
@@ -2414,6 +2425,7 @@ def resume_job(job_id: str, *, skip_missed: bool = False) -> Optional[Dict[str, 
         "paused_at": None,
         "paused_reason": None,
         "next_run_at": next_run_at,
+        **({SKIPPED_UNTIL_KEY: skipped_until} if skipped_until else {}),
     })
 
 
