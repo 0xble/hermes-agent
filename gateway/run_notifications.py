@@ -2915,8 +2915,9 @@ class GatewayNotificationsMixin:
         adapter = self._resolve_injection_adapter(platform_name, source)
         return session_key in (getattr(adapter, "_active_sessions", None) or {})
 
-    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> Optional[bool]:
-        """True = accepted/unknown receipt, False = transport failure, None = no route."""
+    async def _send_watcher_message(self, platform_name: str, chat_id, thread_id, message_text: str, watcher: dict) -> bool:
+        """True = accepted or unknown receipt. False = not delivered: a raised send, or an
+        adapter/route that is absent right now (reconnecting, failed platform). False stays retryable."""
         from gateway.run import _non_conversational_metadata
         source = await asyncio.to_thread(self._build_process_event_source, watcher)
         adapter = self._resolve_injection_adapter(platform_name, source)
@@ -2929,7 +2930,7 @@ class GatewayNotificationsMixin:
                 # Some adapters send successfully but return no receipt. Unknown is not
                 # a known failure: replaying it could duplicate an already delivered message.
                 return result is None or bool(result.success)
-        return None
+        return False
 
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
@@ -3116,9 +3117,6 @@ class GatewayNotificationsMixin:
                         nonlocal sent
                         sent = await self._send_watcher_message(
                             platform_name, chat_id, thread_id, message_text, watcher)
-                        if sent is None:
-                            logger.warning("Process watcher: no delivery route for %s (%s); settling completion",
-                                           session_id, platform_name)
 
                     async with self._completion_event_scope(watcher):
                         # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.

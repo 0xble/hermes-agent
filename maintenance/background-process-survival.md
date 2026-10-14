@@ -31,9 +31,11 @@ shutdown cut receipts, restart adoption, or exactly-once completion delivery.
   it. A known failed send/admission releases the claim and keeps the completion
   retryable. TUI admission failures also re-queue the original completion and
   clear its UI dedup key; UI dedup never bypasses the survivor lease on later
-  attempts. Text-only watcher sends retry known failures while the gateway lives,
-  with exponential delays (at least one second, capped at 15 minutes), releasing
-  the claim between attempts. Shutdown cancellation leaves the completion
+  attempts. Text-only watcher sends retry every non-delivery while the gateway
+  lives: a known failed send, a raised send, and an adapter or route that is
+  absent right now (reconnecting or failed platform). Delays are exponential (at
+  least one second, capped at 15 minutes) and the claim is released between
+  attempts. Only a delivered send settles. Shutdown cancellation leaves the completion
   checkpointed for a successor. An adapter returning no send receipt has an unknown
   outcome, not a known failure; it is settled without retry to avoid duplicate
   sends. Both agent-notify and watcher-routed survivors remain checkpointed and exempt from result

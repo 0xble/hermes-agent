@@ -168,8 +168,9 @@ class ProcessSurvivalMixin:
 
     def _retain_survivor_completion(self, session: ProcessSession) -> bool:
         """Keep both agent and text-watcher results until their delivery is settled."""
-        return (session.survive_restart
-                and (session.notify_on_complete or session.watcher_interval > 0)
+        # Prune paths also see foreign/legacy session objects without the survival fields.
+        return (getattr(session, "survive_restart", False)
+                and (getattr(session, "notify_on_complete", False) or getattr(session, "watcher_interval", 0) > 0)
                 and self._survivor_delivery_pending(session))
 
     def _survivor_delivery_pending(self, session: ProcessSession) -> bool:

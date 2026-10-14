@@ -25,14 +25,15 @@ async def test_watcher_unknown_send_result_is_not_repeated(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ["adapter", "chat_id"])
-async def test_unroutable_survivor_watcher_settles_once(tmp_path, monkeypatch, caplog, missing):
+@pytest.mark.parametrize("failure", ["send-raises", "adapter-missing"])
+async def test_transient_watcher_delivery_failure_retries_until_delivered(tmp_path, monkeypatch, failure):
+    """A raised send or a temporarily absent adapter (reconnect, runtime fatal) is never settled."""
     monkeypatch.setattr(registry_module, "get_hermes_home", lambda: tmp_path / "home")
     registry = ProcessRegistry()
     session = ProcessSession(
-        id="proc_unroutable", command="echo finished", task_id="task", session_key="session",
+        id="proc_transient", command="echo finished", task_id="task", session_key="session",
         survive_restart=True, exited=True, exit_code=0,
-        delivered_path=str(tmp_path / "home" / "process-runs" / "proc_unroutable" / "delivered"),
+        delivered_path=str(tmp_path / "home" / "process-runs" / "proc_transient" / "delivered"),
     )
     registry._finished[session.id] = session
     monkeypatch.setattr(registry_module, "process_registry", registry)
@@ -40,24 +41,44 @@ async def test_unroutable_survivor_watcher_settles_once(tmp_path, monkeypatch, c
     runner._completion_event_scope = lambda _: contextlib.nullcontext()
     runner._load_background_notifications_mode = lambda: "concise"
     runner._build_process_event_source = lambda _: make_restart_source(chat_id="123")
-    runner._resolve_injection_adapter = lambda *_: None if missing == "adapter" else adapter
-    adapter.send = AsyncMock()
+    resolves = []
+
+    def resolve(*_):
+        resolves.append(1)
+        return None if failure == "adapter-missing" and len(resolves) == 1 else adapter
+
+    runner._resolve_injection_adapter = resolve
+    sends = []
+
+    async def send(*args, **kwargs):
+        sends.append(registry._survivor_delivery_state(session))
+        if failure == "send-raises" and len(sends) == 1:
+            raise ConnectionError("network down")
+        return SendResult(success=True, message_id="delivered")
+
+    adapter.send = send
     delays = []
 
     async def sleep(delay):
         delays.append(delay)
-        assert len(delays) == 1, "unroutable completion retried instead of settling"
+        assert registry._survivor_delivery_state(session) != "delivered", "transient failure settled"
+        assert len(delays) <= 3
 
     monkeypatch.setattr("gateway.run_notifications.asyncio.sleep", sleep)
-    watcher = {"session_id": session.id, "check_interval": 0.01, "platform": "telegram",
-               "chat_id": "" if missing == "chat_id" else "123"}
-    with caplog.at_level("WARNING", logger="gateway.run_notifications"):
-        await runner._run_process_watcher(watcher)
+    watcher = {"session_id": session.id, "check_interval": 0.01, "platform": "telegram", "chat_id": "123"}
+    await runner._run_process_watcher(watcher)
+    assert sends == (["claimed", "claimed"] if failure == "send-raises" else ["claimed"])
     assert registry._survivor_delivery_state(session) == "delivered"
-    adapter.send.assert_not_awaited()
-    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
-    assert len(warnings) == 1
-    assert session.id in warnings[0].message and "route" in warnings[0].message
+
+
+@pytest.mark.asyncio
+async def test_send_exception_reports_known_failure(monkeypatch):
+    runner, adapter = make_restart_runner()
+    runner._build_process_event_source = lambda _: make_restart_source(chat_id="123")
+    runner._resolve_injection_adapter = lambda *_: adapter
+    adapter.send = AsyncMock(side_effect=ConnectionError("network down"))
+
+    assert await runner._send_watcher_message("telegram", "123", "", "finished", {}) is False
 
 
 @pytest.mark.asyncio
