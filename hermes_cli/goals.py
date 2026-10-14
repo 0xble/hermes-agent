@@ -2546,6 +2546,18 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
+def _goal_judge_route_hint() -> str:
+    """Render the configured judge route in recovery guidance, never a stale example route."""
+    try:
+        from hermes_cli.config import load_config
+        block = (load_config().get("auxiliary") or {}).get("goal_judge") or {}
+        provider = str(block.get("provider") or "(not configured)")
+        model = str(block.get("model") or "(default)")
+    except Exception:
+        provider, model = "(unavailable)", "(unavailable)"
+    return _JUDGE_CONFIG_HINT.format(provider=provider, model=model)
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -3596,8 +3608,9 @@ class GoalManager:
             return self._pause_decision(
                 f"judge API unreachable {n_tx} turns in a row (check auxiliary.goal_judge provider/key in config.yaml)",
                 "continue", reason,
-                f"⏸ Goal paused — judge API returned errors ({n_tx} turns). Check the goal_judge provider/key in "
-                + _JUDGE_CONFIG_HINT.format(provider="deepseek", model="deepseek-flash"),
+                f"⏸ Goal paused — judge API returned errors ({n_tx} turns). Check the configured "
+                "goal_judge route:\n"
+                + _goal_judge_route_hint(),
             )
         if n_parse >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
             return self._pause_decision(

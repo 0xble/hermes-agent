@@ -23,6 +23,8 @@ from agent.auxiliary_client import (
     _resolve_codex_credential_and_base,
     _is_payment_error,
     _is_rate_limit_error,
+    _is_server_error,
+    _is_auth_unavailable_error,
     _is_model_not_found_error,
     _is_model_incompatible_error,
     _is_statusless_structured_provider_error,
@@ -1517,6 +1519,17 @@ class TestIsRateLimitError:
         # No status_code set, but class name matches
         assert _is_rate_limit_error(exc) is True
 
+    def test_persistent_5xx_is_a_fallback_reason(self):
+        class ServerError(Exception):
+            status_code = 503
+        assert _is_server_error(ServerError("upstream internal error")) is True
+
+    def test_wrapped_auth_unavailable_503_is_a_fallback_reason(self):
+        class RelayAuthUnavailable(Exception):
+            status_code = 503
+        exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
+        assert _is_auth_unavailable_error(exc) is True
+
 
 class TestTryPaymentFallback:
     """_try_payment_fallback skips the failed provider and tries alternatives."""
@@ -1694,6 +1707,36 @@ class TestCallLlmPaymentFallback:
         assert fallback_client.chat.completions.create.called
         # Labelled as an auth error, not mis-tagged as a connection error.
         assert mock_fb.call_args.kwargs.get("reason") == "auth error"
+
+    def test_503_after_same_provider_retry_uses_configured_fallback(self, monkeypatch):
+        """A persistent 5xx must leave the failing provider after its retry rung."""
+        primary_client = MagicMock()
+
+        class _ServerUnavailable(Exception):
+            status_code = 503
+
+        primary_client.chat.completions.create.side_effect = _ServerUnavailable(
+            "Error code: 503 - auth_unavailable: no auth available; last upstream error: rate_limit_error"
+        )
+
+        fallback_client = MagicMock()
+        fallback_client.chat.completions.create.return_value = _DummyResponse("fallback 503 response")
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "claude-opus")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "claude-opus", None, None, None)), \
+             patch("agent.auxiliary_client._transient_retry_count", return_value=0), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(fallback_client, "fallback-model", "fallback_chain[0](codex)")) as mock_fb:
+            result = call_llm(
+                task="goal_judge",
+                messages=[{"role": "user", "content": "judge this"}],
+            )
+
+        assert result.choices[0].message.content == "fallback 503 response"
+        assert fallback_client.chat.completions.create.called
+        assert mock_fb.call_args.kwargs["reason"] == "auth unavailable"
 
 
 class TestStaleFallbackCandidateSkip:
