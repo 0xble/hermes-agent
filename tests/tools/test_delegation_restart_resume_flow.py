@@ -20,7 +20,7 @@ def ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
 
 
-def cut_row(did="deleg_restart_flow", *, batch=True):
+def cut_row(did="deleg_restart_flow", *, batch=True, task_contexts=None):
     now = time.time()
     record = dict(delegation_id=did, goal="first; second; third", context="shared",
                   role="leaf", model="m", session_key="agent:main:telegram:dm:1",
@@ -28,6 +28,8 @@ def cut_row(did="deleg_restart_flow", *, batch=True):
                   dispatched_at=now - 60)
     if batch:
         record.update(is_batch=True, goals=["first", "second", "third"], task_indexes=[0, 1, 2])
+        if task_contexts is not None:
+            record["task_contexts"] = task_contexts
     ad._persist_dispatch(record)
     event = dict(type="async_delegation", delegation_id=did, status="interrupted",
                  cut_reason="gateway shutdown (restart)", completed_at=now)
@@ -63,6 +65,23 @@ def test_delivered_cut_notice_does_not_create_second_parent_notice(batch):
     assert dr.sweep_retries(now=now + dr.NOTICE_GRACE_S * 3) == []
     payload = json.loads(_handle_control_action("resume", did, None, Parent()))
     assert payload["status"] == "retry_claimed"
+
+
+def test_each_claimed_child_recovers_only_its_own_context():
+    did, _, now = cut_row(
+        "deleg_contexts",
+        task_contexts={"0": "context-first", "1": "context-second", "2": "context-third"},
+    )
+    dr.schedule_retry(did, now=now)
+    payload = json.loads(_handle_control_action("resume", did, None, Parent()))
+    assert payload["status"] == "retry_claimed"
+    recovered = {task["goal"]: task["context"] for task in payload["tasks"]}
+    assert "context-second" in recovered["second"]
+    assert "context-first" not in recovered["second"]
+    assert "context-third" not in recovered["second"]
+    assert "context-third" in recovered["third"]
+    assert "context-first" not in recovered["third"]
+    assert "context-second" not in recovered["third"]
 
 
 def test_each_claimed_child_admits_one_replacement_without_rerunning_success():

@@ -410,6 +410,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     # Keep them at the durable boundary too, otherwise replacement lineage is lost.
     contexts = dict.fromkeys(t["context"] for _, t, _ in unit.children if t.get("context"))
     effective_context = "\n\n".join(contexts) or unit.context
+    task_contexts = {str(i): str(t.get("context") or "") for i, t, _ in unit.children if t.get("context")}
     from tools.delegation_resume import recovery_source_id
     # Choose each brief's current source before losing task boundaries. Older
     # headings nested in ORIGINAL CONTEXT cannot authorize this unit's work.
@@ -434,6 +435,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
         interrupt_fn=_interrupt, cancel_fn=_cancel_queued, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
+        task_contexts=task_contexts,
         # Persist locators before starting workers; live_paths omits failed writers and can be compressed.
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None

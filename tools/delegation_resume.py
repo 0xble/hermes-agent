@@ -156,14 +156,16 @@ def _batch_recovery_tasks(record: Dict[str, Any], indexes: Optional[List[int]] =
                 if isinstance(entry, dict) and isinstance(entry.get("task_index"), int)}
     transcripts = task.get("task_transcripts") or {}
     tails = result.get("transcript_tails") or {}
+    task_contexts = task.get("task_contexts") or {}
     shared = str(task.get("context") or "").strip()
     tasks = []
     for child in candidates:
         index = child["task_index"]
         if wanted is not None and index not in wanted:
             continue
+        child_context = task_contexts.get(str(index), task_contexts.get(index)) if isinstance(task_contexts, dict) else None
         child_task = dict(task)
-        child_task.update(goal=child["goal"], context=shared)
+        child_task.update(goal=child["goal"], context=str(child_context or shared).strip())
         child_record = dict(record, task=child_task)
         instruction = build_recovery_instruction(child_record)
         lines = [instruction, "", f"RECOVERY CHILD INDEX: {record['delegation_id']}:{index}"]

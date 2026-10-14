@@ -242,7 +242,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     try:  # where the children's terminals started; lets recovery add a git-state hint
         task_payload["owner_cwd"] = os.getcwd()
@@ -1782,6 +1782,7 @@ def _dispatch_admitted(
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
+    task_contexts: Optional[Dict[str, str]] = None,
     task_transcripts: Optional[Dict[str, str]] = None,
     cron_execution: Optional[Dict[str, str]] = None,
     max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
@@ -1808,7 +1809,8 @@ def _dispatch_admitted(
         "interrupt_fn": interrupt_fn, "cancel_fn": cancel_fn, "runner": runner, "classify": classify,
         "crash_result": crash_result, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
-        **(cron_execution or {}), **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
+        **(cron_execution or {}), **({"task_contexts": dict(task_contexts)} if task_contexts else {}),
+        **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         "_context": contextvars.copy_context(),
         "_worker_context_runner": propagate_context_to_thread(lambda worker: worker()), "_progress_token": None,
@@ -1964,6 +1966,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
     delegation_id: Optional[str] = None, progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None,
+    task_contexts: Optional[Dict[str, str]] = None,
     task_transcripts: Optional[Dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
@@ -1983,7 +1986,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         max_queued_delegations=max_queued_delegations, cancel_fn=cancel_fn,
-        task_indexes=task_indexes, task_transcripts=task_transcripts,
+        task_indexes=task_indexes, task_contexts=task_contexts, task_transcripts=task_transcripts,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
