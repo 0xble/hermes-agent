@@ -91,6 +91,44 @@ async def test_restored_followup_accepted_without_turn_gets_note_and_skipped_out
 
 
 @pytest.mark.asyncio
+async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_path, monkeypatch):
+    """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
+    from gateway import run
+
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    profile_home = tmp_path / "profiles" / "secondary"
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+    active = []
+    entered = []
+
+    class _SpyScope:
+        def __init__(self, home):
+            self.home = home
+
+        async def __aenter__(self):
+            entered.append(self.home)
+            active.append(self.home)
+            return self
+
+        async def __aexit__(self, *exc):
+            active.pop()
+            return False
+
+    monkeypatch.setattr(run, "_async_profile_runtime_scope", _SpyScope)
+    seen = []
+
+    async def deliver(_source, _text):
+        seen.append(list(active))
+        return True
+
+    runner._deliver_platform_notice = deliver
+    event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
+    await runner._finish_recovered_followup(event, entry.session_key, "accepted-without-turn")
+    assert entered == [profile_home]
+    assert seen == [[profile_home]]
+
+
+@pytest.mark.asyncio
 async def test_started_recovered_followup_retires_spool_before_later_restart(tmp_path, monkeypatch):
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id)

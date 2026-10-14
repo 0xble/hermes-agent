@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
@@ -112,17 +112,21 @@ class RestartRecoveryMixin:
 
     async def _finish_recovered_followup(self, event, session_key: str, reason: str) -> None:
         """A future turn can outlive its predecessor's marker; its refusal still needs a note."""
-        from gateway.run import _startup_restore_drain_timeout_secs
+        from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
 
         noted = self._interruption_note_delivered(session_key)
         if not noted:
             try:
-                send = self._deliver_platform_notice(
-                    event.source,
-                    t("gateway.restart.followup_recovery_notice"),
-                )
-                timeout = _startup_restore_drain_timeout_secs()
-                noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
+                # Restore observers run outside any profile scope; a multiplexed secondary
+                # profile's notice must resolve its own locale, metadata and config.
+                home = self._resolve_profile_home_for_source(event.source)
+                async with _async_profile_runtime_scope(home) if home else nullcontext():
+                    send = self._deliver_platform_notice(
+                        event.source,
+                        t("gateway.restart.followup_recovery_notice"),
+                    )
+                    timeout = _startup_restore_drain_timeout_secs()
+                    noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
             except Exception:
                 logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
         suffix = ":noted" if noted else ":note-unavailable"
