@@ -750,8 +750,9 @@ async def test_startup_records_one_boot_and_preserves_breaker_verdict(tmp_path, 
         assert replies == ["A answer", "B: answer separately"]
         assert not list((tmp_path / "pending_messages").glob("*.json"))
     else:
-        assert recovery.call_args.kwargs["candidates"] is None
-        assert schedule.call_args.kwargs["candidates"] is None
+        # A tripped breaker keeps the snapshot so note fallback can run, but vetoes resume.
+        assert recovery.call_args.kwargs["candidates"].breaker_tripped is True
+        assert schedule.call_args.kwargs["candidates"].breaker_tripped is True
         assert replies == []
         assert runner.session_store._entries[key].resume_pending
         assert len(list((tmp_path / "pending_messages").glob("*.json"))) == 1
