@@ -24,10 +24,30 @@ from tools.tool_search_catalog import (
     CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
     build_catalog, build_catalog_listing_with_form, search_catalog)
 from tools.tool_search_validation import (
-    local_batch_error, normalize_tool_call_entries, not_deferrable_error, validate_deferred_call_args)
+    normalize_tool_call_entries, not_deferrable_error, validate_deferred_call_args)
 from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
 from tools.connectors.search import (
     connections_in_scope, connector_entries_by_group, connectors_unavailable, remote_schemas_for)
+
+LOCAL_BATCH_SENTINEL = "local__execute"
+
+
+def local_batch_cap_error(count: int) -> Optional[str]:
+    """Cap error for a multi-entry local batch, or None when within the dispatch bound."""
+    from tools.connectors.gateway.config import batch_cap_error
+
+    return batch_cap_error(count)
+
+
+def mixed_batch_error(entries: List[Dict[str, Any]]) -> Optional[str]:
+    """Error for a batch mixing local and connectors__ entries, else None. The two kinds
+    run through different dispatchers, so name the fix instead of a misleading scope error."""
+    connectors = [e["name"] for e in entries if is_connector_name(e["name"])]
+    if not connectors or len(connectors) == len(entries):
+        return None
+    return ("tool_call cannot mix local and connector tools in one batch; split local and "
+            "connector tools into separate tool_call batches (connector entries: "
+            + ", ".join(connectors) + ").")
 
 logger = logging.getLogger("tools.tool_search")
 # Bound the work one bridge call requests. Search is capped at the gateway's
@@ -579,7 +599,11 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
         return None, {}, err
 
     if len(entries) > 1 and any(not is_connector_name(e["name"]) for e in entries):
-        return None, {}, local_batch_error(entries)
+        # The agent loop normally expands this batch before persistence so each local
+        # entry gets its own admission, hook, and result slot. Keep direct bridge callers
+        # lossless too: model_tools dispatches this sentinel entry-by-entry instead of
+        # dropping every entry after the first or returning a schema-contradicting error.
+        return LOCAL_BATCH_SENTINEL, {"calls": entries}, None
     if is_connector_name(entries[0]["name"]):
         return CONNECTOR_BATCH_SENTINEL, {"calls": entries}, None
 
@@ -598,4 +622,5 @@ __all__ = [
     "bridge_tool_schemas", "assemble_tool_defs", "is_bridge_tool", "dispatch_tool_search",
     "dispatch_tool_describe", "resolve_underlying_call", "scoped_deferrable_names",
     "out_of_scope_reason", "validate_deferred_call_args", "normalize_tool_call_entries",
-    "CONNECTOR_BATCH_SENTINEL", "is_connector_name"]
+    "not_deferrable_error", "CONNECTOR_BATCH_SENTINEL", "LOCAL_BATCH_SENTINEL", "local_batch_cap_error",
+    "mixed_batch_error", "is_connector_name"]

@@ -6,7 +6,7 @@ import json
 from agent.message_sanitization import coalesce_tool_call_id, deterministic_call_id, uniquify_tool_call_ids
 from agent.transports.types import ToolCall
 from tools.connectors import is_connector_name
-from tools.connectors.gateway.config import MAX_CALLS_PER_DISPATCH
+from tools.connectors.gateway.config import batch_cap_error
 from tools.tool_search_catalog import TOOL_CALL_NAME
 from tools.tool_search_validation import normalize_tool_call_entries
 
@@ -29,7 +29,7 @@ def expand_local_tool_batches(tool_calls: list, *, provider_data: dict | None = 
             entries, error = normalize_tool_call_entries(json.loads(args) if isinstance(args, str) else args)
         except (TypeError, ValueError, AttributeError):
             entries, error = [], True
-        if (error or not 1 < len(entries) <= MAX_CALLS_PER_DISPATCH
+        if (error or len(entries) < 2 or batch_cap_error(len(entries)) is not None
                 or all(is_connector_name(entry["name"]) for entry in entries)):
             # Leave malformed/oversized requests intact for the dispatcher's error.
             expanded.append(call)

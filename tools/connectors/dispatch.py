@@ -4,8 +4,9 @@ import json
 from dataclasses import asdict
 
 from tools.registry import tool_error
-from tools.connectors.gateway.config import MAX_CALLS_PER_DISPATCH
-from tools.connectors.gateway.merge import assemble_results, fill_remote_failure, partition_calls
+from tools.connectors.gateway.config import batch_cap_error
+from tools.connectors.gateway.merge import (
+    assemble_results, batch_entry_error, fill_remote_failure, partition_calls)
 
 
 def dispatch_connector_call(name, arguments, tool_call_id):
@@ -23,9 +24,8 @@ def dispatch_connector_batch(calls, ids, *, user_task, enabled_tools,
     from model_tools import handle_function_call
     from tools.interrupt import is_interrupted
 
-    if len(calls) > MAX_CALLS_PER_DISPATCH:
-        return tool_error(f"too many calls: {len(calls)} > max {MAX_CALLS_PER_DISPATCH}. "
-                          "Retry with fewer calls per batch.")
+    if (cap_error := batch_cap_error(len(calls))) is not None:
+        return tool_error(cap_error)
     partition = partition_calls(calls)
     if partition.local:
         from tools.tool_search_validation import local_batch_error
@@ -51,9 +51,8 @@ def dispatch_connector_batch(calls, ids, *, user_task, enabled_tools,
         except ValueError:
             value = payload
         entry = {"index": plan.position, "name": plan.name}
-        if isinstance(value, dict) and "error" in value:
-            error = value["error"]
-            entry["error"] = error if isinstance(error, dict) else {"code": "TOOL_ERROR", "message": str(error)}
+        if (error := batch_entry_error(value)) is not None:
+            entry["error"] = error
         else:
             entry["response"] = value.get("response", value) if isinstance(value, dict) else value
         entries.append(entry)

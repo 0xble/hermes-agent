@@ -194,19 +194,23 @@ _ECHO_ARGS_MAX_CHARS = 1500
 
 
 def local_batch_error(entries: List[Dict[str, Any]]) -> str:
-    """Rejection for a multi-entry batch that names a local tool. Restates the valid
-    shape with the caller's OWN first entry: small models re-send an identical batch
-    when told only the constraint, and the echoed payload is what gets them unstuck."""
+    """Rejection when local entries reach the connector-only dispatcher. Local and
+    connectors__ entries batch separately (see ``tool_search.mixed_batch_error``), so
+    restate a valid shape with the caller's OWN first entry: small models re-send an
+    identical batch when told only the constraint, and the echoed payload unsticks them.
+
+    Defensive only: ``model_tools`` rejects mixed batches with ``mixed_batch_error`` before
+    they reach the connector dispatcher, so this fires only if that guard is bypassed."""
     first = entries[0]
     args = json.dumps(first.get("arguments", {}), ensure_ascii=False, separators=(",", ":"))
     if len(args) > _ECHO_ARGS_MAX_CHARS:
         args = "{...}"  # keep the correction readable; the model still has its own arguments
     retry = '{"calls":[{"name":%s,"arguments":%s}]}' % (json.dumps(first["name"], ensure_ascii=False), args)
-    remaining = (f" then issue the remaining {len(entries) - 1} call(s) as separate tool_call invocations"
+    remaining = (f" then issue the remaining {len(entries) - 1} call(s) in a separate tool_call batch"
                  if len(entries) > 1 else "")
     return (
-        f"tool_call takes exactly one entry for local tools; you sent {len(entries)}. "
-        f"Retry with only: {retry}{remaining}. Only connectors__ names may be batched together."
+        "tool_call cannot mix local and connector tools in one batch; split local and "
+        f"connector tools into separate tool_call batches. Retry with only: {retry}{remaining}."
     )
 
 
