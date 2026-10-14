@@ -33,6 +33,7 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
+_UNREAD_SESSION_OVERRIDE = object()  # ``_create_agent``: caller did not pre-read the /model override
 
 
 def _prefix_names_served_profile(profile: str) -> bool:
@@ -2251,7 +2252,8 @@ class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePla
     def _select_agent_runtime(
         self, runtime_kwargs: Dict[str, Any], model: str, *, requested_model: Optional[str],
         requested_provider: Optional[str], route: Optional[Dict[str, Any]], session_model: Optional[str],
-        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str]) -> tuple:
+        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str],
+        session_override_snapshot: Any = _UNREAD_SESSION_OVERRIDE) -> tuple:
         """Apply the model/provider precedence chain for one agent (mutates ``runtime_kwargs``):
         confirmed Browser lock > session ``/model`` override > session-persisted model >
         model_routes alias > per-request provider/model > global defaults. A confirmed lock
@@ -2265,7 +2267,12 @@ class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePla
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         current_provider = _clean_request_string(runtime_kwargs.get("provider"))
-        session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
+        if confirmed_runtime_lock:
+            session_override = None
+        elif session_override_snapshot is not _UNREAD_SESSION_OVERRIDE:
+            session_override = session_override_snapshot  # read off-loop by an async caller
+        else:
+            session_override = self._session_model_override_for(session_key)
         # Model-string precedence (override > session-persisted > global) is owned by
         # hermes_cli.model_switch.resolve_effective_model.
         from hermes_cli.model_switch import resolve_effective_model
@@ -2326,8 +2333,11 @@ class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePla
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        session_override_snapshot: Any = _UNREAD_SESSION_OVERRIDE) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
+        Loop callers pass ``session_override_snapshot`` (read in a worker) so no store read
+        happens on the loop.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
@@ -2352,7 +2362,8 @@ class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePla
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
             session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
-            gateway_session_key=gateway_session_key, session_id=session_id)
+            gateway_session_key=gateway_session_key, session_id=session_id,
+            session_override_snapshot=session_override_snapshot)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``

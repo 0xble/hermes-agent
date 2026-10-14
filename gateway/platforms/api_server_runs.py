@@ -969,10 +969,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
+        override_key = run.agent_kwargs.get("gateway_session_key") or run.agent_kwargs.get("session_id")
+
+        def _read_session_override():
+            # The persisted /model override is a store read (and credential resolution): keep it
+            # off the loop. The admission prelude already published any hydration on the loop.
+            with self._profile_scope(run.request_profile):
+                return self._session_model_override_for(override_key)
+
+        session_override = await asyncio.to_thread(_read_session_override)
         with self._profile_scope(run.request_profile):
             agent = self._create_agent(
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+                interim_assistant_callback=_interim_cb, session_override_snapshot=session_override,
+                **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(

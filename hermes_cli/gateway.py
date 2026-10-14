@@ -32,12 +32,6 @@ if os.name == "posix":
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-
-def _run_gateway_until_teardown(coro):
-    """Run graceful teardown without ``asyncio.run`` joining the default executor."""
-    from gateway.event_loop import run_until_teardown
-    return run_until_teardown(coro)
-
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config  # noqa: F401 — resolved lazily by siblings through the facade
 from gateway.status import terminate_pid
 from gateway.restart import (  # noqa: F401 — resolved lazily by siblings through the facade
@@ -76,6 +70,13 @@ from hermes_cli.setup import (  # noqa: F401 — resolved lazily by siblings thr
 )
 from hermes_cli.colors import Colors, color
 logger = logging.getLogger(__name__)
+
+
+def _run_gateway_until_teardown(coro):
+    """Run graceful teardown without ``asyncio.run`` joining the default executor."""
+    from gateway.event_loop import run_until_teardown
+    return run_until_teardown(coro)
+
 
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
 _CAPTURE_TEXT = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")

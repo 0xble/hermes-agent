@@ -28,7 +28,10 @@ def reset_loop_guard():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("site", ["status", "model", "selection", "fast", "fast_picker"])
+@pytest.mark.parametrize("site", [
+    "status", "model", "selection",
+    # Non-normal tiers compute the route-ignored note, which resolves the session route.
+    *(f"{s}:{tier}" for s in ("fast", "fast_picker") for tier in ("normal", "fast", "auto"))])
 @pytest.mark.parametrize("persisted", [False, True])
 async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path, monkeypatch):
     import gateway.run as gateway_run
@@ -80,6 +83,7 @@ async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path,
         elif site == "selection":
             await runner.resolve_session_model_selection(source, "next-model", session_key=key)
         elif site.startswith("fast"):
+            site, tier = site.split(":")
             real_apply = runner._apply_fast_selection
 
             def apply(*args, **kwargs):
@@ -91,13 +95,13 @@ async def test_cold_model_override_read_runs_off_loop(site, persisted, tmp_path,
                 async def picker(*args, **kwargs):
                     # A session boundary may evict state while the picker is visible.
                     runner._sessions_map().pop(key, None)
-                    await kwargs["on_choice_selected"]("123", "normal")
+                    await kwargs["on_choice_selected"]("123", tier)
                     return True
 
                 monkeypatch.setattr(runner, "_try_send_choice_picker", picker)
                 command = "/fast"
             else:
-                command = "/fast normal"
+                command = f"/fast {tier}"
             await runner._handle_fast_command(MessageEvent(text=command, source=source))
         assert reads and loop_thread not in reads, f"{site} store read on loop: {reads}"
         assert not ownership_errors, ownership_errors
@@ -327,6 +331,60 @@ async def test_api_route_validation_reads_store_off_loop(site, persisted, tmp_pa
         assert runner._peek_session_state(key) is not None
         if persisted:
             assert runner._session_model_override(key)["model"] == "persisted-model"
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+        if adapter._session_db is not None:
+            adapter._session_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted", [False, True])
+async def test_api_run_agent_creation_reads_override_off_loop(persisted, tmp_path, monkeypatch):
+    """``_execute_run`` builds the agent on the loop; the /model override read must not be."""
+    pytest.importorskip("aiohttp")
+    import gateway.run as gateway_run
+    from gateway.config import PlatformConfig
+    from gateway.platforms import api_server_runs
+    from gateway.platforms.api_server import APIServerAdapter
+
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    key = runner._session_key_for_source(source)
+    runner.session_store.get_or_create_session(source)
+    if persisted:
+        runner.session_store.set_model_override(key, {"model": "persisted-model"})
+    reads = []
+    original = runner.session_store.get_model_override
+    monkeypatch.setattr(runner.session_store, "get_model_override",
+                        lambda k: (reads.append(threading.get_ident()), original(k))[1])
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *_: "default-model")
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs",
+                        lambda: {"api_key": "test-key", "provider": "openai"})
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    await adapter._prepare_request_route_validation(key)  # the /v1/runs admission prelude
+    selected = []
+    real_select = adapter._select_agent_runtime
+
+    def select(*args, **kwargs):
+        selected.append(real_select(*args, **kwargs)[0])
+        raise RuntimeError("agent runtime selected")  # stop before building a real AIAgent
+
+    monkeypatch.setattr(adapter, "_select_agent_runtime", select)
+    run_id = "run-p2"
+    stream = api_server_runs._RunStream()
+    adapter._run_streams[run_id] = stream
+    launch = api_server_runs._RunLaunch(
+        adapter, run_id, stream, "sid", key, False, "hi", [], False,
+        agent_kwargs={"session_id": "sid", "gateway_session_key": key},
+        request_profile=None, browser_control_principal=None, browser_control_transport_family=None)
+    reads.clear()
+    loop_thread = threading.get_ident()
+    hermes_loop_guard.set_loop_thread(loop_thread)
+    try:
+        await api_server_runs._execute_run(adapter, launch, _api_server=sys.modules[APIServerAdapter.__module__])
+        assert selected == ["persisted-model" if persisted else "default-model"]
+        assert loop_thread not in reads, f"store read on loop: {reads}"
     finally:
         hermes_loop_guard.set_loop_thread(None)
         if adapter._session_db is not None:
