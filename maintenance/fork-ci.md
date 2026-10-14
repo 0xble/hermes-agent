@@ -97,7 +97,41 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`,
+  `native-test-coverage`.
+
+`native-test-coverage` keeps strict native assertions aligned with the upstream
+subprocess contract, including closed stdin for the Windows WhatsApp tree kill.
+Windows hand-off supervision has a separate test file from post-commit outcomes
+so intentional watchdog/probe waits do not consume the outcome suite's remaining
+300-second file budget. The runner cap, individual deadlines, platform markers,
+and assertions remain unchanged. Retire these adaptations when upstream carries
+equivalent strict assertions and bounded native test allocation.
+
+`fork-ci-reliability` also owns the Windows half of `isolated_machine_home`.
+It moves LOCALAPPDATA/APPDATA into the per-test home while keeping shell cache
+state separate. The canonical shell runner now preserves the explicit
+`PSModuleAnalysisCachePath` provided by `bin/ci`; direct runner calls retain the
+inherited-LOCALAPPDATA fallback. A behavioral shell canary was red when the
+allowlist dropped the explicit path and green after forwarding it. Installer
+destination isolation is unchanged.
+
+The earlier red result remains historical: nightly [38226819827, Windows job 114768030470](https://github.com/0xble/hermes-agent/actions/runs/38226819827/job/114768030470)
+at `d52d86d1eccda1f908e37fc6fe1cacab7f88e64f` killed lineage and marker at the
+300-second file cap and failed marker-lock's unpublished-child assertion.
+
+The native Windows nightly run [38244602340, job 114799117020](https://github.com/0xble/hermes-agent/actions/runs/38244602340/job/114799117020)
+at patch-equivalent ancestor `267599fd` showed `210 files, 659 tests passed,
+0 failed, 336 skipped`; handoff_lineage (10), marker (19), and marker_lock (3)
+all passed. The mechanism is inferred to be forwarding
+`PSModuleAnalysisCachePath`; that attribution is not separately isolated proof.
+
+The missing uv-shim-validation script and checkout-relative Windows cache
+artifacts are also present in the verified pre-sync baseline; they are separate
+inherited observations, not newly attributed to this candidate. Retire the
+cache forwarding/fallback when the accepted upstream runner preserves equivalent
+isolated cache state, and remove the targeted timing records after native
+root-cause qualification.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 

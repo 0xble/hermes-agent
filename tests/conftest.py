@@ -1565,6 +1565,14 @@ def isolated_machine_home(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setattr(Path, "home", lambda: home)
     if os.name == "nt":
+        # Share shell state separately from per-test installer destinations.
+        # Prefer the harness's explicit cache; direct runner calls may only
+        # provide LOCALAPPDATA. This placement alone does not establish that
+        # Windows PowerShell reuses the cache or meets a protocol deadline.
+        inherited = os.environ.get("LOCALAPPDATA")
+        if inherited and not os.environ.get("PSModuleAnalysisCachePath"):
+            monkeypatch.setenv("PSModuleAnalysisCachePath", os.path.join(
+                inherited, "Microsoft", "Windows", "PowerShell", "ModuleAnalysisCache"))
         for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
             target = home / "AppData" / directory
             target.mkdir(parents=True)
