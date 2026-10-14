@@ -671,18 +671,35 @@ def test_failed_mid_turn_primary_rebuild_keeps_one_coherent_fallback_route(tool_
     agent.client.close.assert_not_called()
 
 
-def test_fallback_bind_failure_after_client_install_restores_the_original_route(tool_loop_agent):
+@pytest.mark.parametrize("failing_step", [
+    "agent.client_lifecycle._swap_fallback_clients",
+    "agent.chat_completion_helpers._update_fallback_context_compressor",
+    "agent.chat_completion_helpers._rescope_fallback_extra_body",
+])
+def test_fallback_bind_failure_after_client_install_restores_the_original_route(tool_loop_agent, failing_step):
     # A provider-specific setup failure after the swap installed the candidate client must not
     # leave the agent marked as on fallback while pointing at a closed, half-bound route.
     agent = tool_loop_agent
     original = (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client)
 
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_state = dict(vars(compressor)) if compressor is not None else None
+
     def swap_then_fail(agent, client, provider, model, base_url, api_mode):
         agent.client = client
         raise RuntimeError("provider setup failed after install")
 
-    with patch("agent.client_lifecycle._swap_fallback_clients", side_effect=swap_then_fail):
+    def fail(*args, **kwargs):
+        if compressor is not None:
+            compressor.context_length = 1
+        raise RuntimeError("post-bind setup failed")
+
+    side_effect = swap_then_fail if failing_step.endswith("_swap_fallback_clients") else fail
+    with patch(failing_step, side_effect=side_effect):
         assert not agent._try_activate_fallback(reason=FailoverReason.server_error)
+
+    if compressor is not None:
+        assert vars(compressor) == compressor_state
 
     assert (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client) == original
     assert not agent._fallback_activated

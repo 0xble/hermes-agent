@@ -90,6 +90,8 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
     reset_codex_reasoning_replay(agent)
     agent._fallback_activated = True
 
+    compressor = getattr(agent, "context_compressor", None)
+    compressor_state = dict(vars(compressor)) if compressor is not None else None
     try:
         _rebind_fallback_credential_pool(agent, provider, model)
         if provider == "moa":
@@ -98,25 +100,28 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
         else:
             from agent.client_lifecycle import _swap_fallback_clients
             _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
+
+        from agent.agent_runtime_helpers import sync_credential_pool_entry_id
+        sync_credential_pool_entry_id(agent)
+
+        agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+            provider=provider, base_url=base_url, api_mode=api_mode, model=model)
+        agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
+        _update_fallback_context_compressor(agent)
+        _reresolve_fallback_reasoning_config(agent, entry)
+        _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     except Exception:
         # Restore the pre-bind route (retiring clients the swap installed), and close the resolved
         # client too in case the failure came before it became reachable.
         from agent.fallback_route_recovery import _restore_route_state
         installed = getattr(agent, "client", None) is client
         _restore_route_state(agent, pre_bind)  # retires the candidate client if it was installed
+        if compressor_state is not None:
+            vars(compressor).clear()
+            vars(compressor).update(compressor_state)
         if not installed and client is not pre_bind.get("client"):
             _close_failed_route_client(agent, client)
         raise
-
-    from agent.agent_runtime_helpers import sync_credential_pool_entry_id
-    sync_credential_pool_entry_id(agent)
-
-    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-        provider=provider, base_url=base_url, api_mode=api_mode, model=model)
-    agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
-    _update_fallback_context_compressor(agent)
-    _reresolve_fallback_reasoning_config(agent, entry)
-    _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
     # Start the optional stay clock only after the route was successfully bound.
     from time import monotonic
     agent._active_fallback_entry = entry
