@@ -403,74 +403,88 @@ def reply_expected_metadata(reply_expected: Optional[bool]) -> dict:
 
 
 def is_partial_silence_marker(text: Any) -> bool:
-    """True while streamed ``text`` could still resolve to a silence marker.
+    """True while streamed ``text`` could still resolve to a silent response.
 
-    A buffer whose canonical form is a non-empty *prefix* of a marker (``"NO"`` on
-    the way to ``"NO_REPLY"``, or an exact marker not yet terminated by stream-end)
-    is held back so a raw marker is never shown and then retracted.  Divergence
-    from every marker, or exceeding the cap, resumes normal streaming.  A trailing
-    complete or partial ``LOOP_COMPLETE`` line is ignored, so ``[SILENT]\\nLOOP``
-    stays held on its way to a combined silent response. Within the marker-size cap,
-    complete ``LOOP_COMPLETE`` lines anywhere in the buffer are also ignored while
-    checking the remaining silence-marker candidate; this is intentionally not the
-    same as the exact predicate's trailing-control-run view.
+    Mid-stream holds use this so a raw marker is never shown and then retracted. It is
+    the hold rule of :func:`_is_silence_run_prefix` for non-blank text: after leading
+    blank lines, ``text`` is a possible prefix of one silence-marker line plus blank and
+    ``LOOP_COMPLETE`` lines in any order, the control run the exact verdict accepts
+    (``"NO"`` on the way to ``"NO_REPLY"``, ``"[SILENT]\\nLOOP"`` on the way to
+    ``"[SILENT]\\nLOOP_COMPLETE"``). Divergence from every such run, or a marker line
+    over the length cap, resumes normal streaming.
     """
-    if isinstance(text, str):
-        # Same control-run view as the exact verdict: every complete LOOP_COMPLETE line is
-        # ignored (repeated, or before the marker), and so is a last line still on its way
-        # to one, so ``[SILENT]\nLOOP_COMPLETE\nLOOP_COMPLETE`` stays held.
-        lines = text.rstrip().split("\n")
-        tail_key = lines[-1].strip().upper()
-        if len(lines) > 1 and tail_key and _LOOP_COMPLETE_MARKER.startswith(tail_key):
-            lines.pop()
-        text = "\n".join(line for line in lines if not is_loop_complete_marker(line))
+    return isinstance(text, str) and bool(text.strip()) and _is_silence_run_prefix(text)
+
+
+def _is_partial_marker_line(line: str) -> bool:
     return any(
         c and any(marker.startswith(c) for marker in LIVE_GATEWAY_SILENT_MARKERS)
-        for c in _canonical_silence_candidates(text)
+        for c in _canonical_silence_candidates(line)
     )
 
 
-def _is_partial_silence_control_run_prefix(text: str) -> bool:
-    """True when a complete silence marker may still be followed only by a LOOP_COMPLETE prefix."""
-    if not isinstance(text, str) or "\n" not in text:
+def _is_silence_run_prefix(text: str) -> bool:
+    """The one streaming hold rule: ``text`` may still become a silent response.
+
+    Leading whitespace and blank lines are ignored (the agent opens the first text after a
+    tool round with ``"\\n\\n"``). What remains must be a prefix of the control run the exact
+    verdict accepts: one silence-marker line plus any number of blank and ``LOOP_COMPLETE``
+    lines, in any order (see :func:`_split_trailing_control_run`). Complete lines must already
+    be such lines; the unterminated last line only needs to be on its way to one. A blank
+    buffer is a prefix too.
+    """
+    lines = text.lstrip().split("\n")
+    tail = lines.pop().strip()
+    markers = 0
+    for line in lines:
+        if _is_silence_marker_line(line):
+            markers += 1
+        elif line.strip() and not is_loop_complete_marker(line):
+            return False
+    if markers > 1:
         return False
-    first, remainder = text.split("\n", 1)
-    if not _is_silence_marker_line(first):
-        return False
-    lines = [line.strip() for line in remainder.split("\n") if line.strip()]
-    if not lines:
+    if not tail or is_loop_complete_marker(tail) or _LOOP_COMPLETE_MARKER.startswith(tail.upper()):
         return True
-    return all(
-        is_loop_complete_marker(line) or _LOOP_COMPLETE_MARKER.startswith(line.upper())
-        for line in lines
-    )
+    return not markers and _is_partial_marker_line(tail)
 
 
 def hold_silence_delta(hold: dict, delta: str) -> str:
-    """Streamed text safe to release now while a bare silence marker stays withheld.
+    """Streamed text safe to release now while a possible silent response stays withheld.
 
-    ``hold`` is per-turn state ``{"buf": "", "held": ""}``. The agent opens the first text after
-    a tool round with ``"\\n\\n"``, so such a delta re-arms the hold for the new segment: the reply
-    after tool commentary may still be the bare marker. A prefix still held from the previous
-    segment is content once more text follows, so it is released, unless the held text plus
-    this delta is still a possible silence-plus-control run (``[SILENT]``, ``\\n\\n``,
-    ``LOOP_COMPLETE`` as separate chunks), which stays held as one response.
+    ``hold`` is per-turn state ``{"buf": "", "held": ""}``: ``held`` is the withheld text and
+    ``buf`` is non-empty once the current segment has diverged and streams freely. While armed,
+    the held text plus each delta is judged by :func:`_is_silence_run_prefix`; the whole buffer
+    is released as soon as it can no longer be a silent response. The agent opens the first text
+    after a tool round with ``"\\n\\n"``, so such a delta re-arms the hold for the new segment.
+    At stream end the caller settles ``held`` with :func:`flush_silence_hold`.
     """
-    released = ""
-    if hold["held"] and hold["buf"].endswith("\n\n") and _is_silence_marker_line(
-        hold["buf"][:-2]
-    ) and not _is_partial_silence_control_run_prefix(hold["buf"] + delta):
-        released, hold["held"], hold["buf"] = hold["held"], "", ""
+    if not delta:
+        return ""
+    if hold["buf"] and delta.startswith("\n\n"):
+        hold["buf"] = ""
+    if hold["buf"]:
+        return delta
+    candidate = hold["held"] + delta
+    if _is_silence_run_prefix(candidate):
+        hold["held"] = candidate
+        return ""
+    if hold["held"] and delta.startswith("\n\n"):
+        # The held text is content, and this delta opens a new segment that is judged alone.
+        released, hold["held"] = hold["held"], ""
         return released + hold_silence_delta(hold, delta)
-    if delta.startswith("\n\n") and not (
-        hold["held"] and _is_partial_silence_control_run_prefix(hold["buf"] + delta)
-    ):
-        released, hold["held"], hold["buf"] = hold["held"], "", ""
-        if delta == "\n\n":
-            return released + delta
-    hold["buf"] += delta
-    if is_partial_silence_marker(hold["buf"]):
-        hold["held"] += delta
-        return released
-    released, hold["held"] = released + hold["held"] + delta, ""
-    return released
+    hold["held"], hold["buf"] = "", candidate
+    return candidate
+
+
+def flush_silence_hold(hold: dict | None) -> str:
+    """Stream end: held control text (a silent response, bare ``LOOP_COMPLETE``) is dropped.
+
+    Anything else still held, such as a prefix that never completed a marker (a reply that
+    is just ``"NO"``), is content and is released.
+    """
+    held = hold["held"] if hold else ""
+    if hold:
+        hold["held"] = ""
+    if is_intentional_silence_response(held) or not strip_trailing_control_markers(held).strip():
+        return ""
+    return held

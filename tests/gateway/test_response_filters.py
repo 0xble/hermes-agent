@@ -1,3 +1,4 @@
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -93,37 +94,69 @@ def test_partial_and_exact_silence_agree_on_repeated_loop_complete(response):
         assert is_intentional_silence_response(response) is True
 
 
-def test_hold_keeps_a_silence_marker_across_a_paragraph_break_before_loop_complete():
-    """CLI streaming TTS: [SILENT], \\n\\n, LOOP_COMPLETE as chunks must never release the marker."""
+def _hold_stream(chunks):
+    """Everything a hold releases for ``chunks``, including the stream-end flush."""
     hold = {"buf": "", "held": ""}
-    released = [response_filters.hold_silence_delta(hold, d) for d in ("[SILENT]", "\n\n", "LOOP_COMPLETE")]
-    assert released == ["", "", ""]
-    assert is_intentional_silence_response(hold["held"])
+    released = "".join(response_filters.hold_silence_delta(hold, d) for d in chunks)
+    return released + response_filters.flush_silence_hold(hold)
 
 
-def test_hold_still_releases_a_held_prefix_when_the_next_segment_is_prose():
-    hold = {"buf": "", "held": ""}
-    released = "".join(response_filters.hold_silence_delta(hold, d) for d in ("Ok", "\n\nQueue is 2."))
-    assert released == "Ok\n\nQueue is 2."
-    hold = {"buf": "", "held": ""}
-    released = "".join(response_filters.hold_silence_delta(hold, d) for d in ("NO", "\n\nmore text"))
-    assert released == "NO\n\nmore text"
+def _chunkings(text, max_chunks=4):
+    """Every split of ``text`` into 1..max_chunks non-empty contiguous chunks."""
+    for count in range(1, max_chunks + 1):
+        for cuts in itertools.combinations(range(1, len(text)), count - 1):
+            bounds = (0, *cuts, len(text))
+            yield [text[bounds[i]:bounds[i + 1]] for i in range(count)]
+
+
+_SILENT_STREAMS = [
+    "[SILENT]", "NO_REPLY", "[SILENT]\nLOOP_COMPLETE", "[SILENT]\n\nLOOP_COMPLETE",
+    "NO_REPLY\n\nLOOP_COMPLETE\n",
+]
+_SILENT_STREAMS += ["\n\n" + s for s in _SILENT_STREAMS]  # first text after a tool round
+_SPOKEN_STREAMS = [
+    "NO\n\nhello", "Update.\n[SILENT]", "[SILENT] is a token", "NO_REPLY was the token\nLOOP soon",
+]
+_SPOKEN_STREAMS += ["\n\n" + s for s in _SPOKEN_STREAMS]
+
+
+@pytest.mark.parametrize("text", _SILENT_STREAMS)
+def test_hold_never_releases_a_silent_response_under_any_chunking(text):
+    """Streaming TTS: no split of a silent response into 1-4 chunks speaks a control marker."""
+    for chunks in _chunkings(text):
+        released = _hold_stream(chunks)
+        assert not any(m in released for m in ("SILENT", "NO_REPLY", "LOOP_COMPLETE")), (chunks, released)
+
+
+@pytest.mark.parametrize("text", _SPOKEN_STREAMS)
+def test_hold_releases_spoken_text_exactly_under_any_chunking(text):
+    for chunks in _chunkings(text):
+        assert _hold_stream(chunks) == text, chunks
 
 
 @pytest.mark.parametrize("marker", ("NO_REPLY", "[SILENT]"))
 def test_hold_rearms_after_break_before_a_fresh_marker(marker):
-    """A fresh marker after a paragraph break starts a new hold instead of being spoken."""
-    hold = {"buf": "", "held": ""}
-    released = [response_filters.hold_silence_delta(hold, d) for d in ("NO", "\n\n", marker)]
-    assert released == ["", "NO\n\n", ""]
-    assert hold["held"] == marker
+    """A held prefix is content once a new segment starts; the fresh marker is held again."""
+    assert _hold_stream(["NO", "\n\n", marker]) == "NO"
 
 
-def test_hold_keeps_a_marker_and_loop_complete_together_across_a_break():
+@pytest.mark.parametrize("chunks", [
+    ["\n\n[SILENT]\n\n", "LOOP_COMPLETE"],
+    ["\n\n[", "SILENT", "]\n\n", "LOOP", "_COMPLETE"],
+    ["\n\nNO_REPLY\n\n", "LOOP_COMPLETE"],
+    ["\n\n[SILENT]", "\n\n", "LOOP_COMPLETE"],
+    ["[SILENT]", "\n\n", "LOOP_COMPLETE"],
+])
+def test_hold_keeps_a_marker_after_a_tool_round_break(chunks):
+    """The agent prefixes the first post-tool delta with a paragraph break; it must not unhold."""
     hold = {"buf": "", "held": ""}
-    released = [response_filters.hold_silence_delta(hold, d) for d in ("[SILENT]", "\n\n", "LOOP_COMPLETE")]
-    assert released == ["", "", ""]
-    assert hold == {"buf": "[SILENT]\n\nLOOP_COMPLETE", "held": "[SILENT]\n\nLOOP_COMPLETE"}
+    assert [response_filters.hold_silence_delta(hold, d) for d in chunks] == [""] * len(chunks)
+    assert response_filters.flush_silence_hold(hold) == ""
+
+
+def test_hold_still_releases_a_held_prefix_when_the_next_segment_is_prose():
+    assert _hold_stream(["Ok", "\n\nQueue is 2."]) == "Ok\n\nQueue is 2."
+    assert _hold_stream(["NO", "\n\nmore text"]) == "NO\n\nmore text"
 
 
 def test_autonomous_silence_accepts_marker_with_own_line_note():

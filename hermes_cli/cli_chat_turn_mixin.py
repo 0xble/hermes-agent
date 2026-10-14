@@ -523,11 +523,10 @@ class CLIChatTurnMixin:
         self._flush_stream()
         if turn.use_streaming_tts and turn.text_queue is not None:
             # A held bare silence marker is dropped; a prefix that never completed one is speech.
-            held = turn.silence_hold["held"] if turn.silence_hold else ""
+            from gateway.response_filters import flush_silence_hold
+            held = flush_silence_hold(turn.silence_hold)
             if held and turn.speak is not None:
-                from gateway.response_filters import is_intentional_silence_response
-                if not is_intentional_silence_response(held):
-                    turn.speak(held)
+                turn.speak(held)
             turn.text_queue.put(None)  # end-of-text sentinel
             if turn.tts_thread is not None:
                 turn.tts_thread.join(timeout=120)

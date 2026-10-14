@@ -45,9 +45,11 @@ def test_partial_predicate_agrees_with_exact_on_full_markers():
 
 
 def test_partial_predicate_holds_through_a_trailing_loop_complete_line():
-    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n"):
+    # Leading blank lines are ignored, and a control run may open with LOOP_COMPLETE.
+    for text in ("[SILENT]\nLOOP", "[SILENT]\nLOOP_COMPLETE", "NO_REPLY\nLOOP_COMPLETE\n",
+                 "\n\n[SILENT]\n\nLOOP", "\nLOOP", "LOOP_COMPLETE\n[SIL"):
         assert is_partial_silence_marker(text) is True
-    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "\nLOOP"):
+    for text in ("[SILENT]\nLOOP is done", "Queue is 2.\nLOOP_COMPLETE", "[SILENT]\nNO_REPLY", "\n\n"):
         assert is_partial_silence_marker(text) is False
 
 
