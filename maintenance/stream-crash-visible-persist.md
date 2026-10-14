@@ -19,6 +19,21 @@ real re-answer, and prefixes its delivery with the delivery ledger's existing
 until completion, so its new preview cannot silently become another copy.
 Ordinary typed turns retain their streaming cadence and progress configuration.
 
+## Resume-turn and policy gate
+
+Adoption and marking belong to the synthetic auto-resume turn only, never to the
+session-level `resume_pending` flag: that flag outlives admission when the
+restart-loop breaker trips, the marker is stale, the adapter is offline or auth
+fails, so a real user inbound can run while it is set. `restore_preview`
+requires the current turn's event to be `internal` and to carry
+`_outbox_admission_id == "resume:<resume_turn_id>"`, the identity
+`_schedule_resume_pending_sessions` stamps on the empty-text resume event.
+It also requires `restart_resume_policy: continue`. Under `ask` (the default)
+or any other value the resume turn only asks one line, which is not the
+interrupted answer: the partial preview stays visible and untouched, a new
+message is sent, and nothing is marked. A restored row is re-recorded under the
+resumed turn's own active token so a second crash still finds the message.
+
 ## Source and implementation
 
 `gateway/stream_recovery.py` journals exact wire text before real send/edit I/O
@@ -27,8 +42,11 @@ restores only the active resume token's known ID, or flags an uncertain first
 send. `TurnRunner` marks only a completed recovery result's delivery text;
 model history and normal persistence retain the actual re-answer without the
 transport marker. Failed/interrupted results are not fabricated completions.
-Ephemeral native draft frames are not journaled. Successful interim deletion
-forgets its journaled ID. Journal reads and writes stay off the gateway loop.
+Ephemeral native draft frames are not journaled. Journal writes are
+best-effort: a failure is logged and never changes delivery. Every path that
+replaces or deletes the on-screen preview re-records or discards first:
+fresh-final re-records the new message ID; silence-marker, empty-fallback and
+full-resend fallback deletes discard. Journal I/O stays off the gateway loop.
 
 ## Upstream contract note
 
