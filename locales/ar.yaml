@@ -327,7 +327,7 @@ gateway:
     tip: "\n✦ نصيحة: {tip}"
   restart:
     in_progress: "⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل..."
-    absorbed_by_update: "⏳ Restart skipped: {detail}."
+    absorbed_by_update: "⏳ تم تخطي إعادة التشغيل: {detail}."
     restarting: "♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`."
   resume:
     db_unavailable: "قاعدة بيانات الجلسات غير متاحة."
@@ -508,7 +508,7 @@ gateway:
     not_git_repo: "✗ ليس مستودع git — لا يمكن التحديث."
     hermes_cmd_not_found: "✗ تعذّر تحديد موقع أمر `hermes`. Hermes يعمل، لكن أمر التحديث لم يجد الملف التنفيذي على PATH أو عبر مُفسّر Python الحالي. جرّب تشغيل `hermes update` يدويًا في طرفيتك."
     start_failed: "✗ فشل بدء التحديث: {error}"
-    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
+    coalesced: "☤ تمت إضافة طلب التحديث إلى قائمة الانتظار: ينضم إلى التحديث الجاري أو الذي انتهى للتو، لذا يُعاد تشغيل Hermes مرة واحدة بأحدث هدف مطلوب. تُرسل النتيجة إلى آخر من طلب التحديث."
     starting: "☤ جارٍ بدء تحديث Hermes… سأبثّ التقدّم هنا."
     reply_failed: "✗ فشل إرسال الردّ إلى عملية التحديث: {error}"
     reply_sent: "✓ أُرسل `{label}` إلى عملية التحديث."

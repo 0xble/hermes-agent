@@ -64,7 +64,8 @@ def test_target_that_drops_live_branch_commits_is_refused_naming_branch_and_pr(r
     home.mkdir()
     guard.record_release_branch(home, repo.x2, "fix/post-update-resume")
     message = guard.refusal(_runner(repo.path), home, live=repo.x2, target=repo.m2,
-                            pr_lookup=lambda branch: "PR #567 https://github.com/0xble/hermes-agent/pull/567"
+                            pr_lookup=lambda branch: {"number": 567, "state": "OPEN", "headRefOid": repo.x2,
+                                                      "url": "https://github.com/0xble/hermes-agent/pull/567"}
                             if branch == "fix/post-update-resume" else None)
     assert message is not None
     assert "fix/post-update-resume" in message
@@ -74,6 +75,11 @@ def test_target_that_drops_live_branch_commits_is_refused_naming_branch_and_pr(r
     assert "cover post-update resume" in message
     assert repo.m2[:12] in message and repo.x2[:12] in message
     assert "--allow-drop-live" in message
+    # The refusal is the only guidance a gateway session gets: an explicit --branch main is
+    # not consent, so it must name the remedy (merge the PR, or roll back from a terminal).
+    assert "Merge PR #567 first" in message
+    assert "explicit --branch does not count as consent" in message
+    assert "from a terminal" in message
 
 
 def test_descendant_branch_install_passes(repo, tmp_path):
@@ -94,6 +100,57 @@ def test_cherry_picked_live_commits_do_not_count_as_dropped(repo, tmp_path):
     picked = _git(repo.path, "rev-parse", "HEAD")
     assert guard.refusal(_runner(repo.path), tmp_path, live=repo.x2, target=picked,
                          pr_lookup=lambda _b: None) is None
+
+
+def _squash_merge_into_main(repo) -> str:
+    """Squash-merge the live branch into main, the way this repo lands most PRs."""
+    _git(repo.path, "checkout", "-q", "main")
+    _git(repo.path, "merge", "-q", "--squash", "fix/post-update-resume")
+    message = repo.path.parent / ".msg-squash"
+    message.write_text("fix(gateway): resume interrupted turns (#567)\n", encoding="utf-8")
+    _git(repo.path, "commit", "-q", "-F", str(message))
+    return _git(repo.path, "rev-parse", "HEAD")
+
+
+def test_multi_commit_branch_squash_merged_into_target_passes(repo, tmp_path):
+    """Per-commit patch-ids miss a squash of x1+x2; the combined change is already in main."""
+    squashed = _squash_merge_into_main(repo)
+    later = _commit(repo.path, "later.txt", "chore: unrelated follow-up on main")
+    for target in (squashed, later):
+        assert guard.refusal(_runner(repo.path), tmp_path, live=repo.x2, target=target,
+                             pr_lookup=lambda _b: None) is None
+
+
+def test_squash_merged_then_edited_on_target_passes_when_the_pr_is_merged(repo, tmp_path):
+    """A follow-up on main that rewrites the squashed lines defeats the tree check; a MERGED PR
+    whose head contains the live commit and whose merge commit the target contains still proves
+    nothing is dropped."""
+    squashed = _squash_merge_into_main(repo)
+    edited = _commit(repo.path, "resume.txt", "fix(gateway): rework resume after #567")
+    merged = {"number": 567, "state": "MERGED", "url": "u", "headRefOid": repo.x2,
+              "mergeCommit": {"oid": squashed}}
+
+    def refused(pr, target=edited):
+        return guard.refusal(_runner(repo.path), tmp_path, live=repo.x2, target=target,
+                             pr_lookup=lambda _b: pr) is not None
+
+    assert not refused(merged)
+    assert refused({**merged, "state": "OPEN"})
+    assert refused({**merged, "headRefOid": repo.x1})  # live has commits pushed after the merged head
+    assert refused(merged, target=repo.m2)  # rollback to a main that predates the merge
+    assert refused(None)
+
+
+def test_partially_squashed_branch_is_still_refused(repo, tmp_path):
+    """Only x1's change landed; x2 is still dropped."""
+    _git(repo.path, "checkout", "-q", "main")
+    _git(repo.path, "checkout", repo.x1, "--", "resume.txt")
+    message = repo.path.parent / ".msg-partial"
+    message.write_text("partial\n", encoding="utf-8")
+    _git(repo.path, "commit", "-q", "-F", str(message))
+    partial = _git(repo.path, "rev-parse", "HEAD")
+    assert guard.refusal(_runner(repo.path), tmp_path, live=repo.x2, target=partial,
+                         pr_lookup=lambda _b: None) is not None
 
 
 def test_unrecorded_live_release_names_the_remote_branch_that_contains_it(repo, tmp_path):

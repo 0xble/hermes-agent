@@ -1179,8 +1179,8 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
 
 def _validate_updates(config: Dict[str, Any], issues: List[ConfigIssue]) -> None:
     import math
-    seconds = lambda v, floor_ok: (not isinstance(v, bool) and isinstance(v, (int, float))  # noqa: E731
-                                   and math.isfinite(v) and (v >= 0 if floor_ok else v > 0))
+    def seconds(v, floor_ok):
+        return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v) and (v >= 0 if floor_ok else v > 0)
     updates = config.get("updates")
     if updates is None:
         return

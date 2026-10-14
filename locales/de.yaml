@@ -327,7 +327,7 @@ gateway:
     tip: "\n✦ Tipp: {tip}"
   restart:
     in_progress: "⏳ Gateway-Neustart läuft bereits..."
-    absorbed_by_update: "⏳ Restart skipped: {detail}."
+    absorbed_by_update: "⏳ Neustart übersprungen: {detail}."
     restarting: "♻ Gateway wird neu gestartet. Falls Sie nicht innerhalb von 60 Sekunden benachrichtigt werden, starten Sie über die Konsole mit `hermes gateway restart` neu."
   resume:
     db_unavailable: "Sitzungsdatenbank nicht verfügbar."
@@ -508,7 +508,7 @@ gateway:
     not_git_repo: "✗ Kein Git-Repository — Update nicht möglich."
     hermes_cmd_not_found: "✗ Der Befehl `hermes` konnte nicht gefunden werden. Hermes läuft, aber der Update-Befehl konnte das ausführbare Programm weder im PATH noch über den aktuellen Python-Interpreter finden. Versuchen Sie, `hermes update` manuell im Terminal auszuführen."
     start_failed: "✗ Update konnte nicht gestartet werden: {error}"
-    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
+    coalesced: "☤ Update-Anfrage eingereiht: Sie schließt sich dem bereits laufenden oder gerade beendeten Update an, sodass Hermes einmal mit dem zuletzt angeforderten Ziel neu startet. Das Ergebnis wird an den letzten Anfragenden gemeldet."
     starting: "☤ Hermes-Update wird gestartet… Ich streame den Fortschritt hier."
     reply_failed: "✗ Antwort an den Update-Prozess konnte nicht gesendet werden: {error}"
     reply_sent: "✓ `{label}` an den Update-Prozess gesendet."

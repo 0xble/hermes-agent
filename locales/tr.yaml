@@ -327,7 +327,7 @@ gateway:
     tip: "\n✦ İpucu: {tip}"
   restart:
     in_progress: "⏳ Gateway yeniden başlatma zaten sürüyor..."
-    absorbed_by_update: "⏳ Restart skipped: {detail}."
+    absorbed_by_update: "⏳ Yeniden başlatma atlandı: {detail}."
     restarting: "♻ Gateway yeniden başlatılıyor. 60 saniye içinde bildirim almazsanız konsoldan `hermes gateway restart` ile yeniden başlatın."
   resume:
     db_unavailable: "Oturum veritabanı kullanılamıyor."
@@ -508,7 +508,7 @@ gateway:
     not_git_repo: "✗ Git deposu değil — güncellenemiyor."
     hermes_cmd_not_found: "✗ `hermes` komutu bulunamadı. Hermes çalışıyor, ancak güncelleme komutu yürütülebilir dosyayı PATH'te veya mevcut Python yorumlayıcısı aracılığıyla bulamadı. Terminalde `hermes update` komutunu manuel olarak çalıştırmayı deneyin."
     start_failed: "✗ Güncelleme başlatılamadı: {error}"
-    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
+    coalesced: "☤ Güncelleme isteği sıraya alındı: zaten çalışan veya yeni biten güncellemeye katılır, böylece Hermes en son istenen hedefle bir kez yeniden başlar. Sonuç en son isteyene bildirilir."
     starting: "☤ Hermes güncellemesi başlatılıyor… İlerlemeyi buraya akıtacağım."
     reply_failed: "✗ Yanıt güncelleme sürecine gönderilemedi: {error}"
     reply_sent: "✓ `{label}` güncelleme sürecine gönderildi."

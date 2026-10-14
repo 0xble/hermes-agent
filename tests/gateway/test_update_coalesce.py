@@ -126,7 +126,20 @@ def test_pending_or_deferred_update_absorbs_a_restart(tmp_path):
     assert "in progress" in launcher.restart_absorbed_by_update(tmp_path)
     _launch(tmp_path, "second", now=1010.0)
     finalize_update(tmp_path)
-    assert "queued" in launcher.restart_absorbed_by_update(tmp_path)
+    assert "queued" in launcher.restart_absorbed_by_update(tmp_path, now=1020.0)
+
+
+def test_stale_deferred_request_never_blocks_restart(tmp_path):
+    """A queued request housekeeping never launched (no binary, dead loop) must age out like a
+    stale in-flight marker, at the watcher's own deadline."""
+    _launch(tmp_path, "first", now=1000.0)
+    _launch(tmp_path, "second", now=1010.0)
+    finalize_update(tmp_path)
+    limit = 1010.0 + launcher._ABSORB_MAX_AGE_SECONDS
+    assert "queued" in launcher.restart_absorbed_by_update(tmp_path, now=limit)
+    assert launcher.restart_absorbed_by_update(tmp_path, now=limit + 1) is None
+    (tmp_path / launcher.DEFERRED_FILE).write_text("{}", encoding="utf-8")  # no timestamp at all
+    assert launcher.restart_absorbed_by_update(tmp_path, now=1020.0) is None
 
 
 def test_stale_inflight_marker_never_blocks_restart(tmp_path):
@@ -203,6 +216,14 @@ async def test_slash_update_opts_into_the_configured_window(tmp_path, monkeypatc
     with patch("gateway.run._hermes_home", home), patch("gateway.run.__file__", str(root / "gateway" / "run.py")), \
          patch("hermes_cli.config.detect_install_method", return_value="git"), \
          patch("shutil.which", return_value="/usr/bin/hermes"):
-        await runner._handle_update_command(event)
+        reply = await runner._handle_update_command(event)
     assert launch.call_args.kwargs["coalesce_window"] == 77.0
+    # The deferred file keeps one route; a merged requester is told who gets the outcome.
+    assert "latest requester" in reply
     runner._schedule_update_notification_watch.assert_called_once()
+
+
+def test_merged_agent_request_is_told_the_outcome_goes_to_the_latest_requester():
+    merged = launcher.agent_update_handoff({"started": False, "pending": True, "coalesced": True})
+    assert "latest requester" in merged and "End this turn now" in merged
+    assert launcher.agent_update_handoff({"started": True}) == launcher._UPDATE_HANDOFF

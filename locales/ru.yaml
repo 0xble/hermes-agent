@@ -327,7 +327,7 @@ gateway:
     tip: "\n✦ Совет: {tip}"
   restart:
     in_progress: "⏳ Перезапуск шлюза уже выполняется..."
-    absorbed_by_update: "⏳ Restart skipped: {detail}."
+    absorbed_by_update: "⏳ Перезапуск пропущен: {detail}."
     restarting: "♻ Перезапуск шлюза. Если уведомление не придёт в течение 60 секунд, перезапустите из консоли командой `hermes gateway restart`."
   resume:
     db_unavailable: "База данных сеансов недоступна."
@@ -508,7 +508,7 @@ gateway:
     not_git_repo: "✗ Не git-репозиторий — обновление невозможно."
     hermes_cmd_not_found: "✗ Не удалось найти команду `hermes`. Hermes запущен, но команда обновления не нашла исполняемый файл в PATH или через текущий интерпретатор Python. Попробуйте выполнить `hermes update` вручную в терминале."
     start_failed: "✗ Не удалось запустить обновление: {error}"
-    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
+    coalesced: "☤ Запрос на обновление поставлен в очередь: он присоединяется к уже идущему или только что завершённому обновлению, поэтому Hermes перезапустится один раз с последней запрошенной целью. Результат получит последний запросивший."
     starting: "☤ Запуск обновления Hermes… Я буду транслировать прогресс сюда."
     reply_failed: "✗ Не удалось отправить ответ процессу обновления: {error}"
     reply_sent: "✓ Отправлено `{label}` процессу обновления."

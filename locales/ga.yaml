@@ -327,7 +327,7 @@ gateway:
     tip: "\n✦ Leid: {tip}"
   restart:
     in_progress: "⏳ Tá atosú gateway ar siúl cheana féin..."
-    absorbed_by_update: "⏳ Restart skipped: {detail}."
+    absorbed_by_update: "⏳ Atosú scipeáilte: {detail}."
     restarting: "♻ Ag atosú gateway. Mura gcuirfear in iúl duit laistigh de 60 soicind, atosaigh ón gconsól le `hermes gateway restart`."
   resume:
     db_unavailable: "Níl bunachar sonraí na seisiún ar fáil."
@@ -508,7 +508,7 @@ gateway:
     not_git_repo: "✗ Ní stór git é seo — ní féidir nuashonrú."
     hermes_cmd_not_found: "✗ Níorbh fhéidir an t-ordú `hermes` a aimsiú. Tá Hermes ag rith, ach níorbh fhéidir leis an ordú nuashonraithe an inrite a aimsiú ar PATH ná tríd an léirmhínitheoir Python reatha. Bain triail as `hermes update` a rith de láimh i do theirminéal."
     start_failed: "✗ Theip ar nuashonrú a thosú: {error}"
-    coalesced: "☤ Update request queued: it joins the update already running or just finished, so Hermes restarts once with the latest requested target."
+    coalesced: "☤ Iarratas nuashonraithe sa scuaine: téann sé leis an nuashonrú atá ar siúl cheana nó díreach críochnaithe, mar sin atosaíonn Hermes uair amháin leis an sprioc is déanaí a iarradh. Tuairiscítear an toradh don iarrthóir is déanaí."
     starting: "☤ Ag tosú nuashonrú Hermes… Cuirfidh mé an dul chun cinn ar shruth anseo."
     reply_failed: "✗ Theip ar fhreagra a sheoladh chuig an bpróiseas nuashonraithe: {error}"
     reply_sent: "✓ Seoladh `{label}` chuig an bpróiseas nuashonraithe."

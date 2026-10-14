@@ -16,6 +16,11 @@ from typing import Any, Callable
 logger = logging.getLogger(__name__)
 MAX_AGENT_UPDATE_REASON = 240
 _UPDATE_HANDOFF = "Update accepted. End this turn now; the native updater owns completion."
+# The deferred file keeps one route (latest requester wins), so an earlier merged requester is
+# told up front that the completion notice goes to whoever asked last.
+_UPDATE_COALESCED_HANDOFF = ("Update queued with a burst of requests; Hermes restarts once with the latest "
+                             "requested target and reports the outcome to the latest requester only. "
+                             "End this turn now.")
 _MAX_PARENT_DEPTH = 32
 _MAX_PREVIOUS_OUTCOME_DETAIL = 240
 _MAX_PREVIOUS_OUTCOME_COUNT = 10000
@@ -313,18 +318,28 @@ def launch_due_deferred(runner: Any, loop: Any) -> None:
         loop.call_soon_threadsafe(runner._schedule_update_notification_watch)
 
 
-def restart_absorbed_by_update(home: Path) -> str | None:
+def _deferred_is_fresh(home: Path, now: float) -> bool:
+    """A queued request younger than the watcher's deadline; an older one was never launched
+    (no hermes binary, a crashed housekeeping loop) and must not block an operator restart."""
+    updated = (_read_json(home / DEFERRED_FILE) or {}).get("updated_at")
+    if isinstance(updated, bool) or not isinstance(updated, (int, float)) or not math.isfinite(updated):
+        return False
+    return now - float(updated) <= _ABSORB_MAX_AGE_SECONDS
+
+
+def restart_absorbed_by_update(home: Path, *, now: float | None = None) -> str | None:
     """Why a plain restart is redundant now: an update in flight or queued restarts anyway."""
     from gateway.update_notifications import _timestamp, final_outcome, read_pending
 
     home = Path(home)
-    if (home / DEFERRED_FILE).exists():
+    now = time.time() if now is None else now
+    if (home / DEFERRED_FILE).exists() and _deferred_is_fresh(home, now):
         return "an update is queued and will restart the gateway"
     current = read_pending(home)
     if current is None:
         return None
     try:
-        age = time.time() - _timestamp(str(current[1].get("timestamp")))
+        age = now - _timestamp(str(current[1].get("timestamp")))
     except (TypeError, ValueError):
         return None
     # A marker older than the watcher's deadline belongs to an updater that died; never let it
@@ -364,6 +379,11 @@ def _route_from_session_lineage(db: Any, session_id: str) -> tuple[str, dict[str
             return current, route
         current = str(row.get("parent_session_id") or "").strip()
     return None
+
+
+def agent_update_handoff(result: dict[str, Any]) -> str:
+    """The agent's turn-ending instruction; a merged request learns who gets the outcome."""
+    return _UPDATE_COALESCED_HANDOFF if result.get("coalesced") else _UPDATE_HANDOFF
 
 
 def make_agent_update_handler(
@@ -435,6 +455,6 @@ def make_agent_update_handler(
         if result["started"]:
             # Socket handlers run in an executor; the watcher creates asyncio tasks.
             main_loop.call_soon_threadsafe(runner._schedule_update_notification_watch)
-        return {"accepted": True, **result, "handoff": _UPDATE_HANDOFF}
+        return {"accepted": True, **result, "handoff": agent_update_handoff(result)}
 
     return _handler
