@@ -8,7 +8,9 @@ off the gateway event loop. Eviction removes the cache entry first, so a refetch
 turn builds a fresh manager while retirement completes. Only idle-TTL, LRU-cap
 and memory-pressure evictions commit the transcript (`on_session_end`) first;
 same-session evictions (`/model`, fallback drift, config signature,
-cross-process) never do. An agent whose `shutdown_memory_provider()` already ran
+cross-process) never do. Not covered yet: fallback drift and mid-turn `/model`
+evict while the agent is running, so they skip the soft release entirely.
+An agent whose `shutdown_memory_provider()` already ran
 (`_memory_provider_shutdown`, the `/new` and `/reset` cleanup) is detached without
 a second commit or shutdown: `shutdown_memory_provider()` sets that flag and
 captures the manager under a per-agent handoff lock (`memory_handoff_lock`) that
@@ -32,6 +34,12 @@ Retire when upstream soft eviction retires memory providers and Hindsight
 prefetch is single-flight. Roll back by reverting the commits carrying
 `Fork-Patch: evict-memory-shutdown`; evicted agents then keep their writer and
 mem-sync threads until process exit again.
+
+Follow up:
+- Fallback-drift and mid-turn `/model` eviction (`gateway/run_turn.py`
+  `_run_agent_evict_on_fallback`) reach `_evict_cached_agent` while the agent is
+  in `_running_agent_ids()`, which returns before the soft release, so that
+  agent's Hindsight writer and mem-sync executor still leak. Predates this patch.
 
 Accepted asynchronous retain operations remain tracked after the first prefetch
 visibility wait expires. Later prefetches do not repeat that wait. The existing

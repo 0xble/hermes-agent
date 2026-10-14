@@ -1286,6 +1286,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 try:
                     if self._prefetch_waits_for_retain:
                         self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
+                    # A newer query queued during the drain wait supersedes this one: skip its
+                    # recall so the latest query is not held behind a result nobody will read.
+                    with self._prefetch_generation.publishing(generation) as current:
+                        if not current:
+                            continue
                     text, count = self._do_recall(query)
                     with self._prefetch_generation.publishing(generation) as current:
                         if current:
