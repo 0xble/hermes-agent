@@ -5,7 +5,9 @@ session: the live tree would become unmanageable (missing from the
 background list while still holding resources).
 """
 
+import json
 import sys
+import threading
 import time
 from contextlib import suppress
 from unittest.mock import MagicMock, patch
@@ -106,19 +108,48 @@ def test_kill_with_dead_tree_still_reports_killed():
 
 @pytest.mark.platforms("posix")  # POSIX signal escalation; Windows uses taskkill
 @pytest.mark.live_system_guard_bypass  # SIGKILL may target a snapshotted child after it is reparented
-def test_escalated_kill_of_sigterm_ignoring_child_reports_killed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reader_owns_finalization", [False, True], ids=["natural", "reader_owns"])
+def test_escalated_kill_of_sigterm_ignoring_child_reports_killed(tmp_path, monkeypatch, reader_owns_finalization):
     """The #115490 scenario itself: a child that ignores SIGTERM is SIGKILLed after the grace
     window, and the verification must give the kernel a moment to reap it — poll() right
-    after kill() still says alive, which turned every escalated kill into 'Kill incomplete'."""
+    after kill() still says alive, which turned every escalated kill into 'Kill incomplete'.
+
+    The reader may observe the SIGKILL first and own finalization. The kill then returns
+    without waiting for the reader's receipt IO, so the move to ``_finished`` is published
+    by the owner's completion event, not by ``kill_process`` returning."""
+    from tools import process_registry as registry_module
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 0.2))
     monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
+    reader_claimed, kill_returned = threading.Event(), threading.Event()
+    if reader_owns_finalization:
+        real_save = registry_module.save_completed_result
+        real_survivors = ProcessRegistry._post_kill_survivors
+
+        def reader_save_after_kill(session, **kwargs):
+            # The reader has claimed finalization; hold its receipt write until the kill returns.
+            if threading.current_thread().name.startswith("proc-reader-"):
+                reader_claimed.set()
+                kill_returned.wait(10.0)
+            return real_save(session, **kwargs)
+
+        def survivors_after_reader_claim(self, session, **kwargs):
+            survivors = real_survivors(self, session, **kwargs)
+            assert reader_claimed.wait(10.0), "reader never observed the SIGKILL exit"
+            return survivors
+
+        monkeypatch.setattr(registry_module, "save_completed_result", reader_save_after_kill)
+        monkeypatch.setattr(ProcessRegistry, "_post_kill_survivors", survivors_after_reader_claim)
     reg = ProcessRegistry()
     s = reg.spawn_local("trap '' TERM; sleep 30", cwd=str(tmp_path))
     try:
         time.sleep(0.3)  # let bash install the trap
         result = reg.kill_process(s.id)
+        kill_returned.set()
+        assert s._completion_event.wait(10.0), "finalization owner never published completion"
     finally:
+        kill_returned.set()
         with suppress(Exception):
             s.process.kill()
             s.process.wait(timeout=2)
@@ -128,6 +159,9 @@ def test_escalated_kill_of_sigterm_ignoring_child_reports_killed(tmp_path, monke
     # session into _finished after its receipt IO, then sets the completion event.
     assert s._completion_event.wait(5)
     assert s.id in reg._finished
+    assert s.id not in reg._running
+    receipt = json.loads((tmp_path / "logs" / "process-results" / f"{s.id}.json").read_text(encoding="utf-8-sig"))
+    assert receipt["completion_reason"] == "killed"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal escalation; Windows uses taskkill")
