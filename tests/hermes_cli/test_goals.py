@@ -133,6 +133,31 @@ class TestJudgeGoal:
 
 class TestGoalManager:
 
+    @pytest.mark.parametrize(
+        "goal,contract,code",
+        [
+            ("x " * 301, None, "length"),
+            ("Ship the release", {"verification": "PR #551 is merged"}, "stale_identifier"),
+            ("Delete the obsolete topic", {"constraints": "Read-only; no changes"}, "readonly_mutation"),
+            ("Ship the release", {"verification": "1. Run tests\n2. Read logs\n3. Review output"}, "verification_checklist"),
+        ],
+    )
+    def test_goal_authoring_rules_have_deterministic_findings(self, goal, contract, code):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(goal, contract)
+        assert [finding.code for finding in findings] == [code]
+
+    @pytest.mark.parametrize("goal", [
+        "Finish scoring the curated source lists using Brian's Round 3 calibration decisions, with the scoring skill deployed. Plan: ~/Workspace/projects/source-scoring/plan.md\nverify: Every list meets the calibration threshold or is marked for rework, and the deployed skill scores a fresh list.\nconstraints: Don't add, remove, or reclassify list entries.\nstop when: Brian's Round 3 calibration decisions are needed.",
+        "The credential broker is retired and agents use 1Password directly through service accounts.\nverify: Agents read secrets from each non-Private vault without the broker, and no broker process or config remains.\nconstraints: Never print secrets, rotate credentials without Brian, or touch LPG or Meridian infrastructure.\nstop when: Brian needs to approve the service accounts on his Mac.",
+    ])
+    def test_goal_authoring_approved_shapes_are_clean(self, goal):
+        from hermes_cli.goals import parse_contract, goal_authoring_findings
+
+        headline, contract = parse_contract(goal)
+        assert goal_authoring_findings(headline, contract) == []
+
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
