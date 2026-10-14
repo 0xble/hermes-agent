@@ -207,3 +207,40 @@ async def test_final_reply_in_one_topic_keeps_other_topic_rearm():
     await _drain(adapter)
 
     assert topics == ["22", "22"]
+
+
+class _InsertingKey(tuple):
+    """A topic key whose comparison inserts into the re-arm maps, like the event loop racing the agent
+    thread's pause. Iterating a live map while it grows raises "dictionary changed size"."""
+
+    def __new__(cls, key, maps):
+        self = super().__new__(cls, key)
+        self.maps = maps
+        return self
+
+    def __eq__(self, other):
+        for task_map in self.maps:
+            task_map[("other", str(len(task_map)))] = None
+        return tuple(self) == tuple(other)
+
+    __hash__ = tuple.__hash__
+
+
+@pytest.mark.asyncio
+async def test_cancel_retrigger_survives_concurrent_inserts():
+    """pause_typing_for_chat runs on the agent thread; a loop-side insert mid-cancel must not skip it."""
+    adapter = _make_adapter()
+    tasks, trailing = adapter._typing_retrigger_task_maps()
+    key = ("123", "11")
+    tasks[key] = asyncio.ensure_future(asyncio.sleep(10))
+    trailing[key] = asyncio.ensure_future(asyncio.sleep(10))
+    adapter._telegram_typing_retrigger_at[key] = 1.0
+    maps = (tasks, trailing, adapter._telegram_typing_retrigger_at)
+    adapter._typing_retrigger_key = lambda chat_id, metadata: _InsertingKey(key, maps)
+    pending = [tasks[key], trailing[key]]
+
+    adapter._cancel_typing_retrigger("123", {"thread_id": "11"})
+    await asyncio.sleep(0)
+
+    assert all(task.cancelled() for task in pending)
+    assert key not in tasks and key not in trailing and key not in adapter._telegram_typing_retrigger_at
