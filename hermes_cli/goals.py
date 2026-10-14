@@ -418,6 +418,9 @@ JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
 
+# Stands in for a successful turn that ended empty or tool-only, so the judge reads the ledger.
+JUDGE_EMPTY_RESPONSE_PLACEHOLDER = "(no final text; judge from recorded evidence)"
+
 JUDGE_LAST_VISIBLE_REPORT_BLOCK_TEMPLATE = (
     "Agent's last visible report from this goal's lifetime "
     "(newest final report; agent prose, not proof):\n{report}\n\n"
@@ -1829,7 +1832,11 @@ def judge_goal(
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
-    if not last_response.strip():
+    # A successful empty or tool-only turn is still judged from recorded evidence; skip the judge
+    # only when there is nothing at all to evaluate (the evidence-free callers keep this path).
+    has_record = bool(evidence) or bool(last_visible_report.strip()) or bool(
+        citations and (citations.get("cited") or citations.get("unresolved")))
+    if not last_response.strip() and not has_record:
         return "continue", "empty response (nothing to evaluate)", False, None, False
     if timeout is None:
         timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
@@ -1848,7 +1855,8 @@ def judge_goal(
     # dropping later requirements makes the judge evaluate a different goal.
     common = dict(
         goal=goal,
-        response=_judge_response_window(last_response),
+        response=(_judge_response_window(last_response) if last_response.strip()
+                  else JUDGE_EMPTY_RESPONSE_PLACEHOLDER),
         last_visible_report_block=(JUDGE_LAST_VISIBLE_REPORT_BLOCK_TEMPLATE.format(
             report=_judge_response_window(last_visible_report)) if last_visible_report else ""),
         evidence_block=_render_evidence_block(evidence),

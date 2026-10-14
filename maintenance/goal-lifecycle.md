@@ -204,7 +204,11 @@ of goal admission. This changes no user-authority, provenance, display/silence o
 revision semantics; the full revision history contract above remains binding.
 
 Admission means the evaluator may examine the boundary, not that it proved
-completion or progress. Successful empty/tool-only turns retain runtime evidence.
+completion or progress. Successful empty/tool-only turns retain runtime evidence,
+and `judge_goal` judges them from it: blank text is shown to the judge as
+`JUDGE_EMPTY_RESPONSE_PLACEHOLDER`, and the judge is skipped only when the text
+is blank and there is no evidence, visible report or citation. Evidence-free
+callers (loops, kanban, the bare-text fallback) therefore keep the blank skip.
 Automatic bare silence still follows the existing silent-turn policy. A silent
 stall, a disputed completion claim, a no-progress streak, and an explicit wait
 remain distinct: this patch introduces no stall threshold or new terminal behavior.
@@ -223,7 +227,9 @@ Proof: the `test_goal_empty_turn.py` suites in gateway and tui_gateway plus
 evaluator with isolated SessionDB evidence. They cover successful empty/tool-only
 turns, generated failure-copy exclusion, incomplete/interrupted rejection, and
 loop-claim release independent of goal admission. Classification is covered by
-`tests/hermes_cli/test_goal_readonly_evidence.py`. TUI handoff tests keep the
+`tests/hermes_cli/test_goal_readonly_evidence.py`. The real judge boundary,
+with only `call_llm` patched, is covered by
+`tests/hermes_cli/test_goal_judge_empty_turn.py`. TUI handoff tests keep the
 result summary consistent with the evaluator input.
 Rollback reverts this boundary; there is no schema migration or configuration.
 Retire when upstream provides the same outcome-based admission on all surfaces.
