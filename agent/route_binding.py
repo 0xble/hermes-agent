@@ -73,6 +73,10 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
+    # Everything below mutates the live route; a failure restores the exact pre-bind objects so
+    # the caller never keeps a half-bound route pointing at a closed candidate client.
+    from agent.fallback_route_recovery import _capture_route_state
+    pre_bind = _capture_route_state(agent)
     # Clear the per-config context_length override so the new model's own context window is
     # resolved instead of the previous model's stale value (#22387).
     agent._config_context_length = None
@@ -95,9 +99,13 @@ def bind_route_entry(agent: Any, entry: Dict[str, Any], provider: str, model: st
             from agent.client_lifecycle import _swap_fallback_clients
             _swap_fallback_clients(agent, client, provider, model, base_url, api_mode)
     except Exception:
-        # Resolution happened before the in-place swap; do not leak a client if
-        # binding or provider-specific setup fails before it becomes reachable.
-        _close_failed_route_client(agent, client)
+        # Restore the pre-bind route (retiring clients the swap installed), and close the resolved
+        # client too in case the failure came before it became reachable.
+        from agent.fallback_route_recovery import _restore_route_state
+        installed = getattr(agent, "client", None) is client
+        _restore_route_state(agent, pre_bind)  # retires the candidate client if it was installed
+        if not installed and client is not pre_bind.get("client"):
+            _close_failed_route_client(agent, client)
         raise
 
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id

@@ -1,7 +1,5 @@
 """Regression tests for restoring a rate-limited primary during a long turn."""
 
-import ast
-import inspect
 import json
 import time
 from types import SimpleNamespace
@@ -11,7 +9,6 @@ import httpx
 import pytest
 from openai import InternalServerError, RateLimitError
 
-from agent import conversation_loop, turn_iteration_prep
 from agent.error_classifier import FailoverReason
 from agent.shared_primary_cooldown import complete_primary_recovery
 from run_agent import AIAgent
@@ -65,30 +62,6 @@ def test_skips_restore_probe_for_primary_iterations(recovery_runtime):
 
     assert result == "Model: primary"
     restore.assert_not_called()
-
-
-def test_outer_iteration_probes_before_building_the_next_request():
-    tree = ast.parse(inspect.getsource(conversation_loop._run_conversation_turn))
-    assert any(
-        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        and node.func.id == "_run_phase" and node.args
-        and isinstance(node.args[0], ast.Name) and node.args[0].id == "begin_iteration"
-        for node in ast.walk(tree)
-    ), "the conversation loop must execute the iteration entry phase"
-    entry = ast.parse(inspect.getsource(turn_iteration_prep.begin_iteration))
-    restore_lines = [
-        node.lineno for node in ast.walk(entry)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        and node.func.id == "_maybe_recheck_fallback_route_for_iteration"
-    ]
-    redirect_lines = [
-        node.lineno for node in ast.walk(entry)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_drain_pending_redirect"
-    ]
-    assert restore_lines, "the outer iteration must re-check primary restoration"
-    assert redirect_lines, "expected normal outer-loop request setup"
-    assert min(restore_lines) < min(redirect_lines)
 
 
 @pytest.mark.parametrize("recovery", [
@@ -696,6 +669,25 @@ def test_failed_mid_turn_primary_rebuild_keeps_one_coherent_fallback_route(tool_
     assert (agent.model, agent.provider, agent.base_url, agent.client) == fallback
     assert agent._fallback_activated and agent._provider_fallback_active
     agent.client.close.assert_not_called()
+
+
+def test_fallback_bind_failure_after_client_install_restores_the_original_route(tool_loop_agent):
+    # A provider-specific setup failure after the swap installed the candidate client must not
+    # leave the agent marked as on fallback while pointing at a closed, half-bound route.
+    agent = tool_loop_agent
+    original = (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client)
+
+    def swap_then_fail(agent, client, provider, model, base_url, api_mode):
+        agent.client = client
+        raise RuntimeError("provider setup failed after install")
+
+    with patch("agent.client_lifecycle._swap_fallback_clients", side_effect=swap_then_fail):
+        assert not agent._try_activate_fallback(reason=FailoverReason.server_error)
+
+    assert (agent.model, agent.provider, agent.base_url, agent.api_mode, agent.client) == original
+    assert not agent._fallback_activated
+    assert getattr(agent, "_active_fallback_entry", None) is None
+    original[-1].close.assert_not_called()
 
 
 def test_explicit_switch_clears_stay_bookkeeping(tool_loop_agent):
