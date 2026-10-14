@@ -125,7 +125,12 @@ def test_bare_and_unknown_heavy_slot_wrappers_scan_the_wrapped_command(
     _script(scripts, "r.sh", "#!/bin/sh\nhermes gateway restart\n")
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
     command = command_template.format(trusted=trusted_slot)
-    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
+    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
+    assert unsafe is True
+    if "--bogus" in command:
+        assert refusal is not None and "unknown option `--bogus`" in refusal
+    else:
+        assert refusal is None
 
 
 def test_heavy_slot_device_path_predicate_is_exact():
@@ -152,7 +157,12 @@ def test_opaque_heavy_slot_keeps_option_carried_commands(
     monkeypatch.setenv("PATH", str(trusted_slot.parent))
     payload = shlex.quote(f"bash {child}")
     command = f"{wrapper.format(trusted=trusted_slot)} {prefix} {tail.format(payload=payload)}"
-    assert scan_gateway_lifecycle(command) == (True, None)
+    unsafe, refusal = scan_gateway_lifecycle(command)
+    assert unsafe is True
+    if prefix.startswith("--bogus"):
+        assert refusal is not None and "unknown option `--bogus`" in refusal
+    else:
+        assert refusal is None
 
 
 @pytest.mark.parametrize("options", ["--bogus", "--label", "--gate-fd", "--"])

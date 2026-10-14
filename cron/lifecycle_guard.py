@@ -888,6 +888,7 @@ def _direct_lifecycle_scan(command: str) -> bool:
 # --- path handling ----------------------------------------------------------------------------
 
 _NON_EXECUTABLE_DEVICE_PATHS = frozenset({"/dev/null", "/dev/zero"})
+_FAIL_CLOSED_DEVICE_PATHS = frozenset({"/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd"})
 
 
 def _is_non_executable_device_path(candidate: str) -> bool:
@@ -896,6 +897,17 @@ def _is_non_executable_device_path(candidate: str) -> bool:
     Standard streams and /dev/fd aliases can carry executable text, so they stay fail-closed.
     """
     return candidate in _NON_EXECUTABLE_DEVICE_PATHS
+
+
+def _is_fail_closed_device_path(candidate: str) -> bool:
+    """True for stream and descriptor pseudo-paths that must never be treated as scripts.
+
+    Some hosts expose ``/dev/stdin`` or ``/dev/fd/<n>`` as regular-file descriptors (or make
+    stdout/stderr unreadable), so relying only on ``fstat`` can accidentally allow them. The
+    lexical guard keeps every device except the two empty devices fail-closed, while traversal
+    paths such as ``/dev/fd/../root/restart.sh`` remain ordinary script candidates.
+    """
+    return candidate in _FAIL_CLOSED_DEVICE_PATHS or re.fullmatch(r"/dev/fd/[0-9]+", candidate) is not None
 
 
 def _resolve_lenient(path: Path) -> Path:
@@ -1178,6 +1190,8 @@ def _read_referenced_script_unlocked(
     See #88052.
     """
     byte_limit = _capped_read_limit(max_bytes)
+    if _is_fail_closed_device_path(str(path)):
+        return None, True
     if _on_cloud_path(path):
         return None, True
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
