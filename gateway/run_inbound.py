@@ -799,6 +799,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 await self._pause_goal_for_stop(_quick_key, source)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
+            if event.internal and (
+                getattr(event, "_startup_resume_claim", False)
+                or str(getattr(event, "_outbox_admission_id", "")).startswith("resume:")
+            ):
+                logger.warning("Rejecting duplicate startup-resume admission for session %s", _quick_key)
+                return QUEUE_ADMISSION_FAILURE
             if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):  # picked up after start
                 return QUEUE_ADMISSION_FAILURE
             return None
@@ -1507,14 +1513,24 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         from gateway.run import _AGENT_PENDING_SENTINEL
 
         pending_state = self._peek_session_state(_quick_key)
+        if _quick_key in getattr(self, "_startup_resume_started", set()):
+            logger.warning("Rejecting duplicate startup-resume event for session %s", _quick_key)
+            return QUEUE_ADMISSION_FAILURE
         owns_startup_claim = (
-            is_internal and pending_state is not None
-            and getattr(event, "_startup_resume_claim", False) is True
-            and pending_state.turn.event is event
-            and pending_state.turn.agent is _AGENT_PENDING_SENTINEL
+            is_internal and getattr(event, "_startup_resume_claim", False) is True
+            and (
+                (
+                    pending_state is not None
+                    and pending_state.turn.event is event
+                    and pending_state.turn.agent is _AGENT_PENDING_SENTINEL
+                )
+                or getattr(self, "_running_agents", {}).get(_quick_key) is _AGENT_PENDING_SENTINEL
+                or _quick_key in getattr(self, "_startup_resume_claimed", set())
+            )
         )
         if owns_startup_claim:
             event._startup_resume_claim = False
+            event._startup_resume_dispatched = True
         if not owns_startup_claim and self._is_session_running(_quick_key):
             await self._hm_evict_reaped_agent(_quick_key)
         if not owns_startup_claim and self._is_session_running(_quick_key):
@@ -1548,7 +1564,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
+        _startup_resume_dispatched = getattr(event, "_startup_resume_dispatched", False)
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        if _startup_resume_dispatched:
+            event._startup_resume_dispatched = True
 
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
@@ -1568,6 +1587,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 if _consumed:
                     return _consumer_reply
             try:
+                if getattr(event, "_startup_resume_dispatched", False):
+                    started = getattr(self, "_startup_resume_started", None)
+                    if started is None:
+                        started = self._startup_resume_started = set()
+                    started.add(_quick_key)
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
@@ -1602,6 +1626,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             # sentinel/agent and lease. Reset/stop release their stale slot before installing a
             # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
             self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+            getattr(self, "_startup_resume_started", set()).discard(_quick_key)
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)

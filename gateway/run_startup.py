@@ -45,6 +45,7 @@ from typing import Any, Dict, Optional, Tuple
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_NOT_SUPPLIED = object()
 # A restart resumes every interrupted session at once. Their turn openings (history load, prompt
 # build, first writes) all hit the shared state.db writer, so admit a few at a time: each slot is
 # held until its turn ends or the opening window passes, so long turns never hold later sessions.
@@ -151,36 +152,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             if index is None:
                 break
             event = queue.pop(index)
-            try:
-                source = getattr(event, "source", None)
-                adapter = self._intake_adapter_for(source)
-                if adapter is None and getattr(event, "_hermes_recovered_followup", False):
-                    adapter = self._delivery_adapter_for(source)
-                if adapter is None:
-                    logger.debug(
-                        "Dropping startup-restore queued message: adapter unavailable for %s",
-                        getattr(getattr(source, "platform", None), "value", None),
-                    )
-                    continue
-                # Mark the replay so _handle_message does not re-queue it while the restore gate is closed.
-                with suppress(Exception):
-                    setattr(event, "_hermes_startup_restore_replay", True)
-                # A normal return can be an admission refusal. Retire the only
-                # durable copy only after this replay acquires an explicit receipt.
-                event._gateway_accepted = False
-                await adapter.handle_message(event)
-                if getattr(event, "_gateway_accepted", False) is not True:
-                    continue
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None and not getattr(event, "_hermes_queue_checkpoint", False):
-                    spool.unlink(missing_ok=True)
-            except Exception:
-                # One bad replay must not abort the drain: the remaining queued
-                # events still deserve their turn, and a raise here used to skip
-                # the gate release in _finish_startup_restore entirely.
-                logger.warning("Startup-restore queued replay failed; continuing drain", exc_info=True)
-                continue
-            drained += 1
+            if await self._dispatch_startup_restore_event(event, resolved[id(event)][1]):
+                drained += 1
         if queue and keys is None:
             logger.warning("Startup-restore drain left %d queued message(s) awaiting a reconnect owner", len(queue))
         return drained
@@ -821,22 +794,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     def _auto_resume_ready(self, entry, *, require_adapter=True) -> tuple | None:
         """Shared admission for deferred follow-ups and synthetic resume turns."""
-        from gateway.run import (
-            _auto_continue_freshness_window, _is_fresh_gateway_interruption,
-            _resume_pending_marker_timestamp,
-        )
-        marker = _resume_pending_marker_timestamp(entry)
-        if not getattr(entry, "resume_pending", True):
-            return None
-        if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
-            return None
-        if self._is_session_running(entry.session_key):
-            return None
-        source = self._restored_source(entry)
-        adapter = self._delivery_adapter_for(source)
-        if not self._resume_owner_authorized(entry.session_key, source) or (require_adapter and adapter is None):
-            return None
-        return adapter, source
+        ready, _reason = self._resume_admission(entry, require_adapter=require_adapter)
+        return ready
 
     def _startup_interrupted_note_candidates(self, candidates) -> list[str]:
         """Return fresh, eligible feature-version rows that may receive a startup note.
@@ -851,7 +810,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         ]
 
     def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
-                                          candidates=_NOT_SUPPLIED) -> int:
+                                          candidates=_NOT_SUPPLIED, allow_resume=True) -> int:
         """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
@@ -861,16 +820,32 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         if candidates is None:
             return 0
         scheduled = 0
+        allow_resume = (allow_resume and not getattr(candidates, "breaker_tripped", False)
+                        and not getattr(self, "_restart_resume_breaker_tripped", False))
         for entry in candidates:
-            # Epoch math: the marker was stamped naive-local by the previous process, possibly
-            # on the other side of a DST change; wall-clock subtraction is off by the shift.
-
-            if platform is not None and entry.origin.platform != platform:
+            if entry.session_key in getattr(self, "_restart_followup_keys", ()):
+                continue
+            if entry.session_key in getattr(self, "_startup_resume_inflight", ()):
+                continue
+            if platform is not None and getattr(entry.origin, "platform", None) != platform:
+                continue
+            if not allow_resume:
+                outcome = "noted" if self._interruption_note_delivered(entry.session_key) else "skipped:restart-loop-breaker"
+                if outcome != "noted" and entry.session_key in getattr(self, "_s2_note_ambiguous_keys", ()):
+                    outcome += ":ambiguous-note"
+                self._record_restart_resume_outcome(entry.session_key, outcome)
                 continue
             ready = self._auto_resume_ready(entry)
             if ready is None:
+                _ready, reason = self._resume_admission(entry)
+                outcome = "noted" if self._interruption_note_delivered(entry.session_key) else f"skipped:{reason}"
+                self._record_restart_resume_outcome(entry.session_key, outcome)
                 continue
             adapter, source = ready
+            inflight = getattr(self, "_startup_resume_inflight", None)
+            if inflight is None:
+                inflight = self._startup_resume_inflight = set()
+            inflight.add(entry.session_key)
             # Claim the slot *before* spawning so an inbound message arriving before the task's first
             # await queues instead of building a duplicate AIAgent.
             _resume_state = self._session_state(entry.session_key)
@@ -885,6 +860,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             _resume_state.turn.event = event
             event._startup_resume_claim = True
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
+            claimed = getattr(self, "_startup_resume_claimed", None)
+            if claimed is None:
+                claimed = self._startup_resume_claimed = set()
+            claimed.add(entry.session_key)
             if resume_marker:
                 # Keep the transport reply anchor for threading, but admit each interruption marker
                 # independently so a second restart cannot dedupe the next synthetic resume.

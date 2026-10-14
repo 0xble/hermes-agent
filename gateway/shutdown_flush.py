@@ -679,7 +679,7 @@ def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any]) -> bool:
     if age > limit:
         if data.get("queue_accepted") is True:
             quarantine_pending_spool(path, "expired drain-deferred input")
-            return False
+            return True
         logger.warning("Dropping expired drain-deferred message from %s", path)
         return True
     from gateway.platforms.event import MessageEvent

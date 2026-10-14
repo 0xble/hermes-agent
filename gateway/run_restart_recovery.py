@@ -134,6 +134,7 @@ class RestartRecoveryMixin:
         finally:
             self._release_startup_preclaim(session_key)
             getattr(self, "_startup_resume_inflight", set()).discard(session_key)
+            getattr(self, "_startup_resume_claimed", set()).discard(session_key)
             if outcome in ("resumed", "skipped:turn-failed"):
                 # The turn ran and replied (or reported its failure) itself; no interruption note.
                 self._release_restart_followup_key(session_key)

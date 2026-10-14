@@ -8,7 +8,7 @@ from hermes_constants import get_routing_process_hermes_home
 from agent.turn_context import _same_trigger_content
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
-    OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
+    DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
     recovered_message_type,
 )
 
