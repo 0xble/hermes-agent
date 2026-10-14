@@ -3250,12 +3250,23 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         return min(boundary, len(result) - min_protect)
 
     @staticmethod
-    def _dedupe_tool_results(result: List[Dict[str, Any]]) -> int:
-        """Pass 1: keep the newest copy of identical tool results, back-reference older ones."""
+    def _dedupe_tool_results(result: List[Dict[str, Any]], spared: range = range(0)) -> int:
+        """Pass 1: keep the newest copy of identical tool results, back-reference older ones.
+
+        Results in ``spared`` belong to the unread pending tool round and must remain verbatim:
+        the model has not seen them yet, so replacing one with a duplicate marker can make it
+        re-run the call or answer without the result.
+        """
         pruned = 0
         content_hashes: set = set()
+        spared_indices = set(spared)
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
+            if i in spared_indices:
+                content = msg.get("content") or ""
+                if msg.get("role") == "tool" and isinstance(content, str) and len(content) >= _PRUNE_MIN_CHARS:
+                    content_hashes.add(hashlib.md5(content.encode("utf-8", errors="replace")).hexdigest()[:12])
+                continue
             content = msg.get("content") or ""
             # Non-string/multimodal-envelope shapes can't be hashed by text.
             if msg.get("role") != "tool" or not isinstance(content, str) or len(content) < _PRUNE_MIN_CHARS:
@@ -3387,7 +3398,7 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         # is not room the round can keep) — the #61932 single-200KB-read case, which must still give way.
         spared = self._spared_pending_tool_round(result)
         prune_boundary = min(prune_boundary, spared.start) if spared else prune_boundary
-        pruned = self._dedupe_tool_results(result)
+        pruned = self._dedupe_tool_results(result, spared=spared)
         # Just-loaded / tail-referenced skills keep full skill_view bodies through the ordinary passes.
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
