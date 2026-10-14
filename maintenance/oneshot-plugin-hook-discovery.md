@@ -18,8 +18,11 @@ first turn. The delivery path treated `_discovered=True` as equivalent to
 contention, `pre_llm_call` observed an empty hook registry, so the turn still
 completed but the plugin marker and injected canary were absent.
 
-`_delivery_manager()` joins the background worker before checking readiness. The
-recursion guard (`_discovered`) is not readiness (`_discovery_complete`): a timeout
+`_delivery_manager()` joins the background worker with the strict `timeout=None`
+barrier before checking readiness. The old default 30-second join was still a
+partial-delivery race: a slow plugin sweep could time out, leave `_discovered`
+true but `_discovery_complete` false, and let a first one-shot hook be skipped.
+The recursion guard (`_discovered`) is not readiness (`_discovery_complete`): a timeout
 or re-entry during the sweep refuses partial policy delivery. A sibling foreground
 sweep is also awaited through the existing discovery lock. The barrier helpers live in
 `hermes_cli/plugins_dispatch.py` and are re-exported by the facade. Policy readers
