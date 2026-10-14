@@ -998,6 +998,9 @@ def _job_is_stale_error_recurring(
     from cron.quota_hold import hold_active
     if hold_active(job, now):
         return False  # deliberately parked past a provider usage window, not wedged (#89376)
+    skipped_until = _parse_aware(job.get(SKIPPED_UNTIL_KEY)) if job.get(SKIPPED_UNTIL_KEY) else None
+    if skipped_until is not None and _instant_after(skipped_until, now):
+        return False  # an operator skipped the slots before this instant; re-arming would undo it
     if _job_running_in_this_process(str(job.get("id") or "")):
         return False
     # A fresh fire_claim means the job is running in ANOTHER process sharing this
@@ -2191,6 +2194,16 @@ def _apply_schedule_update(updated: Dict[str, Any], updates: Dict[str, Any], job
         updated["next_run_at"] = _next_run_or_reject_past_oneshot(
             updated_schedule, updated.get("name", job_id), updated_schedule, "update ",
             job_timezone=updated.get("timezone"))
+    else:
+        _rearm_paused_recurring(updated)
+
+
+def _rearm_paused_recurring(updated: Dict[str, Any]) -> None:
+    """A schedule/zone edit on a paused recurring job re-anchors ``next_run_at`` to the next future
+    slot. Resume keeps a past stored instant due (#113603), so leaving the pre-edit instant in place
+    would fire a slot from the old schedule on resume. One-shots keep resume's own recompute."""
+    if (updated.get("schedule") or {}).get("kind") in {"cron", "interval"}:
+        updated["next_run_at"] = compute_next_run(updated["schedule"], None, updated.get("timezone"))
 
 
 def _fill_missing_next_run(updated: Dict[str, Any]) -> None:
@@ -2240,11 +2253,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # parked. The next fire re-parks (with a fresh notice) if the window is still closed.
             from cron.quota_hold import clear_state as _clear_quota_hold
             _clear_quota_hold(updated)
+            updated.pop(SKIPPED_UNTIL_KEY, None)  # the skip described the old schedule's slots
         elif "timezone" in updates and updated.get("state") != "paused":
             # The wall clock the expression is read in changed, so the stored instant is stale.
             updated["next_run_at"] = _next_run_or_reject_past_oneshot(
                 updated["schedule"], updated.get("name", job_id), updated["schedule"], "update ",
                 job_timezone=updated.get("timezone"))
+        elif "timezone" in updates:
+            _rearm_paused_recurring(updated)
+        if "timezone" in updates:
+            updated.pop(SKIPPED_UNTIL_KEY, None)  # the skip described the old zone's wall clock
         if {"schedule", "next_run_at", "enabled", "state", "timezone"}.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
@@ -2294,7 +2312,77 @@ def pause_job(
     return updated
 
 
-def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
+_SKIP_LOG_LIMIT = 20
+_SKIP_WALK_LIMIT = 10_000
+
+
+# Set by an explicit skip to the instant it landed on. Until then the stale-error re-arm leaves the
+# job alone, so an old persisted error cannot pull a deliberately skipped slot back to now.
+SKIPPED_UNTIL_KEY = "skipped_until"
+
+
+def _skip_slots(job: Dict[str, Any], count: int, reason: str) -> Optional[str]:
+    """Return ``next_run_at`` after deliberately skipping ``count`` occurrences of a recurring job.
+
+    The pending occurrence (stored ``next_run_at``) is the first one skipped. When it has already
+    elapsed, it and every other elapsed slot count together as that first skip, so ``count=1``
+    lands on the next future slot and ``count=N`` on the Nth. The first ``_SKIP_LOG_LIMIT`` skipped
+    slots are INFO-logged one by one and the rest as a single count, so a deliberate skip is never
+    silent (#113603's accounting contract) and a long pause cannot flood the log.
+    """
+    schedule, tz = job["schedule"], job.get("timezone")
+    now = _hermes_now()
+    first = job.get("next_run_at") or compute_next_run(schedule, None, tz)
+    first_dt = _parse_aware(first) if first else None
+    if first_dt is None:
+        return None
+    if _instant_at_or_before(first_dt, now):
+        target, remaining = compute_next_run(schedule, None, tz), count - 1
+    else:
+        target, remaining = first, count
+    for _ in range(max(remaining, 0)):
+        target = compute_next_run(schedule, target, tz) if target else None
+    if not target:
+        return None
+    target_dt, label = _parse_aware(target), job.get("name", job["id"])
+    slot, skipped = first, 0
+    while slot and skipped < _SKIP_WALK_LIMIT and _instant_before(_parse_aware(slot), target_dt):
+        if skipped < _SKIP_LOG_LIMIT:
+            logger.info("Job '%s' skipped occurrence %s (%s).", label, slot, reason)
+        skipped += 1
+        slot = compute_next_run(schedule, slot, tz)
+    if skipped > _SKIP_LOG_LIMIT:
+        logger.info("Job '%s' skipped %s%d more occurrences (%s).", label,
+                    "at least " if skipped >= _SKIP_WALK_LIMIT else "", skipped - _SKIP_LOG_LIMIT, reason)
+    logger.info("Job '%s' next run after skip: %s", label, target)
+    return target
+
+
+def skip_job(job_id: str, count: int = 1) -> Optional[Dict[str, Any]]:
+    """Skip the next ``count`` occurrences of a scheduled recurring job (ID or name).
+
+    The first skipped occurrence is the pending ``next_run_at``; see ``_skip_slots``. Paused jobs are
+    refused: resume re-derives a future instant, so use ``resume_job(skip_missed=True)`` instead.
+    """
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("count must be a positive integer.")
+    job = resolve_job_ref(job_id)
+    if not job:
+        return None
+    name = job.get("name", job["id"])
+    if job["schedule"].get("kind") not in {"cron", "interval"}:
+        raise ValueError(f"Cannot skip: job '{name}' is a one-shot; pause or remove it instead.")
+    if is_terminal_job(job) or job.get("state") == "paused" or not job.get("enabled", True):
+        raise ValueError(
+            f"Cannot skip: job '{name}' is not scheduled ({job.get('state')}). Resume it first, or "
+            "use 'hermes cron resume --skip-missed' to drop occurrences missed while paused.")
+    next_run_at = _skip_slots(job, count, f"operator skip, count={count}")
+    if next_run_at is None:
+        raise ValueError(f"Cannot skip: no next occurrence could be computed for job '{name}'.")
+    return update_job(job["id"], {"next_run_at": next_run_at, SKIPPED_UNTIL_KEY: next_run_at})
+
+
+def resume_job(job_id: str, *, skip_missed: bool = False) -> Optional[Dict[str, Any]]:
     """Resume a paused job. Accepts a job ID or name.
 
     A recurring job paused across one of its slots must not lose that slot silently: the stored
@@ -2302,22 +2390,30 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     catch-up / ``cron.catch_up_missed`` policy in the due scan decides what happens to it — one
     fire or a logged skip, never a silent re-anchor past it (#113603). One-shots and future
     instants recompute from now as before.
+
+    ``skip_missed=True`` is the explicit opt-out: occurrences that elapsed while paused are
+    dropped (each logged) and the job resumes on its next future slot.
     """
     job = resolve_job_ref(job_id)
     if not job:
         return None
     stored_next = job.get("next_run_at")
     stored_dt = _parse_aware(stored_next) if stored_next else None
+    skipped_until = None
     if (
         job["schedule"].get("kind") in {"cron", "interval"}
         and stored_dt is not None
         and _instant_at_or_before(stored_dt, _hermes_now())
     ):
-        next_run_at = stored_next
-        logger.info(
-            "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
-            "tick fires it (late/catch-up) or logs the skip.",
-            job.get("name", job["id"]), stored_next)
+        if skip_missed:
+            next_run_at = _skip_slots(job, 1, "missed while paused; resumed with skip_missed")
+            skipped_until = next_run_at
+        else:
+            next_run_at = stored_next
+            logger.info(
+                "Job '%s' resumed with occurrence %s that elapsed while paused kept due; the next "
+                "tick fires it (late/catch-up) or logs the skip.",
+                job.get("name", job["id"]), stored_next)
     else:
         next_run_at = compute_next_run(job["schedule"], None, job.get("timezone"))
     if next_run_at is None and job["schedule"].get("kind") == "once":
@@ -2331,6 +2427,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
         "paused_at": None,
         "paused_reason": None,
         "next_run_at": next_run_at,
+        **({SKIPPED_UNTIL_KEY: skipped_until} if skipped_until else {}),
     })
 
 

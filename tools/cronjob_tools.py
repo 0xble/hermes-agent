@@ -43,6 +43,7 @@ from cron.jobs import (
     remove_job,
     resolve_job_ref,
     resume_job,
+    skip_job,
     trigger_job,
     update_job)
 from tools.cronjob_prompt_scan import _scan_cron_prompt
@@ -1011,7 +1012,9 @@ _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
     "pause": _action_pause,
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "resume": lambda job, a: _job_state_result(resume_job(job["id"], skip_missed=bool(a.get("skip_missed")))),
+    "skip": lambda job, a: _job_state_result(
+        skip_job(job["id"], 1 if a.get("count") is None else a["count"])),
 }
 
 
@@ -1069,7 +1072,9 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
-    allow_shrink: bool = False) -> str:
+    allow_shrink: bool = False,
+    skip_missed: bool = False,
+    count: Optional[int] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1122,11 +1127,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run, skip. When action=create, the 'schedule' and 'prompt' fields are REQUIRED. 'skip' drops the next 'count' occurrences of a scheduled recurring job (default 1); a paused job must be resumed with skip_missed instead."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run."
+                "description": "Required for update/pause/resume/remove/run/skip."
             },
             "pinned": {
                 "type": "boolean",
@@ -1140,8 +1145,16 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "Update only. Updates refuse a placeholder-looking prompt ('__FILE__', '<prompt>', 'TODO', '$(cat f)', '@file') and any prompt under 10% of an existing prompt of 500+ chars. Set true ONLY when that short or literal prompt is intended."
             },
+            "skip_missed": {
+                "type": "boolean",
+                "description": "Resume only. Default resume keeps a slot that elapsed while paused due, so the next tick fires one catch-up run (or logs the skip). Set true to drop those missed occurrences and resume on the next future slot instead."
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Skip only. How many occurrences to drop, counting the pending next_run_at as the first. Default 1."
+            },
             "schedule": {
-                "type": "string",
                 "type": "string",
                 "description": "REQUIRED for create. Schedule forms: (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'."
             },
@@ -1229,7 +1242,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "allow_shrink")
+    "paused_reason", "pinned", "allow_shrink", "skip_missed", "count")
 
 
 def _cronjob_handler(args, **kw):

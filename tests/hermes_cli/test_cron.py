@@ -169,6 +169,68 @@ class TestCronEditPromptGuard:
         assert get_job(job["id"])["prompt"] == revised
 
 
+class TestCronSkipMissed:
+    """`hermes cron resume --skip-missed`, `hermes cron skip --count`, paused `edit --schedule`."""
+
+    NOW = datetime(2026, 10, 13, 21, 0, 0, tzinfo=timezone.utc)
+    NEXT = datetime(2026, 10, 20, 20, 0, 0, tzinfo=timezone.utc)
+
+    def _run(self, *argv):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        return cron_command(parser.parse_args(["cron", *argv]))
+
+    def _paused_over_slot(self, monkeypatch):
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW - timedelta(days=1))
+        job = create_job(prompt="weekly review", schedule="0 20 * * 2", deliver="local")
+        pause_job(job["id"])
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        return job["id"]
+
+    def test_resume_skip_missed_flag(self, tmp_cron_dir, monkeypatch, capsys):
+        jid = self._paused_over_slot(monkeypatch)
+        assert self._run("resume", jid, "--skip-missed") == 0
+        assert datetime.fromisoformat(get_job(jid)["next_run_at"]) == self.NEXT
+        assert "Resumed job" in capsys.readouterr().out
+
+    def test_resume_skip_missed_conflicts_with_run_now(self, tmp_cron_dir, monkeypatch, capsys):
+        jid = self._paused_over_slot(monkeypatch)
+        assert self._run("resume", jid, "--skip-missed", "--run-now") == 1
+        assert get_job(jid)["state"] == "paused"
+
+    def test_skip_count(self, tmp_cron_dir, monkeypatch, capsys):
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        job = create_job(prompt="weekly review", schedule="0 20 * * 2", deliver="local")
+        assert self._run("skip", job["id"], "--count", "2") == 0
+        assert datetime.fromisoformat(get_job(job["id"])["next_run_at"]) == self.NEXT + timedelta(days=14)
+        assert "Skipped" in capsys.readouterr().out
+
+    def test_skip_notifies_the_scheduler_provider(self, tmp_cron_dir, monkeypatch):
+        """An external provider keeps the old occurrence provisioned unless told the job moved."""
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        job = create_job(prompt="weekly review", schedule="0 20 * * 2", deliver="local")
+        notified = []
+        monkeypatch.setattr("cron.scheduler._notify_provider_jobs_changed", lambda: notified.append(True))
+        assert self._run("skip", job["id"]) == 0
+        assert notified == [True]
+
+    def test_skip_count_zero_is_refused_not_rounded_up(self, tmp_cron_dir, monkeypatch, capsys):
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        job = create_job(prompt="weekly review", schedule="0 20 * * 2", deliver="local")
+        before = get_job(job["id"])["next_run_at"]
+        assert self._run("skip", job["id"], "--count", "0") == 1
+        assert get_job(job["id"])["next_run_at"] == before
+        assert "positive integer" in capsys.readouterr().out
+
+    def test_edit_schedule_on_paused_job_recomputes(self, tmp_cron_dir, monkeypatch, capsys):
+        jid = self._paused_over_slot(monkeypatch)
+        assert self._run("edit", jid, "--schedule", "0 20 * * 2") == 0
+        job = get_job(jid)
+        assert job["state"] == "paused"
+        assert datetime.fromisoformat(job["next_run_at"]) == self.NEXT
+
+
 class TestUnverifiedDeliveryVisibility:
     """An evidence-free live-adapter ack (Slack/Matrix/Mattermost bare
     ``SendResult(success=True)``) is accepted as delivered, but the UNVERIFIED

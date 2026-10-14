@@ -864,7 +864,7 @@ def cron_edit(args):
     return 0
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
+def _job_action(action: str, job_id: str, success_verb: str, **extra) -> int:
     _stateless_token = None
     if action == "run":
         # One-shot CLI: a background-dispatched run (daemon thread, triggered when the CLI
@@ -879,7 +879,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             from gateway.session_context import _SESSION_ASYNC_DELIVERY
             _stateless_token = _SESSION_ASYNC_DELIVERY.set(False)
     try:
-        result = _cron_api(action=action, job_id=job_id)
+        result = _cron_api(action=action, job_id=job_id, **extra)
     finally:
         if _stateless_token is not None:
             _SESSION_ASYNC_DELIVERY.reset(_stateless_token)
@@ -888,7 +888,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         return 1
     job = result.get("job") or result.get("removed_job") or {}
     print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
-    if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
+    if action in {"resume", "run", "skip"} and result.get("job", {}).get("next_run_at"):
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         print(f"  {_run_outcome(result.get('job', {}))}")
@@ -917,6 +917,12 @@ def cron_resume(args) -> int:
     if run_at and run_now:
         print(color("Use exactly one of --at or --run-now.", Colors.RED))
         return 1
+    skip_missed = getattr(args, "skip_missed", False)
+    if skip_missed and (run_at or run_now):
+        print(color("--skip-missed cannot be combined with --at or --run-now.", Colors.RED))
+        return 1
+    if skip_missed:
+        return _job_action("resume", args.job_id, "Resumed", skip_missed=True)
     if not run_at and not run_now:
         return _job_action("resume", args.job_id, "Resumed")
     from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot
@@ -931,6 +937,17 @@ def cron_resume(args) -> int:
     print(color(f"Re-armed job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN)
           + f"\n  Next run: {job.get('next_run_at')}")
     return 0
+
+
+def cron_skip(args) -> int:
+    """Skip the next occurrence(s) of a scheduled recurring job.
+
+    Routed through the cronjob tool, like the other lifecycle actions, so an external scheduler
+    provider is told the job moved. A direct ``skip_job`` call would leave its old occurrence
+    provisioned and still firing.
+    """
+    count = getattr(args, "count", None)
+    return _job_action("skip", args.job_id, "Skipped", **({} if count is None else {"count": count}))
 
 
 def cron_notepad(args) -> int:
@@ -992,6 +1009,7 @@ _CRON_SUBCOMMANDS = {
     "edit": lambda a: cron_edit(a),
     "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
     "resume": lambda a: cron_resume(a),
+    "skip": lambda a: cron_skip(a),
     "run": lambda a: _job_action("run", a.job_id, "Triggered"),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),
 }
@@ -1007,5 +1025,5 @@ def cron_command(args):
     if handler is not None:
         return handler(args)
     print(f"Unknown cron command: {subcmd}\n"
-          "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+          "Usage: hermes cron [list|create|edit|pause|resume|skip|run|remove|status|runs|doctor|tick]")
     sys.exit(1)
