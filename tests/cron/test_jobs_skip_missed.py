@@ -75,3 +75,22 @@ class TestSkipMissedOccurrences:
         assert jid not in {j["id"] for j in get_due_jobs()}
         assert datetime.fromisoformat(resume_job(jid)["next_run_at"]) == self.NEXT
         assert jid not in {j["id"] for j in get_due_jobs()}
+
+    @pytest.mark.parametrize("via", ["skip", "resume_skip_missed"])
+    def test_stale_error_rearm_does_not_undo_an_explicit_skip(self, tmp_cron_dir, monkeypatch, via):
+        """A job wedged in an old persisted error is re-armed to now by the due scan; that recovery
+        must not pull a deliberately skipped occurrence back."""
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW - timedelta(minutes=90))
+        job = create_job(prompt="probe", schedule="every 1h", deliver="local")
+        update_job(job["id"], {"last_status": "error", "last_error": "boom",
+                               "last_run_at": (self.NOW - timedelta(hours=6)).isoformat()})
+        if via == "resume_skip_missed":
+            pause_job(job["id"], reason="skip")
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        if via == "skip":
+            landed = skip_job(job["id"])["next_run_at"]
+        else:
+            landed = resume_job(job["id"], skip_missed=True)["next_run_at"]
+        assert datetime.fromisoformat(landed) > self.NOW
+        assert job["id"] not in {j["id"] for j in get_due_jobs()}
+        assert get_job(job["id"])["next_run_at"] == landed
