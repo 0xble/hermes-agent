@@ -78,8 +78,8 @@ def test_no_summary_yet_is_never_stale(db):
     assert [row[1] for row in _active(db, sid)] == ["m0", "m1", "m2", "m3-pruned"]
 
 
-# Gateway shape: ``load_transcript`` hands the turn a history with no ``_row_id``s, so the guard can only
-# match the summary row by role and loaded-view content.
+# Gateway shape: ``load_transcript`` hands the turn a history with no ``_row_id``s. It still carries the
+# durable message UID and row snapshot, which must take precedence over content fallback.
 
 def _gateway_load(db: SessionDB, sid: str):
     held = db.get_messages_as_conversation(sid, repair_alternation=True)
@@ -101,12 +101,41 @@ def test_stale_rewrite_without_row_ids_is_refused(db):
     assert _active(db, sid) == after_hygiene
 
 
+def test_identical_summary_from_new_generation_is_refused_without_row_ids(db):
+    sid = "s-identical-summary-gw"
+    _seed(db, sid)
+    summary = {"role": "assistant", "content": "[same summary]", "_compressed_summary": True}
+    db.archive_and_compact(sid, [summary, *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
+    stale = _gateway_load(db, sid)
+    held_summary = next(message for message in stale if message.get("_compressed_summary"))
+    assert "_row_id" not in held_summary
+    assert held_summary.get("message_uid") and held_summary.get("_db_row_snapshot")
+
+    # A later generation has byte-identical summary content but a different durable row identity.
+    current_tail = db.get_messages_as_conversation(sid)[-2:]
+    db.archive_and_compact(
+        sid, [{"role": "assistant", "content": "[same summary]", "_compressed_summary": True}, *current_tail],
+        tail_count=2,
+    )
+    after_winner = _active(db, sid)
+    assert sum(row[2] for row in after_winner) == 1
+
+    # Preserve the old summary text so content-only matching would incorrectly admit this stale rewrite.
+    stale_rewrite = [
+        dict(message, content=(message["content"] if message.get("_compressed_summary") else f"{message['content']}-stale"))
+        for message in stale
+    ]
+    with pytest.raises(StaleHeldHistory):
+        db.archive_and_compact(sid, stale_rewrite, held_messages=stale)
+    assert _active(db, sid) == after_winner
+
+
 def test_current_generation_rewrite_without_row_ids_commits(db):
     sid = "s-current-gw"
     _seed(db, sid)
     db.archive_and_compact(sid, [{"role": "user", "content": "[summary]", "_compressed_summary": True},
                                  *db.get_messages_as_conversation(sid)[-2:]], tail_count=2)
-    current = _gateway_load(db, sid)  # carries the summary by content only
+    current = _gateway_load(db, sid)
     db.archive_and_compact(sid, [*current[:-1], {"role": "assistant", "content": "m5-pruned"}],
                            held_messages=current)
     assert [row[1] for row in _active(db, sid)] == ["[summary]", "m4", "m5-pruned"]
