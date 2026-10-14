@@ -474,12 +474,14 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            if session_entry is None or not pinned_session_id or not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
+            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
@@ -495,10 +497,94 @@ class GatewayTurnMixin:
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+            if strict_session and not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
+                # Topic-binding recovery may switch conversations; a pinned event belongs only to
+                # the session it was admitted for, never to whatever the topic now points at.
+                logger.warning(
+                    "Dropping internally routed event: topic binding moved pinned session=%s to %s",
+                    pinned_session_id, session_entry.session_id,
+                )
+                return
+        from gateway.platforms.event import is_goal_continuation_event
+        if is_goal_continuation_event(event):
+            from hermes_cli.session_controls import refresh_goal_continuation
+            if await self._run_in_executor_with_context(
+                refresh_goal_continuation, event, session_entry.session_id,
+            ) is None:
+                return
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY, loop_wake_is_current
+        if (getattr(event, "metadata", None) or {}).get(LOOP_WAKE_METADATA_KEY) and not await (
+                self._run_in_executor_with_context(
+                    loop_wake_is_current, event.metadata, session_entry.session_id)):
+            logger.info("Discarding superseded loop wake for session %s", session_entry.session_id)
+            return
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
         return source, session_entry, session_key
+
+    async def _wake_pin_matches(self, event, pinned: str, session_id: str) -> bool:
+        """Keep strict routing pinned, except for a verified, still-current compressed wake."""
+        if pinned == session_id:
+            return True
+        if not GatewayTurnMixin._is_gateway_wake(event):
+            return False
+        from hermes_cli.session_controls import internal_wake_is_current
+        if not await asyncio.to_thread(internal_wake_is_current, event, session_id):
+            return False
+        return event.metadata.get("gateway_session_id") == session_id
+
+    async def _strict_session_pin_holds(self, event, session_id: Optional[str] = None) -> bool:
+        """The ``_hmwa_resolve_session`` strict rule for every other admission and queue boundary.
+
+        True for an unpinned event. A ``gateway_session_strict`` event holds only while its pinned
+        ``gateway_session_id`` still owns ``gateway_session_key`` and, when ``session_id`` is given,
+        is the session about to run it: after /new or /resume rebinds the key the event is dropped,
+        never run in the conversation that replaced it."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or not metadata.get("gateway_session_strict"):
+            return True
+        pinned = str(metadata.get("gateway_session_id") or "").strip()
+        key = str(metadata.get("gateway_session_key") or "").strip()
+        current = None
+        if pinned and key:
+            entry = await self.async_session_store.lookup_by_session_key(key)
+            current = getattr(entry, "session_id", None)
+        if current is not None and (session_id is None or session_id == current):
+            if await GatewayTurnMixin._wake_pin_matches(self, event, pinned, current):
+                return True
+        logger.warning(
+            "Dropping internally routed event: pinned session id=%s no longer owns key=%s (running=%s)",
+            pinned or "missing", key or "missing", session_id or "-",
+        )
+        return False
+
+    @staticmethod
+    def _is_gateway_wake(event) -> bool:
+        """A goal continuation or a loop tick, recognized by its stamp, never by ``internal``."""
+        from hermes_cli.session_controls import is_gateway_wake
+        return is_gateway_wake(event)
+
+    async def _internal_wake_input_at_execution(self, event, session_id: str, message: str) -> Optional[str]:
+        """Re-check a gateway wake at the model boundary; return the message to run, or None to drop.
+
+        Admission and session resolution already fenced the wake, but turn preparation and hooks
+        await before the agent starts, and a pause, stop, clear or replacement can commit in that
+        window. A goal continuation whose definition was edited since gets its refreshed prompt."""
+        from gateway.platforms.event import is_goal_continuation_event
+        from hermes_cli.session_controls import loop_wake_is_current, refresh_goal_continuation
+        if is_goal_continuation_event(event):
+            before = event.text
+            refreshed = await self._run_in_executor_with_context(refresh_goal_continuation, event, session_id)
+            if refreshed is None:
+                return None
+            if refreshed != before:
+                message = message.replace(before, refreshed) if before and before in message else refreshed
+        if not await self._run_in_executor_with_context(
+                loop_wake_is_current, getattr(event, "metadata", None), session_id):
+            return None
+        return message
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
@@ -2371,6 +2457,15 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # The last fence before the model, for every gateway wake whatever its internal flag
+            # (goal continuations are built with internal=False): a control committed during
+            # preparation or the start hooks must not let the obsolete wake run.
+            if GatewayTurnMixin._is_gateway_wake(event):
+                message_text = await GatewayTurnMixin._internal_wake_input_at_execution(
+                    self, event, _run_start_session_id, message_text)
+                if message_text is None:
+                    logger.info("Discarding wake superseded during turn preparation for %s", session_key)
+                    return None
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2407,6 +2502,12 @@ class GatewayTurnMixin:
                     event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
+                if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
+                    # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
+                    event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
+                if agent_result.get("queued_chain_loop_tick"):
+                    # The latest loop wake the chain ran owns the loop completion.
+                    event._post_turn_loop_tick = agent_result["queued_chain_loop_tick"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -4119,12 +4220,23 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not await asyncio.to_thread(
-                    self._goal_still_active_for_session, session_id):  # goal state lives in state.db
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
+            # A strict event queued before /new or /resume rebound this key belongs to the session
+            # it was pinned to, not to whichever conversation this drain is now running.
+            if not await GatewayTurnMixin._strict_session_pin_holds(self, pending_event, session_id):
+                return result
+            from gateway.platforms.event import is_goal_continuation_event
+            if is_goal_continuation_event(pending_event):
+                from hermes_cli.session_controls import refresh_goal_continuation
+                if await self._run_in_executor_with_context(
+                    refresh_goal_continuation, pending_event, session_id,
+                ) is None:
+                    logger.info("Discarding stale goal continuation for session %s", session_key or "?")
+                    return result
+            from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY, loop_wake_is_current
+            if (getattr(pending_event, "metadata", None) or {}).get(LOOP_WAKE_METADATA_KEY) and not await (
+                    self._run_in_executor_with_context(
+                        loop_wake_is_current, pending_event.metadata, session_id)):
+                logger.info("Discarding superseded loop wake for session %s", session_key or "?")
                 return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
@@ -4193,6 +4305,14 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            if pending_event is not None and GatewayTurnMixin._is_gateway_wake(pending_event):
+                next_message = await GatewayTurnMixin._internal_wake_input_at_execution(
+                    self, pending_event, session_id, next_message)
+                if next_message is None:
+                    logger.info("Discarding queued wake superseded during preparation for %s", session_key or "?")
+                    await _run_followup_processing_hook(
+                        _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+                    return result
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
@@ -4218,6 +4338,11 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
+        # The deepest queued loop wake wins (inner recursions fill this first): it is the latest
+        # tick the chain ran, so the chain's single loop completion settles exactly that tick.
+        _pending_loop_tick = self._post_turn_goal_identity(pending_event).get("loop_tick")
+        if isinstance(merged, dict) and _pending_loop_tick and not merged.get("queued_chain_loop_tick"):
+            merged = {**merged, "queued_chain_loop_tick": _pending_loop_tick}
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -4236,6 +4361,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_origin": (
                     (pending_event.metadata or {}).get("notification_origin")
                     if pending_event is not None and pending_event.internal else None),
+                # The chain's single post-turn judge evaluates the TERMINAL turn's response, so it
+                # must see that turn's goal-continuation identity and origin, not the head's.
+                "queued_terminal_goal_identity": self._post_turn_goal_identity(pending_event),
             }
         return merged
 

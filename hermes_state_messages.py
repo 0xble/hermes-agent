@@ -1580,16 +1580,19 @@ class SessionMessagesMixin:
                  "display_metadata": self._decode_display_metadata(row[6])} for row in rows]
 
     def messages_by_role(self, session_id: str, role: str, *, since: float = 0.0,
-                         limit: int = 500) -> List[Dict[str, Any]]:
+                         limit: int = 500, cursor=None, current_only: bool = False) -> List[Dict[str, Any]]:
         """Newest-first ``{id, content, timestamp, display_kind, compressed_summary}`` rows of one role
         at or after ``since``, every row state included (audit read, not display). ``display_kind`` and
-        ``compressed_summary`` are the provenance callers use to tell runtime rows from typed input."""
+        ``compressed_summary`` are the provenance callers use to tell runtime rows from typed input.
+        ``current_only`` keeps live and compaction-archived rows but drops rewound (``/undo``) and
+        superseded ones, for callers that need what the conversation currently says."""
         if not session_id:
             return []
-        rows = self._read_all(
-            """SELECT id, content, timestamp, display_kind, _compressed_summary FROM messages
-                WHERE session_id = ? AND role = ? AND timestamp >= ? ORDER BY id DESC LIMIT ?""",
-            (session_id, role, float(since or 0.0), max(int(limit), 1)))
+        state_clause = _DISPLAY_ACTIVE_CLAUSE if current_only else ""
+        sql = f"""SELECT id, content, timestamp, display_kind, _compressed_summary FROM messages
+                 WHERE session_id = ? AND role = ? AND timestamp >= ?{state_clause} ORDER BY id DESC LIMIT ?"""
+        params = (session_id, role, float(since or 0.0), max(int(limit), 1))
+        rows = cursor.execute(sql, params).fetchall() if cursor is not None else self._read_all(sql, params)
         return [{"id": row[0], "content": row[1], "timestamp": row[2], "display_kind": row[3],
                  "compressed_summary": bool(row[4])} for row in rows]
 
