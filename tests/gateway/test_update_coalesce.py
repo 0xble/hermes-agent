@@ -120,6 +120,22 @@ def test_failed_deferred_launch_keeps_the_request(tmp_path):
     assert json.loads((tmp_path / launcher.DEFERRED_FILE).read_text(encoding="utf-8"))["request"]["reason"] == "second"
 
 
+def test_non_started_deferred_launch_without_busy_keeps_the_request(tmp_path, monkeypatch):
+    _launch(tmp_path, "first", now=1000.0)
+    _launch(tmp_path, "second", now=1010.0)
+    finalize_update(tmp_path)
+    monkeypatch.setattr(launcher, "_launch_locked", lambda *args, **kwargs: {
+        "started": False, "pending": True,
+    })
+
+    result = launcher.launch_deferred_update(home=tmp_path, hermes_cmd=["hermes"],
+                                             spawn=Mock(), now=1200.0)
+
+    assert result == {"started": False, "pending": True}
+    assert json.loads((tmp_path / launcher.DEFERRED_FILE).read_text(encoding="utf-8"))["request"]["reason"] == "second"
+    assert json.loads((tmp_path / launcher.LAST_LAUNCH_FILE).read_text(encoding="utf-8"))["at"] == 1000.0
+
+
 def test_pending_or_deferred_update_absorbs_a_restart(tmp_path):
     assert launcher.restart_absorbed_by_update(tmp_path) is None
     _launch(tmp_path, "first", now=1000.0)

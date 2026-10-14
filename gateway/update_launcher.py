@@ -296,8 +296,8 @@ def launch_deferred_update(*, home: Path, hermes_cmd: list[str], spawn: Callable
         branch = request.get("branch")
         result = _launch_locked(home, hermes_cmd, request, spawn,
                                 update_args=["--branch", str(branch)] if branch else [])
-        if result.pop("busy", None) is not None:
-            return None
+        if not result.get("started", False):
+            return None if result.pop("busy", None) is not None else result
         _record_launch(home, now)
         (home / DEFERRED_FILE).unlink(missing_ok=True)
         return result
