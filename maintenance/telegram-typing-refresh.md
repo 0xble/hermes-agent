@@ -4,7 +4,7 @@ Load this unit when changing Telegram typing refresh cadence or the post-send ty
 
 ## Required behavior
 
-- Telegram refresh requests use the adapter's bounded 4.5s default (1.0–4.75s override); other platforms retain the 2.0s base default.
+- Telegram refresh requests use the adapter's bounded 4.5s default (`typing_refresh_interval_seconds`, 1.0–4.75s); other platforms retain the 2.0s base default.
 - The refresh deadline is anchored at tick start, so a slow `sendChatAction` does not extend the configured request spacing.
 - A Telegram refresh tick dropped because a delivery holds the per-chat send lock, or because the send timed out or failed, is retried once about 0.5s later, never past the next regular deadline. Budget, flood and cooldown sheds are not retried. Other adapters never retry a tick.
 - The per-tick send timeout stays below the refresh interval.
@@ -17,6 +17,7 @@ Load this unit when changing Telegram typing refresh cadence or the post-send ty
 - Source surfaces: `gateway/platforms/base.py` and `plugins/platforms/telegram/adapter.py`.
 - Regression: `tests/gateway/test_typing_refresh_interval.py` and `tests/gateway/test_telegram_typing_retrigger.py`.
 - Approved scope: Telegram only; daily message budget (1,500), 10:00 UTC anchor, and background limits remain unchanged.
+- File-size ratchet: this patch intentionally keeps the existing adapter surfaces in place; follow up by moving Telegram typing re-arm code into a topical sibling module when the current PR is not constrained to one adapter file.
 
 ## Retirement
 

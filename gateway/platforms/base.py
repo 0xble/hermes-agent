@@ -3609,6 +3609,10 @@ class BasePlatformAdapter(ABC):
         The 2s default cadence already re-covers a missed tick, so the base adapter never retries."""
         return None
 
+    def _typing_tick_anchor_before_send(self) -> bool:
+        """Whether a typing tick's deadline starts before its send request."""
+        return False
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
         """Refresh the typing indicator every ``interval`` seconds until cancelled (platform typing
@@ -3621,9 +3625,7 @@ class BasePlatformAdapter(ABC):
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                # Anchor the next deadline before the request so a slow send does not stretch the
-                # refresh cadence beyond the configured interval.
-                deadline = loop.time() + interval
+                deadline = loop.time() + interval if self._typing_tick_anchor_before_send() else None
                 if chat_id not in self._typing_paused:
                     retry_used = False
                     while True:
@@ -3637,6 +3639,8 @@ class BasePlatformAdapter(ABC):
                         except Exception as typing_err:
                             failed = True
                             logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                        if deadline is None:
+                            deadline = loop.time() + interval
                         retry_delay = self._typing_tick_retry_delay(
                             result, timed_out=timed_out, failed=failed)
                         # Retry only if the sleep plus a full bounded send still ends before the
@@ -3649,6 +3653,8 @@ class BasePlatformAdapter(ABC):
                         await asyncio.sleep(retry_delay)
                         if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
                             break
+                if deadline is None:
+                    deadline = loop.time() + interval
                 if stop_event is None:
                     await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue

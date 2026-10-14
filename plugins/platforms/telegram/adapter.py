@@ -4438,7 +4438,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    pass
+                    logger.exception("[%s] Telegram typing trailing re-arm failed", self.name)
 
             _track(loop.create_task(_trailing()), trailing_tasks)
             return
@@ -6827,6 +6827,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if result == _TYPING_SKIPPED_LOCK_BUSY or timed_out or failed:
             return _TYPING_TICK_RETRY_SECS
         return None
+
+    def _typing_tick_anchor_before_send(self) -> bool:
+        return True
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Send typing indicator. Returns ``_TYPING_SKIPPED_LOCK_BUSY`` when a delivery held the chat lock."""

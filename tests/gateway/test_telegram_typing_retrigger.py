@@ -56,20 +56,26 @@ async def test_send_returns_without_waiting_on_typing():
 
 @pytest.mark.asyncio
 async def test_streaming_burst_defers_one_trailing_rearm():
-    """A burst spaced 0.5s apart gets one immediate and one trailing re-arm."""
+    """A burst gets one immediate and one trailing re-arm per chat."""
     adapter = _make_adapter()
 
     assert (await adapter.send("123", "chunk 0")).success
+    assert (await adapter.send("456", "chunk 0")).success
     await asyncio.sleep(0.5)
     assert (await adapter.send("123", "chunk 1")).success
+    assert (await adapter.send("456", "chunk 1")).success
     await asyncio.sleep(0.5)
     assert (await adapter.send("123", "chunk 2")).success
+    assert (await adapter.send("456", "chunk 2")).success
 
     # The trailing re-arm is due two seconds after the immediate one.
     await asyncio.sleep(1.3)
     await _drain(adapter)
 
-    assert adapter._bot.send_chat_action.await_count == 2
+    assert adapter._bot.send_chat_action.await_count == 4
+    chat_ids = [call.kwargs["chat_id"] for call in adapter._bot.send_chat_action.await_args_list]
+    assert chat_ids.count("123") == 2
+    assert chat_ids.count("456") == 2
 
 
 @pytest.mark.asyncio

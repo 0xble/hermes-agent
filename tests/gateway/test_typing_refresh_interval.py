@@ -94,6 +94,42 @@ async def test_keep_typing_send_timeout_stays_inside_telegram_interval(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_base_keep_typing_deadline_starts_after_send_returns(monkeypatch):
+    """The base adapter retains its historical post-send cadence."""
+    import gateway.platforms.base as base_module
+
+    adapter = _StubAdapter(PlatformConfig(enabled=True), Platform.DISCORD)
+    adapter.stop_typing = AsyncMock()
+    sleep_delays = []
+    clock = [0.0]
+
+    class _Clock:
+        def time(self):
+            return clock[0]
+
+    class _Finished(Exception):
+        pass
+
+    async def capture_wait_for(awaitable, *, timeout):
+        result = await awaitable
+        clock[0] += 0.4
+        return result
+
+    async def capture_sleep(delay):
+        sleep_delays.append(delay)
+        raise _Finished
+
+    monkeypatch.setattr(base_module.asyncio, "get_running_loop", lambda: _Clock())
+    monkeypatch.setattr(base_module.asyncio, "wait_for", capture_wait_for)
+    monkeypatch.setattr(base_module.asyncio, "sleep", capture_sleep)
+
+    with pytest.raises(_Finished):
+        await adapter._keep_typing("123", interval=2.0)
+
+    assert sleep_delays == [pytest.approx(2.0)]
+
+
+@pytest.mark.asyncio
 async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
     """A tick shed because a delivery holds the chat send lock is retried in ~0.5s, not 4.5s later."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
@@ -112,6 +148,7 @@ async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
     adapter._bot.send_chat_action = AsyncMock(side_effect=record)
     holding = asyncio.Event()
     release = asyncio.Event()
+    released = asyncio.Event()
 
     async def delivery():
         async with adapter._chat_send_lock("123"):
@@ -120,18 +157,23 @@ async def test_telegram_keep_typing_retries_lock_skipped_tick_promptly():
 
     holder = asyncio.create_task(delivery())
     await holding.wait()
-    loop.call_later(0.2, release.set)
-    started = loop.time()
+    async def release_delivery():
+        await asyncio.sleep(0.2)
+        release.set()
+        released.set()
+
+    releaser = asyncio.create_task(release_delivery())
     await asyncio.wait_for(
         adapter._keep_typing("123", interval=adapter.typing_refresh_interval, stop_event=stop_event), timeout=3)
     await holder
+    await releaser
 
     assert len(sent_at) == 1
-    assert sent_at[0] - started < 1.0
+    assert released.is_set()
 
 
 @pytest.mark.asyncio
-async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick():
+async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick(monkeypatch):
     """At a 1s interval a 0.5s retry plus a 0.75s send cannot fit, so the next regular tick covers it."""
     from plugins.platforms.telegram.adapter import _TYPING_SKIPPED_LOCK_BUSY
 
@@ -140,6 +182,15 @@ async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick():
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     sent_at = []
+    retry_sleep = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def capture_sleep(delay):
+        if delay < 0.75:
+            retry_sleep.set()
+        await real_sleep(delay)
+
+    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", capture_sleep)
 
     async def typing(chat_id, metadata=None):
         sent_at.append(loop.time())
@@ -149,8 +200,8 @@ async def test_telegram_keep_typing_skips_retry_without_room_before_next_tick():
         return None
 
     adapter.send_typing = typing
-    started = loop.time()
     await asyncio.wait_for(adapter._keep_typing("123", interval=1.0, stop_event=stop_event), timeout=3)
+    monkeypatch.undo()
 
     assert len(sent_at) == 2
-    assert 0.9 <= sent_at[1] - started < 1.3
+    assert not retry_sleep.is_set()
