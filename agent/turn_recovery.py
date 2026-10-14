@@ -1939,17 +1939,22 @@ def route_classified_error(
             False if classified.reason == FailoverReason.upstream_rate_limit or _provider_wide_overload
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
+        reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
         if (
             not pool_may_recover
-            and agent._fallback_index >= len(agent._fallback_chain)
             and not getattr(_retry, "shared_cooldown_arm_attempted", False)
+            and (
+                agent._fallback_index >= len(agent._fallback_chain)
+                # try_activate_fallback returns before arming when the reset is near enough
+                # to wait out, so a deferred switch must reach the shared breaker here.
+                or switch_deferred_by_reset(agent, classified.reason, reset_at)
+            )
         ):
-            # With no fallback candidate, arm once for this turn's retries. A durable-write
-            # failure still returns the local cooldown, so it never escalates backoff per retry.
-            # Mark the guard only when a cooldown was armed: an unarmed attempt (e.g. a rate
-            # limit from an active fallback) must leave terminal exhaustion its short window.
-            from agent.fallback_cooldown import _arm_rate_limit_cooldown
-            reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+            # With no fallback candidate (or a deferred switch), arm once for this turn's retries.
+            # A durable-write failure still returns the local cooldown, so it never escalates
+            # backoff per retry. Mark the guard only when a cooldown was armed: an unarmed attempt
+            # (e.g. a rate limit from an active fallback) must leave terminal exhaustion its window.
             if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at) is not None:
                 _retry.shared_cooldown_arm_attempted = True
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect

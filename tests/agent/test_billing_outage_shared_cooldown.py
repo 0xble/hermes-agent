@@ -177,3 +177,34 @@ def test_unarmed_rate_limit_leaves_terminal_exhaustion_its_short_window(monkeypa
         pass  # Only the guard state before later routing steps matters here.
     arm.assert_called_once()
     assert retry.shared_cooldown_arm_attempted is False
+
+
+def test_deferred_fallback_switch_still_arms_the_shared_breaker(monkeypatch):
+    # With fallback.min_switch_reset_seconds set and a near reset, try_activate_fallback stays on
+    # the primary and returns before arming. The outage must still reach the shared breaker so
+    # other processes stop probing the cooled primary.
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent import fallback_cooldown, turn_recovery
+    from agent.error_classifier import ClassifiedError, FailoverReason
+    from agent.turn_retry_state import TurnRetryState
+
+    arm = Mock(return_value=30)
+    monkeypatch.setattr(fallback_cooldown, "_arm_rate_limit_cooldown", arm)
+    monkeypatch.setattr(fallback_cooldown, "switch_deferred_by_reset", Mock(return_value=True))
+    retry = TurnRetryState()
+    agent = SimpleNamespace(_fallback_index=0, _fallback_chain=[{"provider": "x", "model": "y"}],
+                            _credential_pool=None)
+    classified = ClassifiedError(reason=FailoverReason.upstream_rate_limit, status_code=429)
+    try:
+        turn_recovery.route_classified_error(
+            agent, Exception("429"), classified, retry, error_msg="429", error_context={"reset_at": 30},
+            recovered_with_pool=False, base_url="https://primary.invalid", model="primary",
+            messages=[], api_messages=[], system_message=None, active_system_prompt="",
+            conversation_history=[], retry_count=0, max_retries=3, compression_attempts=0,
+            max_compression_attempts=1, api_call_count=1, effective_task_id="t",
+        )
+    except Exception:
+        pass  # Only the arming decision before later routing steps matters here.
+    arm.assert_called_once()
+    assert retry.shared_cooldown_arm_attempted is True
