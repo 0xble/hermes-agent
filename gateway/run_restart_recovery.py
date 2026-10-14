@@ -373,12 +373,8 @@ class RestartRecoveryMixin:
             state.turn.agent = _AGENT_PENDING_SENTINEL
             state.turn.started_ts = time.time()
             self._persist_active_agents()
-            event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
-                                 message_id=getattr(source, "message_id", None), internal=True)
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
-            if resume_marker:
-                # Admission identity names the interruption, not the original Telegram reply anchor.
-                event._outbox_admission_id = f"resume:{resume_marker}"
+            event = self._build_startup_resume_event(source, resume_marker)
             logger.warning(
                 "startup resume event constructed: session=%s marker=%r admission=%r internal=%r",
                 entry.session_key, resume_marker, getattr(event, "_outbox_admission_id", None),
