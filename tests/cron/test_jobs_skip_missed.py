@@ -94,3 +94,14 @@ class TestSkipMissedOccurrences:
         assert datetime.fromisoformat(landed) > self.NOW
         assert job["id"] not in {j["id"] for j in get_due_jobs()}
         assert get_job(job["id"])["next_run_at"] == landed
+
+    @pytest.mark.parametrize("edit", [{"schedule": "every 1h"}, {"timezone": "America/New_York"}])
+    def test_paused_reanchor_edits_drop_the_skip_marker(self, tmp_cron_dir, monkeypatch, edit):
+        """The skip marker names an instant under the old schedule/zone; a re-anchoring edit
+        must clear it so it cannot suppress stale-error recovery against the new slots."""
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: self.NOW)
+        job = create_job(prompt="probe", schedule="every 1h", deliver="local")
+        skip_job(job["id"])
+        assert get_job(job["id"]).get("skipped_until")
+        pause_job(job["id"], reason="edit")
+        assert "skipped_until" not in update_job(job["id"], edit)

@@ -888,7 +888,7 @@ def _job_action(action: str, job_id: str, success_verb: str, **extra) -> int:
         return 1
     job = result.get("job") or result.get("removed_job") or {}
     print(color(f"{success_verb} job: {job.get('name', job_id)} ({job_id})", Colors.GREEN))
-    if action in {"resume", "run"} and result.get("job", {}).get("next_run_at"):
+    if action in {"resume", "run", "skip"} and result.get("job", {}).get("next_run_at"):
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         print(f"  {_run_outcome(result.get('job', {}))}")
@@ -940,20 +940,14 @@ def cron_resume(args) -> int:
 
 
 def cron_skip(args) -> int:
-    """Skip the next occurrence(s) of a scheduled recurring job."""
-    from cron.jobs import AmbiguousJobReference, skip_job
-    try:
-        count = getattr(args, "count", None)
-        job = skip_job(args.job_id, 1 if count is None else count)
-    except (AmbiguousJobReference, ValueError) as exc:
-        print(color(f"Failed to skip job: {exc}", Colors.RED))
-        return 1
-    if not job:
-        print(color(f"Job not found: {args.job_id}", Colors.RED))
-        return 1
-    print(color(f"Skipped job: {job.get('name', args.job_id)} ({args.job_id})", Colors.GREEN)
-          + f"\n  Next run: {job.get('next_run_at')}")
-    return 0
+    """Skip the next occurrence(s) of a scheduled recurring job.
+
+    Routed through the cronjob tool, like the other lifecycle actions, so an external scheduler
+    provider is told the job moved. A direct ``skip_job`` call would leave its old occurrence
+    provisioned and still firing.
+    """
+    count = getattr(args, "count", None)
+    return _job_action("skip", args.job_id, "Skipped", **({} if count is None else {"count": count}))
 
 
 def cron_notepad(args) -> int:

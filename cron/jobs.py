@@ -2261,6 +2261,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 job_timezone=updated.get("timezone"))
         elif "timezone" in updates:
             _rearm_paused_recurring(updated)
+        if "timezone" in updates:
+            updated.pop(SKIPPED_UNTIL_KEY, None)  # the skip described the old zone's wall clock
         if {"schedule", "next_run_at", "enabled", "state", "timezone"}.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
