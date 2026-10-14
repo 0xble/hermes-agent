@@ -153,28 +153,55 @@ def _looks_like_shell_script(path: Path, content: str) -> bool:
     return bool(first_line and re.search(r"#!.*\b(?:bash|sh|zsh|dash|ksh|fish)\b", first_line[0], re.I))
 
 
+def _first_non_option(tokens: list[str], start: int) -> Optional[int]:
+    """Find the next command token, ignoring option switches but not their values.
+
+    CLI options before a subcommand are common (for example ``slack --account X
+    message send``). Once the known prefix is matched, only the first non-option
+    token may be the verb; later positional arguments must not turn a read-only
+    command into a send.
+    """
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("-"):
+            return index
+        # Options in the CLI/prefix portion generally consume one value unless
+        # written as --name=value. This keeps ``--account lpg message`` from
+        # treating ``lpg`` as the subcommand.
+        if "=" not in token and index + 1 < len(tokens) and not tokens[index + 1].startswith("-"):
+            index += 2
+        else:
+            index += 1
+    return None
+
+
 def _find_send_in_segment(tokens: list[str]) -> tuple[bool, Optional[str], Optional[str]]:
-    for i, token in enumerate(tokens):
-        cli = Path(token).name.lower()
-        table = _SEND_TABLE.get(cli)
-        if not table:
-            continue
-        tail = [part.lower() for part in tokens[i + 1:]]
-        # CLI help is explicitly read-only, even when invoked on a send verb.
-        if "--help" in tail or "-h" in tail:
-            continue
-        for prefix, verbs in table.items():
-            if not prefix:
-                if any(part in verbs for part in tail):
-                    return True, cli, _account_from_tokens(tokens)
-                continue
+    """Match only a CLI's command word and its first subcommand verb."""
+    command_index = _command_word_index(tokens)
+    if command_index >= len(tokens):
+        return False, None, None
+    cli = Path(tokens[command_index]).name.lower()
+    table = _SEND_TABLE.get(cli)
+    if not table:
+        return False, None, None
+    tail = [part.lower() for part in tokens[command_index + 1:]]
+    # CLI help is explicitly read-only, even when invoked on a send verb.
+    if "--help" in tail or "-h" in tail:
+        return False, None, None
+    for prefix, verbs in table.items():
+        prefix_index = _first_non_option(tokens, command_index + 1)
+        if not prefix:
+            verb_index = prefix_index
+        else:
             prefix_lower = tuple(part.lower() for part in prefix)
-            for start in range(len(tail) - len(prefix_lower) + 1):
-                if tuple(tail[start:start + len(prefix_lower)]) != prefix_lower:
-                    continue
-                after = tail[start + len(prefix_lower):]
-                if any(part in verbs for part in after):
-                    return True, cli, _account_from_tokens(tokens)
+            if prefix_index is None or tuple(
+                part.lower() for part in tokens[prefix_index:prefix_index + len(prefix_lower)]
+            ) != prefix_lower:
+                continue
+            verb_index = _first_non_option(tokens, prefix_index + len(prefix_lower))
+        if verb_index is not None and tokens[verb_index].lower() in verbs:
+            return True, cli, _account_from_tokens(tokens)
     return False, None, None
 
 
@@ -186,6 +213,57 @@ def _account_from_tokens(tokens: list[str]) -> Optional[str]:
         if lower.startswith("--account="):
             return token.split("=", 1)[1]
     return None
+
+
+def _source_send_match(content: str) -> tuple[bool, Optional[str]]:
+    """Bounded source-text fallback for executed non-shell code."""
+    match = re.search(
+        r"(?i)(?:^|[\"'\[,(\s])"
+        r"(slack|imsg|gog|wacli|quo|telegram)"
+        r"(?:[\"'\],)\s]+|\s+)"
+        r".{0,240}?\b(send|post|reply|edit)\b",
+        content,
+    )
+    return (bool(match), match.group(1).lower() if match else None)
+
+
+def _inline_interpreter_sources(tokens: list[str]) -> list[tuple[str, str]]:
+    """Return ``(interpreter, source)`` for inline interpreter invocations."""
+    sources: list[tuple[str, str]] = []
+    for segment in _segments(tokens):
+        index = _command_word_index(segment)
+        if index >= len(segment):
+            continue
+        command = Path(segment[index]).name.lower()
+        if not _is_interpreter_name(command):
+            continue
+        arg = index + 1
+        while arg < len(segment):
+            token = segment[arg]
+            if token == "--":
+                arg += 1
+                break
+            if command == "deno" and token.lower() == "eval":
+                if arg + 1 < len(segment):
+                    sources.append((command, segment[arg + 1]))
+                break
+            if command == "node" and token in {"-e", "--eval"}:
+                if arg + 1 < len(segment):
+                    sources.append((command, segment[arg + 1]))
+                break
+            if command in {"python", "python2", "python3", "ruby", "perl", "bun"} or re.fullmatch(
+                r"python\d+(?:\.\d+)+", command
+            ):
+                if token in {"-c", "-e"}:
+                    if arg + 1 < len(segment):
+                        sources.append((command, segment[arg + 1]))
+                    break
+            if token.startswith("-"):
+                arg += 1
+                continue
+            # A non-option script/module argument means this is not inline code.
+            break
+    return sources
 
 
 def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tuple[bool, Optional[str], Optional[str]]:
@@ -211,6 +289,11 @@ def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tupl
                     break
                 j += 1
 
+        for source_command, source in _inline_interpreter_sources(segment):
+            found, cli = _source_send_match(source)
+            if found:
+                return True, cli, _account_from_tokens(segment)
+
         # Inspect only files that this segment would execute: the command word
         # itself, or the first script argument of an interpreter. Reading every
         # existing path token makes ordinary ``git diff``/``pytest`` commands
@@ -231,15 +314,10 @@ def _find_send(tokens: list[str], seen_paths: Optional[set[str]] = None) -> tupl
                 # one quoted expression, which shell tokenization cannot see.
                 # Inspect source text without executing or importing it, but only
                 # for an actually executed non-shell script.
-                match = re.search(
-                    r"(?i)(?:^|[\"'\[,(\s])"
-                    r"(slack|imsg|gog|wacli|quo|telegram)"
-                    r"(?:[\"'\],)\s]+|\s+)"
-                    r".{0,240}?\b(send|post|reply|edit)\b",
-                    content,
-                )
-                if match:
-                    found, cli, account = True, match.group(1).lower(), _account_from_tokens(segment)
+                found, cli = _source_send_match(content)
+                if found:
+                    found, account = True, _account_from_tokens(segment)
+                    cli = cli or ""
             if found:
                 return True, cli, account or _account_from_tokens(segment)
     return False, None, None
@@ -308,9 +386,31 @@ def _write_grant(db: Any, session_id: str, action_hash: str, record: dict) -> bo
         return False
 
 
+def _consumed_timestamps(row: Optional[dict]) -> list[float]:
+    """Normalize current list-based and legacy scalar grant records."""
+    if not isinstance(row, dict):
+        return []
+    value = row.get("consumed_at")
+    values = value if isinstance(value, list) else ([value] if value else [])
+    result = []
+    for timestamp in values:
+        try:
+            result.append(float(timestamp))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def consumed_grant_timestamps(db: Any, session_id: str, action_hash: str) -> list[float]:
+    return _consumed_timestamps(_read_grant(db, session_id, action_hash))
+
+
 def has_consumed_grant(db: Any, session_id: str, action_hash: str) -> bool:
-    row = _read_grant(db, session_id, action_hash)
-    return bool(row and row.get("consumed_at"))
+    return bool(consumed_grant_timestamps(db, session_id, action_hash))
+
+
+def _append_consumed_at(record: dict) -> None:
+    record["consumed_at"] = _consumed_timestamps(record) + [time.time()]
 
 
 def _block(action: str, reason: str) -> str:
@@ -327,8 +427,8 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
     action_hash = classified["action_hash"]
 
     existing = _read_grant(db, session_id, action_hash)
-    if existing and existing.get("approved_at") and not existing.get("consumed_at"):
-        existing["consumed_at"] = time.time()
+    if existing and existing.get("approved_at") and not _consumed_timestamps(existing):
+        _append_consumed_at(existing)
         if not _write_grant(db, session_id, action_hash, existing):
             return _block(action_hash, "grant store unavailable")
         return None
@@ -355,23 +455,14 @@ def authorize_voice_send(agent: Any, tool_name: str, args: Any) -> Optional[str]
         "action_hash": action_hash, "session_id": session_id,
         "approved_at": time.time(),
         "approver": os.getenv("HERMES_APPROVER_ID", "gateway-user"),
-        "consumed_at": None,
+        "consumed_at": [],
     }
     if not _write_grant(db, session_id, action_hash, record):
         return _block(action_hash, "grant store unavailable")
-    record["consumed_at"] = time.time()
+    _append_consumed_at(record)
     if not _write_grant(db, session_id, action_hash, record):
         return _block(action_hash, "grant consumption failed")
     return None
 
 
-def evidence_grant_status(session_id: str, action_hash: str) -> bool:
-    """Read the current session DB for goal-judge's deterministic preflight."""
-    try:
-        from hermes_cli.goals import _get_session_db
-        return has_consumed_grant(_get_session_db(), session_id, action_hash)
-    except Exception:
-        return False
-
-
-__all__ = ["authorize_voice_send", "classify_voice_send", "evidence_grant_status", "has_consumed_grant"]
+__all__ = ["authorize_voice_send", "classify_voice_send", "consumed_grant_timestamps", "has_consumed_grant"]

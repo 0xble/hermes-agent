@@ -91,8 +91,31 @@ class TestWaitingDecision:
         assert repeated["message"] == ""
 
 
-# ──────────────────────────────────────────────────────────────────────
-# judge_goal — fail-open semantics
+def test_collect_goal_evidence_matches_one_grant_to_one_identical_send(hermes_home, monkeypatch):
+    from hermes_cli import goals
+    from tools.voice_send_gate import classify_voice_send
+
+    action_hash = classify_voice_send("terminal", {"command": "slack message send hi"})["action_hash"]
+
+    class DB:
+        def get_messages(self, *_args, **_kwargs):
+            return [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c1", "function": {"name": "terminal", "arguments": json.dumps({"command": "slack message send hi"})}},
+                    {"id": "c2", "function": {"name": "terminal", "arguments": json.dumps({"command": "slack message send hi"})}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "tool_name": "terminal", "content": "sent", "timestamp": 101.0},
+                {"role": "tool", "tool_call_id": "c2", "tool_name": "terminal", "content": "sent", "timestamp": 102.0},
+            ]
+
+        def get_meta(self, key):
+            return json.dumps({"consumed_at": [100.0], "action_hash": action_hash})
+
+    monkeypatch.setattr(goals, "_get_session_db", lambda: DB())
+    rows = goals.collect_goal_evidence("sid")
+    assert [row["voice_send_granted"] for row in rows] == [True, False]
+
+
 # ──────────────────────────────────────────────────────────────────────
 
 

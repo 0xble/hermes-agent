@@ -46,6 +46,11 @@ continue through the existing LLM judge unchanged.
   Hermes update is part of this unit.
 - **Rollback:** revert commits carrying `Fork-Patch: send-approval-gate`.
 
+- **Classifier precision:** send verbs are matched only at the CLI's command/subcommand position; embedded words in read-only arguments are ignored. Inline `python -c`, `node -e`, Ruby/Perl/Bun, and Deno eval sources use the same bounded fallback as executed scripts.
+- **Grant accounting:** consumed grants are stored as timestamp lists and matched one-to-one to evidence rows within 120 seconds, so one grant cannot bless repeated identical sends.
+- **Hook ordering:** plugin pre-tool hooks run before the voice gate; the gate hashes the final modified arguments and remains the single nested-dispatch choke point.
+- **Judge refusal parsing:** the deterministic floor recognizes the registry's JSON `error` wrapper around gate refusals.
+
 ## Verification
 
 Focused tests cover the classifier table and shell/script recursion, the shared

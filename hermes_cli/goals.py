@@ -1543,6 +1543,9 @@ def _tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "[…] " + text[-limit:]
 
 
+_VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS = 120.0
+
+
 class _EvidenceRows(list):
     """Evidence entries plus whether the bounded SessionDB scan omitted rows."""
 
@@ -1585,6 +1588,7 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     except Exception:  # pragma: no cover - redaction module is part of the runtime
         redact_sensitive_text = None
     entries: List[Dict[str, Any]] = []
+    matched_grants: set[tuple[str, int]] = set()
     for row in rows:
         if row.get("role") != "tool" or float(row.get("timestamp") or 0.0) < since:
             continue
@@ -1598,13 +1602,27 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         call_text, output = _one_line(args, _EVIDENCE_CALL_CHARS), _tail(content.strip(), _EVIDENCE_OUTPUT_CHARS)
         voice_fields = {}
         try:
-            from tools.voice_send_gate import classify_voice_send, has_consumed_grant
+            from tools.voice_send_gate import classify_voice_send, consumed_grant_timestamps
             parsed_args = json.loads(args) if isinstance(args, str) and args.strip().startswith("{") else {}
             classified = classify_voice_send(name, parsed_args)
             if classified:
+                row_timestamp = float(row.get("timestamp") or 0.0)
+                grant_times = consumed_grant_timestamps(db, str(session_id), classified["action_hash"])
+                matched = next(
+                    (
+                        (index, grant_time)
+                        for index, grant_time in sorted(enumerate(grant_times), key=lambda pair: pair[1], reverse=True)
+                        if (classified["action_hash"], index) not in matched_grants
+                        and 0.0 <= row_timestamp - grant_time <= _VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS
+                    ),
+                    None,
+                )
+                granted = matched is not None
+                if matched is not None:
+                    matched_grants.add((classified["action_hash"], matched[0]))
                 voice_fields = {
                     "voice_send_action_hash": classified["action_hash"],
-                    "voice_send_granted": has_consumed_grant(db, str(session_id), classified["action_hash"]),
+                    "voice_send_granted": granted,
                 }
         except Exception:
             # The judge's deterministic floor treats an unclassifiable send as ungranted.
@@ -1692,15 +1710,26 @@ def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_a
     return rows
 
 
+def _is_voice_gate_refusal(output: Any) -> bool:
+    """Recognize both raw gate text and the registry's JSON tool-error wrapper."""
+    blocked_prefix = "BLOCKED: approval required before sending a message in Brian"
+    text = str(output or "")
+    if text.startswith(blocked_prefix):
+        return True
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return blocked_prefix in text
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return isinstance(error, str) and error.startswith(blocked_prefix)
+
+
 def _ungranted_voice_send_in_evidence(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
     """Deterministic judge floor: never ask the LLM to decide whether a send was approved."""
-    blocked_prefix = "BLOCKED: approval required before sending a message in Brian"
     for item in evidence or []:
         if not isinstance(item, dict):
             continue
-        # A gate refusal is evidence that no send happened; do not block the
-        # judge a second time on the refused action.
-        if str(item.get("output") or "").startswith(blocked_prefix):
+        if _is_voice_gate_refusal(item.get("output")):
             continue
         if "voice_send_action_hash" in item and not item.get("voice_send_granted"):
             return str(item.get("voice_send_action_hash"))

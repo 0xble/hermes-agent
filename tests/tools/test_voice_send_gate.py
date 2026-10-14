@@ -79,6 +79,24 @@ def test_classifier_scans_only_executed_script_files(tmp_path, monkeypatch):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
 
 
+def test_classifier_rejects_embedded_or_argument_verbs():
+    for command in (
+        "gog gmail search reply",
+        "slack message list --filter reply",
+        "echo slack message send",
+    ):
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+
+
+def test_classifier_scans_inline_interpreter_sources():
+    assert voice_send_gate.classify_voice_send(
+        "terminal", {"command": "python3 -c \"subprocess.run(['slack','message','send','C1','hi'])\""}
+    )
+    assert voice_send_gate.classify_voice_send(
+        "terminal", {"command": "python3 -c \"print(1)\""}
+    ) is None
+
+
 def test_classifier_scans_executed_script_files(tmp_path, monkeypatch):
     shell_script = tmp_path / "send.sh"
     shell_script.write_text("slack --account lpg message send --text hi")
@@ -134,6 +152,21 @@ def test_yolo_mode_off_allowlist_and_cron_do_not_bypass(monkeypatch):
     assert result and "no human approval bridge" in result
 
 
+def test_shared_dispatch_gate_hashes_plugin_modified_args(monkeypatch):
+    import model_tools
+
+    captured = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        lambda *args, **kwargs: (None, {"command": "slack message send final"}),
+    )
+    monkeypatch.setattr(
+        voice_send_gate, "authorize_voice_send",
+        lambda agent, tool, args: captured.append(args.copy()) or "blocked",
+    )
+    ids = model_tools._CallIds(None, "sid", None, None, None)
+    model_tools._pre_dispatch_guards("terminal", {"command": "slack message list"}, False, ids, [])
+    assert captured == [{"command": "slack message send final"}]
 def test_shared_dispatch_choke_point_blocks_execute_code_style_call(monkeypatch):
     import model_tools
 
@@ -186,11 +219,13 @@ def test_goal_judge_voice_send_floor_is_scoped_to_current_turn(monkeypatch):
 
 def test_goal_judge_ignores_gate_refusal_but_blocks_unapproved_send(monkeypatch):
     from hermes_cli import goals
+    from tools import voice_send_gate
 
     called = []
     monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda *a: called.append(1) or '{"verdict":"done","reason":"ok"}')
+    from tools.registry import tool_error
     refused = [{"tool": "terminal", "call": json.dumps({"command": "slack message send hi"}),
-                "output": "BLOCKED: approval required before sending a message in Brian's voice (not approved; action=abc)"}]
+                "output": tool_error(voice_send_gate._block("abc", "not approved"))}]
     verdict, reason, *_ = goals.judge_goal("send", "done", evidence=refused)
     assert verdict == "done"
     assert reason == "ok"

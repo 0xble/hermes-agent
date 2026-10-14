@@ -782,6 +782,23 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
     common choke point for direct dispatches, agent calls, and execute_code
     nested calls; callers that already ran outer hooks still pass through here.
     """
+    # pre_tool_call fires exactly once per execution: one invoke_hook pass yields
+    # both the block message and modified args. skip=True: caller already fired it.
+    # The voice gate runs afterward so it hashes the final args.
+    if not skip_pre_tool_call_hook:
+        block_message: Optional[str] = None
+        try:
+            from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+            block_message, modified_args = _dispatch_pre_tool_call_hooks(
+                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
+            )
+            if modified_args is not None:
+                function_args = modified_args
+        except Exception as _hook_err:
+            logger.debug("pre_tool_call hook error: %s", _hook_err)
+        if block_message is not None:
+            return function_args, (tool_error(block_message), "plugin_block", block_message)
+
     try:
         from types import SimpleNamespace
         from tools.voice_send_gate import authorize_voice_send
@@ -799,22 +816,6 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
         logger.debug("voice-send approval guard error: %s", _voice_err)
         return function_args, (tool_error("BLOCKED: voice-send approval policy unavailable; message send refused."),
                                "voice_send_error", "voice-send approval policy unavailable")
-
-    # pre_tool_call fires exactly once per execution: one invoke_hook pass yields
-    # both the block message and modified args. skip=True: caller already fired it.
-    if not skip_pre_tool_call_hook:
-        block_message: Optional[str] = None
-        try:
-            from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-            block_message, modified_args = _dispatch_pre_tool_call_hooks(
-                function_name, function_args, middleware_trace=list(middleware_trace), **ids.hook_kwargs(),
-            )
-            if modified_args is not None:
-                function_args = modified_args
-        except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
-        if block_message is not None:
-            return function_args, (tool_error(block_message), "plugin_block", block_message)
 
     # ACP/Zed edit approval before any file mutation. The requester is bound
     # via ContextVar only for ACP sessions, so CLI/gateway paths are unaffected.
