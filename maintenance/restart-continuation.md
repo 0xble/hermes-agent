@@ -107,8 +107,12 @@ remain real constraints; this unit does not promise unconditional visibility.
 marker has been cleared. At read time, including for old spools, it uses the
 existing drain-deferred admission path instead of becoming a user row with no
 turn. A restored prompt owns recovery ahead of a synthetic empty resume. Its
-spool survives admission until an actual turn result is observed; failed real
-turns are not automatically replayed because they may have tool effects.
+spool survives an admission refusal, but is retired once a real adapter task
+owns the turn: a crash or restart during that turn falls to the turn's own
+`resume_pending` marker instead of replaying the whole prompt, because the
+prompt may already have caused tool effects. A failed real turn is
+`skipped:turn-failed` with no recovery notice, since its spool is gone and it
+reported its own failure.
 
 Restored follow-ups use the same per-session outcome record. Refusal/no-task
 outcomes retain the spool, attempt a bounded platform notice, and log

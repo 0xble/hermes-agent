@@ -167,11 +167,12 @@ class RestartRecoveryMixin:
                 spool = getattr(event, "_hermes_recovery_spool", None)
                 if spool is not None:
                     spool.unlink(missing_ok=True)
-                if succeeded:
-                    self._release_restart_followup_key(session_key)
-                    self._record_restart_resume_outcome(session_key, "resumed")
-                    return
-                reason = "turn-failed"
+                # A real turn replied or reported its own failure; the "still preserved"
+                # notice would be false once the spool is gone, so neither path sends it.
+                self._release_restart_followup_key(session_key)
+                self._record_restart_resume_outcome(
+                    session_key, "resumed" if succeeded else "skipped:turn-failed")
+                return
         except asyncio.CancelledError:
             self._release_restart_followup_key(session_key)
             self._record_restart_resume_outcome(session_key, "skipped:cancelled")
