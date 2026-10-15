@@ -767,6 +767,21 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             return text
         return _strip_edge_silence_markers(text)
 
+    def _strip_current_segment_markers(self, text: str) -> str:
+        """Strip edge markers of the part of ``text`` after the earlier-segment prefix.
+
+        Whole-text stripping cannot see a marker that opens a later segment of a
+        cumulative stream (``Pre-tool.\\nNO_REPLY\\n\\nPost-tool.``); the prefix itself
+        was already cleaned at its own boundary."""
+        prefix = self._accumulated[:self._segment_start]
+        if not (prefix and text.startswith(prefix) and self.cfg.strip_trailing_silence_markers):
+            return text
+        tail = text[len(prefix):]
+        cleaned = self._strip_final_silence_marker(tail)
+        if _is_intentional_silence_response(cleaned):
+            cleaned = ""
+        return prefix + cleaned if cleaned != tail else text
+
     def _strip_segment_edge_markers(self) -> None:
         """Drop standalone marker lines bracketing the current segment's prose before its
         boundary edit; previews of that segment were held, so nothing visible changes."""
@@ -784,7 +799,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return _strip_trailing_loop_complete_marker(text)
 
     def _strip_final_marker_from_state(self) -> None:
-        """Remove trailing control markers from all final-state buffers before delivery."""
+        """Remove edge control markers from all final-state buffers before delivery."""
+        stripped = self._strip_current_segment_markers(self._accumulated)
+        if stripped != self._accumulated:
+            if self._stream_ledger == self._accumulated:
+                self._stream_ledger = stripped
+            self._accumulated = stripped
         self._accumulated = self._strip_final_silence_marker(self._accumulated)
         self._stream_ledger = self._strip_final_silence_marker(self._stream_ledger)
         self._accumulated = self._strip_final_loop_complete_marker(self._accumulated)
@@ -813,7 +833,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:
-            final_raw = self._with_cumulative_prefix(final_raw)
+            final_raw = self._strip_current_segment_markers(self._with_cumulative_prefix(final_raw))
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
                 self._accumulated = final_raw
