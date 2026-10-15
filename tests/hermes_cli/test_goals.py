@@ -222,6 +222,55 @@ class TestGoalManager:
         findings = goal_authoring_findings("Wait 24 hours before declaring success")
         assert [finding.code for finding in findings] == ["fixed_wait"]
 
+    @pytest.mark.parametrize("goal,constraints", [
+        ("Deploy the new API", "No deletions of user data"),
+        ("Ship the fix", "Don't merge without Brian's approval"),
+        ("Write the weekly report", "No sends to clients"),
+        ("Create the migration plan", "Do not deploy to production"),
+    ])
+    def test_goal_authoring_allows_scoped_hard_limits(self, goal, constraints):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(goal, {"constraints": constraints}) == []
+
+    @pytest.mark.parametrize("goal,constraints", [
+        ("Modify the service", "read-only; no changes"),
+        ("Deploy the new API", "No deploys."),
+        ("Remove the stale topic", "Never delete"),
+    ])
+    def test_goal_authoring_flags_limits_that_forbid_the_outcome(self, goal, constraints):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings(goal, {"constraints": constraints})
+        assert [finding.code for finding in findings] == ["readonly_mutation"]
+
+    def test_goal_authoring_unrelated_revision_skips_legacy_contradiction(self):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(
+            "Delete the topic", {"constraints": "Read-only", "verification": "topic gone"},
+            previous_total=50, changed_fields={"verification"},
+        ) == []
+
+    @pytest.mark.parametrize("verification", [
+        "The service remains healthy over the last 24 hours.",
+        "The service remains healthy and the 24-hour error rate is below 1%.",
+        "Monitoring shows the 7-day error budget intact.",
+        "Errors remain below 1% for the past 2 weeks.",
+    ])
+    def test_goal_authoring_allows_hour_and_week_measurement_windows(self, verification):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings("Keep the service healthy", {"verification": verification}) == []
+
+    def test_goal_authoring_flags_after_duration_waits(self):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings(
+            "Keep the service healthy", {"verification": "Check the dashboard again after 24 hours."}
+        )
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+
+    def test_goal_authoring_length_finding_names_the_contract(self):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings("Keep X healthy", {"constraints": "y " * 400})
+        assert ("length", "contract") in [(finding.code, finding.field) for finding in findings]
+
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 

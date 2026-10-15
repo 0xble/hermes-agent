@@ -62,20 +62,68 @@ _GOAL_AUTHORING_STALE_REF_RES = (
     re.compile(r"(?<!\w)#\d+(?!\w)"),
 )
 _GOAL_AUTHORING_SHA_RE = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
-_GOAL_AUTHORING_READONLY_RE = re.compile(
-    r"(?i)\b(?:read[- ]only|no\s+changes?|without\s+changes?|do(?:es)?\s+not\s+change|"
-    r"don't\s+change|no\s+relay(?:s|ing)?|do(?:es)?\s+not\s+relay|don't\s+relay|"
-    r"no\s+sends?|do(?:es)?\s+not\s+send|don't\s+send|no\s+delet(?:e|ions?)|"
-    r"do(?:es)?\s+not\s+delet(?:e|ions?)|don't\s+delet(?:e|ions?)|no\s+deploy(?:s|ing)?|"
-    r"do(?:es)?\s+not\s+deploy|don't\s+deploy|no\s+merg(?:e|ing)|do(?:es)?\s+not\s+merge|"
-    r"don't\s+merge)\b"
-)
 _GOAL_AUTHORING_MUTATION_RE = re.compile(
     r"(?i)\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al)|relay(?:s|ed|ing)?|send(?:s|ing)?|"
     r"deploy(?:s|ed|ing|ment)?|merg(?:e|ed|ing)|ship(?:s|ped|ping)?|install(?:s|ed|ing)?|"
     r"publish(?:es|ed|ing)?|writ(?:e|es|ten|ing)|creat(?:e|es|ed|ing)|restart(?:s|ed|ing)?|"
-    r"commit(?:s|ted|ting)?)\b"
+    r"commit(?:s|ted|ting)?|update(?:s|d)?|modify(?:ies|ied|ing)?|change(?:s|d|ing)?|"
+    r"add(?:s|ed|ing)?|move(?:s|d|ing)?|rename(?:s|d|ing)?|alter(?:s|ed|ing)?)\b"
 )
+# Blanket limits contradict any mutating outcome. Effect-specific limits such as
+# "no deploys" contradict only the same effect, and only when unqualified: "no
+# deletions of user data" or "don't merge without approval" are real hard limits.
+_GOAL_AUTHORING_BLANKET_LIMIT_RE = re.compile(
+    r"(?i)\b(?:read[- ]only|no\s+changes?|without\s+changes?|do(?:es)?\s+not\s+change|don't\s+change)\b"
+)
+_GOAL_AUTHORING_LIMIT_NEGATION = r"(?:no|do(?:es)?\s+not|don't|never)\s+"
+_GOAL_AUTHORING_LIMIT_END = r"\s*(?:[.;,!]|$)"
+_GOAL_AUTHORING_SCOPED_LIMITS = {
+    "relay": (r"relay(?:s|ing)?", r"\brelay(?:s|ed|ing)?\b"),
+    "send": (r"send(?:s|ing)?", r"\bsend(?:s|ing)?\b"),
+    "delete": (r"delet(?:e|es|ions?|ing)|remov(?:e|es|als?|ing)", r"\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al))\b"),
+    "deploy": (r"deploy(?:s|ing|ments?)?", r"\bdeploy(?:s|ed|ing|ment)?\b"),
+    "merge": (r"merg(?:e|es|ing)", r"\bmerg(?:e|ed|ing)\b"),
+}
+_GOAL_AUTHORING_DURATION = r"\d+\s*[- ]?(?:hours?|hrs?|days?|weeks?|h|d|w)\b"
+_GOAL_AUTHORING_METRIC_WINDOW_RE = re.compile(
+    r"(?i)\b\d+[- ](?:hour|hr|day|week)s?[- ](?:error|rate|window|metric|budget|average|"
+    r"p\d+|uptime|success|availability|latency|total|count|trend|report|summary)"
+)
+_GOAL_AUTHORING_LOOKBACK_RE = re.compile(r"(?i)\b(?:last|past|previous|prior|trailing|rolling)\b")
+
+
+def goal_authoring_readonly_contradiction(readonly: str, mutation: str) -> bool:
+    """True when a limit forbids the effect the goal/outcome requires."""
+    if not readonly or not mutation:
+        return False
+    if _GOAL_AUTHORING_BLANKET_LIMIT_RE.search(readonly) and _GOAL_AUTHORING_MUTATION_RE.search(mutation):
+        return True
+    for limit, family in _GOAL_AUTHORING_SCOPED_LIMITS.values():
+        bare = re.compile(rf"(?i)\b{_GOAL_AUTHORING_LIMIT_NEGATION}(?:{limit}){_GOAL_AUTHORING_LIMIT_END}")
+        if bare.search(readonly) and re.search(rf"(?i){family}", mutation):
+            return True
+    return False
+
+
+def goal_authoring_fixed_wait(value: str) -> str | None:
+    """Return the fixed elapsed-time wait in ``value``; measurement windows are evidence, not waits."""
+    for match in _GOAL_AUTHORING_FIXED_WAIT_RE.finditer(value):
+        text = match.group(0)
+        if not re.search(_GOAL_AUTHORING_DURATION, text, re.IGNORECASE):
+            return text
+        if re.match(r"(?i)\s*(?:wait|after)\b", text):
+            return text
+        context = value[max(0, match.start() - 18):match.end() + 24]
+        if re.search(r"(?i)\bwait\b", context):
+            return text
+        duration = re.search(_GOAL_AUTHORING_DURATION, text, re.IGNORECASE)
+        absolute = match.start() + duration.start()
+        if (_GOAL_AUTHORING_LOOKBACK_RE.search(context)
+                or ("from" in context.lower() and "full" in context.lower())
+                or _GOAL_AUTHORING_METRIC_WINDOW_RE.match(value, absolute)):
+            continue
+        return text
+    return None
 _GOAL_AUTHORING_RECEIPT_RE = re.compile(
     r"(?i)\b(?:read\s*back|receipt|logs?|tests?|checks?|review|closed|assigned|merged|passed|"
     r"fixed|restarted|deployed|verified)\b"
@@ -83,7 +131,8 @@ _GOAL_AUTHORING_RECEIPT_RE = re.compile(
 _GOAL_AUTHORING_FIXED_WAIT_RE = re.compile(
     r"(?i)(?:\bsoak(?:\s+test)?\b|\bobservation\s+window\b|\bstable\s+observation\b|"
     r"\b(?:stay(?:s|ed)?|remain(?:s|ed)?|hold(?:s|ing)?|maintain(?:s|ed)?|observe|wait|monitor(?:ing)?)\b"
-    r".{0,60}\b(?:for\s+)?\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b)"
+    r".{0,60}?\b(?:for\s+)?\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b|"
+    r"\bafter\s+\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b)"
 )
 
 
@@ -160,7 +209,7 @@ def goal_authoring_findings(
         over_cap = ((previous_total is None or previous_total <= GOAL_AUTHORING_MAX_CHARS)
                     and total > GOAL_AUTHORING_MAX_CHARS) or changed_total > GOAL_AUTHORING_MAX_CHARS
     if over_cap:
-        field = "verification" if any(len(values[name]) > GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS for name in checked if name in values and name != "goal") else "goal"
+        field = "goal" if all(not values[name] for name in _GOAL_AUTHORING_FIELDS[1:]) else "contract"
         findings.append(GoalAuthoringFinding(
             "length", field, f"totals {total} characters; keep the outcome contract at or below "
             f"{GOAL_AUTHORING_MAX_CHARS}", "move steps, receipts, and ordering to the linked plan file",
@@ -200,12 +249,14 @@ def goal_authoring_findings(
             ))
             break
 
-    # Cross-field contradictions must inspect the whole current contract on a
-    # revision: checking only changed fields lets a goal change turn an existing
-    # read-only limit into a contradictory mutation without a finding.
+    # Cross-field contradictions inspect the whole current contract whenever a
+    # revision touches either side, so a goal change cannot turn an existing
+    # read-only limit into a contradiction. Unrelated fixes (verification,
+    # stop_when) to a legacy contradictory contract are not blocked.
     readonly = " ".join(values[name] for name in ("constraints", "boundaries"))
     mutation = " ".join(values[name] for name in ("goal", "outcome"))
-    if readonly and mutation and _GOAL_AUTHORING_READONLY_RE.search(readonly) and _GOAL_AUTHORING_MUTATION_RE.search(mutation):
+    touches_contradiction = checked & {"goal", "outcome", "constraints", "boundaries"}
+    if touches_contradiction and goal_authoring_readonly_contradiction(readonly, mutation):
         findings.append(GoalAuthoringFinding(
             "readonly_mutation", "constraints/boundaries",
             "declares read-only/no-change limits while the outcome requires a mutation",
@@ -221,21 +272,13 @@ def goal_authoring_findings(
         value = values[field_name] if field_name in checked else ""
         if not value:
             continue
-        wait_match = _GOAL_AUTHORING_FIXED_WAIT_RE.search(value)
-        if wait_match:
-            context = value[max(0, wait_match.start() - 18):wait_match.end() + 18].lower()
-            measurement = (
-                wait_match.group(0).lower().endswith("days")
-                and (("from" in context and "full" in context)
-                     or re.search(r"\b(?:last|past|previous|prior|trailing)\b", context)
-                        and not re.search(r"\bwait\b", context))
-            )
-            if not measurement:
-                findings.append(GoalAuthoringFinding(
-                    "fixed_wait", field_name,
-                    f"uses a fixed waiting window ({wait_match.group(0)})",
-                    "use a watcher or cron for elapsed-time waits and verify the resulting live state",
-                ))
+        wait_text = goal_authoring_fixed_wait(value)
+        if wait_text:
+            findings.append(GoalAuthoringFinding(
+                "fixed_wait", field_name,
+                f"uses a fixed waiting window ({wait_text})",
+                "use a watcher or cron for elapsed-time waits and verify the resulting live state",
+            ))
 
     verification = values["verification"] if "verification" in checked else ""
     if verification:
