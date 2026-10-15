@@ -55,10 +55,8 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
     # Keep the raw form (reasoning intact) only when it removed every marker the visible
     # pass did; a think block opening the raw text hides a leading marker from the raw pass.
     raw_result = strip_edge_silence_markers(text, respect_fences=False)
-    try:
-        raw_visible = agent._strip_think_blocks(raw_result)
-    except Exception:
-        raw_visible = raw_result
+    # ``visible == text`` covers both "no think block" and "stripping raised above".
+    raw_visible = raw_result if visible == text else agent._strip_think_blocks(raw_result)
     return raw_result if raw_result != text and raw_visible.strip() == visible_result.strip() else visible_result
 
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
