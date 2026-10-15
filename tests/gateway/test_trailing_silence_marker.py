@@ -193,6 +193,19 @@ def test_persisted_assistant_row_lacks_leading_marker(monkeypatch):
     assert agent.persisted_messages[-1]["content"] == _INCIDENT_PROSE
 
 
+@pytest.mark.parametrize("content", [
+    f"<think>plan</think>\nNO_REPLY\n\n{_INCIDENT_PROSE}\n\nNO_REPLY",
+    f"<think>plan</think>\nNO_REPLY\n\n{_INCIDENT_PROSE}",
+])
+def test_think_block_before_leading_marker_cannot_hide_it(monkeypatch, content):
+    agent = _RealThinkAgent()
+    verdict = _run_finish(monkeypatch, agent, content)
+
+    assert "NO_REPLY" not in verdict.final_response
+    assert agent._strip_think_blocks(verdict.final_response).strip() == _INCIDENT_PROSE
+    assert "NO_REPLY" not in agent.persisted_messages[-1]["content"]
+
+
 def test_bare_marker_is_preserved_for_existing_silence_filter():
     from gateway.response_filters import strip_edge_silence_markers
 

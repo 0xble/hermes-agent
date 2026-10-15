@@ -52,8 +52,14 @@ def _strip_interactive_trailing_marker(agent: Any, text: Any) -> Any:
         return text
     # The visible text proved the trailing marker lines are top-level. A fence opened inside
     # a think block must not hide them in the raw text, so strip the raw text fence-blind.
+    # Keep the raw form (reasoning intact) only when it removed every marker the visible
+    # pass did; a think block opening the raw text hides a leading marker from the raw pass.
     raw_result = strip_edge_silence_markers(text, respect_fences=False)
-    return raw_result if raw_result != text else visible_result
+    try:
+        raw_visible = agent._strip_think_blocks(raw_result)
+    except Exception:
+        raw_visible = raw_result
+    return raw_result if raw_result != text and raw_visible.strip() == visible_result.strip() else visible_result
 
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
