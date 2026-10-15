@@ -244,6 +244,53 @@ def test_string_option_scan_stops_at_wrapped_command(tmp_path, trusted_slot):
 
 
 @pytest.mark.parametrize("tail", [
+    "env -P /usr/bin -S {payload}", "env -a foo -S {payload}", "env --argv0 name -S {payload}",
+    "env -P/usr/bin -S{payload}",
+    "su -w VAR root -c {payload}", "su --whitelist-environment VAR root -c {payload}",
+    "runuser -w VAR bob -c {payload}", "runuser --whitelist-environment VAR bob -c {payload}",
+    "env --frobnicate X -S {payload}", "su -Z X root -c {payload}",
+    "env -Zu X Y -S {payload}", "su -Zs /bin/sh root -c {payload}",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_unknown_or_value_wrapper_options_fail_closed_for_string_payloads(
+    tmp_path, trusted_slot, tail, prefix,
+):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    command = f"{prefix.format(trusted=trusted_slot)}{tail.format(payload=payload)}"
+    assert scan_gateway_lifecycle(command) == (True, None), command
+
+
+@pytest.mark.parametrize("tail", [
+    "env --frobnicate X su root -c {payload}",
+    "env --frobnicate X bash -c {payload}",
+    "env --frobnicate X bash {child}",
+    "su -Z X root bash {child}",
+    "env -l -S {payload}",
+    "su --session-command {payload} root",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_unknown_wrapper_option_scans_every_later_command_start(
+    tmp_path, trusted_slot, tail, prefix,
+):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    command = f"{prefix.format(trusted=trusted_slot)}{tail.format(payload=payload, child=child)}"
+    assert scan_gateway_lifecycle(command) == (True, None), command
+
+
+@pytest.mark.parametrize("tail", [
+    "env -P /usr/bin -S 'printf ok'", "env -a foo -S 'printf ok'",
+    "su -w VAR root -c 'printf ok'", "runuser -w VAR bob -c 'printf ok'",
+    "su -l root -c 'printf ok'", "env --frobnicate X -S 'printf ok'",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_value_wrapper_options_allow_benign_string_payloads(trusted_slot, tail, prefix):
+    command = f"{prefix.format(trusted=trusted_slot)}{tail}"
+    assert scan_gateway_lifecycle(command) == (False, None), command
+
+
+@pytest.mark.parametrize("tail", [
     "env -uPS sh -c {payload}",
     "env -uS sh -c {payload}",
     "env -C/x/S sh -c {payload}",

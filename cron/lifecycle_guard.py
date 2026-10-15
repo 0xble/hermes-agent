@@ -321,14 +321,19 @@ _TRANSPARENT_COMMAND_PREFIXES = frozenset({
 _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "sudo": {"-u", "-g", "-U", "-C", "-p", "-r", "-t", "-T", "--user", "--group", "--prompt"},
     "doas": {"-u", "-C"},
-    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir"},
+    # GNU env: -u/-C/-S; BSD env additionally has -P and -a, while GNU env has --argv0.
+    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir", "-P", "--path",
+            "-a", "--argv0"},
     "nice": {"-n", "--adjustment"},
     "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
     "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
     "pkexec": {"--user"},
-    "su": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"},
-    "runuser": {"-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "exec": {"-a"},
+    # util-linux su/runuser: the whitelist, group, shell, and supplemental-group options all take
+    # values.  -l/-m/-p/-f (and their long forms) are flags and are listed below.
+    "su": {"-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "runuser": {"-u", "--user", "-w", "--whitelist-environment", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
     "setpriv": {"--reuid", "--regid", "--groups", "--inh-caps", "--ambient-caps", "--bounding-set",
                 "--selinux-label", "--apparmor-profile"},
     "systemd-run": {"-u", "--unit", "-p", "--property", "-E", "--setenv", "--slice",
@@ -337,12 +342,34 @@ _TRANSPARENT_PREFIX_VALUE_OPTIONS = {
     "unshare": {"--map-user", "--map-group", "--setgroups", "-R", "--root", "-w", "--wd"},
 }
 
+# Flags must be recognized too: an unrecognized option cannot prove where a wrapper's command (or a
+# string-command option's payload) starts. Unknown options deliberately stay ambiguous; every later
+# token is then scanned as a possible command start (over-flag rather than silently drop).
+_TRANSPARENT_PREFIX_FLAG_OPTIONS = {
+    "sudo": {"-A", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-n", "-P", "-S", "-s", "-V", "-v",
+             "--askpass", "--background", "--preserve-env", "--edit", "--set-home", "--login",
+             "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive",
+             "--preserve-groups", "--stdin", "--shell", "--validate"},
+    "doas": {"-n", "-s", "-L"},
+    # GNU env: -i/-0/-v and signal options; BSD env: -i/-v.  -l is NOT an env flag and stays unknown.
+    "env": {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug",
+            "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling"},
+    "timeout": {"-v", "--verbose", "--preserve-status", "--foreground"},
+    "setsid": {"-c", "--ctty", "-f", "--fork", "-w", "--wait"},
+    "ionice": {"-t", "--ignore"},
+    "exec": {"-c", "-l"},
+    "command": {"-p", "-v", "-V"},
+    "pkexec": {"--disable-internal-agent", "--keep-cwd"},
+    "su": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+    "runuser": {"-f", "--fast", "-l", "--login", "-m", "-p", "--preserve-environment", "-P", "--pty"},
+}
+
 # Wrapper options carrying a COMMAND STRING (shell source, re-scanned like `sh -c`); treating it as
 # an opaque value would hide whatever it runs (`env -S 'bash ~/restart.sh'`).
 _STRING_COMMAND_OPTIONS = {
     "env": ("-S", "--split-string"),
-    "su": ("-c", "--command"),
-    "runuser": ("-c", "--command"),
+    "su": ("-c", "--command", "--session-command"),
+    "runuser": ("-c", "--command", "--session-command"),
 }
 
 # Wrappers whose first non-option operand is a VALUE, not the command (`timeout 60 bash x.sh`).
@@ -746,33 +773,37 @@ def _heavy_slot_fallback_command_index(
 
 def _prefix_positions(
     segment: list[str], index: int, *, allow_heavy_slot: bool = True,
-) -> tuple[list[int], bool]:
-    """Return every peeled position and whether the chain ended before the peel budget.
+) -> tuple[list[int], bool, list[bool]]:
+    """Return peeled positions, budget completion, and proven wrapper boundaries.
 
-    ``complete`` is the sole authority for the heavy-slot exception: only a natural stop at a
-    non-wrapper command may omit the installed helper's own source. A loop that reaches
-    ``_MAX_PREFIX_PEELS`` is incomplete even when its last position happens to be a command.
+    ``boundaries[i]`` is true only when the transition from ``positions[i]`` to the next position
+    was proven by ``--`` or entirely recognized options. An unknown option leaves that boundary
+    ambiguous: callers scanning a string-command option must then scan to the segment end.
     """
     positions = [index]
+    boundaries: list[bool] = []
     for _ in range(_MAX_PREFIX_PEELS):
         if index >= len(segment):
-            return positions, False
+            return positions, False, boundaries
         heavy_target = _heavy_slot_command_index(segment, index) if allow_heavy_slot else None
         if heavy_target is not None:
             index = heavy_target
             positions.append(index)
+            boundaries.append(True)
             continue
         fallback_target, _ = _heavy_slot_fallback_command_index(segment, index)
         if fallback_target is not None:
             index = fallback_target
             positions.append(index)
+            boundaries.append(True)
             continue
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
-            return positions, True
+            return positions, True, boundaries
         index += 1
         positional_operand_seen = False
         user_option_seen = False
+        boundary_proven = True
         while index < len(segment):
             token = segment[index]
             if token == "--":
@@ -780,12 +811,22 @@ def _prefix_positions(
                 break
             matched_option, _, option_end = _getopt_value_option(segment, index, name)
             if matched_option is not None:
+                if not token.startswith("--"):
+                    # Every cluster character before the value option must be a known flag;
+                    # otherwise that character's own arity is unknown.
+                    cluster = token[1:token.index(matched_option[1]) if matched_option[1] in token[1:] else 1]
+                    if cluster and not _getopt_token_recognized(f"-{cluster}", name):
+                        boundary_proven = False
                 if name == "runuser" and matched_option in {"-u", "--user"}:
                     # runuser's -u/--user forms select the account in option syntax; unlike
                     # ``su root``, the next non-option token is already the command.
                     user_option_seen = True
                 index = option_end
                 continue
+            if token.startswith("-") and token != "-" and not _getopt_token_recognized(token, name):
+                # An unknown option may consume the next token, so neither this wrapper's command
+                # boundary nor a su/runuser user operand is proven past this point.
+                boundary_proven = False
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
                 index += 1
                 continue
@@ -800,12 +841,13 @@ def _prefix_positions(
             if index < len(segment) and not segment[index].startswith("-"):
                 index += 1
         positions.append(index)
-    return positions, False
+        boundaries.append(boundary_proven)
+    return positions, False, boundaries
 
 
 def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
     """Index of the wrapper chain's final command; callers must bounds-check."""
-    positions, _ = _prefix_positions(segment, index)
+    positions, _, _ = _prefix_positions(segment, index)
     return positions[-1]
 
 
@@ -833,7 +875,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
     """
     for segment in _iter_command_segments(command):
         index = _executed_command_index(segment)
-        if index is not None and _executable_name(segment[index]) == "launchctl":
+        candidates = [index] if index is not None else []
+        start = _command_token_index(segment)
+        if start is not None:
+            # After an unrecognized wrapper option any later token may be the command.
+            positions, _, boundaries = _prefix_positions(segment, start)
+            candidates += _ambiguous_positions(segment, positions, boundaries)
+        for index in candidates:
+            if _executable_name(segment[index]) != "launchctl":
+                continue
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
@@ -1020,6 +1070,30 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 # --- referenced-script discovery --------------------------------------------------------------
 
+def _getopt_token_recognized(token: str, executable_name: str) -> bool:
+    """True when a non-value option token consists only of known flags for *executable_name*.
+
+    Value-taking options are matched by ``_getopt_value_option`` before this is consulted, so a
+    token reaching here must be flags alone to keep the wrapper's command boundary proven.
+    """
+    flags = _TRANSPARENT_PREFIX_FLAG_OPTIONS.get(executable_name, frozenset())
+    if token.startswith("--"):
+        return token.partition("=")[0] in flags
+    return bool(token[1:]) and all(f"-{character}" in flags for character in token[1:])
+
+
+def _ambiguous_positions(segment: list[str], positions: list[int], boundaries: list[bool]) -> list[int]:
+    """Every later token that could be a command once an unknown wrapper option hid the boundary.
+
+    An unrecognized option may consume any number of following tokens, so the real command can sit
+    anywhere to its right. Over-scanning those tokens may over-flag; under-scanning drops payloads.
+    """
+    for position_index, proven in enumerate(boundaries):
+        if not proven:
+            return list(range(positions[position_index] + 1, len(segment)))
+    return []
+
+
 def _getopt_value_option(
     segment: list[str], position: int, executable_name: str,
 ) -> tuple[Optional[str], Optional[str], int]:
@@ -1131,7 +1205,7 @@ def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        positions, complete = _prefix_positions(segment, index, allow_heavy_slot=False)
+        positions, complete, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
         if not complete and positions[-1] < len(segment):
             # Identify helpers even beyond the scan limit, without changing ordinary wrapper
             # behavior. Each chunk advances strictly through the segment's finite token list.
@@ -1147,7 +1221,7 @@ def _iter_heavy_slot_fallback_refusals(command: str) -> Iterator[str]:
                     break
                 if complete or chain[-1] >= len(segment):
                     break
-                chain, complete = _prefix_positions(segment, chain[-1], allow_heavy_slot=False)
+                chain, complete, _ = _prefix_positions(segment, chain[-1], allow_heavy_slot=False)
         for position in positions:
             if position >= len(segment):
                 continue
@@ -1170,11 +1244,18 @@ def _iter_referenced_shell_scripts(
         index = _command_token_index(segment)
         if index is None:
             continue
-        positions, complete = _prefix_positions(segment, index, allow_heavy_slot=allow_heavy_slot)
+        positions, complete, boundaries = _prefix_positions(
+            segment, index, allow_heavy_slot=allow_heavy_slot,
+        )
         if allow_heavy_slot and not complete:
             # An exhausted chain gets exactly the pre-heavy-slot walk: the helper is a normal
             # executable, so its source stays in the strict scan set and earns no peel benefit.
-            positions, _ = _prefix_positions(segment, index, allow_heavy_slot=False)
+            positions, _, boundaries = _prefix_positions(segment, index, allow_heavy_slot=False)
+        # Positions after an unrecognized wrapper option are all possible command starts.
+        positions = positions + [
+            position for position in _ambiguous_positions(segment, positions, boundaries)
+            if position not in positions
+        ]
         for position in positions:
             if position >= len(segment):
                 continue
@@ -1190,15 +1271,31 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         index = _command_token_index(segment)
         if index is None:
             continue
-        positions, _ = _prefix_positions(segment, index)
+        positions, _, boundaries = _prefix_positions(segment, index)
         for position_index, position in enumerate(positions):
             if position >= len(segment):
                 continue
-            stop = positions[position_index + 1] if position_index + 1 < len(positions) else len(segment)
+            # Bound the option scan only at a proven boundary: every option before it was
+            # recognized (or ended by ``--``). Otherwise an unknown value-taking option could make
+            # its value look like the command and hide a later ``-S``/``-c``; scan to segment end.
+            proven = position_index < len(boundaries) and boundaries[position_index]
+            stop = positions[position_index + 1] if proven and position_index + 1 < len(positions) else None
             for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
                 yield from _iter_option_values(segment, position, option, stop=stop)
+        ambiguous = _ambiguous_positions(segment, positions, boundaries)
+        for position in ambiguous:
+            # Any later token may be the real command: treat each wrapper/shell there unbounded.
+            name = _executable_name(segment[position])
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+                yield from _iter_option_values(segment, position, option)
+            if name in _SHELL_EXECUTABLES:
+                arguments = segment[position + 1:]
+                for arg_index, argument in enumerate(arguments[:-1]):
+                    if argument in _SHELL_COMMAND_FLAGS:
+                        yield arguments[arg_index + 1]
+                        break
         index = _executed_command_index(segment)
-        if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
+        if index is None or index in ambiguous or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
