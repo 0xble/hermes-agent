@@ -1203,6 +1203,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
     def _suggest_similar_files(self, path: str) -> ReadResult:
         """"File not found" result listing up to 5 similar names from the same directory."""
+        from tools.file_operations_search import _normalized_filename_search_root
+        # Report the resolution separately; the probe and error keep the raw path.
+        resolved_path = _normalized_filename_search_root(self.env, path, self.cwd)
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
         basename_no_ext = os.path.splitext(filename)[0].lower()
@@ -1236,8 +1239,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 if score > 0:
                     scored.append((score, os.path.join(dir_path, f)))
         scored.sort(key=lambda x: -x[0])
-        return ReadResult(error=f"File not found: {path}", not_found=True,
-                          similar_files=[fp for _, fp in scored[:5]])
+        return ReadResult(error=f"File not found: {path}", not_found=True, resolved_path=resolved_path,
+                          similar_files=[fp for _, fp in scored[:5]],
+                          hint="Do not retry the same path; use similar_files or search_files to locate the file.")
 
     def read_file_raw(self, path: str) -> ReadResult:
         """Whole file as a plain string (no pagination/line numbers/clamping)."""
@@ -1620,9 +1624,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content, _ = _strip_bom(raw_content)
 
         from tools.fuzzy_match import fuzzy_find_and_replace
+        diagnostics: dict = {}
         new_content, match_count, _strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all)
+            content, old_string, new_string, replace_all, diagnostics=diagnostics)
         if error or match_count == 0:
+            if diagnostics:
+                return PatchResult(error=error, **diagnostics)
             return self._no_match_result(path, content, old_string, new_string, match_count, error)
         # Models send bare-LF old/new strings; normalize the substituted region to
         # the file's ending so CRLF files stay consistent.
@@ -1687,8 +1694,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         exclusions = self._macos_search_exclusions(path)
         if exclusions and not result.error:
             skipped = ", ".join(item.split("/")[-1] for item in exclusions)
-            result.warning = (
+            protected = (
                 "Skipped macOS protected folders during broad search to avoid "
                 f"an unattended privacy prompt: {skipped}. Search a protected "
                 "folder directly when access is intentional.")
+            # Append: earlier disclosures (e.g. a literal-search retry) must survive.
+            result.warning = f"{result.warning} {protected}" if result.warning else protected
         return result

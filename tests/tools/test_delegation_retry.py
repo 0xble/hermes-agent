@@ -75,6 +75,22 @@ def _row(delegation_id):
     return dict(zip(cols, row)) if row else None
 
 
+@pytest.mark.parametrize("state", ["interrupted", "unknown", "stalled"])
+@pytest.mark.parametrize("metadata", ["event", "result"])
+@pytest.mark.parametrize("cut_reason", ["/stop", "stop_command", "user_stop", "session_reset"])
+def test_user_stop_cut_batch_is_terminal_not_retry(state, metadata, cut_reason):
+    record = {
+        "state": state,
+        "task": {"goals": ["first", "second"], "task_indexes": [0, 1]},
+        "result": {"results": [{"task_index": 0, "status": "completed"}]},
+        "event": {},
+        "parent_session_id": "sess-owner",
+        "origin_session_id": "",
+    }
+    record[metadata]["cut_reason"] = cut_reason
+    assert dr.classify_outcome(record) == (dr.RETRY_NONE, "stopped by user")
+
+
 @pytest.mark.parametrize("shape", ["tasks", "legacy"])
 def test_resume_context_links_through_model_dispatch_unit(monkeypatch, shape):
     from types import SimpleNamespace

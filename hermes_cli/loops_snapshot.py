@@ -10,7 +10,7 @@ import copy
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
 
@@ -75,14 +75,14 @@ def _same_tick(first: LoopState, second: LoopState) -> bool:
 
 
 @snapshot_control
-def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None:
+def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Optional[Tuple[str, str, str]]:
     """Release only the SAME tick on the winner, never apply its obsolete verdict.
 
     A revision may preserve awaiting_response. Leaving that claim behind would
     wedge the loop. Pauses, clears, replacements and newer ticks are untouched.
     Cleanup uses another CAS so it cannot overwrite a second concurrent edit.
     """
-    from hermes_cli.loops import LoopState, enforce_loop_run_cap, self_paced_floor_seconds
+    from hermes_cli.loops import LoopState, self_paced_floor_seconds
     winner = _read_loop(manager.session_id, db)
     manager._state = winner
     if winner is None or winner.status != "active" or not _same_tick(original, winner):
@@ -90,15 +90,21 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None
     expected = winner.to_json()
     updated = LoopState.from_json(expected)
     updated.awaiting_response = False
-    if not enforce_loop_run_cap(updated):
+    updated.current_delay = updated.interval_seconds if updated.mode == "interval" else updated.current_delay
+    cap = manager._cap_stop(updated)
+    if cap is None:
         updated.next_due_at = time.time() + (updated.current_delay or updated.interval_seconds or self_paced_floor_seconds())
+    else:
+        manager._apply_stop(updated, cap[0], cap[1])
     try:
         commit_and_publish_snapshot(
             manager, updated, lambda: _commit(manager.session_id, expected, updated, db),
             lambda: _read_loop(manager.session_id, db), preserve_reference=False,
         )
+        return cap
     except LoopSnapshotChanged:
         manager._state = _read_loop(manager.session_id, db)
+        return None
 
 
 @snapshot_control
@@ -157,7 +163,9 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
     except LoopSnapshotChanged:
         try:
             if settlement:
-                _release_superseded_tick(manager, initial, db)
+                released = _release_superseded_tick(manager, initial, db)
+                if released is not None:
+                    return {"status": released[0], "stopped": True, "reason": released[1], "message": released[2]}
             else:
                 with manager._snapshot_lock:
                     manager._state = _read_loop(manager.session_id, db)

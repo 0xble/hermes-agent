@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
@@ -34,8 +35,9 @@ from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
 )
+from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
 from gateway.session_transcript import TranscriptReadError
-from gateway.turn_context import TurnContext
+from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext  # noqa: F401 (re-export)
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
@@ -104,10 +106,15 @@ def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> 
     "invalid authentication token"; a bare 400 only counts on a long session."""
     if not agent_result.get("failed"):
         return False
-    if agent_result.get("compression_exhausted"):
-        return True
+    # The classified reason wins over the historical text/length heuristic and any stale
+    # compression flag. Only a legacy/unclassified result retains the #1630 growth-loop guard.
     err = str(agent_result.get("error") or "").lower()
-    return any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES) or ("400" in err and history_len > 50)
+    return is_context_overflow_reason(
+        agent_result.get("failure_reason"),
+        unclassified_overflow=bool(agent_result.get("compression_exhausted"))
+        or any(p in err for p in _CONTEXT_OVERFLOW_ERROR_PHRASES)
+        or ("400" in err and history_len > 50),
+    )
 
 
 # Setup/prefix rows rather than conversation: the agent rebuilds its own system prompt, and a
@@ -467,12 +474,14 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or session_entry.session_id != pinned_session_id:
+            if session_entry is None or not pinned_session_id or not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
                 logger.warning(
                     "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
+            pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         else:
             # Internal wakes observe reset policy without counting as user activity, or periodic
             # notifications keep the routing key alive across every daily/idle boundary.
@@ -488,10 +497,94 @@ class GatewayTurnMixin:
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             session_entry = await self._hmwa_heal_telegram_topic_binding(source, session_entry, session_key)
+            if strict_session and not await GatewayTurnMixin._wake_pin_matches(
+                    self, event, pinned_session_id, session_entry.session_id):
+                # Topic-binding recovery may switch conversations; a pinned event belongs only to
+                # the session it was admitted for, never to whatever the topic now points at.
+                logger.warning(
+                    "Dropping internally routed event: topic binding moved pinned session=%s to %s",
+                    pinned_session_id, session_entry.session_id,
+                )
+                return
+        from gateway.platforms.event import is_goal_continuation_event
+        if is_goal_continuation_event(event):
+            from hermes_cli.session_controls import refresh_goal_continuation
+            if await self._run_in_executor_with_context(
+                refresh_goal_continuation, event, session_entry.session_id,
+            ) is None:
+                return
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY, loop_wake_is_current
+        if (getattr(event, "metadata", None) or {}).get(LOOP_WAKE_METADATA_KEY) and not await (
+                self._run_in_executor_with_context(
+                    loop_wake_is_current, event.metadata, session_entry.session_id)):
+            logger.info("Discarding superseded loop wake for session %s", session_entry.session_id)
+            return
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
         return source, session_entry, session_key
+
+    async def _wake_pin_matches(self, event, pinned: str, session_id: str) -> bool:
+        """Keep strict routing pinned, except for a verified, still-current compressed wake."""
+        if pinned == session_id:
+            return True
+        if not GatewayTurnMixin._is_gateway_wake(event):
+            return False
+        from hermes_cli.session_controls import internal_wake_is_current
+        if not await asyncio.to_thread(internal_wake_is_current, event, session_id):
+            return False
+        return event.metadata.get("gateway_session_id") == session_id
+
+    async def _strict_session_pin_holds(self, event, session_id: Optional[str] = None) -> bool:
+        """The ``_hmwa_resolve_session`` strict rule for every other admission and queue boundary.
+
+        True for an unpinned event. A ``gateway_session_strict`` event holds only while its pinned
+        ``gateway_session_id`` still owns ``gateway_session_key`` and, when ``session_id`` is given,
+        is the session about to run it: after /new or /resume rebinds the key the event is dropped,
+        never run in the conversation that replaced it."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or not metadata.get("gateway_session_strict"):
+            return True
+        pinned = str(metadata.get("gateway_session_id") or "").strip()
+        key = str(metadata.get("gateway_session_key") or "").strip()
+        current = None
+        if pinned and key:
+            entry = await self.async_session_store.lookup_by_session_key(key)
+            current = getattr(entry, "session_id", None)
+        if current is not None and (session_id is None or session_id == current):
+            if await GatewayTurnMixin._wake_pin_matches(self, event, pinned, current):
+                return True
+        logger.warning(
+            "Dropping internally routed event: pinned session id=%s no longer owns key=%s (running=%s)",
+            pinned or "missing", key or "missing", session_id or "-",
+        )
+        return False
+
+    @staticmethod
+    def _is_gateway_wake(event) -> bool:
+        """A goal continuation or a loop tick, recognized by its stamp, never by ``internal``."""
+        from hermes_cli.session_controls import is_gateway_wake
+        return is_gateway_wake(event)
+
+    async def _internal_wake_input_at_execution(self, event, session_id: str, message: str) -> Optional[str]:
+        """Re-check a gateway wake at the model boundary; return the message to run, or None to drop.
+
+        Admission and session resolution already fenced the wake, but turn preparation and hooks
+        await before the agent starts, and a pause, stop, clear or replacement can commit in that
+        window. A goal continuation whose definition was edited since gets its refreshed prompt."""
+        from gateway.platforms.event import is_goal_continuation_event
+        from hermes_cli.session_controls import loop_wake_is_current, refresh_goal_continuation
+        if is_goal_continuation_event(event):
+            before = event.text
+            refreshed = await self._run_in_executor_with_context(refresh_goal_continuation, event, session_id)
+            if refreshed is None:
+                return None
+            if refreshed != before:
+                message = message.replace(before, refreshed) if before and before in message else refreshed
+        if not await self._run_in_executor_with_context(
+                loop_wake_is_current, getattr(event, "metadata", None), session_id):
+            return None
+        return message
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
         """Follow the (chat_id, thread_id) topic binding — healed to its compression tip — or record
@@ -958,9 +1051,13 @@ class GatewayTurnMixin:
         _record_hygiene_cooldown(self, session_id, _hyg_cooldown, reason)
 
     async def _hmwa_hygiene_on_turn_hold(self, attempt, hs, session_entry, session_key, source):
-        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission,
-        notify the user, and re-raise; returns the compressed transcript only when the worker
-        was already committing.
+        """``except HygieneTurnHoldExceeded`` body: keep or cancel the worker's commit admission
+        and re-raise; returns the compressed transcript only when the worker was already committing.
+
+        The user hears about it only when nothing will be adopted: a kept-admission worker's summary
+        is adopted later at its fenced commit, so its turn-hold is internal lifecycle (INFO log only).
+        The cancel path still posts the deferral notice; a kept-admission worker that later fails its
+        summary posts the ordinary hygiene-failure warning from the done-callback.
 
         Turn-hold expiry is an availability boundary, not a failure: the streak must NOT advance,
         only flat retry spacing is recorded. A watermark-fenced commit (rows appended after
@@ -979,8 +1076,10 @@ class GatewayTurnMixin:
             # comes from the durable compression lock. The done-callback records the flat retry-after
             # ONLY if the worker ends without committing anything.
             _sid, _skey, _agent = session_entry.session_id, session_key, attempt.agent
+            _meta = attempt.meta
 
             def _hyg_adopt_or_space_retry(_fut, _gw=self, _sid=_sid, _skey=_skey, _agent=_agent):
+                _exc = None
                 try:
                     _exc = _fut.exception()
                 except (asyncio.CancelledError, Exception):
@@ -990,16 +1089,37 @@ class GatewayTurnMixin:
                         bool(getattr(_agent, "_last_compaction_in_place", False))
                         or getattr(_agent, "session_id", _sid) != _sid
                     )
+                _comp = getattr(_agent, "context_compressor", None)
+                _summary_failed = (
+                    not _committed and _exc is None and _comp is not None
+                    and bool(getattr(_comp, "_last_compress_aborted", False))
+                )
                 if _committed:
                     logger.info(
                         "Session hygiene compression for session %s finished after the "
                         "turn-hold was released — summary adopted at the watermark-fenced "
                         "commit boundary (#97963)", _sid,
                     )
+                    # The prompt-token count on the entry measured the pre-compaction transcript:
+                    # left in place, the next hygiene check re-fires on the compacted one. Mirror
+                    # the inline adoption reset and fence out this turn's stale end-of-turn count.
+                    session_entry.last_prompt_tokens = 0
+                    _gw._note_hygiene_deferred_adoption(_skey)
+                    _gw._retain_background_task(asyncio.ensure_future(
+                        _gw.async_session_store.update_session(
+                            _skey, last_prompt_tokens=0, touch_activity=False,
+                        )
+                    ))
                     try:
                         _reset_hygiene_failure_streak(_gw, _skey)
                     except Exception as _rs_err:
                         logger.debug("hygiene streak reset after deferred adoption failed: %s", _rs_err)
+                elif _summary_failed:
+                    # A real summary failure, not a turn-hold: same escalation and warning as the
+                    # inline abort path, which this deferred attempt never reaches.
+                    _gw._retain_background_task(asyncio.ensure_future(
+                        _gw._hmwa_hygiene_deferred_failure(hs, _skey, _sid, _agent, source, _meta)
+                    ))
                 else:
                     # Nothing to adopt (summary failed / fence refused / superseded): flat spacing so
                     # sustained traffic doesn't spawn and abandon a compressor every turn.
@@ -1014,6 +1134,7 @@ class GatewayTurnMixin:
                 " — the watermark-fenced worker keeps its commit admission and the summary "
                 "will be adopted when it finishes"
             )
+            _notify_user = False
         else:
             _adopted = await self._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene turn-hold")
             if _adopted is not None:
@@ -1025,6 +1146,7 @@ class GatewayTurnMixin:
                 "summary was still streaming",
             )
             _log_suffix = ""
+            _notify_user = True
         self._hmwa_hygiene_stamp(
             attempt.agent, "session hygiene compression turn-hold",
             "AGENT_COMPRESSION_TURNHOLD", "hygiene compression turn-hold activity stamp failed",
@@ -1034,10 +1156,45 @@ class GatewayTurnMixin:
             "proceeding without compression this turn%s",
             session_entry.session_id, time.monotonic() - attempt.wait_started, _log_suffix,
         )
-        await self._hmwa_hygiene_notify(
-            source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
-        )
+        if _notify_user:
+            # Cancelled: nothing will be adopted this time, so the user learns why the turn ran long.
+            await self._hmwa_hygiene_notify(
+                source, attempt.meta, t("gateway.compress.turnhold_deferred"), "compression-turnhold notice",
+            )
         raise
+
+    async def _hmwa_hygiene_deferred_failure(self, hs, session_key, session_id, agent, source, meta):
+        """A kept-admission worker whose summary failed after the turn-hold: escalate the failure
+        cooldown and warn the user, as the inline abort path in ``_hmwa_hygiene_apply_result`` does."""
+        from agent.redact import redact_sensitive_text
+        _comp = getattr(agent, "context_compressor", None)
+        _reason = getattr(_comp, "_last_summary_error", None)
+        try:
+            await self._hmwa_hygiene_record_failure_cooldown(hs, session_key, session_id, _reason)
+        except Exception as _cd_err:
+            logger.debug("hygiene failure cooldown after deferred abort failed: %s", _cd_err)
+        self._hmwa_hygiene_stamp(
+            agent, "session hygiene compression aborted after turn-hold",
+            "AGENT_COMPRESSION_COOLDOWN", "hygiene deferred compression abort activity stamp failed",
+        )
+        _err = redact_sensitive_text(_reason or t("gateway.shared.unknown_error"), force=True)
+        logger.warning("Session hygiene compression aborted after the turn-hold was released: %s", _err)
+        await self._hmwa_hygiene_notify(
+            source, meta, t("gateway.compress.hygiene_failed"), "compression-failure warning",
+        )
+
+    def _note_hygiene_deferred_adoption(self, session_key):
+        """Bump the session's deferred-adoption epoch (see ``_hygiene_deferred_adoption_epoch``)."""
+        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
+        if not isinstance(epochs, dict):
+            epochs = self._hygiene_deferred_adoption_epochs = {}
+        epochs[session_key] = epochs.get(session_key, 0) + 1
+
+    def _hygiene_deferred_adoption_epoch(self, session_key):
+        """How many deferred hygiene summaries this process adopted for ``session_key``. A turn that
+        sees the epoch move ran on the pre-compaction transcript, so its prompt-token count is stale."""
+        epochs = getattr(self, "_hygiene_deferred_adoption_epochs", None)
+        return epochs.get(session_key, 0) if isinstance(epochs, dict) else 0
 
     async def _hmwa_hygiene_on_timeout(self, attempt, hs, session_entry, session_key, source):
         """``except asyncio.TimeoutError`` body: cancel at the commit fence, record the failure
@@ -1864,6 +2021,24 @@ class GatewayTurnMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    async def _hmwa_store_turn_prompt_tokens(
+        self, store, entry_key, session_key, last_prompt_tokens, turn_epoch, *, touch_activity,
+    ):
+        """Store this turn's prompt-token count for hygiene, unless a deferred hygiene summary was
+        adopted while the turn ran: that count measured the pre-compaction transcript and would
+        re-trigger hygiene on the compacted one, so 0 (fall back to the estimate) is stored instead.
+
+        The write runs off-loop, so an adoption can land between the epoch check and the write, and
+        its own off-loop ``last_prompt_tokens=0`` may finish first and be overwritten by this stale
+        count. The epoch is bumped on the loop before the adoption schedules its write, so a second
+        check after this write lands closes the window: unchanged means any later adoption writes
+        its 0 after ours; changed means re-zero here."""
+        if self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            last_prompt_tokens = 0
+        await store.update_session(entry_key, last_prompt_tokens=last_prompt_tokens, touch_activity=touch_activity)
+        if last_prompt_tokens and self._hygiene_deferred_adoption_epoch(session_key) != turn_epoch:
+            await store.update_session(entry_key, last_prompt_tokens=0, touch_activity=False)
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -1947,8 +2122,9 @@ class GatewayTurnMixin:
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
-        await store.update_session(
-            session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+        await self._hmwa_store_turn_prompt_tokens(
+            store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+            getattr(prepared, "hygiene_adoption_epoch", 0),
             touch_activity=not bool(getattr(event, "internal", False)),
         )
 
@@ -2162,6 +2338,8 @@ class GatewayTurnMixin:
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
         title_user_message: Optional[str] = None
+        # Deferred hygiene adoptions seen before the agent ran; persist compares it to drop a stale count.
+        hygiene_adoption_epoch: int = 0
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -2268,6 +2446,7 @@ class GatewayTurnMixin:
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, session_entry.session_id, owner,
             title_user_message=title_user_message,
+            hygiene_adoption_epoch=self._hygiene_deferred_adoption_epoch(session_key),
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2362,6 +2541,15 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # The last fence before the model, for every gateway wake whatever its internal flag
+            # (goal continuations are built with internal=False): a control committed during
+            # preparation or the start hooks must not let the obsolete wake run.
+            if GatewayTurnMixin._is_gateway_wake(event):
+                message_text = await GatewayTurnMixin._internal_wake_input_at_execution(
+                    self, event, _run_start_session_id, message_text)
+                if message_text is None:
+                    logger.info("Discarding wake superseded during turn preparation for %s", session_key)
+                    return None
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2398,6 +2586,12 @@ class GatewayTurnMixin:
                     event.metadata["notification_origin"] = agent_result["queued_terminal_notification_origin"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
                     event._notification_reply_muted = agent_result["_notification_reply_muted"]
+                if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
+                    # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
+                    event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
+                if agent_result.get("queued_chain_loop_tick"):
+                    # The latest loop wake the chain ran owns the loop completion.
+                    event._post_turn_loop_tick = agent_result["queued_chain_loop_tick"]
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -3590,34 +3784,7 @@ class GatewayTurnMixin:
                 ),
             )
 
-    @staticmethod
-    def _run_agent_stream_confirmed_final_delivery(consumer, final_text: str, *, previewed: bool = False) -> bool:
-        """True only when the actual final reply reached the user: a finalize call may carry only the
-        last preview snapshot, so reconcile against the recorded payload — a demonstrable mismatch
-        (False) overrides the flag; None keeps legacy trust."""
-        if consumer is None:
-            return False
-        if getattr(consumer, "final_response_sent", False):
-            matcher = getattr(consumer, "delivered_final_matches", None)
-            if callable(matcher):
-                with suppress(Exception):
-                    if matcher(final_text) is False:
-                        return False
-            return True
-        # Exact-text match against what the consumer DURABLY delivered (commentary, segments, and the
-        # visible prefix only once a real send landed) — safe without the ``previewed`` flag. The codex
-        # app-server bridge delivers the final agentMessage through the commentary path and never sets
-        # response_previewed (#74248 / #80519); gating on the flag re-sent every such reply. Mismatching
-        # commentary still returns False, so a distinct final answer is never suppressed (#65919). Draft
-        # frames are ephemeral and must not count: after draft streaming + a failed finalize send this
-        # predicate must stay False so the fallback final send still fires (#51828 / #33793).
-        has_delivered_text = getattr(consumer, "has_durably_delivered_text", None)
-        if callable(has_delivered_text):
-            try:
-                return bool(has_delivered_text(final_text))
-            except Exception:
-                return False
-        return False
+    _run_agent_stream_confirmed_final_delivery = staticmethod(stream_confirmed_final_delivery)
 
     def _run_agent_start_turn_worker(self, turn_ctx: TurnContext, run_sync: Callable[[], Any]) -> "GatewayRunner._RunAgentWorker":
         """Schedule ``run_sync`` on the executor plus the inactivity watchdog thread.
@@ -3982,7 +4149,10 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
+            # Runtime provenance describes the continuation row, not the original human's silence
+            # contract. A queued successor must not make the retry's second marker silently legal.
+            silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
+            if silence_allowed(silence_kind, turn_ctx.reply_expected):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4132,12 +4302,23 @@ class GatewayTurnMixin:
         # See #60671.
         if pending_event is not None:
             next_source = getattr(pending_event, "source", None) or source
-            if self._is_goal_continuation_event(pending_event) and not await asyncio.to_thread(
-                    self._goal_still_active_for_session, session_id):  # goal state lives in state.db
-                logger.info(
-                    "Discarding stale goal continuation for session %s — goal is no longer active",
-                    session_key or "?",
-                )
+            # A strict event queued before /new or /resume rebound this key belongs to the session
+            # it was pinned to, not to whichever conversation this drain is now running.
+            if not await GatewayTurnMixin._strict_session_pin_holds(self, pending_event, session_id):
+                return result
+            from gateway.platforms.event import is_goal_continuation_event
+            if is_goal_continuation_event(pending_event):
+                from hermes_cli.session_controls import refresh_goal_continuation
+                if await self._run_in_executor_with_context(
+                    refresh_goal_continuation, pending_event, session_id,
+                ) is None:
+                    logger.info("Discarding stale goal continuation for session %s", session_key or "?")
+                    return result
+            from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY, loop_wake_is_current
+            if (getattr(pending_event, "metadata", None) or {}).get(LOOP_WAKE_METADATA_KEY) and not await (
+                    self._run_in_executor_with_context(
+                        loop_wake_is_current, pending_event.metadata, session_id)):
+                logger.info("Discarding superseded loop wake for session %s", session_key or "?")
                 return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
@@ -4206,6 +4387,14 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            if pending_event is not None and GatewayTurnMixin._is_gateway_wake(pending_event):
+                next_message = await GatewayTurnMixin._internal_wake_input_at_execution(
+                    self, pending_event, session_id, next_message)
+                if next_message is None:
+                    logger.info("Discarding queued wake superseded during preparation for %s", session_key or "?")
+                    await _run_followup_processing_hook(
+                        _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+                    return result
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
@@ -4231,6 +4420,11 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
+        # The deepest queued loop wake wins (inner recursions fill this first): it is the latest
+        # tick the chain ran, so the chain's single loop completion settles exactly that tick.
+        _pending_loop_tick = self._post_turn_goal_identity(pending_event).get("loop_tick")
+        if isinstance(merged, dict) and _pending_loop_tick and not merged.get("queued_chain_loop_tick"):
+            merged = {**merged, "queued_chain_loop_tick": _pending_loop_tick}
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -4249,6 +4443,9 @@ class GatewayTurnMixin:
                 "queued_terminal_notification_origin": (
                     (pending_event.metadata or {}).get("notification_origin")
                     if pending_event is not None and pending_event.internal else None),
+                # The chain's single post-turn judge evaluates the TERMINAL turn's response, so it
+                # must see that turn's goal-continuation identity and origin, not the head's.
+                "queued_terminal_goal_identity": self._post_turn_goal_identity(pending_event),
             }
         return merged
 
@@ -4562,6 +4759,10 @@ class GatewayTurnMixin:
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
+    async def _run_agent_silence_followup(self, response: dict, turn_ctx: TurnContext) -> dict:
+        from gateway.run_turn_silence_recovery import run_silence_followup
+        return await run_silence_followup(self, response, turn_ctx)
+
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str = None,
@@ -4576,11 +4777,14 @@ class GatewayTurnMixin:
         scheduled_heartbeat: bool = False,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         title_user_message: Optional[str] = None,
+        _silence_retry: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            # Local-only recovery: the proxy API requires a new non-empty conversation row,
+            # not the empty internal continuation. Preserve its existing human silence fallback.
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -4607,13 +4811,15 @@ class GatewayTurnMixin:
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
-            channel_prompt=channel_prompt, moa_config=moa_config,
+            channel_prompt=channel_prompt, moa_config=moa_config, internal=internal,
+            event_metadata=dict(event_metadata or {}),
             title_user_message=title_user_message,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
+            silence_retry=_silence_retry,
             _post_delivery_adapter=_post_delivery_adapter,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
@@ -4657,11 +4863,20 @@ class GatewayTurnMixin:
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+            # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
+            from gateway.run_turn_silence_recovery import silence_recovery_due
+            if silence_recovery_due(self, response, turn_ctx, silence_retry=_silence_retry,
+                                    scheduled_heartbeat=scheduled_heartbeat):
+                # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.
+                if turn_ctx.stream_consumer_holder[0] is not None:
+                    await self._await_stream_task(stream_task)
+                if turn_ctx._run_still_current():
+                    return await self._run_agent_silence_followup(response, turn_ctx)
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
@@ -4670,4 +4885,8 @@ class GatewayTurnMixin:
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+        if isinstance(response, dict):
+            # Recovery may be redirected after it starts. The outer silence contract is separate
+            # from the inbound message that owns this execution's terminal delivery.
+            response["_terminal_inbound_id"] = turn_ctx.inbound_message_id
         return response

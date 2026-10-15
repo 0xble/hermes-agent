@@ -234,6 +234,43 @@ result summary consistent with the evaluator input.
 Rollback reverts this boundary; there is no schema migration or configuration.
 Retire when upstream provides the same outcome-based admission on all surfaces.
 
+- Fork patch identity: `goal-user-authority`. Own fork patch, no upstream PR yet.
+  The judge sees what the user actually typed since the goal was set, in an
+  authoritative block that keeps each reply-quote header for context (newest 20,
+  8,000 characters). When a relay from another session in the same profile reaches
+  the goal session, the typed messages of that sender session are included and
+  attributed, so a cross-session approval counts only through its original and
+  only messages typed before that delivery are imported. A relay row is trusted
+  only when relay's own receipt ledger records that receipt as delivered from the
+  named sender to this goal session (and this transcript row), the row is not a
+  runtime or continuation prompt, and the sender is a human topic session (not a
+  subagent, cron, tool, kanban or one-shot session, and not a delegate child that
+  inherited a human source, recognised by its `_delegate_from` marker); header text alone never
+  imports anything. Packing keeps the newest
+  messages and stops at the first one that does not fit, marking it omitted rather
+  than excerpting it, so a newer refusal can never be dropped while an older
+  approval stays. Relay
+  deliveries, identified by a `[relay from=… receipt=…]` header on any line (any
+  sender kind, also inside a /steer wrapper), are
+  never user-typed, so they cannot satisfy a revision `user_quote`. The busy queue
+  joins rapid follow-ups with a bare newline, so a header mid-row means a relay and
+  typed text were merged with no boundary; such rows fail closed and Brian restates
+  the approval. Sender rows are bounded by the delivery time in the query, and the
+  ledger is read once per render. An explicit
+  `/goal resume` over a judge block records a user-command revision that renders
+  as user authority with a waiver rule in every judge prompt; the judge does not
+  re-block on that reason but still blocks new breaches; the blocked
+  notice says resume counts as Brian's approval of that block. The waiver comes from the
+  structured `user_command` field only `/goal resume` writes, never from rendered
+  text, so an agent revision cannot imitate it. Profile matching uses the bound
+  session profile first, as relay addresses do. Reviving on an
+  ordinary reply records no override, since the reply may refuse. Goals with no
+  typed user input render a byte-identical prompt. Regression:
+  `scripts/run_tests.sh tests/hermes_cli/test_goal_user_authority.py
+  tests/hermes_cli/test_goals.py`. Retire when upstream judges see user input and
+  exclude relays; rollback reverts this identity's block, relay check, resume
+  revision and tests.
+
 ## Verification
 
 Run scripts/run_tests.sh for tests/hermes_cli/test_goal_criteria_completeness.py,
