@@ -123,7 +123,12 @@ def _scrub(text: str, home: Path) -> str:
     import re
     # Path.home() can resolve from the CI user's passwd entry rather than the
     # child HOME override (for example /home/ci). Normalize that form too, but
-    # do not consume the .hermes directory after a bare /home prefix.
+    # preserve the semantic token for a CI user's .hermes directory.
+    text = re.sub(
+        r"/(?:[^/\s]+/)*home/[^/\s]+/\.hermes(?=[/\s]|$)",
+        "<HERMES_HOME>",
+        text,
+    )
     text = re.sub(
         r"/(?:[^/\s]+/)+home/(?!\.hermes(?:[/\s]|$))[^/\s]+(?=[/\s])",
         "<HOME>",
