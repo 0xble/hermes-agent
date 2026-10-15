@@ -949,13 +949,20 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
         except Exception as exc:  # pragma: no cover - defensive parity with per-call
             from tools.code_execution_tool import _error_result
             logger.error("session kernel failed: %s: %s", type(exc).__name__, exc, exc_info=True)
-            _REGISTRY.discard(key, kernel)
-            if state_reset_note:
-                with _REGISTRY.lock:
+            # Drop the failed kernel and, in the same critical section, decide whether its
+            # eviction note still applies. If a conversation boundary (clear_session) already
+            # removed this kernel, that boundary also forgot the note on purpose; restoring
+            # it would tell the next conversation on this key to recreate state it never had.
+            with _REGISTRY.lock:
+                still_registered = _KERNELS.get(key) is kernel
+                if still_registered:
+                    _KERNELS.pop(key, None)
+                if state_reset_note and still_registered:
                     _EVICTED_KERNELS[key] = state_reset_note
                     _EVICTED_KERNELS.move_to_end(key)
                     while len(_EVICTED_KERNELS) > _MAX_REMEMBERED_KERNEL_EVICTIONS:
                         _EVICTED_KERNELS.popitem(last=False)
+            kernel.teardown()
             body = json.loads(_error_result(
                 str(exc), tool_calls_made=kernel.tool_call_counter[0],
                 duration=round(time.monotonic() - exec_start, 2),
