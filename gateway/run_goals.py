@@ -700,7 +700,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 # delivery notifications cannot create duplicate loop ticks.
                 try:
                     from hermes_cli.loops import wake_loop_for_external_event
-                    wake_loop_for_external_event(str(session_entry.session_id))
+                    await self._run_in_executor_with_context(
+                        wake_loop_for_external_event, str(session_entry.session_id)
+                    )
                 except Exception:
                     logger.debug("external event loop wake failed", exc_info=True)
             # A queued chain is judged once, on its terminal turn's response (identity above).

@@ -304,9 +304,6 @@ class GatewayGoalCommandsMixin:
             # Loop and goal state load and save through the shared SessionDB lock: off the loop.
             result = dispatch_loop_command(
                 LoopManager(session_id=sid), (event.get_command_args() or "").strip(), route=route)
-            output = result.get("output") or ""
-            if result.get("created") and _quiet_bool(lambda: goal_blocks_loop_tick(sid)):
-                output += t("gateway.loop.goal_defers_note")
-            return output
+            return result.get("output") or ""
 
         return await self._run_in_executor_with_context(_dispatch)
