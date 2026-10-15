@@ -195,8 +195,8 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         return
     preview = _load_preview_row(ctx.session_key, ctx.session_id, token)
     # If the process died after publishing the successor active-turn token but
-    # before the preview re-key transaction, the predecessor is no longer named
-    # by resume_turn_id. Keep it reachable by session identity until re-owning it.
+    # before the preview re-key transaction, startup promotion records the
+    # predecessor token and keeps that exact chained row reachable.
     if not preview:
         rows = _load_session_preview_rows(ctx.session_key, ctx.session_id)
         predecessor = getattr(entry, "resume_predecessor_turn_id", None)
