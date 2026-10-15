@@ -75,8 +75,8 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
-# Foreground heavy-slot wait: leave enough of the command timeout for the test itself,
-# while keeping short calls from waiting less than one queue poll interval.
+# Foreground heavy-slot wait: leave most of the command timeout for the test itself.
+# Below a 30s timeout the floor exceeds a third, so the terminal timeout may fire first.
 _FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
 _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
 
@@ -84,6 +84,17 @@ _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
 def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
     """Bound heavy-slot admission without consuming the terminal's whole deadline."""
     return min(_FOREGROUND_HEAVY_SLOT_WAIT_CAP, max(_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR, effective_timeout // 3))
+
+
+def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
+    """Foreground local calls get a bounded queue wait; background jobs keep waiting.
+
+    A foreground call later adopted into the background mid-run keeps the bound it
+    started with, so it can still end with heavy-slot's exit-75 not-started result.
+    """
+    if background or env_type != "local":
+        return None
+    return _foreground_heavy_slot_max_wait(effective_timeout)
 
 
 # Disk usage warning threshold (in GB)
@@ -1520,9 +1531,8 @@ def terminal_tool(
         # local execution is rewritten, putting heavy-slot in front of each recognized test or
         # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
         # Promoted foreground calls are already background jobs, so they retain an unbounded queue wait.
-        max_wait_seconds = (
-            _foreground_heavy_slot_max_wait(plan.effective_timeout)
-            if not background and env_type == "local" else None
+        max_wait_seconds = _heavy_slot_max_wait_for(
+            background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
         )
         execution_command = wrap_heavy_command(
             command,
