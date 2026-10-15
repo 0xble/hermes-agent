@@ -35,6 +35,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "--deliver). 'local' suppresses failure notices entirely; run "
             "state stays visible in `hermes cron list`. Omit = failures "
             "follow --deliver.")
+    cron_create.add_argument("--review-json", dest="review_json",
+        help="Invisible local report review JSON: {contract, subject, deadline_minutes? (10), rerun_deadline_minutes? (20), max_reruns? (0 or 1)}.")
+    _flag(cron_create, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument("--skill", dest="skills", action="append",
         help="Attach a skill. Repeat to add multiple skills.")
@@ -109,6 +112,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--failure-deliver", dest="failure_deliver",
         help="Override target for failure notices (same grammar as --deliver; "
             "'local' suppresses; '' clears the override)")
+    cron_edit.add_argument("--review-json", dest="review_json",
+        help="Invisible local report review JSON: {contract, subject, deadline_minutes? (10), rerun_deadline_minutes? (20), max_reruns? (0 or 1)}.")
+    _flag(cron_edit, "--clear-review", dest="clear_review", help="Clear the review declaration.")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     cron_edit.add_argument("--skill", dest="skills", action="append",
         help="Replace the job's skills with this set. Repeat to attach multiple skills.")
