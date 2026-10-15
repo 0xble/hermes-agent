@@ -114,7 +114,44 @@ def _journal(op):
         return result
 
 
+def _redact_preview_content(content):
+    """Redact preview text before it enters the crash journal.
+
+    Replacement and split rows carry control prefixes plus JSON recovery metadata. Redacting
+    those rows as one string could alter an ID or make the marker unparsable, so redact only the
+    replacement's visible text and preserve the recovery metadata byte-for-byte. Ordinary preview
+    text follows the same storage redactor as assistant transcript content.
+    """
+    if not isinstance(content, str) or not content:
+        return content
+    from agent.redact import redact_sensitive_text
+
+    if content.startswith(_SPLIT_PREVIEW_PREFIX):
+        try:
+            message_ids = json.loads(content[len(_SPLIT_PREVIEW_PREFIX):])
+        except (TypeError, ValueError):
+            return redact_sensitive_text(content)
+        if not isinstance(message_ids, list):
+            return redact_sensitive_text(content)
+        return _SPLIT_PREVIEW_PREFIX + json.dumps(message_ids)
+
+    if content.startswith(_REPLACEMENT_PREVIEW_PREFIX):
+        try:
+            intent = json.loads(content[len(_REPLACEMENT_PREVIEW_PREFIX):])
+        except (TypeError, ValueError):
+            return redact_sensitive_text(content)
+        if not isinstance(intent, dict):
+            return redact_sensitive_text(content)
+        redacted = dict(intent)
+        if isinstance(redacted.get("text"), str):
+            redacted["text"] = redact_sensitive_text(redacted["text"])
+        return _REPLACEMENT_PREVIEW_PREFIX + json.dumps(redacted)
+
+    return redact_sensitive_text(content)
+
+
 def record_preview(*, turn_id, session_key, session_id, content, message_id):
+    content = _redact_preview_content(content)
     _journal(lambda conn: conn.execute("""INSERT INTO streamed_previews
         (turn_id, session_key, session_id, content, message_id, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)

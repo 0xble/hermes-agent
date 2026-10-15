@@ -1,5 +1,6 @@
 """Durable real-preview ownership and fencing at crash/resume boundaries."""
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -23,6 +24,35 @@ def record(**changes):
     values = dict(turn_id="old", session_key="key", session_id="sid", content="visible", message_id="m1")
     values.update(changes)
     recovery.record_preview(**values)
+
+
+def test_journal_redacts_preview_secret(monkeypatch):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+    secret = "sk-proj-" + "a" * 40
+    record(content=f"Your key is {secret}")
+    stored = recovery.load_preview("key", "sid", "old")
+    assert stored is not None
+    assert secret not in stored["content"]
+    assert "Your key is " in stored["content"]
+
+
+def test_journal_redacts_replacement_text_without_corrupting_marker(monkeypatch):
+    import agent.redact as redact
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+    secret = "sk-proj-" + "b" * 40
+    payload = recovery._REPLACEMENT_PREVIEW_PREFIX + json.dumps({
+        "text": f"answer {secret}", "stale_ids": ["old-id"],
+    })
+    record(content=payload)
+    stored = recovery.load_preview("key", "sid", "old")
+    assert stored is not None
+    assert stored["content"].startswith(recovery._REPLACEMENT_PREVIEW_PREFIX)
+    intent = json.loads(stored["content"][len(recovery._REPLACEMENT_PREVIEW_PREFIX):])
+    assert secret not in stored["content"]
+    assert intent["stale_ids"] == ["old-id"]
 
 
 def test_snapshot_is_durable_and_fenced():
