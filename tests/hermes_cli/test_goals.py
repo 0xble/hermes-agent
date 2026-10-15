@@ -271,6 +271,14 @@ class TestGoalManager:
         findings = goal_authoring_findings("Keep X healthy", {"constraints": "y " * 400})
         assert ("length", "contract") in [(finding.code, finding.field) for finding in findings]
 
+    @pytest.mark.parametrize("goal", [
+        "Resolve 0xble/agents#435",
+        "Fix importer per ~/plans/pr#12/plan.md until issue 42 is closed",
+    ])
+    def test_goal_authoring_path_exemption_keeps_real_references(self, goal):
+        from hermes_cli.goals import goal_authoring_findings
+        assert "stale_identifier" in [finding.code for finding in goal_authoring_findings(goal)]
+
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 

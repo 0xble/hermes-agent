@@ -168,6 +168,9 @@ def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
     token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
     token_end = min(token_end_candidates, default=len(text))
     token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
+    # owner/repo#N is a PR/issue reference, not a file path, even though it has a slash.
+    if re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", token):
+        return False
     return "/" in token or "\\" in token or bool(
         re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
     )
@@ -228,8 +231,9 @@ def goal_authoring_findings(
         for pattern in _GOAL_AUTHORING_STALE_REF_RES:
             match = next((candidate for candidate in pattern.finditer(value)
                           if not (pattern is _GOAL_AUTHORING_STALE_REF_RES[-1]
-                                  and _goal_authoring_is_ordinal_hash(value, candidate.start()))), None)
-            if match and not _goal_authoring_text_is_path(value, match.start(), match.end()):
+                                  and _goal_authoring_is_ordinal_hash(value, candidate.start()))
+                          and not _goal_authoring_text_is_path(value, candidate.start(), candidate.end())), None)
+            if match:
                 findings.append(GoalAuthoringFinding(
                     "stale_identifier", field_name,
                     f"contains stale-prone identifier {match.group(0)!r}",
