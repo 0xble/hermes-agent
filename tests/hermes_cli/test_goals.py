@@ -198,6 +198,8 @@ class TestGoalManager:
 
         findings = goal_authoring_findings("Wait for 24 hours before declaring success")
         assert [finding.code for finding in findings] == ["fixed_wait"]
+        findings = goal_authoring_findings("Wait 24 hours before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
 
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager

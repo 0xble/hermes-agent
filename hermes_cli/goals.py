@@ -83,7 +83,7 @@ _GOAL_AUTHORING_RECEIPT_RE = re.compile(
 _GOAL_AUTHORING_FIXED_WAIT_RE = re.compile(
     r"(?i)(?:\bsoak(?:\s+test)?\b|\bobservation\s+window\b|\bstable\s+observation\b|"
     r"\b(?:stay(?:s|ed)?|remain(?:s|ed)?|hold(?:s|ing)?|maintain(?:s|ed)?|observe|wait|monitor(?:ing)?)\b"
-    r".{0,60}\bfor\s+\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b)"
+    r".{0,60}\b(?:for\s+)?\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b)"
 )
 
 
@@ -224,7 +224,11 @@ def goal_authoring_findings(
         wait_match = _GOAL_AUTHORING_FIXED_WAIT_RE.search(value)
         if wait_match:
             context = value[max(0, wait_match.start() - 18):wait_match.end() + 18].lower()
-            measurement = wait_match.group(0).lower().endswith("days") and "from" in context and "full" in context
+            measurement = (
+                wait_match.group(0).lower().endswith("days")
+                and (("from" in context and "full" in context)
+                     or re.search(r"\b(?:last|past|previous|prior|trailing)\b", context))
+            )
             if not measurement:
                 findings.append(GoalAuthoringFinding(
                     "fixed_wait", field_name,
