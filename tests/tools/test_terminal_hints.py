@@ -93,7 +93,15 @@ class TestPytestMissing:
         hint = annotate_failure("python -m pytest", 1, self._output("bare"), str(cwd))
 
         assert hint is not None
-        assert ".venv/bin/python -m pytest" in hint
+        # The runner lives at the toplevel, so the hint must resolve from tests/.
+        assert f"{repo.resolve()}/.venv/bin/python -m pytest" in hint
+
+    def test_plugin_missing_is_not_pytest_missing(self, tmp_path):
+        out = "ModuleNotFoundError: No module named 'pytest_asyncio'"
+
+        hint = annotate_failure("python -m pytest", 1, out, str(tmp_path))
+
+        assert hint is None or "lacks pytest" not in hint
 
     def test_repo_runner_hint_uses_uv_lock(self, tmp_path):
         (tmp_path / "pyproject.toml").touch()
@@ -116,7 +124,7 @@ class TestPytestMissing:
         assert hint is None or "pytest" not in hint
 
 
-
+class TestGitShapes:
     def test_branch_already_exists(self):
         out = "fatal: a branch named 'fix/x' already exists"
         hint = annotate_failure("git checkout -b fix/x", 128, out)

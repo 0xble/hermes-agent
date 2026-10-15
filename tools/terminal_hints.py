@@ -17,7 +17,8 @@ from typing import Callable, Optional
 _SCAN_CHARS = 4000
 
 _PYTEST_MISSING_RE = re.compile(
-    r"(?:No module named ['\"]?pytest['\"]?|pytest: command not found)"
+    # Plugins such as `pytest_asyncio` are a different failure: pytest itself is installed.
+    r"(?:No module named ['\"]?pytest(?![\w.])['\"]?|pytest: command not found)"
 )
 
 
@@ -79,25 +80,23 @@ def _project_roots(cwd: str | None) -> tuple[Path, ...]:
 def _pytest_missing_hint(cwd: str | None) -> str:
     """Choose the repository-owned pytest runner without changing or retrying the command."""
     roots = _project_roots(cwd)
-    for root in roots:
-        if (root / "scripts" / "run_tests.sh").exists():
-            runner = "`scripts/run_tests.sh <files>`"
-            break
-    else:
-        for root in roots:
-            if (root / ".venv" / "bin" / "python").exists():
-                runner = "`.venv/bin/python -m pytest`"
-                break
-        else:
-            for root in roots:
-                if (root / "pyproject.toml").exists() and (root / "uv.lock").exists():
-                    runner = "`uv run pytest`"
-                    break
-            else:
-                runner = "the project's virtualenv"
-    if runner == "the project's virtualenv":
-        return "Interpreter used lacks pytest; use the project's virtualenv."
-    return f"Interpreter used lacks pytest; use the repo's own runner: {runner}."
+    candidates = (
+        (("scripts", "run_tests.sh"), "scripts/run_tests.sh <files>", None),
+        ((".venv", "bin", "python"), ".venv/bin/python -m pytest", None),
+        (("uv.lock",), "uv run pytest", "pyproject.toml"),
+    )
+    for marker, runner, also_required in candidates:
+        for index, root in enumerate(roots):
+            if not root.joinpath(*marker).exists():
+                continue
+            if also_required and not (root / also_required).exists():
+                continue
+            # A runner found at the Git toplevel must still resolve from a subdirectory cwd.
+            # `uv run` already discovers the project upward, so it needs no prefix.
+            if index and also_required is None:
+                runner = f"{root}/{runner}"
+            return f"Interpreter used lacks pytest; use the repo's own runner: `{runner}`."
+    return "Interpreter used lacks pytest; use the project's virtualenv."
 
 
 # Ordered by production frequency — first match wins.
