@@ -99,7 +99,7 @@ def _poll(effects: HandoverEffects, deadline: float, fn: Callable[[], bool]) -> 
             return True
         if effects.monotonic() >= deadline:
             return False
-        effects.sleep(min(0.1, max(0.0, deadline - effects.monotonic())))
+        effects.sleep(min(0.1, max(0.0, deadline - effects.monotonic())) if deadline != float("inf") else 0.5)
 
 
 def _slot_plist_path(label: str) -> Path:
@@ -181,14 +181,16 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         print(f"⚠ promotion reported failed platforms: {', '.join(map(str, failed))}")
     if not promoted or promoted.get("promoted") is not True:
         return _failure(fx, standby_label, f"standby promotion failed: {promoted or 'no response'}")
+    # From here the standby owns Telegram: no failure path may boot it out.
     if not _poll(fx, budget_deadline, lambda: bool(
         (_query(fx, home, "status", SLOT_STANDBY) or {}).get("standby") is False)):
-        return _failure(fx, standby_label, "standby did not verify promotion")
+        print(f"⚠ {standby_label} accepted promotion but has not reported active status yet; leaving it running")
 
+    # The old slot finishes its own in-flight turns with no drain budget (zero-cut), then exits 0.
     old_pid = ((snapshots[SLOT_ACTIVE][0] or {}).get("pid") or
                (snapshots[SLOT_ACTIVE][1] or {}).get("pid"))
-    if not _poll(fx, budget_deadline, lambda: _old_active_exited(fx, home, old_pid)):
-        return _failure(fx, standby_label, "old active gateway did not exit")
+    print(f"… {standby_label} is serving; waiting for {active_label} to finish its in-flight turns and exit")
+    _poll(fx, float("inf"), lambda: _old_active_exited(fx, home, old_pid))
     assert fx.bootout is not None
     try:
         fx.bootout(active_label)

@@ -106,6 +106,44 @@ def test_active_role_errors_and_reverse_are_refused(tmp_path):
                         effects=HandoverEffects(query=reverse, bootout=lambda label: None)) == 1
 
 
+def test_old_active_drains_past_the_budget_and_promoted_standby_is_never_booted_out(tmp_path):
+    """After promotion B owns Telegram: A may take longer than any budget to finish its own turns,
+    and no path may boot B out (that would be a cut). Only A's label is booted out, once A exits."""
+    fake, events = FakeGateway(), []
+    ticks = {"n": 0}
+
+    def promote_keeps_old_alive(home, verb, *, slot, timeout=2.0):
+        result = FakeGateway.query(fake, home, verb, slot=slot, timeout=timeout)
+        if verb == "promote":
+            fake.old_alive = True  # A still finishing an in-flight turn
+        if slot == "a" and verb == "identify" and fake.promoted:
+            ticks["n"] += 1
+            if ticks["n"] > 20:  # long after the 5s budget below has expired
+                fake.old_alive = False
+                return None
+        return result
+
+    clock = {"t": 0.0}
+
+    def sleep(_):
+        fake.standby_ready = True
+        clock["t"] += 1.0
+
+    effects = HandoverEffects(
+        query=promote_keeps_old_alive,
+        bootstrap=lambda label, path: (events.append(("bootstrap", label)), setattr(fake, "booted", True)),
+        bootout=lambda label: events.append(("bootout", label)),
+        process_exists=lambda pid: True,
+        monotonic=lambda: clock["t"],
+        sleep=sleep,
+        write_plist=lambda path, text: None,
+    )
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    bootouts = [label for kind, label in events if kind == "bootout"]
+    assert len(bootouts) == 1 and not bootouts[0].endswith(".b")
+    assert clock["t"] > 5
+
+
 def test_control_socket_client_round_trip(tmp_path):
     home = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
     sock_path = home / "gateway.sock"
