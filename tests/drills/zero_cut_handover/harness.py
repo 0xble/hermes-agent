@@ -23,7 +23,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 LIVE_HOME = Path("/Users/brianle/.hermes-zero-cut")
 BOT_USERNAME = "brianle_hermes_handover_bot"
+BOT_USER_ID = 8899335561  # @brianle_hermes_handover_bot; the CLI chat list carries id, not username
 TELEGRAM = os.path.expanduser("~/.local/bin/telegram")
+_CHAT_POLL_S = 2.0  # MTProto chat reads are FLOOD_WAIT-limited; poll the observer gently
 
 
 @dataclass(frozen=True)
@@ -89,15 +91,25 @@ def _real_effects(home: Path) -> Effects:
         return _completed(subprocess.run(["launchctl", *map(str, args)], check=False,
                                          capture_output=True, text=True, encoding="utf-8"))
 
+    def telegram_json(argv: Sequence[str]) -> Any:
+        # FLOOD_WAIT is retryable; wait what Telegram asks. A send that errored for another reason
+        # is never retried blindly (it may have been delivered), so it surfaces as an error dict.
+        data: Any = None
+        for _attempt in range(6):
+            result = subprocess.run([TELEGRAM, *argv], check=False, capture_output=True,
+                                    text=True, encoding="utf-8")
+            data = _json_or_text(result.stdout)
+            error = data.get("error") if isinstance(data, Mapping) else None
+            if not (isinstance(error, Mapping) and error.get("code") == "rate_limited"):
+                return data
+            time.sleep(float(error.get("retry_after_seconds") or 3) + 0.5)
+        return data
+
     def send_as_user(peer: str, text: str) -> Any:
-        result = subprocess.run([TELEGRAM, "--agent", "--yes", "send", peer, text, "--silent"],
-                                check=False, capture_output=True, text=True, encoding="utf-8")
-        return _json_or_text(result.stdout)
+        return telegram_json(["--agent", "--yes", "send", peer, text, "--silent"])
 
     def read_chat(peer: str, limit: int) -> Any:
-        result = subprocess.run([TELEGRAM, "--agent", "messages", peer, "--limit", str(limit)],
-                                check=False, capture_output=True, text=True, encoding="utf-8")
-        return _json_or_text(result.stdout)
+        return telegram_json(["--agent", "messages", peer, "--limit", str(limit)])
 
     def read_state_db(path: Path) -> Mapping[str, Any]:
         return _read_state_db(path)
@@ -163,29 +175,17 @@ def _slot_labels(home: Path) -> tuple[str, str]:
 
 
 def _peer_username(effects: Effects, peer: str) -> str | None:
-    # Peer discovery is intentionally independent of the checkout command runner: the
-    # telegram CLI is the observer, not code under test.
+    """Resolve ``peer`` to the drill bot only by its fixed user id (the observer is the telegram CLI,
+    not code under test). Returns ``BOT_USERNAME`` when ``peer`` is that id or that username and the
+    id is present in the user's chat list, else None."""
+    if str(peer).lstrip("@").lower() not in {str(BOT_USER_ID), BOT_USERNAME}:
+        return None
     result = _completed(subprocess.run(
-        [TELEGRAM, "--agent", "--json", "chats", "--limit", "100"],
+        [TELEGRAM, "--agent", "chats", "--limit", "200"],
         check=False, capture_output=True, text=True, encoding="utf-8"))
     data = _json_or_text(result.stdout)
-    wanted = str(peer).lstrip("@").lower()
-    found: list[str] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, Mapping):
-            username = value.get("username") or value.get("user_name")
-            identifiers = (value.get(key) for key in ("id", "peer", "name", "title", "username"))
-            if username and any(str(item).lstrip("@").lower() == wanted for item in identifiers if item is not None):
-                found.append(str(username).lstrip("@"))
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
-    visit(data)
-    return found[0] if found else None
+    items = data if isinstance(data, list) else []
+    return BOT_USERNAME if any(isinstance(c, Mapping) and c.get("id") == BOT_USER_ID for c in items) else None
 
 
 def _would_kill_production_gateway(effects: Effects, labels: tuple[str, str]) -> bool:
@@ -707,7 +707,7 @@ def _wait_chat_finals(effects: Effects, peer: str, tags: Sequence[str], *, timeo
         if effects.clock() >= deadline:
             return False
         attempts += 1
-        effects.sleep(0.1)
+        effects.sleep(_CHAT_POLL_S)
     return False
 
 
@@ -732,7 +732,7 @@ def _wait_planned_quiescence(effects: Effects, home: Path, peer: str, tags: Sequ
         if effects.clock() >= deadline:
             break
         attempts += 1
-        effects.sleep(0.1)
+        effects.sleep(_CHAT_POLL_S)
     return chat, state
 
 

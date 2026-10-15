@@ -68,7 +68,6 @@ class FakeWorld:
     def read_state(self, _home):
         rows = []
         for text in self.sent:
-            tag = text.rsplit(" ", 1)[-1]
             if text.startswith(("ZC ", "run ", "reply ")):
                 rows.append({"role": "user", "content": text})
             elif text.startswith(("ACK ", "DONE ")):
@@ -244,11 +243,19 @@ def test_standby_boot_failure_kills_each_new_pid_and_preserves_active(tmp_path):
     assert world.killed == [4343]
 
 
-def test_peer_resolver_calls_telegram_directly(monkeypatch):
+def test_peer_resolver_requires_the_drill_bot_id_in_the_real_chat_list_shape(monkeypatch):
     calls = []
+    chats = [{"id": 8899335561, "name": "Hermes Handover Test", "type": "user"},
+             {"id": 2027045491, "name": "Brian", "type": "user"}]
+
     def fake_run(argv, **kwargs):
         calls.append(argv)
-        return harness.CommandResult(stdout=json.dumps({"chats": [{"id": "123", "username": "brianle_hermes_handover_bot"}]}))
+        return harness.CommandResult(stdout=json.dumps(chats))
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
-    assert harness._peer_username(FakeWorld(Path("/tmp")).effects(), "123") == "brianle_hermes_handover_bot"
+    effects = FakeWorld(Path("/tmp")).effects()
+    assert harness._peer_username(effects, "8899335561") == "brianle_hermes_handover_bot"
+    assert harness._peer_username(effects, "@brianle_hermes_handover_bot") == "brianle_hermes_handover_bot"
     assert calls and calls[0][0] == harness.TELEGRAM
+    assert harness._peer_username(effects, "2027045491") is None  # never the live bot or the user
+    chats.pop(0)
+    assert harness._peer_username(effects, "8899335561") is None  # id must exist in the account
