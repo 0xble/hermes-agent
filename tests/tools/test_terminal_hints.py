@@ -19,6 +19,17 @@ class TestAnnotateFailureBasics:
     def test_unknown_failure_returns_none(self):
         assert annotate_failure("./x", 1, "some unrecognized error") is None
 
+    def test_heavy_slot_wait_explains_command_did_not_run(self):
+        out = "heavy-slot: not started after 10s; queue position 3 of 5 (holders: pytest)"
+        hint = annotate_failure("pytest tests", 75, out)
+        assert hint is not None
+        assert "did not run" in hint
+        assert "background=true" in hint
+        assert "notify_on_complete=true" in hint
+
+    def test_unrelated_exit_75_has_no_heavy_slot_hint(self):
+        assert annotate_failure("./x", 75, "some unrelated failure") is None
+
     def test_only_first_matching_hint(self):
         out = 'CONFLICT (content): Merge conflict in a.py\npython: command not found'
         hint = annotate_failure("git merge x && python t.py", 1, out)

@@ -154,11 +154,24 @@ def test_watch_info_and_non_watch_build_classification(command, label, helper):
         assert f"hermes {label}" in wrapped
 
 
+def test_foreground_dispatcher_passes_bounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=30)
+    dispatcher, body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT=30" in dispatcher
+    assert body == "_hermes_heavy_slot 'hermes pytest' pytest -q tests"
+
+
 def test_routes_only_the_heavy_simple_command(helper):
     wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
     dispatcher, body = wrapped.split("\n", 1)
     assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
     assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
+
+
+def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=None)
+    dispatcher, _body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
 
 
 @pytest.mark.parametrize(("command", "expected"), [

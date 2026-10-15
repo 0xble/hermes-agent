@@ -75,6 +75,17 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
 # Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
+# Foreground heavy-slot wait: leave enough of the command timeout for the test itself,
+# while keeping short calls from waiting less than one queue poll interval.
+_FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
+_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
+
+
+def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
+    """Bound heavy-slot admission without consuming the terminal's whole deadline."""
+    return min(_FOREGROUND_HEAVY_SLOT_WAIT_CAP, max(_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR, effective_timeout // 3))
+
+
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_GB", 500.0, float, "number")
 
@@ -1508,10 +1519,16 @@ def terminal_tool(
         # Approval and pre-exec security checks above saw the user-supplied command; only the
         # local execution is rewritten, putting heavy-slot in front of each recognized test or
         # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
+        # Promoted foreground calls are already background jobs, so they retain an unbounded queue wait.
+        max_wait_seconds = (
+            _foreground_heavy_slot_max_wait(plan.effective_timeout)
+            if not background and env_type == "local" else None
+        )
         execution_command = wrap_heavy_command(
             command,
             env_type=env_type,
             environment=getattr(env, "env", None),
+            max_wait_seconds=max_wait_seconds,
         )
         if background:
             result = spawn_background_process(
