@@ -2082,7 +2082,8 @@ class TurnRunner:
         from hermes_cli.goal_turn_outcome import model_final_response
         # Judge goals on the model's own text, before stream finish may add a recovery marker.
         model_response = model_final_response(result)
-        result = self._finish_stream_consumer(result, agent_history, stream_consumer)
+        # The hook returns the (possibly marked) result; hooks that only mutate in place return None.
+        result = self._finish_stream_consumer(result, agent_history, stream_consumer) or result
         final_response = result.get("final_response")
         # Actual token counts from the agent instance used for this run.
         agent = ctx.agent_holder[0]

@@ -405,6 +405,26 @@ async def test_recovered_cleanup_from_foreign_loop_runs_on_owning_loop():
         owning_loop.close()
 
 
+def test_recovered_cleanup_without_owning_loop_skips_instead_of_throwaway_loop(monkeypatch, caplog):
+    """No running owning loop: never drive the transport on an asyncio.run throwaway loop."""
+    def fail_run(coro):
+        coro.close()
+        raise AssertionError("asyncio.run on a throwaway loop")
+
+    monkeypatch.setattr(recovery.asyncio, "run", fail_run)
+    calls = []
+
+    async def delete(message_ids, *, label, skip_sentinel):
+        calls.append(list(message_ids))
+
+    with caplog.at_level("WARNING"):
+        recovery._delete_recovered_previews(
+            SimpleNamespace(_loop_for_step=None), delete, ["head-id"], label="test",
+        )
+    assert calls == []
+    assert "skipping recovered preview cleanup" in caplog.text
+
+
 def test_schema_and_purge_run_once_per_process(monkeypatch):
     calls = []
     real = recovery._prepare_journal

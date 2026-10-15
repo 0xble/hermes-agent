@@ -90,7 +90,7 @@ those resume turns resolved to `ask`; the journal row and resume token were
 correct. The harness now carries the global policy and per-platform `extra`
 through its child config.
 
-Current verification on `3300dbf836ba`:
+Verification (stream recovery, fd-leak, restart-note, exactly-once and secret-redaction suites):
 
 - The successor fence remains negative for unrelated same-session rows; the only-row fallback now requires the durable `resume_predecessor_turn_id` chain token. A crash after successor active-token publication can still adopt the predecessor row because startup promotion records that predecessor before replacing `resume_turn_id`.
 - Replacement-intent recovery deletes stale IDs and buffers the resumed answer; split-marker recovery deletes sealed heads before retrying. Both cleanup paths schedule adapter deletes on the gateway loop that owns the transport.

@@ -68,7 +68,8 @@ def _delete_recovered_previews(ctx, delete, message_ids, *, label: str) -> None:
             delete(message_ids, label=label, skip_sentinel=False), loop,
         ).result(timeout=10)
         return
-    asyncio.run(delete(message_ids, label=label, skip_sentinel=False))
+    # No owning loop is running: a throwaway loop would drive a transport bound elsewhere, so skip.
+    logger.warning("%s: no running gateway loop; skipping recovered preview cleanup", label)
 
 
 _REPLACEMENT_PREVIEW_PREFIX = "\x00hermes-replacement-preview:"
