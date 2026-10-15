@@ -146,9 +146,12 @@ def _run(tmp_path, mode, *, wall=_TEST_WALL_SECONDS, deliver="telegram:123"):
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
-        # A completed run may spend up to the cap-derived post-commit grace
-        # cleaning up owned descendants before the worker exits.
-        worker_timeout = max(15.0, wall + 10.0)
+        # The parent clock starts at Popen, before worker imports and profile setup
+        # (the startup this module budgets for above). After arming, a completed run
+        # may still spend up to the watchdog's post-commit grace cleaning up owned
+        # descendants: cap + min(60, max(4, cap)) in cron/scheduler_detached_worker.py.
+        startup_margin = 30.0
+        worker_timeout = wall + min(60.0, max(4.0, wall)) + startup_margin
         stdout, stderr = proc.communicate(timeout=worker_timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
