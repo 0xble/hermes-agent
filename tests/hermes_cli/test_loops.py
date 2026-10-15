@@ -980,16 +980,24 @@ class TestControls:
         assert state.interval_seconds >= min_interval_seconds()
 
     def test_pause_resume(self, hermes_home):
-        from hermes_cli.loops import LoopManager
+        from hermes_cli.loops import LoopManager, self_paced_floor_seconds
 
         mgr = LoopManager(session_id="c2")
-        state = mgr.set("poll", interval_seconds=300)
+        state = mgr.set("poll")
         state.next_due_at = time.time() - 1
         mgr.pause()
         assert mgr.is_active() is False
         assert mgr.is_due() is False
+        assert mgr.state is not None
+        mgr.state.backoff_level = 3
+        mgr.state.current_delay = 4 * 60 * 60
+        mgr.state.last_response_digest = "old"
+        mgr._save()
         mgr.resume()
         assert mgr.is_active() is True
+        assert mgr.state.backoff_level == 0
+        assert mgr.state.current_delay == self_paced_floor_seconds()
+        assert mgr.state.last_response_digest == ""
 
     def test_paused_mid_tick_clears_awaiting(self, hermes_home):
         from hermes_cli.loops import LoopManager

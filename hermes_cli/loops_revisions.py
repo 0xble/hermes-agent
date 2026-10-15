@@ -204,6 +204,8 @@ class LoopRevisionsMixin:
             }
         for key in changed:
             setattr(state, key, after[key])
+        state.backoff_level = 0
+        state.last_response_digest = ""
         if any(key in changed for key in ("mode", "interval_seconds", "current_delay")):
             if not state.awaiting_response:
                 state.next_due_at = max(
@@ -326,6 +328,7 @@ class LoopRevisionsMixin:
         state.next_due_at = now
         state.awaiting_response = False
         state.last_response_digest = ""
+        state.backoff_level = 0
         if not was_paused:
             state.paused_reason = None
         state.last_stop_reason = None

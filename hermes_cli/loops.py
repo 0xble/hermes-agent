@@ -875,6 +875,10 @@ class LoopManager(LoopRevisionsMixin):
             if state is None or state.status == "cleared":
                 return None
             state.status, state.paused_reason, state.awaiting_response = "active", None, False
+            state.backoff_level = 0
+            state.last_response_digest = ""
+            if state.mode == "self_paced":
+                state.current_delay = float(self_paced_floor_seconds())
             # Re-arm relative to now so a long pause doesn't fire instantly N times.
             delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
             state.next_due_at = time.time() + min(delay, 5.0)
