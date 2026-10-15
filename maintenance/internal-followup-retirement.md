@@ -15,14 +15,16 @@ flush; it is persisted as the user row's dedupe value and never exposed as
 transport identity. Recovery uses that id to detect a durable turn-start row, so
 a crash between transcript persistence and spool unlink cannot replay the
 prompt. Only true legacy spools (no message id and no recovery id) fall back to
-exact content plus spool timestamp. The fallback never runs and never deletes:
-a match is always declined as `possibly-duplicate` (one outcome, one visible
-note that it may already have been handled and to resend only if not, spool
-quarantined), even when the session has a `resume_pending` marker, because that
-marker may be stale or not admitted and a later identical row could also match.
-The hedged note stays honest when a resume does run. Without a spool timestamp
-it never matches. When a recovered
-event is merged into a busy adapter's pending slot, the background task records
+exact content plus spool timestamp. Any durable input—recovery id, platform
+message id, or legacy content+timestamp match—is always declined as
+`possibly-duplicate`: send the hedged note that it may already have been handled
+and should be resent only if it was not, then quarantine the spool to `.bad`.
+This rule does not depend on whether a fresh `resume_pending` marker is admitted
+or whether another follow-up claims the session; there is never a silent delete.
+If the note cannot be delivered, retain the spool for a later boot within the
+existing 7-day bound. Non-durable inputs proven not to have been handled keep
+the assertive `followup_declined_notice` path when recovery must decline them.
+When a recovered event is merged into a busy adapter's pending slot, the background task records
 the event it actually consumes and restart recovery carries that task's terminal
 result back to the parked recovery event. The recovery outcome is then `resumed`
 or `skipped:turn-failed`, rather than `accepted-without-turn`. If the turn
@@ -38,10 +40,10 @@ or per-user session the shutdown follow-up spool binds it to the turn's source
 attribute and run it. In a shared group or thread session the runner does not
 know who sent the leftover, so the spool keeps no author and recovery declines
 it with `author-missing` rather than running it as the wrong user. Durability is
-checked before stale or author-missing classification: a durable input is
-silently dropped only when the same fresh, admitted `resume_pending` startup
-path will continue it; otherwise it gets the hedged `possibly-duplicate` note,
-one outcome, and quarantine, never replay. A shutdown follow-up that recovery
+checked before stale or author-missing classification: every durable input gets
+only the hedged `possibly-duplicate` note and is quarantined after delivery,
+regardless of resume-marker freshness or scheduler admission; it is never
+silently dropped or replayed. A shutdown follow-up that recovery
 still declines (no recorded author, possible duplicate, or older than the 24h
 drain window) never runs: it gets one `Restart recovery outcome: ...
 outcome=skipped:<reason>:noted` line, one visible note (hedged for a possible

@@ -180,6 +180,32 @@ async def test_durable_turn_failed_followup_logs_after_predecessor_resumed(
 
 
 @pytest.mark.asyncio
+async def test_recovered_followup_resumed_logs_after_predecessor_resumed(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="fresh follow-up", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+
+    async def handle(recovered):
+        recovered._gateway_accepted = True
+        recovered._agent_turn_succeeded = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        runner._record_restart_resume_outcome(entry.session_key, "resumed")
+        assert await runner._drain_startup_restore_queue() == 1
+        await asyncio.gather(*list(runner._background_tasks))
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=resumed",
+        f"Restart recovery outcome: session={entry.session_key} outcome=resumed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_internal_recovered_followup_consumed_by_successor_reports_result(tmp_path, monkeypatch, caplog):
     """A pending-slot successor owns the turn result, not the parked recovery event."""
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
@@ -701,7 +727,8 @@ def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_er
 
 
 @pytest.mark.asyncio
-async def test_durable_followup_with_fresh_admitted_resume_is_silently_dropped(tmp_path, monkeypatch, caplog):
+async def test_durable_followup_with_fresh_admitted_resume_gets_hedged_note_and_quarantine(
+        tmp_path, monkeypatch, caplog):
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
     runner.session_store.mark_resume_pending(entry.session_key, turn_id="resume-now")
     event = MessageEvent(text="already resumed", source=source, user_id=source.user_id, message_id="fresh-1")
@@ -712,10 +739,57 @@ async def test_durable_followup_with_fresh_admitted_resume_is_silently_dropped(t
     with caplog.at_level("INFO", logger="gateway.run"):
         assert recover_pending_to_db(
             Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
-            deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
-    assert adapter.sent == []
-    assert _outcome_lines(caplog) == []
+            deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+    assert len(adapter.sent) == 1
+    assert "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
     assert not list((tmp_path / "pending_messages").glob("*.json"))
+    assert list((tmp_path / "pending_messages").glob("*.bad"))
+
+
+@pytest.mark.asyncio
+async def test_durable_and_fresh_followups_same_session_do_not_silently_delete_durable_spool(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    runner.session_store.mark_resume_pending(entry.session_key, turn_id="resume-now")
+    durable = MessageEvent(
+        text="already handled", source=source, user_id=source.user_id, message_id="durable-1")
+    fresh = MessageEvent(text="run this follow-up", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: durable}, reason="shutdown_follow_up") == 1
+    assert flush_pending_to_file({entry.session_key: fresh}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": durable.text, "platform_message_id": durable.message_id,
+    })
+
+    claimed = []
+
+    async def handle(event):
+        claimed.append(event.text)
+        event._gateway_accepted = True
+        event._agent_turn_succeeded = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+            deferred_followup=partial(_defer_followup, runner, {}, None)) == 2
+        # The fresh follow-up claims the session key, so the scheduler must skip its sibling;
+        # the durable spool has no scheduler-dependent deletion path of its own.
+        assert runner._restart_followup_keys == {entry.session_key}
+        assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 0
+        assert await runner._drain_startup_restore_queue() == 1
+        await asyncio.gather(*list(runner._background_tasks))
+    assert claimed == [fresh.text]
+    assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted",
+        f"Restart recovery outcome: session={entry.session_key} outcome=resumed",
+    ]
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+    assert len(list((tmp_path / "pending_messages").glob("*.bad"))) == 1
 
 
 @pytest.mark.asyncio
@@ -930,12 +1004,14 @@ async def test_legacy_idless_duplicate_with_resume_pending_is_declined_not_dropp
             deferred_followup=partial(_defer_followup, runner, {}, None))
         await runner._drain_startup_restore_queue()
         await asyncio.gather(*list(runner._background_tasks))
-    # A fresh admitted resume owns the durable input, so the spool is silently dropped.
+    # A resume_pending marker does not prove a resume will run, so the durable input still gets
+    # the hedged note and quarantine rather than a silent drop.
     assert runner._startup_restore_queue == []
-    assert adapter.sent == []
-    assert _outcome_lines(caplog) == []
+    assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
     assert not spool.exists()
-    assert not spool.with_name(spool.name + ".bad").exists()
+    assert spool.with_name(spool.name + ".bad").exists()
 
 
 @pytest.mark.asyncio

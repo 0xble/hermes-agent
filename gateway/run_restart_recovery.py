@@ -31,9 +31,9 @@ class RestartRecoveryMixin:
 
     def _record_recovered_followup_outcome(self, event, session_key: str, outcome: str) -> None:
         """Record one terminal outcome per recovered follow-up spool, not per session."""
-        decided = getattr(self, "_declined_followup_outcomes", None)
+        decided = getattr(self, "_recovered_followup_outcomes", None)
         if decided is None:
-            decided = self._declined_followup_outcomes = set()
+            decided = self._recovered_followup_outcomes = set()
         marker = str(getattr(event, "_hermes_recovery_spool", None) or id(event))
         if marker not in decided:
             decided.add(marker)
@@ -279,10 +279,7 @@ class RestartRecoveryMixin:
                 # notice would be false once the spool is gone, so neither path sends it.
                 self._release_restart_followup_key(session_key)
                 outcome = "resumed" if succeeded else "skipped:turn-failed"
-                if not succeeded and await self._recovered_input_durable(event):
-                    self._record_recovered_followup_outcome(event, session_key, outcome)
-                else:
-                    self._record_restart_resume_outcome(session_key, outcome)
+                self._record_recovered_followup_outcome(event, session_key, outcome)
                 return
         except asyncio.CancelledError:
             self._release_restart_followup_key(session_key)
