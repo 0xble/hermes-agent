@@ -692,7 +692,12 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
             external_event = (
                 metadata.get("notification_origin") == "process_registry_synthetic"
-                or (is_internal and event is not None and not own_pacing_wake)
+                or (
+                    is_internal
+                    and event is not None
+                    and not own_pacing_wake
+                    and metadata.get("notification_category") in {"result", "diagnostic"}
+                )
             )
             if external_event and event is not None:
                 # Trusted outside evidence pierces a long loop delay once. The durable mutation is

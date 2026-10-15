@@ -1126,7 +1126,7 @@ class TestDispatchLoopCommand:
         GoalManager(session_id="d-goal").set("ship the release")
         result = dispatch_loop_command(LoopManager(session_id="d-goal"), "5m check CI")
         assert "active goal" in result["output"]
-        assert "separate recurring duty" in result["output"]
+        assert "loop ticks defer while the goal is active" in result["output"]
         stored = __import__("hermes_cli.loops", fromlist=["load_loop"]).load_loop("d-goal")
         assert stored is not None and "active goal" in (stored.goal_warning or "")
         assert result["created"] is True

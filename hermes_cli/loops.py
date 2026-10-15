@@ -1377,8 +1377,8 @@ def _active_goal_loop_warning(session_id: Optional[str]) -> str:
         from hermes_cli.goals import GoalManager
         if GoalManager(session_id=session_id).is_active():
             return (
-                "⚠ An active goal already owns this session: consider folding this check into the "
-                "goal's wake unless it is a separate recurring duty."
+                "⚠ An active goal already owns this session: loop ticks defer while the goal is active; "
+                "keep this as a separate recurring duty only if that deferral is intended."
             )
     except Exception:
         pass
