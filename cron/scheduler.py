@@ -812,7 +812,8 @@ def _record_external_cron_worker(job_id: str, pid: Any, *, scope_isolated: bool)
     (``GatewayChildDispatch``) puts the worker in its own transient systemd scope, outside the
     gateway cgroup. A ``degraded`` worker is still external but shares the cgroup and dies with a
     systemd stop, so it must NOT be listed as restart-safe. Called once per accepted handoff;
-    both maps are cleared by ``release_running_job`` and by the worker waiter's ``finally``.
+    both maps are cleared by ``release_running_job`` after the worker exits and by the worker waiter's
+    ``finally`` when no live external worker claim remains.
     """
     key = _inflight_key(job_id)
     with _running_lock:
@@ -855,7 +856,7 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
 
 
 def release_running_job(
-    job_id: str, home: Optional[Union[Path, str]] = None, *, owner=None,
+    job_id: str, home: Optional[Union[Path, str]] = None, *, owner=None, force: bool = False,
 ) -> None:
     """Remove the registration unless an explicit ``owner`` has been replaced.
 
@@ -863,11 +864,26 @@ def release_running_job(
     was registered under. The scope is a ContextVar the ticker binds per profile: a pool worker
     releasing in a ``finally`` outside ``ctx.run`` resolves the default (launch) home instead, so
     the discard misses the real key and every secondary profile's claim leaks.
+
+    A live detached worker claim fences ordinary cleanup, including cleanup from a waiter or pool
+    callback that errored after handoff. ``force`` is reserved for the worker reaper (and other
+    owner-authorized forced-release paths) after it has established that the worker is gone.
     """
     key = _inflight_key(job_id, home)
     with _running_lock:
         if owner is not None and _running_registration_owners.get(key) is not owner:
             return
+        external_claim = _external_worker_claims.get(key)
+        if external_claim is not None:
+            if owner is not external_claim[0]:
+                return
+            if not force:
+                try:
+                    if external_claim[1].poll() is None:
+                        return
+                except Exception:
+                    # Unknown liveness remains fenced; the reaper owns the forced path.
+                    return
         _running_registration_owners.pop(key, None)
         _running_job_ids.discard(key)
         _running_since.pop(key, None)
@@ -3771,7 +3787,7 @@ def _defer_external_worker_claim_release(
                 except Exception:
                     time.sleep(1.0)
         finally:
-            release_running_job(job_id, home=home, owner=owner)
+            release_running_job(job_id, home=home, owner=owner, force=True)
             with _running_lock:
                 _external_worker_reapers.discard(token)
                 if _external_worker_claims.get(key) == (owner, process):
@@ -3782,20 +3798,6 @@ def _defer_external_worker_claim_release(
         name=f"cron-worker-reaper-{job_id}",
         daemon=True,
     ).start()
-
-
-def _external_worker_claim_is_live(job_id: str, home: Path, owner) -> bool:
-    """Whether a live restart-safe worker still fences the pool callback's claim release."""
-    key = _inflight_key(job_id, home)
-    with _running_lock:
-        claim = _external_worker_claims.get(key)
-        if claim is None or claim[0] is not owner:
-            return False
-        try:
-            return claim[1].poll() is None
-        except Exception:
-            # A failed liveness probe is not proof of death; the reaper remains authoritative.
-            return True
 
 
 class _ExternalWorkerPostHandoffError(RuntimeError):
@@ -4628,8 +4630,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         try:
             return ctx.run(process_job, j)
         finally:
-            if not _external_worker_claim_is_live(j["id"], home, registration_owner):
-                release_running_job(j["id"], home=home, owner=registration_owner)
+            release_running_job(j["id"], home=home, owner=registration_owner)
 
     try:
         fut = pool.submit(_run_and_release)

@@ -1035,6 +1035,10 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "user-libs"))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
     get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
 
     assert scheduler._launch_external_cron_worker(job) is True
     repo_root = Path(scheduler.__file__).resolve().parent.parent
@@ -1057,6 +1061,10 @@ def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeyp
                         lambda command, **_: GatewayChildDispatch("degraded", command))
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
     get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
     assert scheduler._launch_external_cron_worker({"id": "job-pin", "execution_id": "exec-pin"})
     _, kwargs = spawned[0]
     assert kwargs["cwd"] == str(loaded)
@@ -1089,6 +1097,10 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     )
     spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
     get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
     repo_root = Path(scheduler.__file__).resolve().parent.parent
 
     assert scheduler._launch_external_cron_worker(job) is True
