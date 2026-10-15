@@ -50,6 +50,7 @@ class Effects:
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.time
     kill: Callable[[int], None] = lambda pid: os.kill(pid, signal.SIGKILL)
+    query_control: Callable[..., Mapping[str, Any] | None] | None = None
 
 
 def _completed(result: Any) -> CommandResult:
@@ -72,14 +73,16 @@ def _real_effects(home: Path) -> Effects:
         env.update(extra or {})
         return env
 
+    repo_root = Path(__file__).resolve().parents[3]
+
     def run_command(argv: Sequence[str], *, env: Mapping[str, str] | None = None,
                     background: bool = False) -> Any:
         command = [str(part) for part in argv]
         if background:
-            return subprocess.Popen(command, cwd=home, env=env_for(env),
+            return subprocess.Popen(command, cwd=repo_root, env=env_for(env),
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8")
-        return subprocess.run(command, cwd=home, env=env_for(env), check=False,
+        return subprocess.run(command, cwd=repo_root, env=env_for(env), check=False,
                               capture_output=True, text=True, encoding="utf-8")
 
     def launchctl(args: Sequence[str]) -> CommandResult:
@@ -160,8 +163,11 @@ def _slot_labels(home: Path) -> tuple[str, str]:
 
 
 def _peer_username(effects: Effects, peer: str) -> str | None:
-    result = _completed(effects.run_command(
-        [TELEGRAM, "--agent", "--json", "chats", "--limit", "100"], background=False))
+    # Peer discovery is intentionally independent of the checkout command runner: the
+    # telegram CLI is the observer, not code under test.
+    result = _completed(subprocess.run(
+        [TELEGRAM, "--agent", "--json", "chats", "--limit", "100"],
+        check=False, capture_output=True, text=True, encoding="utf-8"))
     data = _json_or_text(result.stdout)
     wanted = str(peer).lstrip("@").lower()
     found: list[str] = []
@@ -182,6 +188,15 @@ def _peer_username(effects: Effects, peer: str) -> str | None:
     return found[0] if found else None
 
 
+def _would_kill_production_gateway(effects: Effects, labels: tuple[str, str]) -> bool:
+    production = _completed(effects.launchctl(["print", f"gui/{os.getuid()}/ai.hermes.gateway"]))
+    production_pid = _pid_from_launchctl(production)
+    if production_pid is None:
+        return False
+    return any(_pid_from_launchctl(_completed(effects.launchctl(
+        ["print", f"gui/{os.getuid()}/{label}"]))) == production_pid for label in labels)
+
+
 def safety_guard(home: Path, peer: str, effects: Effects, *,
                  labels: tuple[str, str] | None = None,
                  peer_resolver: Callable[[Effects, str], str | None] = _peer_username) -> None:
@@ -195,6 +210,8 @@ def safety_guard(home: Path, peer: str, effects: Effects, *,
             raise ValueError(f"refusing live drill with production launchd label: {label}")
     if active == standby:
         raise ValueError("refusing live drill: slot labels are not distinct")
+    if _would_kill_production_gateway(effects, (active, standby)):
+        raise ValueError("refusing live drill: a drill slot shares the production gateway pid")
     config = _config(resolved)
     enabled = ((config.get("gateway") or {}).get("zero_cut_handover") or {}).get("enabled")
     if enabled is not True:
@@ -238,12 +255,17 @@ def _message_id(value: Any) -> Any:
 
 def _command(effects: Effects, home: Path, *argv: str, background: bool = False,
              env: Mapping[str, str] | None = None) -> Any:
+    """Run the checkout's CLI module, never an installed ``hermes`` on PATH."""
+    repo_root = Path(__file__).resolve().parents[3]
+    command = [sys.executable, "-m", "hermes_cli.main", *argv]
+    merged_env = dict(env or {})
+    merged_env.pop("PYTHONPATH", None)
+    merged_env["HERMES_HOME"] = str(home)
+    merged_env["ZERO_CUT_DRILLS_REPO_ROOT"] = str(repo_root)
     try:
-        return effects.run_command(list(argv), env=env, background=background)
+        return effects.run_command(command, env=merged_env, background=background)
     except TypeError:
-        # Small fakes often expose only argv; retaining this fallback keeps the
-        # Effects seam pleasant without weakening the real command environment.
-        return effects.run_command(list(argv))
+        return effects.run_command(command)
 
 
 def _wait_process(process: Any) -> CommandResult:
@@ -265,13 +287,16 @@ def _launchctl_label(effects: Effects, label: str) -> tuple[str, CommandResult]:
 
 def _wait_slot(effects: Effects, label: str, *, timeout: float = 10.0) -> bool:
     deadline = effects.clock() + timeout
-    while True:
+    attempts = 0
+    while attempts < 100:
         _domain, result = _launchctl_label(effects, label)
         if result.returncode == 0:
             return True
-        if effects.clock() >= deadline:
+        if attempts >= 99 or effects.clock() >= deadline:
             return False
+        attempts += 1
         effects.sleep(0.1)
+    return False
 
 
 def _pid_from_launchctl(result: CommandResult) -> int | None:
@@ -288,15 +313,98 @@ def _kill_slot(effects: Effects, label: str) -> int | None:
 
 
 def _handover(effects: Effects, home: Path, *, background: bool = False) -> Any:
-    return _command(effects, home, "hermes", "gateway", "handover", background=background)
+    return _command(effects, home, "gateway", "handover", background=background)
 
 
 def _install(effects: Effects, home: Path) -> CommandResult:
-    return _completed(_command(effects, home, "hermes", "gateway", "install"))
+    return _completed(_command(effects, home, "gateway", "install", "--if-missing"))
+
+
+def _control_query(effects: Effects, home: Path, verb: str, slot: str) -> Mapping[str, Any] | None:
+    if effects.query_control is not None:
+        try:
+            return effects.query_control(home, verb, slot=slot)
+        except TypeError:
+            return effects.query_control(home, verb, slot)
+    from gateway.control_socket import query_gateway_control
+    return query_gateway_control(home, verb, slot=slot)
+
+
+def _starting_active_slot(effects: Effects, home: Path) -> str:
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY
+    statuses = {slot: _control_query(effects, home, "status", slot)
+                for slot in (SLOT_ACTIVE, SLOT_STANDBY)}
+    active = [slot for slot, status in statuses.items()
+              if isinstance(status, Mapping) and status.get("standby") is False]
+    if len(active) != 1:
+        raise RuntimeError(f"expected exactly one active slot at drill start, found {len(active)}")
+    return active[0]
+
+
+def _other_slot(slot: str) -> str:
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY
+    return SLOT_STANDBY if slot == SLOT_ACTIVE else SLOT_ACTIVE
+
+
+def _wait_handover_accepted(effects: Effects, home: Path, slot: str, *, timeout: float = 240.0) -> bool:
+    deadline = effects.clock() + timeout
+    attempts = 0
+    while attempts < 2400:
+        state = _control_query(effects, home, "handover-status", slot)
+        if isinstance(state, Mapping) and state.get("accepted") is True:
+            return True
+        if effects.clock() >= deadline:
+            return False
+        attempts += 1
+        effects.sleep(0.1)
+    return False
+
+
+def _process_done(process: Any) -> bool:
+    poll = getattr(process, "poll", None)
+    if callable(poll):
+        return poll() is not None
+    return False
+
+
+def _kill_label_until_done(effects: Effects, label: str, process: Any, *, timeout: float = 240.0) -> None:
+    deadline = effects.clock() + timeout
+    killed: set[int] = set()
+    attempts = 0
+    while not _process_done(process) and attempts < 2400:
+        _domain, result = _launchctl_label(effects, label)
+        pid = _pid_from_launchctl(result)
+        if pid is not None and pid not in killed:
+            effects.kill(pid)
+            killed.add(pid)
+        if effects.clock() >= deadline:
+            break
+        attempts += 1
+        effects.sleep(0.1)
+    if not _process_done(process):
+        raise RuntimeError(f"handover did not exit while killing {label}")
+    _wait_process(process)
+
+
+def _label_for_slot(home: Path, slot: str) -> str:
+    labels = _slot_labels(home)
+    return labels[0] if slot == "a" else labels[1]
+
+
+def _pid_for_slot(effects: Effects, home: Path, slot: str) -> int | None:
+    identity = _control_query(effects, home, "identify", slot)
+    status = _control_query(effects, home, "status", slot)
+    for value in (identity, status):
+        if isinstance(value, Mapping) and value.get("pid") is not None:
+            try:
+                return int(value["pid"])
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _planned(effects: Effects, home: Path, peer: str, drill: str,
-             message_ids: list[Any]) -> tuple[list[str], bool, str | None]:
+             message_ids: list[Any], active_slot: str) -> tuple[list[str], bool, str | None]:
     tags: list[str] = []
 
     def long_in_flight() -> tuple[bool, str | None]:
@@ -307,7 +415,7 @@ def _planned(effects: Effects, home: Path, peer: str, drill: str,
     def follow_up() -> tuple[bool, str | None]:
         _send(effects, peer, drill, 1, "run terminal sleep 45 then reply exactly DONE", tags, message_ids)
         process = _handover(effects, home, background=True)
-        _active, standby = _slot_labels(home)
+        standby = _label_for_slot(home, _other_slot(active_slot))
         if not _wait_slot(effects, standby):
             return False, f"standby {standby} did not boot"
         _send(effects, peer, drill, 2, "reply exactly ACK", tags, message_ids)
@@ -316,7 +424,7 @@ def _planned(effects: Effects, home: Path, peer: str, drill: str,
 
     def promotion_burst() -> tuple[bool, str | None]:
         process = _handover(effects, home, background=True)
-        _active, standby = _slot_labels(home)
+        standby = _label_for_slot(home, _other_slot(active_slot))
         for number in (1, 2):
             _send(effects, peer, drill, number, "reply exactly ACK", tags, message_ids)
         _wait_slot(effects, standby)
@@ -328,9 +436,7 @@ def _planned(effects: Effects, home: Path, peer: str, drill: str,
     def repeated_handovers() -> tuple[bool, str | None]:
         _wait_process(_handover(effects, home))
         second = _wait_process(_handover(effects, home))
-        if second.returncode != 0:
-            return True, "reverse handover is not supported by the current stack"
-        return True, None
+        return second.returncode == 0, None if second.returncode == 0 else "reverse handover failed"
 
     handlers = {
         "long-in-flight": long_in_flight,
@@ -346,35 +452,71 @@ def _planned(effects: Effects, home: Path, peer: str, drill: str,
 
 
 def _crash(effects: Effects, home: Path, peer: str, drill: str,
-           message_ids: list[Any]) -> tuple[list[str], bool, str | None]:
+           message_ids: list[Any], active_slot: str) -> tuple[list[str], bool, str | None]:
     tags: list[str] = []
-    _active, standby = _slot_labels(home)
+    standby_slot = _other_slot(active_slot)
+    standby_label = _label_for_slot(home, standby_slot)
+    active_label = _label_for_slot(home, active_slot)
 
     def kill_a() -> tuple[bool, str | None]:
         _send(effects, peer, drill, 1, "run terminal sleep 45 then reply exactly DONE", tags, message_ids)
         process = _handover(effects, home, background=True)
-        _wait_slot(effects, standby)
-        _kill_slot(effects, _slot_labels(home)[0])
+        if not _wait_handover_accepted(effects, home, active_slot):
+            return False, "handover was not accepted before killing active slot"
+        _kill_slot(effects, active_label)
         _wait_process(process)
+        # The promoted slot must own the gateway before post-kill messages are sent.
+        promoted = _control_query(effects, home, "status", standby_slot) or {}
+        if promoted.get("standby") is not False:
+            return False, "standby did not become active after killing active slot"
+        for number in (2, 3):
+            _send(effects, peer, drill, number, "reply exactly ACK", tags, message_ids)
+        if not _wait_chat_finals(effects, peer, tags[1:]):
+            return False, "post-kill messages did not receive finals"
         return True, None
 
     def kill_b() -> tuple[bool, str | None]:
         process = _handover(effects, home, background=True)
-        _wait_slot(effects, standby)
-        _send(effects, peer, drill, 1, "reply exactly ACK", tags, message_ids)
-        _kill_slot(effects, standby)
         _wait_process(process)
-        domain, _result = _launchctl_label(effects, standby)
-        effects.launchctl(["kickstart", "-k", f"{domain}/{standby}"])
+        promoted_slot = _other_slot(active_slot)
+        promoted_label = _label_for_slot(home, promoted_slot)
+        _send(effects, peer, drill, 1, "reply exactly ACK", tags, message_ids)
+        old_pid = _pid_for_slot(effects, home, promoted_slot)
+        _kill_slot(effects, promoted_label)
+        deadline = effects.clock() + 240
+        new_pid = old_pid
+        attempts = 0
+        while attempts < 2400 and effects.clock() < deadline:
+            new_pid = _pid_for_slot(effects, home, promoted_slot)
+            if new_pid is not None and new_pid != old_pid:
+                break
+            attempts += 1
+            effects.sleep(0.1)
+        if new_pid is None or new_pid == old_pid:
+            return False, "promoted slot did not restart with a new pid"
+        _send(effects, peer, drill, 2, "reply exactly ACK", tags, message_ids)
+        if not _wait_chat_finals(effects, peer, tags):
+            return False, "messages around promoted-slot restart did not receive finals"
         return True, None
 
     def failed_boot() -> tuple[bool, str | None]:
-        # The invalid slot environment is isolated to B; A remains untouched.
         _send(effects, peer, drill, 1, "reply exactly ACK", tags, message_ids)
-        result = _completed(_command(
-            effects, home, "hermes", "gateway", "handover", env={
-                "HERMES_GATEWAY_SLOT": "b", "ZERO_CUT_DRILL_INVALID_CONFIG": "1"}))
-        return (False, "standby failure simulation unexpectedly succeeded") if result.returncode == 0 else (True, None)
+        process = _handover(effects, home, background=True)
+        _kill_label_until_done(effects, standby_label, process)
+        result = _completed(process)
+        if result.returncode == 0:
+            return False, "standby boot failure unexpectedly succeeded"
+        active_status = _control_query(effects, home, "status", active_slot) or {}
+        if active_status.get("standby") is not False:
+            return False, "original active slot lost ownership after standby boot failure"
+        _send(effects, peer, drill, 2, "reply exactly ACK", tags, message_ids)
+        if not _wait_chat_finals(effects, peer, tags):
+            return False, "fresh ACK did not receive a final after standby failure"
+        idle_domain, idle_result = _launchctl_label(effects, standby_label)
+        del idle_domain
+        if idle_result.returncode == 0:
+            return False, "failed standby label remained loaded"
+        return True, None
 
     handlers = {
         "kill-a-during-drain": kill_a,
@@ -435,57 +577,97 @@ def _parked_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     tables = state.get("tables", state)
     if not isinstance(tables, Mapping):
         return []
+    terminal = {"sent", "delivered", "failed", "cancelled", "canceled", "expired", "completed", "done", "acknowledged", "skipped"}
     parked: list[Mapping[str, Any]] = []
-    for name, values in tables.items():
-        if not isinstance(values, list):
+    for row in tables.get("outbox", []) if isinstance(tables.get("outbox", []), list) else []:
+        if not isinstance(row, Mapping):
             continue
-        for row in values:
-            if not isinstance(row, Mapping):
-                continue
-            state_value = str(row.get("state", row.get("status", ""))).lower()
-            if name == "outbox" and state_value in {"pending", "sending", "ambiguous"}:
-                parked.append(row)
-            if name == "gateway_routing" and any(row.get(key) for key in
-                                                 ("active_turn_token", "active_turn_id", "queued_event")):
-                parked.append(row)
+        status = str(row.get("state", row.get("status", ""))).lower()
+        if status not in terminal:
+            parked.append({"table": "outbox", **row})
+    for row in tables.get("gateway_routing", []) if isinstance(tables.get("gateway_routing", []), list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        raw = row.get("entry_json")
+        try:
+            entry = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            entry = {}
+        if isinstance(entry, Mapping) and entry.get("active_turn_token") is not None:
+            parked.append({"table": "gateway_routing", **row})
     return parked
 
 
+def _queue_observation(state: Mapping[str, Any]) -> tuple[str, list[Any]]:
+    found: list[Any] = []
+    slots = state.get("slots", [])
+    for slot in slots if isinstance(slots, list) else []:
+        if not isinstance(slot, Mapping):
+            continue
+        for key in ("queue_depth", "pending_queue_depth", "pending_events", "queued_events", "adapter_pending", "pending_messages"):
+            if key in slot:
+                found.append({"slot": slot.get("slot"), key: slot[key]})
+    return ("exposed" if found else "not_exposed", found)
+
+
+def _state_message_evidence(state: Mapping[str, Any], tags: Sequence[str]) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    tables = state.get("tables", state)
+    rows = tables.get("messages", []) if isinstance(tables, Mapping) else []
+    users = {tag: 0 for tag in tags}
+    finals = {tag: 0 for tag in tags}
+    done = {tag: 0 for tag in tags}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        role = str(row.get("role", "")).lower()
+        content = str(row.get("content", "") or "")
+        for tag in tags:
+            if tag not in content:
+                continue
+            if role == "user":
+                users[tag] += 1
+            if role == "assistant" and re.search(rf"(?is)\b(?:ACK|DONE)\s+{re.escape(tag)}\b", content):
+                finals[tag] += 1
+            if role == "assistant" and re.search(rf"(?is)^\s*DONE\s+{re.escape(tag)}\s*$", content):
+                done[tag] += 1
+    return users, finals, done
+
+
 def assert_evidence(tags: Sequence[str], chat: Any, state: Mapping[str, Any], logs: str,
-                    *, allow_interrupted: bool = False) -> dict[str, Any]:
-    """Compute the drill assertions from observer chat, state-db, and logs."""
+                    *, planned: bool = False, require_done: bool = False) -> dict[str, Any]:
+    """Assert observer replies plus durable state.db rows; logs are never evidence."""
+    del logs
     texts = [_message_text(message) for message in _walk_messages(chat)]
     finals = {tag: [text for text in texts if re.search(
         rf"(?is)^\s*(?:ACK|DONE)\s+{re.escape(tag)}\s*$", text)] for tag in tags}
-    lost = [tag for tag, matches in finals.items() if not matches]
+    users, state_finals, done = _state_message_evidence(state, tags)
+    lost = [tag for tag, matches in finals.items() if planned and not matches]
     duplicates = {tag: len(matches) for tag, matches in finals.items() if len(matches) > 1}
-    corpus = "\n".join([logs, json.dumps(state, default=str)])
-
-    def starts_for(tag: str) -> int:
-        start_lines = re.findall(r"(?im)^[^\n]*(?:model[-_ ]?turn|turn|admission)[-_ ]?start[^\n]*$", corpus)
-        return sum(1 for line in start_lines if tag in line)
-
-    starts = {tag: starts_for(tag) for tag in tags}
-    interrupted = [tag for tag in tags if re.search(
-        rf"(?im){re.escape(tag)}[^\n]*(?:interrupt|cancel|cut)", corpus)]
+    bad_users = {tag: count for tag, count in users.items() if count != 1}
+    bad_state_finals = {tag: count for tag, count in state_finals.items()
+                        if (count != 1 if planned else count > 1)}
+    missing_done = [tag for tag in tags if require_done and done[tag] < 1]
     parked_rows = _parked_rows(state)
-    queued_events = state.get("queued_events", []) if isinstance(state, Mapping) else []
-    active_markers = state.get("active_turn_markers", []) if isinstance(state, Mapping) else []
-    parked = bool(parked_rows or queued_events or active_markers or re.search(
-        r"(?im)(?:queued event|active[-_ ]turn marker|pending outbox)", logs))
+    queue_status, queue_values = _queue_observation(state)
+    queued = [item for item in queue_values if any(value not in (0, None, False, "", [])
+                                                   for key, value in item.items() if key != "slot")]
     slots = state.get("slots", []) if isinstance(state, Mapping) else []
     active_slots = [slot for slot in slots if isinstance(slot, Mapping) and slot.get("standby") is False]
     ownership_ok = len(active_slots) == 1 and bool(active_slots[0].get("owns_telegram", True))
-
     assertions = {
-        "final_reply_exactly_once": {"passed": not lost and not duplicates, "lost": lost, "duplicates": duplicates},
-        "no_cut": {"passed": allow_interrupted or not interrupted, "interrupted": interrupted},
-        "no_auto_replay": {"passed": not any(count > 1 for count in starts.values()), "turn_starts": starts},
-        "no_parking": {"passed": not parked, "residue": parked_rows},
+        "final_reply_exactly_once": {"passed": not lost and not duplicates and not bad_state_finals,
+                                     "lost": lost, "duplicates": duplicates,
+                                     "state_final_counts": state_finals, "bad_state_finals": bad_state_finals},
+        "no_cut": {"passed": not missing_done, "missing_done": missing_done,
+                    "state_done_counts": done},
+        "no_auto_replay": {"passed": not bad_users, "user_message_counts": users,
+                            "bad_user_counts": bad_users},
+        "no_parking": {"passed": not parked_rows and not queued, "residue": parked_rows,
+                        "queue_status": queue_status, "queue_values": queue_values},
         "standby_ownership": {"passed": ownership_ok, "active_slots": active_slots},
     }
     return {"passed": all(item["passed"] for item in assertions.values()), "assertions": assertions,
-            "finals": finals, "interrupted": interrupted}
+            "finals": finals}
 
 
 def _control_slots(home: Path) -> list[Mapping[str, Any]]:
@@ -513,8 +695,49 @@ def _result_path(home: Path, drill: str, now: float) -> Path:
     return path
 
 
+def _wait_chat_finals(effects: Effects, peer: str, tags: Sequence[str], *, timeout: float = 240.0) -> bool:
+    deadline = effects.clock() + timeout
+    attempts = 0
+    while attempts < 2400:
+        chat = effects.read_chat(peer, max(50, len(tags) * 10))
+        texts = [_message_text(message) for message in _walk_messages(chat)]
+        if all(any(re.fullmatch(rf"(?:ACK|DONE) {re.escape(tag)}", text.strip()) for text in texts)
+               for tag in tags):
+            return True
+        if effects.clock() >= deadline:
+            return False
+        attempts += 1
+        effects.sleep(0.1)
+    return False
+
+
+def _wait_planned_quiescence(effects: Effects, home: Path, peer: str, tags: Sequence[str],
+                             *, timeout: float = 240.0) -> tuple[Any, Mapping[str, Any]]:
+    deadline = effects.clock() + timeout
+    attempts = 0
+    chat: Any = None
+    state: Mapping[str, Any] = {}
+    while attempts < 2400:
+        chat = effects.read_chat(peer, max(50, len(tags) * 10))
+        state = dict(effects.read_state_db(home))
+        texts = [_message_text(message) for message in _walk_messages(chat)]
+        finals_present = all(any(re.fullmatch(rf"(?:ACK|DONE) {re.escape(tag)}", text.strip())
+                                 for text in texts) for tag in tags)
+        outbox_pending = any(row.get("state", row.get("status", "")).lower() in {"pending", "sending"}
+                             for row in (state.get("tables", {}).get("outbox", [])
+                                         if isinstance(state.get("tables", {}), Mapping) else [])
+                             if isinstance(row, Mapping))
+        if finals_present and not outbox_pending:
+            return chat, state
+        if effects.clock() >= deadline:
+            break
+        attempts += 1
+        effects.sleep(0.1)
+    return chat, state
+
+
 def run_drill(*, home: Path, peer: str, drill: str, effects: Effects,
-              live: bool = False) -> dict[str, Any]:
+              live: bool = False, install: bool = False) -> dict[str, Any]:
     """Run one named drill and persist its JSON evidence result."""
     home = home.expanduser().resolve()
     if live:
@@ -523,25 +746,30 @@ def run_drill(*, home: Path, peer: str, drill: str, effects: Effects,
         # Fake tests can use a temporary path while retaining the same sequence.
         if home.expanduser().resolve() == LIVE_HOME:
             safety_guard(home, peer, effects)
-    install = _install(effects, home)
-    if install.returncode != 0:
-        raise RuntimeError(f"gateway install failed: {install.stderr or install.stdout}")
+    if install:
+        install_result = _install(effects, home)
+        if install_result.returncode != 0:
+            raise RuntimeError(f"gateway install failed: {install_result.stderr or install_result.stdout}")
+    active_slot = _starting_active_slot(effects, home)
     started = effects.clock()
     message_ids: list[Any] = []
-    if drill in {"long-in-flight", "follow-up-before-lock-release", "promotion-burst", "repeated-handovers"}:
-        tags, sequence_ok, xfail_reason = _planned(effects, home, peer, drill, message_ids)
-        allow_interrupted = False
+    planned = drill in {"long-in-flight", "follow-up-before-lock-release", "promotion-burst", "repeated-handovers"}
+    if planned:
+        tags, sequence_ok, xfail_reason = _planned(effects, home, peer, drill, message_ids, active_slot)
     else:
-        tags, sequence_ok, xfail_reason = _crash(effects, home, peer, drill, message_ids)
-        allow_interrupted = True
-    chat = effects.read_chat(peer, max(50, len(tags) * 10))
-    state = dict(effects.read_state_db(home))
-    slots = state.get("slots") if isinstance(state, Mapping) else None
-    if not isinstance(slots, list):
+        tags, sequence_ok, xfail_reason = _crash(effects, home, peer, drill, message_ids, active_slot)
+    if planned:
+        chat, state_value = _wait_planned_quiescence(effects, home, peer, tags)
+        state = dict(state_value)
+    else:
+        chat = effects.read_chat(peer, max(50, len(tags) * 10))
+        state = dict(effects.read_state_db(home))
+    if not isinstance(state.get("slots"), list):
         state["slots"] = _control_slots(home)
-    evidence = assert_evidence(tags, chat, state, _logs(home), allow_interrupted=allow_interrupted)
+    evidence = assert_evidence(tags, chat, state, _logs(home), planned=planned,
+                               require_done=drill in {"long-in-flight", "follow-up-before-lock-release"})
     result = {
-        "drill": drill, "started_at": started, "finished_at": effects.clock(), "tags": tags,
+        "drill": drill, "started_at": started, "finished_at": effects.clock(), "starting_active_slot": active_slot, "tags": tags,
         "message_ids": message_ids, "sequence_ok": sequence_ok, "xfail_reason": xfail_reason,
         "assertions": evidence["assertions"],
         "passed": bool(sequence_ok and (xfail_reason or evidence["passed"])),
@@ -560,6 +788,12 @@ def run_suite(*, home: Path, peer: str, drills: str, repeat: int, effects: Effec
         "crash": ("kill-a-during-drain", "kill-b-after-promotion", "standby-fails-to-boot"),
     }
     names = groups[drills] if drills in groups else groups["planned"] + groups["crash"]
+    install = _install(effects, home)
+    if install.returncode != 0:
+        raise RuntimeError(f"gateway install failed: {install.stderr or install.stdout}")
+    slot_a_label, _slot_b_label = _slot_labels(home)
+    if not _wait_slot(effects, slot_a_label):
+        raise RuntimeError(f"slot a launchd label is not loaded: {slot_a_label}")
     results: list[dict[str, Any]] = []
     for _ in range(max(1, repeat)):
         for name in names:
