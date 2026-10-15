@@ -97,20 +97,28 @@ def resume_event(token="old", *, active="successor-token", internal=True, admiss
     return event
 
 
-def make_runner(*, pending=True, token="old", session_id="sid", event=None):
-    entry = SimpleNamespace(resume_pending=pending, resume_turn_id=token, session_id=session_id)
+def make_runner(*, pending=True, token="old", session_id="sid", event=None, predecessor=None, loop=None):
+    entry = SimpleNamespace(
+        resume_pending=pending, resume_turn_id=token, session_id=session_id,
+        resume_predecessor_turn_id=predecessor,
+    )
     store = SimpleNamespace(_lock=threading.RLock(), _ensure_loaded_locked=lambda: None, _entries={"key": entry})
     state = SimpleNamespace(turn=SimpleNamespace(event=event if event is not None else resume_event(token)))
-    return SimpleNamespace(session_store=store, _peek_session_state=lambda key: state if key == "key" else None)
+    runner = SimpleNamespace(session_store=store, _peek_session_state=lambda key: state if key == "key" else None)
+    runner._loop = loop
+    return runner
 
 
 def restore(runner, consumer, policy="continue"):
-    recovery.restore_preview(runner, SimpleNamespace(session_key="key", session_id="sid"), consumer, policy=policy)
+    recovery.restore_preview(
+        runner, SimpleNamespace(session_key="key", session_id="sid", _loop_for_step=runner._loop),
+        consumer, policy=policy,
+    )
 
 
 @pytest.mark.parametrize("pending,session_id,token,restored", [
     (True, "sid", "old", True), (False, "sid", "old", False),
-    (True, "reset-sid", "old", False), (True, "sid", "successor", True),
+    (True, "reset-sid", "old", False), (True, "sid", "successor", False),
 ])
 def test_resume_reuses_only_exact_predecessor(pending, session_id, token, restored):
     record()
@@ -202,10 +210,45 @@ def test_successor_resume_finds_predecessor_if_reown_crashed_after_marker_publis
     record(content="partial", message_id="m1")
     consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
     # The next process sees resume_turn_id=successor, but the row was never re-keyed.
-    restore(make_runner(token="successor", event=resume_event("successor", active="successor-2")), consumer)
+    restore(make_runner(
+        token="successor", predecessor="old",
+        event=resume_event("successor", active="successor-2"),
+    ), consumer)
     assert consumer.message_id == "m1"
     assert recovery.load_preview("key", "sid", "successor-2") == dict(content="partial", message_id="m1")
     assert recovery.load_preview("key", "sid", "old") is None
+
+
+def test_unrelated_stale_same_session_row_is_not_adopted():
+    """A stopped/orphaned preview cannot become the next turn's editable answer."""
+    record(turn_id="stopped", content="old stopped answer", message_id="stale-id")
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(token="crashed", predecessor=None), consumer)
+    assert consumer.message_id is None
+    assert consumer._already_sent is False
+    row = recovery.load_preview("key", "sid", "stopped")
+    assert row is not None and row["message_id"] == "stale-id"
+
+
+@pytest.mark.asyncio
+async def test_recovered_split_cleanup_runs_on_gateway_loop():
+    """Recovery cleanup must use the adapter's owning loop, not asyncio.run in the worker."""
+    gateway_loop = asyncio.get_running_loop()
+    calls = []
+
+    class LoopBoundAdapter:
+        async def delete_message(self, chat_id, message_id):
+            calls.append(asyncio.get_running_loop())
+            assert asyncio.get_running_loop() is gateway_loop
+            return True
+
+    recovery.record_split_preview(
+        turn_id="old", session_key="key", session_id="sid", message_ids=["head-id"],
+    )
+    consumer = GatewayStreamConsumer(LoopBoundAdapter(), "chat")
+    runner = make_runner(token="old", loop=gateway_loop)
+    await asyncio.to_thread(restore, runner, consumer)
+    assert calls == [gateway_loop]
 
 
 @pytest.mark.asyncio

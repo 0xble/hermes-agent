@@ -25,6 +25,24 @@ _PREVIEW_RETENTION_SECONDS = 86400 * 7
 _prepared_paths: set[str] = set()
 _prepared_lock = threading.Lock()
 _SPLIT_PREVIEW_PREFIX = "\x00hermes-split-preview:"
+
+
+def _delete_recovered_previews(ctx, delete, message_ids, *, label: str) -> None:
+    """Run adapter cleanup on the gateway loop that owns its async transport."""
+    loop = getattr(ctx, "_loop_for_step", None)
+    if loop is not None and loop.is_running():
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        if current is not loop:
+            asyncio.run_coroutine_threadsafe(
+                delete(message_ids, label=label, skip_sentinel=False), loop,
+            ).result(timeout=10)
+            return
+    asyncio.run(delete(message_ids, label=label, skip_sentinel=False))
+
+
 _REPLACEMENT_PREVIEW_PREFIX = "\x00hermes-replacement-preview:"
 
 
@@ -181,7 +199,8 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
     # by resume_turn_id. Keep it reachable by session identity until re-owning it.
     if not preview:
         rows = _load_session_preview_rows(ctx.session_key, ctx.session_id)
-        if len(rows) == 1:
+        predecessor = getattr(entry, "resume_predecessor_turn_id", None)
+        if len(rows) == 1 and predecessor and rows[0]["turn_id"] == predecessor:
             preview = rows[0]
     if not preview:
         return
@@ -196,8 +215,9 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         delete = getattr(consumer, "_delete_previews", None)
         if delete and stale_ids:
             try:
-                asyncio.run(delete(list(dict.fromkeys(stale_ids)), label="Recovered replacement preview",
-                                    skip_sentinel=False))
+                _delete_recovered_previews(
+                    ctx, delete, list(dict.fromkeys(stale_ids)), label="Recovered replacement preview",
+                )
             except Exception:
                 logger.warning("Could not clean recovered replacement preview for %s", ctx.session_key,
                                exc_info=True)
@@ -215,11 +235,10 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         delete = getattr(consumer, "_delete_previews", None)
         if delete and head_ids:
             try:
-                asyncio.run(delete(head_ids, label="Recovered split heads", skip_sentinel=False))
+                _delete_recovered_previews(ctx, delete, head_ids, label="Recovered split heads")
             except Exception:
                 logger.warning("Could not clean recovered split heads for %s", ctx.session_key, exc_info=True)
         discard_preview(token)
-        consumer._recovered_split_delivery = True
         return
     # Re-own the row under this resumed turn's own active token: if it crashes too,
     # promotion makes that token the next resume_turn_id and recovery still finds it.
