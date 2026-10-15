@@ -231,6 +231,89 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_recovered_followup_is_persisted_before_proxy_and_not_duplicated(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+
+        class _Store:
+            def __init__(self):
+                self.rows = []
+
+            async def has_platform_message_id(self, session_id, platform_message_id):
+                return any(row.get("platform_message_id") == platform_message_id for row in self.rows)
+
+            async def append_to_transcript(self, session_id, row, **kwargs):
+                self.rows.append(dict(row))
+
+        store = _Store()
+        monkeypatch.setattr(GatewayRunner, "async_session_store", property(lambda _self: store))
+        proxy_called = False
+
+        async def _proxy(**kwargs):
+            nonlocal proxy_called
+            assert store.rows == [
+                {
+                    "role": "user",
+                    "content": "recovered follow-up",
+                    "timestamp": 123.0,
+                    "platform_message_id": "hermes-recovery-123",
+                }
+            ]
+            proxy_called = True
+            return {
+                "final_response": "remote answer",
+                "messages": [
+                    {"role": "user", "content": "recovered follow-up"},
+                    {"role": "assistant", "content": "remote answer"},
+                ],
+                "history_offset": 0,
+                "tools": [],
+            }
+
+        runner._run_agent_via_proxy = _proxy
+        result = await runner._run_agent_inner(
+            message="recovered follow-up",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="test-session-123",
+            session_key="test-key",
+            run_generation=7,
+            recovery_id="hermes-recovery-123",
+            persist_user_message="recovered follow-up",
+            persist_user_timestamp=123.0,
+        )
+
+        assert proxy_called
+        assert result["_gateway_user_turn_persisted"] is True
+        runner._session_db_pinned = None
+        runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        await runner._hmwa_persist_turn_transcript(
+            event=types.SimpleNamespace(
+                message_id=None, _hermes_recovery_id="hermes-recovery-123", internal=True,
+            ),
+            source=source,
+            session_entry=types.SimpleNamespace(session_id="test-session-123", session_key="test-key"),
+            session_key="test-key",
+            agent_result=result,
+            agent_messages=result["messages"],
+            prepared=types.SimpleNamespace(
+                history=[], message_text="recovered follow-up", persist_user_message="recovered follow-up",
+                persist_user_timestamp=123.0, persist_user_display_kind=None, persistence_owner=None,
+                hygiene_adoption_epoch=0,
+            ),
+            response="remote answer",
+            agent_failed_early=False,
+            hidden_reasoning_incomplete=False,
+            is_context_overflow_failure=False,
+        )
+        # The turn-start write is the sole user row; closeout contributes only session metadata and assistant.
+        assert len([row for row in store.rows if row.get("role") == "user"]) == 1
+        assert len([row for row in store.rows if row.get("role") == "assistant"]) == 1
+
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
 

@@ -2004,6 +2004,44 @@ class GatewayTurnMixin:
             _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
+    async def _hmwa_persist_proxy_recovery_user_row(
+        self, *, session_id: str, message: str, inbound_message_id: Optional[str],
+        recovery_id: Optional[str], recovery_session_key: Optional[str],
+        persist_user_message: Optional[Any], persist_user_timestamp: Optional[float],
+        persist_user_display_kind: Optional[str], persist_user_display_metadata: Optional[dict],
+    ) -> bool:
+        """Persist a recovered proxy turn's user row before the remote model can run.
+
+        The local gateway owns restart durability even when execution is delegated. The marker on
+        the result lets the normal gateway closeout append only the assistant side of the proxy
+        response, avoiding a second user row.
+        """
+        if recovery_id is None and recovery_session_key is None:
+            return False
+        store = self.async_session_store
+        platform_message_id = inbound_message_id or recovery_id or recovery_session_key
+        row = {
+            "role": "user",
+            "content": persist_user_message if persist_user_message is not None else message,
+            "timestamp": persist_user_timestamp if persist_user_timestamp is not None else time.time(),
+        }
+        if platform_message_id is not None:
+            row["platform_message_id"] = str(platform_message_id)
+        if persist_user_display_kind:
+            row["display_kind"] = persist_user_display_kind
+        if isinstance(persist_user_display_metadata, dict):
+            row["display_metadata"] = dict(persist_user_display_metadata)
+        if platform_message_id is not None:
+            probe = getattr(store, "has_platform_message_id", None)
+            if callable(probe):
+                already_present = probe(session_id, str(platform_message_id))
+                if inspect.isawaitable(already_present):
+                    already_present = await already_present
+                if already_present:
+                    return True
+        await store.append_to_transcript(session_id, row)
+        return True
+
     async def _hmwa_store_turn_prompt_tokens(
         self, store, entry_key, session_key, last_prompt_tokens, turn_epoch, *, touch_activity,
     ):
@@ -2045,6 +2083,7 @@ class GatewayTurnMixin:
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        _proxy_user_row_persisted = bool(agent_result.get("_gateway_user_turn_persisted"))
 
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
@@ -2063,7 +2102,9 @@ class GatewayTurnMixin:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                if _proxy_user_row_persisted:
+                    pass
+                elif event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
@@ -2080,7 +2121,8 @@ class GatewayTurnMixin:
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    if not _proxy_user_row_persisted:
+                        await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         await store.append_to_transcript(
                             sid, {"role": "assistant", "content": response, "timestamp": ts},
@@ -2090,9 +2132,13 @@ class GatewayTurnMixin:
                     # Attach the inbound platform message_id to the first user entry so platform-level
                     # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
                     _user_msg_id_attached = False
+                    _proxy_user_row_skipped = False
                     for msg in new_messages:
                         if msg.get("role") == "system":
                             continue  # rebuilt each run
+                        if _proxy_user_row_persisted and msg.get("role") == "user" and not _proxy_user_row_skipped:
+                            _proxy_user_row_skipped = True
+                            continue
                         entry = {**msg, "timestamp": ts}
                         if (
                             not _user_msg_id_attached
@@ -2267,6 +2313,14 @@ class GatewayTurnMixin:
                 _owned = await self.async_session_store.has_input_owner(
                     prepared.persistence_session_id, prepared.persistence_owner,
                 )
+                if not _owned:
+                    _platform_message_id = getattr(event, "message_id", None) or getattr(
+                        event, "_hermes_recovery_id", None,
+                    )
+                    if _platform_message_id:
+                        _owned = await self.async_session_store.has_platform_message_id(
+                            session_entry.session_id, str(_platform_message_id),
+                        )
                 if not _owned:
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
@@ -2543,6 +2597,7 @@ class GatewayTurnMixin:
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 recovery_id=getattr(event, "_hermes_recovery_id", None),
+                recovery_session_key=getattr(event, "_hermes_recovery_session_key", None),
                 channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
@@ -4777,7 +4832,7 @@ class GatewayTurnMixin:
         source: SessionSource, session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
-        recovery_id: Optional[str] = None,
+        recovery_id: Optional[str] = None, recovery_session_key: Optional[str] = None,
         channel_prompt: Optional[str] = None, internal: bool = False, event_metadata: Optional[dict] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
@@ -4794,12 +4849,23 @@ class GatewayTurnMixin:
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
             # Local-only recovery: the proxy API requires a new non-empty conversation row,
-            # not the empty internal continuation. Preserve its existing human silence fallback.
-            return await self._run_agent_via_proxy(
+            # not the empty internal continuation. Persist the recovered input before dispatch
+            # so a gateway crash cannot replay its side effects on the next boot.
+            _proxy_user_row_persisted = await self._hmwa_persist_proxy_recovery_user_row(
+                session_id=session_id, message=message, inbound_message_id=inbound_message_id,
+                recovery_id=recovery_id, recovery_session_key=recovery_session_key,
+                persist_user_message=persist_user_message, persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
+            )
+            _proxy_result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            if _proxy_user_row_persisted:
+                _proxy_result["_gateway_user_turn_persisted"] = True
+            return _proxy_result
 
         from run_agent import AIAgent
 
