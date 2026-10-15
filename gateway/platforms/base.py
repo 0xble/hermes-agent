@@ -2467,8 +2467,8 @@ class BasePlatformAdapter(ABC):
         ``--replace`` connect (the status module validates ownership and terminates)."""
         from gateway.status import (
             acquire_scoped_lock, scoped_lock_owner_label, take_over_scoped_lock_holder)
-        self._platform_lock_scope, self._platform_lock_identity = scope, identity
-        lock_meta = {"platform": self.platform.value}
+        self._platform_lock_scope, self._platform_lock_identity, self._platform_lock_nonce = scope, identity, uuid.uuid4().hex
+        lock_meta = {"platform": self.platform.value, "nonce": self._platform_lock_nonce}  # nonce: per-acquire owner
         acquired, existing = acquire_scoped_lock(scope, identity, metadata=lock_meta)
         if acquired:
             return True

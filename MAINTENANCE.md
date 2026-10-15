@@ -174,6 +174,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Agent friction repairs | Preserve unread pending tool results during dedupe and tell execute_code when an LRU kernel eviction discarded state | Context-pruning dedupe, session-kernel eviction, or their regression tests | [Agent friction repairs](maintenance/agent-friction-repairs.md) |
 | Secret-safe provider diagnostics | Check the selected custom HTTP endpoint without exposing credentials through argv, responses or logs | Provider diagnostic helper, credential resolution or output/logging changes | [Secret-safe provider diagnostics](maintenance/io-safe-provider-probe.md) |
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+| Deferred local tool_call batching | Multi-entry local `tool_call` batches run losslessly, bounded and interruptible through each entry's ordinary pipeline, with entry-indexed, non-misleading errors | Tool Search bridge, `tool_call` batching, local batch splitter, or connector batch dispatch changes | [Deferred local batch](maintenance/deferred-local-batch.md) |
 
 ## Active patch record: relay silence (S1)
 
