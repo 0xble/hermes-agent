@@ -90,13 +90,11 @@ those resume turns resolved to `ask`; the journal row and resume token were
 correct. The harness now carries the global policy and per-platform `extra`
 through its child config.
 
-Current verification on `d71da74fe3d9`:
+Current verification on `789e731fcc31`:
 
-- E2E crash matrix: `7 passed, 0 failed` (`161.9s`):
-  `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/e2e/core/delivery/test_messaging_exactly_once.py -k test_crash_between_completion_and_send`
-- Stream recovery and consumer units: `105 passed, 0 failed` (`26.1s`):
-  `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/gateway/test_stream_recovery.py tests/gateway/test_stream_consumer.py tests/gateway/test_stream_consumer_transport.py`
-- Python compile check: passed for all changed gateway and harness/test modules.
+- The successor fence remains negative for unrelated same-session rows; the only-row fallback now requires the durable `resume_predecessor_turn_id` chain token. A crash after successor active-token publication can still adopt the predecessor row because startup promotion records that predecessor before replacing `resume_turn_id`.
+- Replacement-intent recovery deletes stale IDs and buffers the resumed answer; split-marker recovery deletes sealed heads before retrying. Both cleanup paths schedule adapter deletes on the gateway loop that owns the transport.
+- The regression suite adds a loop-bound adapter test for split-head cleanup and a stale stopped/orphaned-row rejection test.
 
 Preview journal connections use a 250 ms busy timeout so state-db contention
 cannot hold a stream edit behind the delivery ledger's 10 s timeout. Every
