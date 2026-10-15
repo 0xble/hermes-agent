@@ -138,6 +138,57 @@ async def test_retrigger_has_at_most_one_in_flight_per_chat():
 
 
 @pytest.mark.asyncio
+async def test_zero_interval_still_collapses_a_burst_behind_the_inflight_rearm():
+    """0 removes the time window only: a burst during an in-flight re-arm still yields one trailing re-arm."""
+    adapter = _make_adapter()
+    adapter._telegram_typing_retrigger_interval = 0.0
+    started = asyncio.Event()
+    release = asyncio.Event()
+    entries = 0
+
+    async def blocking_typing(chat_id, metadata=None):
+        nonlocal entries
+        entries += 1
+        started.set()
+        await release.wait()
+
+    adapter.send_typing = blocking_typing
+
+    assert (await adapter.send("123", "chunk 0")).success
+    await asyncio.wait_for(started.wait(), timeout=1)
+    for i in range(1, 5):
+        assert (await adapter.send("123", f"chunk {i}")).success
+    await asyncio.sleep(0.1)
+    assert entries == 1
+
+    release.set()
+    await _drain(adapter)
+
+    assert entries == 2
+    assert len([t for t in adapter._background_tasks if not t.done()]) == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_interval_rearms_each_spaced_send():
+    """With 0 and no re-arm in flight, every intermediate send gets its own immediate re-arm."""
+    adapter = _make_adapter()
+    adapter._telegram_typing_retrigger_interval = 0.0
+    calls = 0
+
+    async def typing(chat_id, metadata=None):
+        nonlocal calls
+        calls += 1
+
+    adapter.send_typing = typing
+
+    for i in range(3):
+        assert (await adapter.send("123", f"chunk {i}")).success
+        await _drain(adapter)
+
+    assert calls == 3
+
+
+@pytest.mark.asyncio
 async def test_pause_before_edit_only_finalize_cancels_trailing_rearm():
     """The stream consumer pauses typing, then finalizes by edit (no notify send): no re-arm may follow."""
     adapter = _make_adapter()

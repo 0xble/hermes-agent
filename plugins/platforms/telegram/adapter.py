@@ -1061,7 +1061,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._telegram_typing_retrigger_trailing_tasks: Dict[tuple[str, Optional[str]], asyncio.Task] = {}
         self._telegram_typing_retrigger_at: Dict[tuple[str, Optional[str]], float] = {}
         # Telegram's bubble lasts ~5s and _keep_typing refreshes at the configured 4.5s cadence, so
-        # the re-arm covers the gap left by a landed message. 0 restores a call per intermediate send.
+        # the re-arm covers the gap left by a landed message. 0 removes the time window; a re-arm
+        # already in flight for the topic still absorbs a burst, so there is never more than one.
         self._telegram_typing_retrigger_interval: float = self._coerce_float_extra(
             "typing_retrigger_min_interval_seconds", 2.0, min_value=0.0, max_value=30.0)
         # Buffer album/photo bursts into a single MessageEvent instead of self-interrupting turns.
