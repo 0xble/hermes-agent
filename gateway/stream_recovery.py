@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # A contended state writer must never hold a stream edit behind the ledger's 10 s timeout.
 _PREVIEW_BUSY_TIMEOUT_MS = 250
+# The resume re-own runs once per recovery on the worker thread, off the edit hot path,
+# so it may wait as long as the delivery ledger does instead of losing ownership to contention.
+_REOWN_BUSY_TIMEOUT_MS = 10_000
 _PREVIEW_RETENTION_SECONDS = 86400 * 7
 # State DB paths whose table this process has created and purged once (not per write).
 _prepared_paths: set[str] = set()
@@ -84,7 +87,7 @@ def _prepare_journal(conn):
                  (time.time() - _PREVIEW_RETENTION_SECONDS,))
 
 
-def _journal(op):
+def _journal(op, *, busy_timeout_ms=_PREVIEW_BUSY_TIMEOUT_MS):
     """Run ``op(conn)`` in one commit-and-ALWAYS-close transaction (#69567: ``with conn:`` leaks fds).
 
     The table is created and the retention purge runs once per DB path per process, not on
@@ -100,7 +103,7 @@ def _journal(op):
             prepare = path not in _prepared_paths
         try:
             with transaction(open_db(path, db_label="state.db (stream previews)", row_factory=None,
-                                     busy_timeout_ms=_PREVIEW_BUSY_TIMEOUT_MS,
+                                     busy_timeout_ms=busy_timeout_ms,
                                      initialize=_prepare_journal if prepare else None)) as conn:
                 result = op(conn)
         except sqlite3.OperationalError as err:
@@ -260,6 +263,7 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
     if getattr(event, "_outbox_admission_id", None) != resume_admission_id(token):
         return
     preview = _load_preview_row(ctx.session_key, ctx.session_id, token)
+    via_predecessor = False
     # If the process died after publishing the successor active-turn token but
     # before the preview re-key transaction, startup promotion records the
     # predecessor token and keeps that exact chained row reachable.
@@ -268,6 +272,7 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
         predecessor = getattr(entry, "resume_predecessor_turn_id", None)
         if len(rows) == 1 and predecessor and rows[0]["turn_id"] == predecessor:
             preview = rows[0]
+            via_predecessor = True
     if not preview:
         return
     if isinstance(preview.get("content"), str) and preview["content"].startswith(_REPLACEMENT_PREVIEW_PREFIX):
@@ -304,7 +309,8 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
                 _delete_recovered_previews(ctx, delete, head_ids, label="Recovered split heads")
             except Exception:
                 logger.warning("Could not clean recovered split heads for %s", ctx.session_key, exc_info=True)
-        discard_preview(token)
+        # The found row may be the predecessor's, not this resume token's.
+        discard_preview(preview["turn_id"])
         return
     # Re-own the row under this resumed turn's own active token: if it crashes too,
     # promotion makes that token the next resume_turn_id and recovery still finds it.
@@ -326,9 +332,16 @@ def restore_preview(runner, ctx, consumer, *, policy=None):
                     (successor, ctx.session_key, ctx.session_id, preview["content"],
                      preview["message_id"], now))
                 conn.execute("DELETE FROM streamed_previews WHERE turn_id = ?", (predecessor,))
-            _journal(_reown)
+            _journal(_reown, busy_timeout_ms=_REOWN_BUSY_TIMEOUT_MS)
         except Exception:
             logger.warning("Could not re-own streamed preview for %s", ctx.session_key, exc_info=True)
+            if via_predecessor:
+                # The row is keyed by the predecessor, which the next promotion would
+                # forget: another crash could not find it again. Leave it in place and
+                # treat this turn like an ACK-lost send rather than adopt an unreachable owner.
+                consumer._recovered_send_uncertain = True
+                consumer.cfg.buffer_only = True
+                return
     if not preview["message_id"]:
         # The platform may hold this send, but without its ACK there is no ID
         # to reconcile. Re-run the unfinished turn and label its completed reply;

@@ -220,12 +220,12 @@ def test_failed_reown_keeps_the_predecessor_row(monkeypatch):
     real_journal = recovery._journal
     calls = 0
 
-    def locked(op):
+    def locked(op, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:  # the re-own transaction, after the preview read
             raise RuntimeError("state.db is locked")
-        return real_journal(op)
+        return real_journal(op, **kwargs)
 
     monkeypatch.setattr(recovery, "_journal", locked)
     consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
@@ -246,6 +246,61 @@ def test_successor_resume_finds_predecessor_if_reown_crashed_after_marker_publis
     ), consumer)
     assert consumer.message_id == "m1"
     assert recovery.load_preview("key", "sid", "successor-2") == dict(content="partial", message_id="m1")
+    assert recovery.load_preview("key", "sid", "old") is None
+
+
+def test_failed_reown_of_predecessor_row_is_not_adopted(monkeypatch):
+    """A predecessor-keyed row that cannot be re-owned would be unreachable after another crash."""
+    record(content="partial", message_id="m1")
+    real_journal = recovery._journal
+
+    def locked(op, **kwargs):
+        if getattr(op, "__name__", "") == "_reown":
+            raise RuntimeError("state.db is locked")
+        return real_journal(op, **kwargs)
+
+    monkeypatch.setattr(recovery, "_journal", locked)
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(
+        token="successor", predecessor="old",
+        event=resume_event("successor", active="successor-2"),
+    ), consumer)
+    monkeypatch.setattr(recovery, "_journal", real_journal)
+    assert consumer.message_id is None
+    assert consumer._already_sent is False
+    assert consumer._recovered_send_uncertain is True
+    assert consumer.cfg.buffer_only is True
+    # The row stays under its existing key, so the predecessor fallback can still reach it.
+    assert recovery.load_preview("key", "sid", "old") == dict(content="partial", message_id="m1")
+    assert recovery.load_preview("key", "sid", "successor-2") is None
+
+
+def test_reown_uses_the_long_busy_timeout(monkeypatch):
+    record(content="partial", message_id="m1")
+    real_journal = recovery._journal
+    seen = []
+
+    def spy(op, **kwargs):
+        if getattr(op, "__name__", "") == "_reown":
+            seen.append(kwargs.get("busy_timeout_ms"))
+        return real_journal(op, **kwargs)
+
+    monkeypatch.setattr(recovery, "_journal", spy)
+    restore(make_runner(event=resume_event("old", active="turn-2")), GatewayStreamConsumer(SimpleNamespace(), "chat"))
+    assert seen == [recovery._REOWN_BUSY_TIMEOUT_MS]
+    assert recovery._REOWN_BUSY_TIMEOUT_MS > recovery._PREVIEW_BUSY_TIMEOUT_MS
+
+
+def test_split_marker_found_via_predecessor_is_discarded():
+    recovery.record_split_preview(
+        turn_id="old", session_key="key", session_id="sid", message_ids=["head-id"],
+    )
+    consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
+    restore(make_runner(
+        token="successor", predecessor="old",
+        event=resume_event("successor", active="successor-2"),
+    ), consumer)
+    assert consumer.message_id is None
     assert recovery.load_preview("key", "sid", "old") is None
 
 
