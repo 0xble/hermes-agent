@@ -30,11 +30,19 @@ def test_registered_agent_origin_headers_match_only_at_message_edges():
 
 
 def test_fyi_relay_envelope_requires_footer_and_no_task():
-    fyi = "Title\nBrief\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]"
+    fyi = "📨 Title\nBrief\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]"
     assert is_fyi_relay_text(fyi)
     assert not is_fyi_relay_text(fyi.replace("receipt=r1", "receipt=r1 task=t1"))
     assert not is_fyi_relay_text(fyi + "\n\nuser typed text")
     assert not is_fyi_relay_text(fyi.replace(" · FYI, no action requested", ""))
+
+
+def test_fyi_relay_requires_one_complete_envelope():
+    fyi = "📨 Title\nBrief\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]"
+    assert is_fyi_relay_text("📨 Title\nBrief\n---\nDetailed context\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]")
+    assert not is_fyi_relay_text(f"Question from the user\n\n{fyi}")
+    assert not is_fyi_relay_text(f"{fyi}\n\n{fyi.replace('receipt=r1', 'receipt=r2')}")
+    assert not is_fyi_relay_text(fyi.replace("📨 Title", "Title"))
 
 
 def test_exact_silence_tokens_are_intentional_silence():

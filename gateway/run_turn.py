@@ -2205,6 +2205,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
+        # A drained passive FYI is admitted during _run_agent, but its row must follow every row from
+        # this outer turn, including session_meta and the failed-turn closing notice.
+        for passive_event in agent_result.pop("_deferred_passive_fyi_events", []):
+            if await self._hm_try_passive_fyi_relay(
+                passive_event, passive_event.source, session_key, after_turn=True,
+            ):
+                continue
+            requeue = getattr(self, "_queue_or_replace_pending_event", None)
+            if callable(requeue):
+                requeue(session_key, passive_event)
+            else:
+                logger.warning("Dropping deferred passive FYI with no pending-event queue: %s", session_key)
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -4119,12 +4132,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
             if pending_event and await self._hm_try_passive_fyi_relay(
-                pending_event, pending_event.source, session_key, after_turn=True,
+                pending_event, pending_event.source, session_key, after_turn=True, defer=True,
             ):
-                # Passive FYIs are already durable in transcript order after the completed turn. Do not
-                # hand them to _run_agent_queued_followup: that path is a real model turn and would make
-                # a busy-session FYI behave differently from an idle one.
-                pending_event = None
+                # The passive event is admitted now but written only after the outer turn's transcript
+                # persistence, so session_meta/user/assistant/failed-turn rows stay ahead of it.
+                if isinstance(result, dict):
+                    result.setdefault("_deferred_passive_fyi_events", []).append(pending_event)
+                else:
+                    logger.warning("Cannot defer passive FYI after non-dict turn result; requeueing it")
+                    self._queue_or_replace_pending_event(session_key, pending_event)
+                # Passive FYIs are admitted without a follow-up model turn.
+                return None, pending
             elif result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if result.get("interrupt_source") or _is_control_interrupt_message(interrupt_message):

@@ -20,6 +20,18 @@ _RELAY_HEADER_RE = re.compile(
     r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?P<task> task=[^\s\]]+)?\]"
 )
 _RELAY_FYI_FOOTER_RE = re.compile(r"From: .+ · FYI, no action requested")
+_RELAY_TITLE_RE = re.compile(r"^(?P<emoji>\S+) (?P<title>\S.*)$")
+
+
+def _is_single_emoji(token: str) -> bool:
+    """Accept the single-symbol emoji prefix emitted by relay titles."""
+    if not token:
+        return False
+    base = token[0]
+    if unicodedata.category(base) not in {"So", "Sk"}:
+        return False
+    return all(char in {"\ufe0f", "\u200d"} or unicodedata.category(char) in {"Mn", "Sk"}
+               for char in token[1:])
 
 
 def is_agent_origin_text(text: Any) -> bool:
@@ -38,18 +50,28 @@ def is_agent_origin_text(text: Any) -> bool:
 
 
 def is_fyi_relay_text(text: Any) -> bool:
-    """True only for one complete relay FYI envelope, with no task or typed tail."""
+    """True only for one complete, unaddressed relay FYI envelope."""
     if not isinstance(text, str):
         return False
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 2:
+    if len(lines) < 4:
         return False
     header = _RELAY_HEADER_RE.fullmatch(lines[-1])
-    return bool(
-        header is not None
-        and not header.group("task")
-        and _RELAY_FYI_FOOTER_RE.fullmatch(lines[-2])
-    )
+    if header is None or header.group("task"):
+        return False
+    if sum(bool(_RELAY_HEADER_RE.fullmatch(line)) for line in lines) != 1:
+        return False
+    if not _RELAY_FYI_FOOTER_RE.fullmatch(lines[-2]):
+        return False
+    title = _RELAY_TITLE_RE.fullmatch(lines[0])
+    if title is None or not _is_single_emoji(title.group("emoji")):
+        return False
+    if lines[1] in {"---", "From:"}:
+        return False
+    details = lines[2:-2]
+    if details and (details[0] != "---" or len(details) == 1):
+        return False
+    return True
 
 
 def apply_agent_origin_reply_expectation(event: Any) -> Any:

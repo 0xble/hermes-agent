@@ -907,7 +907,7 @@ class GatewayBusySessionMixin:
         if not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
-        if await getattr(self, "_hm_try_passive_fyi_relay")(event, event.source, session_key, busy=True):
+        if await self._hm_try_passive_fyi_relay(event, event.source, session_key, busy=True):
             return True
 
         if await self._route_plaintext_approval_while_busy(event, session_key):
