@@ -903,7 +903,12 @@ class LoopManager(LoopRevisionsMixin):
             if state is None or state.status != "active" or state.awaiting_response:
                 return False
             now = time.time()
-            if state.next_due_at <= now or state.ticks_fired <= state.last_external_wake_tick:
+            minimum_gap = state.interval_seconds or self_paced_floor_seconds()
+            if (
+                state.next_due_at <= now
+                or state.ticks_fired <= state.last_external_wake_tick
+                or (state.last_fired_at and now - state.last_fired_at < minimum_gap)
+            ):
                 return False
             state.next_due_at = now
             state.last_external_wake_tick = state.ticks_fired

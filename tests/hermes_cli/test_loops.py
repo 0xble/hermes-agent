@@ -944,6 +944,8 @@ class TestSelfPacedBackoff:
         assert fresh.fire_tick() is None
         assert wake_loop_for_external_event("external-wake") is False
         fresh.complete_tick("changed evidence")
+        assert fresh.state is not None
+        fresh.state.last_fired_at = time.time() - 61
         fresh.state.next_due_at = time.time() + 60 * 60
         fresh._save()
         assert wake_loop_for_external_event("external-wake") is True
