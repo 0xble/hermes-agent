@@ -359,6 +359,7 @@ class TestGoalManager:
             ("must not be merged until Brian approves", "active", True, False),
             ("the release must not be merged until Brian approves", "active", True, False),
             ("already merged despite the constraint", "paused", False, True),
+            ("already merged even though it must not have been", "paused", False, True),
         ],
     )
     def test_blocked_approval_waits_but_completed_constraint_breach_pauses(

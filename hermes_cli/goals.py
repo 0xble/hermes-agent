@@ -1690,7 +1690,7 @@ _BLOCKED_PAUSE_RE = re.compile(
     r"nothing (?:left|more) to try|no remaining (?:options|approaches))\b"
     # A completed action next to a prohibition is a breach; the prohibition alone is not.
     r"|\b(?:merged|sent|deleted|published|posted|paid|pushed|removed|dropped|wiped)\b[^.;]{0,80}"
-    r"\b(?:forbid\w*|prohibit\w*|constraints?)\b",
+    r"\b(?:forbid\w*|prohibit\w*|constraints?|must not)\b",
     re.I,
 )
 # BLOCKED reasons that only need the user's answer, approval or decision.
