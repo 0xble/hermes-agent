@@ -396,3 +396,36 @@ def test_real_platform_lock_acquire_records_a_fresh_nonce_each_time(monkeypatch,
     assert first._platform_lock_nonce != second._platform_lock_nonce
     assert _lock_owner_nonce(first) == second._platform_lock_nonce
     assert status._get_scope_lock_path("telegram-bot-token", "token").exists()
+
+
+def test_detached_disconnect_spares_same_adapter_reacquire(monkeypatch, tmp_path):
+    """If this very adapter re-acquires before its old teardown finishes, the new lock survives."""
+    from gateway import status
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path))
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
+    adapter._platform_lock_takeover_allowed = False
+    adapter._platform_lock_takeover_attempted = False
+    assert adapter._acquire_platform_lock("telegram-bot-token", "token", "Telegram bot token")
+    lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
+
+    async def scenario():
+        finish = asyncio.Event()
+
+        async def teardown(*, zero_cut_handover):
+            await finish.wait()
+            zero_cut_handover()
+
+        outer = asyncio.ensure_future(run_disconnect(adapter, teardown))
+        await asyncio.sleep(0)
+        outer.cancel()  # the gateway's disconnect budget gives up
+        await asyncio.sleep(0.01)
+        assert adapter._acquire_platform_lock("telegram-bot-token", "token", "Telegram bot token")
+        finish.set()
+        await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+    assert lock_path.exists()
+    assert adapter._platform_lock_identity == "token"

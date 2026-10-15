@@ -35,15 +35,15 @@ async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) ->
     if not is_zero_cut_handover_enabled(runner_config):
         await disconnect(zero_cut_handover=None)
         return
+    own = getattr(adapter, "_platform_lock_nonce", None)  # captured now: a later reacquire must not count
 
     def release() -> None:
-        own = getattr(adapter, "_platform_lock_nonce", None)
         current = _lock_owner_nonce(adapter)
         if own is None or current == own:
             adapter._release_platform_lock()
-        elif current is not None:
-            adapter._platform_lock_identity = None  # a successor re-acquired the record
-        # Unreadable record: keep the identity so a later release can still clean it up.
+        elif current is not None and getattr(adapter, "_platform_lock_nonce", None) == own:
+            adapter._platform_lock_identity = None  # another adapter re-acquired the record
+        # Unreadable record, or this adapter re-acquired: leave the identity for its later release.
 
     def release_after(task: asyncio.Future) -> None:
         _DETACHED_TEARDOWNS.discard(task)
