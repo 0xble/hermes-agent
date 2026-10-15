@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
-from gateway.gateway_slot import process_slot_filename, sibling_lock_name
+from gateway.gateway_slot import effective_gateway_slot, process_slot_filename, sibling_lock_name, slot_filename
 from gateway.status_inline_source import (
     command_line_runs_inline_source, inline_bootstrap_argv, inline_source_flag_index)
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
@@ -311,7 +311,7 @@ def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
 
 
 def _get_runtime_status_path() -> Path:
-    return _get_process_hermes_home() / _RUNTIME_STATUS_FILE
+    return _get_process_hermes_home() / process_slot_filename(_RUNTIME_STATUS_FILE)
 
 
 def _get_lock_dir() -> Path:
@@ -1660,11 +1660,12 @@ def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
 
 
 def _get_planned_stop_marker_path() -> Path:
-    return _get_process_hermes_home() / _PLANNED_STOP_MARKER_FILENAME
+    return _get_process_hermes_home() / process_slot_filename(_PLANNED_STOP_MARKER_FILENAME)
 
 
-def _get_planned_restart_marker_path(hermes_home: Optional[Path] = None) -> Path:
-    return (hermes_home or _get_process_hermes_home()) / _PLANNED_RESTART_MARKER_FILENAME
+def _get_planned_restart_marker_path(hermes_home: Optional[Path] = None, *, slot: Optional[str] = None) -> Path:
+    home = hermes_home or _get_process_hermes_home()
+    return home / slot_filename(_PLANNED_RESTART_MARKER_FILENAME, effective_gateway_slot() if slot is None else slot)
 
 
 def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
@@ -1952,11 +1953,10 @@ def _terminate_verified_owner(
     return None
 
 
-def write_planned_stop_marker(target_pid: int) -> bool:
-    """Record that ``target_pid`` is being stopped intentionally: unexpected SIGTERM exits non-zero
-    so service managers revive the gateway; the CLI writes this first so a deliberate stop exits
-    cleanly."""
-    return _write_marker(_get_planned_stop_marker_path(), {
+def write_planned_stop_marker(target_pid: int, *, slot: str = "a") -> bool:
+    """Record a deliberate stop marker so launchd does not treat SIGTERM as a crash."""
+    return _write_marker(_get_planned_stop_marker_path() if slot == effective_gateway_slot() else
+                         _get_process_hermes_home() / slot_filename(_PLANNED_STOP_MARKER_FILENAME, slot), {
         "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
         "stopper_pid": os.getpid(), "written_at": _utc_now_iso(),
     })
@@ -2013,12 +2013,10 @@ def consume_planned_stop_marker_for_self() -> bool:
                                             keep=True, on_consume=update_pause_record.mark_stop_accepted)
 
 
-def write_planned_restart_marker(target_pid: int, *, hermes_home: Optional[Path] = None) -> bool:
-    """Record that ``target_pid`` is about to be booted out only so launchd re-reads its plist. The
-    bootout SIGTERM then takes the bounded restart path instead of the unplanned-signal shutdown.
-    ``hermes_home`` names the target's home when the writer's own home differs (guardian)."""
+def write_planned_restart_marker(target_pid: int, *, hermes_home: Optional[Path] = None, slot: str = "a") -> bool:
+    """Record a planned service reload marker for ``target_pid``."""
     marker_home = _canonical_hermes_home(hermes_home or _get_process_hermes_home())
-    return _write_marker(_get_planned_restart_marker_path(marker_home), {
+    return _write_marker(_get_planned_restart_marker_path(marker_home, slot=slot), {
         "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
         "target_hermes_home": str(marker_home), "writer_pid": os.getpid(),
         "written_at": _utc_now_iso(),
