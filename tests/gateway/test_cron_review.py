@@ -197,17 +197,21 @@ async def test_waited_review_is_refused_once_the_gateway_starts_draining(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_expired_review_queued_behind_a_human_turn_never_runs():
+async def test_review_reaching_a_busy_session_fails_its_capture_and_never_queues():
     adapter = Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
     adapter.sent = []
-    adapter.send_typing = AsyncMock()
     adapter.set_message_handler(AsyncMock(return_value="PRESENT"))
+    busy_handler = AsyncMock(return_value=True)
+    adapter._busy_session_handler = busy_handler
     capture = Future()
-    capture.cancel()  # the caller's deadline already passed
     event = MessageEvent(text="review", source=SessionSource(
         platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="139328"),
         internal=True, reply_expected=False, allow_gateway_control=False,
         metadata={"_cron_review_capture": capture})
-    await adapter._process_message_background(event, "key")
+    await adapter._handle_message_while_active(event, "key")
+    with pytest.raises(RuntimeError, match="busy"):
+        capture.result(timeout=0)
+    busy_handler.assert_not_awaited()
     adapter._message_handler.assert_not_awaited()
+    assert "key" not in adapter._pending_messages
     assert adapter.sent == []

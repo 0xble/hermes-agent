@@ -17,8 +17,9 @@ _MIN_REVIEW_SECONDS = 60.0
 
 
 def is_review_event(event):
-    return (getattr(event, "internal", False)
-            and (getattr(event, "metadata", None) or {}).get("_cron_review_capture") is not None)
+    metadata = getattr(event, "metadata", None)
+    return (getattr(event, "internal", False) is True and isinstance(metadata, dict)
+            and metadata.get("_cron_review_capture") is not None)
 
 
 def private_turn_response(event, agent_result):

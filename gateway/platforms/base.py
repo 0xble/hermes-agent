@@ -4472,6 +4472,15 @@ class BasePlatformAdapter(ABC):
         # merged event is likewise unaddressed; a typed human event restores the visible fallback.
         from gateway.response_filters import apply_agent_origin_reply_expectation
         apply_agent_origin_reply_expectation(event)
+        from gateway.cron_review import is_review_event
+        if is_review_event(event):
+            # A hidden cron review must never queue behind a live turn: a queued event is
+            # later drained in-band without its capture and would post its reply. Fail the
+            # capture so the scheduler sends the original report on time instead.
+            future = event.metadata["_cron_review_capture"]
+            if not future.done():
+                future.set_exception(RuntimeError("review subject is busy; use original report"))
+            return
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
         # calling the message handler directly and sending the response.  Do NOT use
@@ -5186,14 +5195,6 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
         from gateway.cron_review import ReviewCapture
         review_capture = ReviewCapture(event)
-        if review_capture.future is not None and review_capture.future.done():
-            # The review deadline passed while this queued behind a human turn; the
-            # original report already went out, so the hidden review must not run late.
-            logger.info("[%s] Dropping expired cron review for session %s", self.name, session_key)
-            current_task = asyncio.current_task()
-            if current_task is not None and self._session_tasks.get(session_key) is current_task:
-                self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
-            return
 
         def _record_delivery(result, *, required: bool = False):
             nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
