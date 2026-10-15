@@ -674,7 +674,7 @@ class GatewayGoalsMixin:
             # behind a continuation head keeps its origin on the head event.
             metadata = getattr(event, "metadata", None) or {}
             from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
-            own_pacing_wake = event is not None and (
+            own_pacing_wake = is_internal and event is not None and (
                 self._is_goal_continuation_event(event)
                 or bool(metadata.get(LOOP_WAKE_METADATA_KEY))
                 or bool(getattr(event, "_heartbeat_session_id", None))

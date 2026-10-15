@@ -177,9 +177,10 @@ def test_real_repeated_judge_waits_use_idle_lift_backoff_and_one_notice(
             assert not cli._pending_input.empty(), cycle
             cli._pending_input.get_nowait()
 
-    assert waits == [300, 900, 1800, 1800]
-    assert all(300 <= seconds <= 1800 for seconds in waits)
+    # Automatic judge WAITs are floored at the current no-progress rung and advance it.
+    assert waits == list(goals._NO_PROGRESS_BACKOFF_S)
     assert waits == sorted(waits)
+    assert manager.state.status == "active"
     assert sum("Goal parked (judge)" in message for message in notices) == 1
     assert manager.state.last_wait_notice_key == "timed|reason:external consolidation"
 
@@ -196,13 +197,13 @@ def test_real_timed_wait_expiry_reparks_through_evaluator_with_one_notice(
 
     first = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
     assert first["message"].count("Goal parked") == 1
-    assert manager.state.waiting_seconds == 300
+    assert manager.state.waiting_seconds == 900
     manager.state.waiting_until = time.time() - 1
     manager._save()
 
     second = manager.evaluate_after_turn("Still waiting on the external result.", user_initiated=False)
     assert second["message"] == ""
-    assert manager.state.waiting_seconds == 900
+    assert manager.state.waiting_seconds == 3600
     assert manager.state.last_wait_notice_key == "timed|reason:external consolidation"
     assert manager.state.backoff_level == 2
 
@@ -210,7 +211,7 @@ def test_real_timed_wait_expiry_reparks_through_evaluator_with_one_notice(
 def test_real_judge_wait_mixed_continue_and_wait_uses_shared_backoff_formula(
     hermes_home, monkeypatch,
 ):
-    """B3: CONTINUE, CONTINUE, WAIT, WAIT shares the 300/900/1800 ladder."""
+    """B3: CONTINUE, CONTINUE, WAIT, WAIT shares the 900/3600/14400/86400 ladder."""
     _sid, _db, manager = _new_goal()
     import agent.auxiliary_client as auxiliary
 
@@ -222,19 +223,19 @@ def test_real_judge_wait_mixed_continue_and_wait_uses_shared_backoff_formula(
     ])
     monkeypatch.setattr(auxiliary, "call_llm", lambda **_kwargs: _judge_response(next(responses)))
 
-    first = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
-    second = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
-    assert first["verdict"] == second["verdict"] == "continue"
-    for _ in range(2):
-        manager.state.waiting_until = time.time() - 1
-        manager._save()
+    waits = []
+    for _ in range(4):
+        if manager.state.waiting_until:
+            manager.state.waiting_until = time.time() - 1
+            manager._save()
         decision = manager.evaluate_after_turn("No actionable work yet.", user_initiated=False)
-        if manager.state.waiting_seconds == 300:
-            assert decision["verdict"] == "wait"
-    assert manager.state.waiting_seconds == 900
+        # Automatic no-progress CONTINUEs park at once, exactly like judge WAITs.
+        assert decision["verdict"] == "wait"
+        waits.append(manager.state.waiting_seconds)
+    assert waits == [900, 3600, 14400, 86400]
     assert manager.state.last_wait_notice_key == "timed|reason:still checking"
 
-    # A requested 1200-second wait outranks the first automatic floor.
+    # A requested 1200-second wait outranks the first automatic floor (900).
     _sid2, _db2, manager2 = _new_goal()
     monkeypatch.setattr(
         auxiliary, "call_llm",
@@ -249,7 +250,7 @@ def test_real_judge_wait_mixed_continue_and_wait_uses_shared_backoff_formula(
 def test_real_judge_wait_with_active_delegations_uses_delegation_floor_and_key(
     hermes_home, monkeypatch,
 ):
-    """B4: an active delegation raises a timed WAIT to 600 seconds."""
+    """B4: an active delegation floors a timed WAIT at max(600, current rung)."""
     from hermes_cli import goals
 
     _sid, _db, manager = _new_goal()
@@ -261,7 +262,7 @@ def test_real_judge_wait_with_active_delegations_uses_delegation_floor_and_key(
         "The delegated review is still running.", user_initiated=False, active_delegations=2,
     )
     assert decision["verdict"] == "wait"
-    assert manager.state.waiting_seconds == 600
+    assert manager.state.waiting_seconds == max(600, goals._NO_PROGRESS_BACKOFF_S[0])
     assert manager.state.waiting_on_delegations == 2
     assert manager.state.last_wait_notice_key == "delegations|reason:delegated review"
 
@@ -272,9 +273,17 @@ def test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak(hermes_
 
     sid, db, manager = _new_goal()
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "waiting for external work"})
+
+    def expire():
+        manager.state.waiting_until = time.time() - 1
+        manager._save()
+
     manager.evaluate_after_turn("No action.", user_initiated=False)
+    expire()
     manager.evaluate_after_turn("No action.", user_initiated=False)
     assert manager.state.consecutive_no_progress == 2
+    assert manager.state.backoff_level == 2
+    expire()
 
     call_id = "real-actionable-call"
     stamp = time.time()
@@ -289,12 +298,18 @@ def test_real_actionable_evidence_and_user_turn_reset_shared_wait_streak(hermes_
     )
     manager.evaluate_after_turn("I applied the requested change.", user_initiated=False)
     assert manager.state.consecutive_no_progress == 0
+    assert manager.state.backoff_level == 0
 
     manager.evaluate_after_turn("No action.", user_initiated=False)
+    expire()
     manager.evaluate_after_turn("No action.", user_initiated=False)
     assert manager.state.consecutive_no_progress == 2
-    manager.evaluate_after_turn("The user supplied a new instruction.", user_initiated=True)
+    assert manager.is_waiting()
+    # A real user turn pierces the live wait, re-judges, and resets the ladder.
+    decision = manager.evaluate_after_turn("The user supplied a new instruction.", user_initiated=True)
+    assert decision["verdict"] == "continue"
     assert manager.state.consecutive_no_progress == 0
+    assert manager.state.backoff_level == 0
 
 
 def test_real_session_evidence_drives_three_status_continuations_to_backoff(
@@ -364,7 +379,7 @@ def test_real_pause_resume_resets_no_progress_backoff_before_status_turn(
     state = manager.state
     assert state is not None
     assert state.backoff_level == 2
-    assert state.waiting_seconds == 900
+    assert state.waiting_seconds == 3600
 
     manager.pause()
     state = manager.state
@@ -381,9 +396,11 @@ def test_real_pause_resume_resets_no_progress_backoff_before_status_turn(
     decision = manager.evaluate_after_turn("I checked the status.", user_initiated=False)
     state = manager.state
     assert state is not None
-    assert decision["should_continue"] is True
+    # The fresh ladder starts again at its first rung.
+    assert decision["should_continue"] is False
     assert state.consecutive_no_progress == 1
-    assert state.waiting_until == 0.0
+    assert state.waiting_seconds == goals._NO_PROGRESS_BACKOFF_S[0]
+    assert state.backoff_level == 1
 
 
 def test_real_collector_preserves_json_argument_representation(hermes_home):
@@ -650,7 +667,7 @@ def test_real_tui_followup_dispatch_reaches_goal_followup_as_automatic(hermes_ho
 def test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early(
     hermes_home, monkeypatch,
 ):
-    """P2: real status evidence plus a live delegation parks for ten minutes, then lifts on return."""
+    """P2: real status evidence plus a live delegation parks for max(600s, rung), then lifts on return."""
     from hermes_cli import goals
     from tools import async_delegation as delegation
 
@@ -672,7 +689,7 @@ def test_real_delegation_no_progress_uses_sessiondb_evidence_and_lifts_early(
         state = goals.GoalManager(sid).state
         assert state is not None
         assert state.waiting_on_delegations == 1
-        assert state.waiting_seconds == 10 * 60
+        assert state.waiting_seconds == max(10 * 60, goals._NO_PROGRESS_BACKOFF_S[0])
         assert state.waiting_until > state.waiting_since
 
         with delegation._records_lock:
@@ -694,12 +711,14 @@ def test_real_exited_target_lifts_barrier_for_a_continuation(
     """An exited target clears the live barrier and returns to normal judging."""
     from hermes_cli import goals
 
-    sid, _db, manager = _new_goal()
+    sid, db, manager = _new_goal()
     calls: list[dict] = []
     _stub_judge(monkeypatch, {"verdict": "wait", "wait_on_session": "watcher-exited", "reason": "watcher"}, calls)
     manager.evaluate_after_turn("Waiting on the watcher.", user_initiated=True)
     monkeypatch.setattr(goals, "_session_waiting", lambda _session_id: False)
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "inspect the completed watcher result"}, calls)
+    # The continuation acts on the watcher's result, so it is progress rather than a ladder park.
+    _record_tool_result(db, sid, "write_file", {"path": "watcher-result.md", "content": "ok"}, "wrote file", 1)
 
     decision = goals.GoalManager(sid).evaluate_after_turn(
         "The watcher exited; inspect its result.", user_initiated=False,

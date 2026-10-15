@@ -121,8 +121,11 @@ def test_bot_chat_silence_reaches_real_goal_judge_and_loop_bookkeeping(server, t
     assert marker in str(calls[0]["messages"])
     assert after.turns_used == 1
     assert after.last_reason == "still waiting"
-    assert after.consecutive_silent_no_progress == 1
-    assert followups and followups[0]
+    # A silent automatic no-progress turn parks quietly on the first ladder rung; nothing clears.
+    assert after.status == "active"
+    assert after.backoff_level == 1
+    assert after.waiting_seconds == goals._NO_PROGRESS_BACKOFF_S[0] == 900
+    assert followups == [None]  # parked on the ladder: no goal continuation is dispatched
     loop_after = loops.load_loop(session_key)
     assert loop_after.awaiting_response is False
     assert loop_after.last_response_digest == loops._digest_response(marker)

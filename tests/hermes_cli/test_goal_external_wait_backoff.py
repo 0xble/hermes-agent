@@ -69,6 +69,7 @@ def test_read_only_status_turns_back_off_with_varied_results(hermes_home):
         [{"tool": "terminal", "call": '{"command": "gh run view 1"}', "output": "in_progress", "timestamp": time.time() + 2}],
         [{"tool": "terminal", "call": '{"command": "gh run view 1"}', "output": "completed", "timestamp": time.time() + 3}],
     ]
+    decisions, waits = [], []
     with patch.object(goals, "collect_goal_evidence", side_effect=rows), patch.object(
         goals, "judge_goal", side_effect=[
             ("continue", "still checking", False, None, False),
@@ -76,10 +77,18 @@ def test_read_only_status_turns_back_off_with_varied_results(hermes_home):
             ("continue", "waiting for the next poll", False, None, False),
         ]
     ):
-        decisions = [mgr.evaluate_after_turn("status only", user_initiated=False) for _ in rows]
+        for _ in rows:
+            if mgr.state.waiting_until:
+                mgr.state.waiting_until = time.time() - 1  # let the previous rung expire
+                mgr._save()
+            decisions.append(mgr.evaluate_after_turn("status only", user_initiated=False))
+            waits.append(mgr.state.waiting_seconds)
 
-    assert [d["verdict"] for d in decisions] == ["continue", "continue", "wait"]
-    assert mgr.state.consecutive_no_progress == goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
+    # Every automatic read-only turn parks immediately on the quiet ladder.
+    assert [d["verdict"] for d in decisions] == ["wait", "wait", "wait"]
+    assert all(d["message"] == "" for d in decisions)
+    assert waits == list(goals._NO_PROGRESS_BACKOFF_S[:3])
+    assert mgr.state.status == "active"
 
 
 def test_read_only_status_regex_rejects_redirects_and_pipes():
@@ -90,29 +99,33 @@ def test_read_only_status_regex_rejects_redirects_and_pipes():
     assert not goals._READ_ONLY_STATUS_CALL_RE.match("gh run view 1 | tee status")
 
 
-def test_three_qualifying_no_progress_turns_back_off_and_persist(hermes_home):
-    """Repeated no-tool, same-reason continuations park instead of busy-polling."""
+def test_no_progress_turns_climb_the_quiet_ladder_and_persist(hermes_home):
+    """Every automatic no-progress CONTINUE parks at once and the ladder climbs to its 24h cap."""
     from hermes_cli import goals
     from hermes_cli.goals import GoalManager
 
     mgr = GoalManager("no-progress-backoff", default_max_turns=20)
     mgr.set("wait for external consolidation", max_turns=20)
+    decisions, waits = [], []
     with patch.object(goals, "collect_goal_evidence", return_value=[]), patch.object(
         goals, "judge_goal", return_value=("continue", "nothing actionable until the watchdog", False, None, False)
     ):
-        d1 = mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
-        d2 = mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
-        d3 = mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
+        for _ in range(5):
+            if mgr.state.waiting_until:
+                mgr.state.waiting_until = time.time() - 1
+                mgr._save()
+            decisions.append(mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False))
+            waits.append(mgr.state.waiting_seconds)
 
-    assert d1["should_continue"] is True
-    assert d2["should_continue"] is True
-    assert d3["verdict"] == "wait"
-    assert d3["should_continue"] is False
-    assert mgr.state.consecutive_no_progress == goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
+    assert all(d["verdict"] == "wait" and d["should_continue"] is False for d in decisions)
+    assert all(d["message"] == "" for d in decisions)
+    assert waits == [900, 3600, 14400, 86400, 86400]
+    assert mgr.state.status == "active"
     assert mgr.state.waiting_until > mgr.state.waiting_since
 
     restored = GoalManager("no-progress-backoff")
-    assert restored.state.consecutive_no_progress == goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
+    assert restored.state.backoff_level == len(goals._NO_PROGRESS_BACKOFF_S) - 1
+    assert restored.state.status == "active"
     assert restored.is_waiting()
 
 
@@ -134,9 +147,10 @@ def test_live_delegation_parks_an_unproductive_automatic_turn(hermes_home):
 
     assert decision["verdict"] == "wait"
     assert decision["should_continue"] is False
-    assert "active delegation" in decision["message"]
+    assert decision["message"] == ""  # quiet ladder
     assert mgr.state is not None
     assert mgr.state.waiting_on_delegations == 1
+    assert mgr.state.waiting_seconds >= 600
     assert mgr.state.waiting_until > mgr.state.waiting_since
     with patch.object(goals, "count_active_delegations", return_value=0):
         assert mgr.is_waiting() is False
@@ -173,19 +187,29 @@ def test_progress_and_real_user_turn_reset_no_progress_streak(hermes_home):
         {"tool": "terminal", "call": "echo progress", "output": "progress", "timestamp": time.time() + 60},
     ]
     with patch.object(
-        goals, "collect_goal_evidence", side_effect=[[], [], evidence, evidence, evidence, evidence]
+        goals, "collect_goal_evidence", side_effect=[[], [], evidence, [], [], []]
     ), patch.object(
         goals, "judge_goal", return_value=("continue", "nothing actionable until the watchdog", False, None, False)
     ):
         mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
+        mgr.state.waiting_until = time.time() - 1
+        mgr._save()
         mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
-        # New recorded tool evidence is deterministic progress and resets the streak.
+        assert mgr.state.backoff_level == 2
+        mgr.state.waiting_until = time.time() - 1
+        mgr._save()
+        # New recorded tool evidence is deterministic progress and resets the ladder.
         d3 = mgr.evaluate_after_turn("The service status is unchanged, but I checked it.", user_initiated=False)
         assert d3["verdict"] == "continue"
         assert mgr.state.consecutive_no_progress == 0
-        # A real user turn also resets it, even if the judge reason repeats.
-        mgr.evaluate_after_turn("User supplied a clarification.", user_initiated=True)
+        assert mgr.state.backoff_level == 0
+        # Climb again, then a real user turn pierces the wait and resets it.
+        d4 = mgr.evaluate_after_turn("Nothing to do until the watchdog runs.", user_initiated=False)
+        assert d4["verdict"] == "wait" and mgr.state.backoff_level == 1
+        d5 = mgr.evaluate_after_turn("User supplied a clarification.", user_initiated=True)
+        assert d5["verdict"] == "continue"
         assert mgr.state.consecutive_no_progress == 0
+        assert mgr.state.backoff_level == 0
 
 
 def test_unchanged_continuation_reason_is_not_reposted(hermes_home):
@@ -197,8 +221,9 @@ def test_unchanged_continuation_reason_is_not_reposted(hermes_home):
     with patch.object(goals, "collect_goal_evidence", return_value=[]), patch.object(
         goals, "judge_goal", return_value=("continue", "nothing actionable until the watchdog", False, None, False)
     ):
-        first = mgr.evaluate_after_turn("Nothing to do until the watchdog.", user_initiated=False)
-        second = mgr.evaluate_after_turn("Still nothing to do until the watchdog.", user_initiated=False)
+        # User turns continue visibly; automatic no-progress turns would park on the ladder.
+        first = mgr.evaluate_after_turn("Nothing to do until the watchdog.", user_initiated=True)
+        second = mgr.evaluate_after_turn("Still nothing to do until the watchdog.", user_initiated=True)
 
     assert "Continuing toward goal" in first["message"]
     assert second["message"] == ""

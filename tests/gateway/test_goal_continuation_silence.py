@@ -52,7 +52,8 @@ def _runner_with_goal(hermes_home):
 @pytest.mark.asyncio
 async def test_post_turn_goal_continuation_is_not_a_typed_turn(hermes_home):
     runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)):
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False):
         await runner._post_turn_goal_continuation(session_entry=entry, source=src, final_response="partial")
 
     queued = adapter._pending_messages[key]
