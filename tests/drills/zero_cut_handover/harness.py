@@ -92,18 +92,7 @@ def _real_effects(home: Path) -> Effects:
                                          capture_output=True, text=True, encoding="utf-8"))
 
     def telegram_json(argv: Sequence[str]) -> Any:
-        # FLOOD_WAIT is retryable; wait what Telegram asks. A send that errored for another reason
-        # is never retried blindly (it may have been delivered), so it surfaces as an error dict.
-        data: Any = None
-        for _attempt in range(6):
-            result = subprocess.run([TELEGRAM, *argv], check=False, capture_output=True,
-                                    text=True, encoding="utf-8")
-            data = _json_or_text(result.stdout)
-            error = data.get("error") if isinstance(data, Mapping) else None
-            if not (isinstance(error, Mapping) and error.get("code") == "rate_limited"):
-                return data
-            time.sleep(float(error.get("retry_after_seconds") or 3) + 0.5)
-        return data
+        return _telegram_json(argv)
 
     def send_as_user(peer: str, text: str) -> Any:
         return telegram_json(["--agent", "--yes", "send", peer, text, "--silent"])
@@ -116,6 +105,21 @@ def _real_effects(home: Path) -> Effects:
 
     return Effects(run_command, launchctl, send_as_user, read_chat, read_state_db,
                    kill=lambda pid: os.kill(pid, signal.SIGKILL))
+
+
+def _telegram_json(argv: Sequence[str]) -> Any:
+    """Run the telegram CLI observer. FLOOD_WAIT is retryable, so wait what Telegram asks. A send
+    that errored for another reason is never retried blindly (it may have been delivered)."""
+    data: Any = None
+    for _attempt in range(6):
+        result = subprocess.run([TELEGRAM, *argv], check=False, capture_output=True,
+                                text=True, encoding="utf-8")
+        data = _json_or_text(result.stdout)
+        error = data.get("error") if isinstance(data, Mapping) else None
+        if not (isinstance(error, Mapping) and error.get("code") == "rate_limited"):
+            return data
+        time.sleep(float(error.get("retry_after_seconds") or 3) + 0.5)
+    return data
 
 
 def _json_or_text(text: str) -> Any:
@@ -180,10 +184,7 @@ def _peer_username(effects: Effects, peer: str) -> str | None:
     id is present in the user's chat list, else None."""
     if str(peer).lstrip("@").lower() not in {str(BOT_USER_ID), BOT_USERNAME}:
         return None
-    result = _completed(subprocess.run(
-        [TELEGRAM, "--agent", "chats", "--limit", "200"],
-        check=False, capture_output=True, text=True, encoding="utf-8"))
-    data = _json_or_text(result.stdout)
+    data = _telegram_json(["--agent", "chats", "--limit", "200"])
     items = data if isinstance(data, list) else []
     return BOT_USERNAME if any(isinstance(c, Mapping) and c.get("id") == BOT_USER_ID for c in items) else None
 
