@@ -23,9 +23,11 @@ from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
+from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
+from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_trailing_silence_marker,
@@ -147,30 +149,6 @@ def bound_model_input_without_hygiene(history: List[Any], limit: int) -> List[An
            and history[tail_start].get("role") == "tool"):
         tail_start += 1
     return history[:head_end] + history[tail_start:]
-
-
-def hygiene_no_commit_reason(agent) -> str:
-    """Name WHY a hygiene compression left the session id unchanged with no in-place commit.
-    The terminal ``else`` used to blame "no session_db on the hygiene agent" for every route into it,
-    but that is one of several causes (#71097): an attempt that ABORTED before any commit boundary
-    (lock skip, transient cooldown, summary timeout, codex thread interrupted) leaves
-    ``_last_compression_attempt_in_place`` at ``None``; a DB-less agent is only the case when
-    ``_session_db`` really is missing. Read the per-attempt signals the compressor sets, in that order."""
-    if not bool(getattr(agent, "_last_compression_attempt_recorded", False)):
-        return "compression did not run"
-    lock_skip = getattr(agent, "_compression_skipped_due_to_lock", None)
-    if lock_skip is True or isinstance(lock_skip, str):
-        return "attempt skipped: compression lease held by another process"
-    blocked = getattr(agent, "_compression_blocked_transient", None)
-    if blocked:
-        return f"attempt blocked: {blocked}"
-    if getattr(agent, "_last_compression_attempt_in_place", None) is None:
-        detail = "summary timed out" if getattr(agent, "_last_compression_timed_out", False) else "aborted before commit"
-        warning = getattr(agent, "_last_compression_summary_warning", None)
-        return f"attempt {detail}" + (f": {warning}" if warning else "")
-    if getattr(agent, "_session_db", None) is None:
-        return "no session_db on the hygiene agent"
-    return "in-place commit did not complete"
 
 
 class GatewayTurnMixin:
@@ -1201,7 +1179,7 @@ class GatewayTurnMixin:
         """``except asyncio.TimeoutError`` body: cancel at the commit fence, record the failure
         cooldown, warn the user, and re-raise; returns the compressed transcript only when the
         worker crossed the commit boundary first."""
-        from gateway.run import _hygiene_compression_timeout_message
+        from gateway.run_turn_hygiene import _hygiene_compression_timeout_message
         fence = attempt.commit_fence
         _hyg_waited = time.monotonic() - attempt.wait_started
         _hyg_total_exhausted = _hyg_waited >= hs.total_ceiling_seconds or fence.deadline_exceeded
@@ -2113,8 +2091,10 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
-        if diagnostic_wake_muted(event):
-            return None
+        from gateway.cron_review import private_turn_response
+        private, captured_response = private_turn_response(event, agent_result)
+        if private:
+            return captured_response
         raw_response = response if raw_response is None else raw_response
         # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
         # raw response available to post-turn hooks and strip only at this final display boundary.
@@ -4803,10 +4783,12 @@ class GatewayTurnMixin:
         from run_agent import AIAgent
 
         disp = self._run_agent_display_settings(source)
-        if scheduled_heartbeat:
+        cron_review = (event_metadata or {}).get("_cron_review_capture") is not None
+        if scheduled_heartbeat or cron_review:
             # A heartbeat is proactive work: tool chrome, drafts, thinking and periodic
             # liveness notices would create a user-visible ping before its final result is known.
-            # Keep status callbacks intact for approvals and actionable failures.
+            # Keep status callbacks intact for approvals and actionable failures. An invisible
+            # cron review turn stays equally private until its report is presented.
             disp = dataclasses.replace(
                 disp,
                 tool_progress_enabled=False,
@@ -4832,10 +4814,12 @@ class GatewayTurnMixin:
             _post_delivery_adapter=_post_delivery_adapter, queued_event=queued_event,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
+        turn_ctx.mute_notification_reply |= cron_review
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
-        # Two independent quiet reasons: a muted diagnostic wake (ours) and a scheduled heartbeat.
+        # Two independent quiet reasons: a muted diagnostic wake (ours, or a cron review) and a
+        # scheduled heartbeat.
         if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
@@ -4873,6 +4857,7 @@ class GatewayTurnMixin:
             self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
+            pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

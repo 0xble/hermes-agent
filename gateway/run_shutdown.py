@@ -32,7 +32,7 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
-from agent.async_utils import consume_detached_task_result
+from agent.async_utils import cancel_task_with_grace
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -42,25 +42,6 @@ logger = logging.getLogger("gateway.run")
 # this short, non-zero bound (never above the restart-path bound) collects its result for the
 # interrupted-cron notice without letting a held fire fence stall ordinary teardown.
 _NONRESTART_CRON_MARK_BOUND_S = 0.5
-
-async def _cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
-    """Cancel ``task`` and wait only a short grace before detaching it.
-
-    Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task
-    without a bound wedges restart recovery forever; a task that misses the grace is detached
-    and its result is consumed when it eventually finishes.
-    """
-    task.cancel()
-    try:
-        done, _pending = await asyncio.wait({task}, timeout=grace)
-    except asyncio.CancelledError:
-        task.add_done_callback(consume_detached_task_result)
-        raise
-    if task not in done:
-        task.add_done_callback(consume_detached_task_result)
-        return False
-    return True
-
 
 def _exit_with_failure_verdict(runner) -> bool:
     """True (after logging the reason) when the runner asked for a failure exit."""
@@ -932,6 +913,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
     async def _mark_running_sessions_resume_pending(self, log_prefix: str) -> list:
         """Bulk-mark running turns durably; return all interruption candidates for notes."""
+        from gateway.cron_review import is_review_event
         from gateway.run import _AGENT_PENDING_SENTINEL
         reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
         markers = []
@@ -944,6 +926,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             with _log_suppressed(logging.DEBUG, "%s failed for %s: %s", log_prefix, _sk):
                 _state = getattr(self, "_peek_session_state", lambda _key: None)(_sk)
                 _event = getattr(getattr(_state, "turn", None), "event", None)
+                if is_review_event(_event):
+                    continue  # the delivery queue replays a cut review; resuming it would post its reply
                 _human = bool(_event is not None and getattr(self, "_is_user_turn_event", lambda _event: not _event.internal)(_event))
                 _entry = getattr(self.session_store, "_entries", {}).get(_sk)
                 _turn_id = getattr(_entry, "active_turn_token", None)
@@ -1203,7 +1187,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 done, _pending = await asyncio.wait({batch_task}, timeout=wait_timeout)
                 completed = batch_task in done
                 if not completed:
-                    cancelled_in_grace = await _cancel_task_with_grace(batch_task)
+                    cancelled_in_grace = await cancel_task_with_grace(batch_task)
                     if cancelled_in_grace:
                         logger.warning(
                             "Interrupted-turn notes exceeded %.1fs; cancelled and awaited before resume",
@@ -1220,7 +1204,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                         await _record_shutdown_misses(shutdown_fallback_keys)
                     return 0
             except asyncio.CancelledError:
-                await _cancel_task_with_grace(batch_task)
+                await cancel_task_with_grace(batch_task)
                 raise
         else:
             # A transport may accept a send just before the local 2s deadline while the durable claim
@@ -2316,7 +2300,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
     @staticmethod
     def _stop_kill_tool_subprocesses(
-        phase: str, *, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
+        phase: str, *, restart: bool = False, deadline: Optional[float] = None, stop_event: Optional[threading.Event] = None,
     ) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
@@ -2372,9 +2356,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
         def _interrupt_delegations() -> None:
             from tools.async_delegation import interrupt_all as _interrupt_async
+            from tools.delegation_resume import GATEWAY_RESTART_CUT_REASON
             _count_step(
                 "Shutdown (%s): interrupted %d background delegation(s)",
-                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
+                lambda: _interrupt_async(reason=GATEWAY_RESTART_CUT_REASON if restart else f"gateway shutdown ({phase})"),
             )
 
         def _kill_foreground_processes() -> None:
@@ -2409,17 +2394,16 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
     @staticmethod
     async def _stop_kill_tool_subprocesses_off_loop(
-        phase: str, *, timeout: Optional[float] = None,
+        phase: str, *, timeout: Optional[float] = None, restart: bool = False,
     ) -> list:
         """Run the shutdown kill sweep off-loop with a cooperative deadline.
 
-        The worker receives the same deadline used by the awaiter. If one target blocks past it,
-        cancellation only detaches the thread after its registry hooks have stopped issuing kills and
-        checkpoint writes; it is therefore safe for the successor gateway to proceed.
+        The shared deadline prevents detached cleanup from issuing later kills or checkpoint writes.
+        Explicit restart intent (including planned signal restarts) travels with the worker.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
         stop_event = threading.Event() if timeout is not None else None
-        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline}
+        kill_kwargs: dict[str, Any] = {"phase": phase, "deadline": deadline, "restart": restart}
         if stop_event is not None:
             kill_kwargs["stop_event"] = stop_event
         task = asyncio.create_task(asyncio.to_thread(
@@ -2452,6 +2436,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         except Exception:
             logger.debug("Could not fence survivor pollers during shutdown", exc_info=True)
         self._mark_api_runs_shutdown_requested()
+        from cron.scheduler_review import stop_reviews
+        await asyncio.to_thread(stop_reviews)
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):
@@ -2660,7 +2646,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
         else:
             _swept_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
-                "post-interrupt", timeout=_sweep_timeout,
+                "post-interrupt", timeout=_sweep_timeout, restart=self._restart_requested,
             )
         if _swept_cron_jobs:
             _interrupted_cron_jobs = list(dict.fromkeys(_interrupted_cron_jobs + _swept_cron_jobs))
@@ -2976,7 +2962,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
-            "final-cleanup",
+            "final-cleanup", restart=self._restart_requested,
             timeout=min(2.0, self._restart_shutdown_bound()) if self._restart_requested else None,
         )
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
@@ -3096,6 +3082,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
+        if self._restart_requested:
+            # Stamp intent after the drain: the chat routing marker can already be older
+            # than the breaker chain gap by the time /restart finishes waiting for work.
+            from gateway.restart_loop_guard import record_planned_exit
+            record_planned_exit()
         if self._restart_requested and self._restart_command_source is None:
             with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
                 atomic_json_write(

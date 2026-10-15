@@ -22,6 +22,14 @@ from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_ver
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_home(tmp_path, monkeypatch):
+    # Shutdown writes notification markers via the facade's process-home snapshot;
+    # isolating only HERMES_HOME leaves those markers shared across collected tests.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
+
+
 async def _deliver_sigterm(monkeypatch):
     """Drive the real SIGTERM handler through a full stop with one agent that outlives the drain."""
     runner, adapter = make_restart_runner()
@@ -32,8 +40,8 @@ async def _deliver_sigterm(monkeypatch):
     runner._post_interrupt_grace_timeout = lambda: 0.01
     sweeps = []
 
-    async def _sweep(phase, *, timeout=None):
-        sweeps.append((phase, timeout))
+    async def _sweep(phase, *, timeout=None, restart=False):
+        sweeps.append((phase, timeout, restart))
         return []
 
     monkeypatch.setattr(
@@ -67,7 +75,8 @@ async def test_sigterm_with_planned_restart_marker_takes_bounded_restart_path(mo
     runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch)
 
     assert runner._restart_requested and runner._restart_via_service
-    post_interrupt = [timeout for phase, timeout in sweeps if phase == "post-interrupt"]
+    post_interrupt = [timeout for phase, timeout, restart in sweeps if phase == "post-interrupt" and restart]
+    assert all(restart for _phase, _timeout, restart in sweeps)
     assert len(post_interrupt) == 1 and post_interrupt[0] is not None and post_interrupt[0] <= 2.0
     with pytest.raises(SystemExit) as exc:
         _resolve_gateway_exit_verdict(runner, signal_initiated)
@@ -81,7 +90,7 @@ async def test_sigterm_without_marker_keeps_signal_shutdown_exit_1(monkeypatch):
     runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch)
 
     assert not runner._restart_requested
-    assert ("post-interrupt", None) in sweeps
+    assert ("post-interrupt", None, False) in sweeps
     assert signal_initiated is True
     # False => start_gateway's caller exits 1 so the service manager revives the gateway.
     assert _resolve_gateway_exit_verdict(runner, signal_initiated) is False
@@ -94,8 +103,8 @@ def test_marker_for_another_pid_is_ignored_and_stale_marker_cleared(monkeypatch)
     assert not marker.exists()
 
     assert status.write_planned_restart_marker(os.getpid())
-    record = json.loads(marker.read_text())
+    record = json.loads(marker.read_text(encoding="utf-8-sig"))
     record["written_at"] = "2000-01-01T00:00:00+00:00"
-    marker.write_text(json.dumps(record))
+    marker.write_text(json.dumps(record), encoding="utf-8")
     assert status.consume_planned_restart_marker_for_self() is False
     assert not marker.exists()

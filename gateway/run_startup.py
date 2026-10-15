@@ -388,7 +388,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
         # S2 interruption notes have a stricter lifecycle than the other boot sends: a resumed turn
         # must not be scheduled until this bounded, cancel-on-timeout step has completed. The sender
-        # owns its timeout and _cancel_task_with_grace behavior, so keep it outside the detachable
+        # owns its timeout and cancel_task_with_grace behavior, so keep it outside the detachable
         # boot-send task below.
         if interrupted_note_keys:
             await self._send_interrupted_turn_notes(
@@ -742,27 +742,23 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return None
-        # Restart-loop breaker: only boots WITH restart-interrupted sessions count; when tripped, skip
-        # auto-resume for THIS boot only (inbound still served; sessions stay resume_pending). A pending
-        # /restart marker, or a planned service-restart marker requested within one chain gap, identifies
-        # the predecessor as intentional (``.restart_pending.json`` outlives later crashes while a home
-        # channel is unreachable, so an old one proves nothing). The guard gives one such restart a
-        # chain-local allowance, then counts repeated planned restarts so an auto-resumed agent cannot
-        # evade the breaker by calling request_restart forever.
+        # Only boots with restart-interrupted sessions count. Shutdown stamps one-shot planned
+        # intent after draining; recent chat/home notification markers remain a fallback.
+        # The guard gives the first planned boot one chain-local allowance; repeated planned boots count.
         candidates.breaker_tripped = bool(getattr(self, "_restart_resume_breaker_tripped", False))
-        if candidates and record_boot:
+        if record_boot:
             try:
                 from gateway import restart_loop_guard as _rlg
-                from gateway.run import (
-                    _planned_restart_notification_path,
-                    _planned_restart_notification_pending,
-                    _restart_notification_pending,
-                )
+                from gateway.run import _hermes_home, _planned_restart_notification_path
                 _max_restarts, _window, _max_gap = self._restart_loop_guard_config()
-                _planned_restart = _restart_notification_pending() or (
-                    _planned_restart_notification_pending() and _rlg.planned_marker_is_recent(
-                        _planned_restart_notification_path(), window_seconds=_window, max_gap_seconds=_max_gap,
-                    )
+                _planned_exit = _rlg.consume_planned_exit(_window, max_gap_seconds=_max_gap)
+                if not candidates:
+                    return candidates
+                _planned_restart = _planned_exit or _rlg.planned_marker_is_recent(
+                    _hermes_home / ".restart_notify.json", window_seconds=_window,
+                    max_gap_seconds=_max_gap, use_mtime=True,
+                ) or _rlg.planned_marker_is_recent(
+                    _planned_restart_notification_path(), window_seconds=_window, max_gap_seconds=_max_gap,
                 )
                 candidates.breaker_tripped = _rlg.check_and_record(
                     _max_restarts, _window, max_gap_seconds=_max_gap, planned_restart=_planned_restart,

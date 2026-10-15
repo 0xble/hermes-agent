@@ -8,7 +8,6 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures  # noqa: F401 -- kept public after the plugin-injection move
 import json
@@ -20,6 +19,7 @@ from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
+from gateway.cron_review import is_review_event
 from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import QUEUE_ADMISSION_FAILURE, approval_input_words
@@ -35,7 +35,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -2017,9 +2017,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         return paths
 
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Persist the exact resolved routing key for this running turn; never a cron review's, which boot would resume."""
         try:
-            token = await self.async_session_store.mark_turn_active(
+            token = None if is_review_event(event) else await self.async_session_store.mark_turn_active(
                 session_key, human=bool(getattr(self, "_is_user_turn_event", lambda _event: not event.internal)(event))
             )
         except Exception as exc:
