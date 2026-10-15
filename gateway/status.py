@@ -21,7 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
-from gateway.gateway_slot import effective_gateway_slot, process_slot_filename, sibling_lock_name, slot_filename
+from gateway.gateway_slot import (SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, process_slot_filename,
+                                  sibling_lock_name, slot_filename)
 from gateway.status_inline_source import (
     command_line_runs_inline_source, inline_bootstrap_argv, inline_source_flag_index)
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
@@ -489,9 +490,8 @@ def _get_process_start_time(pid: int) -> Optional[int]:
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         pass
 
-    # No /proc (macOS / Windows): psutil is a hard dependency and exposes a
-    # cross-platform creation time.  Quantize to centiseconds so repeated reads
-    # of the same process compare equal without float-precision fragility.
+    # No /proc (macOS / Windows): psutil gives a cross-platform creation time, quantized to
+    # centiseconds so repeated reads of the same process compare equal.
     try:
         import psutil  # type: ignore
         return int(round(psutil.Process(pid).create_time() * 100))
@@ -568,9 +568,8 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     # Gateway-dedicated entrypoints carry no subcommand to inspect.
     if any(t == "gateway/run.py" or t.endswith("/gateway/run.py") for t in tokens):
         return "run"
-    # Atomic Hermes' bundled desktop runner shares HERMES_HOME with the CLI; without this,
-    # `gateway run --replace` does not recognise it as a running gateway, skips the
-    # terminate-and-scoped-lock-handoff path, and collides with its still-held scoped locks
+    # Atomic Hermes' bundled desktop runner shares HERMES_HOME with the CLI; without this, `gateway run
+    # --replace` does not recognise it, skips the terminate-and-scoped-lock-handoff path, and collides with its still-held scoped locks
     # (e.g. the Discord bot-token lock). See #22418.
     if any(b == "desktop-gateway.py" for b in basenames):
         return "run"
@@ -779,8 +778,7 @@ def _build_pid_record() -> dict:
     return {
         "pid": os.getpid(), "kind": _GATEWAY_KIND, "argv": _record_argv(),
         "start_time": _get_process_start_time(os.getpid()),
-        # Scoped locks are machine-global; the owner's home lets a cross-profile
-        # --replace place its takeover marker where the target will read it.
+        # Scoped locks are machine-global; the owner's home tells a cross-profile --replace where to put its takeover marker.
         "hermes_home": str(_canonical_hermes_home(_get_process_hermes_home())),
     }
 
@@ -827,9 +825,8 @@ def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[s
     try:
         raw = path.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeDecodeError):
-        # OSError: file vanished or permission flipped between exists() and
-        # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
-        # (a truncated or clobbered status file). Either way it's unusable.
+        # OSError: file vanished or permission flipped. UnicodeDecodeError: truncated or clobbered
+        # non-UTF-8 status file. Either way it's unusable.
         return None
     if not raw:
         return None
@@ -940,14 +937,10 @@ def _pid_exists(pid: int) -> bool:
         # let pid_exists() below (or the ctypes fallback) decide.
         probe_zombie = os.name != "nt"
         try:
-            # A zombie (defunct) process is still in the process table, so ``psutil.pid_exists()`` returns
-            # True for it — but it is already dead: SIGKILL has no effect and it cannot be a running
-            # gateway. Treating a zombie as alive makes ``--replace`` wait for the old PID to die (it never
-            # does, until its parent reaps it), then abort with exit 1 — a silent crash loop under systemd
-            # ``Restart=always``, which respawns the gateway before reaping the previous process (issue
-            # #42126). Report zombies as dead so the takeover proceeds. Best-effort: any failure to read
-            # status (partial/stub psutil, access denied, transient race) falls through to the authoritative
-            # ``pid_exists()`` below rather than raising.
+            # A zombie is still in the process table, so ``psutil.pid_exists()`` returns True, but it is
+            # dead and cannot be a gateway. Treating it as alive makes ``--replace`` wait forever, then exit 1:
+            # a silent crash loop under systemd ``Restart=always`` (#42126). Report zombies as dead. Any
+            # status-read failure falls through to the authoritative ``pid_exists()`` below.
             if probe_zombie and psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
                 return False
         except getattr(psutil, "NoSuchProcess", ()):
@@ -1953,10 +1946,17 @@ def _terminate_verified_owner(
     return None
 
 
-def write_planned_stop_marker(target_pid: int, *, slot: str = "a") -> bool:
+def _slot_of_pid(target_pid: int, home: Optional[Path] = None) -> str:
+    """Slot whose PID file names ``target_pid`` (CLI/s6/systemd/Windows stoppers run outside it)."""
+    home = home or _get_process_hermes_home()
+    return next((s for s in (SLOT_STANDBY, SLOT_ACTIVE) if _pid_from_record(_read_pid_record(
+        home / slot_filename("gateway.pid", s))) == target_pid), effective_gateway_slot())
+
+
+def write_planned_stop_marker(target_pid: int, *, slot: Optional[str] = None) -> bool:
     """Record a deliberate stop marker so launchd does not treat SIGTERM as a crash."""
-    return _write_marker(_get_planned_stop_marker_path() if slot == effective_gateway_slot() else
-                         _get_process_hermes_home() / slot_filename(_PLANNED_STOP_MARKER_FILENAME, slot), {
+    slot = _slot_of_pid(target_pid) if slot is None else slot
+    return _write_marker(_get_process_hermes_home() / slot_filename(_PLANNED_STOP_MARKER_FILENAME, slot), {
         "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
         "stopper_pid": os.getpid(), "written_at": _utc_now_iso(),
     })
@@ -2013,9 +2013,10 @@ def consume_planned_stop_marker_for_self() -> bool:
                                             keep=True, on_consume=update_pause_record.mark_stop_accepted)
 
 
-def write_planned_restart_marker(target_pid: int, *, hermes_home: Optional[Path] = None, slot: str = "a") -> bool:
+def write_planned_restart_marker(target_pid: int, *, hermes_home: Optional[Path] = None, slot: Optional[str] = None) -> bool:
     """Record a planned service reload marker for ``target_pid``."""
     marker_home = _canonical_hermes_home(hermes_home or _get_process_hermes_home())
+    slot = _slot_of_pid(target_pid, marker_home) if slot is None else slot
     return _write_marker(_get_planned_restart_marker_path(marker_home, slot=slot), {
         "target_pid": target_pid, "target_start_time": _get_process_start_time(target_pid),
         "target_hermes_home": str(marker_home), "writer_pid": os.getpid(),

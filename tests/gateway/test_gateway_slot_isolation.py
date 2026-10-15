@@ -304,7 +304,7 @@ def test_runtime_status_isolation_preserves_active_file(home, monkeypatch):
     assert status.read_runtime_status()["gateway_state"] == "starting"
 
 
-def test_standby_paths_and_explicit_active_stop_marker(home, monkeypatch):
+def test_standby_paths_and_stop_marker_follows_the_target_pid(home, monkeypatch):
     from gateway import run_startup, status
 
     (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
@@ -315,9 +315,35 @@ def test_standby_paths_and_explicit_active_stop_marker(home, monkeypatch):
     assert status._get_planned_restart_marker_path() == home / ".b.gateway-planned-restart.json"
 
     monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: None)
-    assert status.write_planned_stop_marker(os.getpid())
+    (home / "gateway.pid").write_text("4242", encoding="utf-8")
+    (home / "gateway.b.pid").write_text("4343", encoding="utf-8")
+    # An explicit slot still wins.
+    assert status.write_planned_stop_marker(os.getpid(), slot="a")
     assert (home / ".gateway-planned-stop.json").exists()
-    assert not (home / ".b.gateway-planned-stop.json").exists()
+    (home / ".gateway-planned-stop.json").unlink()
+    # Without one, the marker lands beside the gateway that PID belongs to, not the caller's slot.
+    assert status.write_planned_stop_marker(4242)
+    assert (home / ".gateway-planned-stop.json").exists()
+    assert status.write_planned_stop_marker(4343)
+    assert (home / ".b.gateway-planned-stop.json").exists()
+    assert status.write_planned_restart_marker(4343)
+    assert (home / ".b.gateway-planned-restart.json").exists()
+
+
+def test_cli_stop_of_standby_from_an_unpinned_process_targets_slot_b(home, monkeypatch):
+    """`hermes gateway stop`, s6, systemd and Windows callers run as slot a; stopping B must still mark B."""
+    from gateway import status
+
+    (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT", raising=False)
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    assert gateway_slot.effective_gateway_slot() == "a"
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: None)
+    (home / "gateway.b.pid").write_text("4343", encoding="utf-8")
+    assert status.write_planned_stop_marker(4343)
+    assert (home / ".b.gateway-planned-stop.json").exists()
+    assert not (home / ".gateway-planned-stop.json").exists()
 
 
 def test_flag_off_slot_b_preserves_all_historical_paths(home, monkeypatch):
