@@ -1547,7 +1547,13 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
     try:
         with cron_jobs.use_cron_store(home):
             with cron_jobs._jobs_lock():
-                live_jobs = cron_jobs.load_jobs()
+                live_doc = _load_cron_jobs_doc(live_path)
+                loaded_jobs = cron_jobs.load_jobs()
+                live_jobs = (
+                    _cron_jobs_list(live_doc)
+                    if live_doc is not None
+                    else loaded_jobs
+                )
                 live_ids = {
                     str(job.get("id")) for job in live_jobs
                     if isinstance(job, dict) and job.get("id")
@@ -1564,7 +1570,20 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
                     live_ids.add(job_id)
                 if not restored_jobs:
                     return None
-                cron_jobs.save_jobs(live_jobs + restored_jobs)
+                if not live_jobs:
+                    # A total-loss restore must reproduce the snapshot document, not route it
+                    # through save_jobs(), whose normal writer adds a fresh updated_at field.
+                    if isinstance(snap_doc, dict):
+                        merged_doc = dict(snap_doc)
+                        merged_doc["jobs"] = restored_jobs
+                    else:
+                        merged_doc = restored_jobs
+                elif isinstance(live_doc, dict):
+                    merged_doc = dict(live_doc)
+                    merged_doc["jobs"] = live_jobs + restored_jobs
+                else:
+                    merged_doc = live_jobs + restored_jobs
+                cron_jobs.save_jobs_document(merged_doc)
     except (OSError, PermissionError, RuntimeError) as exc:
         logger.error("Cron auto-restore failed: %s", exc)
         return None

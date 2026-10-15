@@ -1594,14 +1594,27 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
-    """Serialize the store payload to a fsynced temp file beside the resolved *jobs_file*; return its path."""
+def _stage_jobs_payload(
+    jobs_file: Path, jobs: List[Dict[str, Any]], *, document: Optional[Any] = None,
+) -> str:
+    """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
+
+    Normal saves use the canonical wrapper with a fresh ``updated_at``. Recovery callers may pass
+    an existing document to preserve its top-level metadata exactly while replacing only its jobs.
+    """
+    if document is None:
+        payload: Any = {"jobs": jobs, "updated_at": _hermes_now().isoformat()}
+    elif isinstance(document, dict):
+        payload = dict(document)
+        payload["jobs"] = jobs
+    elif isinstance(document, list):
+        payload = jobs
+    else:
+        raise ValueError("Cron jobs document must be a dict or list")
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
-                f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -1713,11 +1726,13 @@ _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, document: Optional[Any] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
+    ``document`` preserves an existing dict/list wrapper for exact recovery writes.
+    """
     jobs_file = _current_cron_store().jobs_file
     removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
     ensure_dirs()
@@ -1734,7 +1749,7 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs, document=document)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -1776,6 +1791,24 @@ def save_jobs(
     """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+
+
+def save_jobs_document(document: Any) -> None:
+    """Persist an existing cron document without adding or rewriting wrapper metadata.
+
+    This is for recovery paths that merge jobs from a snapshot while preserving the document's
+    original top-level keys. Normal callers should use :func:`save_jobs`.
+    """
+    if isinstance(document, dict):
+        jobs = document.get("jobs")
+    elif isinstance(document, list):
+        jobs = document
+    else:
+        raise ValueError("Cron jobs document must be a dict or list")
+    if not isinstance(jobs, list):
+        raise ValueError("Cron jobs document must contain a jobs list")
+    with _jobs_lock():
+        _save_jobs_unlocked(jobs, replace=True, document=document)
 
 
 _MISSING = object()

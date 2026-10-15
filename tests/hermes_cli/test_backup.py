@@ -2826,6 +2826,26 @@ class TestRestoreCronJobsIfEmptied:
         assert len(restored["jobs"]) == 3
 
 
+    def test_total_loss_preserves_snapshot_document_metadata(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        expected = {
+            "jobs": [{"id": "a", "prompt": "report"}],
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "format": "cron-v1",
+        }
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps(expected), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        jobs_path.write_text('{"jobs": []}', encoding="utf-8")
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        assert json.loads(jobs_path.read_text(encoding="utf-8")) == expected
+
+
     def test_non_utf8_journal_does_not_stop_restore(self, tmp_path):
         from hermes_cli.backup import restore_cron_jobs_if_emptied
         hermes_home = tmp_path / ".hermes"
