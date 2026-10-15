@@ -27,6 +27,11 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         return manager._replace(**kwargs)
     if not manager.session_id:
         return manager._replace(**kwargs) if replace_mode else manager._revise(**kwargs)
+    if getattr(manager, "_cursor", None) is not None:
+        # The caller already holds the write transaction and the manager loaded its state through
+        # that cursor, so the snapshot is current and writers are serialized. Re-entering the
+        # SessionDB lock for a separate read/CAS here would deadlock (session_controls.apply).
+        return manager._replace(**kwargs) if replace_mode else manager._revise(**kwargs)
     expected = original.to_json()
     db = None
     try:
