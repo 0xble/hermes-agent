@@ -1,7 +1,9 @@
 """A shutdown follow-up is its own future turn, not the predecessor's resume marker."""
 
 import asyncio
+import json
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -243,11 +245,42 @@ def test_followup_spool_whose_input_is_already_durable_is_dropped_not_replayed(t
     assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
-def test_legacy_followup_spool_same_id_is_dropped_even_with_different_text(tmp_path, monkeypatch):
-    """Older spools have no second content form, so an id match remains a safe drop."""
+def test_marked_followup_spool_without_persist_text_keeps_distinct_reused_id(tmp_path, monkeypatch):
+    """A current-build unprepared spool compares the raw trigger, not id alone."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="marked replay", source=source, user_id=source.user_id, message_id="m-marked")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "different historical text", "platform_message_id": "m-marked"})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+    assert [event.text for event in runner._startup_restore_queue] == ["marked replay"]
+    assert list((tmp_path / "pending_messages").glob("*.json"))
+
+
+def test_marked_followup_spool_without_persist_text_drops_matching_raw(tmp_path, monkeypatch):
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="same raw", source=source, user_id=source.user_id, message_id="m-marked-same")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "same raw", "platform_message_id": "m-marked-same"})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
+    assert runner._startup_restore_queue == []
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+
+
+def test_unmarked_legacy_followup_spool_same_id_is_dropped(tmp_path, monkeypatch):
+    """Legacy spools retain their historical id-only suppression behavior."""
     runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="legacy replay", source=source, user_id=source.user_id, message_id="m-legacy")
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    path, = (tmp_path / "pending_messages").glob("*.json")
+    payload = json.loads(path.read_text())
+    payload.pop("dedupe")
+    path.write_text(json.dumps(payload))
     runner.session_store.append_to_transcript(entry.session_id, {
         "role": "user", "content": "different historical text", "platform_message_id": "m-legacy"})
     assert recover_pending_to_db(
@@ -257,21 +290,6 @@ def test_legacy_followup_spool_same_id_is_dropped_even_with_different_text(tmp_p
     assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
-def test_followup_spool_with_same_id_but_corrected_text_is_replayed(tmp_path, monkeypatch):
-    """A reused platform id is not enough to retire a corrected shutdown follow-up."""
-    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
-    event = MessageEvent(text="corrected side effect", source=source, user_id=source.user_id, message_id="m-9")
-    setattr(event, "_hermes_persist_text", "prepared corrected side effect")
-    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
-    runner.session_store.append_to_transcript(entry.session_id, {
-        "role": "user", "content": "original side effect", "platform_message_id": "m-9"})
-    assert recover_pending_to_db(
-        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
-        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
-    assert [event.text for event in runner._startup_restore_queue] == ["corrected side effect"]
-    assert list((tmp_path / "pending_messages").glob("*.json")), "replayed follow-up must keep its spool"
-
-
 def test_input_already_durable_compares_content_on_a_direct_session_db(tmp_path):
     """A bare SessionDB has an id-only probe; content must still decide durability."""
     from gateway.run_pending_recovery import input_already_durable
@@ -279,8 +297,8 @@ def test_input_already_durable_compares_content_on_a_direct_session_db(tmp_path)
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = db.create_session("direct", "telegram")
     db.append_message(sid, "user", "original", platform_message_id="m-10")
-    assert input_already_durable(db, sid, "m-10", "original", "original")
-    assert not input_already_durable(db, sid, "m-10", "corrected", "corrected")
+    assert input_already_durable(db, sid, "m-10", "original", "original", 2)
+    assert not input_already_durable(db, sid, "m-10", "corrected", "corrected", 2)
     db.close()
 
 

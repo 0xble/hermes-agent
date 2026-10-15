@@ -64,14 +64,20 @@ def _fsync_directory(flush_dir: Path) -> None:
         os.close(directory_fd)
 
 
+DEDUPE_MARKER_VERSION = 2
+
+
 def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[Path] = None,
                    require_durable: bool = False) -> Path:
     """Atomically write one private, uniquely named recovery payload; return its path.
 
     Durable queue admission stages the payload under a non-eligible name. A directory-fsync failure
     therefore cannot leave a new replayable file behind or replace an already accepted checkpoint.
+    Every payload written by this build carries an explicit content-identity marker; files without
+    it are legacy spools whose historical id-only behavior is retained at recovery.
     """
     from utils import atomic_json_write
+    payload = {**payload, "dedupe": DEDUPE_MARKER_VERSION}
     final_path = path if path is not None else flush_dir / f"pending-{uuid.uuid4().hex}.json"
     if not require_durable:
         atomic_json_write(final_path, payload, mode=0o600, default=str)
@@ -736,6 +742,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     data = _upgrade_shutdown_follow_up(payload, data)
+    if "dedupe" in payload:
+        data = {**data, "dedupe": payload["dedupe"]}
     text = data.get("text", "")
     if data.get("drain_deferred") is True and _drop_drain_deferred(path, text, data):
         return DROP_PENDING
@@ -774,14 +782,22 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         message_id = data.get("message_id") or data.get("_outbox_admission_id")
         if target_db is not None and message_id:
             prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
-            if "persist_text" not in data:
+            if payload.get("dedupe") != 2:
+                # Spools from the previous build never replayed a persisted platform id, so retain
+                # their historical id-only suppression behavior.
                 already_durable = bool(prior_rows)
             else:
                 from agent.turn_context import _same_trigger_content
-                already_durable = any(
-                    _same_trigger_content(row.get("content"), data.get("text"), data.get("persist_text"))
-                    for row in prior_rows
-                )
+                if "persist_text" in data:
+                    already_durable = any(
+                        _same_trigger_content(row.get("content"), data.get("text"), data.get("persist_text"))
+                        for row in prior_rows
+                    )
+                else:
+                    already_durable = any(
+                        _same_trigger_content(row.get("content"), data.get("text"), None)
+                        for row in prior_rows
+                    )
             if already_durable:
                 return True
         if deferred_followup is None:

@@ -206,9 +206,51 @@ def test_queue_checkpoint_dedupe_matches_prepared_persist_text(home):
     db.close()
 
 
-def test_legacy_queue_checkpoint_id_match_is_dropped(home):
+def test_marked_queue_checkpoint_without_persist_text_keeps_distinct_reused_id(home):
     event = _event("legacy raw", "tg:legacy")
     assert shutdown_flush.checkpoint_queued_event("original", event)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message("original", "user", "different historical text", platform_message_id=event.message_id)
+    assert _boot(db, home, sid="original") == [event.text]
+    assert _spools(home)
+    db.close()
+
+
+def test_marked_queue_checkpoint_without_persist_text_drops_matching_raw(home):
+    event = _event("same raw", "tg:legacy-same")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message("original", "user", event.text, platform_message_id=event.message_id)
+    assert _boot(db, home, sid="original") == []
+    assert _spools(home) == []
+    db.close()
+
+
+def test_prepare_checkpoint_failure_aborts_before_persisted_row(home, monkeypatch):
+    """A refresh failure must not leave a persisted row beside an unbound replay spool."""
+    event = _event("queued input", "tg:refresh-fail")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    monkeypatch.setattr(shutdown_flush, "checkpoint_queued_event", lambda *args, **kwargs: False)
+    with pytest.raises(RuntimeError, match="provider call was not sent"):
+        shutdown_flush.prepare_queued_turn_checkpoint(
+            SimpleNamespace(), event, "original", "original", event.message_id, "persisted queued input",
+        )
+    assert _spools(home)
+    assert db.get_messages("original") == []
+    db.close()
+
+
+def test_unmarked_legacy_queue_checkpoint_id_match_is_dropped(home):
+    event = _event("legacy raw", "tg:legacy-old")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    path = event._hermes_recovery_spool
+    payload = json.loads(path.read_text())
+    payload.pop("dedupe")
+    path.write_text(json.dumps(payload))
     db = SessionDB(db_path=home / "state.db")
     db.create_session("original", "telegram")
     db.append_message("original", "user", "different historical text", platform_message_id=event.message_id)

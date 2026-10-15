@@ -47,7 +47,8 @@ class RestartRecoveryMixin:
         return await asyncio.to_thread(
             input_already_durable, getattr(self, "session_store", None),
             getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None),
-            getattr(event, "text", None), getattr(event, "_hermes_persist_text", None))
+            getattr(event, "text", None), getattr(event, "_hermes_persist_text", None),
+            getattr(event, "_hermes_dedupe", None))
 
     async def _retire_spool_once_input_durable(self, event) -> None:
         """Retire the replay copy at the turn's durable start, not at adapter admission.
