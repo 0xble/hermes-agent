@@ -74,7 +74,11 @@ def test_consumption_checkpoints_debt_before_unlink_and_producer_death(cell, cla
         Path(sys.argv[2]).write_text(str(os.getpid()), encoding="utf-8")
         while not Path(sys.argv[3]).exists(): time.sleep(.01)
         accepted = consume_planned_stop_marker_for_self()
-        Path(sys.argv[4]).write_text(json.dumps(accepted), encoding="utf-8")
+        # Publish atomically: the test waits only for the path to exist, so a plain write_text
+        # could be observed after create and before the payload lands (empty JSON under load).
+        partial = Path(sys.argv[4] + ".tmp")
+        partial.write_text(json.dumps(accepted), encoding="utf-8")
+        os.replace(partial, sys.argv[4])
         while True: time.sleep(.05)
     ''', base / "ready", base / "consume", base / "consumed")
     _wait(base / "ready", consumer)
