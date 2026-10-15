@@ -232,3 +232,16 @@ async def test_runner_running_session_fast_path_fails_a_review_instead_of_interr
     assert result is None
     with pytest.raises(RuntimeError, match="busy"):
         capture.result(timeout=0)
+
+
+def test_drain_never_preserves_a_review():
+    from gateway.run_busy import GatewayBusySessionMixin
+    capture = Future()
+    event = MessageEvent(text="review", source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="139328"),
+        internal=True, reply_expected=False, allow_gateway_control=False,
+        metadata={"_cron_review_capture": capture})
+    runner = SimpleNamespace()  # any queue or spool access would fail the test
+    assert GatewayBusySessionMixin._preserve_drain_event(runner, "key", event) is False
+    with pytest.raises(RuntimeError, match="busy"):
+        capture.result(timeout=0)
