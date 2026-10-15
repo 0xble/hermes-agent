@@ -33,6 +33,17 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+def get_launchd_slot_labels() -> tuple[str, str]:
+    """Return the fixed active/standby launchd labels for the resolved Hermes home.
+
+    The first label reuses the existing per-home/per-profile convention; the
+    standby slot is its stable ``.b`` sibling. No generation is encoded in either
+    label, so launchd supervision remains stable across releases.
+    """
+    active = get_launchd_label()
+    return active, f"{active}.b"
+
+
 def _probe_launchd_domain_for_label(label: str, *, budget=None) -> str:
     """Launchd domain managing ``label`` (uncached): ``gui/<uid>`` (Aqua), then ``user/<uid>``
     (Background/SSH), else the ``launchctl managername`` heuristic. Sibling profiles may live in
