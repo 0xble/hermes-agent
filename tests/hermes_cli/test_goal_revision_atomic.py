@@ -6,7 +6,7 @@ from hermes_cli import goals
 from hermes_state import SessionDB
 
 
-@pytest.mark.parametrize("timing", ["before", "quote", "commit", "noop_commit"])
+@pytest.mark.parametrize("timing", ["before", "evidence", "commit", "noop_commit"])
 @pytest.mark.parametrize("change", ["pause", "clear", "replace", "revise", "pause_resume"])
 def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, change):
     db = SessionDB(tmp_path / "state.db")
@@ -36,11 +36,13 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
 
         if timing == "before":
             publish()
-        elif timing == "quote":
-            def messages(*args):
+        elif timing == "evidence":
+            # Agents cannot change the objective (that is /goal replace), so the long read
+            # inside a revision is the recorded-evidence lookup.
+            def lookup(self, evidence, state):
                 publish()
-                return ["Work on the corrected task instead"]
-            monkeypatch.setattr(goals, "user_messages_since", messages)
+                return None
+            monkeypatch.setattr(goals.GoalManager, "_recorded_evidence_error", lookup)
         else:
             execute = db._execute_write
             def interleave(write, *args, **kwargs):
@@ -50,9 +52,9 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
             monkeypatch.setattr(db, "_execute_write", interleave)
         if timing == "noop_commit":
             result = manager.revise(reason="Nothing changed", contract={})
-        elif timing == "quote":
-            result = manager.revise(reason="New task", goal="corrected task",
-                                    user_quote="Work on the corrected task instead")
+        elif timing == "evidence":
+            result = manager.revise(reason="Recorded audit", contract={"verification": "check the audit"},
+                                    evidence="audit passed")
         else:
             result = manager.revise(reason="More proof", contract={"verification": "check the artifact"})
         assert result["ok"] is False
@@ -143,7 +145,7 @@ def test_revision_persistence_failure_is_not_ephemeral_success(tmp_path, monkeyp
         db.close()
 
 
-@pytest.mark.parametrize("operation", ["stop_waiting", "clear_lifted_wait"])
+@pytest.mark.parametrize("operation", ["stop_waiting", "clear_lifted_wait", "rearm_live_barrier"])
 def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch, operation):
     from contextlib import contextmanager
 
@@ -175,7 +177,8 @@ def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch
             monkeypatch.setattr(manager, "_save", checked_save)
             assert manager.stop_waiting()
         else:
-            target = "clear_goal_wait_if_since"
+            target = ("clear_goal_wait_if_since" if operation == "clear_lifted_wait"
+                      else "rearm_goal_barrier_if_since")
             write = getattr(goals, target)
 
             def checked_write(*args, **kwargs):
@@ -183,7 +186,13 @@ def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch
                 return write(*args, **kwargs)
 
             monkeypatch.setattr(goals, target, checked_write)
-            assert manager.clear_lifted_wait(manager.state.waiting_since)
+            if operation == "clear_lifted_wait":
+                assert manager.clear_lifted_wait(manager.state.waiting_since)
+            else:
+                monkeypatch.setattr(goals, "_pid_alive", lambda _pid: True)
+                monkeypatch.setattr(goals.time, "time", lambda: manager.state.waiting_since + goals._MAX_BARRIER_WAIT_S + 1)
+                manager.rearm_live_barrier()
+                assert manager.state.barrier_rearms == 1
         assert not entered
         assert manager.state.to_json() == goals.load_goal(manager.session_id).to_json()
     finally:

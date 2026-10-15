@@ -43,6 +43,19 @@ async def _post_turn_event(runner):
     return runner.adapter._pending_messages[runner.target.session_key]
 
 
+def _pause_before(action):
+    """Resume lifts any pause; a replacement lifts only a judge pause over the contract it supersedes."""
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager("target")
+    if action != "replace":
+        manager.pause()
+        return
+    manager.state.status, manager.state.last_verdict = "paused", "blocked"
+    manager.state.paused_reason = "judge blocked: needs approval"
+    manager._save()
+
+
 def _apply(state, action, **payload):
     from hermes_cli import session_controls
 
@@ -64,7 +77,7 @@ async def test_real_control_constructor_revalidated_at_idle_ingress(state, actio
 
     runner = _runner(state)
     GoalManager("target").set("old objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     record = _apply(state, action, **({"goal": "approved objective"} if action == "replace" else {}))
     event = await _control_event(runner, record)
     assert event.internal is False  # Production continuations are ordinary authorized ingress.
@@ -601,7 +614,7 @@ async def test_approved_control_continuation_refreshes_after_subgoal_add(
 
     runner = _runner(state)
     GoalManager("target").set("same objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     request = request_control("goal", action, "target", requester_sid="requester",
                               payload={"goal": "approved objective"} if action == "replace" else {})
     record = resolve_request(request["id"], "approve", "99")
