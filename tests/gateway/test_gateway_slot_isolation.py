@@ -411,7 +411,6 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.delenv("HERMES_GATEWAY_SLOT")
     assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
     assert "host_attach" in calls
-    assert "compact" in calls
     assert zero_cut_standby.readiness()["ready"] is False  # a clean early exit never reports ready
 
     # A serving standby reports ready only after cron and housekeeping have started.
@@ -430,6 +429,7 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
     assert mode["ready_at_cron"] is False
     assert zero_cut_standby.readiness()["ready"] is True
+    assert "compact" not in calls
 
 
 @pytest.mark.asyncio
