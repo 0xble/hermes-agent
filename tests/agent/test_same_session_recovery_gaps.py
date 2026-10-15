@@ -180,6 +180,11 @@ def test_presend_gate_lowers_an_oversized_output_cap_instead_of_withholding(tmp_
     assert verdict.action == "fallthrough" and not verdict.failed
     shrunk = agent._ephemeral_max_output_tokens
     assert shrunk is not None and 4096 <= shrunk < 30000
+    assert agent._preflight_output_ceiling == shrunk
+    first = agent._build_api_kwargs(rows)
+    second = agent._build_api_kwargs(rows)
+    assert first["max_tokens"] == shrunk
+    assert second["max_tokens"] == shrunk
 
 
 def test_presend_gate_keeps_the_cap_when_too_little_answer_runway_remains(tmp_path):
@@ -195,6 +200,7 @@ def test_presend_gate_keeps_the_cap_when_too_little_answer_runway_remains(tmp_pa
         verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
     assert verdict.action == "break" and verdict.failed
     assert agent._ephemeral_max_output_tokens is None
+    assert agent._preflight_output_ceiling is None
 
 
 def test_presend_gate_shrinks_output_cap_again_after_compaction(tmp_path):
@@ -226,6 +232,7 @@ def test_bedrock_preflight_does_not_arm_ignored_ephemeral_output_cap(tmp_path):
         verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
     assert verdict.action == "break" and verdict.failed
     assert agent._ephemeral_max_output_tokens is None
+    assert agent._preflight_output_ceiling is None
     from agent.chat_completion_helpers import selected_max_output_tokens
     agent._ephemeral_max_output_tokens = 4000
     assert selected_max_output_tokens(agent) == 7000

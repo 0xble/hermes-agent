@@ -4224,6 +4224,10 @@ class BasePlatformAdapter(ABC):
                     if not checkpointed_merge_pending_message_event(
                         self._pending_messages, session_key, event, merge_text=True,
                     ):
+                        # Preserve the event for shutdown spooling when durable admission is temporarily
+                        # unavailable. Sender attribution was checked above, so this merge is safe.
+                        merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                        event._gateway_accepted = True
                         return
                 return
         now = time.monotonic()

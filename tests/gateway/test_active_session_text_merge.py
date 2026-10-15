@@ -130,6 +130,26 @@ async def test_debounce_checkpoint_failure_moves_burst_to_pending_for_shutdown()
 
 
 @pytest.mark.asyncio
+async def test_cross_sender_debounce_checkpoint_failure_preserves_pending_event():
+    """A failed checkpoint must not drop a cross-sender follow-up already mergeable into pending."""
+    adapter = _make_adapter()
+    key = build_session_key(_make_event("first", user_id="u1").source)
+    state_event = _make_event("buffered", user_id="u1")
+    pending = _make_event("pending", user_id="u2")
+    incoming = _make_event("incoming", user_id="u2")
+    adapter._text_debounce[key] = TextDebounceState(
+        event=state_event, task=None, first_ts=0.0, last_ts=0.0,
+    )
+    adapter._pending_messages[key] = pending
+    with patch.object(adapter, "_flush_text_debounce_now", new=AsyncMock(return_value=False)), \
+            patch("gateway.platforms.base.checkpointed_merge_pending_message_event", return_value=False):
+        await adapter._queue_text_debounce(key, incoming)
+    assert adapter._pending_messages[key] is pending
+    assert "incoming" in adapter._pending_messages[key].text
+    assert incoming._gateway_accepted is True
+
+
+@pytest.mark.asyncio
 async def test_non_dm_message_does_not_wait_for_topic_recovery_executor(monkeypatch):
     """Group messages must not queue behind the shared thread pool.
 

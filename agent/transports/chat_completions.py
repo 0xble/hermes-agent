@@ -335,16 +335,20 @@ def _swap_developer_role(sanitized: list, model_lower: str) -> list:
 
 
 def resolve_chat_max_tokens(model: str, reasoning_config: Any, ephemeral: Any, max_tokens: Any,
-                            profile_max: Any = None) -> Any:
+                            profile_max: Any = None, output_ceiling: Any = None) -> Any:
     """Output-cap value the chat builder sends (before the provider's param-name mapping), or None
     when the request omits it: one-shot cap, configured cap, then profile default, each raised for
-    Gemini thinking."""
+    Gemini thinking. A turn-scoped preflight ceiling is applied after provider-specific raises."""
+    value = None
     for candidate in (ephemeral, max_tokens):
         if candidate is not None:
-            return _raise_gemini_thinking_max_tokens(model, reasoning_config, candidate)
-    if profile_max:
-        return _raise_gemini_thinking_max_tokens(model, reasoning_config, profile_max)
-    return None
+            value = _raise_gemini_thinking_max_tokens(model, reasoning_config, candidate)
+            break
+    if value is None and profile_max:
+        value = _raise_gemini_thinking_max_tokens(model, reasoning_config, profile_max)
+    if value is not None and output_ceiling is not None:
+        value = min(value, output_ceiling)
+    return value
 
 
 def _apply_max_tokens(api_kwargs: dict, model: str, reasoning_config: Any, params: dict, profile_max: Any = None) -> None:
@@ -353,7 +357,8 @@ def _apply_max_tokens(api_kwargs: dict, model: str, reasoning_config: Any, param
     if not max_tokens_fn:
         return
     value = resolve_chat_max_tokens(model, reasoning_config, params.get("ephemeral_max_output_tokens"),
-                                    params.get("max_tokens"), profile_max)
+                                    params.get("max_tokens"), profile_max,
+                                    params.get("output_ceiling"))
     if value is not None:
         api_kwargs.update(max_tokens_fn(value))
 

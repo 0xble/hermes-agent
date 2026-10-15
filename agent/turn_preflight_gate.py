@@ -17,6 +17,12 @@ from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _clear_preflight_output_state(agent: Any) -> None:
+    """Do not carry a failed turn's preflight cap into the cached agent's next turn."""
+    agent._preflight_output_ceiling = None
+    agent._ephemeral_max_output_tokens = None
+
+
 def run_preflight_gate(
     agent: Any, *, request_pressure_tokens: Any, _moa_prepared_request: Any,
     pending_moa_prepared_request: Any, messages: Any, system_message: Any, user_message: Any,
@@ -55,6 +61,7 @@ def run_preflight_gate(
         with suppress(Exception):
             agent.iteration_budget.refund()
         v.action = "break"
+        _clear_preflight_output_state(agent)
         return v
 
     # A known hard-window breach cannot defer to real usage: some servers truncate
@@ -69,6 +76,8 @@ def run_preflight_gate(
         # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
         shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
         if shrunk is not None:
+            if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
+                agent._preflight_output_ceiling = shrunk
             agent._ephemeral_max_output_tokens = shrunk
             logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
     if (api_messages is not None and isinstance(window, int) and window > 0
@@ -94,6 +103,8 @@ def run_preflight_gate(
             if can_shrink_output and not request_fits(agent, recovered, prompt, tools=tools_for_api):
                 shrunk = affordable_output_cap(agent, recovered, tools=tools_for_api)
                 if shrunk is not None:
+                    if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
+                        agent._preflight_output_ceiling = shrunk
                     agent._ephemeral_max_output_tokens = shrunk
                     logger.info("Post-recovery fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
             if request_fits(agent, recovered, prompt, tools=tools_for_api):
@@ -110,6 +121,7 @@ def run_preflight_gate(
         v._turn_exit_reason = "context_compression_timeout"
         v._compression_timeout_exhausted = True
         v.action = "break"
+        _clear_preflight_output_state(agent)
         return v
 
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
@@ -142,7 +154,7 @@ def run_preflight_gate(
             f"{_last_preflight_pressure:,}",
             f"{request_pressure_tokens:,}",
         )
-    return run_preflight_compression(
+    result = run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
@@ -155,3 +167,6 @@ def run_preflight_gate(
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
+    if result.action == "break":
+        _clear_preflight_output_state(agent)
+    return result
