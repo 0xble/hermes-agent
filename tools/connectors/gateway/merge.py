@@ -24,6 +24,9 @@ __all__ = [
     "splice_remote_results",
 ]
 
+# Codes the user resolves by connecting the app; both carry the card or link.
+_CONNECTION_CODES = frozenset({"CONNECTION_REQUIRED", "CONNECTION_EXPIRED"})
+
 
 @dataclass(frozen=True)
 class PlannedCall:
@@ -82,7 +85,10 @@ def partition_calls(calls: Sequence[Any]) -> Partition:
 
 
 def render_remote_entry(planned: PlannedCall, remote: Mapping[str, Any]) -> dict[str, Any]:
-    """Use the shared CONNECTION_REQUIRED shape so links render consistently."""
+    """Use the shared connection shape so links render consistently.
+
+    The model sees code, message, connector and the gateway's hint, plus ``family`` when the gateway
+    classified the failure. Transport details (status, request id) stay in the logs."""
     error = remote.get("error") if isinstance(remote, Mapping) else None
     account = _opt_str(remote.get("account")) if isinstance(remote, Mapping) else None
     if not isinstance(error, Mapping):
@@ -91,13 +97,14 @@ def render_remote_entry(planned: PlannedCall, remote: Mapping[str, Any]) -> dict
 
     code = str(error.get("code") or "PROVIDER_ERROR")
     message = str(error.get("message") or "The gateway reported an error.")
-    if code == "CONNECTION_REQUIRED":
+    if code in _CONNECTION_CODES:
         payload = render_connection_required(
             connector=_opt_str(error.get("connector")) or planned.connector,
             message=message,
             connect_url=_opt_str(error.get("connect_url")),
             hint=_opt_str(error.get("hint")),
             surface=connection_surface(),
+            code=code,
         )
         # The account the link repairs or waits on; with no connect_url the user already holds its link.
         connection_id = _opt_str(error.get("connection_id"))
@@ -111,6 +118,9 @@ def render_remote_entry(planned: PlannedCall, remote: Mapping[str, Any]) -> dict
         hint = _opt_str(error.get("hint"))
         if hint:
             payload["hint"] = hint
+    family = _opt_str(error.get("family"))
+    if family:
+        payload["family"] = family
     return _with_account({"index": planned.position, "name": planned.name, "error": payload}, account)
 
 

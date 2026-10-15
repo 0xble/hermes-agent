@@ -4,12 +4,13 @@
   "parameters": {
     "properties": {
       "action": {
-        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child (subagent_id + message) without stopping it; 'stop' = end one child early (subagent_id; partial result still returns). Control actions return immediately; goal/tasks are ignored unless spawning.",
+        "description": "Default 'spawn'. Live control of running children: 'list' = ids/goals/status/transcripts; 'steer' = queue course-correction text into one child (subagent_id + message) without stopping it; 'stop' = end one child early (subagent_id; partial result still returns). 'resume' = for a background delegation that was INTERRUPTED (unknown/interrupted/stalled outcome), claim its one-shot recovery brief (subagent_id = its delegation_id); it returns a 'recovery_context' to pass as the context of a normal spawn — it does NOT spawn anything. Control actions return immediately; goal/tasks are ignored unless spawning.",
         "enum": [
           "spawn",
           "list",
           "steer",
-          "stop"
+          "stop",
+          "resume"
         ],
         "type": "string"
       },
@@ -18,7 +19,7 @@
         "type": "string"
       },
       "subagent_id": {
-        "description": "Target for action='steer'/'stop' (ids from the spawn response or action='list').",
+        "description": "Target for action='steer'/'stop' (ids from the spawn response or action='list'), or the delegation_id for action='resume'.",
         "type": "string"
       },
       "tasks": {

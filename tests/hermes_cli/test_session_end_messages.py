@@ -33,6 +33,7 @@ def finalize_hook(monkeypatch):
 
     mgr = PluginManager()
     mgr._discovered = True
+    mgr._discovery_complete = True
     mgr._hooks["on_session_finalize"] = [_hook]
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: mgr)
     return calls
@@ -172,6 +173,7 @@ async def test_gateway_shutdown_sends_finalize_message_before_teardown(finalize_
 async def test_gateway_finalize_without_message_sends_nothing(monkeypatch):
     mgr = PluginManager()
     mgr._discovered = True
+    mgr._discovery_complete = True
     mgr._hooks["on_session_finalize"] = [lambda **_: None]
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: mgr)
     runner, adapter, _source, key = _gateway_runner()

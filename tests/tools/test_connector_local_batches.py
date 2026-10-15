@@ -23,7 +23,7 @@ def recorded_dispatch(monkeypatch):
         registry.register(
             name, _TOOLSET, {"name": name, "description": name, "parameters": schema},
             lambda args, _name=name, **kw: (invoked.append((_name, args)) or json.dumps({"ran": _name, "n": args["n"]})))
-    monkeypatch.setattr(bridge, "_default_client_factory", lambda: invoked.append("gateway"))
+    monkeypatch.setattr(bridge, "_default_client_factory", lambda call=None: invoked.append("gateway"))
     invalidate_check_fn_cache()
     try:
         yield invoked

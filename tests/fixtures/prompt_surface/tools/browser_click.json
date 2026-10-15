@@ -1,5 +1,5 @@
 {
-  "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate and browser_snapshot to be called first.",
+  "description": "Click on an element identified by its ref ID from the snapshot (e.g., '@e5'). The ref IDs are shown in square brackets in the snapshot output. Requires browser_navigate or browser_handoff and browser_snapshot to be called first.",
   "name": "browser_click",
   "parameters": {
     "properties": {

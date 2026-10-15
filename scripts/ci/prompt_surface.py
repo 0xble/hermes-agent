@@ -26,6 +26,7 @@ import argparse
 import difflib
 import json
 import logging
+import re
 import os
 import shutil
 import socket
@@ -79,9 +80,14 @@ def _pin_environment() -> None:
     socket.socket.connect = refuse  # type: ignore[method-assign]
     socket.create_connection = refuse  # type: ignore[assignment]
     socket.getaddrinfo = refuse  # type: ignore[assignment]
+    # Import host-platform extension modules before pinning ``sys.platform``. On macOS,
+    # changing it first makes psutil look for its Linux extension and breaks imports.
+    import psutil  # noqa: F401
+    # Likewise import zoneinfo-backed modules before pinning platform; otherwise Python's
+    # stdlib looks for the Linux sysconfig-data module and breaks ``zoneinfo``.
+    import hermes_time
     sys.platform = "linux"  # skills index ``platforms:`` gate
 
-    import hermes_time
     hermes_time.now = lambda: FIXED_NOW  # type: ignore[assignment]
     # Every registered tool counts as available, as on a fully configured install: check_fns
     # read credentials, binaries and the tool store, which vary by host and would hide schemas.
@@ -113,6 +119,10 @@ def _scrub(text: str, home: Path) -> str:
         f"{_platform.system()} ({_platform.release()})": "<HOST_OS>",
     }.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
+    # Some imported modules cache Path.home()/TMPDIR before the child pins its
+    # environment. Normalize the per-render temporary home as a final guard.
+    text = re.sub(r"/[^\s/]+/T/prompt-surface-[^/\s]+/home/\.hermes", "<HERMES_HOME>", text)
+    text = re.sub(r"/[^\s/]+/T/prompt-surface-[^/\s]+/home", "<HOME>", text)
     return text
 
 

@@ -49,11 +49,9 @@ def test_local_persistent_defaults_on_and_reaches_the_environment(monkeypatch, t
 
 
 @pytest.mark.platforms("linux", "macos")
-@pytest.mark.parametrize("setting, later", [("true", "fn:no"), ("false", "fn:yes")])
-def test_profile_functions_survive_only_with_persistence_off(monkeypatch, tmp_path, setting, later):
-    """The login snapshot holds profile functions; with persistence on the first command's
-    ``export -p`` re-dump replaces it, so they are gone from the second command on. The docs'
-    "Profile functions / aliases" row states exactly this."""
+@pytest.mark.parametrize("setting", ["true", "false"])
+def test_profile_functions_survive_with_or_without_persistence(monkeypatch, tmp_path, setting):
+    """Profile functions remain available after the snapshot is re-dumped in either mode."""
     home = tmp_path / "home"
     home.mkdir()
     for rc in (".bashrc", ".bash_profile"):
@@ -70,6 +68,6 @@ def test_profile_functions_survive_only_with_persistence_off(monkeypatch, tmp_pa
 
     try:
         assert run(probe) == "fn:yes"
-        assert run(probe) == later
+        assert run(probe) == "fn:yes"
     finally:
         cleanup_vm(_resolve_container_task_id(task_id))

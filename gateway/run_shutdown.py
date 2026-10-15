@@ -1605,10 +1605,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 if deadline is not None and time.monotonic() >= deadline:
                     return
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                await self._finalize_session_off_loop(
+                messages = await self._finalize_session_off_loop(
                     session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                     session_key=session_key, timeout=remaining,
                 )
+                await self._deliver_session_end_messages(messages, session_key=session_key)
                 if stop_event is not None and stop_event.is_set():
                     return
                 if deadline is not None and time.monotonic() >= deadline:
@@ -1618,10 +1619,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 continue
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
             # (e.g. a full-session trace export) — same hang class as the memory provider below.
-            await self._finalize_session_off_loop(
+            messages = await self._finalize_session_off_loop(
                 session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                 session_key=session_key,
             )
+            await self._deliver_session_end_messages(messages, session_key=session_key)
             if stop_event is not None and stop_event.is_set():
                 return
             # Off-loop + bounded: a wedged memory provider here used to hang the whole shutdown so
@@ -1707,33 +1709,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             )
         except Exception as flush_exc:
             logger.debug("Interrupted-agent memory flush failed: %s", flush_exc)
-
-    async def _finalize_session_off_loop(
-        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None,
-        timeout: Optional[float] = None, **extra: Any,
-    ) -> None:
-        """Run hermes_cli.lifecycle.finalize_session off-loop, bounded; on timeout the worker is left alone.
-        ``session_key`` lets an unscoped caller (shutdown) enter the owning profile's scope: plugin
-        ``on_session_finalize`` observers and the Relay coordinator (``current_profile_key``) resolve
-        profile state at call time."""
-
-        def _call() -> None:
-            from hermes_cli.lifecycle import finalize_session
-            finalize_session(session_id=session_id, platform=platform, reason=reason, **extra)
-
-        try:
-            await asyncio.wait_for(
-                self._run_housekeeping_in_executor(self._run_release_in_profile_scope, _call, (), session_key),
-                timeout=self._FINALIZE_TIMEOUT_S if timeout is None else max(0.0, timeout),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Session finalize hooks (%s, reason=%s) exceeded %ss; proceeding without blocking the event loop "
-                "(the worker thread is left to finish on its own).", session_id, reason,
-                self._FINALIZE_TIMEOUT_S if timeout is None else timeout,
-            )
-        except Exception as finalize_exc:
-            logger.debug("Session finalize hooks (%s, reason=%s) failed: %s", session_id, reason, finalize_exc)
 
     async def _cleanup_agent_resources_off_loop(
         self, agent: Any, *, context: str = "", session_key: Optional[str] = None,

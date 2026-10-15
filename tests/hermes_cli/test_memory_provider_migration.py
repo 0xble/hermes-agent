@@ -302,6 +302,9 @@ def test_startup_recovery_backs_off_after_a_failed_install(tmp_path, monkeypatch
 
     (tmp_path / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # The fixture controls provider presence explicitly because the fork intentionally keeps the
+    # bundled provider while this test exercises the failed catalog-install path.
+    monkeypatch.setattr(mig, "provider_present", lambda *_args: False)
     monkeypatch.setattr(mig, "catalog_source", lambda n: n)
     monkeypatch.setattr(pm_install, "lazy_installs_allowed", lambda: True)
     attempts: list[str] = []

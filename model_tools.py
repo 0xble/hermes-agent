@@ -32,9 +32,10 @@ _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_h
 
 
 @contextmanager
-def suppress_post_tool_call_hook():
-    """Let an outer executor own the terminal post-tool event."""
-    token = _post_tool_call_hook_suppressed.set(True)
+def suppress_post_tool_call_hook(suppressed: bool = True):
+    """Let an outer executor own the terminal post-tool event. ``suppressed=False`` re-enables it
+    inside such a block, for calls that are their own (each entry of a connector batch)."""
+    token = _post_tool_call_hook_suppressed.set(suppressed)
     try:
         yield
     finally:
@@ -436,25 +437,16 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault note: on a login/checkout form call browser_vault_list first. Password: use "
-                           "browser_vault_fill when the vault has an item for the origin; when it has none, you may type a "
-                           "password you deliberately fetched yourself from an authorized store for that service (the "
-                           "credential CLI or 1Password CLI), otherwise use browser_vault_save_login. One-time / 2FA code "
-                           "(independent of where the password came from): call browser_vault_enter_code when the list shows "
-                           "two_factor exactly \"automatic\" for the handle; otherwise you may type a code you deliberately "
-                           "fetched yourself (1Password CLI TOTP field, or the newest verification email/SMS from the "
-                           "expected sender in the intended mailbox or phone), and call browser_vault_enter_code only when "
-                           "you have no such source, since it prompts the user. Type only on the origin the secret belongs "
-                           "to. Card numbers and CVCs go only through browser_vault_fill. Any other value (shown on the page, appearing incidentally in unrelated tool "
-                           "output, or given by the user in chat) is never a source: never type it, never ask for or accept "
-                           "one in chat, and never repeat a secret in a reply.")
+_VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
+                           "Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
+                           "the page or the user shows it.")
 
 
 def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
     """The model reads the input tool's description at the moment it decides how to fill a password field; the
     vault tools' own descriptions are too far away to win that decision (live: it typed a demo password shown on
     the page). Say it where the temptation is."""
-    if "browser_vault_fill" not in available:
+    if "browser_vault" not in available:
         return td
     fn = td["function"]
     return _fn_def({**fn, "description": fn.get("description", "") + _VAULT_NO_PASSWORD_NOTE})
@@ -478,8 +470,7 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "browser_cdp": _rewrite_browser_cdp,
     "browser_exec": _compose_rewriters(_rewrite_browser_exec, _rewrite_input_tool_for_vault),
     "browser_type": _rewrite_input_tool_for_vault,
-    "browser_vault_list": _rewrite_browser_vault,
-    "browser_vault_fill": _rewrite_browser_vault,
+    "browser_vault": _rewrite_browser_vault,
     "delegate_task": _rewrite_delegate_task,
 }
 
@@ -712,7 +703,8 @@ def _emit_post_tool_call_hook(
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
-                          enabled_toolsets: Optional[list[str]], disabled_toolsets: Optional[list[str]]):
+                          enabled_toolsets: Optional[list[str]], disabled_toolsets: Optional[list[str]],
+                          ids: Optional[_CallIds] = None):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -733,10 +725,12 @@ def _dispatch_bridge_tool(function_name: str, function_args: dict[str, Any],
     except Exception:
         current_defs = []
     args = function_args or {}
+    from tools.managed_gateway_identity import CallRef
+    call = CallRef(turn_id=ids.turn_id, tool_call_id=ids.tool_call_id) if ids else None
     if function_name == ts.TOOL_SEARCH_NAME:
-        return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
+        return ts.dispatch_tool_search(args, current_tool_defs=current_defs, call=call), None
     if function_name == ts.TOOL_DESCRIBE_NAME:
-        return ts.dispatch_tool_describe(args, current_tool_defs=current_defs), None
+        return ts.dispatch_tool_describe(args, current_tool_defs=current_defs, call=call), None
     underlying_name, underlying_args, err = ts.resolve_underlying_call(args)
     if err or not underlying_name:
         return tool_error(err or "tool_call could not be resolved"), None
@@ -878,7 +872,7 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
     def _dispatch(next_args: dict[str, Any]) -> Any:
         from tools.connectors import dispatch_connector_call, is_connector_name
         if is_connector_name(function_name):
-            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
+            return dispatch_connector_call(function_name, next_args, ids.tool_call_id, ids.turn_id, ids.task_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
@@ -997,7 +991,7 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
+    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets, ids)
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:

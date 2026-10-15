@@ -24,9 +24,12 @@ class InterruptionNotesMixin:
         from gateway.run import _parse_session_key
         source = None
         try:
-            if getattr(self, "session_store", None) is not None:
-                await self.async_session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                async_store = getattr(self, "async_session_store", None)
+                if async_store is not None:
+                    await async_store._ensure_loaded()
+                entry = getattr(store, "_entries", {}).get(session_key)
                 source = getattr(entry, "origin", None) if entry else None
         except Exception as e:
             logger.debug("Failed to load session origin for shutdown notification %s: %s", session_key, e)

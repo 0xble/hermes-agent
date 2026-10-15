@@ -1622,10 +1622,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         raw_content = data.decode("utf-8", "surrogateescape")
         content, _ = _strip_bom(raw_content)
 
-        from tools.fuzzy_match import fuzzy_find_and_replace
+        from tools.fuzzy_match import boundary_note, fuzzy_find_and_replace
         diagnostics: dict = {}
-        new_content, match_count, _strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all, diagnostics=diagnostics)
+        new_content, match_count, strategy, error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all, diagnostics=diagnostics, correction_notes=correction_notes)
         if error or match_count == 0:
             if diagnostics:
                 return PatchResult(error=error, **diagnostics)
@@ -1645,6 +1645,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
+            note="\n".join(n for n in (*correction_notes, boundary_note([strategy])) if n) or None,
             # From the internal write_file call, whose baseline was the pre-patch content.
             lsp_diagnostics=write_result.lsp_diagnostics,
             _writes=[(path, hashlib.sha256(data).hexdigest(), write_result._content_sha256)])
