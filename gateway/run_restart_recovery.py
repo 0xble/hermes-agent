@@ -203,14 +203,20 @@ class RestartRecoveryMixin:
             else:
                 await self._finish_restart_recovery(session_key, outcome.removeprefix("skipped:"))
 
-    async def _deliver_recovered_followup_note(self, event, session_key: str, content: str) -> bool:
-        """Send one recovered-follow-up notice inside the event's own profile scope."""
+    async def _deliver_recovered_followup_note(self, event, session_key: str, *,
+                                               notice_key: str | None = None, text: str | None = None) -> bool:
+        """Send one recovered-follow-up notice inside the event's own profile scope.
+
+        Pass an i18n ``notice_key`` rather than translated text: ``t()`` must run inside the
+        scope, or a multiplexed secondary profile's notice resolves the launch profile's locale.
+        """
         from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
         try:
             # Restore observers run outside any profile scope; a multiplexed secondary
             # profile's notice must resolve its own locale, metadata and config.
             home = self._resolve_profile_home_for_source(event.source)
             async with _async_profile_runtime_scope(home) if home else nullcontext():
+                content = t(notice_key) if notice_key is not None else text
                 send = self._deliver_platform_notice(event.source, content)
                 timeout = _startup_restore_drain_timeout_secs()
                 return bool(await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None))
@@ -225,11 +231,14 @@ class RestartRecoveryMixin:
         # A declined input never ran, so the predecessor's interruption note does not cover it.
         noted = False if declined else self._interruption_note_delivered(session_key)
         if not noted:
-            noted = await self._deliver_recovered_followup_note(
-                event, session_key,
-                t("gateway.restart.followup_declined_notice" if declined
-                  else "gateway.restart.followup_recovery_notice"),
-            )
+            if not declined:
+                key = "gateway.restart.followup_recovery_notice"
+            elif reason == "possibly-duplicate":
+                # Its content may already have run; never tell the user it was not run.
+                key = "gateway.restart.followup_possible_duplicate_notice"
+            else:
+                key = "gateway.restart.followup_declined_notice"
+            noted = await self._deliver_recovered_followup_note(event, session_key, notice_key=key)
         suffix = ":noted" if noted else ":note-unavailable"
         if declined and noted:
             # The user now knows to resend it: keep the bytes for manual recovery, but never
@@ -283,9 +292,12 @@ class RestartRecoveryMixin:
             if await self._recovered_input_durable(event):
                 from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
                 self._retire_recovered_followup_spool(event)
-                await self._deliver_recovered_followup_note(event, session_key, PARTIAL_FAILED_TURN_NOTICE)
+                noted = await self._deliver_recovered_followup_note(
+                    event, session_key, text=PARTIAL_FAILED_TURN_NOTICE)
+                # The input is durable, so there is no spool to retain; log the note's real fate.
                 self._release_restart_followup_key(session_key)
-                self._record_restart_resume_outcome(session_key, "skipped:turn-failed")
+                self._record_restart_resume_outcome(
+                    session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
                 return
         finally:
             watcher.cancel()

@@ -449,7 +449,9 @@ async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_
 
 
 @pytest.mark.asyncio
-async def test_restored_followup_exception_after_input_retirement_gets_turn_failed_note(tmp_path, monkeypatch, caplog):
+@pytest.mark.parametrize("note_sent", [True, False])
+async def test_restored_followup_exception_after_input_retirement_gets_turn_failed_note(
+        tmp_path, monkeypatch, caplog, note_sent):
     runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
@@ -467,14 +469,20 @@ async def test_restored_followup_exception_after_input_retirement_gets_turn_fail
         "role": "user", "content": recovered.text, "platform_message_id": recovery_id,
     })
     runner._follow_startup_resume_turn = AsyncMock(side_effect=RuntimeError("turn exploded"))
+    if not note_sent:
+        async def refuse(_source, _text):
+            return False
+        runner._deliver_platform_notice = refuse
     with caplog.at_level("INFO", logger="gateway.run"):
         await runner._observe_recovered_followup(_adapter, recovered, entry.session_key)
     from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
     # The spool is gone, so the turn-failed note is sent and the "still preserved" one is not.
-    assert _adapter.sent == [PARTIAL_FAILED_TURN_NOTICE]
+    assert _adapter.sent == ([PARTIAL_FAILED_TURN_NOTICE] if note_sent else [])
     assert not spool.exists()
+    # The input is durable (no spool to keep), so the outcome reports the note's real fate.
+    suffix = ":noted" if note_sent else ":note-unavailable"
     assert _outcome_lines(caplog) == [
-        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed"]
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed{suffix}"]
 
 
 @pytest.mark.asyncio
@@ -503,16 +511,27 @@ async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_pat
 
     monkeypatch.setattr(run, "_async_profile_runtime_scope", _SpyScope)
     seen = []
+    from gateway import run_restart_recovery
 
-    async def deliver(_source, _text):
+    def translate(key, *args, **kwargs):
+        # The locale is a property of the active profile scope: resolve it as t() would.
+        return f"{key}@{active[-1] if active else 'launch'}"
+
+    monkeypatch.setattr(run_restart_recovery, "t", translate)
+    sent = []
+
+    async def deliver_text(_source, text):
         seen.append(list(active))
+        sent.append(text)
         return True
 
-    runner._deliver_platform_notice = deliver
+    runner._deliver_platform_notice = deliver_text
     event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
     await runner._finish_recovered_followup(event, entry.session_key, "accepted-without-turn")
     assert entered == [profile_home]
     assert seen == [[profile_home]]
+    # The text itself must be translated inside the scope, not before entering it.
+    assert sent == [f"gateway.restart.followup_recovery_notice@{profile_home}"]
 
 
 @pytest.mark.asyncio
@@ -697,11 +716,43 @@ async def test_legacy_idless_duplicate_content_is_declined_not_deleted(tmp_path,
             deferred_followup=partial(_defer_followup, runner, {}, None))
         await runner._drain_startup_restore_queue()
         await asyncio.gather(*list(runner._background_tasks))
-    assert adapter.sent and "send it again" in adapter.sent[0]
+    # It may already have run: the note must not claim it was not run or ask for a blind resend.
+    assert len(adapter.sent) == 1
+    assert "may already have been handled" in adapter.sent[0]
+    assert "was not run" not in adapter.sent[0]
     assert _outcome_lines(caplog) == [
         f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
     assert not spool.exists()
     assert spool.with_name(spool.name + ".bad").exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_idless_duplicate_with_resume_pending_is_owned_by_the_resume(tmp_path, monkeypatch, caplog):
+    """The interrupted turn persisted this input and its marker is resuming it: no resend note."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    runner.session_store.mark_resume_pending(entry.session_key, turn_id="interrupted-turn")
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    spool = flush_dir / "pending-legacy.json"
+    spool.write_text(json.dumps({
+        "session_key": entry.session_key, "reason": "shutdown_follow_up", "ts": time.time() - 10, "seq": -1,
+        "data": {"text": "continue", "source_user_id": source.user_id, "user_id": source.user_id},
+    }))
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "continue", "timestamp": time.time(),
+    })
+    with caplog.at_level("INFO", logger="gateway.run"):
+        recover_pending_to_db(
+            Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+            deferred_followup=partial(_defer_followup, runner, {}, None))
+        await runner._drain_startup_restore_queue()
+        await asyncio.gather(*list(runner._background_tasks))
+    assert runner._startup_restore_queue == []
+    assert adapter.sent == []
+    # The resume_pending auto-resume records the session's outcome; this spool adds none.
+    assert _outcome_lines(caplog) == []
+    assert not spool.exists()
+    assert not spool.with_name(spool.name + ".bad").exists()
 
 
 @pytest.mark.asyncio

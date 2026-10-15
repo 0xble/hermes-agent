@@ -15,16 +15,22 @@ flush; it is persisted as the user row's dedupe value and never exposed as
 transport identity. Recovery uses that id to detect a durable turn-start row, so
 a crash between transcript persistence and spool unlink cannot replay the
 prompt. Only true legacy spools (no message id and no recovery id) fall back to
-exact content plus spool timestamp, and that fallback never deletes: a match is
-declined as `possibly-duplicate` (one outcome, one visible resend note, spool
-quarantined), and without a spool timestamp it never matches. When a recovered
+exact content plus spool timestamp. On a match while the session's own
+`resume_pending` marker is being auto-resumed, that resume owns the turn and the
+spool is dropped without a note (a resend could repeat its tool effects).
+Otherwise the fallback never deletes: a match is declined as
+`possibly-duplicate` (one outcome, one visible note that it may already have
+been handled and to resend only if not, spool quarantined), and without a spool
+timestamp it never matches. When a recovered
 event is merged into a busy adapter's pending slot, the background task records
 the event it actually consumes and restart recovery carries that task's terminal
 result back to the parked recovery event. The recovery outcome is then `resumed`
 or `skipped:turn-failed`, rather than `accepted-without-turn`. If the turn
 raises after its input row is durable (so the spool may already be retired), the
-outcome is `skipped:turn-failed` with the failed-turn note, never the "still
-preserved" notice.
+outcome is `skipped:turn-failed:noted` (or `:note-unavailable` when the send
+fails) with the failed-turn note, never the "still preserved" notice. Notice
+text is translated inside the event's profile scope so a multiplexed secondary
+profile gets its own locale.
 
 A draining turn's leftover `/steer` or interrupt text is only a string. In a DM
 or per-user session the shutdown follow-up spool binds it to the turn's source
@@ -41,7 +47,8 @@ no adapter can carry the note, the spool is retained for a later boot.
 ## Source surfaces
 
 `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`,
-`gateway/run_turn.py`, `locales/*.yaml` (`followup_declined_notice`),
+`gateway/run_turn.py`, `locales/*.yaml` (`followup_declined_notice`,
+`followup_possible_duplicate_notice`),
 `gateway/platforms/base.py`, `gateway/session_transcript.py`,
 `hermes_state_messages.py`, `gateway/shutdown_flush.py`,
 `tests/gateway/test_shutdown_followup_restart.py`, and
@@ -50,7 +57,8 @@ no adapter can carry the note, the spool is retained for a later boot.
 ## Verification
 
 Focused restart-recovery tests cover id-less durability, recovery-id stamping
-for every id-less spool, legacy duplicate-content decline and quarantine, spool
+for every id-less spool, legacy duplicate-content decline and quarantine versus resume-owned drop,
+in-scope notice translation, spool
 retirement at turn start, the post-retirement turn-failed path, and pending-slot
 successor result propagation.
 
