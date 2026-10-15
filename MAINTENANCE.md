@@ -355,6 +355,25 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove once upstream ships a precise macOS shell producer and strict own-PID validation, and these regressions pass there without the fork patch.
 - **Rollback:** Revert the commits carrying `Fork-Patch: updater-pid-incarnation`. Revert all of them together: restoring the strict rule without the precise producer would break macOS hand-offs.
 
+## Additional maintenance units
+
+The following units are part of the enrolled maintenance surface. Load the row's
+contract before acting on its trigger; a full maintenance run accounts for every
+row:
+
+| Unit | Required behavior | Load when | Contract |
+|---|---|---|---|
+| CI slow-file timeouts | Keep known-slow hosted test files within measured per-file bounds without changing the default for other files | Hosted shard timeout evidence, `FILE_TIMEOUTS`, or slow-file selection changes; also load Portable CI | [CI slow-file timeouts](maintenance/ci-slow-file-timeouts.md) |
+| Fallback mid-turn restore | Restore an eligible primary or earlier fallback between model requests while preserving cooldown and route invariants | Provider fallback recovery, mid-turn retry, or fallback stay-limit changes | [Fallback mid-turn restore](maintenance/fallback-mid-turn-restore.md) |
+| Gate flake quarantine | Keep the PR gate blocking while isolating only reproduced host/process flakes with nightly evidence | Gate quarantine lists, exact-SHA flake evidence, or shard disposition changes; also load Portable CI and Repository CI contract | [Gate flake quarantine](maintenance/gate-flake-quarantine.md) |
+| Goal continuation quiet | Deduplicate unchanged continuation notices across waits and preserve meaningful goal outcomes | Goal wait, continuation notice, automatic silence, or lifecycle deduplication changes | [Goal continuation quiet](maintenance/goal-continuation-quiet.md) |
+| Install and scratch GC | Reclaim orphaned installs and scratch data only under ownership, age, lock, lease, and deletion-window safeguards | PM install cleanup, scratch pruning, housekeeping, worktree pruning, or deletion-window changes; also load runtime ownership | [Install and scratch GC](maintenance/install-and-scratch-gc.md) |
+| One-shot task governing skill loading | Load task-governing procedural skills in one-shot sessions without restoring omitted maintenance tooling | One-shot footprint, prompt skill admission, or governing-skill loading changes | [One-shot task governing skill loading](maintenance/oneshot-task-governing-skill-loading.md) |
+| Portable CI | Keep local and hosted source gates reproducible, isolated, and aligned across supported lanes | `bin/ci`, `scripts/ci/portable.py`, toolchain pins, workflow lanes, or source-gate isolation changes | [Portable CI](maintenance/portable-ci.md) |
+| Repository CI contract | Preserve exact-SHA admission, gate aggregation, workflow dispositions, and the boundary between local evidence and qualification | Repository CI commands, workflow graph, required statuses, or gate/nightly policy changes | [Repository CI contract](maintenance/repository-ci-contract.md) |
+| Shared primary cooldown | Share provider outage cooldowns across agents while preventing fallback replies from clearing them | Fallback classification, cooldown state, outage/recovery notices, or cross-process route adoption changes | [Shared primary cooldown](maintenance/shared-primary-cooldown.md) |
+| Updater external supervisor sweep | Protect newly spawned supervised gateways while draining pre-existing processes for supervisor hand-back | Update restart sweeps, gateway PID snapshots, launchd or external-supervisor ownership changes; also load runtime ownership | [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md) |
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
