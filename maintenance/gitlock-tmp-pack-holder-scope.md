@@ -33,10 +33,9 @@ recovery tests.
 - **Contribution route and rationale:** narrow draft PR to restore the Linux
   nightly truthful-outcome behavior after foreign-checkout Git processes caused
   dead transfer packs to survive a successful update.
-- **Related evidence:** nightly runs `38548768361` and `38399882810` failed
-  with surviving `tmp_pack_*` debris; pre-sync baseline run `38137185573`
-  passed. The system-wide `pgrep -x git` guard in `gitlock.py` is the affected
-  boundary.
+- **Root cause:** Linux holder scanning treated every transient `/proc` race as a live ownership veto. In a busy four-worker container, short-lived Git descendants routinely disappear between reading `comm` and `cwd`, `environ`, or `fd`; the scan then conservatively left that candidate. Because candidates were checked independently, this produced partial sweeps (the failing run removed 5 but left 3). The same race is reproducible with concurrent foreign-repository Git churn: a deterministic Linux probe observed partial sweeps in 30/30 trials and `FileNotFoundError`/`PermissionError` on `/proc/<pid>` paths.
+- **Repair:** classify a disappeared process or single-threaded zombie as unable to hold/write a pack, and retry transient inspection failures for a bounded two-second sweep budget. Persistent unreadable live-holder evidence remains a veto; target Git, open fd/mmap holders, and unknown ownership policy are unchanged.
+- **Evidence:** nightly run `38689220608` failed with exactly three survivors after the sweep reported five removed; earlier failures were `38399882810`, `38458589765`, `38548768361`, and `38636106488`. The pre-sync baseline `38137185573` did not reproduce the failure. A Linux container stress probe with four concurrent workers reproduced partial sweeps in 30/30 trials before the repair and clean sweeps in 30/30 trials after it.
 - **Fork delivery:** draft PR against `main`; no merge, activation, or upstream
   public action is part of this unit.
 
