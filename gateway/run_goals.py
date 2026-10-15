@@ -694,6 +694,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 metadata.get("notification_origin") == "process_registry_synthetic"
                 or (is_internal and event is not None and not own_pacing_wake)
             )
+            if external_event and event is not None:
+                # Trusted outside evidence pierces a long loop delay once. The durable mutation is
+                # idempotent and refuses to move a tick that is already in flight, so duplicate
+                # delivery notifications cannot create duplicate loop ticks.
+                try:
+                    from hermes_cli.loops import wake_loop_for_external_event
+                    wake_loop_for_external_event(str(session_entry.session_id))
+                except Exception:
+                    logger.debug("external event loop wake failed", exc_info=True)
             # A queued chain is judged once, on its terminal turn's response (identity above).
             goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
             # A stamped continuation turn is judged only against the goal instance it served.

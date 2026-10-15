@@ -776,9 +776,9 @@ class TestTickLifecycle:
             decision = mgr.complete_tick("3 tests still failing")
         assert decision["stopped"] is False
 
-    def test_until_judge_blocked_pauses(self, hermes_home):
-        """An unachievable stop condition pauses the loop instead of spinning to the tick budget."""
-        from hermes_cli.loops import LoopManager
+    def test_until_judge_blocked_backoffs_but_stays_active(self, hermes_home):
+        """An unachievable stop condition backs off instead of pausing the loop."""
+        from hermes_cli.loops import LoopManager, _NO_PROGRESS_BACKOFF_S
 
         mgr = LoopManager(session_id="t11b")
         state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
@@ -786,8 +786,11 @@ class TestTickLifecycle:
         mgr.fire_tick()
         with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
             decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
-        assert decision["stopped"] is True
-        assert decision["status"] == "paused"
+        assert decision["stopped"] is False
+        assert decision["status"] == "active"
+        assert mgr.state is not None
+        assert mgr.state.status == "active"
+        assert mgr.state.next_due_at >= time.time() + _NO_PROGRESS_BACKOFF_S[0] - 1
         assert "unachievable" in decision["message"]
 
     def test_until_judge_is_not_called_for_a_silent_tick(self, hermes_home):
@@ -834,7 +837,7 @@ class TestSelfPacedBackoff:
         assert mgr.state.awaiting_response is False
         assert mgr.state.next_due_at >= before + self_paced_floor_seconds()
 
-    def test_backoff_doubles_on_unchanged_and_resets_on_change(self, hermes_home):
+    def test_backoff_uses_shared_ladder_and_resets_on_change(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="sp1")
@@ -848,23 +851,49 @@ class TestSelfPacedBackoff:
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor
 
-        # Tick 2: same response → backoff doubles.
+        # Tick 2: same response → first shared no-progress step (15m).
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
-        assert mgr.state.current_delay == floor * 2
+        assert mgr.state.current_delay == 15 * 60
 
-        # Tick 3: same again → doubles again.
+        # Tick 3: same again → 1h.
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
-        assert mgr.state.current_delay == floor * 4
+        assert mgr.state.current_delay == 60 * 60
 
-        # Tick 4: changed response → snaps back to floor.
+        # Tick 4: same again → 4h.
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        mgr.complete_tick("queue depth is 5")
+        assert mgr.state.current_delay == 4 * 60 * 60
+
+        # Tick 5: same again → 24h cap.
+        mgr.state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        mgr.complete_tick("queue depth is 5")
+        assert mgr.state.current_delay == 24 * 60 * 60
+
+        # Tick 6: changed response → snaps back to floor.
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 2 — draining")
         assert mgr.state.current_delay == floor
+
+    def test_external_event_makes_one_delayed_tick_due_without_duplicates(self, hermes_home):
+        from hermes_cli.loops import LoopManager, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-wake")
+        state = mgr.set("watch the queue", interval_seconds=24 * 60 * 60)
+        state.next_due_at = time.time() + 60 * 60
+        mgr._save()
+        assert wake_loop_for_external_event("external-wake") is True
+        assert wake_loop_for_external_event("external-wake") is False
+        fresh = LoopManager(session_id="external-wake")
+        assert fresh.is_due()
+        assert fresh.fire_tick() is not None
+        assert fresh.fire_tick() is None
 
     def test_backoff_treats_consecutive_silent_wakeups_as_unchanged(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -878,7 +907,7 @@ class TestSelfPacedBackoff:
             mgr.fire_tick()
             mgr.complete_tick("[SILENT]")
 
-        assert mgr.state.current_delay == floor * 2
+        assert mgr.state.current_delay == 15 * 60
 
     def test_backoff_treats_every_silence_marker_form_as_unchanged(self, hermes_home):
         """The digest uses the judge skip's marker set, so NO_REPLY and '[SILENT].' back off too."""
@@ -888,12 +917,12 @@ class TestSelfPacedBackoff:
         state = mgr.set("watch the queue")
         floor = state.current_delay
 
-        for reply in ("[SILENT]", "NO_REPLY", "[SILENT].", " no reply "):
+        for reply in ("[SILENT]", "NO_REPLY", "[SILENT].", " no reply ", "NO_REPLY"):
             mgr.state.next_due_at = time.time() - 1
             mgr.fire_tick()
             mgr.complete_tick(reply)
 
-        assert mgr.state.current_delay == floor * 8
+        assert mgr.state.current_delay == 24 * 60 * 60
 
     def test_timestamp_only_changes_do_not_reset(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -907,7 +936,7 @@ class TestSelfPacedBackoff:
         mgr.state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:07:33")
-        assert mgr.state.current_delay == floor * 2  # digest ignored the clock
+        assert mgr.state.current_delay == 15 * 60  # digest ignored the clock
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1017,6 +1046,16 @@ class TestGoalMixing:
 
 
 class TestDispatchLoopCommand:
+
+    def test_set_warns_when_goal_is_active(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+        from hermes_cli.loops import LoopManager, dispatch_loop_command
+
+        GoalManager(session_id="d-goal").set("ship the release")
+        result = dispatch_loop_command(LoopManager(session_id="d-goal"), "5m check CI")
+        assert result["created"] is True
+        assert "active goal" in result["output"]
+        assert "separate recurring duty" in result["output"]
 
     def test_create_self_paced(self, hermes_home):
         from hermes_cli.loops import LoopManager, dispatch_loop_command

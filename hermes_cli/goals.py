@@ -1699,6 +1699,13 @@ _BLOCKED_ON_USER_RE = re.compile(
     r"confirm\w*|answer|input|credentials?|login|consent)\b",
     re.I,
 )
+# A constraint that deliberately withholds an action pending approval is not itself a breach. The
+# breach classifier remains authoritative for completed/irreversible actions ("already merged", etc.).
+_APPROVAL_ONLY_BLOCK_RE = re.compile(
+    r"\bmust\s+not\s+be\s+(?:merged|sent|deleted|published|posted|paid|pushed|removed)\b"
+    r"[^.;]{0,100}\b(?:until|pending|awaiting)\b[^.;]{0,80}\b(?:approv\w*|sign-?off|permission|consent)\b",
+    re.I,
+)
 
 
 def _parse_wait_until(raw: str) -> Optional[float]:
@@ -3545,7 +3552,10 @@ class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
             # Only a real irreversible-constraint breach or a goal with nothing left to try
             # pauses. Every other BLOCKED (approval, decision, credentials, an answer) is a
             # wait on the user's next message: the goal stays active and no /goal resume chore.
-            needs_user = bool(_BLOCKED_ON_USER_RE.search(reason or "")) and not _BLOCKED_PAUSE_RE.search(reason or "")
+            needs_user = bool(_BLOCKED_ON_USER_RE.search(reason or "")) and (
+                bool(_APPROVAL_ONLY_BLOCK_RE.search(reason or ""))
+                or not _BLOCKED_PAUSE_RE.search(reason or "")
+            )
             if needs_user:
                 return self._apply_wait_directive({"user_message": True}, reason)
             return self._pause_decision(
