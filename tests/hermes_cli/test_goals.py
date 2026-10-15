@@ -357,6 +357,7 @@ class TestGoalManager:
         ("reason", "expected_status", "waiting_on_user", "paused"),
         [
             ("must not be merged until Brian approves", "active", True, False),
+            ("the release must not be merged until Brian approves", "active", True, False),
             ("already merged despite the constraint", "paused", False, True),
         ],
     )
