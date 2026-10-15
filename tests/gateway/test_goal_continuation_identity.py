@@ -1,6 +1,7 @@
 """Goal lifecycle fences through real continuation producers and gateway admission."""
 from __future__ import annotations
 
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -31,7 +32,11 @@ async def _post_turn_event(runner):
     runner._goal_max_turns_from_config = lambda: 50
     runner._goal_min_continuation_gap_from_config = lambda: 0
     runner._defer_goal_status_notice_after_delivery = AsyncMock()
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "work remains", True, None, False)):
+    # The automatic turn did real (non-read-only) work, so it continues instead of
+    # parking on the quiet no-progress ladder.
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "work remains", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=runner.target, source=runner.target.origin, final_response="partial progress",
         )
@@ -827,7 +832,9 @@ async def test_post_turn_judges_the_terminal_queued_turn_not_the_chain_head(stat
     runner._post_turn_loop_completion = AsyncMock()
     before = load_goal("target").turns_used
     with patch("hermes_cli.goals.judge_goal",
-               return_value=("continue", "work remains", True, None, False)) as judged:
+               return_value=("continue", "work remains", False, None, False)) as judged, \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._run_post_turn_hooks(
             agent_result={"final_response": "progress on the new objective"},
             source=runner.target.origin, is_internal=True, event=head,
