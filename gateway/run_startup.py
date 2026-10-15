@@ -1439,12 +1439,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
-            # Multiplex: a platform enabled in the shared config.yaml may hold its token only in a
-            # secondary profile's .env; an empty primary would queue a reconnect loop that never heals.
-            # Starting that primary adapter with an empty token fails immediately and queues an infinite
-            # reconnect loop that can never heal (#64674). Secondary profiles still start their own adapters
-            # under _profile_runtime_scope with the real token -- skip the empty primary instead of failing
-            # loudly.
+            # Skip empty primary credentials in multiplex mode; secondary profiles may supply the token.
             if _multiplex_on and not _platform_has_bot_credential(platform, platform_config):
                 logger.info(
                     "Skipping %s on default profile: no bot credential in this "
@@ -1606,7 +1601,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _transient_exit_streak_path():
         from hermes_cli.config import get_hermes_home
 
-        return get_hermes_home() / ".transient_startup_exits"
+        from gateway.gateway_slot import process_slot_filename
+        return get_hermes_home() / process_slot_filename(".transient_startup_exits")
 
     def _reset_transient_exit_streak(self) -> None:
         """A platform connected, so the backend recovered; forget the retry budget."""
@@ -2085,7 +2081,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True
-        await self._start_recover_previous_run()
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await self._start_recover_previous_run()
         # From here on shutdown may write a clean receipt: this boot has made the crash/clean
         # decision and processed the previous run's recovery state.
         self._suppress_clean_shutdown_receipt = False

@@ -15,6 +15,23 @@ from typing import Any
 SLOT_ACTIVE = "a"
 SLOT_STANDBY = "b"
 
+# Pinned once by gateway startup so every state path in one process uses one slot.
+_PINNED_GATEWAY_SLOT: str | None = None
+
+
+def pin_gateway_slot(config: Any = None) -> str:
+    """Pin this process to its effective gateway slot for the lifetime of the boot."""
+    global _PINNED_GATEWAY_SLOT
+    if _PINNED_GATEWAY_SLOT is None:
+        _PINNED_GATEWAY_SLOT = _effective_gateway_slot_uncached(config)
+    return _PINNED_GATEWAY_SLOT
+
+
+def reset_gateway_slot_for_tests() -> None:
+    """Clear the process slot pin for isolated tests."""
+    global _PINNED_GATEWAY_SLOT
+    _PINNED_GATEWAY_SLOT = None
+
 
 def get_gateway_slot() -> str:
     """This process's launchd slot: ``b`` only when its environment says so, else ``a``.
@@ -26,8 +43,8 @@ def get_gateway_slot() -> str:
     return SLOT_STANDBY if value == SLOT_STANDBY else SLOT_ACTIVE
 
 
-def effective_gateway_slot(config: Any = None) -> str:
-    """Slot whose file names this process uses: ``b`` only for slot ``b`` with the flag on.
+def _effective_gateway_slot_uncached(config: Any = None) -> str:
+    """Resolve the slot before the process-wide pin is applied.
 
     ``config`` is a GatewayConfig or config mapping; ``None`` loads this home's config, and only
     after the env already says ``b``, so slot ``a`` never pays for a config read.
@@ -39,6 +56,13 @@ def effective_gateway_slot(config: Any = None) -> str:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
     return SLOT_STANDBY if is_zero_cut_handover_enabled(config) else SLOT_ACTIVE
+
+
+def effective_gateway_slot(config: Any = None) -> str:
+    """Return the pinned slot, or resolve it dynamically before gateway startup pins it."""
+    if _PINNED_GATEWAY_SLOT is not None:
+        return _PINNED_GATEWAY_SLOT
+    return _effective_gateway_slot_uncached(config)
 
 
 def slot_filename(filename: str, slot: str = SLOT_ACTIVE) -> str:

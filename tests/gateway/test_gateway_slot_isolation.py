@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from gateway import gateway_slot
+from gateway import zero_cut_standby
 from gateway.control_socket import GatewayControlServer, identify_gateway, resolve_server_socket_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +85,27 @@ def test_slot_defaults_to_a_and_reads_env_at_call_time(monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_SLOT", raw)
         assert gateway_slot.get_gateway_slot() == expected
 
+
+def test_slot_pin_is_stable(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    config = {"gateway": {"zero_cut_handover": {"enabled": True}}}
+    assert gateway_slot.pin_gateway_slot(config) == "b"
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT")
+    assert gateway_slot.effective_gateway_slot() == "b"
+    gateway_slot.reset_gateway_slot_for_tests()
+
+
+def test_standby_readiness_is_local(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    zero_cut_standby.reset_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    assert zero_cut_standby.readiness() == {"slot": "b", "standby": True, "ready": False, "deferred": []}
+    zero_cut_standby.mark_ready()
+    assert zero_cut_standby.readiness()["ready"] is True
+    zero_cut_standby.reset_for_tests()
+    gateway_slot.reset_gateway_slot_for_tests()
 
 def test_slot_filenames():
     assert gateway_slot.slot_filename("gateway.pid", "a") == "gateway.pid"
