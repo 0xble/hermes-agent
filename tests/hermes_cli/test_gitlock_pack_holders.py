@@ -196,6 +196,46 @@ def test_unplaced_git_through_a_symlink_to_the_target_keeps_its_pack(scope, tmp_
         shutil.rmtree(proc)
 
 
+def _linked_worktree(main: Path, name: str, root: Path) -> tuple[Path, Path]:
+    """Mirror `git worktree add`: metadata under main/.git/worktrees, a gitfile in the tree."""
+    meta = main / ".git" / "worktrees" / name
+    meta.mkdir(parents=True)
+    (meta / "commondir").write_text("../..\n")
+    (meta / "HEAD").write_text("ref: refs/heads/wt\n")
+    tree = root / name
+    tree.mkdir()
+    (tree / ".git").write_text(f"gitdir: {meta}\n")
+    return tree, meta
+
+
+def test_env_real_git_exports_for_foreign_work_does_not_veto(scope, tmp_path):
+    """Git exports GIT_INDEX_FILE for an ordinary commit and an absolute GIT_DIR for
+    `git -C <linked worktree>`. Neither proves the target is involved."""
+    table, ours, other = scope
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    tree, meta = _linked_worktree(other, "wt", tmp_path)
+    _process(table, 300, other, argv=("git", "commit", "-m", "x"), env=("GIT_INDEX_FILE=.git/index",))
+    _process(table, 301, tree, argv=("git", "-C", str(tree), "commit", "-m", "x"),
+             env=(f"GIT_DIR={meta}", f"GIT_INDEX_FILE={meta / 'index'}"))
+    _process(table, 302, launch, argv=("git", "-C", str(tree), "fetch"), env=(f"GIT_DIR={meta}",))
+    pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
+    assert gitlock.clear_stale_tmp_packs(ours) == [str(pack)]
+    assert not pack.exists()
+
+
+def test_absolute_git_dir_of_a_target_worktree_keeps_its_pack(scope, tmp_path):
+    """A linked worktree of the target shares its object store, so its Git owns the pack."""
+    table, ours, _ = scope
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    tree, meta = _linked_worktree(ours, "wt", tmp_path)
+    _process(table, 310, launch, argv=("git", "-C", str(tree), "fetch"), env=(f"GIT_DIR={meta}",))
+    pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
+    assert gitlock.clear_stale_tmp_packs(ours) == []
+    assert pack.exists()
+
+
 def test_replaced_or_touched_pack_is_not_deleted_after_holder_proof(scope, monkeypatch):
     _, ours, _ = scope
     pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")

@@ -157,7 +157,10 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
     argv = os.fsdecode(proc.joinpath("cmdline").read_bytes()).strip("\0").split("\0")
     # Alternate object stores and inline config can redirect ownership beyond cwd.
     # Do not guess: unknown ownership retains the global safety veto.
-    redirected = ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    # GIT_INDEX_FILE is deliberately absent: Git exports it for ordinary commits
+    # (".git/index") and the index location never chooses the object store a
+    # process writes packs into. Repository ownership still comes from cwd/GIT_DIR.
+    redirected = ("GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR",
                   "GIT_CONFIG_COUNT")
     if any(env.get(key) for key in redirected):
         raise ValueError("explicit resource/config ownership")
@@ -231,8 +234,16 @@ def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool
         elif arg.startswith(("--config", "--work-tree", "--bare", "--git-dir", "--separate-git-dir")):
             return True
     env = proc.joinpath("environ").read_bytes().split(b"\0")
-    if any(entry.startswith(b"GIT_DIR=") and entry != b"GIT_DIR=" for entry in env):
-        return True  # relative launch context is unproven, even for an explicit GIT_DIR
+    for entry in env:
+        if entry.startswith(b"GIT_DIR=") and entry != b"GIT_DIR=":
+            git_dir = os.fsdecode(entry.partition(b"=")[2])
+            # A relative GIT_DIR depends on the lost launch cwd and stays a veto.
+            # Git exports an absolute one for linked worktrees (-C <worktree>);
+            # that names its repository exactly, so compare it with the target.
+            if not os.path.isabs(git_dir):
+                return True
+            if target & _repository_dirs(cwd, git_dir):
+                return True
     places = tuple(str(p) for p in target | {Path(repo_root).resolve()})
     if git_works_in(argv, str(cwd), None, places):
         return True
