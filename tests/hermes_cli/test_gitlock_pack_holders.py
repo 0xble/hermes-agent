@@ -175,6 +175,22 @@ def test_unplaced_exception_does_not_bypass_unparsed_configuration_guards(scope,
     assert pack.exists()
 
 
+def test_unplaced_git_through_a_symlink_to_the_target_keeps_its_pack(scope, tmp_path):
+    table, ours, other = scope
+    alias = tmp_path / "alias-to-ours"
+    alias.symlink_to(ours, target_is_directory=True)
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "rel-alias").symlink_to(ours, target_is_directory=True)
+    pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
+    for pid, argv in enumerate([("git", "-C", str(alias), "fetch"), ("git", "-C", "rel-alias", "fetch"),
+                                ("git", "upload-pack", "--stateless-rpc", "rel-alias")], start=200):
+        proc = _process(table, pid, launch, argv=argv)
+        assert gitlock.clear_stale_tmp_packs(ours) == []
+        assert pack.exists()
+        shutil.rmtree(proc)
+
+
 def test_replaced_or_touched_pack_is_not_deleted_after_holder_proof(scope, monkeypatch):
     _, ours, _ = scope
     pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")

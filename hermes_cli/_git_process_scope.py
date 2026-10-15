@@ -233,8 +233,16 @@ def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool
     env = proc.joinpath("environ").read_bytes().split(b"\0")
     if any(entry.startswith(b"GIT_DIR=") and entry != b"GIT_DIR=" for entry in env):
         return True  # relative launch context is unproven, even for an explicit GIT_DIR
-    places = [str(p) for p in target | {Path(repo_root).resolve()}]
-    return git_works_in(argv, str(cwd), None, places)
+    places = tuple(str(p) for p in target | {Path(repo_root).resolve()})
+    if git_works_in(argv, str(cwd), None, places):
+        return True
+    # git_works_in compares lexically. A target reached through a symlinked
+    # -C or operand path is still the target, so resolve each path-like
+    # argument (realpath only reads link metadata) before ruling it unrelated.
+    resolved = [os.path.realpath(os.path.join(str(cwd), value))
+                for arg in argv[1:]
+                if (value := arg.partition("=")[2] if arg.startswith("-") else arg)]
+    return git_works_in(["git", *resolved], None, None, places)
 
 
 def _pack_held_proc(proc: Path, path: Path) -> bool:
