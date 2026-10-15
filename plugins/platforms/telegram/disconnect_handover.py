@@ -7,9 +7,13 @@ from typing import Awaitable, Callable, Optional
 
 from gateway.config import is_zero_cut_handover_enabled
 
+# The loop holds tasks weakly: a teardown detached by the gateway's disconnect budget must stay
+# rooted until it finishes, or GC can drop it before updater.stop() and the lock release run.
+_DETACHED_TEARDOWNS: set[asyncio.Future] = set()
+
 
 def _lock_stamp(adapter) -> Optional[str]:
-    """The on-disk stamp of the adapter's token lock; every acquire rewrites it."""
+    """The on-disk stamp of the adapter's token lock (every acquire rewrites it); None if unreadable."""
     scope = getattr(adapter, "_platform_lock_scope", None)
     identity = getattr(adapter, "_platform_lock_identity", None)
     if not scope or not identity:
@@ -32,12 +36,15 @@ async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) ->
     stamp = _lock_stamp(adapter)
 
     def release() -> None:
-        if _lock_stamp(adapter) == stamp:
+        current = _lock_stamp(adapter)
+        if current is not None and current != stamp:
+            adapter._platform_lock_identity = None  # a successor re-acquired the record
+        elif current == stamp:
             adapter._release_platform_lock()
-        else:
-            adapter._platform_lock_identity = None  # a successor owns the record now
+        # Unreadable record: keep the identity so a later release can still clean it up.
 
     def release_after(task: asyncio.Future) -> None:
+        _DETACHED_TEARDOWNS.discard(task)
         if not task.cancelled():
             task.exception()
         release()
@@ -49,4 +56,5 @@ async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) ->
         if task.done():
             release()
         else:
+            _DETACHED_TEARDOWNS.add(task)
             task.add_done_callback(release_after)

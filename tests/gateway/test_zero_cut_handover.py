@@ -317,3 +317,38 @@ def test_detached_disconnect_does_not_release_a_successor_lock(monkeypatch, tmp_
     asyncio.run(scenario())
     assert lock_path.exists()
     assert old._platform_lock_identity is None
+
+
+def test_detached_disconnect_survives_garbage_collection_and_releases(monkeypatch, tmp_path):
+    """Once the gateway stops waiting, nothing else references the teardown; it must still finish."""
+    import gc
+
+    from gateway import status
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path))
+    old = object.__new__(TelegramAdapter)
+    old.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
+    old._platform_lock_scope, old._platform_lock_identity = "telegram-bot-token", "token"
+    assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]
+    lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+
+        async def teardown(*, zero_cut_handover):
+            stopped = loop.create_future()  # referenced only from this frame, like updater.stop()
+            loop.call_later(0.05, stopped.set_result, None)
+            await stopped
+            zero_cut_handover()
+
+        outer = asyncio.ensure_future(run_disconnect(old, teardown))
+        await asyncio.sleep(0)
+        outer.cancel()
+        with __import__("contextlib").suppress(asyncio.CancelledError):
+            await outer
+        del outer
+        gc.collect()
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    assert not lock_path.exists()
