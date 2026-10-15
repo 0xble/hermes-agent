@@ -200,10 +200,11 @@ def goal_authoring_findings(
             ))
             break
 
-    readonly_fields = {name for name in ("constraints", "boundaries") if name in checked}
-    mutation_fields = {name for name in ("goal", "outcome", "verification") if name in values}
-    readonly = " ".join(values[name] for name in readonly_fields)
-    mutation = " ".join(values[name] for name in mutation_fields)
+    # Cross-field contradictions must inspect the whole current contract on a
+    # revision: checking only changed fields lets a goal change turn an existing
+    # read-only limit into a contradictory mutation without a finding.
+    readonly = " ".join(values[name] for name in ("constraints", "boundaries"))
+    mutation = " ".join(values[name] for name in ("goal", "outcome", "verification"))
     if readonly and mutation and _GOAL_AUTHORING_READONLY_RE.search(readonly) and _GOAL_AUTHORING_MUTATION_RE.search(mutation):
         findings.append(GoalAuthoringFinding(
             "readonly_mutation", "constraints/boundaries",
@@ -211,12 +212,27 @@ def goal_authoring_findings(
             "replace the blanket read-only limit with the specific systems or effects that must not change",
         ))
 
-    verification = values["verification"] if "verification" in checked else ""
     if "goal" in checked and _GOAL_AUTHORING_NUMBERED_STEP_RE.search(values["goal"]):
         findings.append(GoalAuthoringFinding(
             "numbered_steps", "goal", "contains a numbered step list",
             "state the outcome and move the steps to the plan file",
         ))
+    for field_name in ("goal", "verification"):
+        value = values[field_name] if field_name in checked else ""
+        if not value:
+            continue
+        wait_match = _GOAL_AUTHORING_FIXED_WAIT_RE.search(value)
+        if wait_match:
+            context = value[max(0, wait_match.start() - 18):wait_match.end() + 18].lower()
+            measurement = wait_match.group(0).lower().endswith("days") and "from" in context and "full" in context
+            if not measurement:
+                findings.append(GoalAuthoringFinding(
+                    "fixed_wait", field_name,
+                    f"uses a fixed waiting window ({wait_match.group(0)})",
+                    "use a watcher or cron for elapsed-time waits and verify the resulting live state",
+                ))
+
+    verification = values["verification"] if "verification" in checked else ""
     if verification:
         checklist = bool(_GOAL_AUTHORING_BULLET_RE.search(verification) or
                           _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
@@ -230,16 +246,6 @@ def goal_authoring_findings(
                 "is a step/receipt checklist rather than one live end-state outcome",
                 "state one observable result and put per-step checks in the plan file",
             ))
-        wait_match = _GOAL_AUTHORING_FIXED_WAIT_RE.search(verification)
-        if wait_match:
-            context = verification[max(0, wait_match.start() - 18):wait_match.end() + 18].lower()
-            measurement = wait_match.group(0).lower().endswith("days") and "from" in context and "full" in context
-            if not measurement:
-                findings.append(GoalAuthoringFinding(
-                    "fixed_wait", "verification",
-                    f"uses a fixed waiting window ({wait_match.group(0)})",
-                    "use a watcher or cron for elapsed-time waits and verify the resulting live state",
-                ))
     return findings
 
 

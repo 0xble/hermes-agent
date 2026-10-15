@@ -182,6 +182,23 @@ class TestGoalManager:
             previous_total=700, changed_fields={"verification"},
         ) == []
 
+    def test_goal_authoring_revision_checks_cross_field_contradictions(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(
+            "Delete the obsolete topic",
+            {"constraints": "Read-only; no changes", "verification": "topic is gone"},
+            previous_total=100,
+            changed_fields={"goal"},
+        )
+        assert [finding.code for finding in findings] == ["readonly_mutation"]
+
+    def test_goal_authoring_rejects_fixed_wait_in_goal(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings("Wait for 24 hours before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
