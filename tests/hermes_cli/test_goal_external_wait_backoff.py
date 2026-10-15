@@ -58,117 +58,6 @@ def test_judge_prompt_allows_external_scheduled_wait(hermes_home):
     assert directive == {"seconds": 900}
 
 
-def test_timed_wait_is_bounded(hermes_home):
-    """A model cannot park a goal beyond the existing bounded barrier window."""
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("external-wait-cap")
-    mgr.set("wait for the external service", max_turns=10)
-    with patch.object(
-        goals,
-        "judge_goal",
-        return_value=("wait", "external service next check", False, {"seconds": 999999}, False),
-    ):
-        decision = mgr.evaluate_after_turn(
-            "Nothing actionable until the external service finishes; wait for the next scheduled check.",
-            user_initiated=False,
-        )
-
-    assert decision["verdict"] == "wait"
-    assert decision["should_continue"] is False
-    assert mgr.state.waiting_until - mgr.state.waiting_since <= goals._MAX_BARRIER_WAIT_S + 1
-    assert mgr.state.waiting_until > mgr.state.waiting_since
-
-
-def test_live_session_barrier_rearms_after_age_cap(hermes_home):
-    """A watcher session that remains live must keep its trigger barrier armed."""
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("session-rearm")
-    mgr.set("wait for watcher signal")
-    mgr.wait_on_session("watcher-1", reason="watcher")
-    state = mgr.state
-    assert state is not None
-    state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-    state.barrier_recheck_at = 0.0
-    mgr._save()
-    with patch.object(goals, "_session_waiting", return_value=True):
-        mgr.rearm_live_barrier()
-        assert mgr.is_waiting() is True
-    assert mgr.state.waiting_on_session == "watcher-1"
-    assert mgr.state.barrier_recheck_at > time.time()
-    assert mgr.state.waiting_until == 0.0
-    assert mgr.state.barrier_rearms == 1
-
-
-def test_user_turn_at_age_cap_stages_notice_without_conflict(hermes_home):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("age-user-turn")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-user", reason="external watcher")
-    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-    mgr.state.barrier_recheck_at = 0.0
-    mgr._save()
-    with patch.object(goals, "_session_waiting", return_value=True), patch.object(goals, "judge_goal") as judge:
-        decision = mgr.evaluate_after_turn("user checked the status", user_initiated=True)
-
-    assert decision["verdict"] == "waiting"
-    assert "Goal parked" in decision["message"]
-    assert "30 minutes" not in decision["message"]
-    assert mgr.state.turns_used == 0
-    assert mgr.state.last_age_notice_key.startswith("live-barrier:session watcher-user")
-    judge.assert_not_called()
-
-
-def test_user_turn_at_hard_cap_pauses_without_judge(hermes_home):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("hard-cap-user-turn")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-hard-user", reason="external watcher")
-    mgr.state.waiting_since = time.time() - goals._MAX_LIVE_BARRIER_S - 1
-    mgr.state.barrier_recheck_at = 0.0
-    mgr._save()
-    with patch.object(goals, "_session_waiting", return_value=True), patch.object(goals, "judge_goal") as judge:
-        decision = mgr.evaluate_after_turn("user checked the status", user_initiated=True)
-
-    assert decision["status"] == "paused"
-    assert "watcher-hard-user" in decision["message"]
-    assert mgr.state.turns_used == 0
-    judge.assert_not_called()
-
-
-def test_age_notice_does_not_repost_parked_notice(hermes_home):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("age-notice-dedupe")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-dedupe", reason="external watcher")
-    with patch.object(goals, "_session_waiting", return_value=True):
-        first = mgr.evaluate_after_turn("internal status", user_initiated=False)
-        assert "Goal parked" in first["message"]
-        sid = "age-notice-dedupe"
-        st = goals.GoalManager(sid).state
-        assert st is not None
-        st.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-        st.barrier_recheck_at = 0.0
-        goals.save_goal(sid, st)
-        fresh = goals.GoalManager(sid)
-        assert fresh.rearm_live_barrier() is None
-        second = fresh.evaluate_after_turn("internal status", user_initiated=False)
-
-    assert second["message"] == ""
-    assert fresh.state is not None
-    assert fresh.state.last_wait_notice_key == "session:watcher-dedupe|reason:external watcher"
-    assert fresh.state.last_age_notice_key.startswith("live-barrier:session watcher-dedupe")
-
-
 def test_read_only_status_turns_back_off_with_varied_results(hermes_home):
     from hermes_cli import goals
     from hermes_cli.goals import GoalManager
@@ -317,67 +206,6 @@ def test_unchanged_continuation_reason_is_not_reposted(hermes_home):
     assert mgr.state.last_continuation_notice_key == "continuation|reason:nothing actionable until the watchdog"
 
 
-def test_live_barrier_age_recheck_is_silent(hermes_home):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("age-notice")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-age", reason="external watcher")
-    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-    mgr.state.barrier_recheck_at = 0.0
-    mgr._save()
-    with patch.object(goals, "_session_waiting", return_value=True):
-        first = mgr.rearm_live_barrier()
-        second = mgr.rearm_live_barrier()
-
-    assert first is None
-    assert second is None
-    assert mgr.state.last_age_notice_key.startswith("live-barrier:session watcher-age")
-    assert mgr.state.waiting_until == 0.0
-
-
-def test_live_barrier_pauses_at_hard_ceiling(hermes_home):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("hard-cap")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-hard-cap", reason="external watcher")
-    mgr.state.waiting_since = time.time() - goals._MAX_LIVE_BARRIER_S - 1
-    mgr.state.barrier_recheck_at = 0.0
-    mgr._save()
-    with patch.object(goals, "_session_waiting", return_value=True):
-        notice = mgr.rearm_live_barrier()
-
-    assert notice and "watcher-hard-cap" in notice and "6h" in notice
-    assert mgr.state.status == "paused"
-    assert "watcher-hard-cap" in mgr.state.paused_reason
-
-
-def test_live_barrier_rearm_respects_cas_loss(hermes_home, monkeypatch):
-    from hermes_cli import goals
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager("rearm-cas")
-    mgr.set("wait for watcher")
-    mgr.wait_on_session("watcher-cas", reason="external watcher")
-    since = mgr.state.waiting_since
-    mgr.state.waiting_since = time.time() - goals._MAX_BARRIER_WAIT_S - 1
-    mgr.state.barrier_recheck_at = 0.0
-    mgr._save()
-    since = mgr.state.waiting_since
-    concurrent = goals.load_goal("rearm-cas")
-    concurrent.waiting_on_session = "newer-watcher"
-    concurrent.waiting_since = since + 10
-    goals.save_goal("rearm-cas", concurrent)
-    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
-
-    assert mgr.rearm_live_barrier() is None
-    assert mgr.state.waiting_on_session == "newer-watcher"
-    assert mgr.state.waiting_since == since + 10
-
-
 def test_quality_gate_rows_do_not_reset_no_progress(hermes_home):
     from hermes_cli import goals
 
@@ -406,5 +234,39 @@ def test_legacy_goal_row_defaults_new_backoff_fields():
     assert state.consecutive_no_progress == 0
     assert state.last_progress_fingerprint is None
     assert state.last_wait_notice_key is None
-    assert state.barrier_rearms == 0
-    assert state.barrier_recheck_at == 0.0
+    assert not hasattr(state, "barrier_rearms")
+
+
+def test_timed_wait_is_not_clamped(hermes_home):
+    """A judge wait longer than the old 30-minute clamp is kept as requested."""
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("external-wait-uncapped")
+    mgr.set("wait for the external service", max_turns=10)
+    with patch.object(
+        goals, "judge_goal",
+        return_value=("wait", "external service next check", False, {"seconds": 999999}, False),
+    ):
+        decision = mgr.evaluate_after_turn("Nothing actionable until the service finishes.", user_initiated=False)
+    assert decision["verdict"] == "wait"
+    assert mgr.state.waiting_seconds == 999999
+
+
+def test_live_session_barrier_has_no_age_ceiling(hermes_home):
+    """A live watcher barrier stays parked and active no matter how old it is."""
+    from hermes_cli import goals
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager("session-no-ceiling")
+    mgr.set("wait for watcher signal")
+    mgr.wait_on_session("watcher-old", reason="watcher")
+    mgr.state.waiting_since = time.time() - 7 * 24 * 3600
+    mgr._save()
+    with patch.object(goals, "_session_waiting", return_value=True), patch.object(goals, "judge_goal") as judge:
+        assert mgr.lifted_barrier_prompt() is None
+        decision = mgr.evaluate_after_turn("internal status", user_initiated=False)
+    assert decision["status"] == "active"
+    assert mgr.state.status == "active"
+    assert mgr.state.waiting_on_session == "watcher-old"
+    judge.assert_not_called()

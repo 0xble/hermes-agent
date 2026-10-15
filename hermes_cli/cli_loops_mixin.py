@@ -604,9 +604,6 @@ class CLILoopsMixin:
             mgr = self._get_goal_manager()
             if mgr is None or not mgr.is_parked():
                 return
-            if notice := mgr.rearm_live_barrier():
-                from cli import _cprint
-                _cprint(f"  {notice}")
             prompt = mgr.lifted_barrier_prompt()
             if prompt:
                 from cli import _DIM, _RST, _cprint

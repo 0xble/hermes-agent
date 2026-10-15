@@ -673,7 +673,12 @@ class GatewayGoalsMixin:
             # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
             # metadata, never derived from message text.
             metadata = getattr(event, "metadata", None) or {}
-            external_event = metadata.get("notification_origin") == "process_registry_synthetic"
+            external_event = (
+                metadata.get("notification_origin") == "process_registry_synthetic"
+                or (is_internal and metadata.get("display_kind") in {
+                    "internal_notification", "async_delegation_complete", "process_complete",
+                })
+            )
             # A queued chain is judged once, on its terminal turn's response (identity above).
             goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
             # A stamped continuation turn is judged only against the goal instance it served.
@@ -925,13 +930,9 @@ class GatewayGoalsMixin:
             mgr = GoalManager(
                 session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
             )
-            notice = mgr.rearm_live_barrier()
-            return mgr, notice, mgr.lifted_barrier_prompt()
+            return mgr, mgr.lifted_barrier_prompt()
 
-        mgr, barrier_notice, prompt = await self._run_in_executor_with_context(_check)
-        if barrier_notice:
-            with suppress(Exception):
-                await self._send_goal_status_notice(source, barrier_notice, notice_kind="wait-age")
+        mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.

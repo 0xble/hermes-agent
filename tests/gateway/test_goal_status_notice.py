@@ -295,28 +295,3 @@ async def test_real_post_turn_outcome_survives_daily_quota(hermes_home, tmp_path
     assert transport._bot.send_message.await_count == 1
     assert transport._bot.send_message.await_args.kwargs["message_thread_id"] == 213
 
-
-@pytest.mark.asyncio
-async def test_real_lifetime_pause_remains_protected_on_wait_age_path(hermes_home, tmp_path, monkeypatch):
-    import time
-    from hermes_cli import goals
-    from tests.gateway.test_telegram_daily_quota import CHAT, _adapter, _spend
-
-    manager = goals.GoalManager("real-lifetime-notice")
-    manager.set("wait for the watcher")
-    manager.wait_on_session("watcher-lifetime", reason="external work")
-    manager.state.waiting_since = time.time() - goals._MAX_LIVE_BARRIER_S - 1
-    manager.state.barrier_recheck_at = 0
-    manager._save()
-    monkeypatch.setattr(goals, "_session_waiting", lambda sid: True)
-    message = manager.rearm_live_barrier()
-    assert message and "6h" in message
-    assert goals.GoalManager(manager.session_id).state.status == "paused"
-    transport = _adapter(tmp_path)
-    _spend(transport, 11)
-    runner = GatewayRunner.__new__(GatewayRunner)
-    runner._goal_notice_adapter = lambda source: transport
-    runner._thread_metadata_for_source = lambda source: {"thread_id": "213"}
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT, thread_id="213", chat_type="dm")
-    await runner._send_goal_status_notice(source, message, notice_kind="wait-age")
-    assert transport._bot.send_message.await_count == 1

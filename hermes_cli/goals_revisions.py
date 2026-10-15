@@ -157,9 +157,6 @@ class GoalRevisionsMixin:
         state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
         state.subgoals = after["subgoals"]
         state.revisions.append(revision)
-        # The bar moved: an earlier dispute streak was about the superseded wording.
-        state.consecutive_disputes = 0
-        state.last_dispute_evidence = ""
         self._save()
         return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
 
