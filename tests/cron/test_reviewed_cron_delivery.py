@@ -204,3 +204,19 @@ def test_subject_must_still_be_live_and_same_at_final_send(delivery, monkeypatch
     assert len(incidents) == 1
     assert receipts[0]["decision"] == "UNRESOLVED"
     assert receipts[0]["text_sent"] is None
+
+
+@pytest.mark.parametrize("title, passed", [
+    ("# Stripe Priorities — October 14, 2026", True),
+    ("# Stripe Priorities", True),
+    ("# Daily Brief — October 14, 2026", False),
+])
+def test_shipped_stripe_contract_accepts_the_dated_report_title(title, passed):
+    from pathlib import Path
+
+    import cron
+    from cron.review import load_contract
+
+    shipped = Path(cron.__file__).resolve().parent / "contracts" / "reports" / "stripe-brief.yaml"
+    report = f"{title}\n\n**Focus:** billing\n\n## Priorities\n1. Ship it\n"
+    assert check_contract(report, load_contract(str(shipped)))["passed"] is passed

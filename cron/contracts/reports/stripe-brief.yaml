@@ -1,5 +1,9 @@
-title: Stripe Priorities
+# Stripe Priorities brief contract.
+# Reports are titled "# Stripe Priorities — <Month D, YYYY>" (presentation
+# archetype), so the title is a required line prefix rather than an exact
+# match; the checker still rejects any second top-level heading.
 required_lines:
+  - "# Stripe Priorities"
   - "**Focus:**"
 required_sections:
   - Priorities
