@@ -146,6 +146,10 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
     if not manager.session_id or original is None:
         # No session means intentionally ephemeral state, not a failed durable write.
         return getattr(manager, method)(*args, **kwargs)
+    if getattr(manager, "_cursor", None) is not None:
+        # The caller already owns the write transaction and loaded this snapshot through its
+        # cursor. Re-entering SessionDB for the separate snapshot read/CAS would deadlock.
+        return getattr(manager, method)(*args, **kwargs)
     expected = original.to_json()
     # Commands on this same manager can mutate original, including its claim ID.
     initial = LoopState.from_json(expected)
@@ -174,6 +178,11 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
         return result
     except LoopSnapshotChanged:
         try:
+            if settlement and manager._follow_compression():
+                # Compression may move the claimed row after this manager read it. Retry the
+                # complete staged mutation against the validated successor; the copied snapshot
+                # and tick identity preserve the CAS fence while the old parent stays cleared.
+                return mutate_loop_snapshot(manager, method, *args, **kwargs)
             if settlement:
                 # The winner's caps still apply to the released claim, but the obsolete verdict is
                 # never published: callers see state_changed with no user-visible message.
