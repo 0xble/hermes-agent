@@ -85,7 +85,7 @@ def _pin_environment() -> None:
     # Import native platform extensions before pinning sys.platform. psutil selects its
     # compiled module from the real host platform at import time; importing it afterward
     # makes a macOS interpreter look for the Linux extension and drops browser/terminal tools.
-    import psutil  # noqa: F401
+    import psutil
     sys.platform = "linux"  # skills index ``platforms:`` gate
 
     hermes_time.now = lambda: FIXED_NOW  # type: ignore[assignment]
@@ -121,7 +121,7 @@ def _scrub(text: str, home: Path) -> str:
     }.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
     import re
-    return re.sub(r"/prompt-surface-[^/]+", "/<PROMPT_SURFACE_TMP>", text)
+    return re.sub(r"/(?:[^/\s]+/)*prompt-surface-[^/\s]+", "/<PROMPT_SURFACE_TMP>", text)
 
 
 def _enabled_toolsets(platform: str) -> list[str]:
