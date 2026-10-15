@@ -81,9 +81,8 @@ def test_classifier_shell_forms_and_read_only(tmp_path):
     for command in (
         "slack message list",
         "slack message send --help",
-        "gog gmail draft create",
         "gog gmail drafts list",
-        "quo message list",
+        "gog gmail search reply",
         "telegram chats",
     ):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
@@ -114,20 +113,63 @@ def test_classifier_send_flag_regressions(command):
 
 
 def test_classifier_known_value_taking_and_unknown_flag_paths():
-    # A documented value-taking option consumes its value. Known flags do not,
-    # while an unknown long option is fail-closed across both parses.
+    # A documented value-taking option consumes its value. Unknown options and
+    # any path not on the read-only allowlist fail closed.
     for command in (
         "slack --account ALIAS message list",
         "gog --json gmail search reply",
-        "telegram --yes chats send",
-        "wacli --json list send",
         "slack --account=ALIAS message list",
+        "slack message list --filter reply",
     ):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
 
-    assert voice_send_gate.classify_voice_send(
-        "terminal", {"command": "telegram --new-flag chats send"}
-    ), "unknown options must fail closed"
+    for command in (
+        "telegram --yes chats send",
+        "slack message list --unknown value",
+        "slack message list --filter reply --unknown value",
+        "slack --unknown=value message list",
+        "telegram --new-flag chats send",
+    ):
+        assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
+
+
+@pytest.mark.parametrize("command", [
+    "slack message send C1 --text-file - <<'EOF'\nDon't forget\nEOF",
+    "cd /tmp\nslack message send C1 hi",
+    "slack message send C1 hi & true",
+    "{ slack message send C1 hi; }",
+    "! slack message send C1 hi",
+    "timeout 30 slack message send C1 hi",
+    "nice slack message send C1 hi",
+    "caffeinate -i slack message send C1 hi",
+    "xargs -I{} slack message send {} hi",
+    "for c in C1; do slack message send $c hi; done",
+    "if true; then slack message send C1 hi; fi",
+    "`slack message send C1 hi`",
+    "slack -a lpg message send C1 hi",
+    "telegram -a me send peer hi",
+    "gog -a brian gmail send --to x",
+    "gog send --to x",
+    "gog gmail forward --to x",
+    "gog gmail fwd --to x",
+    "gog gmail reply-all --to x",
+    "gog gmail replyall --to x",
+    "gog gmail drafts post --to x",
+])
+def test_classifier_structural_fail_closed_regressions(command):
+    assert voice_send_gate.classify_voice_send("terminal", {"command": command}), command
+
+
+def test_execute_code_source_with_subprocess_send_is_classified():
+    code = "import subprocess\nsubprocess.run(['slack', 'message', 'send', 'C1', 'hi'])"
+    classified = voice_send_gate.classify_voice_send("execute_code", {"code": code})
+    assert classified and classified["command"] == code
+
+
+def test_raw_command_text_is_the_action_hash_input():
+    first = voice_send_gate.classify_voice_send("terminal", {"command": "slack message send C1 hi"})
+    second = voice_send_gate.classify_voice_send("terminal", {"command": "slack  message send C1 hi"})
+    assert first and second and first["action_hash"] != second["action_hash"]
 
 
 def test_classifier_scans_only_executed_script_files(tmp_path, monkeypatch):
@@ -158,9 +200,15 @@ def test_classifier_rejects_embedded_or_argument_verbs():
     for command in (
         "gog gmail search reply",
         "slack message list --filter reply",
-        "echo slack message send",
+        "cat messages.txt",
+        "grep messages.txt",
+        "git diff tools/voice_send_gate.py",
+        "slack --help",
     ):
         assert voice_send_gate.classify_voice_send("terminal", {"command": command}) is None, command
+    assert voice_send_gate.classify_voice_send(
+        "terminal", {"command": "echo slack message send"}
+    ), "raw CLI occurrences outside a command word fail closed"
 
 
 def test_classifier_scans_inline_interpreter_sources():
@@ -343,10 +391,11 @@ def test_shared_dispatch_gate_hashes_plugin_modified_args(monkeypatch):
         voice_send_gate, "authorize_voice_send",
         lambda agent, tool, args: captured.append(args.copy()) or "blocked",
     )
-    ids = model_tools._CallIds(None, "sid", None, None, None)
     result = model_tools.handle_function_call("terminal", {"command": "slack message list"}, session_id="sid")
     assert "blocked" in result
     assert captured == [{"command": "slack message send final"}]
+
+
 def test_shared_dispatch_choke_point_blocks_execute_code_style_call(monkeypatch):
     import model_tools
 

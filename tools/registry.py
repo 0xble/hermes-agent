@@ -915,8 +915,12 @@ class ToolRegistry:
             if session_db is None and session_id:
                 from hermes_cli.goals import _get_session_db
                 session_db = _get_session_db()
-            voice_block = authorize_voice_send(
-                SimpleNamespace(session_id=session_id, _session_db=session_db), name, args)
+            gate_agent = SimpleNamespace(session_id=session_id, _session_db=session_db)
+            tool_call_id = kwargs.get("tool_call_id")
+            if tool_call_id:
+                voice_block = authorize_voice_send(gate_agent, name, args, tool_call_id=tool_call_id)
+            else:
+                voice_block = authorize_voice_send(gate_agent, name, args)
             if voice_block:
                 return tool_error(voice_block)
         except Exception:

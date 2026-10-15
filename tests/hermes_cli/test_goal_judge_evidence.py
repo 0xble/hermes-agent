@@ -105,6 +105,55 @@ def test_evidence_excludes_bookkeeping_tools_and_pre_goal_results(hermes_home):
     assert evidence[0]["output"] == "90 passed"
 
 
+def test_voice_grant_matches_tool_call_id_beyond_timestamp_window(hermes_home):
+    sid = "voice-id-match"
+    db = _session_db(sid)
+    from tools import voice_send_gate
+
+    command = {"command": "slack message send C1 delayed"}
+    classified = voice_send_gate.classify_voice_send("terminal", command)
+    assert classified is not None
+    db.set_meta(voice_send_gate._meta_key(sid, classified["action_hash"]), json.dumps({
+        "grants": [{
+            "approved_at": 1.0,
+            "consumed_at": [100.0],
+            "consumed_tool_call_ids": ["voice-call"],
+        }],
+    }))
+    db.append_message(sid, "assistant", "", tool_calls=[{
+        "id": "voice-call", "type": "function",
+        "function": {"name": "terminal", "arguments": json.dumps(command)},
+    }])
+    db.append_message(sid, "tool", "sent", tool_name="terminal", tool_call_id="voice-call")
+    evidence = goals.collect_goal_evidence(sid)
+    assert evidence[-1]["voice_send_granted"] is True
+    assert evidence[-1]["tool_call_id"] == "voice-call"
+
+
+def test_voice_grant_bound_to_tool_call_id_not_claimed_by_other_call(hermes_home):
+    sid = "voice-id-mismatch"
+    db = _session_db(sid)
+    from tools import voice_send_gate
+
+    command = {"command": "slack message send C1 other"}
+    classified = voice_send_gate.classify_voice_send("terminal", command)
+    assert classified is not None
+    db.set_meta(voice_send_gate._meta_key(sid, classified["action_hash"]), json.dumps({
+        "grants": [{
+            "approved_at": time.time(),
+            "consumed_at": [time.time()],
+            "consumed_tool_call_ids": ["approved-call"],
+        }],
+    }))
+    db.append_message(sid, "assistant", "", tool_calls=[{
+        "id": "different-call", "type": "function",
+        "function": {"name": "terminal", "arguments": json.dumps(command)},
+    }])
+    db.append_message(sid, "tool", "sent", tool_name="terminal", tool_call_id="different-call")
+    evidence = goals.collect_goal_evidence(sid)
+    assert evidence[-1]["voice_send_granted"] is False
+
+
 def test_evidence_keeps_output_tail_bounded_and_redacted(hermes_home):
     sid = "evidence-bounds"
     db = _session_db(sid)

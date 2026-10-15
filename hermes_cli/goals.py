@@ -1611,7 +1611,8 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     for row in rows:
         if row.get("role") != "tool" or float(row.get("timestamp") or 0.0) < since:
             continue
-        name, args = calls.get(str(row.get("tool_call_id") or ""), (str(row.get("tool_name") or ""), ""))
+        row_tool_call_id = str(row.get("tool_call_id") or "")
+        name, args = calls.get(row_tool_call_id, (str(row.get("tool_name") or ""), ""))
         name = name or str(row.get("tool_name") or "") or "tool"
         if _evidence_tool_excluded(name):
             continue
@@ -1625,7 +1626,9 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
             row_timestamp = 0.0
         voice_fields = {}
         try:
-            from tools.voice_send_gate import classify_voice_send, consumed_grant_timestamps
+            from tools.voice_send_gate import (
+                classify_voice_send, consumed_grant_timestamps, consumed_grant_tool_call_ids,
+            )
             if not isinstance(args, str) or not args.strip():
                 raise ValueError("stored tool arguments are not JSON")
             parsed_args = json.loads(args)
@@ -1633,19 +1636,37 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
                 raise ValueError("stored tool arguments are not an object")
             classified = classify_voice_send(name, parsed_args)
             if classified:
-                grant_times = consumed_grant_timestamps(db, str(session_id), classified["action_hash"])
-                matched = next(
-                    (
-                        (index, grant_time)
-                        for index, grant_time in sorted(enumerate(grant_times), key=lambda pair: pair[1], reverse=True)
-                        if (classified["action_hash"], index) not in matched_grants
-                        and 0.0 <= row_timestamp - grant_time <= _VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS
-                    ),
-                    None,
-                )
+                action_hash = classified["action_hash"]
+                grant_ids = consumed_grant_tool_call_ids(db, str(session_id), action_hash)
+                matched = None
+                if row_tool_call_id:
+                    matched = next(
+                        (
+                            (index, None)
+                            for index, grant_id in enumerate(grant_ids)
+                            if grant_id == row_tool_call_id
+                            and (action_hash, index) not in matched_grants
+                        ),
+                        None,
+                    )
+                if matched is None:
+                    # Timestamp fallback only for consumptions that recorded no
+                    # tool-call ID (legacy grants); an ID-bound grant can never
+                    # be claimed by a different call.
+                    grant_times = consumed_grant_timestamps(db, str(session_id), action_hash)
+                    matched = next(
+                        (
+                            (index, grant_time)
+                            for index, grant_time in sorted(enumerate(grant_times), key=lambda pair: pair[1], reverse=True)
+                            if (action_hash, index) not in matched_grants
+                            and (index >= len(grant_ids) or grant_ids[index] is None)
+                            and 0.0 <= row_timestamp - grant_time <= _VOICE_SEND_GRANT_MATCH_WINDOW_SECONDS
+                        ),
+                        None,
+                    )
                 granted = matched is not None
                 if matched is not None:
-                    matched_grants.add((classified["action_hash"], matched[0]))
+                    matched_grants.add((action_hash, matched[0]))
                 voice_fields = {
                     "voice_send_action_hash": classified["action_hash"],
                     "voice_send_granted": granted,
@@ -1662,7 +1683,8 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
             call_text = redact_sensitive_text(call_text, force=True)
             output = redact_sensitive_text(output, force=True)
         entries.append({"tool": name, "call": call_text, "output": output,
-                        "timestamp": float(row.get("timestamp") or 0.0), **voice_fields})
+                        "timestamp": float(row.get("timestamp") or 0.0),
+                        "tool_call_id": row_tool_call_id, **voice_fields})
     selected = entries if max_entries is None else entries[-max_entries:]
     voice_send_entries = [item for item in entries if "voice_send_action_hash" in item]
     return _EvidenceRows(selected, truncated=scan_truncated, voice_send_entries=voice_send_entries)

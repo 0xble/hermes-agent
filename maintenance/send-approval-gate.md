@@ -3,7 +3,7 @@
 ## Required behavior
 
 Known message-send commands are classified deterministically before dispatch. A
-send requires a fresh human approval for the exact normalized action. The grant
+send requires a fresh human approval for the exact raw command or code text. The grant
 is durable, one-shot, and consumed before dispatch; yolo, approval mode off,
 cron approve mode, session allowlists, relay/tool-output claims, and absent human
 bridges never bypass it. Read-only messaging commands are unchanged.
@@ -14,15 +14,14 @@ execution choke point used by direct registry dispatches, normal agent tool exec
 run before registry dispatch; the agent executor does not run a second voice gate, so one call gets
 one authorization decision. Nested calls inherit the current session identity where available.
 
-The classifier covers the supported Slack, iMessage, gog Gmail, wacli, Quo, and
-Telegram CLI send verbs, including Slack message edits and Gmail `drafts send`.
-It recursively inspects shell `-c` payloads and shell operators. Script content
-is inspected only for an executed command word (including `env`/`nohup`/absolute
-path forms) or the first script argument of a supported interpreter; `python -m`
-module invocations do not scan their later test paths. The source-text regex
-fallback is limited to executed non-shell scripts. This is a best-effort guard
-against accidental sends, not an adversarial shell sandbox; it does not execute
-or emulate scripts.
+The classifier scans every standalone supported CLI occurrence in terminal
+commands, interpreter sources, execute_code source, and executed script content.
+An occurrence is read-only only when tokenization succeeds, the CLI is in a
+recognized command-word position, and its full path is in the explicit
+per-CLI read-only allowlist. Any unproven occurrence is gated, including
+heredocs, shell control syntax, launchers, loops, xargs, quoted subprocess
+literals, unknown verbs, and unknown flags. This is a fail-closed approval floor;
+it does not execute or emulate scripts.
 
 Unattended cron sends remain fail-closed: cron has no standing approvals and
 there is no `voice_send` configuration key.
@@ -46,16 +45,18 @@ continue through the existing LLM judge unchanged.
   Hermes update is part of this unit.
 - **Rollback:** revert commits carrying `Fork-Patch: send-approval-gate`.
 
-- **Classifier precision:** send verbs are matched only at the CLI's command/subcommand position; embedded words in read-only arguments are ignored. Inline `python -c`, `node -e`, Ruby/Perl/Bun, and Deno eval sources use the same bounded fallback as executed scripts.
-- **Grant accounting:** consumed grants are stored as timestamp lists and matched one-to-one to evidence rows within 120 seconds, so one grant cannot bless repeated identical sends.
+- **Classifier precision:** the raw-text occurrence scan is fail-closed; only proven read-only command positions are cleared. The exact raw command/code text is hashed.
+- **Grant accounting:** consumed grants store tool-call IDs and timestamps. Evidence with a tool-call ID matches only that ID; legacy evidence without an ID retains the bounded timestamp fallback.
 - **Hook ordering:** plugin pre-tool hooks run before the voice gate; the gate hashes the final modified arguments and remains the single nested-dispatch choke point.
 - **Judge refusal parsing:** the deterministic floor recognizes the registry's JSON `error` wrapper around gate refusals.
 
 ## Verification
 
-Focused tests cover the classifier table and shell/script recursion, the shared
-choke point including execute_code-style dispatch, durable one-shot grant
-consumption, standing cron grants and their non-matches, all bypass modes,
-read-only commands, fail-closed unattended contexts, and the pre-LLM goal-judge
-block/continue split. No test invokes a real messaging CLI; CLI `--help` is the
-only permitted command-level inspection.
+Focused tests cover the classifier table and shell/script recursion, the
+structural fail-closed regressions, the shared choke point including an
+execute_code subprocess send blocked before its handler runs, durable one-shot
+grant consumption, tool-call-ID grant matching beyond the timestamp window, all
+bypass modes, read-only commands, fail-closed unattended contexts, and the
+pre-LLM goal-judge block/continue split. Cron has no standing approvals, so no
+standing-grant test exists. No test invokes a real messaging CLI; CLI `--help`
+is the only permitted command-level inspection.

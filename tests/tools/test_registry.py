@@ -50,7 +50,7 @@ class TestRegisterAndDispatch:
 
         approved_args = {"command": "slack message send --text exact"}
 
-        def authorize(agent, name, args):
+        def authorize(agent, name, args, **kwargs):
             assert name == "terminal"
             assert agent.session_id == "sid"
             return None if args == approved_args else "BLOCKED: approval required"
@@ -67,6 +67,20 @@ class TestRegisterAndDispatch:
             "terminal", approved_args, session_id="sid", _session_db=object()))
         assert allowed == {"sent": True}
         assert executed == [approved_args]
+
+    def test_direct_dispatch_blocks_execute_code_subprocess_send_before_handler(self):
+        reg = ToolRegistry()
+        executed = []
+        reg.register(
+            name="execute_code", toolset="core", schema=_make_schema("execute_code"),
+            handler=lambda args, **kwargs: executed.append(args.copy()) or json.dumps({"ran": True}),
+        )
+        blocked_code = {"code": "import subprocess\nsubprocess.run(['slack', 'message', 'send', 'C1', 'hi'])"}
+        blocked = json.loads(reg.dispatch(
+            "execute_code", blocked_code, session_id="sid", _session_db=object(), tool_call_id="tc-code",
+        ))
+        assert "approval required" in blocked["error"]
+        assert executed == []
 
     def test_dispatch_withholds_injected_kwargs_from_narrow_plugin_handler(self):
         """model_tools injects task_id/session_id/user_task on every call; a third-party ``handle(args)``
