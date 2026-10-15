@@ -306,7 +306,7 @@ def _exited(proc: Path) -> bool:
     a running process and stays a veto, as does any status we cannot read.
     """
     try:
-        status = proc.joinpath("status").read_text(encoding="utf-8", errors="replace")
+        status = proc.joinpath("status").read_text(encoding="utf-8-sig", errors="replace")
     except FileNotFoundError:
         return not proc.exists()  # only a vanished /proc/<pid> proves the process is gone
     except OSError:
