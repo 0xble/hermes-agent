@@ -698,7 +698,7 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
     "status or id that was never recorded is unverified: any criterion that "
     "rests on it is NOT proven, so do not return DONE on its strength. If a "
     "cited result contradicts the recorded tool results, the claim is false: "
-    "return CONTINUE with disputed and name the contradiction.\n\n"
+    "return CONTINUE and name the contradiction.\n\n"
 )
 
 # Judge prompt block for the goal's revision history (empty without revisions).

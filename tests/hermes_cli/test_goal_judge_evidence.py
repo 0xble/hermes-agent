@@ -195,7 +195,10 @@ def test_silent_recheck_passes_newest_visible_report_with_older_citations(hermes
     monkeypatch.setattr(goals, "_call_goal_judge_llm", judge)
     mgr = GoalManager(session_id=sid)
     first = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
-    assert first["verdict"] == "continue"
+    # A silent no-progress continue parks quietly on the first ladder rung.
+    assert first["verdict"] == "wait" and first["message"] == ""
+    assert mgr.state.waiting_seconds == goals._NO_PROGRESS_BACKOFF_S[0]
+    mgr.stop_waiting()
     second = mgr.evaluate_after_turn(goals.SILENCE_MARKER, user_initiated=False)
     assert second["verdict"] == "done"
     assert mgr.state.status == "done"
@@ -283,26 +286,6 @@ def test_silent_recheck_bounds_report_without_losing_cited_proof(hermes_home, mo
     assert f"{citation}: wiki-check pass" in prompts[0]
 
 
-@pytest.mark.parametrize(
-    "early_return",
-    [
-        "quality_gate",
-        "judge_wait",
-        "parked",
-        "live_blocked",
-        "live_parked",
-        "blocked",
-        "done",
-        "transport_error",
-        "parse_error",
-        "silent_stall",
-        "dispute",
-        "max_turns",
-        "delegation",
-        "no_progress",
-        "continuation_gap",
-    ],
-)
 def test_passing_gate_is_shown_to_judge_as_evidence(hermes_home, monkeypatch):
     sid = "evidence-gate"
     mgr = GoalManager(session_id=sid)
@@ -326,15 +309,6 @@ def test_evidence_failure_falls_back_to_response_only(hermes_home, monkeypatch):
 
 
 # ── dispute stall breaker ────────────────────────────────────────────
-
-
-def test_parse_marks_only_explicit_disputes():
-    parse = goals._parse_judge_response
-    assert parse('{"verdict":"continue","disputed":true,"reason":"x"}')[3] == {"disputed": True}
-    assert parse('{"verdict":"continue","disputed":"true","reason":"x"}')[3] == {"disputed": True}
-    assert parse('{"verdict":"continue","disputed":false,"reason":"x"}')[3] is None
-    assert parse('{"verdict":"continue","reason":"x"}')[3] is None
-    assert parse('{"verdict":"done","disputed":true,"reason":"x"}')[3] is None
 
 
 def _judge_sequence(*verdicts):
