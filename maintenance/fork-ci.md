@@ -210,6 +210,16 @@ zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this 
 synchronization, not a production liveness correction. Retire when the watcher exposes an owned
 synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
 
+## Update pause consumer publish race
+
+The `fork-ci-reliability` identity also covers
+`tests/hermes_cli/test_update_pause_boundaries.py::test_consumption_checkpoints_debt_before_unlink_and_producer_death`.
+Its consumer subprocess published `consumed` with a plain `write_text`, while the test waited only
+for the path to exist and then parsed it. Under hosted load the reader could open the file between
+create and payload write and fail with `JSONDecodeError`. The subprocess now writes a sibling and
+`os.replace`s it into place, so existence implies a complete payload. Product code is unchanged.
+Retire with the test if upstream rewrites this cell harness.
+
 ## Nightly Linux notification regression
 
 The `fork-ci-reliability` identity covers the cut-completion notice assertion in
