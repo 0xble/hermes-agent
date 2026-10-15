@@ -1101,6 +1101,13 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             if interval_minutes:
                 allowance = max(allowance, 2.0 * interval_minutes * 60.0)
             fut = _running_futures.get(key)
+            external_claim = _external_worker_claims.get(key)
+            if external_claim is not None:
+                try:
+                    if external_claim[1].poll() is None:
+                        continue  # the detached worker still owns this claim
+                except Exception:
+                    continue  # the reaper remains authoritative when liveness is uncertain
             if fut is _FUTURE_PENDING:
                 # Submit path hung before ``pool.submit`` returned — the wedge class; release it.
                 pass

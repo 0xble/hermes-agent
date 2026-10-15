@@ -770,6 +770,74 @@ def test_post_handoff_waiter_error_keeps_claim_until_worker_exit(monkeypatch, tm
         scheduler.release_running_job(job["id"], home=tmp_path)
 
 
+def test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error(
+    monkeypatch, tmp_path, execution_ledger
+):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-live-detached-terminal"
+    job = {
+        "id": job_id,
+        "schedule": {"kind": "interval", "minutes": 1},
+    }
+    owner = object()
+    process = Mock()
+    exited = threading.Event()
+    errors = []
+
+    process.poll.side_effect = lambda: 0 if exited.is_set() else None
+    process.wait.side_effect = lambda timeout=None: (
+        0 if exited.wait(timeout) else (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="worker", timeout=timeout)))
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        Mock(side_effect=RuntimeError("transient ledger read")),
+    )
+    assert scheduler.try_register_running_job(job_id, owner=owner)
+    key = scheduler._inflight_key(job_id, tmp_path)
+    execution = execution_ledger.create_execution(job_id, source="builtin")
+    terminal = execution_ledger.finish_execution(execution["id"], success=True)
+    assert terminal and terminal["status"] == "completed"
+    with scheduler._running_lock:
+        scheduler._external_worker_modes[key] = "detached"
+
+    def wait_for_worker():
+        try:
+            scheduler._wait_for_external_cron_worker(
+                process,
+                execution_id="exec-live-detached-terminal",
+                job_id=job_id,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    waiter = threading.Thread(target=wait_for_worker)
+    waiter.start()
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
+    assert errors and isinstance(errors[0], scheduler._ExternalWorkerPostHandoffError)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_latest_executions_for_releasable_claims",
+        lambda: {job_id: terminal},
+    )
+    try:
+        assert scheduler.sweep_stale_inflight([job]) == []
+        assert scheduler.is_job_running(job_id, home=tmp_path)
+        exited.set()
+        deadline = time.monotonic() + 2
+        while scheduler.is_job_running(job_id, home=tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+    finally:
+        exited.set()
+        waiter.join(timeout=2)
+        scheduler.release_running_job(job_id, home=tmp_path, owner=owner)
+
+
 def test_stale_waiter_cleanup_does_not_erase_successor_metadata(monkeypatch, tmp_path):
     import cron.scheduler as scheduler
 
