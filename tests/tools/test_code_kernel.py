@@ -487,7 +487,7 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
 
 class TestInScriptToolErrors(unittest.TestCase):
     def test_ignored_helper_error_is_reported_for_that_cell_only(self):
-        """A script that drops a helper's {"error": ...} return must not read as a clean success."""
+        """A file-tool HermesToolError fails only its cell and is still listed in tool_errors."""
         def _handle(tool_name, tool_args, task_id=None, **_ids):
             if tool_name == "write_file":
                 return json.dumps({"error": "Refusing to overwrite a.py: never read"})
@@ -496,7 +496,8 @@ class TestInScriptToolErrors(unittest.TestCase):
         with _kernel_config(), patch("model_tools.handle_function_call", new=_handle):
             failed = _run("import hermes_tools\nhermes_tools.write_file('a.py', 'x')\nprint('done')\n")
             clean = _run("import hermes_tools\nhermes_tools.web_search(query='q')\n")
-        self.assertEqual(failed["status"], "success", failed)
+        self.assertEqual(failed["status"], "error", failed)
+        self.assertIn("HermesToolError", failed.get("error", "") + failed.get("output", ""))
         self.assertEqual(failed["tool_errors"], [{"tool": "write_file", "error": "Refusing to overwrite a.py: never read"}])
         self.assertNotIn("tool_errors", clean)
 

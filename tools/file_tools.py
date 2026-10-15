@@ -7,6 +7,7 @@ staleness state).
 """
 
 import base64
+import contextvars
 import errno
 import json
 import logging
@@ -15,7 +16,7 @@ import re
 import stat
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error, get_read_block_error
@@ -43,6 +44,24 @@ from tools.file_tools_read_tracking import (
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
 
 logger = logging.getLogger(__name__)
+
+
+_SANDBOX_READ_CONTEXT = contextvars.ContextVar("sandbox_read_context", default=False)
+
+
+@contextmanager
+def sandbox_read_context():
+    """Make one nested execute_code read bypass model-result deduplication."""
+    token = _SANDBOX_READ_CONTEXT.set(True)
+    try:
+        yield
+    finally:
+        _SANDBOX_READ_CONTEXT.reset(token)
+
+
+def sandbox_read_active() -> bool:
+    """Whether the current call is a sandbox read that must bypass deduplication."""
+    return _SANDBOX_READ_CONTEXT.get()
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -680,7 +699,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         # read-before-write guard needs a real read, which the stub path never records (#95976).
         file_ops = _get_file_ops(task_id)
         version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
-        if (cached_version is not None and not is_background_review()
+        if (cached_version is not None and not _SANDBOX_READ_CONTEXT.get()
+                and not is_background_review()
                 and version_before == cached_version and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
