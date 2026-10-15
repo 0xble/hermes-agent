@@ -211,36 +211,77 @@ def test_promotion_does_not_spawn_a_second_reconnect_watcher():
     assert "drain_control_watcher" in supervised
 
 
-@pytest.mark.asyncio
-async def test_promote_survives_connect_raise_and_queues_secondary(monkeypatch):
-    platform = Platform.TELEGRAM
-    adapter = object()
-    queued = []
+def _secondary_runner(tmp_path, connect):
+    """A real GatewayRunner shell whose secondary profiles start through _start_one_profile_adapters."""
+    from gateway.run import GatewayRunner
 
-    async def boom(a, p):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner._profile_failed_platforms = {}
+    runner._profile_adapters = {}
+    runner._standby_deferred = {}
+    runner._primary_profile_name = "default"
+    runner._served_profile_homes = {"work": tmp_path / "work", "play": tmp_path / "play"}
+    runner._start_prime_session_db_after_ready = lambda: asyncio.sleep(0)
+    runner._restore_secondary_completion_ledgers = lambda homes: None
+    runner._start_finish_wiring = lambda count: asyncio.sleep(0)
+    runner._start_spawn_background_watchers = lambda: None
+    runner._multiplex_on = lambda: False
+    runner._sync_voice_mode_state_to_adapter = lambda adapter: None
+    runner._configure_profile_adapter = lambda adapter, profile, platform: None
+    runner._connect_initial_adapter_with_timeout = connect
+    tokens = {"work": "tok-shared", "play": "tok-shared"}
+    scopes = []
+
+    async def load_config(profile, home):
+        return GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token=tokens[profile])})
+
+    def create(platform, config):
+        from hermes_constants import get_hermes_home
+        scopes.append(str(get_hermes_home()))
+        return SimpleNamespace(platform=platform, config=config, token=config.token)
+
+    runner._load_secondary_profile_config = load_config
+    runner._create_adapter = create
+    runner._adapter_credential_claim = staticmethod(lambda platform, adapter: (platform, adapter.token))
+    runner._adapter_listener_claim = staticmethod(lambda platform, adapter: None)
+    runner._adapter_credential_fingerprint = lambda adapter: None
+    runner._duplicate_credential_origins = lambda *a: (None, None)
+    reconnects = []
+    runner._safe_adapter_disconnect = lambda adapter, platform: asyncio.sleep(0)
+    runner._schedule_secondary_profile_startup_reconnect = (
+        lambda profile, platform, adapter: reconnects.append((profile, platform)))
+    return runner, scopes, reconnects
+
+
+@pytest.mark.asyncio
+async def test_promote_starts_secondaries_in_profile_scope_and_refuses_shared_token(monkeypatch, tmp_path):
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    runner, scopes, reconnects = _secondary_runner(tmp_path, lambda a, p: asyncio.sleep(0, result=True))
+    for profile in ("work", "play"):
+        zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile=profile)
+    zcs.mark_ready()
+    result = await zcs.promote(runner)
+    # Only the first profile in served order polls the shared token; the duplicate is refused.
+    assert Platform.TELEGRAM in runner._profile_adapters["work"]
+    assert Platform.TELEGRAM not in runner._profile_adapters.get("play", {})
+    assert result["failed"] == ["play:telegram"]
+    assert scopes == [str(tmp_path / "work"), str(tmp_path / "play")]  # created inside each profile scope
+    assert reconnects == []
+
+
+@pytest.mark.asyncio
+async def test_promote_secondary_connect_raise_is_queued_for_reconnect(monkeypatch, tmp_path):
+    async def boom(adapter, platform):
         raise RuntimeError("network down")
 
-    runner = SimpleNamespace(
-        adapters={},
-        _failed_platforms={},
-        _profile_failed_platforms={},
-        _standby_deferred={},
-        _create_adapter=lambda p, c: adapter,
-        _configure_profile_adapter=lambda a, prof, p: None,
-        _connect_initial_adapter_with_timeout=boom,
-        _safe_adapter_disconnect=lambda a, p: asyncio.sleep(0),
-        _run_secondary_profile_reconnect=lambda prof, p, a: asyncio.sleep(0, result=queued.append((prof, p, a))),
-        _retain_background_task=lambda task: task,
-        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
-        _start_finish_wiring=lambda count: asyncio.sleep(0),
-        _start_spawn_background_watchers=lambda: None,
-    )
     monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
-    zcs.defer_platform(runner, platform, object(), profile="work")
+    runner, _scopes, reconnects = _secondary_runner(tmp_path, boom)
+    runner._served_profile_homes = {"work": tmp_path / "work"}
+    zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile="work")
     zcs.mark_ready()
     result = await zcs.promote(runner)
     assert result == {"promoted": True, "already": False, "failed": ["work:telegram"]}
-    task = runner._profile_failed_platforms["work"][platform]
-    await task
-    assert queued == [("work", platform, adapter)]
+    assert reconnects == [("work", Platform.TELEGRAM)]
     assert zcs.is_standby() is False

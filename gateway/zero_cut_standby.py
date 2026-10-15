@@ -60,24 +60,43 @@ async def _connect_deferred(runner, platform, adapter) -> bool:
         return False
 
 
-def _queue_secondary_reconnect(runner, profile, platform, adapter) -> None:
-    """Hand a failed secondary to the profile's own reconnect slot, as a retryable fatal would."""
-    pending = runner._profile_failed_platforms
-    if not isinstance(pending, dict):
-        pending = runner._profile_failed_platforms = {}
-    profile_pending = pending.setdefault(profile, {})
-    if platform not in profile_pending:
-        profile_pending[platform] = runner._retain_background_task(asyncio.create_task(
-            runner._run_secondary_profile_reconnect(profile, platform, adapter),
-            name=f"secondary-reconnect:{profile}:{platform.value}"))
+def _existing_claims(runner) -> dict:
+    """Credential/listener claims already held by live primary and secondary adapters."""
+    active = getattr(runner, "_primary_profile_name", None) or "default"
+    claimed = runner._primary_resource_claims(active)
+    for profile, adapters in (getattr(runner, "_profile_adapters", None) or {}).items():
+        for platform, adapter in adapters.items():
+            for claim in (runner._adapter_credential_claim(platform, adapter),
+                          runner._adapter_listener_claim(platform, adapter)):
+                if claim is not None:
+                    claimed.setdefault(claim, profile)
+    return claimed
+
+
+async def _promote_secondary_profiles(runner, profiles: list[str], failed: list[str]) -> None:
+    """Start deferred secondaries through the normal per-profile path (runtime scope, credential and
+    listener conflict refusal, startup reconnect), in the served order, after the primary is live."""
+    from gateway.config import Platform
+    homes = getattr(runner, "_served_profile_homes", None) or {}
+    claimed = _existing_claims(runner)
+    for profile in [p for p in homes if p in profiles]:
+        try:
+            await runner._start_one_profile_adapters(profile, homes[profile], claimed)
+        except Exception:
+            logger.exception("Promotion could not start deferred adapters for profile %s", profile)
+        if Platform.TELEGRAM not in (runner._profile_adapters.get(profile) or {}):
+            failed.append(f"{profile}:{Platform.TELEGRAM.value}")
+    for profile in [p for p in profiles if p not in homes]:
+        logger.error("Promotion has no served home for deferred profile %s", profile)
+        failed.append(f"{profile}:{Platform.TELEGRAM.value}")
 
 
 async def promote(runner) -> dict[str, Any]:
     """Promote a ready standby in place, starting deferred adapters and autonomous services.
 
-    A deferred platform that fails to connect (False or a raise) goes to the same reconnect path a
-    transient startup failure uses (primary queue or the profile's own reconnect task), so a promoted
-    gateway heals instead of silently serving without it. The payload names every failed platform.
+    A deferred primary that fails to connect (False or a raise) joins the primary reconnect queue;
+    deferred secondaries start through the normal per-profile path, so a promoted gateway heals
+    instead of silently serving without them. The payload names every platform not yet serving.
     """
     global _promoted
     if _promoted:
@@ -98,29 +117,23 @@ async def promote(runner) -> dict[str, Any]:
     deferred = dict(getattr(runner, "_standby_deferred", {}))
     runner._standby_deferred = {}
     for (profile, platform), config in deferred.items():
-        name = f"{profile}:{platform.value}" if profile else platform.value
+        if profile is not None:
+            continue
         adapter = runner._create_adapter(platform, config)
         if adapter is None:
-            logger.error("Promotion could not create deferred adapter %s", name)
-            failed.append(name)
+            logger.error("Promotion could not create deferred adapter %s", platform.value)
+            failed.append(platform.value)
             continue
-        if profile is None:
-            runner._wire_adapter_handlers(adapter)
-        else:
-            runner._configure_profile_adapter(adapter, profile, platform)
+        runner._wire_adapter_handlers(adapter)
         if not await _connect_deferred(runner, platform, adapter):
-            logger.error("Promotion could not connect deferred adapter %s; queued for reconnect", name)
-            failed.append(name)
-            if profile is None:
-                runner._failed_platforms[platform] = runner._startup_retry_entry(platform, adapter, config)
-            else:
-                await runner._safe_adapter_disconnect(adapter, platform)
-                _queue_secondary_reconnect(runner, profile, platform, adapter)
+            logger.error("Promotion could not connect deferred adapter %s; queued for reconnect", platform.value)
+            failed.append(platform.value)
+            runner._failed_platforms[platform] = runner._startup_retry_entry(platform, adapter, config)
             continue
-        if profile is None:
-            runner._publish_primary_adapter(platform, adapter)
-        else:
-            runner._profile_adapters.setdefault(profile, {})[platform] = adapter
+        runner._publish_primary_adapter(platform, adapter)
+    secondary = sorted({profile for profile, _platform in deferred if profile is not None})
+    if secondary:
+        await _promote_secondary_profiles(runner, secondary, failed)
 
     await runner._start_finish_wiring(len(runner.adapters))
     runner._start_spawn_background_watchers()
