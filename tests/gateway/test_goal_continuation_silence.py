@@ -10,7 +10,8 @@ treated it as a typed message. A message the user types must still get the fallb
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 import uuid
 
 import pytest
@@ -88,3 +89,242 @@ def test_heartbeat_and_loop_prompts_keep_their_existing_contract():
 
     event = GatewayRunner._synthetic_prompt_event(_slack_thread_source(), "loop tick")
     assert event.reply_expected is None
+
+
+class _TurnContextBuilt(Exception):
+    """Stop at the real wiring seam before executor, model or delivery tasks start."""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["initial", "eventless", "goal-event", "human-event"])
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+async def test_turn_context_preserves_event_contract_when_requeued(hermes_home, path, defer):
+    """#419/#444: event-backed turns retain provenance; eventless follow-ups are human.
+
+    A leftover steer/interrupt is new authored text, not the previous goal tick,
+    so a missing event must not confer internal status or goal metadata.
+    """
+    from gateway.run import GatewayRunner
+    from gateway.turn_context import TurnContext
+
+    runner, _, entry, src, key = _runner_with_goal(hermes_home)
+    runner._get_proxy_url = lambda: None
+    defaults = TurnContext()
+    display = SimpleNamespace(**{name: getattr(defaults, name) for name in runner._DISPLAY_TO_TURN_CTX})
+    display.platform_key = "slack"
+    display.resolve_display_setting = lambda *args: False
+    runner._run_agent_display_settings = lambda source: display
+    contexts = []
+
+    def observe_context(ctx, *args):
+        contexts.append(ctx)
+        raise _TurnContextBuilt
+
+    runner._run_agent_bind_turn_wiring = observe_context
+    runner._run_agent = runner._run_agent_inner
+    adapter = SimpleNamespace(_active_sessions={}, send_typing=AsyncMock())
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._intake_adapter_for = lambda source: None
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="next turn")
+    runner._session_key_for_source = lambda source: key
+    runner._pinned_channel_inputs = lambda key, prompt, source, **kw: (prompt, source)
+    runner._persist_prompt_pins = AsyncMock()
+    runner._reply_anchor_for_event = lambda event: None
+    metadata = {"goal_continuation": True, "origin": "initial"}
+    with pytest.raises(_TurnContextBuilt):
+        await runner._run_agent_inner(
+            message="initial turn", context_prompt="", history=[], source=src,
+            session_id=entry.session_id, session_key=key, reply_expected=False,
+        )
+
+    expected_internal = True
+    expected_metadata = metadata
+    if path != "initial":
+        expected_internal = False
+        expected_metadata = {}
+        pending_event = None
+        if path != "eventless":
+            expected_internal = path == "goal-event"
+            expected_metadata = {"goal_continuation": True, "origin": "queued"} if expected_internal else {"origin": "human"}
+            pending_event = MessageEvent(
+                text="next turn", source=src, internal=expected_internal,
+                metadata=expected_metadata, reply_expected=False if expected_internal else True,
+            )
+        with pytest.raises(_TurnContextBuilt):
+            await runner._run_agent_queued_followup(
+                contexts[0], adapter, "next turn", pending_event,
+                response={}, result={"interrupted": True, "messages": []}, stream_task=None,
+            )
+        assert len(contexts) == 2
+
+    ctx = contexts[-1]
+    result = {"final_response": "done", "messages": []}
+    if defer == "depth-cap":
+        ctx._interrupt_depth = runner._MAX_INTERRUPT_DEPTH
+        queued = []
+
+        def queue_message(session_key, text, **contract):
+            queued.append(MessageEvent(text=text, source=src, **contract))
+
+        adapter.queue_message = queue_message
+    else:
+        adapter._pending_messages = {}
+        runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    requeued_event = None if path == "eventless" else MessageEvent(
+        text="requeued turn", source=src, internal=expected_internal, metadata=expected_metadata,
+        reply_expected=ctx.reply_expected,
+    )
+    await runner._run_agent_queued_followup(
+        ctx, adapter, "requeued turn", requeued_event, response=result, result=result, stream_task=None,
+    )
+    event = queued[0] if defer == "depth-cap" else adapter._pending_messages[key]
+    expected_reply_expected = False if expected_internal else True
+    assert ctx.reply_expected is expected_reply_expected
+    assert event.internal is expected_internal
+    assert event.metadata == expected_metadata
+    assert event.reply_expected is expected_reply_expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("origin", ["steer", "interrupt"])
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+@pytest.mark.parametrize(
+    ("text", "expected_reply_expected"),
+    [
+        ("please show me the current status", True),
+        ("[relay from=agent:source receipt=r1]\nNO_REPLY", False),
+        ("NO_REPLY\n[relay from=agent:source receipt=r1]", False),
+        ("quoted example:\n[relay from=agent:source receipt=r1]\nplease explain this", True),
+    ],
+    ids=("human", "agent-origin-relay", "trailing-relay", "human-quoted-relay"),
+)
+async def test_eventless_followup_requeues_with_its_own_reply_contract(
+    hermes_home, origin, defer, text, expected_reply_expected
+):
+    """Real leftover steer envelopes keep relay silence; human text still requires a reply."""
+    await _assert_eventless_followup_reply_contract(
+        hermes_home, origin, defer, text, expected_reply_expected,
+    )
+
+
+async def _assert_eventless_followup_reply_contract(
+    hermes_home, origin, defer, text, expected_reply_expected, explicit_reply_expected=None,
+):
+    from gateway.response_filters import display_kind_for_event
+    from gateway.turn_context import TurnContext
+
+    runner, adapter, entry, src, key = _runner_with_goal(hermes_home)
+    runner._draining = False
+    if origin == "steer":
+        text = runner._steer_text_with_origin(
+            text, MessageEvent(text=text, source=src, reply_expected=explicit_reply_expected),
+        )
+    result: dict[str, object] = {"messages": []}
+    if origin == "interrupt":
+        result.update(interrupted=True, interrupt_message=text)
+    else:
+        result["pending_steer"] = text
+    pending_event, pending = await runner._run_agent_drain_pending(result, adapter, src, key)
+    assert pending_event is None
+    assert pending == text
+
+    ctx = TurnContext(
+        source=src, session_id=entry.session_id, session_key=key, reply_expected=False,
+    )
+    if defer == "depth-cap":
+        ctx._interrupt_depth = runner._MAX_INTERRUPT_DEPTH
+
+        def queue_message(session_key, text, **contract):
+            adapter._pending_messages[session_key] = MessageEvent(text=text, source=src, **contract)
+
+        setattr(adapter, "queue_message", queue_message)
+    else:
+        runner._run_agent_deliver_first_response = AsyncMock(return_value=False)
+    # Deferral is reached after a completed recursive turn too, even for an interrupt.
+    completed = {"final_response": "done", "messages": []}
+    await runner._run_agent_queued_followup(
+        ctx, adapter, pending, pending_event, response=completed, result=completed, stream_task=None,
+    )
+    queued = adapter._pending_messages[key]
+    assert queued.text == text
+    assert queued.internal is False
+    assert queued.metadata == {}
+    assert queued.reply_expected is expected_reply_expected
+    # Exercise the real second drain and the predicate used by final delivery.
+    drained, drained_text = await runner._run_agent_drain_pending(completed, adapter, src, key)
+    assert drained is queued
+    assert drained_text == text
+    assert silence_allowed(display_kind_for_event(drained), drained.reply_expected) is (not expected_reply_expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defer", ["depth-cap", "failed-delivery"])
+async def test_addressed_relay_leftover_handoff_keeps_explicit_reply_expected(hermes_home, defer):
+    await _assert_eventless_followup_reply_contract(
+        hermes_home, "steer", defer,
+        "[relay from=agent:source receipt=r1]\nplease answer me", True, True,
+    )
+
+
+@pytest.mark.parametrize("joiner", ["steer", "requeue"])
+@pytest.mark.parametrize(
+    ("texts", "expected_reply_expected"),
+    [
+        (("[relay from=agent:source receipt=r1]\nNO_REPLY", "please show me the current status"), True),
+        (("please show me the current status", "NO_REPLY\n[relay from=agent:source receipt=r2]"), True),
+        (("[relay from=agent:source receipt=r1]\nNO_REPLY", "NO_REPLY\n[relay from=agent:source receipt=r2]"), False),
+    ],
+    ids=("relay-human", "human-trailing-relay", "relay-relay"),
+)
+def test_joined_eventless_steers_require_a_reply_if_any_segment_is_human(
+    hermes_home, joiner, texts, expected_reply_expected
+):
+    from agent.agent_runtime_helpers import _requeue_pending_steer
+    from agent.interrupt_control import InterruptControlMixin
+    from gateway.run_turn import _eventless_followup_reply_expected
+
+    runner, _, _, src, _ = _runner_with_goal(hermes_home)
+    agent = InterruptControlMixin()
+    for text in texts:
+        wrapped = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
+        if joiner == "steer":
+            assert agent.steer(wrapped) is True
+        else:
+            _requeue_pending_steer(agent, wrapped)
+
+    reply_expected = _eventless_followup_reply_expected(agent._pending_steer)
+    assert reply_expected is expected_reply_expected
+    assert silence_allowed(None, reply_expected) is (not expected_reply_expected)
+
+
+@pytest.mark.parametrize("damage", ["header", "invalid-json", "nonobject-json", "footer"])
+@pytest.mark.parametrize("relay_header_position", ["leading", "trailing"])
+@pytest.mark.parametrize("position", ["single", "before-relay", "after-relay"])
+def test_eventless_followup_does_not_scan_arbitrary_origin_preambles(
+    hermes_home, damage, relay_header_position, position
+):
+    from gateway.run_turn import _eventless_followup_reply_expected
+
+    runner, _, _, src, _ = _runner_with_goal(hermes_home)
+    relay_header = "[relay from=agent:source receipt=r1]"
+    text = (f"{relay_header}\nNO_REPLY" if relay_header_position == "leading"
+            else f"NO_REPLY\n{relay_header}")
+    lines = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src)).split("\n")
+    line_index, replacement = {
+        "header": (0, "quoted example:"),
+        "invalid-json": (1, "not JSON"),
+        "nonobject-json": (1, "[]"),
+        "footer": (2, "a different instruction"),
+    }[damage]
+    lines[line_index] = replacement
+    damaged = "\n".join(lines)
+    if position != "single":
+        from agent.interrupt_control import InterruptControlMixin
+
+        valid = runner._steer_text_with_origin(text, MessageEvent(text=text, source=src))
+        agent = InterruptControlMixin()
+        for segment in ((damaged, valid) if position == "before-relay" else (valid, damaged)):
+            assert agent.steer(segment) is True
+        damaged = agent._pending_steer
+    assert _eventless_followup_reply_expected(damaged) is True
