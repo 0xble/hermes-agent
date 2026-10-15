@@ -123,15 +123,11 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
           and input_already_durable(
               runner.session_store, session_id, None, data.get("text"),
               data.get("_recovery_spool_ts"))):
-        if entry is not None and entry.resume_pending and entry.session_id == session_id:
-            # The interrupted turn persisted this input and its resume_pending marker is being
-            # auto-resumed this boot: that resume owns the turn. A note asking for a resend
-            # would let the user run its tool effects twice.
-            logger.info("Dropping legacy recovered follow-up for %s: its resuming turn owns it", key)
-            return DROP_PENDING
         # Legacy id-less spools have no identity stronger than their content. A matching row may
-        # be an unrelated later message, so preserve the bytes and make the uncertainty visible;
-        # never silently delete the only recovery copy.
+        # be an unrelated later message, and a resume_pending marker is not proof that a resume
+        # will run (it may be stale or not admitted). So always decline visibly: never run it,
+        # never delete the only recovery copy silently. The hedged note stays honest even when a
+        # resume does run.
         decline = "possibly-duplicate"
     adapter, source = ready
     if decline is not None:

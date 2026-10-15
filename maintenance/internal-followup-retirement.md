@@ -15,13 +15,13 @@ flush; it is persisted as the user row's dedupe value and never exposed as
 transport identity. Recovery uses that id to detect a durable turn-start row, so
 a crash between transcript persistence and spool unlink cannot replay the
 prompt. Only true legacy spools (no message id and no recovery id) fall back to
-exact content plus spool timestamp. On a match while the session's own
-`resume_pending` marker is being auto-resumed, that resume owns the turn and the
-spool is dropped without a note (a resend could repeat its tool effects).
-Otherwise the fallback never deletes: a match is declined as
-`possibly-duplicate` (one outcome, one visible note that it may already have
-been handled and to resend only if not, spool quarantined), and without a spool
-timestamp it never matches. When a recovered
+exact content plus spool timestamp. The fallback never runs and never deletes:
+a match is always declined as `possibly-duplicate` (one outcome, one visible
+note that it may already have been handled and to resend only if not, spool
+quarantined), even when the session has a `resume_pending` marker, because that
+marker may be stale or not admitted and a later identical row could also match.
+The hedged note stays honest when a resume does run. Without a spool timestamp
+it never matches. When a recovered
 event is merged into a busy adapter's pending slot, the background task records
 the event it actually consumes and restart recovery carries that task's terminal
 result back to the parked recovery event. The recovery outcome is then `resumed`
@@ -57,7 +57,7 @@ no adapter can carry the note, the spool is retained for a later boot.
 ## Verification
 
 Focused restart-recovery tests cover id-less durability, recovery-id stamping
-for every id-less spool, legacy duplicate-content decline and quarantine versus resume-owned drop,
+for every id-less spool, legacy duplicate-content decline and quarantine (also with a resume_pending marker),
 in-scope notice translation, spool
 retirement at turn start, the post-retirement turn-failed path, and pending-slot
 successor result propagation.

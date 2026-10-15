@@ -727,8 +727,9 @@ async def test_legacy_idless_duplicate_content_is_declined_not_deleted(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_legacy_idless_duplicate_with_resume_pending_is_owned_by_the_resume(tmp_path, monkeypatch, caplog):
-    """The interrupted turn persisted this input and its marker is resuming it: no resend note."""
+async def test_legacy_idless_duplicate_with_resume_pending_is_declined_not_dropped(tmp_path, monkeypatch, caplog):
+    """A resume_pending marker does not prove a resume will run (it may be stale or not admitted),
+    so a legacy content match still gets the hedged note and quarantine, never a silent drop."""
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
     runner.session_store.mark_resume_pending(entry.session_key, turn_id="interrupted-turn")
     flush_dir = tmp_path / "pending_messages"
@@ -748,11 +749,12 @@ async def test_legacy_idless_duplicate_with_resume_pending_is_owned_by_the_resum
         await runner._drain_startup_restore_queue()
         await asyncio.gather(*list(runner._background_tasks))
     assert runner._startup_restore_queue == []
-    assert adapter.sent == []
-    # The resume_pending auto-resume records the session's outcome; this spool adds none.
-    assert _outcome_lines(caplog) == []
+    assert len(adapter.sent) == 1
+    assert "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
     assert not spool.exists()
-    assert not spool.with_name(spool.name + ".bad").exists()
+    assert spool.with_name(spool.name + ".bad").exists()
 
 
 @pytest.mark.asyncio

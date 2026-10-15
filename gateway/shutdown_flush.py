@@ -55,10 +55,13 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
-    """Atomically write one private, uniquely named recovery payload; return its path."""
+def _write_payload(flush_dir: Path, payload: Dict[str, Any], file_id: Optional[str] = None) -> Path:
+    """Atomically write one private, uniquely named recovery payload; return its path.
+
+    ``file_id`` lets a caller that already drew the file's uuid reuse it (see ``_flush_value``).
+    """
     from utils import atomic_json_write
-    final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
+    final_path = flush_dir / f"pending-{file_id or uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
         # Persist the directory entry too; keep the published file (the only recovery copy) even if
@@ -85,10 +88,13 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
             return False
         # Any id-less follow-up needs a stable recovery-only dedupe key. This includes ordinary
         # MessageEvents flushed from a non-internal queue: leaving those on the legacy content
-        # fallback lets a later identical message destroy the only recovery copy.
+        # fallback lets a later identical message destroy the only recovery copy. The key reuses
+        # the spool file's own uuid (one uuid4 per payload, so file names keep their draw order),
+        # and is stamped on a copy: dict values are serialised by identity and belong to the caller.
+        file_id = uuid.uuid4().hex
         if not serialised.get("message_id") and not serialised.get("recovery_id"):
-            serialised["recovery_id"] = f"hermes-recovery-{uuid.uuid4().hex}"
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
+            serialised = {**serialised, "recovery_id": f"hermes-recovery-{file_id}"}
+        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised}, file_id)
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
