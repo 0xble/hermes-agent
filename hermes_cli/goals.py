@@ -25,6 +25,18 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.goal_evidence import (
+    JUDGE_EVIDENCE_BLOCK_TEMPLATE as JUDGE_EVIDENCE_BLOCK_TEMPLATE,
+    _READ_ONLY_STATUS_CALL_RE as _READ_ONLY_STATUS_CALL_RE,
+    _READ_ONLY_STATUS_TOOLS as _READ_ONLY_STATUS_TOOLS,
+    _read_only_status_call as _read_only_status_call,
+    _evidence_only_read_only_status,
+    _evidence_scan_truncated_for_turn,
+    _goal_progress_fingerprint,
+    _render_evidence_block,
+)
+from hermes_cli.goals_revisions import GoalRevisionsMixin
+from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
 
@@ -379,15 +391,6 @@ JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
     "on one of these):\n{background_lines}\n\n"
 )
 
-# Judge prompt block for the evidence ledger (empty when nothing was recorded, so prompts without
-# evidence stay byte-identical).
-JUDGE_EVIDENCE_BLOCK_TEMPLATE = (
-    "Tool results recorded by the runtime while this goal was active (oldest "
-    "first; authoritative, not written by the agent). Treat them as concrete "
-    "evidence: the response does not need to repeat them. Weigh their age, "
-    "since a later change can make an earlier result stale:\n{evidence_lines}\n\n"
-)
-
 # Judge prompt block for citations the runtime located verbatim in recorded tool results (empty when
 # the response cites nothing, so citation-free prompts stay byte-identical).
 JUDGE_CITED_EVIDENCE_BLOCK_TEMPLATE = (
@@ -420,6 +423,9 @@ JUDGE_REVISIONS_BLOCK_TEMPLATE = (
     "specific change; otherwise, including every revision with no user "
     "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
 )
+
+# Stands in for a successful turn that ended empty or tool-only, so the judge reads the ledger.
+JUDGE_EMPTY_RESPONSE_PLACEHOLDER = "(no final text; judge from recorded evidence)"
 
 JUDGE_LAST_VISIBLE_REPORT_BLOCK_TEMPLATE = (
     "Agent's last visible report from this goal's lifetime "
@@ -1605,62 +1611,6 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     return _EvidenceRows(selected, truncated=scan_truncated)
 
 
-def _goal_progress_fingerprint(evidence: Optional[List[Dict[str, Any]]]) -> Optional[str]:
-    """Return a stable identity for recorded tool progress, or ``None`` when there is no signal.
-
-    Tool-result timestamps and content are runtime-owned, unlike the agent's prose. Hashing the
-    bounded evidence ledger keeps the durable state small while distinguishing a new result from a
-    repeated no-op evaluation.
-    """
-    rows = []
-    for item in evidence or []:
-        if not isinstance(item, dict) or str(item.get("tool") or "").strip().lower() == "quality gate":
-            continue
-        rows.append({k: item.get(k) for k in ("tool", "call", "output")})
-    if not rows:
-        return None
-    payload = json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-_READ_ONLY_STATUS_CALL_RE = re.compile(
-    r"^(?![^\r\n]*[\r\n])(?!.*(?:>>|>|\||&&|\|\||;|`|\$\(|\n|\r|&|<\(|>\())"
-    r"(?!.*(?:\s-(?:exec|execdir|ok|fprint|fprint0|fprintf|fls|delete)(?:\s|$)|\s--delete(?:\s|$)))"
-    r"(?!.*(?:--ext-diff|--textconv)(?:=|\s|$))"
-    r"(?!.*(?:--output)(?:=|\s|$))(?!.*(?:--pre)(?:=|\s|$))"
-    r"(?:gh\s+(?:pr|run)\s+(?:view|checks|status|list)(?:\s+.*)?|"
-    r"git\s+(?:status|diff|log|show|rev-parse)(?:\s+.*)?|"
-    r"git\s+branch(?:\s+(?:--show-current|--list|-a|--all))?\s*\Z|"
-    r"(?:ls|pwd|rg|grep|cat|head|tail)(?:\s+.*)?|"
-    r"find(?:\s+.*)?)\Z",
-    re.I,
-)
-_READ_ONLY_STATUS_TOOLS = frozenset({
-    "browser_console", "browser_get_images", "browser_snapshot", "read_file", "search_files",
-    "web_extract", "web_search", "skill_view", "skills_list", "tool_search", "tool_describe",
-})
-
-
-def _read_only_status_call(call: Any) -> str:
-    """Extract a shell command from the collector's bounded JSON argument representation.
-
-    The collector stores shell arguments as bounded JSON. A bare, truncated, or redacted call is
-    deliberately not accepted: the classifier must fail closed rather than turn an allowed prefix
-    into an actionable-command bypass.
-    """
-    text = str(call or "").strip()
-    if not text.startswith("{"):
-        return ""
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    command = payload.get("command")
-    if not isinstance(command, str):
-        command = payload.get("cmd")
-    return command.strip() if isinstance(command, str) else ""
 
 
 
@@ -1677,61 +1627,6 @@ def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_a
         if previous_turn_at <= 0.0 or timestamp > previous_turn_at:
             rows.append(item)
     return rows
-
-
-def _evidence_scan_truncated_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> bool:
-    """Whether the bounded evidence scan may have omitted rows from this turn.
-
-    A long transcript alone is not enough: older rows can fill the scan while the current
-    turn remains fully visible. If every returned row is newer than the previous-turn boundary,
-    the current turn may itself exceed the scan bound, so classify it as actionable.
-    """
-    if not bool(getattr(evidence, "truncated", False)):
-        return False
-    rows = [item for item in (evidence or []) if isinstance(item, dict)]
-    if previous_turn_at <= 0.0:
-        return True
-    timestamps = []
-    for item in rows:
-        try:
-            timestamps.append(float(item.get("timestamp") or 0.0))
-        except (TypeError, ValueError):
-            continue
-    return bool(timestamps) and all(timestamp > previous_turn_at for timestamp in timestamps)
-
-
-def _evidence_only_read_only_status(evidence: Optional[List[Dict[str, Any]]]) -> bool:
-    """Whether current-turn evidence consists only of bounded status/read operations."""
-    rows = [item for item in (evidence or []) if isinstance(item, dict)]
-    if not rows:
-        return True
-    for item in rows:
-        tool = str(item.get("tool") or "").strip().lower()
-        if tool in _READ_ONLY_STATUS_TOOLS:
-            continue
-        call = _read_only_status_call(item.get("call"))
-        if tool in {"terminal", "shell"} and _READ_ONLY_STATUS_CALL_RE.fullmatch(call):
-            continue
-        return False
-    return True
-
-
-def _render_evidence_block(evidence: Optional[List[Dict[str, Any]]], now: Optional[float] = None) -> str:
-    """Judge prompt block for the evidence ledger; empty when there is none."""
-    lines: List[str] = []
-    now = time.time() if now is None else now
-    for item in evidence or []:
-        if not isinstance(item, dict):
-            continue
-        age = max(0, int(now - float(item.get("timestamp") or now)))
-        head = f"- {item.get('tool') or 'tool'} ({age}s ago)"
-        if item.get("call"):
-            head += f": {item['call']}"
-        output = str(item.get("output") or "").strip() or "(no output)"
-        lines.append(f"{head}\n  output: {output}")
-    if not lines:
-        return ""
-    return JUDGE_EVIDENCE_BLOCK_TEMPLATE.format(evidence_lines="\n".join(lines))
 
 
 def _judge_response_window(text: str) -> str:
@@ -2014,7 +1909,11 @@ def judge_goal(
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
-    if not last_response.strip():
+    # A successful empty or tool-only turn is still judged from recorded evidence; skip the judge
+    # only when there is nothing at all to evaluate (the evidence-free callers keep this path).
+    has_record = bool(evidence) or bool(last_visible_report.strip()) or bool(
+        citations and (citations.get("cited") or citations.get("unresolved")))
+    if not last_response.strip() and not has_record:
         return "continue", "empty response (nothing to evaluate)", False, None, False
     if timeout is None:
         timeout = _goal_judge_timeout()   # the declared default is the config key, not the constant
@@ -2033,7 +1932,8 @@ def judge_goal(
     # dropping later requirements makes the judge evaluate a different goal.
     common = dict(
         goal=goal,
-        response=_judge_response_window(last_response),
+        response=(_judge_response_window(last_response) if last_response.strip()
+                  else JUDGE_EMPTY_RESPONSE_PLACEHOLDER),
         last_visible_report_block=(JUDGE_LAST_VISIBLE_REPORT_BLOCK_TEMPLATE.format(
             report=_judge_response_window(last_visible_report)) if last_visible_report else ""),
         evidence_block=_render_evidence_block(evidence),
@@ -2546,7 +2446,7 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
-class GoalManager:
+class GoalManager(GoalRevisionsMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -2556,6 +2456,7 @@ class GoalManager:
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS,
                  min_continuation_gap_seconds: Optional[float] = None, cursor=None):
+        self._snapshot_lock = threading.RLock()
         self.session_id = session_id
         self.default_max_turns = normalize_goal_max_turns(default_max_turns)
         if min_continuation_gap_seconds is None:
@@ -2664,6 +2565,7 @@ class GoalManager:
         prior = max(float(prior or 0.0), float(getattr(stored, "created_at", 0.0) or 0.0))
         return max(time.time(), prior + 1e-6)
 
+    @snapshot_control
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
@@ -2675,6 +2577,7 @@ class GoalManager:
         )
         return self._save()
 
+    @snapshot_control
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
         if self._state is None:
@@ -2682,6 +2585,7 @@ class GoalManager:
         self._state.contract = contract or GoalContract()
         return self._save()
 
+    @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
@@ -2692,6 +2596,7 @@ class GoalManager:
         self._state.backoff_level = 0
         return self._save()
 
+    @snapshot_control
     def resume(self, *, reset_budget: bool = True, user_override: bool = True) -> Optional[GoalState]:
         """``user_override`` records an explicit resume over a judge block. Reviving on an ordinary
         user reply passes False: that reply may refuse the action, and the judge reads it directly."""
@@ -2722,6 +2627,7 @@ class GoalManager:
             self._state.turns_used = 0
         return self._save()
 
+    @snapshot_control
     def resume_for_user_input(self) -> bool:
         """Reactivate a goal the judge paused as BLOCKED because a real user message just
         arrived. BLOCKED means "the next step needs user input" (#100954), and that message
@@ -2739,6 +2645,7 @@ class GoalManager:
         self.resume(reset_budget=False, user_override=False)
         return True
 
+    @snapshot_control
     def clear(self) -> None:
         if self._state is None:
             return
@@ -2747,6 +2654,7 @@ class GoalManager:
         self._cleared_instance = self._state.created_at
         self._state = None
 
+    @snapshot_control
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
@@ -2756,151 +2664,12 @@ class GoalManager:
         self._state.last_reason = reason
         self._save()
 
-    # --- revisions ------------------------------------------------------
-
-    # Changes that need an identifiable user instruction: the objective itself, dropping criteria,
-    # and changing constraints. Other contract fields may be restructured by the agent; the judge
-    # still holds an unauthorized revision to any earlier requirement it weakened.
-    _AUTHORITY_FIELDS = ("goal", "constraints")
-
-    def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
-               contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-               user_quote: str = "", user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Record a versioned revision of the goal, contract fields and/or subgoal list.
-
-        ``contract`` updates only the named fields (``""`` clears one); ``subgoals`` replaces the list.
-        A change to the objective or constraints, or a dropped subgoal, needs ``user_quote``: a verbatim
-        excerpt (12+ chars) of a real user message in ``user_messages`` (defaults to this session's
-        user messages since the goal was set). Returns ``{"ok", "error_code", "error", "revision"}``."""
-        state = self._require_goal()
-        reason = (reason or "").strip()
-        if not reason:
-            return {"ok": False, "error_code": "reason_required", "error": "a revision needs a reason"}
-        before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
-        after = dict(before)
-        if goal is not None and goal.strip():
-            after["goal"] = goal.strip()
-        for key, value in (contract or {}).items():
-            if key not in _CONTRACT_FIELDS:
-                return {"ok": False, "error_code": "unknown_field", "error": f"unknown contract field: {key}"}
-            after[key] = str(value or "").strip()
-        if subgoals is not None:
-            after["subgoals"] = [str(s).strip() for s in subgoals if str(s).strip()]
-        changed = [k for k in after if after[k] != before[k]]
-        if not changed:
-            return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
-        dropped = [s for s in before["subgoals"] if s not in after["subgoals"]]
-        needs_authority = [k for k in self._AUTHORITY_FIELDS if k in changed] + (["subgoals"] if dropped else [])
-        quote = " ".join((user_quote or "").split())
-        if needs_authority and len(quote) < _REVISION_QUOTE_MIN_CHARS:
-            return {"ok": False, "error_code": "user_authority_required",
-                    "error": f"changing {', '.join(needs_authority)} needs user_quote: a verbatim excerpt "
-                             f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"}
-        source = ""
-        if quote:
-            # Deterministic part: the quote must come from a real user message. Whether that message
-            # authorizes this specific change is judged against the full message, shown with the revision.
-            if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-                return {"ok": False, "error_code": "user_quote_too_short",
-                        "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"}
-            pool = user_messages if user_messages is not None else user_messages_since(self.session_id, state.created_at)
-            sources = [" ".join(m.split()) for m in pool if quote in " ".join(m.split())]
-            if not sources:
-                return {"ok": False, "error_code": "user_quote_not_found",
-                        "error": "user_quote does not match any user message sent since the goal was set"}
-            source = next((m for m in sources if len(m) <= _REVISION_SOURCE_MAX_CHARS), "")
-            if not source:
-                return {"ok": False, "error_code": "user_message_too_long",
-                        "error": f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too "
-                                 "long to judge whether it authorizes this change; ask the user to state the "
-                                 "change in a short message and quote that"}
-        revision = {"at": time.time(), "actor": actor, "reason": reason, "user_quote": quote,
-                    "user_message": source,
-                    "before": {k: before[k] for k in changed}, "after": {k: after[k] for k in changed}}
-        state.goal = after["goal"]
-        state.contract = GoalContract.from_dict({k: after[k] for k in _CONTRACT_FIELDS})
-        state.subgoals = after["subgoals"]
-        state.revisions.append(revision)
-        # The bar moved: an earlier dispute streak was about the superseded wording.
-        state.consecutive_disputes = 0
-        state.last_dispute_evidence = ""
-        self._save()
-        return {"ok": True, "revision": revision, "version": len(state.revisions) + 1}
-
-    def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
-                contract: Optional[Any] = None, user_quote: str = "",
-                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Replace the goal with explicit quote authority and preserve revision history."""
-        old = self._state
-        if old is None or old.status not in {"active", "paused"}:
-            return {"ok": False, "error_code": "no_goal", "error": "there is no active or paused goal to replace", "state": old, "revision": None}
-        reason = (reason or "").strip()
-        goal = (goal or "").strip()
-        if not reason:
-            return {"ok": False, "error_code": "reason_required", "error": "a replacement needs a reason", "state": old, "revision": None}
-        if not goal:
-            return {"ok": False, "error_code": "no_change", "error": "replacement goal is empty", "state": old, "revision": None}
-        authority = None
-        try:
-            from hermes_cli.session_controls import _CURRENT_AUTHORITY
-            authority = _CURRENT_AUTHORITY.get()
-        except Exception:
-            authority = None
-        quote = " ".join((user_quote or "").split())
-        source = ""
-        if not (authority and authority.get("via") in {"quote", "button"}):
-            if not quote:
-                return {"ok": False, "error_code": "user_authority_required", "error": "goal replacement needs user_quote", "state": old, "revision": None}
-            try:
-                from hermes_cli.session_controls import (
-                    _governing_sentence, check_user_quote, quote_matches_control)
-                checked = check_user_quote(self.session_id, quote)
-                if isinstance(checked, str):
-                    return {"ok": False, "error_code": checked, "error": checked, "state": old, "revision": None}
-                if not quote_matches_control("goal", "replace", self.session_id, self.session_id,
-                                             _governing_sentence(*checked), {"goal": goal}):
-                    return {"ok": False, "error_code": "user_quote_mismatch",
-                            "error": "the quote must be the user asking to replace or change the goal",
-                            "state": old, "revision": None}
-                quote, source = checked
-                # A quote validated here is the same user authority apply_control records.
-                authority = {"via": "quote", "quote": quote, "message": source}
-            except ValueError as exc:
-                code = str(exc)
-                return {"ok": False, "error_code": code, "error": code, "state": old, "revision": None}
-        elif authority.get("via") == "button":
-            # Button approval is the user's authority: record who approved what so the judge and
-            # continuation treat the old goal as superseded rather than as an agent-only change.
-            quote = ""
-            source = f'Approved in Telegram: replace goal with "{goal}"'
-        else:
-            source = str(authority.get("message") or "")
-        if user_messages is not None and source == "" and user_messages:
-            source = " ".join(str(user_messages[-1]).split())
-        old_contract = old.contract.to_dict()
-        new_contract = contract.to_dict() if hasattr(contract, "to_dict") else dict(contract or {})
-        new_contract = {k: str(new_contract.get(k) or "").strip() for k in _CONTRACT_FIELDS}
-        before = {"goal": old.goal, "max_turns": old.max_turns, "contract": old_contract,
-                  "status": old.status, "subgoals": list(old.subgoals)}
-        after = {"goal": goal, "max_turns": old.max_turns if max_turns is None else normalize_goal_max_turns(max_turns, self.default_max_turns),
-                 "contract": new_contract, "status": "active", "subgoals": []}
-        revision = {"kind": "replace", "before": before, "after": after, "user_quote": quote,
-                    "user_message": source, "reason": reason, "at": time.time(), "actor": "agent"}
-        if authority and authority.get("via") in {"quote", "button"}:
-            revision["actor"] = "user"
-            revision["authority"] = authority["via"]
-            if authority["via"] == "button":
-                revision["approved_by"] = str(authority.get("user_id") or "")
-        revisions = list(old.revisions) + [revision]
-        self._state = GoalState(goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(),
-                                max_turns=after["max_turns"], contract=GoalContract.from_dict(new_contract),
-                                revisions=revisions)
-        self._save()
-        return {"ok": True, "error_code": "", "error": "", "state": self._state,
-                "revision": revision}
+    # Versioned revise/replace are provided by GoalRevisionsMixin; its CAS wrapper is the
+    # sole public mutation boundary.
 
     # --- /subgoal user controls ---------------------------------------
 
+    @snapshot_control
     def add_subgoal(self, text: str) -> str:
         """Append a user-added criterion; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -2927,10 +2696,12 @@ class GoalManager:
         self._save()
         return prev
 
+    @snapshot_control
     def remove_subgoal(self, index_1based: int) -> str:
         """Remove a subgoal by 1-based index. Returns the removed text."""
         return self._pop_item("subgoals", index_1based)
 
+    @snapshot_control
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
         return self._clear_items("subgoals")
@@ -2943,6 +2714,7 @@ class GoalManager:
 
     # --- /goal gate quality gates ---------------------------------------
 
+    @snapshot_control
     def add_gate(self, command: str, *, timeout_seconds: Optional[int] = None, max_retries: Optional[int] = None) -> GoalGate:
         """Append a quality-gate command; raises ``RuntimeError`` without ``has_goal()``."""
         state = self._require_goal()
@@ -2958,10 +2730,12 @@ class GoalManager:
         self._save()
         return gate
 
+    @snapshot_control
     def remove_gate(self, index_1based: int) -> str:
         """Remove a gate by 1-based index. Returns the removed command."""
         return self._pop_item("gates", index_1based).command
 
+    @snapshot_control
     def clear_gates(self) -> int:
         """Remove all gates. Returns the previous count."""
         return self._clear_items("gates")
@@ -3054,6 +2828,7 @@ class GoalManager:
         # differ even though the durable behavior is identical.
         return self._save()
 
+    @snapshot_control
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
         """Park the goal loop until a background PID exits (no turn burned, no judge call). For a
         process with a watch/notify trigger prefer ``wait_on_session``. Requires an active goal."""
@@ -3065,6 +2840,7 @@ class GoalManager:
             raise ValueError("pid is not alive on this host")
         return self._park(reason, waiting_on_pid=pid)
 
+    @snapshot_control
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
         """Park on a process_registry session's OWN trigger: exit OR ``watch_patterns`` match. The
         right barrier for a long-lived watcher/poller that signals mid-run and may never exit."""
@@ -3074,6 +2850,7 @@ class GoalManager:
             raise ValueError("session_id must be a non-empty string")
         return self._park(reason, waiting_on_session=session_id)
 
+    @snapshot_control
     def wait_for_seconds(self, seconds: int, reason: str = "", *, on_delegations: int = 0) -> GoalState:
         """Park until ``seconds`` from now (backoff/cooldown waits with no process to track). With
         ``on_delegations`` the wait is FOR those live delegation batches: it also lifts as soon as
@@ -3089,6 +2866,7 @@ class GoalManager:
             waiting_on_delegations=max(0, int(on_delegations)), waiting_seconds=seconds,
         )
 
+    @snapshot_control
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
         s = self._state
@@ -3098,6 +2876,7 @@ class GoalManager:
         self._save()
         return True
 
+    @snapshot_control
     def clear_lifted_wait(self, waiting_since: float) -> bool:
         """Clear the barrier an idle surface just resumed, only if it is still that same wait
         (matched by ``waiting_since`` on the durable row). The resumed turn may already have finished
@@ -3144,6 +2923,7 @@ class GoalManager:
             return False
         return still
 
+    @snapshot_control
     def rearm_live_barrier(self) -> Optional[str]:
         """Refresh a due live barrier with a CAS write and return a new user notice, if any.
 

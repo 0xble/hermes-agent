@@ -2114,21 +2114,19 @@ class GatewayTurnMixin:
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
-        raw_response=None,
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        # Evaluation needs the model's raw output, including explicit emptiness and control
+        # markers, not a normalized display notice. The non-streamed return value is display
+        # text; post-turn hooks prefer the model copy (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            from hermes_cli.goal_turn_outcome import model_final_response
+            event._agent_final_response = model_final_response(agent_result)
         from gateway.cron_review import private_turn_response
         private, captured_response = private_turn_response(event, agent_result)
         if private:
             return captured_response
-        raw_response = response if raw_response is None else raw_response
-        # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
-        # raw response available to post-turn hooks and strip only at this final display boundary.
-        # The non-streamed return value is the stripped display text, so the hooks read the raw
-        # copy stashed here instead (see _final_text_for_post_turn_hooks).
-        with suppress(Exception):
-            event._raw_final_response = str(raw_response or "")
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -2225,7 +2223,7 @@ class GatewayTurnMixin:
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(raw_response or "")
+                event._streamed_final_response = str(agent_result.get("final_response") or "")
             return None
 
         if agent_result.get("interrupted") and response:
@@ -2588,7 +2586,6 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
-            raw_response_for_delivery = response
             from gateway.response_filters import strip_trailing_loop_complete_marker
             response = strip_trailing_loop_complete_marker(response)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
@@ -2615,7 +2612,6 @@ class GatewayTurnMixin:
             delivered_response = await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
-                raw_response=raw_response_for_delivery,
             )
             from gateway.run import _should_clear_resume_pending_after_turn
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
@@ -4841,6 +4837,7 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if isinstance(response, dict) and "delivery_text" in response: response = {**response, "final_response": response["delivery_text"]}
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

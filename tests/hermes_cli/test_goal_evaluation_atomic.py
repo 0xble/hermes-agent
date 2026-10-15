@@ -104,3 +104,46 @@ def test_evaluation_failures_preserve_goal_state(tmp_path, monkeypatch, failure)
         assert read_meta("goal:session") == before
     finally:
         db.close()
+
+
+def test_superseded_snapshot_adopts_durable_winner(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    try:
+        manager = goals.GoalManager("snapshot-winner")
+        staged = deepcopy(manager.set("original task"))
+        winner = goals.GoalManager(manager.session_id).set("replacement task")
+
+        def read():
+            # Reentrant publication changes the memory identity while the durable
+            # snapshot is being read. The durable replacement must still be adopted.
+            manager._state = deepcopy(staged)
+            return goals.load_goal(manager.session_id)
+
+        assert commit_and_publish_snapshot(manager, staged, lambda: None, read) is False
+        assert manager.state is not None
+        assert manager.state.to_json() == winner.to_json()
+    finally:
+        db.close()
+
+
+def test_superseded_goal_evaluation_suppresses_stale_preserved_notice(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from hermes_cli import goals
+    from hermes_cli import goals_evaluation
+
+    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    manager = goals.GoalManager("superseded-notice")
+    manager.set("finish the task")
+    monkeypatch.setattr(goals, "judge_goal", lambda *args, **kwargs: ("done", "finished", False, None, False))
+    monkeypatch.setattr(goals_evaluation, "commit_and_publish_snapshot", lambda *args, **kwargs: False)
+    try:
+        decision = goals_evaluation.evaluate_goal_snapshot(manager, "answer")
+        assert decision["message"] == ""
+    finally:
+        db.close()

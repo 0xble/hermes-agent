@@ -91,6 +91,9 @@ class TestHealthyTurnStillRuns:
             {"role": "assistant", "content": "did some work, more to do"},
         ]
 
+        cli._last_turn_started = True
+        cli._last_turn_result = {"completed": True, "final_response": "did some work, more to do"}
+
         # Force the judge to say "continue" without touching the network.
         with patch(
             "hermes_cli.goals.judge_goal",
@@ -111,6 +114,8 @@ class TestHealthyTurnStillRuns:
         cli.conversation_history = [
             {"role": "assistant", "content": "all finished, here's the result"},
         ]
+        cli._last_turn_started = True
+        cli._last_turn_result = {"completed": True, "final_response": "all finished, here's the result"}
 
         with patch(
             "hermes_cli.goals.judge_goal",

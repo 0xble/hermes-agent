@@ -8,9 +8,44 @@ Keep `/loop` agent-editable without allowing an agent to silently make a loop mo
 
 The CLI's cached manager must refresh before due checks and post-turn completion so a `loop_set` revision made during a wakeup cannot be overwritten by stale completion state. A failed refresh read keeps the cached state rather than dropping an in-flight tick. Gateway and TUI paths construct fresh managers and must retain that cross-surface behavior. Receipts for `goal_set` and `loop_set` use their configured `auto_notices` gates and distinct notice keys, while requiring successful persistence readback.
 
+Revisions, replacements, and tick settlement stage changes against a durable snapshot and
+commit only after a transactional compare-and-swap. Every persisted write carries a
+mutation token, including same-value lifecycle changes. A stale revision returns
+`state_changed` and refreshes its manager; it cannot overwrite a newer definition or
+lifecycle control. A judge verdict for an obsolete snapshot is discarded without a
+completion/blocker notice. If a newer revision retained the same in-flight tick,
+release only that claim and schedule from the winning cadence with a second CAS;
+never release a replacement/new tick or alter paused/cleared state. Existing quote,
+cadence, run-count, and prompt authority policy is unchanged.
+
+The initial comparison uses the manager's complete canonical state, not only its
+mutation token, so unequal legacy rows with empty tokens still conflict. No-op
+returns validate inside the same SessionDB write transaction. Each new tick also
+carries a claim ID that revisions retain, so abandon/re-fire cannot impersonate
+the old claim even when its timestamps and counters match. Already-running legacy
+ticks use their creation/fire/count identity until the next claim. Operational
+read/write failures log the cause and return `persistence_failed`, preserving
+staged edits only in the discarded copy. Only a manager with an empty session ID
+uses intentional ephemeral operation.
+
+Conflict cleanup compares against the isolated initial snapshot, never the live
+manager reference. Commands on that same manager during judging may pause,
+resume, abandon, or fire another tick. They cannot mutate the cleanup identity
+and cause the old response to release a newer claim.
+
+Successful empty turns, failed display notices, and interrupted turns remain
+separate admission outcomes. The goal admission decision does not prevent loop
+claim cleanup. Failed/incomplete output is not judged as loop completion evidence,
+and the CLI's existing Ctrl+C pause remains authoritative. Gateway evaluation
+uses the agent's raw final output, including explicit emptiness, before display
+normalization can manufacture retry/cleanup notices. Silent replies still
+skip the loop judge. This repair changes neither self-paced backoff nor the user's
+cadence/quote-authority policy. The moved revision bodies are unchanged except
+for late imports and their CAS wrappers.
+
 ## Proof surface
 
-Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
+Focused tests cover LoopState compatibility and versioning, authority branches, cadence re-anchoring, preservation of ticks/route/created_at, replacement, status and wakeup text, receipt registry behavior, and stale-manager survival through CLI/TUI completion paths. `tests/hermes_cli/test_loop_settlement.py` covers continue/done/blocked races, stale revisions, legacy entry checks, no-op and commit-edge conflicts, pause/resume ABA, claim cleanup races, persistence failures, and ephemeral operation with the real SessionDB. Run the affected tests through `scripts/run_tests.sh`; run the repository's canonical gate before publication.
 
 ## Upstream disposition and retirement
 
