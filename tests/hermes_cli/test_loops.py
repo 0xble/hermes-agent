@@ -549,6 +549,27 @@ class TestTickLifecycle:
         assert after.awaiting_response is True and after.ticks_fired == 1
         assert after.prompt == "poll the revised target" and after.version == 2
 
+    def test_prompt_revision_resets_self_paced_delay(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        mgr = LoopManager(session_id="t-revise-backoff")
+        state = mgr.set("watch A")
+        state.current_delay = 4 * 60 * 60
+        state.backoff_level = 2
+        state.last_response_digest = "old"
+        state.next_due_at = time.time() + 4 * 60 * 60
+        mgr._save()
+        quote = "Please switch the loop to watching B"
+        result = LoopManager(session_id="t-revise-backoff").revise(
+            reason="new target", prompt="watch B", user_quote="switch the loop to watching B",
+            user_messages=[quote])
+        assert result["ok"] is True, result
+        revised = load_loop("t-revise-backoff")
+        assert revised.current_delay == 60
+        assert revised.backoff_level == 0
+        assert revised.last_response_digest == ""
+        assert revised.next_due_at <= time.time() + 60 + 1
+
     def test_revise_after_fire_does_not_inherit_the_old_stop_verdict(self, hermes_home):
         """LOOP_COMPLETE answering prompt A cannot finish the loop after it was revised to B."""
         from hermes_cli.loops import LoopManager, load_loop
@@ -921,6 +942,22 @@ class TestSelfPacedBackoff:
         assert fresh.state is not None and fresh.state.backoff_level == 0
         assert fresh.fire_tick() is not None
         assert fresh.fire_tick() is None
+
+    def test_external_event_resets_blocked_until_ladder_for_interval_loops(self, hermes_home):
+        from hermes_cli.loops import LoopManager, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-interval-wake")
+        state = mgr.set("watch the queue", interval_seconds=300, until="queue is empty")
+        state.next_due_at = time.time() + 60 * 60
+        state.backoff_level = 3
+        state.last_response_digest = "old"
+        mgr._save()
+        assert wake_loop_for_external_event("external-interval-wake") is True
+        fresh = LoopManager(session_id="external-interval-wake")
+        assert fresh.state is not None
+        assert fresh.state.backoff_level == 0
+        assert fresh.state.last_response_digest == ""
+        assert fresh.state.current_delay == 300
 
     def test_backoff_treats_consecutive_silent_wakeups_as_unchanged(self, hermes_home):
         from hermes_cli.loops import LoopManager

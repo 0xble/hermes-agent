@@ -162,7 +162,7 @@ class LoopRevisionsMixin:
         )
         new_effective_delay = (
             after["interval_seconds"] if after["mode"] == "interval"
-            else (after["current_delay"] or float(self_paced_floor_seconds()))
+            else float(self_paced_floor_seconds())
         )
         # Switching to self-paced starts at the floor, so it is faster whenever the floor is below the
         # current delay; it gets the same authority check as any other cadence change.
@@ -206,12 +206,17 @@ class LoopRevisionsMixin:
             setattr(state, key, after[key])
         state.backoff_level = 0
         state.last_response_digest = ""
-        if any(key in changed for key in ("mode", "interval_seconds", "current_delay")):
-            if not state.awaiting_response:
-                state.next_due_at = max(
-                    now,
-                    (state.last_fired_at or now) + new_effective_delay,
-                )
+        state.current_delay = (
+            float(self_paced_floor_seconds()) if state.mode == "self_paced" else state.interval_seconds
+        )
+        reset_schedule = state.mode == "self_paced" or any(
+            key in changed for key in ("mode", "interval_seconds", "current_delay")
+        )
+        if reset_schedule and not state.awaiting_response:
+            state.next_due_at = max(
+                now,
+                (state.last_fired_at or now) + new_effective_delay,
+            )
         state.revisions.append(revision)
         self._save()
         return self._revision_result(
