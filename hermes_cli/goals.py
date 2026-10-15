@@ -204,7 +204,7 @@ def goal_authoring_findings(
     # revision: checking only changed fields lets a goal change turn an existing
     # read-only limit into a contradictory mutation without a finding.
     readonly = " ".join(values[name] for name in ("constraints", "boundaries"))
-    mutation = " ".join(values[name] for name in ("goal", "outcome", "verification"))
+    mutation = " ".join(values[name] for name in ("goal", "outcome"))
     if readonly and mutation and _GOAL_AUTHORING_READONLY_RE.search(readonly) and _GOAL_AUTHORING_MUTATION_RE.search(mutation):
         findings.append(GoalAuthoringFinding(
             "readonly_mutation", "constraints/boundaries",
@@ -217,7 +217,7 @@ def goal_authoring_findings(
             "numbered_steps", "goal", "contains a numbered step list",
             "state the outcome and move the steps to the plan file",
         ))
-    for field_name in ("goal", "verification"):
+    for field_name in ("goal", "outcome", "verification"):
         value = values[field_name] if field_name in checked else ""
         if not value:
             continue
@@ -227,7 +227,8 @@ def goal_authoring_findings(
             measurement = (
                 wait_match.group(0).lower().endswith("days")
                 and (("from" in context and "full" in context)
-                     or re.search(r"\b(?:last|past|previous|prior|trailing)\b", context))
+                     or re.search(r"\b(?:last|past|previous|prior|trailing)\b", context)
+                        and not re.search(r"\bwait\b", context))
             )
             if not measurement:
                 findings.append(GoalAuthoringFinding(

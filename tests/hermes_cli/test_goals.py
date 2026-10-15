@@ -192,6 +192,27 @@ class TestGoalManager:
             changed_fields={"goal"},
         )
         assert [finding.code for finding in findings] == ["readonly_mutation"]
+        assert goal_authoring_findings(
+            "Keep the service healthy",
+            {"constraints": "Read-only; no changes", "verification": "Verify no deploys occurred"},
+        ) == []
+
+    def test_goal_authoring_checks_waits_in_outcome_and_not_measurement_windows(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(
+            "Keep the service healthy", {"outcome": "Wait for 24 hours before declaring success"}
+        )
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"verification": "The service remains healthy and the report covers the last 7 days."}
+        ) == []
+
+    def test_goal_authoring_rejects_explicit_wait_over_a_measurement_window(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings("Wait for the last 7 days before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
 
     def test_goal_authoring_rejects_fixed_wait_in_goal(self):
         from hermes_cli.goals import goal_authoring_findings
