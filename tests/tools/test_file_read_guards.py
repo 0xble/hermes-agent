@@ -442,6 +442,37 @@ class TestFileDedup(unittest.TestCase):
         fake.write_file.assert_called_once_with(os.path.realpath(path), "line one\nline two\n")
 
     @patch("tools.file_tools._get_file_ops")
+    def test_session_kernel_sandbox_read_bypasses_dedup(self, mock_ops):
+        """Local session kernels run tools in the cell-start context copy, which lacks a
+        flag set later by the RPC handler; the bypass must still reach read_file_tool."""
+        from tools.code_execution_rpc import _handle_rpc_request
+        from tools.code_kernel import CellAuthority
+
+        mock_ops.return_value = _make_fake_ops(content="line one\nline two\n", file_size=20)
+        path = self._tmpfile
+        authority = CellAuthority("dup")  # snapshot taken before the RPC sets the flag
+
+        parent = json.loads(read_file_tool(path, task_id="dup"))
+        assert parent["content"] == "line one\nline two\n"
+
+        def run_nested():
+            return json.loads(_handle_rpc_request(
+                {"tool": "read_file", "args": {"path": path}},
+                allowed_tools=frozenset({"read_file"}), tool_call_counter=[0], max_tool_calls=2,
+                dispatch=authority.dispatch, tool_call_log=[], call_start=time.monotonic(),
+                where="test",
+            ))
+
+        with patch("model_tools.handle_function_call",
+                   side_effect=lambda name, args, task_id, tool_call_id: read_file_tool(
+                       args["path"], task_id=task_id)):
+            first, second = run_nested(), run_nested()
+        self.assertEqual(first.get("content"), parent["content"])
+        self.assertEqual(second.get("content"), parent["content"])
+        # The parent's ordinary reads keep their deduplication.
+        self.assertTrue(json.loads(read_file_tool(path, task_id="dup")).get("dedup"))
+
+    @patch("tools.file_tools._get_file_ops")
     def test_write_rejects_internal_read_status_text(self, mock_ops):
         """write_file must not persist internal read_file status text."""
         fake = MagicMock(env=None)

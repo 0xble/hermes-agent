@@ -59,6 +59,11 @@ def sandbox_read_context():
         _SANDBOX_READ_CONTEXT.reset(token)
 
 
+def sandbox_read_active() -> bool:
+    """Whether the current call is a sandbox read that must bypass deduplication."""
+    return _SANDBOX_READ_CONTEXT.get()
+
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 # Read-size guard. Model-agnostic, so characters proxy tokens: 100K chars is
