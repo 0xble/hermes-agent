@@ -257,7 +257,7 @@ def test_unresolvable_explicit_git_dir_is_unknown_not_unrelated(scope, tmp_path)
 def test_replaced_or_touched_pack_is_not_deleted_after_holder_proof(scope, monkeypatch):
     _, ours, _ = scope
     pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
-    def replaced(repo, path, fallback):
+    def replaced(repo, path, fallback, **kwargs):
         path.rename(path.with_name("held-after-rename"))
         path.write_bytes(b"new live transfer")
         return False
