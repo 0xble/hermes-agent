@@ -847,9 +847,8 @@ class GatewayAdapterLifecycleMixin:
             return  # not time yet
         platform_config = info["config"]
         attempt = info["attempts"] + 1
-        # Empty-token primary configs can never reconnect; drop them so multiplex setups
-        # where a secondary profile owns the bot do not spin forever.
-        # See #64674.
+        # Empty-token primary configs can never reconnect; drop them so multiplex setups where a
+        # secondary profile owns the bot do not spin forever (#64674).
         if not _platform_has_bot_credential(platform, platform_config):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
@@ -1156,9 +1155,8 @@ class GatewayAdapterLifecycleMixin:
         # would park a transiently-failed profile before the first watcher tick can retry it.
         for profile_name in transient_failed:
             self._served_profile_signatures.pop(profile_name, None)
-        # Cached configs follow the served set: a profile that failed to start (or stopped being
-        # served) keeps no home channel in the host-wide notice fan-out, where it would be owed a
-        # notice no transport can deliver and ``.restart_pending.json`` would never be unlinked.
+        # Cached configs follow the served set: a failed/unserved profile keeps no home channel in the
+        # host-wide notice fan-out (it would be owed an undeliverable notice; .restart_pending.json stays).
         configs = getattr(self, "_profile_configs", None)
         if configs is not None:
             for profile_name in [p for p in configs if p not in self._served_profile_signatures]:
