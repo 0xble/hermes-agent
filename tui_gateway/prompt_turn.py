@@ -56,19 +56,26 @@ def _hook_failure(what: str, exc: BaseException) -> None:
 
 
 def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
-    """Whether a turn produced a real response the goal judge can use.
+    """Admit successful boundaries, including empty/tool-only completed turns.
 
-    A non-failed ``max_iterations_reached(...)`` handoff is a resumable turn boundary, not a
-    failure: its summary must reach the judge so an active goal continues (#102213). Failed,
-    interrupted and other ``completed is False`` turns still stay out (cf. #63180)."""
-    from agent.turn_failure_copy import is_max_iteration_handoff
-    if status != "complete" or not isinstance(raw, str) or not raw.strip():
+    A non-failed ``max_iterations_reached(...)`` handoff with a summary remains
+    resumable, so an active goal can judge it (#102213). Failed, interrupted and
+    other incomplete turns stay out (cf. #63180).
+    """
+    from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+    # A max-iteration handoff is judged from the returned summary. A blank delivery
+    # boundary is not a successful goal turn even when the result retains an older
+    # fallback summary for display.
+    if (
+        isinstance(result, dict)
+        and result.get("completed") is False
+        and str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached")
+        and isinstance(raw, str)
+        and not raw.strip()
+    ):
         return False
-    if not isinstance(result, dict):
-        return True
-    if result.get("failed") or result.get("interrupted"):
-        return False
-    return result.get("completed") is not False or is_max_iteration_handoff(result)
+    return (status == "complete" and isinstance(raw, str)
+            and is_successful_goal_turn(result, raw))
 
 
 def _active_goal_manager(session: dict):
@@ -370,6 +377,8 @@ def _goal_followup_after_turn(
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
+    from hermes_cli.goal_turn_outcome import model_final_response
+    raw = model_final_response(result, raw)
     goal_followup = None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
     try:
@@ -410,8 +419,8 @@ def _goal_followup_after_turn(
     return goal_followup
 
 
-def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
-    """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
+def _settle_loop_after_turn(sid: str, session: dict, raw: Any) -> None:
+    """Release the in-flight loop claim even when the model turn was unsuccessful."""
     try:
         from hermes_cli.loops import LoopManager
         loop_sid_key = session.get("session_key") or ""
@@ -423,7 +432,15 @@ def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> Non
                 if loop_msg := loop_decision.get("message") or "":
                     _emit("status.update", sid, {"kind": "loop", "text": loop_msg})
     except Exception as _loop_exc:
-        _hook_failure("loop completion hook", _loop_exc)
+        logger.warning("loop completion hook failed: %s", _loop_exc, exc_info=True)
+
+
+def _after_complete_turn(sid: str, session: dict, st: _TurnRun, raw: Any) -> None:
+    """Hooks for a ``complete`` turn: /loop tick evaluation, pending title, voice fallback."""
+    from hermes_cli.goal_turn_outcome import model_final_response
+    model_text = model_final_response(getattr(st, "result", None), raw)
+    successful = _is_successful_goal_turn(getattr(st, "result", None), "complete", model_text)
+    _settle_loop_after_turn(sid, session, model_text if successful else "")
     # Apply pending_title now that the DB row exists — in the session-owned profile store.
     if _pending := session.get("pending_title"):
         _session_key = session.get("session_key") or sid
@@ -1067,10 +1084,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
     delivered = raw
     if _silence_hidden_turn(session, st.prompt_text):
         delivered = _bot_mode_delivery_text(raw, successful=status == "complete")
-    if _is_bot_mode_session(session):
-        raw = delivered
-    # A wakeup keeps its raw marker for the post-turn /loop hook (self-paced backoff, judge skip);
-    # only the rendered text is emptied.
+    # Every surface keeps model text for bookkeeping; only delivery hides markers.
     from gateway.copy_blocks import render_copy_blocks_inline
     from gateway.response_filters import strip_trailing_loop_complete_marker
     # The TUI shows one message per turn, so copy blocks render inline without markers.
@@ -1130,7 +1144,7 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
         st.receipt_attempted = True
         st.terminal_callback({
             "status": {"interrupted": "cancelled", "error": "failed"}.get(status, "settled"),
-            "text": raw if isinstance(raw, str) else str(raw),
+            "text": visible_raw if isinstance(visible_raw, str) else str(visible_raw),
             **({"error": str(error_value or raw)} if status == "error" else {})})
         st.receipt_committed = True
     if st.receipt_committed:
@@ -1335,10 +1349,13 @@ def _run_prompt_submit(
                 sid, session, st.result, status, raw, user_initiated=user_turn)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
+            else:
+                _settle_loop_after_turn(sid, session, "")
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the
             # structured control snapshot now so the Desktop card never paints the pre-judge turn count.
             _publish_session_control_snapshot(sid, session, only_if_present=True)
         except Exception as e:
+            _settle_loop_after_turn(sid, session, "")
             _recover_turn_exception(sid, session, st, e)
         finally:
             _release_turn_scopes(sid, session, st)

@@ -101,6 +101,8 @@ class StallMidStream:
     text: str = "partial answer that stalls"
     after_chars: int = 8
     seconds: float = 3600.0
+    prefix_chars: int = 0
+    prefix_delay: float = 0.0
 
 
 @dataclass
@@ -302,7 +304,10 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
             if isinstance(resp, StallMidStream):
                 self._start_sse()
                 self._sse(_chunk({"role": "assistant", "content": ""}))
-                self._sse(_chunk({"content": resp.text[: resp.after_chars]}))
+                if resp.prefix_chars:
+                    self._sse(_chunk({"content": resp.text[: resp.prefix_chars]}))
+                    server._stop.wait(resp.prefix_delay)
+                self._sse(_chunk({"content": resp.text[resp.prefix_chars: resp.after_chars]}))
                 server._stop.wait(resp.seconds)
                 self.close_connection = True
                 return

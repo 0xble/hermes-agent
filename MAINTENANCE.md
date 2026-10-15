@@ -84,6 +84,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Copilot ACP usage-less compaction | ACP responses report unknown usage, never fabricated zeros, so estimate-driven compaction still fires | Copilot ACP client response or usage accounting changes | [Copilot ACP usage](maintenance/copilot-acp-usage.md) |
 | Nightly concurrency and compaction regressions | Preserve early process output, tolerate concurrent DB quarantine, and exercise actual ACP summarization | Process heartbeat, state DB preflight/quarantine, or ACP compaction E2E changes | [Nightly regression repairs](maintenance/nightly-regression-0926b.md) |
 | Foreground command exit cleanup | Fence graceful exit against spawning foreground commands so no child outlives its host | Foreground spawn publication, terminal environment process-exit cleanup, or live foreground killing changes | [Foreground exit cleanup](maintenance/foreground-exit-cleanup.md) |
+| Agent wait ergonomics | Bound default process waits and keep unchanged delegation lists from consuming turns | Process wait defaults, timeout guidance, or delegation list observations; load async delegation capacity for queued-state changes | [Agent wait ergonomics](maintenance/agent-wait-ergonomics.md) |
 | Terminal heavy-slot | Heavy terminal launchers share machine-wide slots; test, workspace, and PM workers default to four per job | Terminal execution/classification or test, workspace-check, PM build/install/bytecode parallelism changes | [Terminal heavy-slot](maintenance/terminal-heavy-slot.md) |
 | Snapshot keeps shell functions | Functions and aliases survive every command of a terminal session, not just the first | Terminal session snapshot bootstrap or per-command re-dump changes | [Snapshot functions](maintenance/snapshot-keep-functions.md) |
 | Explicit topic title receipts | Report the stored alias and actual Bot API rename result | `/title` Telegram topic changes and upstream title sync | [Explicit title receipts](maintenance/telegram-title-receipts.md) |
@@ -98,6 +99,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Telegram first-poll health | Each new polling generation proves health from a non-blocking first getUpdates; steady-state polls keep the long poll | The instrumented getUpdates request, polling-generation fencing, `start_polling` arguments, or a PTB upgrade | [Telegram first-poll health](maintenance/telegram-first-poll-health.md) |
 | Stdio wrapper chain | Agent builds and thread-scoped silencing never stack or loop `sys.stdout`/`sys.stderr` wrappers, and wrapper attribute lookup cannot recurse | `_SafeWriter`, `_install_safe_stdio`, `thread_scoped_output`, or other process-lifetime stdio rebinding | [Stdio wrapper chain](maintenance/stdio-wrapper-chain.md) |
 | Telegram delivery | Preserve flood coherence, split-send recovery, and legacy emphasis | Telegram send/edit/typing, delivery ledger, or emphasis changes | [Telegram delivery](maintenance/telegram-delivery.md) |
+| Stream preview crash ownership | Resume into the exact prior editable platform message, never a reset or successor preview | Stream send/edit journaling or crash auto-resume ownership changes | [Stream preview crash ownership](maintenance/stream-crash-visible-persist.md) |
+| Telegram typing refresh | Keep Telegram's 4.5s refresh deadline-based and defer one coalesced trailing re-arm without extending it past final delivery | Telegram typing cadence, post-send re-arm, or typing-refresh regressions | [Telegram typing refresh](maintenance/telegram-typing-refresh.md) |
 | Telegram stale final delivery | Recover completed replies from deleted private DM topics without duplicating partially sent content or moving interim output | Telegram private-topic final sends and recovery | [Telegram stale final delivery](maintenance/telegram-stale-final-delivery.md) |
 | Telegram internal delivery recovery | Redeliver failed answers on same-adapter polling recovery without crossing profile ownership | Polling health, final delivery settlement, or runtime ledger replay | [Telegram internal delivery recovery](maintenance/telegram-internal-delivery-recovery.md) |
 | Status bubble ownership and cleanup | Keep Telegram topic/turn statuses independent and forget deleted bubbles | Telegram/Slack `send_or_update_status`, `delete_message`, or progress cleanup changes | [Status cache after cleanup](maintenance/status-cache-after-cleanup.md) |
@@ -135,6 +138,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Native Telegram topic tool | Let an agent create or edit a Telegram DM topic and bind its settings, opening brief, and relay address to a native Hermes session | `telegram_topic`, Telegram DM topic creation/editing, topic bindings, or opening-brief delivery | [Native Telegram topic tool](maintenance/telegram-topic-tool.md) |
 | Queued voice transcription | Transcribe and echo queued voice immediately with bounded concurrency, reuse it at drain | Busy queueing, pending-event STT cache, transcript echo, or drain changes | [Queued voice STT](maintenance/queued-voice-stt.md) |
 | Worktree GC Git isolation | Host Git config never hides files from the reclaim safety check; every listed path is archived exactly or the worktree is kept, except regenerable directories, which go with the tree | Worktree-GC dirty checks, archiving, or reclaim changes | [Worktree GC Git isolation](maintenance/worktree-gc-git-isolation.md) |
+| Git tmp-pack holder scope | Linux removes aged aborted-transfer packs when only foreign checkouts have Git processes, while target/shared holders and all stale locks remain conservatively protected | `hermes_cli/gitlock.py`, Git process ownership or tmp-pack recovery tests | [Git tmp-pack holder scope](maintenance/gitlock-tmp-pack-holder-scope.md) |
 | Camofox accounts and vault | Preserve named accounts, Connect/secret-safe fills, shadow-DOM login forms | Browser account, vault, or 1Password backend changes | [Camofox and vault](maintenance/camofox-vault.md) |
 | Camofox navigation titles | Return the exact owned tab's title without crossing account boundaries | Camofox navigation or tab-list changes | [Camofox navigation titles](maintenance/camofox-navigation-titles.md) |
 | Camofox tab reuse | Close disposable owned tabs automatically while preserving kept/adopted handoff tabs and live sibling ownership | Camofox cleanup, tab adoption, handoff, leases, or compression task-id changes | [Camofox tab reuse](maintenance/camofox-tab-reuse.md) |
@@ -172,6 +176,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Agent friction repairs | Preserve unread pending tool results during dedupe and tell execute_code when an LRU kernel eviction discarded state | Context-pruning dedupe, session-kernel eviction, or their regression tests | [Agent friction repairs](maintenance/agent-friction-repairs.md) |
 | Secret-safe provider diagnostics | Check the selected custom HTTP endpoint without exposing credentials through argv, responses or logs | Provider diagnostic helper, credential resolution or output/logging changes | [Secret-safe provider diagnostics](maintenance/io-safe-provider-probe.md) |
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+| Deferred local tool_call batching | Multi-entry local `tool_call` batches run losslessly, bounded and interruptible through each entry's ordinary pipeline, with entry-indexed, non-misleading errors | Tool Search bridge, `tool_call` batching, local batch splitter, or connector batch dispatch changes | [Deferred local batch](maintenance/deferred-local-batch.md) |
 
 ## Active patch record: relay silence (S1)
 
@@ -193,15 +198,15 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
 - **Rollback:** Revert the resumable-delegation-retention fix commit.
 
-## Active patch record: trailing silence marker (S1)
+## Active patch record: edge silence markers (S1)
 
 - **Patch identity:** `trailing-silence-marker`.
-- **Behavior:** Strip the run of trailing standalone `NO_REPLY`/`[SILENT]`/`no reply` marker lines from substantive interactive replies before delivery and assistant-transcript persistence. The decision is made on the visible text after inline think blocks are removed, so reasoning plus a bare marker stays intended silence. A response of only marker lines collapses to one marker and still goes through the silence guard. Preserve bare-marker suppression, fenced-code content, mid-sentence text, and autonomous-lane semantics.
+- **Behavior:** Strip runs of standalone `NO_REPLY`/`[SILENT]`/`no reply` marker lines that open or end a substantive interactive reply before delivery and assistant-transcript persistence, so a model that emits the marker *and* prose delivers only the prose. The decision is made on the visible text after inline think blocks are removed, so reasoning plus a bare marker stays intended silence. A response of only marker lines collapses to one marker and still goes through the silence guard. Streaming holds previews while a segment opens with a marker line or its last line could become one, and strips a segment's edge markers before its tool-boundary edit. Preserve bare-marker suppression, fenced-code content, mid-sentence text, and autonomous-lane semantics.
 - **Source surfaces:** `gateway/response_filters.py`, `agent/turn_final_response.py`, `gateway/run_turn.py`, `gateway/stream_consumer.py`, and gateway response-filter/stream/final-persistence regression tests.
-- **Upstream status:** NousResearch #126581, #126646, and #126827 address bare-marker leaks on failed turns and segment-break previews; none strips a trailing marker line from substantive replies.
+- **Upstream status:** NousResearch #126581, #126646, and #126827 address bare-marker leaks on failed turns and segment-break previews; none strips a marker line from substantive replies.
 - **Focused regression:** `HERMES_HEAVY_SLOT=off HERMES_HOME=<isolated-home> /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest -q tests/gateway/test_trailing_silence_marker.py tests/gateway/test_response_filters.py tests/gateway/test_stream_consumer_silence.py`.
-- **Retirement:** Remove this patch when released upstream behavior strips trailing standalone markers at both persistence and every interactive streaming delivery boundary.
-- **Rollback:** Revert the trailing-silence-marker fix commit.
+- **Retirement:** Remove this patch when released upstream behavior strips leading and trailing standalone markers at both persistence and every interactive streaming delivery boundary.
+- **Rollback:** Revert the trailing-silence-marker fix commits.
 
 ## Active patch record: gateway human-turn silence re-prompt
 
@@ -354,6 +359,25 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Verification:** The new regression files fail on the frozen base (5 failed, 8 passed) and pass on the candidate (13 passed). The final eight-file run, including all four wider-regression failures, passes on native macOS (172 passed, 12 platform skips), using the private test environment and CI-style isolated Git configuration. The two positive handoff fixtures use a real parent instead of a child stand-in; the runtime-host ancestry guard is unchanged. Source-only fork validation reports 0 problems.
 - **Retirement:** Remove once upstream ships a precise macOS shell producer and strict own-PID validation, and these regressions pass there without the fork patch.
 - **Rollback:** Revert the commits carrying `Fork-Patch: updater-pid-incarnation`. Revert all of them together: restoring the strict rule without the precise producer would break macOS hand-offs.
+
+## Additional maintenance units
+
+The following units are part of the enrolled maintenance surface. Load the row's
+contract before acting on its trigger; a full maintenance run accounts for every
+row:
+
+| Unit | Required behavior | Load when | Contract |
+|---|---|---|---|
+| CI slow-file timeouts | Keep known-slow hosted test files within measured per-file bounds without changing the default for other files | Hosted shard timeout evidence, `FILE_TIMEOUTS`, or slow-file selection changes; also load Portable CI | [CI slow-file timeouts](maintenance/ci-slow-file-timeouts.md) |
+| Fallback mid-turn restore | Restore an eligible primary or earlier fallback between model requests while preserving cooldown and route invariants | Provider fallback recovery, mid-turn retry, or fallback stay-limit changes | [Fallback mid-turn restore](maintenance/fallback-mid-turn-restore.md) |
+| Gate flake quarantine | Keep the PR gate blocking while isolating only reproduced host/process flakes with nightly evidence | Gate quarantine lists, exact-SHA flake evidence, or shard disposition changes; also load Portable CI and Repository CI contract | [Gate flake quarantine](maintenance/gate-flake-quarantine.md) |
+| Goal continuation quiet | Deduplicate unchanged continuation notices across waits and preserve meaningful goal outcomes | Goal wait, continuation notice, automatic silence, or lifecycle deduplication changes | [Goal continuation quiet](maintenance/goal-continuation-quiet.md) |
+| Install and scratch GC | Reclaim orphaned installs and scratch data only under ownership, age, lock, lease, and deletion-window safeguards | PM install cleanup, scratch pruning, housekeeping, worktree pruning, or deletion-window changes; also load runtime ownership | [Install and scratch GC](maintenance/install-and-scratch-gc.md) |
+| One-shot task governing skill loading | Load task-governing procedural skills in one-shot sessions without restoring omitted maintenance tooling | One-shot footprint, prompt skill admission, or governing-skill loading changes | [One-shot task governing skill loading](maintenance/oneshot-task-governing-skill-loading.md) |
+| Portable CI | Keep local and hosted source gates reproducible, isolated, and aligned across supported lanes | `bin/ci`, `scripts/ci/portable.py`, toolchain pins, workflow lanes, or source-gate isolation changes | [Portable CI](maintenance/portable-ci.md) |
+| Repository CI contract | Preserve exact-SHA admission, gate aggregation, workflow dispositions, and the boundary between local evidence and qualification | Repository CI commands, workflow graph, required statuses, or gate/nightly policy changes | [Repository CI contract](maintenance/repository-ci-contract.md) |
+| Shared primary cooldown | Share provider outage cooldowns across agents while preventing fallback replies from clearing them | Fallback classification, cooldown state, outage/recovery notices, or cross-process route adoption changes | [Shared primary cooldown](maintenance/shared-primary-cooldown.md) |
+| Updater external supervisor sweep | Protect newly spawned supervised gateways while draining pre-existing processes for supervisor hand-back | Update restart sweeps, gateway PID snapshots, launchd or external-supervisor ownership changes; also load runtime ownership | [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md) |
 
 ## Update
 

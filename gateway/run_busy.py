@@ -225,6 +225,11 @@ class GatewayBusySessionMixin:
             kept = [e for e in overflow if not remove(e)]
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
+        # Retained real messages must precede any freshly enqueued continuation.
+        if isinstance(pending_slot, dict) and session_key not in pending_slot:
+            overflow = self._overflow_queue(session_key)
+            if overflow:
+                pending_slot[session_key] = overflow.pop(0)
         return removed
 
     def _get_max_concurrent_sessions(self) -> Optional[int]:
@@ -546,6 +551,9 @@ class GatewayBusySessionMixin:
         """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
 
         Returns whether the event was preserved (FIFO or durable spool)."""
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            return False  # a hidden review cannot outlive this process; the original report goes out
         setattr(event, "_drain_deferred", True)
         if self._queue_or_replace_pending_event(session_key, event):
             return True

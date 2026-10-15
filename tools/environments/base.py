@@ -64,6 +64,11 @@ _exit_fenced = False  # one-way, set by the hard-exit kill: no foreground comman
 _cleanup_fences = 0  # temporary, per graceful cleanup; overlapping callers release only their own fence
 _spawns_in_flight = 0  # past the fence check, child maybe alive, not yet in _live_foreground
 _HARD_KILL_BUDGET_S = 0.5  # also bounds the graceful spawn-publication wait; SDK spawn may stall
+_HOST_EXITING_OUTPUT = (
+    "[host is exiting: command not started]\n"
+    "Hermes is restarting or shutting down; the command was NOT run. "
+    "This turn's work will resume after restart. Do not retry this command in this turn."
+)
 
 
 def _enter_foreground_spawn() -> bool:
@@ -671,7 +676,7 @@ class BaseEnvironment(ABC):
             if parent_activity_cb is not None:
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
-                return {"output": "[host is exiting: command not started]", "returncode": 130}
+                return {"output": _HOST_EXITING_OUTPUT, "returncode": 130}
             spawned = None
             try:
                 spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)

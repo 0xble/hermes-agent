@@ -220,6 +220,36 @@ class PortableGateTests(unittest.TestCase):
             self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
             self.assertTrue(Path(result['APPDATA']).is_dir())
 
+    def test_windows_appdata_seeds_only_the_isolated_analysis_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            checkout = base / 'checkout'
+            checkout.mkdir()
+            home = base / 'isolated'
+            source = checkout / 'prebuilt-analysis.cache'
+            source.write_bytes(b'prebuilt cache')
+
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(source)}):
+                result = ci.windows_appdata_environment(home)
+            cache = Path(result['PSModuleAnalysisCachePath'])
+            self.assertTrue(cache.is_relative_to(home))
+            self.assertFalse(cache.is_relative_to(checkout))
+            self.assertEqual(cache.read_bytes(), b'prebuilt cache')
+
+            cache.write_bytes(b'existing isolated cache')
+            source.write_bytes(b'changed prebuilt cache')
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(source)}):
+                ci.windows_appdata_environment(home)
+            self.assertEqual(cache.read_bytes(), b'existing isolated cache')
+
+            missing = base / 'missing-analysis.cache'
+            fallback_home = base / 'fallback'
+            with patch.dict(os.environ, {'PSModuleAnalysisCachePath': str(missing)}):
+                fallback = ci.windows_appdata_environment(fallback_home)
+            fallback_cache = Path(fallback['PSModuleAnalysisCachePath'])
+            self.assertTrue(fallback_cache.is_relative_to(fallback_home))
+            self.assertFalse(fallback_cache.exists())
+
     def test_msvc_linker_environment_rejects_git_link_and_retains_sdk_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory) / 'VC/Tools/MSVC/14.51'

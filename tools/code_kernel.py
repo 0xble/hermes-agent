@@ -447,19 +447,38 @@ def _resolve_owner(task_id: str) -> str:
     return owner
 
 
+def _forget_kernel_evictions(owner_matches: Optional[Callable[[str], bool]] = None) -> None:
+    """Forget eviction notes that cannot apply after a lifecycle boundary."""
+    with _REGISTRY.lock:
+        if owner_matches is None:
+            _EVICTED_KERNELS.clear()
+        else:
+            for key in list(_EVICTED_KERNELS):
+                if owner_matches(key[0]):
+                    _EVICTED_KERNELS.pop(key, None)
+
+
 def shutdown_all_kernels() -> None:
     """Kill every session kernel. Registered via atexit; also used by tests."""
     _REGISTRY.shutdown()
+    _forget_kernel_evictions()
 
 
 def shutdown_kernels_for_owner(owner: str) -> None:
     """Dispose every kernel a session owns — wired into ``tools.approval.clear_session``
     so kernels die at the same boundary that clears approval/yolo state (/new, session close).
 
+    Eviction tombstones die with the owner too. ``clear_session`` is the boundary for
+    /new, /reset and auto-reset, which reuse the session key for a different
+    conversation that never had the evicted variables. A conversation resumed after
+    this boundary starts with a fresh kernel whether its kernel was evicted earlier
+    or killed here, so neither case carries a state-reset note across it.
+
     See #88637.
     """
     if owner:
         _REGISTRY.shutdown(owner)
+        _forget_kernel_evictions(lambda candidate: candidate == owner)
 
 
 def delegated_child_owner_matcher(child_session_id: str) -> Callable[[str], bool]:
@@ -478,6 +497,7 @@ def shutdown_kernels_for_delegated_child(child_session_id: str) -> None:
         return
     matcher = delegated_child_owner_matcher(child_session_id)
     _REGISTRY.shutdown(owner_matches=matcher)
+    _forget_kernel_evictions(matcher)
     from tools.code_kernel_remote import shutdown_remote_kernels_where
     shutdown_remote_kernels_where(matcher)
 
@@ -929,9 +949,30 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
         except Exception as exc:  # pragma: no cover - defensive parity with per-call
             from tools.code_execution_tool import _error_result
             logger.error("session kernel failed: %s: %s", type(exc).__name__, exc, exc_info=True)
-            _REGISTRY.discard(key, kernel)
-            return _error_result(str(exc), tool_calls_made=kernel.tool_call_counter[0],
-                                 duration=round(time.monotonic() - exec_start, 2))
+            # Drop the failed kernel and, in the same critical section, decide whether its
+            # eviction note still applies. If a conversation boundary (clear_session) already
+            # removed this kernel, that boundary also forgot the note on purpose; restoring
+            # it would tell the next conversation on this key to recreate state it never had.
+            with _REGISTRY.lock:
+                still_registered = _KERNELS.get(key) is kernel
+                if still_registered:
+                    _KERNELS.pop(key, None)
+                if state_reset_note and still_registered:
+                    _EVICTED_KERNELS[key] = state_reset_note
+                    _EVICTED_KERNELS.move_to_end(key)
+                    while len(_EVICTED_KERNELS) > _MAX_REMEMBERED_KERNEL_EVICTIONS:
+                        _EVICTED_KERNELS.popitem(last=False)
+            kernel.teardown()
+            body = json.loads(_error_result(
+                str(exc), tool_calls_made=kernel.tool_call_counter[0],
+                duration=round(time.monotonic() - exec_start, 2),
+            ))
+            if state_reset_note:
+                body["kernel"] = {
+                    "mode": "session", "reused": False, "state_reset": True,
+                    "note": state_reset_note,
+                }
+            return json.dumps(body, ensure_ascii=False)
         finally:
             # The cell has settled on every path: its tool authority retires with it, so
             # nothing the cell left running can dispatch under it.

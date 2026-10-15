@@ -1700,6 +1700,7 @@ async def test_successor_interruption_sends_one_new_note_without_resending_prede
     recovered = store._entries[entry.session_key]
     marker_b = store.get_resume_pending_marker(entry.session_key)
     assert recovered.resume_turn_id == "turn-b"
+    assert recovered.resume_predecessor_turn_id == "turn-a"
     assert marker_b is not None and marker_b[1] != "marker-a"
 
     adapter = NoteAdapter()

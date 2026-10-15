@@ -32,8 +32,9 @@ from gateway.response_filters import (
     ends_with_partial_silence_marker as _ends_with_partial_silence_marker,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
+    opens_with_silence_marker as _opens_with_silence_marker,
     strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
-    strip_trailing_silence_marker as _strip_trailing_silence_marker)
+    strip_edge_silence_markers as _strip_edge_silence_markers)
 from gateway.copy_blocks import CopyMarkerStreamFilter, adapter_sends_copy_blocks, copy_free_text_for
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
@@ -126,6 +127,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
+        on_preview: Optional[Callable] = None,
         run_still_current: Optional[Callable[[], bool]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -135,6 +137,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
+        self._on_preview = on_preview
+        self._recovered_send_uncertain = False
+        # Set when a crash-journaled preview is adopted; cleared by the first landed edit. The
+        # row is write-ahead, so until then its text is not known to be on screen: it forces the
+        # first edit, counts as neither visible nor delivered, and the adopted id survives a
+        # segment boundary (see _reset_segment_state). Holds the adopted id: any path that
+        # retargets ``_message_id`` (fallback resend, split) ends it implicitly.
+        self._adopted_unconfirmed: Optional[str] = None
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -163,6 +173,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
         self._last_edit_overflowed = False  # last _send_or_edit split into continuations
+        self._split_delivery_journal_pending = False
         self._flood_strikes = 0
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
@@ -396,7 +407,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
         target = self._clean_for_display(copy_free_text_for(self.adapter, text or "")).strip()
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
-        if self._already_sent:
+        if self._already_sent and not self._adoption_unconfirmed():
             seen.append(self._visible_prefix())
         return bool(target) and any(sent.strip() == target for sent in seen)
 
@@ -476,13 +487,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        # An adopted crash preview nothing has confirmed yet is not delivered text, and it
+        # stays the edit target across the boundary so the resumed turn's first real content
+        # replaces it instead of leaving the stale partial frozen above a new message.
+        adopted = ((self._message_id, self._message_created_ts, self._last_sent_text)
+                   if self._adoption_unconfirmed() else None)
         # Retain the segment's visible text so has_delivered_text still matches.
-        finalized = self._clean_for_display(self._last_sent_text).strip()
+        finalized = "" if adopted else self._clean_for_display(self._last_sent_text).strip()
         if finalized:
             self._delivered_segment_texts.append(finalized)
         # Also clears the final flags: what we delivered was an interim preamble.  Safe:
         # got_done returns before any reset; run.py reads flags after the task exits.
         self._reset_message_state()
+        if adopted:
+            self._message_id, self._message_created_ts, self._last_sent_text = adopted
         # Telegram-shaped drafts: bump draft_id so the next segment animates as a fresh
         # preview below the tool-progress bubbles.  Stream-is-the-message adapters keep
         # ONE stream per turn — a bump there left one frozen message per segment.
@@ -595,11 +613,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._end_segment(tick)
                     self._signal_flush(tick.flush_event)
                     continue
+                if tick.got_segment_break:
+                    self._strip_segment_edge_markers()
 
                 if tick.got_done:
                     self._flush_think_buffer()
                     self._flush_copy_filter()
-                    # Strip a trailing standalone marker only from substantive interactive
+                    # Strip standalone edge markers only from substantive interactive
                     # replies. A bare marker remains unchanged for the existing silence path.
                     self._strip_final_marker_from_state()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
@@ -635,6 +655,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     await self._finalize_turn(tick)
+                    if self._final_response_sent or self._turn_split_delivery:
+                        # Split turns too: their row would point at a sealed head chunk.
+                        await self._journal_preview("", force=True)
                     return
 
                 if tick.commentary_text is not None:
@@ -742,7 +765,33 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Apply the interactive trailing-marker filter at the final delivery boundary."""
         if not self.cfg.strip_trailing_silence_markers:
             return text
-        return _strip_trailing_silence_marker(text)
+        return _strip_edge_silence_markers(text)
+
+    def _strip_current_segment_markers(self, text: str) -> str:
+        """Strip edge markers of the part of ``text`` after the earlier-segment prefix.
+
+        Whole-text stripping cannot see a marker that opens a later segment of a
+        cumulative stream (``Pre-tool.\\nNO_REPLY\\n\\nPost-tool.``); the prefix itself
+        was already cleaned at its own boundary."""
+        prefix = self._accumulated[:self._segment_start]
+        if not (prefix and text.startswith(prefix) and self.cfg.strip_trailing_silence_markers):
+            return text
+        tail = text[len(prefix):]
+        cleaned = self._strip_final_silence_marker(tail)
+        if _is_intentional_silence_response(cleaned):
+            cleaned = ""
+        return prefix + cleaned if cleaned != tail else text
+
+    def _strip_segment_edge_markers(self) -> None:
+        """Drop standalone marker lines bracketing the current segment's prose before its
+        boundary edit; previews of that segment were held, so nothing visible changes."""
+        segment = self._accumulated[self._segment_start:]
+        cleaned = self._strip_final_silence_marker(segment)
+        if cleaned == segment:
+            return
+        self._accumulated = self._accumulated[:self._segment_start] + cleaned
+        if self._stream_ledger.endswith(segment):
+            self._stream_ledger = self._stream_ledger[:len(self._stream_ledger) - len(segment)] + cleaned
 
     @staticmethod
     def _strip_final_loop_complete_marker(text: str) -> str:
@@ -750,7 +799,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return _strip_trailing_loop_complete_marker(text)
 
     def _strip_final_marker_from_state(self) -> None:
-        """Remove trailing control markers from all final-state buffers before delivery."""
+        """Remove edge control markers from all final-state buffers before delivery."""
+        stripped = self._strip_current_segment_markers(self._accumulated)
+        if stripped != self._accumulated:
+            if self._stream_ledger == self._accumulated:
+                self._stream_ledger = stripped
+            self._accumulated = stripped
         self._accumulated = self._strip_final_silence_marker(self._accumulated)
         self._stream_ledger = self._strip_final_silence_marker(self._stream_ledger)
         self._accumulated = self._strip_final_loop_complete_marker(self._accumulated)
@@ -779,7 +833,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         final_raw = self._strip_final_silence_marker(final_raw)
         final_raw = self._strip_final_loop_complete_marker(final_raw)
         if not self._turn_split_delivery:
-            final_raw = self._with_cumulative_prefix(final_raw)
+            final_raw = self._strip_current_segment_markers(self._with_cumulative_prefix(final_raw))
             final_payload = self._clean_for_display(final_raw)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
                 self._accumulated = final_raw
@@ -826,12 +880,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                                or (len(self._accumulated) >= self.cfg.buffer_threshold
                                    and not self._flood_strikes))
         # Defer mid-stream edits while the buffer could still resolve to a silence
-        # marker ("NO"→"NO_REPLY"), or while its last top-level line could be a trailing
-        # marker after prose; got_done always resolves the buffer.
+        # marker ("NO"→"NO_REPLY"), while its last top-level line could be a trailing
+        # marker after prose, or while it opens with a standalone marker line that the
+        # final strip will remove; got_done always resolves the buffer.
         _visible = self._clean_for_display(self._accumulated)
         _segment = self._clean_for_display(self._accumulated[self._segment_start:])
         return should_edit and not _is_partial_silence_marker(_segment) and not (
-            self.cfg.strip_trailing_silence_markers and _ends_with_partial_silence_marker(_visible)
+            self.cfg.strip_trailing_silence_markers and (
+                _ends_with_partial_silence_marker(_visible) or _opens_with_silence_marker(_segment))
         ) and not _ends_with_partial_loop_complete_marker(_visible)
 
     async def _split_first_send(self, tick: "_Tick") -> bool:
@@ -844,12 +900,19 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
         reply_to = self._initial_reply_to_id
         heads_delivered = len(chunks) > 1
+        sealed_head_ids = []
+        # The first head send is already visible before _enter_split_delivery can
+        # retire the normal preview row. Fence that whole window durably.
+        self._split_delivery_journal_pending = True
+        await self._journal_split_delivery(sealed_head_ids)
         for chunk in chunks[:-1]:
             new_id = await self._send_new_chunk(chunk, reply_to, final=tick.got_done)
             if new_id is None or new_id == reply_to:
                 heads_delivered = False  # keep the full text intact for the gateway fallback
                 break
             reply_to = new_id
+            sealed_head_ids.append(new_id)
+            await self._journal_split_delivery(sealed_head_ids)
 
         if heads_delivered:
             # truncate_message suffixes multi-chunk output with " (n/n)"; the tail is the LIVE
@@ -860,7 +923,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # Flag BEFORE the tail send: fresh-final replaces every tracked preview
             # with one message, which is only valid while the active message holds
             # the whole answer — deleting sealed heads drops delivered text.
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
         # Heads are sealed (or a later head failed): never edit a sealed message with
         # the unsplit payload — the tail is sent fresh, or the fallback path retries.
         self._message_id = None
@@ -873,7 +936,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # ``_already_sent`` may be True from prior state — only heads + tail count.
             self._final_response_sent = heads_delivered and tail_delivered
             if self._final_response_sent:
-                self._turn_split_delivery = True
+                await self._enter_split_delivery()
                 self._mark_final_delivered(record=self._accumulated)
             return True
         if tick.got_segment_break:
@@ -898,13 +961,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # finalize=True: the sealed chunk is never edited again, so it needs its
             # rich-text pass now.  is_turn_final=False: a split head is not the
             # answer, so fresh-final must not mark the turn delivered on it.
+            self._split_delivery_journal_pending = True
+            await self._journal_split_delivery([self._message_id])
             ok = await self._send_or_edit(chunk, finalize=True, is_turn_final=False)
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
+            await self._journal_split_delivery(self._preview_message_ids | {self._message_id})
             self._accumulated = self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
 
     async def _push_update(self, tick: "_Tick") -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""

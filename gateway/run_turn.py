@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- strict session-pin and loop-effect integration lives in this established turn facade; follow-up extraction is required before adding unrelated behavior.
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 background tasks, MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -28,9 +29,10 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platforms.event import MessageEvent
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
+from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
-    strip_trailing_silence_marker,
+    strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -78,7 +80,6 @@ def _tool_call_logger() -> logging.Logger:
             tool_logger.propagate = False
             tool_logger.addHandler(handler)
     return tool_logger
-
 
 
 _CONTEXT_OVERFLOW_ERROR_PHRASES = (
@@ -151,7 +152,7 @@ def bound_model_input_without_hygiene(history: List[Any], limit: int) -> List[An
     return history[:head_end] + history[tail_start:]
 
 
-class GatewayTurnMixin:
+class GatewayTurnMixin(GatewayLoopWakeMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(
@@ -553,6 +554,21 @@ class GatewayTurnMixin:
         window. A goal continuation whose definition was edited since gets its refreshed prompt."""
         from gateway.platforms.event import is_goal_continuation_event
         from hermes_cli.session_controls import loop_wake_is_current, refresh_goal_continuation
+        metadata = getattr(event, "metadata", None) or {}
+        if metadata.get("gateway_session_strict"):
+            pin_check = getattr(self, "_strict_session_pin_holds", None)
+            if callable(pin_check):
+                if not await pin_check(event, session_id):
+                    return None
+            else:
+                lookup = getattr(getattr(self, "async_session_store", None), "lookup_by_session_key", None)
+                if callable(lookup):
+                    current = await lookup(metadata.get("gateway_session_key", ""))
+                    if (getattr(current, "session_id", None) != session_id
+                            or getattr(current, "session_id", None) != metadata.get("gateway_session_id")):
+                        from hermes_cli.session_controls import internal_wake_is_current
+                        if not internal_wake_is_current(event, session_id):
+                            return None
         if is_goal_continuation_event(event):
             before = event.text
             refreshed = await self._run_in_executor_with_context(refresh_goal_continuation, event, session_id)
@@ -560,9 +576,25 @@ class GatewayTurnMixin:
                 return None
             if refreshed != before:
                 message = message.replace(before, refreshed) if before and before in message else refreshed
-        if not await self._run_in_executor_with_context(
-                loop_wake_is_current, getattr(event, "metadata", None), session_id):
+        current = await self._run_in_executor_with_context(loop_wake_is_current, metadata, session_id)
+        if metadata.get("loop_wakeup_session_id"):
+            from hermes_cli.session_controls import migrated_successor
+            successor = await self._run_in_executor_with_context(
+                migrated_successor, "loop", metadata.get("loop_wakeup_session_id"),
+            )
+            if successor and successor != session_id:
+                current = await self._run_in_executor_with_context(
+                    loop_wake_is_current, metadata, successor,
+                )
+        if not current:
             return None
+        fence = getattr(event, "_gateway_loop_execution_fence", None)
+        rebound_sid = metadata.get("loop_wakeup_session_id")
+        if fence is not None and rebound_sid and fence[0] != rebound_sid:
+            from hermes_cli.loops import loop_control_generation
+            event._gateway_loop_execution_fence = (
+                rebound_sid, fence[1], fence[2], loop_control_generation(rebound_sid),
+            )
         return message
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):
@@ -1694,11 +1726,11 @@ class GatewayTurnMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
-        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
-        # marker from substantive text before the silence verdict, so a marker-only run that
+        # leave its marker semantics unchanged. Interactive replies drop standalone edge
+        # markers from substantive text before the silence verdict, so a marker-only run that
         # collapses to one marker still goes through the silence guard below.
         if source.platform != Platform.WEBHOOK:
-            response = strip_trailing_silence_marker(response)
+            response = strip_edge_silence_markers(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
@@ -1836,8 +1868,10 @@ class GatewayTurnMixin:
 
     async def _hmwa_post_turn_hooks(self, hook_ctx, agent_result, response):
         """agent:end hook, process-watcher scheduling, and watch-notification drain."""
+        from gateway.stream_recovery import unmark_recovered_reply
         await self.hooks.emit("agent:end", {
-            **hook_ctx, "response": (response or "")[:500], "model": agent_result.get("model", ""),
+            **hook_ctx, "response": unmark_recovered_reply(response or "", agent_result)[:500],
+            "model": agent_result.get("model", ""),
             "provider": agent_result.get("provider", ""),
         })
 
@@ -2047,7 +2081,10 @@ class GatewayTurnMixin:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
-                    # Edge case: fall back to simple user/assistant rows.
+                    # Edge case: fall back to simple user/assistant rows. The recovered-reply
+                    # marker labels delivery only; the transcript keeps the model's answer.
+                    from gateway.stream_recovery import unmark_recovered_reply
+                    response = unmark_recovered_reply(response, agent_result)
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         await store.append_to_transcript(
@@ -2087,21 +2124,19 @@ class GatewayTurnMixin:
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
-        raw_response=None,
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        # Evaluation needs the model's raw output, including explicit emptiness and control
+        # markers, not a normalized display notice. The non-streamed return value is display
+        # text; post-turn hooks prefer the model copy (see _final_text_for_post_turn_hooks).
+        with suppress(Exception):
+            from hermes_cli.goal_turn_outcome import model_final_response
+            event._agent_final_response = model_final_response(agent_result)
         from gateway.cron_review import private_turn_response
         private, captured_response = private_turn_response(event, agent_result)
         if private:
             return captured_response
-        raw_response = response if raw_response is None else raw_response
-        # LOOP_COMPLETE is a control marker for /loop detection, not assistant content. Keep the
-        # raw response available to post-turn hooks and strip only at this final display boundary.
-        # The non-streamed return value is the stripped display text, so the hooks read the raw
-        # copy stashed here instead (see _final_text_for_post_turn_hooks).
-        with suppress(Exception):
-            event._raw_final_response = str(raw_response or "")
         from gateway.response_filters import strip_trailing_loop_complete_marker
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
@@ -2133,7 +2168,8 @@ class GatewayTurnMixin:
         )
         # Paste-ready text is read, never spoken, on every platform.
         from gateway.copy_blocks import strip_copy_blocks
-        _spoken = strip_copy_blocks(response) if response else response
+        from gateway.stream_recovery import unmark_recovered_reply
+        _spoken = strip_copy_blocks(unmark_recovered_reply(response, agent_result)) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
@@ -2198,7 +2234,9 @@ class GatewayTurnMixin:
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(raw_response or "")
+                from gateway.stream_recovery import unmark_recovered_reply
+                event._streamed_final_response = unmark_recovered_reply(
+                    str(agent_result.get("final_response") or ""), agent_result)
             return None
 
         if agent_result.get("interrupted") and response:
@@ -2404,7 +2442,7 @@ class GatewayTurnMixin:
             hygiene_adoption_epoch=self._hygiene_deferred_adoption_epoch(session_key),
         ), _session_env_tokens
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):  # health: allow CC -- session wake execution composes strict pins, leases, and final loop fences.
         """Inner handler that runs under the _running_agents sentinel guard."""
         # The outbound string (or streamed None) loses the raw result's outcome.
         # Fail closed through preparation, execution and delivery exceptions.
@@ -2418,6 +2456,13 @@ class GatewayTurnMixin:
             getattr(event, "reply_to_message_id", None),
             (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
         )
+
+        if not await self._prepare_loop_wake_execution(event, source):
+            self._log_loop_wake_suppressed(event, "superseded before session resolution")
+            return
+        _owned_loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
+        if _owned_loop_fence is not None:
+            run_generation = _owned_loop_fence[2]
 
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
@@ -2454,6 +2499,9 @@ class GatewayTurnMixin:
                 logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
         event._restart_note_marker_api_available = _resume_marker_reader_available
         event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
+        if not await self._prepare_loop_wake_execution(event, source):
+            self._log_loop_wake_suppressed(event, "superseded before turn preparation")
+            return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
         )
@@ -2462,6 +2510,9 @@ class GatewayTurnMixin:
         history, message_text = prepared.history, prepared.message_text
 
         try:
+            if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during turn preparation")
+                return
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -2484,6 +2535,13 @@ class GatewayTurnMixin:
                 self._clear_user_stop_latch(_quick_key)
             await self._revive_blocked_goal_for_user_turn(session_entry, source, event)
             _run_start_session_id = session_entry.session_id
+            _loop_tick = self._loop_wake_command_identity(event)
+            _loop_tick = _loop_tick[1] if _loop_tick is not None else None
+            if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during agent:start hooks")
+                return
+            if _loop_tick is not None:
+                event._gateway_loop_tick = _loop_tick
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
@@ -2505,7 +2563,8 @@ class GatewayTurnMixin:
                 if message_text is None:
                     logger.info("Discarding wake superseded during turn preparation for %s", session_key)
                     return None
-            agent_result = await self._run_agent(
+            started, agent_result = await self._invoke_loop_wake_effect(
+                event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
@@ -2524,6 +2583,9 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
+            if not started:
+                self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
+                return
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -2562,7 +2624,6 @@ class GatewayTurnMixin:
                 reply_expected=event.reply_expected,
             )
             response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
-            raw_response_for_delivery = response
             from gateway.response_filters import strip_trailing_loop_complete_marker
             response = strip_trailing_loop_complete_marker(response)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
@@ -2589,7 +2650,6 @@ class GatewayTurnMixin:
             delivered_response = await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
-                raw_response=raw_response_for_delivery,
             )
             from gateway.run import _should_clear_resume_pending_after_turn
             event._agent_turn_succeeded = _should_clear_resume_pending_after_turn(agent_result)
@@ -4846,6 +4906,7 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if isinstance(response, dict) and "delivery_text" in response: response = {**response, "final_response": response["delivery_text"]}
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)

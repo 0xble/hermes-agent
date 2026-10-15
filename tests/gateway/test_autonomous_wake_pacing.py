@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from hermes_cli import goals
@@ -104,8 +104,14 @@ def _goal_runner():
     return runner, adapter, entry, src
 
 
-def _turn_event(src, text, *, internal, origin=None):
+def _turn_event(src, text, *, internal, origin=None, loop_wake=False):
     metadata = {"notification_origin": origin} if origin else {}
+    if loop_wake:
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        metadata[LOOP_WAKE_METADATA_KEY] = True
+    if goals.is_goal_continuation_text(text):
+        # The gateway marks the continuations it enqueues; classification reads that provenance.
+        metadata[GOAL_CONTINUATION_METADATA_KEY] = True
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
 
 
@@ -125,8 +131,8 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
     runner, adapter, entry, src = _goal_runner()
     clock = [10_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
-    # Each turn here does real work; the no-progress backoff (#302) has its own coverage.
-    monkeypatch.setattr(goals, "_evidence_only_read_only_status", lambda evidence: False)
+    # No turn here leaves non-read-only tool evidence, so every automatic CONTINUE parks on the
+    # quiet no-progress ladder; user turns and delivered results pierce it.
     mgr = goals.GoalManager(entry.session_id)
     mgr.set("ship the release")
     continuation = mgr.next_continuation_prompt()
@@ -137,15 +143,15 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         assert _queued_continuations(adapter) == 1
         adapter._pending_messages.clear()
 
-        # The continuation turn itself is autonomous → held, silently, for the gap.
+        # The continuation turn itself is autonomous with no progress → held, silently, on the ladder.
         clock[0] += 20
         await _after_turn(runner, src, continuation, internal=False)
         assert _queued_continuations(adapter) == 0
-        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(10_000.0 + 900)
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
 
-        # A /loop tick (internal, no completion origin) is paced too.
+        # A /loop tick (gateway-stamped loop wake, no completion origin) is paced too.
         clock[0] += 20
-        await _after_turn(runner, src, "loop tick", internal=True)
+        await _after_turn(runner, src, "loop tick", internal=True, loop_wake=True)
         assert _queued_continuations(adapter) == 0
 
         # A completion result injected by the process path is fresh evidence: continue now.
@@ -155,10 +161,11 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
         assert goals.load_goal(entry.session_id).waiting_until == 0
         adapter._pending_messages.clear()
 
-        # Paced again after that continuation...
+        # Paced again after that continuation (the result reset the ladder to its first rung)...
         clock[0] += 20
         await _after_turn(runner, src, continuation, internal=False)
         assert _queued_continuations(adapter) == 0
+        assert goals.load_goal(entry.session_id).waiting_until == pytest.approx(clock[0] + 900)
         # ...but a completion drained behind a continuation head (the follow-up chain copies its
         # origin onto the head event, which is not internal) still counts as fresh evidence.
         clock[0] += 20
@@ -171,7 +178,7 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
 
 
 @pytest.mark.asyncio
-async def test_idle_ticker_releases_gap_hold_once_and_silently(hermes_home, monkeypatch):
+async def test_idle_ticker_releases_ladder_hold_once_and_silently(hermes_home, monkeypatch):
     runner, adapter, entry, src = _goal_runner()
     clock = [20_000.0]
     monkeypatch.setattr(goals.time, "time", lambda: clock[0])
@@ -183,13 +190,13 @@ async def test_idle_ticker_releases_gap_hold_once_and_silently(hermes_home, monk
         mgr.evaluate_after_turn("second", user_initiated=False)
 
     await runner._goal_wakeup_fire_one(entry.session_id)
-    assert adapter.handled == []  # still inside the gap
+    assert adapter.handled == []  # still inside the first 900s ladder rung
 
-    clock[0] = 20_000.0 + 901
+    clock[0] = 20_030.0 + 901  # past the 900s rung parked by the automatic turn at 20_030
     await runner._goal_wakeup_fire_one(entry.session_id)
     assert len(adapter.handled) == 1 and adapter.handled[0].text.startswith("[Continuing toward your standing goal]")
     state = goals.load_goal(entry.session_id)
-    assert state.waiting_until == 0 and state.last_continuation_at == pytest.approx(clock[0])
+    assert state.status == "active" and state.waiting_until == 0
     assert adapter.sends == []  # no "wait ended" notice for routine pacing
 
     await runner._goal_wakeup_fire_one(entry.session_id)

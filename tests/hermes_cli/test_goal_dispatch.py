@@ -117,6 +117,8 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
             state = asdict(state)
             for key in ('created_at', 'updated_at', 'waiting_since', 'mutation_id'):
                 state.pop(key, None)
+            for revision in state.get('revisions') or []:
+                revision.pop('at', None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]
 
@@ -151,12 +153,26 @@ def test_drafts_start_work_but_inspection_and_literal_prefixes_do_not_draft(
     execute('drafting docs')
     assert goals.load_goal(mgr.session_id).goal == 'drafting docs'
     assert calls == ['build it']
-    assert prompts[-1] == 'drafting docs'
+    # Bare /goal replacement is in place and does not enqueue a kickoff.
+    assert prompts == ['build it']
 
 
 def _dispatch(mgr, arg):
     from hermes_cli.goal_command import dispatch_goal_command
     return dispatch_goal_command(mgr, arg, authorize_gate=lambda: None)
+
+
+@pytest.mark.parametrize("bad", [
+    "Ship it " * 130,
+    "Ship it\nverify: PR #551 is merged",
+    "Delete the obsolete topic\nconstraints: read-only; no changes",
+    "Ship it\nverify: 1. Run tests\n2. Read logs\n3. Review output",
+])
+def test_goal_command_warns_without_blocking_authoring_findings(bad):
+    mgr = goals.GoalManager("goal-authoring-warning")
+    result = _dispatch(mgr, bad)
+    assert result.error is False
+    assert "Goal authoring warning" in result.output
 
 
 @pytest.mark.parametrize('command, paused, status', [

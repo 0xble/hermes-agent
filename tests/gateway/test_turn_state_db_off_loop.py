@@ -98,7 +98,9 @@ async def test_turn_storage_contention_keeps_loop_live(path, monkeypatch, tmp_pa
             AsyncMock(return_value=100),
         )
     original_read = db.get_meta
-    original_write = db.set_meta
+    # Goal mutations commit through SessionDB's write transaction (re-read + write under BEGIN
+    # IMMEDIATE), not set_meta: block that real boundary so the proof still covers the write.
+    original_write = db._execute_write
     if path == "revive-write":
         goals.save_goal(
             "session-a",
@@ -121,7 +123,7 @@ async def test_turn_storage_contention_keeps_loop_live(path, monkeypatch, tmp_pa
                 block()
                 return original_write(*args, **kwargs)
 
-            monkeypatch.setattr(db, "set_meta", write)
+            monkeypatch.setattr(db, "_execute_write", write)
         else:
             monkeypatch.setattr(db, "get_meta", read)
         if path == "notification":
@@ -454,7 +456,9 @@ async def test_goal_family_commands_keep_loop_live(command, monkeypatch, tmp_pat
     monkeypatch.setattr(runner.async_session_store, "get_or_create_session", AsyncMock(return_value=entry))
     monkeypatch.setattr(runner, "_register_heartbeat_watch", lambda *args: None)
     goals.save_goal("session-a", goals.GoalState(goal="probe", status="active"))
-    original_write = db.set_meta
+    # Goal mutations commit through SessionDB's write transaction, not set_meta; heartbeat and
+    # loop writes reach the same boundary via set_meta -> _write_sql -> _execute_write.
+    original_write = db._execute_write
 
     def install(block):
         # Block the command's own write: manager construction is already off the loop.
@@ -462,7 +466,7 @@ async def test_goal_family_commands_keep_loop_live(command, monkeypatch, tmp_pat
             block()
             return original_write(*args, **kwargs)
 
-        monkeypatch.setattr(db, "set_meta", write)
+        monkeypatch.setattr(db, "_execute_write", write)
 
     handler = {"/subgoal": runner._handle_subgoal_command, "/heartbeat": runner._handle_heartbeat_command,
                "/loop": runner._handle_loop_command}[command.split()[0]]

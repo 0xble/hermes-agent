@@ -16,6 +16,23 @@ resolution has its separate invariant test. These corrections remain within
 The native Telegram cancel-before-entry test awaits its task callback rendezvous
 before asserting admission release. PTB stop and an already completed Task do not
 by themselves drain registered callbacks. The production admission code is unchanged.
+Native Windows desktop-update commit-outcome and Unicode runtime fixtures use
+PowerShell child processes. The hosted diagnostic traced their cold-start cost to
+PowerShell's module-analysis cache: `scripts/ci/portable.py` pointed
+`PSModuleAnalysisCachePath` at a fresh isolated HOME, while PowerShell only writes
+that cache after a debounce longer than each short-lived child. Every child then
+paid about 25 seconds of cold module analysis; the runner's prebuilt cache reduced
+that to about 0.40 seconds. The portable environment now seeds the isolated cache
+from the runner's file when available, keeps a cold-cache fallback on copy failure,
+and never writes into the checkout. The measured fix completed runtime Unicode 6/6
+in 9.6 seconds and commit-outcome 12/12 in 83.3 seconds, including R6.
+The earlier `-NonInteractive`/stdin=EOF change was not causal and has been
+reverted to the upstream fixture form.
+The hermetic Windows worker environment sets `PSModulePath` explicitly empty
+when the parent leaves it unset; an empty value still autoloads built-in
+cmdlets from `$PSHOME\Modules` in both Windows PowerShell 5.1 and pwsh 7
+(native run 38399052622), and
+`tests/scripts/ci/test_portable_windows_environment.py` pins that contract.
 
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
@@ -163,6 +180,15 @@ uv-shim installer scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot
 substitute for these checks. Earlier local macOS arm64 evidence covered 94 tests
 across 36 files with Python 3.11.14; it does not establish a result for the
 current nightly candidate or for hosted Windows.
+
+The native Windows Git-for-Windows trampoline regression now covers both the
+pre-v2.56 ``mingw64`` and v2.56+ ``ucrt64`` git-core layouts. Git for Windows
+v2.56 moved x64 from MINGW64 to UCRT64; the updater must probe both layouts so a
+broken ``bin\\git.exe`` or ``cmd\\git.exe`` shim can still be replaced by the
+real binary. This remains under `fork-ci-reliability` and is guarded by the
+cross-platform fake-tree tests in `tests/hermes_cli/test_cmd_update.py` plus the
+live Windows test.
+
 
 For Windows process-lifecycle changes, the former on-demand `wine2e/**` selection
 remains available through the canonical harness on an isolated Windows machine:

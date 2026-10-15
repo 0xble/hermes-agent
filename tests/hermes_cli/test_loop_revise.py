@@ -40,6 +40,7 @@ def test_less_active_revision_preserves_lifecycle_and_reanchors(tmp_path, monkey
     state.ticks_fired = 2
     state.last_fired_at = time.time() - 10
     state.awaiting_response = False
+    mgr._save()  # revisions compare against the durable snapshot
     result = mgr.revise(reason="reduce polling", interval_seconds=600, times=3)
     assert result["ok"] is True
     assert result["version"] == 2
@@ -140,6 +141,7 @@ def test_replace_requires_quote_and_preserves_route_in_history(tmp_path, monkeyp
     mgr = _manager(tmp_path, monkeypatch, "replace")
     state = mgr.set("old", interval_seconds=300, times=9, until="old condition", route={"chat_id": "1"})
     state.ticks_fired = 4
+    mgr._save()  # revisions compare against the durable snapshot
     old_created_at = state.created_at
     quote = "Please replace the loop with the deploy verification task"
     result = mgr.replace(
@@ -161,10 +163,11 @@ def test_status_and_wakeup_text_include_revision_guidance(tmp_path, monkeypatch)
     mgr = _manager(tmp_path, monkeypatch, "text")
     state = mgr.set("watch", interval_seconds=300)
     state.next_due_at = time.time() - 1
+    mgr._save()  # revisions compare against the durable snapshot
     quote = "Please slow the loop down while the deploy settles"
     assert mgr.revise(reason="slow down", interval_seconds=600, user_quote="", user_messages=[quote])["ok"] is True
     assert "v2" in mgr.status_line()
-    state.next_due_at = time.time() - 1
+    mgr.state.next_due_at = time.time() - 1
     wakeup = mgr.fire_tick()
     assert wakeup and "loop_set tool (action=revise)" in wakeup
 
@@ -183,10 +186,12 @@ def test_cli_completion_refresh_preserves_mid_wakeup_revision(tmp_path, monkeypa
 
     fake = SimpleNamespace(
         session_id="cli-cache", _loop_manager=mgr, _last_turn_interrupted=False,
+        _last_turn_started=True, _last_turn_result={"completed": True, "final_response": "still working"},
         conversation_history=[{"role": "assistant", "content": "still working"}],
     )
     fake._get_loop_manager = lambda: mgr
     fake._maybe_complete_loop_tick_after_turn = CLILoopsMixin._maybe_complete_loop_tick_after_turn.__get__(fake)
+    fake._post_turn_response = CLILoopsMixin._post_turn_response.__get__(fake)
     fake._last_assistant_response_text = lambda: "still working"
     fake._cprint = lambda *args, **kwargs: None
     with patch("cli._cprint", lambda *args, **kwargs: None), patch("hermes_cli.cli_loops_mixin._print_decision_message", lambda decision: None):

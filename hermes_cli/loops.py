@@ -12,12 +12,16 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER, is_intentional_silence_response
 from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES
+from hermes_cli.loops_revisions import LoopRevisionsMixin
+from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
 
 logger = logging.getLogger(__name__)
 
@@ -323,11 +327,22 @@ class LoopState:
     max_ticks: int = DEFAULT_MAX_TICKS  # config backstop; 0 = unlimited
     ticks_fired: int = 0
     created_at: float = 0.0
+    # Monotonic control fence, owned by ``save_loop``: any write that changes the status or loop
+    # instance, or (outside tick lifecycle) clears/replaces the in-flight tick, bumps it so an
+    # admitted tick cannot cross a control boundary during the executor return gap. Callers never
+    # set it; a cached copy can never write an older value back over the stored row.
+    control_generation: int = 0
     last_fired_at: float = 0.0
     next_due_at: float = 0.0
     # True between "wakeup injected" and "that turn's response evaluated": stops a tick from
     # double-firing mid-turn and tells the post-turn hook the turn that just ended was ours.
     awaiting_response: bool = False
+    # Admission starts the tick in the same stored-row CAS that claims it. Legacy phases also
+    # have unknown outcomes and are skipped on ownerless recovery, never refunded or replayed.
+    claim_phase: str = ""  # started | empty (legacy/unknown)
+    # Gateway session run generation captured by the admission CAS. This is a JSON state field,
+    # not a database schema column, so independent processes compare the same durable row.
+    run_generation: int = 0
     # Definition version the in-flight tick fired with; completion judges against it, so a revise
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
@@ -339,6 +354,8 @@ class LoopState:
     route: Dict[str, str] = field(default_factory=dict)
     # Versioned agent-authored changes; old rows omit this field and load as an empty list.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
+    mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
+    tick_id: str = ""  # survives revisions, changes on every new claim
 
     @property
     def version(self) -> int:
@@ -387,10 +404,35 @@ class LoopState:
 
 
 _META_PREFIX = "loop:"
+# Keyed by (store home, session) so multiplexed profiles never share a fence. Retired loops drop
+# out; the stored row stays authoritative for them and the sync fence treats absence as stale.
+_CONTROL_GENERATIONS: Dict[Tuple[str, str], int] = {}
 
 
 def _meta_key(session_id: str) -> str:
     return f"{_META_PREFIX}{session_id}"
+
+
+def _control_generation_key(session_id: str) -> Tuple[str, str]:
+    from hermes_constants import hermes_home_key
+
+    return hermes_home_key(), session_id
+
+
+def _remember_control_generation(session_id: str, state: Optional[LoopState]) -> None:
+    if not session_id or state is None:
+        return
+    key = _control_generation_key(session_id)
+    if state.status == "cleared":
+        _CONTROL_GENERATIONS.pop(key, None)
+        return
+    current = _CONTROL_GENERATIONS.get(key, 0)
+    _CONTROL_GENERATIONS[key] = max(current, int(getattr(state, "control_generation", 0) or 0))
+
+
+def loop_control_generation(session_id: str, default: Optional[int] = 0) -> Optional[int]:
+    """Return the process-local fence for synchronous gateway execution-entry checks."""
+    return _CONTROL_GENERATIONS.get(_control_generation_key(session_id), default)
 
 
 def _get_session_db() -> Optional[Any]:
@@ -437,13 +479,44 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
         raw = row[0] if row else None
     else:
         raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
-    return _parse_state(raw, session_id) if raw else None
+    state = _parse_state(raw, session_id) if raw else None
+    _remember_control_generation(session_id, state)
+    return state
 
 
-def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
-    """Persist a loop to SessionDB. No-op if DB unavailable."""
+def _next_control_generation(session_id: str, stored: Optional[LoopState], state: LoopState, *,
+                             tick_lifecycle: bool) -> int:
+    """The control fence *state* must carry when it replaces *stored* (the single bump rule).
+
+    The stored row (and this process's fence) is authoritative, never the writer's cached copy,
+    so a stale manager cannot regress the fence. The fence advances when the write changes the
+    status or the loop instance (``created_at``): set, replace, pause, resume, clear, stop
+    verdicts, recovery budget stops and session-reset retirement. Outside the tick lifecycle's own
+    claim/settlement writes it also advances when the in-flight tick is cleared or replaced. A
+    definition-only revise keeps the in-flight tick by design and so leaves the fence alone.
+    """
+    current = max(loop_control_generation(session_id),
+                  int(getattr(stored, "control_generation", 0) or 0))
+    if stored is None:
+        return max(current, int(state.control_generation or 0))
+    changed = stored.status != state.status or stored.created_at != state.created_at
+    if not tick_lifecycle and stored.awaiting_response and (
+        not state.awaiting_response or stored.ticks_fired != state.ticks_fired
+    ):
+        changed = True
+    return current + 1 if changed else current
+
+
+def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None,
+              tick_lifecycle: bool = False, apply=None):
+    """Write a loop or apply a command to the current row under the same control fence.
+
+    Command callbacks validate and edit only their owned fields on the live row. They may
+    be replayed on lock contention and must not mutate a manager's cached state. Return the
+    persisted row and command result only after a successful write; cursor owners see errors.
+    """
     if not session_id:
-        return
+        return None
     db = _get_session_db()
     if db is None:
         if cursor is not None:
@@ -451,20 +524,53 @@ def save_loop(session_id: str, state: LoopState, *, cursor=None) -> None:
         from hermes_cli.goals import _warn_dropped_write
 
         _warn_dropped_write("LoopManager", "loop", session_id)
-        return
-    if cursor is not None:
-        # Transaction owners must see failures, not report an unapplied control as successful.
-        db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
-    else:
-        _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
+        return None
+    key = _meta_key(session_id)
+
+    def write(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+        stored = _parse_state(row[0]) if row and row[0] else None
+        original = stored.to_json() if stored is not None else None
+        live = _parse_state(original) if original is not None else None
+        result = apply(live) if apply is not None else None
+        updated = live if apply is not None else state
+        if updated is not None and (apply is None or updated.to_json() != original):
+            updated.control_generation = _next_control_generation(
+                session_id, stored, updated, tick_lifecycle=tick_lifecycle)
+            # Every durable write gets a fresh token so snapshot CAS detects same-value (ABA) changes.
+            updated.mutation_id = uuid.uuid4().hex
+            db.set_meta(key, updated.to_json(), cursor=conn)
+        return updated, result
+
+    # Transaction owners must see failures, not acknowledge an unapplied control.
+    saved = write(cursor) if cursor is not None else _db_op(
+        "set_meta", lambda: db._execute_write(write))
+    if saved is not None:
+        _remember_control_generation(session_id, saved[0])
+    return saved
+
+
+def _overlay(live: LoopState, staged: LoopState) -> None:
+    """Copy a staged loop onto the live row; ``save_loop`` still assigns the writer-owned tokens."""
+    snapshot = LoopState.from_json(staged.to_json())
+    for item in fields(LoopState):
+        setattr(live, item.name, getattr(snapshot, item.name))
+
+
+def _tick_outcome_applies(stored: Optional[LoopState], instance: Any, fired_ticks: int,
+                          expected_phase: Optional[str] = None, owns_turn=None) -> bool:
+    """The one fence for every tick outcome: still this in-flight tick, and no live owner."""
+    return bool(
+        stored is not None and stored.status == "active" and stored.awaiting_response
+        and stored.created_at == instance and stored.ticks_fired == fired_ticks
+        and (expected_phase is None or stored.claim_phase == expected_phase)
+        and (owns_turn is None or not owns_turn())
+    )
 
 
 def clear_loop(session_id: str) -> None:
-    """Mark a loop cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_loop(session_id)
-    if state is not None:
-        state.status = "cleared"
-        save_loop(session_id, state)
+    """Retire the current loop without overwriting a concurrent definition or tick."""
+    LoopManager(session_id).clear()
 
 
 def list_active_loops() -> List[Tuple[str, LoopState]]:
@@ -507,11 +613,31 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared" or load_loop(new_session_id) is not None:
+        db = _get_session_db()
+        if db is None:
             return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
+        state = load_loop(old_session_id)
+        if state is None or state.status == "cleared":
+            return False
+        expected = state.to_json()
+
+        def migrate(conn):
+            # A control or settlement after discovery wins; never copy stale active state onto
+            # the child or clear a newer parent. Both writes share this stored-row transaction.
+            current = load_loop(old_session_id, cursor=conn)
+            if (current is None or current.to_json() != expected
+                    or conn.execute("SELECT value FROM state_meta WHERE key = ?",
+                                    (_meta_key(new_session_id),)).fetchone() is not None):
+                return False
+            save_loop(new_session_id, current, cursor=conn)
+            retired = LoopState.from_json(expected)
+            retired.status = "cleared"
+            retired.awaiting_response = False
+            save_loop(old_session_id, retired, cursor=conn)
+            return True
+
+        if not db._execute_write(migrate):
+            return False
         logger.debug(
             "LoopManager: migrated loop %s -> %s (%s)",
             old_session_id, new_session_id, reason or "rotation",
@@ -550,7 +676,7 @@ def _digest_response(response: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
-class LoopManager:
+class LoopManager(LoopRevisionsMixin):
     """Per-session /loop state + tick decisions.
 
     Drivers call ``set``/``pause``/``resume``/``clear`` for user controls, ``is_due()`` (cheap,
@@ -559,6 +685,7 @@ class LoopManager:
     """
 
     def __init__(self, session_id: str, *, cursor=None):
+        self._snapshot_lock = threading.RLock()
         self.session_id = session_id
         self._cursor = cursor
         self._state: Optional[LoopState] = (
@@ -573,18 +700,20 @@ class LoopManager:
         (pause/resume, revise, cadence change) rescheduled the loop since, and that schedule wins
         over this manager's cached copy."""
         self._synced_due_at = self._state.next_due_at if self._state is not None else None
+        self._synced_json = self._state.to_json() if self._state is not None else None
 
     @property
     def state(self) -> Optional[LoopState]:
         return self._state
 
+    @snapshot_control
     def refresh(self) -> None:
         """Re-read state from the DB (cross-process safety for the gateway).
 
         A failed read also yields None; keep the cached state then, or a transient DB error during a
         wakeup would drop ``awaiting_response`` handling and wedge the tick. Rows are never deleted
         (stop marks them cleared), so None with a cached state means the read failed."""
-        fresh = load_loop(self.session_id)
+        fresh = self._load()
         if fresh is not None or self._state is None:
             self._state = fresh
             self._mark_synced()
@@ -595,12 +724,58 @@ class LoopManager:
     def has_loop(self) -> bool:
         return self._state is not None and self._state.status in {"active", "paused"}
 
-    def _save(self) -> LoopState:
-        if self._cursor is None:
-            save_loop(self.session_id, self._state)
-        else:
-            save_loop(self.session_id, self._state, cursor=self._cursor)
+    def _load(self) -> Optional[LoopState]:
+        # A cursor owner holds the write lock; reading outside it would block on that same lock.
+        return (load_loop(self.session_id) if self._cursor is None
+                else load_loop(self.session_id, cursor=self._cursor))
+
+    def _mutate_current(self, apply, *, failure=None, tick_lifecycle: bool = False) -> Any:
+        """Run one command against the stored row, then publish only the durable winner.
+
+        ``apply`` validates and edits the live row inside the write transaction and returns the
+        command result; it may be replayed on lock contention. The shared snapshot boundary then
+        adopts the committed row unless a newer same-manager command already published, so a
+        rejected command still refreshes this manager. A failed write publishes nothing and
+        returns ``failure``; cursor owners see the error instead.
+        """
+        from hermes_cli.loops_snapshot import LoopPersistenceError
+
+        if not self.session_id:
+            return apply(self._state)  # intentionally ephemeral: there is no stored row
+        written = []
+
+        def commit() -> Optional[LoopState]:
+            saved = save_loop(self.session_id, cursor=self._cursor, apply=apply,
+                              tick_lifecycle=tick_lifecycle)
+            if saved is None:
+                raise LoopPersistenceError("loop write failed")
+            written.append(saved)
+            return saved[0]
+
+        try:
+            # Rows are never deleted, so a failed winner read keeps the committed row.
+            commit_and_publish_snapshot(self, None, commit, lambda: self._load() or written[-1][0])
+        except LoopPersistenceError:
+            return failure
         self._mark_synced()
+        return written[-1][1]
+
+    def _save(self) -> Optional[LoopState]:
+        """Legacy snapshot edits are CAS-only; commands use ``_mutate_current``."""
+        snapshot = getattr(self, "_evaluation_snapshot", None)
+        if snapshot is not None:
+            # Staged settlement/revision: the snapshot CAS commits, never this direct write.
+            from hermes_cli.loops_snapshot import assert_loop_snapshot
+            db, expected = snapshot
+            assert_loop_snapshot(self.session_id, expected, db, cursor=self._cursor)
+            return self._state
+        candidate = self._state
+
+        def apply(stored):
+            if stored is not None and stored.to_json() == self._synced_json and candidate is not None:
+                _overlay(stored, candidate)
+
+        self._mutate_current(apply)
         return self._state
 
     def status_line(self) -> str:
@@ -628,6 +803,7 @@ class LoopManager:
             return f"✓ Loop finished ({version}{fired}{_dash(s.last_stop_reason)}): {s.prompt}"
         return f"Loop ({s.status}, {version}{meta}): {s.prompt}"
 
+    @snapshot_control
     def set(
         self,
         prompt: str,
@@ -666,316 +842,57 @@ class LoopManager:
             next_due_at=now,
             route=dict(route or {}),
         )
-        self._state = state
-        return self._save()
+        if not self.session_id:
+            self._state = state  # intentionally ephemeral
+            return state
 
-    @staticmethod
-    def _revision_result(*, ok: bool, revision: Optional[Dict[str, Any]], version: int,
-                         error_code: str = "", error: str = "") -> Dict[str, Any]:
-        return {
-            "ok": ok,
-            "error_code": error_code,
-            "error": error,
-            "revision": revision,
-            "version": version,
-        }
+        def commit() -> LoopState:
+            saved = save_loop(self.session_id, state, cursor=self._cursor)
+            if saved is None:
+                raise ValueError("loop could not be saved")
+            return saved[0]
 
-    def _revision_quote(self, state: LoopState, user_quote: str,
-                        user_messages: Optional[List[str]], *, required: bool) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
-        """Validate a verbatim user quote using the goal lifecycle's shared source rules."""
-        from hermes_cli.goals import (
-            _REVISION_QUOTE_MIN_CHARS,
-            _REVISION_SOURCE_MAX_CHARS,
-            user_messages_since,
-        )
+        commit_and_publish_snapshot(self, None, commit, lambda: self._load() or state)
+        self._mark_synced()
+        return self._state
 
-        quote = " ".join((user_quote or "").split())
-        if required and not quote:
-            return None, "user_authority_required", {
-                "error": (
-                    f"this change needs user_quote: a verbatim excerpt "
-                    f"({_REVISION_QUOTE_MIN_CHARS}+ chars) of the user's instruction in this session"
-                )
-            }
-        if not quote:
-            return "", None, None
-        if len(quote) < _REVISION_QUOTE_MIN_CHARS:
-            return None, "user_quote_too_short", {
-                "error": f"user_quote must be at least {_REVISION_QUOTE_MIN_CHARS} characters"
-            }
-        pool = user_messages if user_messages is not None else user_messages_since(
-            self.session_id, state.created_at
-        )
-        sources = [" ".join(message.split()) for message in pool if quote in " ".join(message.split())]
-        if not sources:
-            return None, "user_quote_not_found", {
-                "error": "user_quote does not match any user message sent since the loop was set"
-            }
-        source = next((message for message in sources if len(message) <= _REVISION_SOURCE_MAX_CHARS), "")
-        if not source:
-            return None, "user_message_too_long", {
-                "error": (
-                    f"the quoted user message exceeds {_REVISION_SOURCE_MAX_CHARS} characters, too long to "
-                    "judge whether it authorizes this change; ask the user to state the change in a short "
-                    "message and quote that"
-                )
-            }
-        return quote, None, {"user_message": source}
-
-    def revise(
-        self,
-        *,
-        reason: str,
-        actor: str = "agent",
-        prompt: Optional[str] = None,
-        interval_seconds: Optional[int] = None,
-        self_paced: bool = False,
-        times: Optional[int] = None,
-        until: Optional[str] = None,
-        user_quote: str = "",
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """Apply a versioned, authority-checked edit to the existing loop."""
-        state = self._state
-        version = state.version if state is not None else 1
-        reason = (reason or "").strip()
-        if not reason:
-            return self._revision_result(
-                ok=False, revision=None, version=version,
-                error_code="reason_required", error="a revision needs a reason",
-            )
-        if state is None or state.status not in {"active", "paused"}:
-            return self._revision_result(
-                ok=False, revision=None, version=version,
-                error_code="no_loop", error="there is no active or paused loop to revise",
-            )
-        if interval_seconds is not None and self_paced:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code="invalid_cadence",
-                error="interval_seconds and self_paced are mutually exclusive",
-            )
-
-        before = {
-            "prompt": state.prompt,
-            "mode": state.mode,
-            "interval_seconds": state.interval_seconds,
-            "current_delay": state.current_delay,
-            "times": state.times,
-            "until": state.until,
-        }
-        after = dict(before)
-        clamped_from: Optional[int] = None
-        if prompt is not None:
-            new_prompt = (prompt or "").strip()
-            if new_prompt:
-                after["prompt"] = new_prompt
-        if interval_seconds is not None:
-            requested = int(interval_seconds)
-            applied = max(requested, min_interval_seconds())
-            clamped_from = requested if applied != requested else None
-            after.update({
-                "mode": "interval",
-                "interval_seconds": float(applied),
-                "current_delay": float(applied),
-            })
-        elif self_paced:
-            floor = float(self_paced_floor_seconds())
-            after.update({"mode": "self_paced", "interval_seconds": 0.0, "current_delay": floor})
-        if times is not None:
-            after["times"] = max(0, int(times))
-        if until is not None:
-            after["until"] = (until or "").strip()
-
-        changed = [key for key in before if after[key] != before[key]]
-        if not changed:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code="no_change", error="the revision changes nothing",
-            )
-
-        current_effective_delay = (
-            state.interval_seconds if state.mode == "interval"
-            else (state.current_delay or float(self_paced_floor_seconds()))
-        )
-        new_effective_delay = (
-            after["interval_seconds"] if after["mode"] == "interval"
-            else (after["current_delay"] or float(self_paced_floor_seconds()))
-        )
-        # Switching to self-paced starts at the floor, so it is faster whenever the floor is below the
-        # current delay; it gets the same authority check as any other cadence change.
-        faster = new_effective_delay < current_effective_delay
-        raising_times = (
-            "times" in changed
-            and state.times > 0
-            and (after["times"] == 0 or after["times"] > state.times)
-        )
-        needs_authority = (
-            ("prompt" in changed)
-            or ("until" in changed)
-            or faster
-            or raising_times
-        )
-        quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority
-        )
-        if quote_error:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
-            )
-
-        now = time.time()
-        revision = {
-            "at": now,
-            "actor": actor,
-            "reason": reason,
-            "user_quote": quote or "",
-            "user_message": (quote_detail or {}).get("user_message", "") if quote else "",
-            "before": {key: before[key] for key in changed},
-            "after": {key: after[key] for key in changed},
-        }
-        if clamped_from is not None:
-            revision["clamped"] = {
-                "interval_seconds": clamped_from,
-                "applied": after["interval_seconds"],
-            }
-        for key in changed:
-            setattr(state, key, after[key])
-        if any(key in changed for key in ("mode", "interval_seconds", "current_delay")):
-            if not state.awaiting_response:
-                state.next_due_at = max(
-                    now,
-                    (state.last_fired_at or now) + new_effective_delay,
-                )
-        state.revisions.append(revision)
-        self._save()
-        return self._revision_result(
-            ok=True, revision=revision, version=state.version,
-        )
-
-    def replace(
-        self,
-        *,
-        prompt: str,
-        interval_seconds: Optional[int] = None,
-        times: int = 0,
-        until: str = "",
-        route: Optional[Dict[str, str]] = None,
-        reason: str,
-        user_quote: str,
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """Replace the loop definition while preserving its revision history and route."""
-        state = self._state
-        version = state.version if state is not None else 1
-        reason = (reason or "").strip()
-        if not reason:
-            return self._revision_result(
-                ok=False, revision=None, version=version,
-                error_code="reason_required", error="a replacement needs a reason",
-            )
-        if state is None or state.status not in {"active", "paused"}:
-            return self._revision_result(
-                ok=False, revision=None, version=version,
-                error_code="no_loop", error="there is no active or paused loop to replace",
-            )
-        prompt = (prompt or "").strip()
-        if not prompt:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code="no_change", error="replacement prompt is empty",
-            )
-        quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=True
-        )
-        if quote_error:
-            return self._revision_result(
-                ok=False, revision=None, version=state.version,
-                error_code=quote_error, error=(quote_detail or {}).get("error", "invalid user quote"),
-            )
-        now = max(time.time(), state.created_at + 1e-6)
-        self_paced = interval_seconds is None
-        interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
-        new_times = max(0, int(times or 0))
-        new_until = (until or "").strip()
-        old_snapshot = {
-            "prompt": state.prompt,
-            "mode": state.mode,
-            "interval_seconds": state.interval_seconds,
-            "current_delay": state.current_delay,
-            "times": state.times,
-            "until": state.until,
-            "ticks_fired": state.ticks_fired,
-        }
-        new_snapshot = {
-            "prompt": prompt,
-            "mode": "self_paced" if self_paced else "interval",
-            "interval_seconds": interval,
-            "current_delay": float(self_paced_floor_seconds()) if self_paced else interval,
-            "times": new_times,
-            "until": new_until,
-            "ticks_fired": 0,
-        }
-        revision = {
-            "at": now,
-            "actor": "agent",
-            "reason": reason,
-            "user_quote": quote or "",
-            "user_message": (quote_detail or {}).get("user_message", "") if quote else "",
-            "kind": "replace",
-            "before": old_snapshot,
-            "after": new_snapshot,
-        }
-        old_route = dict(state.route)
-        # Resume is a user-only control: a replaced paused loop stays paused (with its reason) until /loop resume.
-        was_paused = state.status == "paused"
-        state.prompt = prompt
-        state.status = "paused" if was_paused else "active"
-        state.mode = new_snapshot["mode"]
-        state.interval_seconds = interval
-        state.current_delay = new_snapshot["current_delay"]
-        state.times = new_times
-        state.until = new_until
-        state.max_ticks = max_ticks_default()
-        state.ticks_fired = 0
-        state.created_at = now
-        state.last_fired_at = 0.0
-        state.next_due_at = now
-        state.awaiting_response = False
-        state.last_response_digest = ""
-        if not was_paused:
-            state.paused_reason = None
-        state.last_stop_reason = None
-        state.route = dict(old_route if route is None else route)
-        state.revisions.append(revision)
-        self._save()
-        return self._revision_result(ok=True, revision=revision, version=state.version)
-
+    @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
-        s = self._state
-        if not s or s.status not in {"active", "paused"}:
-            return None
-        s.status, s.paused_reason, s.awaiting_response = "paused", reason, False
-        return self._save()
+        def apply(state):
+            if state is None or state.status not in {"active", "paused"}:
+                return None
+            state.status, state.paused_reason, state.awaiting_response = "paused", reason, False
+            return state
 
+        return self._mutate_current(apply)
+
+    @snapshot_control
     def resume(self) -> Optional[LoopState]:
-        s = self._state
-        if not s or s.status == "cleared":
-            return None
-        s.status, s.paused_reason, s.awaiting_response = "active", None, False
-        # Re-arm relative to now so a long pause doesn't fire instantly N times.
-        delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
-        s.next_due_at = time.time() + min(delay, 5.0)
-        return self._save()
+        def apply(state):
+            if state is None or state.status == "cleared":
+                return None
+            state.status, state.paused_reason, state.awaiting_response = "active", None, False
+            # Re-arm relative to now so a long pause doesn't fire instantly N times.
+            delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
+            state.next_due_at = time.time() + min(delay, 5.0)
+            return state
 
+        return self._mutate_current(apply)
+
+    @snapshot_control
     def clear(self) -> bool:
-        if self._state is None or self._state.status == "cleared":
-            return False
-        self._state.status = "cleared"
-        self._save()
-        self._state = None
-        return True
+        def apply(state):
+            if state is None or state.status == "cleared":
+                return False
+            state.status = "cleared"
+            state.awaiting_response = False
+            return True
+
+        cleared = self._mutate_current(apply, failure=False)
+        if cleared:
+            self._state = None
+            self._mark_synced()
+        return bool(cleared)
 
     def is_due(self, now: Optional[float] = None) -> bool:
         """Cheap check: active, not mid-wakeup, and the clock has passed."""
@@ -985,12 +902,12 @@ class LoopManager:
             and (now if now is not None else time.time()) >= s.next_due_at
         )
 
-    def fire_tick(self) -> Optional[str]:
-        """Claim a due tick; returns the message to inject, or None.
+    @snapshot_control
+    def fire_tick(self, run_generation: int = 0, *, can_claim=None) -> Optional[str]:
+        """Atomically claim and start a due tick before any wake preparation or effects.
 
-        The message is the wakeup-framed prompt, or the raw command when the loop's prompt is
-        itself a slash command (``/loop 10m /recap``). Marks ``awaiting_response`` so the tick
-        can't double-fire; drivers MUST follow up with ``complete_tick`` (or ``abandon_tick``).
+        Admission consumes the tick even if delivery or execution is interrupted. The stored
+        row owns the exact run token. Failed admission runs no work and needs no refund.
         """
         s = self._state
         if s is None or not self.is_due():
@@ -998,15 +915,18 @@ class LoopManager:
 
         def claim(state: LoopState) -> None:
             state.ticks_fired += 1
+            state.tick_id = uuid.uuid4().hex  # survives revisions, changes on every claim
             state.last_fired_at = time.time()
             state.awaiting_response = True
+            state.claim_phase = "started"
+            state.run_generation = int(run_generation)
             state.fired_version = state.version
             # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
             # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
             state.next_due_at = state.last_fired_at + (
                 state.current_delay or state.interval_seconds or self_paced_floor_seconds())
 
-        if not self._claim_tick(claim):
+        if not self._claim_tick(claim, can_claim=can_claim):
             return None
         s = self._state
 
@@ -1016,55 +936,50 @@ class LoopManager:
         template = WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE if s.until else WAKEUP_PROMPT_TEMPLATE
         return template.format(tick=s.ticks_fired, cadence=cadence, prompt=s.prompt, until=s.until)
 
-    def _claim_tick(self, claim) -> bool:
+    def _claim_tick(self, claim, *, can_claim=None) -> bool:
         """Claim the due tick on the stored loop inside one write transaction.
 
         A scheduler loads its manager before awaiting the executor that fires the tick, so a pause,
         stop, revise or re-set can commit in between; saving the cached copy would resurrect it. The
-        claim applies only while the stored row is still this loop instance, active and idle. A
+        claim applies only while the stored row is still this loop instance, active, idle and at the
+        cached control generation (compare-and-swap): a control another manager committed since this
+        one loaded rejects the claim and refreshes the cache, never writing the stale fence back. A
         revise in between fires the stored (revised) definition; otherwise the caller's copy fires."""
         s = self._state
-        db = _get_session_db() if self._cursor is None else None
-        if db is None:
+        # An unbound manager is intentionally ephemeral: there is no stored row to fence against.
+        db = _get_session_db() if self._cursor is None and self.session_id else None
+        if db is None and self._cursor is None:
+            if can_claim is not None and not can_claim():
+                return False
             claim(s)
-            self._save()
+            save_loop(self.session_id, s, tick_lifecycle=True)
+            self._mark_synced()
             return True
 
-        def write(conn) -> Optional[LoopState]:
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
-            ).fetchone()
-            stored = _parse_state(row[0]) if row and row[0] else None
+        def apply(stored: Optional[LoopState]) -> bool:
             if (
                 stored is None or stored.status != "active" or stored.awaiting_response
+                or (can_claim is not None and not can_claim())
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
+                or stored.control_generation != s.control_generation
             ):
-                return None
+                return False
             # Another writer's schedule since this manager's last sync governs: a revise,
             # pause/resume or cadence change can postpone the tick. A revise since load fires the
             # stored definition.
             rescheduled = stored.next_due_at != self._synced_due_at or stored.version != s.version
             if rescheduled and time.time() < stored.next_due_at:
-                return None
-            base = s if stored.version == s.version else stored
-            claimed = _parse_state(base.to_json())
+                return False
+            claimed = _parse_state((s if stored.version == s.version else stored).to_json())
             claim(claimed)
-            save_loop(self.session_id, claimed, cursor=conn)
-            return claimed
+            _overlay(stored, claimed)
+            return True
 
-        try:
-            claimed = db._execute_write(write)
-        except Exception as exc:
-            logger.debug("LoopManager: tick claim write failed: %s", exc)
-            return False
-        if claimed is None:
-            self.refresh()
-            return False
-        self._state = claimed
-        self._mark_synced()
-        return True
+        # A cursor owner already holds the write transaction: the same guarded stored-row check
+        # runs through it, and its failures propagate as save_loop(cursor=...) does.
+        return bool(self._mutate_current(apply, failure=False, tick_lifecycle=True))
 
-    def _save_tick_outcome(self, fired_ticks: int, settle) -> bool:
+    def _save_tick_outcome(self, fired_ticks: int, settle, *, expected_phase=None, owns_turn=None) -> bool:
         """Settle the fired tick on the stored loop inside one write transaction.
 
         A user or cross-session pause, stop, resume, replace or re-set can land while the tick's
@@ -1074,57 +989,42 @@ class LoopManager:
         the tick in flight by design, so ``settle`` runs against the stored row and the revised
         definition survives while the tick still clears awaiting_response."""
         s = self._state
-        db = _get_session_db() if self._cursor is None else None
+        if getattr(self, "_evaluation_snapshot", None) is not None:
+            # Staged by mutate_loop_snapshot: the snapshot CAS is the conditional write, and the
+            # staged copy is the snapshot it validates, so the same outcome fence applies to it.
+            if not _tick_outcome_applies(s, getattr(s, "created_at", None), fired_ticks,
+                                         expected_phase, owns_turn):
+                return False
+            settle(s)
+            return True
+        db = _get_session_db() if self._cursor is None and self.session_id else None
         if s is None:
             return False
-        if db is None:
+        if db is None and self._cursor is None:
             settle(s)
-            self._save()
+            save_loop(self.session_id, s, tick_lifecycle=True)
+            self._mark_synced()
             return True
 
-        def write(conn) -> Optional[LoopState]:
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
-            ).fetchone()
-            stored = _parse_state(row[0]) if row and row[0] else None
-            if (
-                stored is None or stored.status != "active" or not stored.awaiting_response
-                or stored.created_at != s.created_at or stored.ticks_fired != fired_ticks
-            ):
-                return None
-            settle(stored)
-            save_loop(self.session_id, stored, cursor=conn)
-            return stored
+        instance = s.created_at
 
-        try:
-            settled = db._execute_write(write)
-        except Exception as exc:
-            logger.debug("LoopManager: tick outcome write failed: %s", exc)
-            return False
-        if settled is None and self._follow_compression():
-            # Compression migrated the loop (verbatim, same instance and tick) after this manager
-            # loaded it; the claim now lives on the continuation. Settle it there, under the same
-            # conditional fence, so an abandoned or completed tick never strands the child at
-            # awaiting_response. A user pause or stop on the child still rejects the outcome.
-            try:
-                settled = db._execute_write(write)
-            except Exception as exc:
-                logger.debug("LoopManager: tick outcome write failed: %s", exc)
+        def apply(stored: Optional[LoopState]) -> bool:
+            if not _tick_outcome_applies(stored, instance, fired_ticks, expected_phase, owns_turn):
                 return False
-        if settled is None:
-            self.refresh()
-            return False
-        self._state = settled
-        self._mark_synced()
-        return True
+            settle(stored)
+            return True
+
+        if self._mutate_current(apply, failure=False, tick_lifecycle=True):
+            return True
+        # Compression migrated the loop (verbatim, same instance and tick) after this manager
+        # loaded it; the claim now lives on the continuation. Settle it there, under the same
+        # conditional fence, so an abandoned or completed tick never strands the child at
+        # awaiting_response. A user pause or stop on the child still rejects the outcome.
+        return self._follow_compression() and bool(
+            self._mutate_current(apply, failure=False, tick_lifecycle=True))
 
     def _follow_compression(self) -> bool:
-        """Rebind this manager to the compression continuation that now owns its loop.
-
-        ``migrate_loop_to_session`` copies the row verbatim and archives the parent as cleared,
-        so a manager loaded before the rotation would otherwise settle against the archived row.
-        Only a validated compression successor holding the same loop instance qualifies; a fork,
-        a user stop (no successor row), or an ambiguous lineage leaves the manager unchanged."""
+        """Rebind this manager to a verified compression continuation holding the same loop."""
         s = self._state
         if s is None or self._cursor is not None:
             return False
@@ -1143,35 +1043,78 @@ class LoopManager:
         return {"status": s.status if s else None, "stopped": False,
                 "reason": "loop changed during the tick", "message": ""}
 
-    def abandon_tick(self, *, tick: Optional[Tuple[float, int]] = None) -> None:
-        """Roll back a fired tick whose turn never ran.
+    @snapshot_control
+    def abandon_tick(self, *, tick: Optional[Tuple[Any, Any]] = None, owns_turn=None) -> bool:
+        """Release a pre-start claim, or skip a started tick without replaying it.
 
-        ``tick`` fences the rollback to the wake that is being abandoned. Without that fence, a
-        stale early-exit handler could undo a newer tick claimed after the original wake was queued.
+        ``fire_tick`` normally claims and starts in one CAS, so admission failures after that
+        boundary must clear ``awaiting_response`` while retaining ``ticks_fired``. The legacy
+        ``claimed`` phase remains refundable for recovery of rows written before the atomic CAS.
         """
         s = self._state
         if s is None or not s.awaiting_response:
-            return
+            return False
         if tick is not None:
             try:
                 instance, fired = tick
             except (TypeError, ValueError):
-                return
+                return False
             if s.created_at != instance or s.ticks_fired != fired:
                 if not self._follow_compression():
-                    return
+                    return False
                 s = self._state
-                if s is None or not s.awaiting_response or s.created_at != instance or s.ticks_fired != fired:
-                    return
-        else:
-            fired = s.ticks_fired
+                if s is None or not s.awaiting_response:
+                    return False
+                if s.created_at != instance or s.ticks_fired != fired:
+                    return False
+        fired = s.ticks_fired
+        phase = s.claim_phase
+        if phase not in {"claimed", "started", ""}:
+            return False
 
         def settle(state: LoopState) -> None:
             state.awaiting_response = False
-            state.ticks_fired = max(0, fired - 1)
-            state.next_due_at = time.time()
+            if phase == "claimed":
+                state.ticks_fired = max(0, fired - 1)  # legacy pre-start claim: nothing ran
+            # Deterministic caps also govern a released tick (a revise may have lowered them).
+            cap = self._cap_stop(state)
+            if cap is not None:
+                self._apply_stop(state, cap[0], cap[1])
+            elif phase == "claimed":
+                state.next_due_at = time.time()
+            else:
+                self._settle_continue(state, "", time.time())
 
-        self._save_tick_outcome(fired, settle)
+        return self._save_tick_outcome(fired, settle, expected_phase=phase, owns_turn=owns_turn)
+
+    def _tick_execution_current(self, tick: Tuple[Any, Any], *, control_generation: int,
+                                run_generation: int) -> bool:
+        """Read the stored admission fence off-loop before each effect producer."""
+        s = load_loop(self.session_id)
+        return bool(
+            s is not None and s.status == "active" and s.awaiting_response
+            and (s.created_at, s.ticks_fired) == tick and s.claim_phase == "started"
+            and s.control_generation == int(control_generation)
+            and s.run_generation == int(run_generation)
+        )
+
+    def recover_tick(self, *, owns_turn=None) -> str:
+        """Skip an ownerless interrupted tick and schedule its successor, never replay it."""
+        s = self._state
+        if s is None or not s.awaiting_response:
+            return ""
+        reason = "interrupted loop tick skipped: execution outcome unknown"
+
+        def skip(state):
+            cap = self._cap_stop(state)
+            if cap is not None:
+                self._apply_stop(state, cap[0], cap[1])
+            else:
+                self._settle_continue(state, "", time.time())
+
+        return reason if self._save_tick_outcome(
+            s.ticks_fired, skip, expected_phase=s.claim_phase, owns_turn=owns_turn,
+        ) else ""
 
     @staticmethod
     def _cap_stop(state: LoopState) -> Optional[Tuple[str, str, str]]:
@@ -1252,6 +1195,14 @@ class LoopManager:
         state.next_due_at = now + state.current_delay
 
     def complete_tick(self, last_response: str, *, tick: Optional[Tuple[Any, Any]] = None) -> Dict[str, Any]:
+        """Settle the finished wakeup turn through the durable snapshot/CAS boundary.
+
+        A superseded verdict cannot overwrite a newer durable state; see ``_complete_tick``.
+        """
+        from hermes_cli.loops_snapshot import mutate_loop_snapshot
+        return mutate_loop_snapshot(self, "_complete_tick", last_response, tick=tick)
+
+    def _complete_tick(self, last_response: str, *, tick: Optional[Tuple[Any, Any]] = None) -> Dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         ``tick`` is the ``(loop instance, ticks_fired)`` the completed turn's wake carried. A fresh
@@ -1297,6 +1248,7 @@ class LoopManager:
 
                 verdict, reason, _pf, _wait, _tf = judge_goal(s.until, last_response)
             except Exception as exc:
+                logger.warning("Loop stop-condition judge unavailable", exc_info=True)
                 verdict, reason = "continue", f"judge unavailable: {type(exc).__name__}"
             if verdict == "done":
                 return self._stop("done", f"stop condition met: {reason}",
@@ -1326,6 +1278,17 @@ class LoopManager:
         if cap is not None:
             return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
+
+
+def enforce_loop_run_cap(state: LoopState) -> Optional[Dict[str, Any]]:
+    """Apply deterministic budgets without judging an obsolete or absent reply."""
+    if state.status != "active":
+        return None
+    cap = LoopManager._cap_stop(state)
+    if cap is None:
+        return None
+    LoopManager._apply_stop(state, cap[0], cap[1])
+    return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
 
 
 def goal_blocks_loop_tick(session_id: str) -> bool:
@@ -1437,7 +1400,8 @@ def dispatch_loop_command(
 __all__ = [
     "LoopState", "LoopManager", "parse_loop_args", "parse_interval_token", "format_interval",
     "response_signals_complete", "goal_blocks_loop_tick", "load_loop", "save_loop", "clear_loop",
-    "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "LOOP_COMPLETE_MARKER",
+    "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "loop_control_generation",
+    "LOOP_COMPLETE_MARKER",
     "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",
     "DEFAULT_MAX_TICKS", "is_quiet_wakeup_prompt",
 ]

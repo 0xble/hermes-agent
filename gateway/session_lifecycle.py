@@ -194,6 +194,7 @@ class SessionLifecycleMixin:
                     else:
                         entry.resume_reason = "restart_interrupted"
                         entry.resume_marker_token = uuid.uuid4().hex
+                        entry.resume_predecessor_turn_id = entry.resume_turn_id
                         entry.resume_turn_id = entry.active_turn_token
                         entry.resume_human = bool(entry.active_turn_human)
                         entry.restart_note_reconcile_attempts = 0
@@ -203,6 +204,7 @@ class SessionLifecycleMixin:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_predecessor_turn_id = None
                     entry.resume_turn_id = entry.active_turn_token
                     entry.resume_human = bool(entry.active_turn_human)
                     # Notes are append-only: a newly discovered interruption gets a new marker
@@ -259,17 +261,20 @@ class SessionLifecycleMixin:
                 marked.append(session_key)
                 human = bool(human)
                 same_turn = bool(turn_id and entry.resume_pending and entry.resume_turn_id == turn_id)
+                previous_resume_turn_id = entry.resume_turn_id if entry.resume_pending else None
                 if same_turn and entry.resume_reason == reason and entry.resume_human == human:
                     continue
                 previous.append((entry, (
                     entry.resume_pending, entry.resume_reason, entry.resume_human,
-                    entry.resume_marker_token, entry.resume_turn_id, entry.last_resume_marked_at,
+                    entry.resume_marker_token, entry.resume_turn_id,
+                    entry.resume_predecessor_turn_id, entry.last_resume_marked_at,
                 )))
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.resume_human = human
                 if not same_turn:
                     entry.resume_marker_token = uuid.uuid4().hex
+                    entry.resume_predecessor_turn_id = previous_resume_turn_id
                     entry.resume_turn_id = turn_id
                     # A successor owns a new note; predecessor records stay durable and visible.
                     entry.last_resume_marked_at = _now()
@@ -281,7 +286,8 @@ class SessionLifecycleMixin:
                     for entry, state in reversed(previous):
                         (
                             entry.resume_pending, entry.resume_reason, entry.resume_human,
-                            entry.resume_marker_token, entry.resume_turn_id, entry.last_resume_marked_at,
+                            entry.resume_marker_token, entry.resume_turn_id,
+                            entry.resume_predecessor_turn_id, entry.last_resume_marked_at,
                         ) = state
                     raise
         return marked
@@ -538,6 +544,7 @@ class SessionLifecycleMixin:
             entry.resume_reason = None
             entry.resume_marker_token = None
             entry.resume_turn_id = None
+            entry.resume_predecessor_turn_id = None
             entry.resume_human = True
             entry.last_resume_marked_at = None
         return self._update_entry(session_key, _apply)
