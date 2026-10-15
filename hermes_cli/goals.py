@@ -141,7 +141,11 @@ def goal_authoring_required_effects(text: str) -> set[str]:
             while match:
                 # A marker in an earlier subclause asks about that subclause;
                 # a later clause may still independently require a mutation.
-                boundaries = list(_GOAL_AUTHORING_END_STATE_BOUNDARY_RE.finditer(clause, 0, match.start()))
+                boundaries = [boundary for boundary in _GOAL_AUTHORING_END_STATE_BOUNDARY_RE.finditer(
+                    clause, 0, match.start()
+                ) if not re.match(
+                    r"(?i)\s*(?:is|are|be|been|gets?)\b", clause[boundary.end():]
+                )]
                 segment_start = boundaries[-1].end() if boundaries else 0
                 if not _GOAL_AUTHORING_EMBEDDED_RE.search(clause[segment_start:match.start()]):
                     effects.add(effect)

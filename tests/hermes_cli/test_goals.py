@@ -257,6 +257,8 @@ class TestGoalManager:
         ("Verify that the backup is written nightly", ""),
         ("List files that were removed last week", ""),
         ("Identify what should be deleted", ""),
+        ("Check whether the migration is deployed and the backup is written", ""),
+        ("Report which topics are sent and are deleted", ""),
     ])
     def test_goal_authoring_allows_read_only_investigations(self, goal, outcome):
         from hermes_cli.goals import goal_authoring_findings
