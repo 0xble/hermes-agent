@@ -108,7 +108,15 @@ sys.exit(0 if result else 2)
 '''
 
 
-def _run(tmp_path, mode, *, wall=3.0, deliver="telegram:123"):
+# The watchdog starts before ``run_one_job`` and includes real process/import/SQLite
+# startup. Three seconds is enough on an idle workstation but is not enough budget
+# for this subprocess path when the native lane runs four files concurrently on
+# hosted macOS. Keep the synthetic cap short while leaving room for that startup;
+# all intentional race delays below scale from this value.
+_TEST_WALL_SECONDS = 10.0
+
+
+def _run(tmp_path, mode, *, wall=_TEST_WALL_SECONDS, deliver="telegram:123"):
     home = tmp_path / "profile"
     home.mkdir()
     script = home / "scripts" / "job.py"
@@ -138,7 +146,13 @@ def _run(tmp_path, mode, *, wall=3.0, deliver="telegram:123"):
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=15)
+        # The parent clock starts at Popen, before worker imports and profile setup
+        # (the startup this module budgets for above). After arming, a completed run
+        # may still spend up to the watchdog's post-commit grace cleaning up owned
+        # descendants: cap + min(60, max(4, cap)) in cron/scheduler_detached_worker.py.
+        startup_margin = 30.0
+        worker_timeout = wall + min(60.0, max(4.0, wall)) + startup_margin
+        stdout, stderr = proc.communicate(timeout=worker_timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
@@ -219,8 +233,10 @@ def test_terminal_commit_survives_worker_death_before_delivery_call(tmp_path):
 @pytest.mark.platforms("macos")
 @pytest.mark.parametrize("deliver", ["telegram:123", "origin"])
 def test_watchdog_commit_wins_before_delivery_and_does_not_mark_job_success(tmp_path, deliver):
+    # This case exercises the completion-versus-delivery fence, not timeout
+    # ownership; leave the child ample startup budget under native-lane load.
     code, row, queued, stored, _, _, out, err, _ = _run(
-        tmp_path, "commit-lost-before-delivery", wall=10, deliver=deliver)
+        tmp_path, "commit-lost-before-delivery", wall=30, deliver=deliver)
     assert code == 2, (code, row, stored, out, err)
     assert row["status"] == "failed" and row["error"] == "watchdog timeout"
     assert stored["last_status"] not in ("ok", "delivery_queued")
