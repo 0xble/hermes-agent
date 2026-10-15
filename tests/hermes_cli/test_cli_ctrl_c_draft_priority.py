@@ -38,7 +38,7 @@ class _Cli(mixin_mod.CLITuiMixin):
 @pytest.mark.parametrize("handler", ["_tui_handle_ctrl_c", "_tui_handle_ctrl_q"])
 def test_draft_is_cleared_before_a_running_turn_is_interrupted(monkeypatch, handler):
     interrupts = []
-    monkeypatch.setattr(mixin_mod, "request_hard_interrupt", interrupts.append)
+    monkeypatch.setattr(mixin_mod, "request_hard_interrupt", lambda agent, **kwargs: interrupts.append(agent))
     cli = _Cli()
     buffer = Buffer()
     buffer.text = "half typed follow-up"

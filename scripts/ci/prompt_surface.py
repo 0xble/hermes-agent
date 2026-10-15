@@ -116,10 +116,12 @@ def _scrub(text: str, home: Path) -> str:
     for raw, token in sorted({
         str(home / ".hermes"): "<HERMES_HOME>",
         str(home): "<HOME>",
+        str(home.parent): "<PROMPT_SURFACE_TMP>",
         f"{_platform.system()} ({_platform.release()})": "<HOST_OS>",
     }.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
-    return text
+    import re
+    return re.sub(r"/prompt-surface-[^/]+", "/<PROMPT_SURFACE_TMP>", text)
 
 
 def _enabled_toolsets(platform: str) -> list[str]:

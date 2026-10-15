@@ -1065,7 +1065,7 @@ class TestBackgroundReviewDeleteGate:
                     {"action": "add", "content": "replacement fact"},
                 ], store=store)
             else:
-                raw = memory_tool(action=operation, old_text="stale fact",
+                raw = memory_tool(action=("patch" if operation == "replace" else operation), old_text="stale fact",
                                   content="replacement fact", store=store)
             result = json.loads(raw)
             assert result.get("staged") is True
@@ -1119,7 +1119,7 @@ class TestBackgroundReviewDeleteGate:
                     {"action": "add", "content": "replacement fact"},
                 ], store=store)
             else:
-                raw = memory_tool(action=operation, old_text="stale fact",
+                raw = memory_tool(action=("patch" if operation == "replace" else operation), old_text="stale fact",
                                   content="replacement fact", store=store)
         finally:
             reset_current_write_origin(token)

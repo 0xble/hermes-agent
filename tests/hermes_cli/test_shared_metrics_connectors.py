@@ -19,9 +19,9 @@ from tests.hermes_cli import test_relay_shared_metrics_runtime as runtime_tests
 _RESOURCE = {"architecture": "x86_64", "hermes_version": "0.0.0", "install_method": "git", "os_family": "linux"}
 _ROUTE = {"model": "m", "provider": "openrouter"}
 @pytest.fixture
-def fake_relay(tmp_path, monkeypatch):
+def fake_relay(tmp_path, monkeypatch, completed_plugin_registry):
     """The runtime tests' fake Relay, so lifecycle hooks drive the real metrics runtime."""
-    yield from runtime_tests.direct_runtime.__wrapped__(tmp_path, monkeypatch)
+    yield from runtime_tests.direct_runtime.__wrapped__(tmp_path, monkeypatch, completed_plugin_registry)
 
 
 _BASE = {"session_id": "s1", "task_id": "t1", "turn_id": "turn-1", "api_request_id": "r1", "platform": "cli"}
