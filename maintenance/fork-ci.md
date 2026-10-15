@@ -195,6 +195,31 @@ host fixture defects addressed here. Focused reruns establish repaired fixtures;
 the original full run is not reported as green. Candidate extension files are
 additionally included in both bounded and full fork validation.
 
+## Display watcher hosted-load race
+
+The `fork-ci-reliability` identity also covers `tests/tui_gateway/test_display_watch.py`.
+The process-wide lease watcher runs `_poll_runtime_files` every 0.5 seconds, while these tests
+invoke the same pass directly. Under hosted load, the background pass could claim a launcher
+liveness transition and update `_runtime_marks`, then spend time building the snapshot; the manual
+pass returned before that broadcast, so the test saw no `display.status` event. The test helper now
+serializes lease/runtime polls with one lock, preserving the real watcher and exact one-event
+assertion while making the observation wait for the claimed broadcast. The external-start test also
+holds that lock across its two start writes (`launcher.pid`, then `env`), so a background pass
+cannot broadcast the half-written start as a separate transition. The runtime already treats
+zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
+synchronization, not a production liveness correction. Retire when the watcher exposes an owned
+synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
+
+## Update pause consumer publish race
+
+The `fork-ci-reliability` identity also covers
+`tests/hermes_cli/test_update_pause_boundaries.py::test_consumption_checkpoints_debt_before_unlink_and_producer_death`.
+Its consumer subprocess published `consumed` with a plain `write_text`, while the test waited only
+for the path to exist and then parsed it. Under hosted load the reader could open the file between
+create and payload write and fail with `JSONDecodeError`. The subprocess now writes a sibling and
+`os.replace`s it into place, so existence implies a complete payload. Product code is unchanged.
+Retire with the test if upstream rewrites this cell harness.
+
 ## Nightly Linux notification regression
 
 The `fork-ci-reliability` identity covers the cut-completion notice assertion in
