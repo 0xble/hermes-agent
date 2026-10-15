@@ -181,6 +181,15 @@ substitute for these checks. Earlier local macOS arm64 evidence covered 94 tests
 across 36 files with Python 3.11.14; it does not establish a result for the
 current nightly candidate or for hosted Windows.
 
+The native Windows Git-for-Windows trampoline regression now covers both the
+pre-v2.56 ``mingw64`` and v2.56+ ``ucrt64`` git-core layouts. Git for Windows
+v2.56 moved x64 from MINGW64 to UCRT64; the updater must probe both layouts so a
+broken ``bin\\git.exe`` or ``cmd\\git.exe`` shim can still be replaced by the
+real binary. This remains under `fork-ci-reliability` and is guarded by the
+cross-platform fake-tree tests in `tests/hermes_cli/test_cmd_update.py` plus the
+live Windows test.
+
+
 For Windows process-lifecycle changes, the former on-demand `wine2e/**` selection
 remains available through the canonical harness on an isolated Windows machine:
 

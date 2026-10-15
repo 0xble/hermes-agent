@@ -140,6 +140,54 @@ class TestStreamedSilenceSuppression:
         assert all(marker not in text for text in _sent_and_edited(adapter))
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", (
+        "NO_REPLY\n\nDocs are signed.", "Docs are signed.\n\nNO_REPLY",
+    ))
+    async def test_marker_beside_prose_never_reaches_any_edit(self, raw):
+        """Marker + prose streams deliver only the prose, mid-stream and final."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        for i in range(0, len(raw), 4):
+            consumer.on_delta(raw[i:i + 4])
+            await asyncio.sleep(0.03)
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert texts and all("NO_REPLY" not in t for t in texts), texts
+        assert consumer.delivered_final_matches("Docs are signed.") is True
+
+    @pytest.mark.asyncio
+    async def test_leading_marker_in_a_tool_segment_is_dropped_at_the_boundary(self):
+        """A segment that opens with a marker line keeps its prose and loses the marker."""
+        import asyncio
+
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        runner = asyncio.create_task(consumer.run())
+        consumer.on_delta("NO_REPLY\n\nChecking the ledger first.")
+        await asyncio.sleep(0.1)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.1)
+        consumer.on_delta("Ledger matches.")
+        consumer.finish()
+        await runner
+
+        texts = _sent_and_edited(adapter)
+        assert all("NO_REPLY" not in t for t in texts), texts
+        assert any("Checking the ledger first." in t for t in texts), texts
+        assert any("Ledger matches." in t for t in texts), texts
+
+    @pytest.mark.asyncio
     async def test_autonomous_stream_keeps_trailing_marker_semantics(self):
         adapter = _make_adapter()
         consumer = GatewayStreamConsumer(

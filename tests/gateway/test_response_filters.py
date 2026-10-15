@@ -68,19 +68,19 @@ def test_autonomous_lane_agrees_with_interactive_lane_on_cjk_punctuation_variant
 
 
 def test_trailing_standalone_marker_is_removed_for_substantive_interactive_reply():
-    assert response_filters.strip_trailing_silence_marker("Done.\n\nNO_REPLY") == "Done."
-    assert response_filters.strip_trailing_silence_marker("Done.\n\n[SILENT]") == "Done."
-    assert response_filters.strip_trailing_silence_marker("Done.\n\nno reply") == "Done."
+    assert response_filters.strip_edge_silence_markers("Done.\n\nNO_REPLY") == "Done."
+    assert response_filters.strip_edge_silence_markers("Done.\n\n[SILENT]") == "Done."
+    assert response_filters.strip_edge_silence_markers("Done.\n\nno reply") == "Done."
 
 
 def test_trailing_marker_inside_sentence_or_fenced_code_is_untouched():
-    assert response_filters.strip_trailing_silence_marker("The token NO_REPLY is documented.") == (
+    assert response_filters.strip_edge_silence_markers("The token NO_REPLY is documented.") == (
         "The token NO_REPLY is documented."
     )
     fenced = "```text\nNO_REPLY\n```"
-    assert response_filters.strip_trailing_silence_marker(fenced) == fenced
+    assert response_filters.strip_edge_silence_markers(fenced) == fenced
 
 
 def test_bare_marker_keeps_existing_silence_path():
     for marker in ("NO_REPLY", "[SILENT]", "no reply"):
-        assert response_filters.strip_trailing_silence_marker(marker) == marker
+        assert response_filters.strip_edge_silence_markers(marker) == marker

@@ -561,6 +561,18 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
+# MSYS2 environment dirs that hold ``libexec\\git-core\\git.exe`` in a Git for Windows tree. x64 moved
+# from ``mingw64`` to ``ucrt64`` in v2.56.0 (MSYS2 dropped Windows 8.1); arm64 uses ``clangarm64``;
+# ``mingw64``/``mingw32`` cover older x64 and 32-bit trees.
+_GIT_FOR_WINDOWS_ENVS = ("clangarm64", "ucrt64", "mingw64", "mingw32")
+_GIT_FOR_WINDOWS_ROOTS = (Path(r"C:\Program Files") / "Git", Path(r"C:\Program Files (x86)") / "Git")
+
+
+def _git_core_candidates(git_root: Path) -> list:
+    """Every ``<env>\\libexec\\git-core\\git.exe`` a Git for Windows tree at *git_root* may hold."""
+    return [git_root / env / "libexec" / "git-core" / "git.exe" for env in _GIT_FOR_WINDOWS_ENVS]
+
+
 def _portable_git_candidates() -> list:
     """PortableGit candidates: shared root first (where the managed tree actually lives, not the
     profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
@@ -572,7 +584,8 @@ def _portable_git_candidates() -> list:
     from hermes_constants import get_default_hermes_root, get_hermes_home
     candidates = []
     with suppress(Exception):
-        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+        for root in (get_default_hermes_root(), Path(get_hermes_home())):
+            candidates += _git_core_candidates(root / "git")
     return candidates
 
 
@@ -582,14 +595,11 @@ def _locate_real_git() -> Optional[Path]:
     fetch-failure ZIP fallback handle it. A failed probe (None) disqualifies a candidate like a guard hit.
 
     The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe`` (both ~46KB shims) fail to
-    re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
-    invoked directly (#87876).
+    re-exec git-core, while the real binary at ``<env>\\libexec\\git-core\\git.exe`` (≈4.4MB; ``ucrt64`` on
+    x64 since v2.56.0, ``mingw64`` before) works when invoked directly (#87876).
     """
-    candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    candidates = [c for root in _GIT_FOR_WINDOWS_ROOTS for c in _git_core_candidates(root)]
+    candidates += _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

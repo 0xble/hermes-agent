@@ -1134,3 +1134,31 @@ class TestNativeCommentaryPreservesAccumulated:
             f"pre-commentary prefix lost (the bug): {final_text!r}"
         )
         assert "finished (exit 0)." in final_text
+
+
+# === EDGE SILENCE MARKERS ===
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", [None, "Pre-tool.\nNO_REPLY\n\nPost-tool.", "NO_REPLY\n\nPost-tool."])
+async def test_native_stream_later_segment_leading_marker_never_reaches_a_frame(final_text):
+    """A marker opening a later segment of a cumulative native stream is control text."""
+
+    adapter = _make_native_streaming_adapter()
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+    )
+    runner = asyncio.create_task(consumer.run())
+    consumer.on_delta("Pre-tool.\n")
+    await asyncio.sleep(0.1)
+    consumer.on_segment_break()
+    await asyncio.sleep(0.1)
+    consumer.on_delta("NO_REPLY\n\nPost-tool.")
+    await asyncio.sleep(0.1)
+    consumer.finish(final_text)
+    await runner
+
+    texts = [f["text"] for f in adapter.frames]
+    assert all("NO_REPLY" not in t for t in texts), texts
+    finals = [f["text"] for f in adapter.frames if f["finalize"]]
+    assert finals and "Pre-tool." in finals[-1] and "Post-tool." in finals[-1], adapter.frames
