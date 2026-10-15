@@ -16,6 +16,10 @@ from typing import Any, Optional
 _AGENT_ORIGIN_HEADERS = (
     re.compile(r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?: task=[^\s\]]+)?\]"),
 )
+_RELAY_HEADER_RE = re.compile(
+    r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?P<task> task=[^\s\]]+)?\]"
+)
+_RELAY_FYI_FOOTER_RE = re.compile(r"From: .+ · FYI, no action requested")
 
 
 def is_agent_origin_text(text: Any) -> bool:
@@ -30,6 +34,21 @@ def is_agent_origin_text(text: Any) -> bool:
         pattern.fullmatch(line)
         for line in edge_lines
         for pattern in _AGENT_ORIGIN_HEADERS
+    )
+
+
+def is_fyi_relay_text(text: Any) -> bool:
+    """True only for one complete relay FYI envelope, with no task or typed tail."""
+    if not isinstance(text, str):
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    header = _RELAY_HEADER_RE.fullmatch(lines[-1])
+    return bool(
+        header is not None
+        and not header.group("task")
+        and _RELAY_FYI_FOOTER_RE.fullmatch(lines[-2])
     )
 
 

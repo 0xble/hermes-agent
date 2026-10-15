@@ -316,6 +316,93 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
+    @staticmethod
+    def _relay_fyi_passive_enabled() -> bool:
+        """Read the rollback flag from the effective gateway config; absent means enabled."""
+        try:
+            from gateway.run import _load_gateway_config
+            raw = ((_load_gateway_config().get("relay") or {}).get("fyi_passive", True))
+            if isinstance(raw, str):
+                token = raw.strip().lower()
+                if token in {"0", "false", "no", "off"}:
+                    return False
+                if token in {"1", "true", "yes", "on"}:
+                    return True
+                return True
+            return bool(raw)
+        except Exception:
+            return True
+
+    async def _hm_try_passive_fyi_relay(
+        self, event: "MessageEvent", source: SessionSource, session_key: str, *, busy: bool = False,
+    ) -> bool:
+        """Persist one unaddressed Telegram FYI relay without creating an agent turn.
+
+        A busy session queues the event through the normal FIFO and lets the idle path persist it after
+        the current turn, preserving turn ordering. Anything uncertain falls back to normal handling.
+        """
+        from gateway.response_filters import is_fyi_relay_text
+        if (
+            source.platform != Platform.TELEGRAM
+            or getattr(event, "message_type", None) != MessageType.TEXT
+            or getattr(event, "internal", False)
+            or getattr(event, "_gateway_human_text_merged", False)
+            or getattr(event, "reply_expected", None) is True
+            or not self._relay_fyi_passive_enabled()
+            or not is_fyi_relay_text(getattr(event, "text", None))
+        ):
+            return False
+        session_store = getattr(self, "async_session_store", None)
+        if session_store is None:
+            return False
+        try:
+            session_entry = await session_store.lookup_by_session_key(session_key)
+        except Exception:
+            logger.debug("FYI relay session lookup failed; falling back to a turn", exc_info=True)
+            return False
+        if session_entry is None or not getattr(session_entry, "session_id", None):
+            return False
+
+        def _active_wakes():
+            from hermes_cli.goals import _get_session_db, load_goal
+            from hermes_cli.loops import load_loop
+            if _get_session_db() is None:
+                raise RuntimeError("session control database unavailable")
+            return load_goal(session_entry.session_id), load_loop(session_entry.session_id)
+
+        try:
+            goal_state, loop_state = await getattr(self, "_run_in_executor_with_context")(_active_wakes)
+        except Exception:
+            logger.debug("FYI relay goal/loop lookup failed; falling back to a turn", exc_info=True)
+            return False
+        if (
+            getattr(goal_state, "status", None) == "active"
+            or getattr(loop_state, "status", None) == "active"
+        ):
+            return False
+        if busy:
+            getattr(self, "_queue_or_replace_pending_event")(session_key, event)
+            event._gateway_accepted = True
+            return True
+
+        timestamp = getattr(event, "timestamp", None)
+        try:
+            timestamp = timestamp.timestamp()
+        except (AttributeError, TypeError, ValueError):
+            timestamp = time.time()
+        row = {"role": "user", "content": event.text, "timestamp": timestamp}
+        if getattr(event, "message_id", None):
+            row["message_id"] = str(event.message_id)
+        session_store = getattr(self, "async_session_store", None)
+        if session_store is None:
+            return False
+        try:
+            await session_store.append_to_transcript(session_entry.session_id, row)
+        except Exception:
+            logger.warning("FYI relay transcript append failed; falling back to a turn", exc_info=True)
+            return False
+        return True
+
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
@@ -1551,6 +1638,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             return _result
+        if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
+            return None
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.

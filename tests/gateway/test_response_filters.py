@@ -5,6 +5,7 @@ from gateway.response_filters import (
     apply_agent_origin_reply_expectation,
     is_agent_origin_text,
     is_autonomous_silence_response,
+    is_fyi_relay_text,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
@@ -23,10 +24,17 @@ def test_registered_agent_origin_headers_match_only_at_message_edges():
     # Same value class as relay's own parser: a value may not contain "]".
     assert not is_agent_origin_text("[relay from=a] receipt=b]\nbody")
     assert is_agent_origin_text("[relay from=hermes:default/20261005_123248_1ad0e297 receipt=59666700-260a-4356-8533-8d889ca51de4]\nbody")
-
     addressed = SimpleNamespace(text=f"body\n{header}\n\n", reply_expected=True)
     assert apply_agent_origin_reply_expectation(addressed) is addressed
     assert addressed.reply_expected is True
+
+
+def test_fyi_relay_envelope_requires_footer_and_no_task():
+    fyi = "Title\nBrief\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]"
+    assert is_fyi_relay_text(fyi)
+    assert not is_fyi_relay_text(fyi.replace("receipt=r1", "receipt=r1 task=t1"))
+    assert not is_fyi_relay_text(fyi + "\n\nuser typed text")
+    assert not is_fyi_relay_text(fyi.replace(" · FYI, no action requested", ""))
 
 
 def test_exact_silence_tokens_are_intentional_silence():

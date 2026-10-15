@@ -1951,6 +1951,10 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            if existing.reply_expected is not False or event.reply_expected is not False:
+                # Preserve provenance for relay admission: a human text merged on either side of an
+                # agent-origin event must never be mistaken for a standalone FYI envelope later.
+                existing._gateway_human_text_merged = True
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
