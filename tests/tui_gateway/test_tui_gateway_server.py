@@ -7483,6 +7483,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     isolated_queue.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(process_registry, "restore_completions", lambda: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
