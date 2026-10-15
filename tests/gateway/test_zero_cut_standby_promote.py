@@ -20,9 +20,36 @@ def _reset(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
     gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
     zcs.reset_for_tests()
+    from tools.process_registry import process_registry
+    monkeypatch.setattr(process_registry, "restore_completions", lambda: 0)
     yield
     zcs.reset_for_tests()
     gateway_slot.reset_gateway_slot_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_standby_boot_leaves_delegation_ledger_and_promotion_replays_it(monkeypatch):
+    from gateway.run import GatewayRunner
+    from tools.process_registry import process_registry
+
+    replays = []
+    monkeypatch.setattr(process_registry, "restore_completions", lambda: replays.append("launch") or 0)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._profile_adapters = {}
+    runner._start_secondary_profile_adapters = lambda: asyncio.sleep(0, result=0)
+    await runner._start_secondary_profiles(0, [])
+    assert replays == []  # standby never touches the shared ledger at boot
+
+    promoted = SimpleNamespace(
+        adapters={}, _standby_deferred={},
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.mark_ready()
+    assert (await zcs.promote(promoted))["promoted"] is True
+    assert replays == ["launch"]
 
 
 @pytest.mark.asyncio

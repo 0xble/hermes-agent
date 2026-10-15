@@ -1719,7 +1719,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         # The launch profile's durable completions replay here, not at import (#123265); the
         # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below.
         # Off the loop: the replay writes state.db, and the liveness watchdog is already armed.
-        await asyncio.to_thread(_pr.restore_completions)
+        # A standby must not touch the shared ledger while the active gateway serves; promotion replays it.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await asyncio.to_thread(_pr.restore_completions)
         # Secondary-profile adapters connect under their own home + credential scope.
         try:
             connected_count += await self._start_secondary_profile_adapters()

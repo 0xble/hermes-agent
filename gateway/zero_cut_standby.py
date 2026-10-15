@@ -119,6 +119,9 @@ async def promote(runner) -> dict[str, Any]:
 
 async def _promote(runner) -> dict[str, Any]:
     await runner._start_prime_session_db_after_ready()
+    # Replay the launch profile's durable delegation completions the standby left untouched at boot.
+    from tools.process_registry import process_registry
+    await asyncio.to_thread(process_registry.restore_completions)
     homes = list((getattr(runner, "_served_profile_homes", None) or {}).items())
     if homes:
         await asyncio.to_thread(runner._restore_secondary_completion_ledgers, homes)
