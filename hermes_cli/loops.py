@@ -347,6 +347,8 @@ class LoopState:
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
     last_response_digest: str = ""    # self-paced change detection
+    # Non-blocking overlap guidance returned by loop_set results when a goal already owns this session.
+    goal_warning: Optional[str] = None
     # Shared no-progress ladder index. It advances on unchanged self-paced replies and one-shot
     # --until blocks, and resets when a reply changes or a user revises/resumes the loop.
     backoff_level: int = 0
@@ -378,6 +380,7 @@ class LoopState:
             "mode": data.get("mode", "interval"),
             "paused_reason": data.get("paused_reason"),
             "last_stop_reason": data.get("last_stop_reason"),
+            "goal_warning": data.get("goal_warning"),
             "route": route if isinstance(route, dict) else {},
             "revisions": revisions if isinstance(revisions, list) else [],
         }
@@ -844,6 +847,7 @@ class LoopManager(LoopRevisionsMixin):
             created_at=now,
             next_due_at=now,
             route=dict(route or {}),
+            goal_warning=_active_goal_loop_warning(self.session_id) or None,
         )
         if not self.session_id:
             self._state = state  # intentionally ephemeral

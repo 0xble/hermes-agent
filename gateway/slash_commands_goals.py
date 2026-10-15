@@ -295,7 +295,7 @@ class GatewayGoalCommandsMixin:
             if src is not None:
                 platform = getattr(src, "platform", "")
                 route = {"platform": platform.value if hasattr(platform, "value") else str(platform or "")}
-                for key in ("chat_id", "chat_type", "thread_id", "user_id", "user_name", "profile"):
+                for key in ("chat_id", "chat_type", "thread_id", "user_id", "user_name", "profile", "scope_id"):
                     route[key] = str(getattr(src, key, "") or "")
                 route = {k: v for k, v in route.items() if v}
         except Exception:

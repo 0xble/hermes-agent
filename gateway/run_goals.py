@@ -973,6 +973,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             # never enter that path as a fabricated human answer while another turn owns it.
             return
         def _due_manager():
+            from agent.estop import check_paused
+            if check_paused("loop", logger):
+                return None
             if goal_blocks_loop_tick(sid):
                 return None
             mgr = LoopManager(session_id=sid)
@@ -981,11 +984,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         mgr = await self._run_in_executor_with_context(_due_manager)
         if mgr is None:
             return
-        from agent.estop import check_paused
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if check_paused("loop", logger) or _turn_owner_exists():
+        if _turn_owner_exists():
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog

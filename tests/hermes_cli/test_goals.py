@@ -353,6 +353,30 @@ class TestGoalManager:
         assert decision["status"] == "paused"
         assert mgr.state.paused_reason == "turn budget exhausted (2/2)"
 
+    @pytest.mark.parametrize(
+        ("reason", "expected_status", "waiting_on_user", "paused"),
+        [
+            ("must not be merged until Brian approves", "active", True, False),
+            ("already merged despite the constraint", "paused", False, True),
+        ],
+    )
+    def test_blocked_approval_waits_but_completed_constraint_breach_pauses(
+        self, hermes_home, reason, expected_status, waiting_on_user, paused,
+    ):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id=f"blocked-classification-{expected_status}")
+        mgr.set("ship the release")
+        with patch.object(goals, "judge_goal", return_value=("blocked", reason, False, None, False)):
+            decision = mgr.evaluate_after_turn("blocked")
+
+        assert decision["status"] == expected_status
+        assert mgr.state is not None
+        assert mgr.state.status == expected_status
+        assert mgr.state.waiting_on_user_message is waiting_on_user
+        assert (mgr.state.paused_reason is not None) is paused
+
     def test_unlimited_budget_keeps_lifecycle_controls_functional(self, hermes_home):
         """Zero is only a budget sentinel: terminal and user lifecycle controls still work."""
         from hermes_cli import goals
