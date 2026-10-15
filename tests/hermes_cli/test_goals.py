@@ -242,6 +242,33 @@ class TestGoalManager:
         findings = goal_authoring_findings(goal, {"constraints": constraints})
         assert [finding.code for finding in findings] == ["readonly_mutation"]
 
+    @pytest.mark.parametrize("goal,outcome", [
+        ("Audit recent config changes", ""),
+        ("Find which commit added the regression", ""),
+        ("Investigate why the deploy failed", ""),
+        ("Explain the update flow", ""),
+        ("Write up the root cause of the outage", ""),
+        ("Compare three CRMs", "Brian has a written comparison of three CRMs"),
+        ("Review the goal-authoring change", "Exact-head review returns a verdict"),
+        ("Report which topics were sent to the wrong chat", ""),
+    ])
+    def test_goal_authoring_allows_read_only_investigations(self, goal, outcome):
+        from hermes_cli.goals import goal_authoring_findings
+        contract = {"constraints": "Read-only; no changes"}
+        if outcome:
+            contract["outcome"] = outcome
+        assert goal_authoring_findings(goal, contract) == []
+
+    @pytest.mark.parametrize("goal,contract", [
+        ("The obsolete topic is deleted", {"constraints": "read-only"}),
+        ("Fix the config and deploy", {"constraints": "No deploys."}),
+        ("Clean up stale topics", {"outcome": "Stale topics are removed", "constraints": "Never delete"}),
+        ("Draft the summary, then send it", {"constraints": "no changes"}),
+    ])
+    def test_goal_authoring_flags_required_end_states_and_later_clauses(self, goal, contract):
+        from hermes_cli.goals import goal_authoring_findings
+        assert [finding.code for finding in goal_authoring_findings(goal, contract)] == ["readonly_mutation"]
+
     def test_goal_authoring_unrelated_revision_skips_legacy_contradiction(self):
         from hermes_cli.goals import goal_authoring_findings
         assert goal_authoring_findings(

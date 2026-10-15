@@ -62,13 +62,6 @@ _GOAL_AUTHORING_STALE_REF_RES = (
     re.compile(r"(?<!\w)#\d+(?!\w)"),
 )
 _GOAL_AUTHORING_SHA_RE = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
-_GOAL_AUTHORING_MUTATION_RE = re.compile(
-    r"(?i)\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al)|relay(?:s|ed|ing)?|send(?:s|ing)?|"
-    r"deploy(?:s|ed|ing|ment)?|merg(?:e|ed|ing)|ship(?:s|ped|ping)?|install(?:s|ed|ing)?|"
-    r"publish(?:es|ed|ing)?|writ(?:e|es|ten|ing)|creat(?:e|es|ed|ing)|restart(?:s|ed|ing)?|"
-    r"commit(?:s|ted|ting)?|update(?:s|d)?|modify(?:ies|ied|ing)?|change(?:s|d|ing)?|"
-    r"add(?:s|ed|ing)?|move(?:s|d|ing)?|rename(?:s|d|ing)?|alter(?:s|ed|ing)?)\b"
-)
 # Blanket limits contradict any mutating outcome. Effect-specific limits such as
 # "no deploys" contradict only the same effect, and only when unqualified: "no
 # deletions of user data" or "don't merge without approval" are real hard limits.
@@ -78,11 +71,11 @@ _GOAL_AUTHORING_BLANKET_LIMIT_RE = re.compile(
 _GOAL_AUTHORING_LIMIT_NEGATION = r"(?:no|do(?:es)?\s+not|don't|never)\s+"
 _GOAL_AUTHORING_LIMIT_END = r"\s*(?:[.;,!]|$)"
 _GOAL_AUTHORING_SCOPED_LIMITS = {
-    "relay": (r"relay(?:s|ing)?", r"\brelay(?:s|ed|ing)?\b"),
-    "send": (r"send(?:s|ing)?", r"\bsend(?:s|ing)?\b"),
-    "delete": (r"delet(?:e|es|ions?|ing)|remov(?:e|es|als?|ing)", r"\b(?:delet(?:e|ed|ing|ion)|remov(?:e|ed|ing|al))\b"),
-    "deploy": (r"deploy(?:s|ing|ments?)?", r"\bdeploy(?:s|ed|ing|ment)?\b"),
-    "merge": (r"merg(?:e|es|ing)", r"\bmerg(?:e|ed|ing)\b"),
+    "relay": r"relay(?:s|ing)?",
+    "send": r"send(?:s|ing)?",
+    "delete": r"delet(?:e|es|ions?|ing)|remov(?:e|es|als?|ing)",
+    "deploy": r"deploy(?:s|ing|ments?)?",
+    "merge": r"merg(?:e|es|ing)",
 }
 _GOAL_AUTHORING_DURATION = r"\d+\s*[- ]?(?:hours?|hrs?|days?|weeks?|h|d|w)\b"
 _GOAL_AUTHORING_METRIC_WINDOW_RE = re.compile(
@@ -92,15 +85,67 @@ _GOAL_AUTHORING_METRIC_WINDOW_RE = re.compile(
 _GOAL_AUTHORING_LOOKBACK_RE = re.compile(r"(?i)\b(?:last|past|previous|prior|trailing|rolling)\b")
 
 
+# A goal *requires* a mutation only when it commands one ("Delete the topic",
+# "fix it and deploy") or names it as the end state ("the topic is deleted").
+# Nouns and incidental past forms ("audit recent changes", "find which commit
+# added the bug", "why the deploy failed") describe read-only work.
+_GOAL_AUTHORING_REQUIRED_EFFECTS = {
+    "delete": ("delete", "deleted"),
+    "remove": ("remove", "removed"),
+    "relay": ("relay", "relayed"),
+    "send": ("send", "sent"),
+    "deploy": ("deploy", "deployed"),
+    "merge": ("merge", "merged"),
+    "ship": ("ship", "shipped"),
+    "install": ("install", "installed"),
+    "publish": ("publish", "published"),
+    "write": (r"write(?!\s+up\b)", "written"),
+    "create": ("create", "created"),
+    "restart": ("restart", "restarted"),
+    "commit": ("commit", "committed"),
+    "update": ("update", "updated"),
+    "modify": ("modify", "modified"),
+    "change": ("change", "changed"),
+    "add": ("add", "added"),
+    "move": ("move", "moved"),
+    "rename": ("rename", "renamed"),
+    "alter": ("alter", "altered"),
+}
+_GOAL_AUTHORING_CLAUSE_START = r"(?:^|[.;:!?\n]\s*|,\s*|\b(?:and|then)\s+)(?:please\s+)?"
+_GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|was|were|gets?|got)\s+(?:\w+ly\s+)?"
+_GOAL_AUTHORING_SCOPED_EFFECTS = {
+    "relay": {"relay"}, "send": {"send"}, "delete": {"delete", "remove"},
+    "deploy": {"deploy"}, "merge": {"merge"},
+}
+
+
+def goal_authoring_required_effects(text: str) -> set[str]:
+    """Return mutation effects ``text`` commands or names as its end state."""
+    text = text.strip()
+    effects: set[str] = set()
+    for effect, (base, participle) in _GOAL_AUTHORING_REQUIRED_EFFECTS.items():
+        if (re.search(rf"(?i){_GOAL_AUTHORING_CLAUSE_START}{base}\b", text)
+                or re.search(rf"(?i){_GOAL_AUTHORING_END_STATE}{participle}\b", text)):
+            effects.add(effect)
+    return effects
+
+
 def goal_authoring_readonly_contradiction(readonly: str, mutation: str) -> bool:
-    """True when a limit forbids the effect the goal/outcome requires."""
+    """True when a limit forbids an effect the goal/outcome requires.
+
+    Only commanded effects or required end states count; a read-only audit of
+    "recent changes" or "why the deploy failed" is not a contradiction.
+    """
     if not readonly or not mutation:
         return False
-    if _GOAL_AUTHORING_BLANKET_LIMIT_RE.search(readonly) and _GOAL_AUTHORING_MUTATION_RE.search(mutation):
+    required = goal_authoring_required_effects(mutation)
+    if not required:
+        return False
+    if _GOAL_AUTHORING_BLANKET_LIMIT_RE.search(readonly):
         return True
-    for limit, family in _GOAL_AUTHORING_SCOPED_LIMITS.values():
+    for name, limit in _GOAL_AUTHORING_SCOPED_LIMITS.items():
         bare = re.compile(rf"(?i)\b{_GOAL_AUTHORING_LIMIT_NEGATION}(?:{limit}){_GOAL_AUTHORING_LIMIT_END}")
-        if bare.search(readonly) and re.search(rf"(?i){family}", mutation):
+        if bare.search(readonly) and required & _GOAL_AUTHORING_SCOPED_EFFECTS[name]:
             return True
     return False
 
