@@ -113,7 +113,7 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     followup = data.get("shutdown_follow_up") is True
     if followup and input_already_durable(
         runner.session_store, session_id, data.get("message_id"),
-        data.get("text"), data.get("text"),
+        data.get("text"), data.get("persist_text"),
     ):
         # A previous boot's turn persisted this input before the restart cut it: the turn's own
         # resume_pending marker owns it now, and replaying the prompt could repeat tool effects.
@@ -149,6 +149,8 @@ def input_already_durable(
         tip = tip_for(session_id) if callable(tip_for) else session_id
         session_ids = dict.fromkeys((session_id, tip))
         get_rows = getattr(store, "get_messages_by_platform_message_id", None)
+        if persist_user_message is None:
+            return any(bool(probe(sid, str(message_id))) for sid in session_ids if sid)
         if user_message is not None or persist_user_message is not None:
             from agent.turn_context import _same_trigger_content
             if callable(get_rows):
@@ -209,6 +211,7 @@ def _recovered_followup_event(data, source, author_id, *, key=None, session_id=N
     )
     setattr(event, "_hermes_queue_checkpoint", data.get("queue_accepted") is True)
     event._outbox_admission_id = data.get("_outbox_admission_id")
+    event._hermes_persist_text = data.get("persist_text")
     event.session_id = data.get("session_id") or session_id
     return event
 

@@ -1845,7 +1845,8 @@ class TurnRunner:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
             from gateway.shutdown_flush import prepare_queued_turn_checkpoint
             platform_id = prepare_queued_turn_checkpoint(
-                agent, ctx.queued_event, session_key, ctx.session_id, ctx.inbound_message_id)
+                agent, ctx.queued_event, session_key, ctx.session_id, ctx.inbound_message_id,
+                persist_user_message_override)
             if platform_id is not None:
                 kwargs["persist_user_platform_id"] = platform_id
             from agent.notification_presentation import notification_turn

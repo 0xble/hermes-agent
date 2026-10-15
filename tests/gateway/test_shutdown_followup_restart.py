@@ -243,10 +243,25 @@ def test_followup_spool_whose_input_is_already_durable_is_dropped_not_replayed(t
     assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
+def test_legacy_followup_spool_same_id_is_dropped_even_with_different_text(tmp_path, monkeypatch):
+    """Older spools have no second content form, so an id match remains a safe drop."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="legacy replay", source=source, user_id=source.user_id, message_id="m-legacy")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "different historical text", "platform_message_id": "m-legacy"})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
+    assert runner._startup_restore_queue == []
+    assert not list((tmp_path / "pending_messages").glob("*.json"))
+
+
 def test_followup_spool_with_same_id_but_corrected_text_is_replayed(tmp_path, monkeypatch):
     """A reused platform id is not enough to retire a corrected shutdown follow-up."""
     runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="corrected side effect", source=source, user_id=source.user_id, message_id="m-9")
+    setattr(event, "_hermes_persist_text", "prepared corrected side effect")
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
     runner.session_store.append_to_transcript(entry.session_id, {
         "role": "user", "content": "original side effect", "platform_message_id": "m-9"})

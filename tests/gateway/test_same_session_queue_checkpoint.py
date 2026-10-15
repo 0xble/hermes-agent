@@ -107,6 +107,7 @@ def test_restart_dedup_requires_matching_platform_id_and_content(tmp_path, monke
     db.create_session("same", "telegram")
     db.append_message("same", "user", "first version", platform_message_id="101")
     event = _event("different accepted instruction", "101")
+    setattr(event, "_hermes_persist_text", event.text)
     assert shutdown_flush.checkpoint_queued_event("key", event)
     claimed = []
     recovered, _ = shutdown_flush.recover_pending_spool(

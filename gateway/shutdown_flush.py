@@ -270,15 +270,21 @@ def checkpoint_queued_event(session_key: str, event: Any, *, refresh: bool = Fal
         return False
 
 
-def prepare_queued_turn_checkpoint(agent, event, session_key: str, session_id: str, inbound_id):
+def prepare_queued_turn_checkpoint(
+    agent, event, session_key: str, session_id: str, inbound_id, persist_user_message=None,
+):
     """Bind the accepted spool to the actual transcript before provider work.
 
     Routing can rotate after admission. An original-session receipt must still suppress
     replay when retirement fails, without changing the event's transport or reply anchor.
+    The prepared persistence form is recorded because the transcript may differ from the raw
+    queued text (sender prefixes, channel backfill, or media enrichment).
     """
     platform_id = str(inbound_id) if inbound_id is not None else None
     if not getattr(event, "_hermes_queue_checkpoint", False):
         return platform_id
+    if persist_user_message is not None:
+        event._hermes_persist_text = persist_user_message
     event.session_id = session_id
     if not session_id or not checkpoint_queued_event(session_key, event, refresh=True):
         raise RuntimeError("Queued input checkpoint could not bind to its session. "
@@ -419,6 +425,9 @@ def _serialise_value(value: Any) -> Optional[dict]:
         admission_id = getattr(value, "_outbox_admission_id", None)
         if isinstance(admission_id, str) and admission_id:
             result["_outbox_admission_id"] = admission_id
+        persist_text = getattr(value, "_hermes_persist_text", None)
+        if persist_text is not None and _json_safe(persist_text):
+            result["persist_text"] = persist_text
         for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
@@ -764,11 +773,16 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         # the native transcript/resume owner retains continuation.
         message_id = data.get("message_id") or data.get("_outbox_admission_id")
         if target_db is not None and message_id:
-            from agent.turn_context import _same_trigger_content
             prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
-            if any(not data.get("message_id") or
-                   _same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
-                   for row in prior_rows):
+            if "persist_text" not in data:
+                already_durable = bool(prior_rows)
+            else:
+                from agent.turn_context import _same_trigger_content
+                already_durable = any(
+                    _same_trigger_content(row.get("content"), data.get("text"), data.get("persist_text"))
+                    for row in prior_rows
+                )
+            if already_durable:
                 return True
         if deferred_followup is None:
             return False

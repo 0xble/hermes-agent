@@ -188,6 +188,61 @@ def test_identical_idless_queue_occurrences_keep_distinct_admission_receipts(hom
     db.close()
 
 
+def test_queue_checkpoint_dedupe_matches_prepared_persist_text(home):
+    event = _event("raw group message", "tg:prepared")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    shutdown_flush.prepare_queued_turn_checkpoint(
+        SimpleNamespace(), event, "original", "original", event.message_id,
+        "[sender: Alice]\nraw group message\n[image: attached.png]",
+    )
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message(
+        "original", "user", "[sender: Alice]\nraw group message\n[image: attached.png]",
+        platform_message_id=event.message_id,
+    )
+    assert _boot(db, home, sid="original") == []
+    assert _spools(home) == []
+    db.close()
+
+
+def test_legacy_queue_checkpoint_id_match_is_dropped(home):
+    event = _event("legacy raw", "tg:legacy")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message("original", "user", "different historical text", platform_message_id=event.message_id)
+    assert _boot(db, home, sid="original") == []
+    assert _spools(home) == []
+    db.close()
+
+
+def test_queue_checkpoint_edit_differs_from_raw_and_prepared_text_is_replayed(home):
+    event = _event("edited raw", "tg:edited")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    shutdown_flush.prepare_queued_turn_checkpoint(
+        SimpleNamespace(), event, "original", "original", event.message_id, "edited persisted text")
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message("original", "user", "old persisted text", platform_message_id=event.message_id)
+    assert _boot(db, home, sid="original") == ["edited raw"]
+    assert _spools(home)
+    db.close()
+
+
+def test_queue_checkpoint_identical_raw_text_is_dropped(home):
+    event = _event("same raw", "tg:raw")
+    assert shutdown_flush.checkpoint_queued_event("original", event)
+    shutdown_flush.prepare_queued_turn_checkpoint(
+        SimpleNamespace(), event, "original", "original", event.message_id, "same prepared")
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("original", "telegram")
+    db.append_message("original", "user", "same raw", platform_message_id=event.message_id)
+    assert _boot(db, home, sid="original") == []
+    assert _spools(home) == []
+    db.close()
+
+
 def test_recovered_idless_checkpoint_restores_occurrence_identity(home):
     from gateway.run_pending_recovery import _defer_followup
 
