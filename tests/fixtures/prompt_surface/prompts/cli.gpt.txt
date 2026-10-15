@@ -167,7 +167,7 @@ After difficult/iterative tasks, offer to save as a skill. If a skill you loaded
 
 Only proceed without loading a skill if genuinely none are relevant to the task.
 
-Active Hermes profile: default. Other profiles (if any) live under /<PROMPT_SURFACE_TMP>/home/.hermes/profiles/<name>/. Each profile has its own skills/, plugins/, cron/, and memories/ that affect a different session than this one. Do not modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
+Active Hermes profile: default. Other profiles (if any) live under <HOME>/.hermes/profiles/<name>/. Each profile has its own skills/, plugins/, cron/, and memories/ that affect a different session than this one. Do not modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
 
 Conversation started: Thursday, January 15, 2026 (UTC, UTC+00:00)
 Model: openai/gpt-5
@@ -176,8 +176,8 @@ Platform: cli
 # Hermes runtime environment
 
 Host: <HOST_OS>
-User home directory: /<PROMPT_SURFACE_TMP>/home
+User home directory: <HOME>
 Current working directory: <HOME>/plain
-Scratch directory: /<PROMPT_SURFACE_TMP>/home/.hermes/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
+Scratch directory: <HOME>/.hermes/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
 
 <!-- End Hermes runtime environment -->

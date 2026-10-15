@@ -121,6 +121,7 @@ def _scrub(text: str, home: Path) -> str:
     }.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
     import re
+    text = re.sub(r"/(?:[^/\s]+/)+home(?=[/\s])", "<HOME>", text)
     return re.sub(r"/(?:[^/\s]+/)*prompt-surface-[^/\s]+", "/<PROMPT_SURFACE_TMP>", text)
 
 
