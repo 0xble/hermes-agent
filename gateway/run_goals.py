@@ -667,17 +667,21 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion,
                   {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
         if successful:
-            # A process or delegation result injected by the completion path is new evidence and
-            # may pierce the continuation gap, including one drained behind a goal continuation
-            # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
-            # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
-            # metadata, never derived from message text.
+            # Any delivery into the session is fresh evidence and pierces a goal wait: process or
+            # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
+            # pacing wakes (continuations, /loop ticks, heartbeats) stay on the quiet ladder. The
+            # markers are gateway-set metadata, never derived from message text. A completion drained
+            # behind a continuation head keeps its origin on the head event.
             metadata = getattr(event, "metadata", None) or {}
+            from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+            own_pacing_wake = event is not None and (
+                self._is_goal_continuation_event(event)
+                or bool(metadata.get(LOOP_WAKE_METADATA_KEY))
+                or bool(getattr(event, "_heartbeat_session_id", None))
+            )
             external_event = (
                 metadata.get("notification_origin") == "process_registry_synthetic"
-                or (is_internal and metadata.get("display_kind") in {
-                    "internal_notification", "async_delegation_complete", "process_complete",
-                })
+                or (is_internal and event is not None and not own_pacing_wake)
             )
             # A queued chain is judged once, on its terminal turn's response (identity above).
             goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
