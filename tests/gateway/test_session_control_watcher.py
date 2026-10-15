@@ -370,7 +370,7 @@ async def test_watcher_enqueues_replaced_goal_continuation(state):
         user_quote="replace the target goal with ship now",
         payload={"goal": "ship now"},
     )
-    assert result["record"]["continuation_prompt"]
+    assert "continuation_prompt" not in result["record"]
     async def admit_event(_adapter, event):
         event._gateway_accepted = True
 
@@ -401,7 +401,10 @@ async def test_watcher_discards_superseded_control_continuation(state, authority
                                                    payload=payload)
         record = session_controls.resolve_request(request["id"], "approve", "admin")
     assert record["status"] == "applied"
-    assert record["continuation_prompt"]
+    if action == "replace":
+        assert "continuation_prompt" not in record
+    else:
+        assert record["continuation_prompt"]
     if subsequent == "replace":
         GoalManager("target").set("superseding objective")
     else:
@@ -415,8 +418,12 @@ async def test_watcher_discards_superseded_control_continuation(state, authority
         await runner._drain_session_controls()
     admit.assert_not_awaited()
     persisted = session_controls._load_record(record["id"])
-    assert persisted["continuation_enqueued"] is True
-    assert persisted["continuation_discarded"] == "target_changed"
+    if action == "replace":
+        assert persisted["continuation_enqueued"] is False
+        assert persisted["continuation_discarded"] is None
+    else:
+        assert persisted["continuation_enqueued"] is True
+        assert persisted["continuation_discarded"] == "target_changed"
     assert session_controls.pending_outbox() == []
     assert len(runner.adapter.sends) == 1
     assert len(runner.injections) == 1

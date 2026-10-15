@@ -497,6 +497,13 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'plain
               'Check its progress before waiting again.]',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
  {'formatter': 'barrier_lift_note',
+  'template': '[Goal wait lifted: pid {note_field_0} is still running after Check its progress before waiting again.]',
+  'source_commits': ('working-tree',)},
+ {'formatter': 'barrier_lift_note',
+  'template': '[Goal wait lifted: background process {note_field_0} is still running after Check its progress before '
+              'waiting again.]',
+  'source_commits': ('working-tree',)},
+ {'formatter': 'barrier_lift_note',
   'template': '[Goal wait lifted: background process {note_field_0} finished ({note_field_1}, exit {note_field_2}). '
               'Read its output with the process tool before continuing.]',
   'source_commits': ('915777a8321b4186faad8e87e7fc00077a6bcca9', 'd3c3d03f1709538a380dd9071621e6bedc912f79')},
@@ -530,7 +537,7 @@ CURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),
 )
 
-GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'plain': 5, 'contract': 9, 'subgoals': 4, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 8}
+GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'plain': 5, 'contract': 9, 'subgoals': 4, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
 
 # All historical goal formatter versions contributing to the frozen registry. Individual rows
 # name their newest and oldest source commits instead of repeating this complete list per row.

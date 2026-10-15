@@ -690,8 +690,10 @@ async def test_historical_pause_cutoff_removes_old_slot_and_overflow_without_rem
         GatewayBusySessionMixin._clear_goal_pending_continuations(runner, key, adapter, before)
     )
     await runner._drain_session_controls()
-    assert runner.target.session_key not in runner.adapter._pending_messages
-    assert queue.conversation.queued_events == [fresh, human]
+    # The stale slot is removed; retained real work is promoted in FIFO order.
+    slot = runner.adapter._pending_messages.get(runner.target.session_key)
+    assert slot is not old
+    assert ([slot] if slot is not None else []) + queue.conversation.queued_events == [fresh, human]
 
 
 @pytest.mark.asyncio
@@ -822,7 +824,7 @@ async def test_superseded_continuation_turn_is_not_judged_against_the_new_goal(s
     after = load_goal("target")
     judged.assert_not_called()
     assert after.status == "active" and after.goal == "new objective"
-    assert after.turns_used == before.turns_used == 0
+    assert after.turns_used == before.turns_used == (1 if change == "replace" else 0)
     assert runner.target.session_key not in runner.adapter._pending_messages
 
 
