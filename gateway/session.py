@@ -567,6 +567,10 @@ class SessionEntry:
     # Gateway ``/yolo`` bypass for this lane, mirrored from ``tools.approval``'s in-memory set so a restart
     # keeps it; cleared with it at every conversation boundary (``_clear_session_boundary_security_state``).
     yolo: bool = False
+    # When a resumed successor is interrupted before its predecessor preview can be re-keyed,
+    # retain the predecessor token so recovery can adopt only that exact chained row. Appended to
+    # preserve older positional SessionEntry construction.
+    resume_predecessor_turn_id: Optional[str] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -574,7 +578,8 @@ class SessionEntry:
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
         "expiry_finalized", "suspended", "resume_pending", "resume_reason", "resume_marker_token",
-        "resume_turn_id", "resume_human", "restart_note_message_id", "restart_note_marker_token",
+        "resume_turn_id", "resume_predecessor_turn_id", "resume_human", "restart_note_message_id",
+        "restart_note_marker_token",
         "restart_note_turn_id", "restart_note_reconcile_attempts", "restart_notes", "active_turn_human",
         "yolo",
     )

@@ -1835,8 +1835,10 @@ class GatewayTurnMixin:
 
     async def _hmwa_post_turn_hooks(self, hook_ctx, agent_result, response):
         """agent:end hook, process-watcher scheduling, and watch-notification drain."""
+        from gateway.stream_recovery import unmark_recovered_reply
         await self.hooks.emit("agent:end", {
-            **hook_ctx, "response": (response or "")[:500], "model": agent_result.get("model", ""),
+            **hook_ctx, "response": unmark_recovered_reply(response or "", agent_result)[:500],
+            "model": agent_result.get("model", ""),
             "provider": agent_result.get("provider", ""),
         })
 
@@ -2074,7 +2076,10 @@ class GatewayTurnMixin:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
-                    # Edge case: fall back to simple user/assistant rows.
+                    # Edge case: fall back to simple user/assistant rows. The recovered-reply
+                    # marker labels delivery only; the transcript keeps the model's answer.
+                    from gateway.stream_recovery import unmark_recovered_reply
+                    response = unmark_recovered_reply(response, agent_result)
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         await store.append_to_transcript(
@@ -2158,7 +2163,8 @@ class GatewayTurnMixin:
         )
         # Paste-ready text is read, never spoken, on every platform.
         from gateway.copy_blocks import strip_copy_blocks
-        _spoken = strip_copy_blocks(response) if response else response
+        from gateway.stream_recovery import unmark_recovered_reply
+        _spoken = strip_copy_blocks(unmark_recovered_reply(response, agent_result)) if response else response
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, _spoken, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
@@ -2223,7 +2229,9 @@ class GatewayTurnMixin:
             # Return None so the body isn't sent twice; stash the raw text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
-                event._streamed_final_response = str(agent_result.get("final_response") or "")
+                from gateway.stream_recovery import unmark_recovered_reply
+                event._streamed_final_response = unmark_recovered_reply(
+                    str(agent_result.get("final_response") or ""), agent_result)
             return None
 
         if agent_result.get("interrupted") and response:
