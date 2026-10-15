@@ -18,6 +18,10 @@ commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
 ``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
 runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
 targeted runs of 1-10 explicit test files with only single-run options.
+Foreground local commands pass ``HEAVY_SLOT_MAX_WAIT`` derived from their
+terminal timeout, so a busy queue fails before the terminal deadline; background
+commands omit it and retain the helper's unbounded wait. The environment-variable
+transport is backwards-compatible with helpers that predate ``--max-wait``.
 """
 
 from __future__ import annotations
@@ -353,18 +357,23 @@ def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
     return found.command[0] if found.command else None
 
 
-def wrap_heavy_command(command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None) -> str:
-    """Prefix each heavy simple command in a local terminal command with ``heavy-slot``."""
+def wrap_heavy_command(
+    command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
+    max_wait_seconds: Optional[int] = None,
+) -> str:
+    """Prefix heavy local commands with ``heavy-slot`` and optionally bound its queue wait."""
     if env_type != "local" or not command:
         return command
     try:
-        return _wrap_local(command, environment)
+        return _wrap_local(command, environment, max_wait_seconds=max_wait_seconds)
     except Exception:  # throttling is best-effort and must never break the terminal
         logger.debug("heavy-slot wrapping failed; running the command unwrapped", exc_info=True)
         return command
 
 
-def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
+def _wrap_local(
+    command: str, environment: Optional[Mapping[str, str]], *, max_wait_seconds: Optional[int],
+) -> str:
     effective = dict(os.environ)
     if environment:
         effective.update(environment)
@@ -379,10 +388,10 @@ def _wrap_local(command: str, environment: Optional[Mapping[str, str]]) -> str:
     rewritten = command
     for offset, label in reversed(positions):
         rewritten = rewritten[:offset] + f"{_DISPATCH} {shlex.quote('hermes ' + label)} " + rewritten[offset:]
-    return _dispatcher(executable) + rewritten
+    return _dispatcher(executable, max_wait_seconds=max_wait_seconds) + rewritten
 
 
-def _dispatcher(executable: str) -> str:
+def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None) -> str:
     """Shell function the rewritten commands call.
 
     A name the session shell resolves itself (alias, function, builtin) runs exactly as
@@ -393,6 +402,9 @@ def _dispatcher(executable: str) -> str:
     resolve = '$(type -t -- "$1" 2>/dev/null || whence -w -- "$1" 2>/dev/null)'  # bash, then zsh
     shell_owned = 'alias|function|builtin|keyword|*": alias"|*": function"|*": builtin"|*": reserved"'
     run_in_shell = '_hermes_hs_name=$1; shift; eval "$_hermes_hs_name \\"\\$@\\""'
-    run_in_slot = f'{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
+    wait_env = ""
+    if max_wait_seconds is not None:
+        wait_env = f"HEAVY_SLOT_MAX_WAIT={shlex.quote(str(max_wait_seconds))} "
+    run_in_slot = f'{wait_env}{shlex.quote(executable)} --label "$_hermes_hs_label (in $PWD)" -- "$@"'
     return (f'{_DISPATCH}() {{ _hermes_hs_label=$1; shift; case "{resolve}" in '
             f'{shell_owned}) {run_in_shell} ;; *) {run_in_slot} ;; esac; }}\n')
