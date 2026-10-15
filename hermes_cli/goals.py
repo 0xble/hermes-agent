@@ -119,6 +119,7 @@ _GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|gets?)\s+(?:\w+ly\s+)?"
 _GOAL_AUTHORING_EMBEDDED_RE = re.compile(
     r"(?i)\b(?:whether|if|which|why|how|what|that|when|where|who|whose)\b"
 )
+_GOAL_AUTHORING_END_STATE_BOUNDARY_RE = re.compile(r"(?i),|\b(?:and|then)\b")
 _GOAL_AUTHORING_SCOPED_EFFECTS = {
     "relay": {"relay"}, "send": {"send"}, "delete": {"delete", "remove"},
     "deploy": {"deploy"}, "merge": {"merge"},
@@ -135,10 +136,19 @@ def goal_authoring_required_effects(text: str) -> set[str]:
             effects.add(effect)
             continue
         end_state = re.compile(rf"(?i){_GOAL_AUTHORING_END_STATE}{participle}\b")
-        if any((match := end_state.search(clause))
-               and not _GOAL_AUTHORING_EMBEDDED_RE.search(clause[:match.start()])
-               for clause in clauses):
-            effects.add(effect)
+        for clause in clauses:
+            match = end_state.search(clause)
+            while match:
+                # A marker in an earlier subclause asks about that subclause;
+                # a later clause may still independently require a mutation.
+                boundaries = list(_GOAL_AUTHORING_END_STATE_BOUNDARY_RE.finditer(clause, 0, match.start()))
+                segment_start = boundaries[-1].end() if boundaries else 0
+                if not _GOAL_AUTHORING_EMBEDDED_RE.search(clause[segment_start:match.start()]):
+                    effects.add(effect)
+                    break
+                match = end_state.search(clause, match.end())
+            if effect in effects:
+                break
     return effects
 
 
