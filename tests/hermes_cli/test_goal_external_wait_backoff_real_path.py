@@ -577,7 +577,10 @@ async def test_real_gateway_post_turn_hooks_mark_continuation_gate_failure_and_i
         else:
             prompt = manager.next_continuation_prompt()
         runner = await _gateway_runner_for_goal(monkeypatch, sid)
-        event = GatewayRunner._synthetic_prompt_event(source, prompt)
+        # Built exactly as _post_turn_goal_continuation enqueues it (provenance-marked).
+        event = GatewayRunner._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+        )
         await GatewayRunner._run_post_turn_hooks(
             runner, agent_result={"final_response": "still working"}, source=source,
             is_internal=False, event=event,

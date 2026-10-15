@@ -26,8 +26,13 @@ GOAL_CONTINUATION_METADATA_KEY = "goal_continuation"
 def is_goal_continuation_event(event_or_text: Any) -> bool:
     """Recognize stamped continuations and legacy text (which must fail the identity fence)."""
     metadata = getattr(event_or_text, "metadata", None)
-    if isinstance(metadata, dict) and metadata.get(GOAL_CONTINUATION_METADATA_KEY):
-        return True
+    if isinstance(metadata, dict):
+        return bool(metadata.get(GOAL_CONTINUATION_METADATA_KEY))
+    # A live MessageEvent without the provenance stamp is ordinary ingress, even when its
+    # text quotes a legacy continuation prompt. Raw strings remain supported for persisted
+    # rows and text-only compatibility callers.
+    if hasattr(event_or_text, "metadata"):
+        return False
     from hermes_cli.goals import is_goal_continuation_text
     return is_goal_continuation_text(str(getattr(event_or_text, "text", event_or_text) or ""))
 

@@ -6,7 +6,7 @@ from hermes_cli import goals
 from hermes_state import SessionDB
 
 
-@pytest.mark.parametrize("timing", ["before", "quote", "commit", "noop_commit"])
+@pytest.mark.parametrize("timing", ["before", "evidence", "commit", "noop_commit"])
 @pytest.mark.parametrize("change", ["pause", "clear", "replace", "revise", "pause_resume"])
 def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, change):
     db = SessionDB(tmp_path / "state.db")
@@ -36,11 +36,13 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
 
         if timing == "before":
             publish()
-        elif timing == "quote":
-            def messages(*args):
+        elif timing == "evidence":
+            # Agents cannot change the objective (that is /goal replace), so the long read
+            # inside a revision is the recorded-evidence lookup.
+            def lookup(self, evidence, state):
                 publish()
-                return ["Work on the corrected task instead"]
-            monkeypatch.setattr(goals, "user_messages_since", messages)
+                return None
+            monkeypatch.setattr(goals.GoalManager, "_recorded_evidence_error", lookup)
         else:
             execute = db._execute_write
             def interleave(write, *args, **kwargs):
@@ -50,9 +52,9 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
             monkeypatch.setattr(db, "_execute_write", interleave)
         if timing == "noop_commit":
             result = manager.revise(reason="Nothing changed", contract={})
-        elif timing == "quote":
-            result = manager.revise(reason="New task", goal="corrected task",
-                                    user_quote="Work on the corrected task instead")
+        elif timing == "evidence":
+            result = manager.revise(reason="Recorded audit", contract={"verification": "check the audit"},
+                                    evidence="audit passed")
         else:
             result = manager.revise(reason="More proof", contract={"verification": "check the artifact"})
         assert result["ok"] is False

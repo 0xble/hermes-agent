@@ -18,14 +18,25 @@ import re
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from collections.abc import Mapping
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.goals_contract_commands import GoalContractCommandsMixin
+from hermes_cli.goals_legacy_prompts import (
+    _LEGACY_CONTINUATION_PROMPT_TEMPLATE, _LEGACY_CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
+    _LEGACY_CONTINUATION_REVISIONS_TEMPLATE, _LEGACY_CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
+    _PRE_531_ADDITIVE_CONTRACT_TEMPLATE,
+)
+from hermes_cli.goals_contract_items import (
+    _migrate_legacy_revision_requirements, contract_remove_aliases, goal_remove_usage,
+    render_removable_contract_items,
+)
 from hermes_cli.goal_evidence import (
     JUDGE_EVIDENCE_BLOCK_TEMPLATE as JUDGE_EVIDENCE_BLOCK_TEMPLATE,
     _READ_ONLY_STATUS_CALL_RE as _READ_ONLY_STATUS_CALL_RE,
@@ -467,6 +478,19 @@ _CITATION_TOKEN_RE = re.compile(r"\b(?:[0-9a-f]{7,64}|\d{8,}|[A-Za-z]+_[A-Za-z0-
 _BLOCKED_PAUSE_PREFIX = "judge blocked: "
 _LEGACY_BLOCKED_PAUSE_PREFIX = "judged unachievable: "
 
+
+def _paused_by_contract_verdict(state) -> bool:
+    """Whether the judge paused this goal over its contract (a BLOCKED verdict).
+
+    A user-authorized replacement supersedes that contract, so it may lift such a pause. User and
+    interrupt pauses, an exhausted budget, and judge-infrastructure or barrier pauses are not about
+    the contract and stay until ``/goal resume``."""
+    reason = state.paused_reason or ""
+    if state.status != "paused":
+        return False
+    return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
+
+
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
 # on concrete evidence instead of a vibe check.
@@ -514,17 +538,8 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "If you are blocked and need input from the user, say so clearly and stop."
 )
 
-# Appended to every continuation prompt once the goal has been revised. The runtime cannot tell
-# whether a quoted user message really authorizes an ordinary revision (the judge decides that
-# after the fact). An explicitly user-authorized replacement, however, starts a new outcome scope.
-# Earlier requirements remain in the audit history, but must not bind the replacement goal.
-CONTINUATION_REVISIONS_TEMPLATE = (
-    "\n\nThis goal has been revised. Requirements marked superseded (no longer binding) "
-    "are audit history only, not obligations for the current goal. Each remaining earlier requirement still "
-    "binds you unless the user message cited for that revision plainly instructs "
-    "that specific change. When in doubt, honor the earlier requirement.\n"
-    "{revision_lines}"
-)
+# Revision history never enters a continuation: the current contract is the whole binding state.
+# Every shipped revision-appendix wording stays in goals_prompt_registry for classification only.
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
 # not to break, scope, and when to stop — so it targets the verification surface.
@@ -536,15 +551,18 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     + "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
     "Your method may change as you learn; the end state may not. If a criterion "
-    "has become obsolete or wrong, say so and revise the goal (goal_set "
-    "action=revise when available, quoting the user's words when they changed "
-    "scope) rather than working around it. Before claiming the goal is done, audit each "
-    "Verification item against current state and end with an Evidence section (plain or collapsible) "
-    "that quotes exact identifiers or output lines from tool results in "
+    "has become obsolete or wrong, say so. goal_set action=revise can only add "
+    "requirements (cite concrete recorded evidence for verification changes); "
+    "retiring or replacing an existing item requires a user-typed /goal remove "
+    "<kind> <N> or /goal replace command. Before "
+    "claiming the goal is done, audit each Verification item against current state "
+    "and end with an Evidence section that quotes exact identifiers or output lines "
+    "from tool results in "
     "backticks (commit SHAs, run ids, URLs, `N passed` lines), so the runtime "
     "can locate them. If you hit the stated stop condition or are otherwise "
     "blocked and need user input, say so clearly and stop."
 )
+
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
 CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
@@ -701,21 +719,6 @@ JUDGE_UNRESOLVED_CITATIONS_TEMPLATE = (
     "return CONTINUE and name the contradiction.\n\n"
 )
 
-# Judge prompt block for the goal's revision history (empty without revisions).
-JUDGE_REVISIONS_BLOCK_TEMPLATE = (
-    "Revision history (the goal and criteria above are the CURRENT version). "
-    "Requirements marked superseded (no longer binding) are audit history only: "
-    "they precede a goal replacement the renderer marked \"superseded goal (replaced with user "
-    "authority, no longer binding)\", and only that marker resets the outcome scope, so do not "
-    "judge the current goal against any requirement marked superseded. A revision that merely "
-    "cites the user is not a replacement and resets nothing. For the remaining history, "
-    "a revision may clarify or restructure, but only the user can lower the "
-    "bar. For each earlier requirement a revision dropped or weakened: it is "
-    "superseded only when the cited user message plainly instructs that "
-    "specific change; otherwise, including every revision with no user "
-    "authority, hold the agent to the earlier requirement.\n{revision_lines}\n\n"
-)
-
 # Stands in for a successful turn that ended empty or tool-only, so the judge reads the ledger.
 JUDGE_EMPTY_RESPONSE_PLACEHOLDER = "(no final text; judge from recorded evidence)"
 
@@ -734,16 +737,16 @@ JUDGE_USER_MESSAGES_BLOCK_TEMPLATE = (
     "message here.\n{user_message_lines}\n\n"
 )
 
-# Appended to every judge prompt whose revision history carries a /goal resume over a block.
+# Appended to every judge prompt whose structured state records a /goal resume over a block.
 JUDGE_RESUME_OVERRIDE_RULE = (
-    "Brian explicitly resumed this goal with /goal resume over the BLOCKED reason(s) in the revision "
-    "history marked \"user command /goal resume\". That is his authority: do not return BLOCKED again "
-    "for the same reason. Still return BLOCKED for any new breach or a different missing input.\n\n"
+    "Brian explicitly resumed this goal with /goal resume over the BLOCKED reason(s) listed here. "
+    "That is his authority: do not return BLOCKED again for the same reason. Still return BLOCKED "
+    "for any new breach or a different missing input.\n"
 )
 
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
-    "{revisions_block}"
+    "{resume_override_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{user_messages_block}"
     "{last_visible_report_block}"
@@ -759,7 +762,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
-    "{revisions_block}"
+    "{resume_override_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{user_messages_block}"
     "{last_visible_report_block}"
@@ -783,7 +786,7 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
-    "{revisions_block}"
+    "{resume_override_block}"
     "Agent's most recent response:\n{response}\n\n"
     "{user_messages_block}"
     "{last_visible_report_block}"
@@ -917,7 +920,35 @@ def parse_contract(text: str) -> tuple[str, GoalContract]:
     return " ".join(headline_parts).strip(), contract
 
 
-def _render_extra_criteria(subgoals: list[str]) -> str:
+def _normalize_item_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _split_text_units(text: str) -> List[str]:
+    """Split a text contract field into independently removable items."""
+    items = (_normalize_item_text(part.strip().rstrip(";").strip())
+             for part in re.split(r"\n+|(?<=[.!?;])(?=\s|$)", text or ""))
+    # Filter after stripping separators so a bare ";" never becomes an empty numbered item.
+    return [item for item in items if item]
+
+
+def contract_items(field_name: str, value: Any) -> List[str]:
+    """Return the canonical atomic items for one contract or subgoal field.
+
+    Contract text is sentence/separator-delimited; each subgoal list entry is already
+    atomic and must never be split into sentences. Item identity is exact after
+    whitespace normalization: case, punctuation, and quoted text remain significant.
+    """
+    if field_name == "subgoals":
+        values = value if isinstance(value, list) else [value]
+        return [_normalize_item_text(item) for item in values if _normalize_item_text(item)]
+    if field_name not in _CONTRACT_FIELDS:
+        raise ValueError(f"unknown goal item field: {field_name}")
+    values = value if isinstance(value, list) else [value]
+    return [item for raw in values for item in _split_text_units(str(raw or ""))]
+
+
+def _render_extra_criteria(subgoals: List[str]) -> str:
     return "\n".join(f"- Extra criterion {i}: {text}" for i, text in enumerate(subgoals, start=1))
 
 
@@ -1039,8 +1070,8 @@ class GoalState:
     gates: List[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
-    # Versioned revisions of the goal/contract/subgoals: {at, actor, reason, user_quote, before, after}.
-    # Shown to the judge and continuation so superseded wording stops binding. Old rows load as [].
+    # Versioned revisions of the goal/contract/subgoals. ``authority`` records
+    # Non-binding audit trail: agent_addition, evidence, or explicit_command.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     # Stable identity of the last parked state announced to the user. This is durable so repeated
     # internal wakes and gateway restarts do not replay an unchanged wait notice.
@@ -1073,7 +1104,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
-            subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
+            subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_on_user_message=bool(data.get("waiting_on_user_message")),
@@ -1098,69 +1129,32 @@ class GoalState:
 
     def render_subgoals_block(self) -> str:
         """Numbered ``- N. text`` block; empty when there are no subgoals."""
-        return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+        return "\n".join(
+            f"- {i}. {text}" for i, text in enumerate(contract_items("subgoals", self.subgoals), start=1)
+        )
 
     def _replacement_boundary(self) -> int:
         """Index of the latest user-authorized replacement revision, else -1."""
         return max(
-            (i for i, rev in enumerate(self.revisions)
-             if rev.get("kind") == "replace" and rev.get("actor") == "user"
-             and rev.get("authority") in {"quote", "button"}),
+            (i for i, revision in enumerate(self.revisions)
+             if revision.get("kind") == "replace" and revision.get("actor") == "user"
+             and revision.get("authority") in {"quote", "button", "explicit_command"}),
             default=-1,
         )
 
-    def has_resume_override(self) -> bool:
-        """Whether a /goal resume over a judge block is recorded for the current goal. Only
-        GoalManager.resume writes ``user_command``; revise() never does, so an agent revision cannot
-        set it. A user-authorized replacement starts a new goal, so earlier waivers do not carry over."""
-        boundary = self._replacement_boundary()
-        return any(rev.get("user_command") == "/goal resume" for rev in self.revisions[boundary + 1:])
+    def resume_override_reasons(self) -> List[str]:
+        """The block reasons a user-command resume waived since the latest replacement.
 
-    def render_revisions_block(self) -> str:
-        """Every revision with every requirement it replaced, in full; empty without revisions.
-
-        Nothing is windowed or truncated. Ordinary revisions preserve earlier requirements, but
-        the latest user-authorized replacement supersedes the entire preceding outcome scope.
-        Derive that boundary from the audit entries rather than storing a second source of truth.
+        Only the exact structured ``user_command`` field grants the waiver. Agent prose,
+        revision reasons, and rendered prompt text cannot imitate it.
         """
-        lines = []
-        replacement_boundary = self._replacement_boundary()
-        for i, rev in enumerate(self.revisions, start=1):
-            quote = str(rev.get("user_quote") or "").strip()
-            source = str(rev.get("user_message") or "").strip()
-            if rev.get("authority") == "button":
-                authority = "approved by the user in Telegram" + (f" ({source})" if source else "")
-            elif rev.get("user_command") == "/goal resume":
-                authority = "user command /goal resume, user authority"
-            elif quote:
-                authority = f'cites the user: "{quote}"' + (f" (full message: \"{source}\")" if source else "")
-            else:
-                authority = "agent, no user authority"
-            # Ordinary revisions flatten the contract; replacements keep a full nested snapshot.
-            # Render both representations, including the old verification and constraints.
-            before, after = dict(rev.get("before") or {}), dict(rev.get("after") or {})
-            for snapshot in (before, after):
-                contract = snapshot.pop("contract", None)
-                if isinstance(contract, dict):
-                    snapshot.update({key: contract.get(key, "") for key in _CONTRACT_FIELDS})
-            changed = [k for k in sorted(set(before) | set(after)) if before.get(k) != after.get(k)]
-            superseded = i - 1 <= replacement_boundary
-            lines.append(f"- v{i + 1} ({rev.get('actor') or 'agent'}, {authority}): "
-                         f"{_truncate(str(rev.get('reason') or ''), 300)} — changed: {', '.join(changed) or 'nothing'}"
-                         + (" — superseded history (no longer binding)" if superseded else ""))
-            for key in changed:
-                if superseded and key == "goal":
-                    lines.append(f"    superseded goal (replaced with user authority, no longer binding): "
-                                 f"{str(before.get(key) or '(empty)')}")
-                elif key in ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when"):
-                    label = f"superseded {key} (no longer binding)" if superseded else f"earlier {key}"
-                    lines.append(f"    {label}: {str(before.get(key) or '(empty)')}")
-                elif key == "subgoals":
-                    dropped = [s for s in (before.get(key) or []) if s not in (after.get(key) or [])]
-                    if dropped:
-                        label = "superseded criteria (no longer binding)" if superseded else "dropped criteria"
-                        lines.append(f"    {label}: " + "; ".join(str(s) for s in dropped))
-        return "\n".join(lines)
+        boundary = self._replacement_boundary()
+        return [str(revision.get("reason") or "") for revision in self.revisions[boundary + 1:]
+                if revision.get("user_command") == "/goal resume"]
+
+    def has_resume_override(self) -> bool:
+        """Whether this goal has a user-command resume waiver."""
+        return bool(self.resume_override_reasons())
 
     def clear_wait(self, *, preserve_notice_key: bool = False) -> None:
         self.waiting_on_pid = None
@@ -1313,8 +1307,18 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
+def _parse_goal_row(session_id: str, raw: str) -> GoalState:
+    try:
+        return GoalState.from_json(raw)
+    except Exception as exc:
+        logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
+        raise GoalRowCorrupt(
+            "existing goal could not be parsed; refusing to overwrite it. /goal clear discards it"
+        ) from exc
+
+
 def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
+    """Load the goal, atomically upgrading legacy history-backed requirements once."""
     if not session_id:
         return None
     db = _get_session_db()
@@ -1329,15 +1333,45 @@ def load_goal(session_id: str, *, cursor=None) -> Optional[GoalState]:
     except Exception as exc:
         if cursor is not None:
             raise
-        logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
+        logger.warning("GoalManager: get_meta failed for %s: %s", session_id, exc)
+        raise GoalPersistenceError("existing goal could not be read; refusing to treat it as absent") from exc
     if not raw:
         return None
+    state = _parse_goal_row(session_id, raw)
+    if not _migrate_legacy_revision_requirements(state):
+        return state
+
+    # Session-control mutations already own the SessionDB write transaction. Re-entering
+    # _execute_write here deadlocks on the non-reentrant writer lock; apply the migration to the
+    # caller's cursor instead. The enclosing command CAS then commits migration + mutation
+    # atomically.
+    if cursor is not None:
+        state.mutation_id = uuid.uuid4().hex
+        cursor.execute("UPDATE state_meta SET value = ? WHERE key = ?",
+                       (state.to_json(), _meta_key(session_id)))
+        return state
+
+    def _txn(conn) -> Optional[GoalState]:
+        # Never overwrite a command or verdict that raced the initial read.
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
+        if row is None or not row[0]:
+            return None
+        live = GoalState.from_json(row[0])
+        if _migrate_legacy_revision_requirements(live):
+            live.mutation_id = uuid.uuid4().hex
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (live.to_json(), _meta_key(session_id)))
+        return live
+
     try:
-        return GoalState.from_json(raw)
+        return db._execute_write(_txn)
     except Exception as exc:
-        logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        # The row existed and the migration was computed successfully. Returning None here makes
+        # GoalManager believe there is no goal, so a following /goal <text> can overwrite the
+        # unrestored durable row. Keep the migrated in-memory state and mark it so ordinary
+        # mutations retry the migration transaction; set() explicitly refuses to replace it.
+        setattr(state, "_legacy_migration_pending", True)
+        logger.warning("GoalManager: legacy requirement migration failed for %s: %s", session_id, exc, exc_info=True)
+        return state
 
 
 def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
@@ -2126,10 +2160,9 @@ def judge_goal(
     active_delegations: int = 0,
     evidence: Optional[List[Dict[str, Any]]] = None,
     citations: Optional[Dict[str, Any]] = None,
-    revisions_block: str = "",
     last_visible_report: str = "",
     user_messages_block: str = "",
-    resume_override: bool = False,
+    resume_override: Union[bool, List[str]] = False,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -2160,7 +2193,8 @@ def judge_goal(
 
     # Prompt priority: contract > subgoals > plain. With both, subgoals fold into the contract
     # block as extra criteria so the judge sees a single source of truth.
-    clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
+    clean_subgoals = contract_items("subgoals", subgoals or [])
+    waived = resume_override if isinstance(resume_override, list) else []
     # Criteria are authoritative, unlike the bounded response preview. Silently
     # dropping later requirements makes the judge evaluate a different goal.
     common = dict(
@@ -2171,9 +2205,8 @@ def judge_goal(
             report=_judge_response_window(last_visible_report)) if last_visible_report else ""),
         evidence_block=_render_evidence_block(evidence),
         cited_block=_render_cited_block(citations),
-        revisions_block=(JUDGE_REVISIONS_BLOCK_TEMPLATE.format(revision_lines=revisions_block)
-                         + (JUDGE_RESUME_OVERRIDE_RULE if resume_override else "")
-                         if revisions_block.strip() else ""),
+        resume_override_block=(JUDGE_RESUME_OVERRIDE_RULE + "".join(
+            f"- {_truncate(reason, 300)}\n" for reason in waived) + "\n" if resume_override else ""),
         user_messages_block=user_messages_block,
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
@@ -2608,64 +2641,24 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
     return JUDGE_USER_MESSAGES_BLOCK_TEMPLATE.format(user_message_lines="\n".join(kept)) if kept else ""
 
 
-def _is_user_typed(row: Dict[str, Any]) -> bool:
-    """Whether a user-role row is input the person typed, judged by provenance first."""
-    content = row.get("content")
-    if not isinstance(content, str) or row.get("compressed_summary"):
-        return False
-    if str(row.get("display_kind") or "") not in _USER_TYPED_KINDS:
-        return False
-    if _is_agent_origin(content):
-        return False
-    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
-        return False
-    # Relay and other gateway-authored text is persisted as an ordinary user row.  The
-    # response-origin marker is the authoritative second provenance check; fail closed if
-    # the filter cannot be imported so synthetic text can never authorize a revision.
-    try:
-        from gateway.response_filters import is_agent_origin_text
-        if is_agent_origin_text(content):
-            return False
-    except Exception:
-        return False
-    try:
-        from agent.context_compressor import ContextCompressor
-        if ContextCompressor._is_context_summary_content(content):
-            return False
-    except Exception:
-        # Same fail-closed rule: if a context summary cannot be ruled out, the row cannot
-        # authorize a revision or session control.
-        return False
-    return True
-# Gateway reply pointer (gateway/run_inbound.py ``_prepend_inbound_reply_context``), with or without
-# " your previous message". Greedy to the last ``"]`` line end: the quoted text is the assistant's
-# words and may itself contain ``"]``, so stripping too much fails closed for quote authority.
-_REPLY_QUOTE_RE = re.compile(r'^\[Replying to(?: your previous message)?: ".*"\]\n\s*', re.DOTALL)
+# Goal authority and recorded-user/evidence helpers live in a topical sibling.
+# The imports keep the facade patch seam used by CLI, gateway, loops and tests.
+_REVISION_EVIDENCE_MIN_CHARS = 12
+from hermes_cli.goals_authority import (
+    _AUTHORITY_PRESERVE_RE, _REPLACEMENT_ACTION_RE, _REPLACEMENT_BUDGET_TARGET_RE,
+    _REPLACEMENT_GATE_TARGET_RE, _REPLACEMENT_NEGATION_RE, _REMOVAL_VERBS,
+    _REVISION_QUOTE_MIN_CHARS, _REVISION_SOURCE_MAX_CHARS, _REPLY_QUOTE_RE,
+    _NON_AUTHORITATIVE_QUOTE_RE, _NON_AUTHORITATIVE_SPANS_RE,
+    _authority_unit_records, _authority_units, _bounded_authority_match,
+    _bounded_evidence_match, _direct_authority_unit, _evidence_is_negated,
+    _explicit_restriction_removals, _is_user_typed, _mask_non_authoritative_spans,
+    _mask_replacement_objective_spans, _normalize_authority_text,
+    _normalize_authority_value, _removal_authority_text, _removal_instruction_units,
+    _replacement_action_is_authorized, _replacement_goal_is_negated, _requirement_diff,
+    _typed_user_message_records_since, _typed_user_message_text, _unit_is_non_directive,
+    user_messages_since,
+)
 
-
-_REVISION_QUOTE_MIN_CHARS = 12
-# Longest user message a revision may cite. The judge decides authority from the complete message,
-# so a longer one is refused rather than excerpted: an excerpt can drop the context that negates it.
-_REVISION_SOURCE_MAX_CHARS = 4000
-
-
-def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
-    """Text the user actually wrote since ``since``: synthetic runtime prompts are dropped and a
-    reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
-    db = _get_session_db()
-    reader = getattr(db, "messages_by_role", None) if db is not None else None
-    if not session_id or reader is None:
-        return []
-    try:
-        # A rewound (/undo) message is no longer something the user is asking for.
-        try:
-            rows = reader(session_id, "user", since=since, limit=limit, current_only=True)
-        except TypeError:  # an older reader without the parameter
-            rows = reader(session_id, "user", since=since, limit=limit)
-    except Exception as exc:
-        logger.debug("goal revise: user message read failed: %s", exc)
-        return []
-    return [_REPLY_QUOTE_RE.sub("", row["content"], count=1) for row in rows if _is_user_typed(row)]
 
 
 # One notice per judge outage for the whole process, not one per goal: a provider outage
@@ -2699,7 +2692,29 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
-class GoalManager(GoalRevisionsMixin):
+class GoalPersistenceError(RuntimeError):
+    """A durable goal change failed, so callers must not acknowledge or schedule it."""
+
+
+class GoalRowCorrupt(GoalPersistenceError):
+    """The stored goal row exists but cannot be parsed; only ``clear()`` may replace it."""
+
+
+class _GoalMutationRefused(Exception):
+    """A command mutation rejected the live row; carries the original error out of the txn."""
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _live_goal(state: Optional[GoalState]) -> GoalState:
+    if state is None or state.status not in {"active", "paused"}:
+        raise RuntimeError("no active goal")
+    return state
+
+
+class GoalManager(GoalRevisionsMixin, GoalContractCommandsMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -2721,9 +2736,18 @@ class GoalManager(GoalRevisionsMixin):
         self.min_continuation_gap_seconds = normalize_goal_continuation_gap(min_continuation_gap_seconds)
         # Session controls lend their write transaction; ordinary drivers keep independent writes.
         self._cursor = cursor
-        self._state: Optional[GoalState] = (
-            load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
-        )
+        # A row that exists but cannot be read must not break every user turn or the commands that
+        # recover it. The manager holds no state (no continuation, judge, or revive) and remembers
+        # why; writes still re-read the live row and refuse to overwrite it.
+        self._unreadable: Optional[GoalPersistenceError] = None
+        try:
+            self._state: Optional[GoalState] = (
+                load_goal(session_id) if cursor is None else load_goal(session_id, cursor=cursor)
+            )
+        except GoalPersistenceError as exc:
+            logger.warning("GoalManager: goal for %s is unreadable; treating it as inert: %s", session_id, exc)
+            self._state = None
+            self._unreadable = exc
 
     # --- introspection ------------------------------------------------
 
@@ -2737,15 +2761,26 @@ class GoalManager(GoalRevisionsMixin):
     def has_goal(self) -> bool:
         return self._state is not None and self._state.status in {"active", "paused"}
 
+    @property
+    def unreadable(self) -> bool:
+        """True when a stored goal row exists but this manager could not load it."""
+        return self._unreadable is not None
+
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
 
     def status_line(self) -> str:
         s = self._state
+        if isinstance(self._unreadable, GoalRowCorrupt):
+            return ("⚠ The stored goal is unreadable, so it is inert: no continuation or judge runs. "
+                    "/goal clear discards it; then /goal <text> sets a new one.")
+        if self._unreadable is not None:
+            return "⚠ The stored goal could not be read right now, so it is inert this turn. Try again."
         if s is None or s.status == "cleared":
             return "No active goal. Set one with /goal <text>."
         turns = f"{_goal_budget_label(s.turns_used, s.max_turns)} turns"
-        sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
+        subgoal_items = contract_items("subgoals", s.subgoals)
+        sub = f", {len(subgoal_items)} subgoal{'s' if len(subgoal_items) != 1 else ''}" if subgoal_items else ""
         con = ", contract" if self.has_contract() else ""
         gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
         meta = f"{turns}{sub}{con}{gat}"
@@ -2782,6 +2817,103 @@ class GoalManager(GoalRevisionsMixin):
         else:
             save_goal(self.session_id, self._state, cursor=self._cursor)
         return self._state
+
+    def _mutate_current(self, mutate, *, discard_corrupt: bool = False):
+        """Apply ``mutate(state)`` to the CURRENT durable goal row in one write transaction.
+
+        Commands and the evaluator run on different managers (the gateway loads the command
+        manager and dispatches it in separate executor hops), so the in-memory snapshot can be
+        stale. Saving it blindly would undo a concurrent verdict: re-activating a budget pause or
+        refunding consumed turns. Instead the row is re-read under ``BEGIN IMMEDIATE``, the edit is
+        applied to that live state (lifecycle fields stay whatever is current), and the result is
+        written with a fresh mutation token. The caller's manager is refreshed from the row, so
+        continuation decisions after a command see current state. ``mutate`` receives ``None``
+        when no row exists, must validate before mutating, and must not touch the database (the
+        transaction may be replayed on lock contention). Inside an evaluator snapshot the edit is
+        staged locally; the evaluator's own compare-and-set commit settles it. A row that cannot be
+        parsed refuses every mutation except ``discard_corrupt``, which tombstones it unparsed.
+        """
+        if getattr(self, "_evaluation_snapshot", None) is not None or getattr(self, "_staging_internal", False):
+            # Evaluator-internal transitions (judge waits, no-progress parks) act on the judged
+            # snapshot; the evaluator's compare-and-set commit settles them.
+            result = mutate(self._state)
+            if self._state is not None:
+                self._save()
+            return result
+        db = _get_session_db() if self.session_id else None
+        if db is None or not hasattr(db, "_execute_write"):
+            result = mutate(self._state)
+            if self._state is not None:
+                save_goal(self.session_id, self._state)   # warns on a dropped write
+            return result
+        key = _meta_key(self.session_id)
+        seen: List[Optional[GoalState]] = []
+
+        def _txn(conn):
+            seen.clear()
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            try:
+                live = _parse_goal_row(self.session_id, row[0]) if row and row[0] else None
+            except GoalRowCorrupt:
+                if not discard_corrupt:
+                    raise
+                # A cleared tombstone keeps the instance fence monotonic for the next /goal set.
+                tombstone = GoalState(goal="", status="cleared", created_at=time.time(),
+                                      mutation_id=uuid.uuid4().hex)
+                conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (tombstone.to_json(), key))
+                return None, None
+            # Compare normalized JSON so a no-op command never mints a token (which would
+            # needlessly interrupt an in-flight evaluation).
+            original = live.to_json() if live is not None else None
+            if live is not None:
+                _migrate_legacy_revision_requirements(live)
+            seen.append(None if live is None else GoalState.from_json(live.to_json()))
+            try:
+                result = mutate(live)
+            except Exception as exc:
+                raise _GoalMutationRefused(exc) from exc   # rolls the transaction back
+            if live is not None and live.to_json() != original:
+                live.mutation_id = uuid.uuid4().hex
+                conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (live.to_json(), key))
+            return live, result
+
+        if self._cursor is not None:
+            try:
+                live, result = _txn(self._cursor)
+            except _GoalMutationRefused as refused:
+                if seen:
+                    self._adopt(seen[0])
+                raise refused.error from None
+            except GoalRowCorrupt:
+                raise
+            except Exception as exc:
+                logger.warning("GoalManager: atomic goal mutation for %s not persisted: %s", self.session_id, exc)
+                raise GoalPersistenceError("goal change was not saved; try again") from exc
+            self._adopt(live)
+            return result
+
+        try:
+            live, result = db._execute_write(_txn)
+        except _GoalMutationRefused as refused:
+            if seen:
+                self._adopt(seen[0])
+            raise refused.error from None
+        except GoalRowCorrupt:
+            raise
+        except Exception as exc:
+            logger.warning("GoalManager: atomic goal mutation for %s not persisted: %s", self.session_id, exc)
+            raise GoalPersistenceError("goal change was not saved; try again") from exc
+        self._adopt(live)
+        return result
+
+    def _adopt(self, live: Optional[GoalState]) -> None:
+        """Refresh from the written row, keeping object identity for callers holding ``state``."""
+        if live is None or self._state is None:
+            self._state = live
+        else:
+            self._state.__dict__.update(live.__dict__)
+            if not hasattr(live, "_legacy_migration_pending"):
+                self._state.__dict__.pop("_legacy_migration_pending", None)
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -2825,6 +2957,14 @@ class GoalManager(GoalRevisionsMixin):
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        # A cached manager may predate a restored row or a failed read. Re-read before replacing
+        # rather than interpreting its stale None as proof that the durable goal is absent.
+        live = load_goal(self.session_id)
+        if getattr(live, "_legacy_migration_pending", False):
+            self._state = live
+            raise GoalPersistenceError(
+                "existing goal migration was not saved; refusing to overwrite it; try again"
+            )
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
@@ -2835,250 +2975,122 @@ class GoalManager(GoalRevisionsMixin):
     @snapshot_control
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
-        if self._state is None:
-            return None
-        self._state.contract = contract or GoalContract()
-        return self._save()
+        def _apply(state):
+            if state is not None:
+                state.contract = contract or GoalContract()
+            return state
+        return self._mutate_current(_apply)
 
     @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
-        if not self._state:
-            return None
-        self._state.status = "paused"
-        self._state.paused_reason = reason
-        self._state.clear_wait()   # a wait barrier is meaningless once paused
-        self._state.consecutive_no_progress = 0
-        self._state.backoff_level = 0
-        return self._save()
+        def _apply(state):
+            if state is None or state.status == "cleared":
+                return None   # a concurrent /goal clear stays cleared
+            state.status = "paused"
+            state.paused_reason = reason
+            state.clear_wait()   # a wait barrier is meaningless once paused
+            state.consecutive_no_progress = 0
+            state.backoff_level = 0
+            return state
+        return self._mutate_current(_apply)
 
     @snapshot_control
     def resume(self, *, reset_budget: bool = True, user_override: bool = True) -> Optional[GoalState]:
-        """``user_override`` records an explicit resume over a judge block. Reviving on an ordinary
-        user reply passes False: that reply may refuse the action, and the judge reads it directly."""
-        if not self._state:
-            return None
-        prior_block_reason = self._state.last_reason or self._state.paused_reason or "unknown blocker"
-        record_override = user_override and (
-            self._state.status == "paused" and self._state.last_verdict == "blocked"
-            and (self._state.paused_reason or "").startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
-        )
-        if record_override:
-            before = {"goal": self._state.goal, **self._state.contract.to_dict(), "subgoals": list(self._state.subgoals)}
-            self._state.revisions.append({
-                "at": time.time(), "actor": "user", "user_command": "/goal resume",
-                "reason": f"Brian resumed over block: {prior_block_reason}",
-                "user_quote": "", "user_message": "",
-                "before": before, "after": before,
-            })
-        self._state.status = "active"
-        self._state.paused_reason = None
-        self._state.consecutive_no_progress = 0
-        self._state.backoff_level = 0
-        self._state.clear_wait()   # resuming starts fresh
+        """Resume through a live-row mutation, optionally recording a user override."""
+        def _apply(state):
+            if state is None or state.status == "cleared":
+                return None
+            prior_block_reason = state.last_reason or state.paused_reason or "unknown blocker"
+            record_override = user_override and (
+                state.status == "paused" and state.last_verdict == "blocked"
+                and (state.paused_reason or "").startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
+            )
+            if record_override:
+                before = {"goal": state.goal, **state.contract.to_dict(), "subgoals": list(state.subgoals)}
+                state.revisions.append({
+                    "at": time.time(), "actor": "user", "user_command": "/goal resume",
+                    "reason": f"Brian resumed over block: {prior_block_reason}",
+                    "user_quote": "", "user_message": "", "before": before, "after": before,
+                })
+            self._resume_state(state, reset_budget=reset_budget)
+            return state
+        return self._mutate_current(_apply)
+
+    @staticmethod
+    def _resume_state(state: GoalState, *, reset_budget: bool) -> None:
+        state.status = "active"
+        state.paused_reason = None
+        state.consecutive_no_progress = 0
+        state.backoff_level = 0
+        state.clear_wait()
         if reset_budget:
-            self._state.turns_used = 0
-        return self._save()
+            state.turns_used = 0
 
     @snapshot_control
     def resume_for_user_input(self) -> bool:
-        """Reactivate a goal the judge paused as BLOCKED because a real user message just
-        arrived. BLOCKED means "the next step needs user input" (#100954), and that message
-        IS the input — leaving the goal paused makes the user's answer run as a plain prompt
-        with no judge and no continuation, while the card keeps saying "Goal paused" until
-        they discover /goal resume. Only the judge's BLOCKED pause qualifies: an explicit
-        /goal pause, Ctrl+C, an exhausted budget or a broken judge stay paused because the
-        user must consciously choose to spend more turns there. Budget is kept, not reset
-        (this is the same goal continuing). Returns True when the goal was reactivated."""
-        s = self._state
-        if s is None or s.status != "paused" or s.last_verdict != "blocked":
+        """Reactivate a goal paused by the judge for required user input.
+
+        Runs on every admitted user turn, so a goal that cannot be read or saved stays as it is and
+        the turn proceeds; it never raises into the turn."""
+        if self._unreadable is not None:
             return False
-        if not (s.paused_reason or "").startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX)):
+
+        def _apply(state):
+            if state is None or state.status != "paused" or state.last_verdict != "blocked":
+                return False
+            if not (state.paused_reason or "").startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX)):
+                return False
+            self._resume_state(state, reset_budget=False)
+            return True
+        try:
+            return self._mutate_current(_apply)
+        except GoalPersistenceError as exc:
+            logger.warning("GoalManager: blocked goal for %s not revived: %s", self.session_id, exc)
             return False
-        self.resume(reset_budget=False, user_override=False)
-        return True
 
     @snapshot_control
     def clear(self) -> None:
-        if self._state is None:
-            return
-        self._state.status = "cleared"
-        self._save()
-        self._cleared_instance = self._state.created_at
+        def _apply(state):
+            if state is not None:
+                state.status = "cleared"
+        self._mutate_current(_apply, discard_corrupt=True)
+        if self._state is not None:
+            self._cleared_instance = self._state.created_at
         self._state = None
+        self._unreadable = None
 
     @snapshot_control
     def mark_done(self, reason: str) -> None:
-        if not self._state:
-            return
-        self._state.clear_wait()
-        self._state.status = "done"
-        self._state.last_verdict = "done"
-        self._state.last_reason = reason
-        self._save()
-
-    # Versioned revise/replace are provided by GoalRevisionsMixin; its CAS wrapper is the
-    # sole public mutation boundary.
-
-    # --- /subgoal user controls ---------------------------------------
-
-    @snapshot_control
-    def add_subgoal(self, text: str) -> str:
-        """Append a user-added criterion; raises ``RuntimeError`` without ``has_goal()``."""
-        state = self._require_goal()
-        text = (text or "").strip()
-        if not text:
-            raise ValueError("subgoal text is empty")
-        state.subgoals.append(text)
-        self._save()
-        return text
-
-    def _pop_item(self, attr: str, index_1based: int):
-        items = getattr(self._require_goal(), attr)
-        idx = int(index_1based) - 1
-        if idx < 0 or idx >= len(items):
-            raise IndexError(f"index out of range (1..{len(items)})")
-        removed = items.pop(idx)
-        self._save()
-        return removed
-
-    def _clear_items(self, attr: str) -> int:
-        state = self._require_goal()
-        prev = len(getattr(state, attr))
-        setattr(state, attr, [])
-        self._save()
-        return prev
-
-    @snapshot_control
-    def remove_subgoal(self, index_1based: int) -> str:
-        """Remove a subgoal by 1-based index. Returns the removed text."""
-        return self._pop_item("subgoals", index_1based)
-
-    @snapshot_control
-    def clear_subgoals(self) -> int:
-        """Wipe all subgoals. Returns the previous count."""
-        return self._clear_items("subgoals")
-
-    def render_subgoals(self) -> str:
-        """Public helper for the /subgoal slash command."""
-        if self._state is None:
-            return "(no active goal)"
-        return self._state.render_subgoals_block() or "(no subgoals — use /subgoal <text> to add criteria)"
-
-    # --- /goal gate quality gates ---------------------------------------
-
-    @snapshot_control
-    def add_gate(self, command: str, *, timeout_seconds: Optional[int] = None, max_retries: Optional[int] = None) -> GoalGate:
-        """Append a quality-gate command; raises ``RuntimeError`` without ``has_goal()``."""
-        state = self._require_goal()
-        command = (command or "").strip()
-        if not command:
-            raise ValueError("gate command is empty")
-        gate = GoalGate(
-            command=command,
-            timeout_seconds=int(timeout_seconds) if timeout_seconds else DEFAULT_GATE_TIMEOUT_SECONDS,
-            max_retries=int(max_retries) if max_retries else DEFAULT_GATE_MAX_RETRIES,
-        )
-        state.gates.append(gate)
-        self._save()
-        return gate
-
-    @snapshot_control
-    def remove_gate(self, index_1based: int) -> str:
-        """Remove a gate by 1-based index. Returns the removed command."""
-        return self._pop_item("gates", index_1based).command
-
-    @snapshot_control
-    def clear_gates(self) -> int:
-        """Remove all gates. Returns the previous count."""
-        return self._clear_items("gates")
-
-    def render_gates(self) -> str:
-        """Public helper for the /goal gate slash command."""
-        if self._state is None:
-            return "(no active goal)"
-        if not self._state.gates:
-            return "(no quality gates — use /goal gate add <command> to require one)"
-        lines = []
-        for i, g in enumerate(self._state.gates, start=1):
-            status = ""
-            if g.last_exit_code == 0:
-                status = " ✓ passing"
-            elif g.last_exit_code is not None:
-                status = f" ✗ failing (exit {g.last_exit_code}, attempt {g.attempts}/{g.max_retries})"
-            lines.append(f"- {i}. $ {g.command}{status}")
-        return "\n".join(lines)
-
-    def _check_gates(self) -> Optional[dict[str, Any]]:
-        """Run quality gates in order; return a decision dict on failure.
-
-        Every eligible boundary re-executes a failed gate. A git HEAD+porcelain fingerprint used to
-        replay the recorded failure when "nothing changed", but porcelain sees neither the contents
-        of an untracked or already-modified file nor inputs outside the repo, so a repaired input
-        was replayed as still-failing until retry exhaustion paused the goal (#110649). The
-        retry cap below still bounds a genuinely stuck red suite.
-        """
-        state = self._state
-        if state is None or not state.gates:
-            return None
-
-        gate_cwd, refusal = _gate_workspace()
-        if refusal:
-            return self._pause_decision(
-                f"quality gates not run: {refusal}", "gate_failed", f"gates not run: {refusal}",
-                f"⏸ Goal paused — quality gates not run: {refusal}. Fix the workspace or "
-                f"/goal gate remove the gates, then /goal resume.",
-            )
-        for gate in state.gates:
-            passed, exit_code, tail = run_gate(gate, cwd=gate_cwd)
-            gate.last_exit_code = exit_code
-            gate.last_output_tail = tail
-            if passed:
-                gate.attempts = 0
-                continue
-
-            gate.attempts += 1
-
-            if gate.attempts > gate.max_retries:
-                return self._pause_decision(
-                    f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}",
-                    "gate_failed", f"gate exhausted retries: $ {gate.command}",
-                    f"⏸ Goal paused — quality gate still failing after "
-                    f"{gate.max_retries} retries: $ {gate.command} "
-                    f"(exit {exit_code}). Fix it manually or /goal gate remove it, "
-                    f"then /goal resume.",
-                )
-
-            self._save()
-            prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
-                goal=state.goal, command=gate.command, exit_code=exit_code, attempt=gate.attempts,
-                max_retries=gate.max_retries, output=tail or "(no output)",
-            )
-            return _decision(
-                "active", True, prompt, "gate_failed",
-                f"gate failed (exit {exit_code}): $ {gate.command}",
-                f"✗ Quality gate failed ({_goal_budget_label(state.turns_used, state.max_turns)} turns, "
-                f"attempt {gate.attempts}/{gate.max_retries}): $ {gate.command}",
-            )
-
-        self._save()
-        return None
+        def _apply(state):
+            if state is None:
+                return
+            state.clear_wait()
+            state.status = "done"
+            state.last_verdict = "done"
+            state.last_reason = reason
+        self._mutate_current(_apply)
 
     # --- /goal wait barrier -------------------------------------------
 
     def _park(self, reason: str, **barrier) -> GoalState:
-        state = self._require_active()
-        # Re-parking is not progress: keep the last notice key so an unchanged judge WAIT
-        # remains silent, while clearing barrier fields before applying the new target.
-        state.clear_wait(preserve_notice_key=True)
-        for k, v in barrier.items():
-            setattr(state, k, v)
-        state.waiting_reason = (reason or "").strip() or None
-        state.waiting_since = time.time()
-        # A live barrier's first recheck is derived from waiting_since below rather than
-        # persisted here.  The three goal surfaces can park the same state in separate
-        # calls, so storing a wall-clock value at park time makes their state snapshots
-        # differ even though the durable behavior is identical.
-        return self._save()
+        self._require_active()
+
+        def _apply(state):
+            if state is None or state.status != "active":
+                raise RuntimeError("no active goal to park")
+            # Re-parking is not progress: keep the last notice key so an unchanged judge WAIT
+            # remains silent, while clearing barrier fields before applying the new target.
+            state.clear_wait(preserve_notice_key=True)
+            for k, v in barrier.items():
+                setattr(state, k, v)
+            state.waiting_reason = (reason or "").strip() or None
+            state.waiting_since = time.time()
+            # A live barrier's first recheck is derived from waiting_since below rather than
+            # persisted here.  The three goal surfaces can park the same state in separate
+            # calls, so storing a wall-clock value at park time makes their state snapshots
+            # differ even though the durable behavior is identical.
+            return state
+        return self._mutate_current(_apply)
 
     @snapshot_control
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
@@ -3121,13 +3133,13 @@ class GoalManager(GoalRevisionsMixin):
     @snapshot_control
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True if one was cleared."""
-        s = self._state
-        if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None
-                         and not s.waiting_on_user_message and not s.waiting_until):
-            return False
-        s.clear_wait()
-        self._save()
-        return True
+        def _apply(s):
+            if s is None or (s.waiting_on_pid is None and s.waiting_on_session is None
+                             and not s.waiting_on_user_message and not s.waiting_until):
+                return False
+            s.clear_wait()
+            return True
+        return self._mutate_current(_apply)
 
     @snapshot_control
     def clear_lifted_wait(self, waiting_since: float) -> bool:
@@ -3273,7 +3285,15 @@ class GoalManager(GoalRevisionsMixin):
             message=f"⏳ Goal parked — waiting on {tgt}: {reason}",
         )
 
-    def _apply_wait_directive(
+    def _apply_wait_directive(self, *args, **kwargs):
+        prior = getattr(self, "_staging_internal", False)
+        self._staging_internal = True
+        try:
+            return self._apply_wait_directive_impl(*args, **kwargs)
+        finally:
+            self._staging_internal = prior
+
+    def _apply_wait_directive_impl(
         self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
         automatic: bool = False, min_seconds: int = 0,
     ) -> Optional[Dict[str, Any]]:
@@ -3320,7 +3340,15 @@ class GoalManager(GoalRevisionsMixin):
             message=f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
         )
 
-    def _no_progress_wait(
+    def _no_progress_wait(self, *args, **kwargs):
+        prior = getattr(self, "_staging_internal", False)
+        self._staging_internal = True
+        try:
+            return self._no_progress_wait_impl(*args, **kwargs)
+        finally:
+            self._staging_internal = prior
+
+    def _no_progress_wait_impl(
         self, state: GoalState, reason: str, *, active_delegations: int = 0, min_seconds: int = 0,
     ) -> Dict[str, Any]:
         """Park after an automatic no-progress turn as a quiet, durable backoff."""
@@ -3333,7 +3361,15 @@ class GoalManager(GoalRevisionsMixin):
             message="",
         )
 
-    def _delegation_no_progress_wait(
+    def _delegation_no_progress_wait(self, *args, **kwargs):
+        prior = getattr(self, "_staging_internal", False)
+        self._staging_internal = True
+        try:
+            return self._delegation_no_progress_wait_impl(*args, **kwargs)
+        finally:
+            self._staging_internal = prior
+
+    def _delegation_no_progress_wait_impl(
         self, state: GoalState, reason: str, active_delegations: int, *, min_seconds: int = 0,
     ) -> Dict[str, Any]:
         """Park immediately when live delegations leave an automatic turn with no action."""
@@ -3460,10 +3496,10 @@ class GoalManager(GoalRevisionsMixin):
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal, last_response, subgoals=state.subgoals or None, background_processes=background_processes,
             contract=state.contract if state.has_contract() else None, active_delegations=active_delegations,
-            evidence=evidence or None, citations=citations, revisions_block=state.render_revisions_block(),
-            resume_override=state.has_resume_override(),
-            user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
+            evidence=evidence or None, citations=citations,
             last_visible_report=visible_report,
+            resume_override=state.resume_override_reasons(),
+            user_messages_block=_render_user_messages_block(self.session_id, state.created_at),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -3575,10 +3611,7 @@ class GoalManager(GoalRevisionsMixin):
         s = self._state
         if not s or s.status != "active":
             return None
-        prompt = self._current_continuation_prompt(s)
-        if s.revisions:
-            prompt += CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=s.render_revisions_block())
-        return prompt
+        return self._current_continuation_prompt(s)
 
     @staticmethod
     def _current_continuation_prompt(s: "GoalState") -> str:

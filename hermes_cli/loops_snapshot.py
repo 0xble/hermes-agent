@@ -2,6 +2,9 @@
 
 No database lock is held during authority lookup or judging. Mutation tokens detect
 ABA changes; tick identity lets cleanup release only the claim that actually finished.
+Commits go through ``save_loop``'s stored-row transaction, so the loop control fence
+advances exactly as it does for every other loop write, including inside a cursor owner's
+transaction.
 """
 
 from __future__ import annotations
@@ -9,7 +12,6 @@ from __future__ import annotations
 import copy
 import logging
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
@@ -28,39 +30,52 @@ class LoopPersistenceError(RuntimeError):
     """The loop snapshot could not be read or committed."""
 
 
-def _read_loop(session_id: str, db: Any) -> LoopState | None:
+def _read_loop(session_id: str, db: Any, cursor: Any = None) -> LoopState | None:
     from hermes_cli.loops import LoopState, _meta_key
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        if cursor is not None:
+            # A cursor owner holds the write lock; a separate SessionDB read would deadlock.
+            row = cursor.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)
+            ).fetchone()
+            raw = row[0] if row else None
+        else:
+            raw = db.get_meta(_meta_key(session_id))
         return LoopState.from_json(raw) if raw else None
     except Exception as exc:
+        if cursor is not None:
+            raise  # transaction owners see their own failures
         raise LoopPersistenceError from exc
 
 
-def assert_loop_snapshot(session_id: str, expected: str, db: Any) -> None:
-    current = _read_loop(session_id, db)
+def assert_loop_snapshot(session_id: str, expected: str, db: Any, *, cursor: Any = None) -> None:
+    current = _read_loop(session_id, db, cursor)
     if current is None or current.to_json() != expected:
         raise LoopSnapshotChanged("loop state changed")
 
 
-def _commit(session_id: str, expected: str, state: LoopState, db: Any) -> None:
-    from hermes_cli.loops import LoopState, _meta_key
+def _commit(manager: Any, expected: str, state: LoopState, *, tick_lifecycle: bool) -> LoopState:
+    """Write *state* only while the stored row is still *expected*; return the row written."""
+    from hermes_cli.loops import _overlay, save_loop
 
-    def write(cursor):
-        row = cursor.execute(
-            "SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)
-        ).fetchone()
-        if not row or not row[0] or LoopState.from_json(row[0]).to_json() != expected:
-            raise LoopSnapshotChanged("loop state changed")
-        if state.to_json() != expected:
-            state.mutation_id = uuid.uuid4().hex
-            db.set_meta(_meta_key(session_id), state.to_json(), cursor=cursor)
+    def apply(live: Optional[LoopState]) -> bool:
+        if live is None or live.to_json() != expected:
+            return False
+        _overlay(live, state)  # a no-op stays unwritten, validated inside the same transaction
+        return True
+
     try:
-        db._execute_write(write)
-    except LoopSnapshotChanged:
-        raise
+        saved = save_loop(manager.session_id, cursor=manager._cursor, apply=apply,
+                          tick_lifecycle=tick_lifecycle)
     except Exception as exc:
+        if manager._cursor is not None:
+            raise  # transaction owners see their own failures
         raise LoopPersistenceError from exc
+    if saved is None:
+        raise LoopPersistenceError("loop write failed")
+    if not saved[1]:
+        raise LoopSnapshotChanged("loop state changed")
+    return saved[0]
 
 
 def _mark_synced(manager: Any) -> None:
@@ -90,7 +105,7 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Opti
     Cleanup uses another CAS so it cannot overwrite a second concurrent edit.
     """
     from hermes_cli.loops import LoopState, self_paced_floor_seconds
-    winner = _read_loop(manager.session_id, db)
+    winner = _read_loop(manager.session_id, db, manager._cursor)
     manager._state = winner
     _mark_synced(manager)
     if winner is None or winner.status != "active" or not _same_tick(original, winner):
@@ -106,13 +121,13 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Opti
         manager._apply_stop(updated, cap[0], cap[1])
     try:
         commit_and_publish_snapshot(
-            manager, updated, lambda: _commit(manager.session_id, expected, updated, db),
-            lambda: _read_loop(manager.session_id, db), preserve_reference=False,
+            manager, None, lambda: _commit(manager, expected, updated, tick_lifecycle=True),
+            lambda: _read_loop(manager.session_id, db, manager._cursor), preserve_reference=False,
         )
         _mark_synced(manager)
         return cap
     except LoopSnapshotChanged:
-        manager._state = _read_loop(manager.session_id, db)
+        manager._state = _read_loop(manager.session_id, db, manager._cursor)
         _mark_synced(manager)
         return None
 
@@ -121,7 +136,7 @@ def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Opti
 def _reload_if_readable(manager: Any, db: Any) -> None:
     if db is not None:
         try:
-            manager._state = _read_loop(manager.session_id, db)
+            manager._state = _read_loop(manager.session_id, db, manager._cursor)
             _mark_synced(manager)
         except LoopPersistenceError:
             logger.warning("Could not reload loop %s; retaining in-memory state", manager.session_id)
@@ -146,10 +161,7 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
     if not manager.session_id or original is None:
         # No session means intentionally ephemeral state, not a failed durable write.
         return getattr(manager, method)(*args, **kwargs)
-    if getattr(manager, "_cursor", None) is not None:
-        # The caller already owns the write transaction and loaded this snapshot through its
-        # cursor. Re-entering SessionDB for the separate snapshot read/CAS would deadlock.
-        return getattr(manager, method)(*args, **kwargs)
+    cursor = getattr(manager, "_cursor", None)
     expected = original.to_json()
     # Commands on this same manager can mutate original, including its claim ID.
     initial = LoopState.from_json(expected)
@@ -161,16 +173,18 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
             raise LoopPersistenceError from exc
         if db is None:
             raise LoopPersistenceError("session DB unavailable")
-        assert_loop_snapshot(manager.session_id, expected, db)
+        # A cursor owner's snapshot read and CAS run through its own transaction, never a
+        # second SessionDB lock acquisition that would deadlock against it.
+        assert_loop_snapshot(manager.session_id, expected, db, cursor=cursor)
         staged = copy.copy(manager)
         staged._state = LoopState.from_json(expected)
         staged._evaluation_snapshot = (db, expected)
         result = getattr(staged, method)(*args, **kwargs)
         # Even a no-op must validate at the transactional boundary.
         published = commit_and_publish_snapshot(
-            manager, staged.state,
-            lambda: _commit(manager.session_id, expected, staged.state, db),
-            lambda: _read_loop(manager.session_id, db),
+            manager, None,
+            lambda: _commit(manager, expected, staged.state, tick_lifecycle=settlement),
+            lambda: _read_loop(manager.session_id, db, cursor),
         )
         _mark_synced(manager)
         if settlement and not published:
@@ -180,9 +194,16 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
         try:
             if settlement and manager._follow_compression():
                 # Compression may move the claimed row after this manager read it. Retry the
-                # complete staged mutation against the validated successor; the copied snapshot
-                # and tick identity preserve the CAS fence while the old parent stays cleared.
-                return mutate_loop_snapshot(manager, method, *args, **kwargs)
+                # complete staged mutation against the validated successor's snapshot only while
+                # it still holds this exact claim; otherwise release below as superseded.
+                with manager._snapshot_lock:
+                    moved = _read_loop(manager.session_id, db)
+                    follow = moved is not None and _same_tick(initial, moved)
+                    if follow:
+                        manager._state = moved
+                        _mark_synced(manager)
+                if follow:  # re-judge outside the lock: controls never wait on judging
+                    return mutate_loop_snapshot(manager, method, *args, **kwargs)
             if settlement:
                 # The winner's caps still apply to the released claim, but the obsolete verdict is
                 # never published: callers see state_changed with no user-visible message.
@@ -192,7 +213,7 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
                             "message": "", "error_code": "state_changed"}
             else:
                 with manager._snapshot_lock:
-                    manager._state = _read_loop(manager.session_id, db)
+                    manager._state = _read_loop(manager.session_id, db, cursor)
                     _mark_synced(manager)
         except LoopPersistenceError:
             logger.warning("Could not reload or release superseded loop %s", manager.session_id, exc_info=True)

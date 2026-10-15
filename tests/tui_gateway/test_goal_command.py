@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import goals
+
 
 @pytest.fixture()
 def hermes_home(tmp_path, monkeypatch):
@@ -291,6 +293,33 @@ def test_goal_resume_without_goal_stays_exec(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
     assert r["result"]["type"] == "exec"
+
+
+def test_goal_replace_and_remove_commands_use_real_dispatch(server, session):
+    sid, session_key, record = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.; No secrets.", session_id=sid)
+    replaced = _call(server, "command.dispatch", name="goal", arg="replace Ship Y", session_id=sid)
+    assert replaced["result"]["type"] == "send"
+    assert "Goal replaced" in replaced["result"]["notice"]
+    assert "Ship Y" in replaced["result"]["message"]
+    assert "Ship X" not in replaced["result"]["message"]
+    removed = _call(server, "command.dispatch", name="goal", arg="remove constraint 2", session_id=sid)
+    assert removed["result"]["type"] == "send"
+    assert "Removed constraint 2" in removed["result"]["notice"]
+    assert "No downtime." in removed["result"]["message"]
+    assert "No secrets." not in removed["result"]["message"]
+    with server._session_profile_runtime_scope(record):
+        state = goals.load_goal(session_key)
+        assert state.goal == "Ship Y" and state.contract.constraints == "No downtime."
+        assert state.status == "active"
+
+
+def test_goal_remove_out_of_range_uses_real_dispatch_error(server, session):
+    sid, _, _ = session
+    _call(server, "command.dispatch", name="goal", arg="Ship X\nconstraints: No downtime.", session_id=sid)
+    result = _call(server, "slash.exec", command="goal remove constraint 2", session_id=sid)
+    assert "error" in result
+    assert "out of range" in result["error"]["message"]
 
 
 # ── slash.exec /goal routing ──────────────────────────────────────────
@@ -837,3 +866,25 @@ def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, ses
     assert result["result"]["status"] == "streaming"
     assert seen[0]["user_turn"] is (not hidden)
     assert seen[0]["display_metadata"]["title_preview"] == "Useful title"
+
+
+def test_user_turn_completes_over_a_corrupt_goal_row(server, turn_env, monkeypatch):
+    """Regression for the PR #551 review: an unreadable goal row errored every TUI user turn."""
+    session_key = "goal-corrupt-row"
+    goals._get_session_db().set_meta(f"goal:{session_key}", "{corrupt")
+    seen = []
+
+    def run_conversation(message, **_kwargs):
+        seen.append(message)
+        return {"final_response": "Answered."}
+
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", lambda *a, **k: pytest.fail("never judged"))
+    agent = types.SimpleNamespace(
+        session_id=session_key, run_conversation=run_conversation, clear_interrupt=lambda: None)
+
+    server._run_prompt_submit("rid", "sid", _turn_session(agent, session_key), "hello", user_turn=True)
+
+    assert seen == ["hello"]
+    assert not [event for event, _sid, _payload in turn_env if event == "error"]
+    assert any(event == "message.complete" for event, _sid, _payload in turn_env)
+    assert goals._get_session_db().get_meta(f"goal:{session_key}") == "{corrupt"

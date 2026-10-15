@@ -401,7 +401,6 @@ class TestGoalManager:
 
     def test_user_authorized_replacement_supersedes_all_prior_requirements_in_prompts(self, hermes_home):
         """A user replacement starts a new outcome scope, including prior agent revisions."""
-        from hermes_cli import session_controls
         from hermes_cli.goals import GoalContract, GoalManager, judge_goal
 
         manager = GoalManager(session_id="replacement-boundary")
@@ -414,27 +413,18 @@ class TestGoalManager:
             reason="tighten the verification wording",
             contract={"verification": "production migration fully verified"},
         )
-        assert revised["ok"] is True
+        assert revised["error_code"] == "destructive_change_requires_command"
 
-        authority = {
-            "via": "quote",
-            "quote": "replace the goal with a local design note",
-            "message": "Please replace the goal with a local design note",
-        }
-        with session_controls._approved_authority(authority):
-            replaced = manager.replace(
-                reason="the user changed the outcome",
-                goal="write a local design note",
-                contract=GoalContract(verification="design note exists"),
-                user_quote=authority["quote"],
-            )
+        replaced = manager.replace(
+            reason="the user changed the outcome",
+            goal="write a local design note",
+            contract=GoalContract(verification="design note exists"),
+            actor="user",
+        )
         assert replaced["ok"] is True
 
         continuation = manager.next_continuation_prompt()
         assert continuation is not None
-        assert "superseded verification (no longer binding): production migration verified" in continuation
-        assert "superseded verification (no longer binding): production migration fully verified" in continuation
-        assert "superseded criteria (no longer binding): production shard" in continuation
         assert "write a local design note" in continuation
         assert manager.state is not None
 
@@ -444,16 +434,10 @@ class TestGoalManager:
                 choices=[MagicMock(message=MagicMock(content='{"verdict": "continue", "reason": "more"}'))]
             ),
         ) as call_llm:
-            judge_goal(
-                manager.state.goal,
-                "still working",
-                contract=manager.state.contract,
-                subgoals=manager.state.subgoals,
-                revisions_block=manager.state.render_revisions_block(),
-            )
+            judge_goal(manager.state.goal, "still working", contract=manager.state.contract,
+                       subgoals=manager.state.subgoals)
         judge_prompt = call_llm.call_args.kwargs["messages"][1]["content"]
-        assert "production migration fully verified" in judge_prompt
-        assert "no longer binding" in judge_prompt
+        assert "design note exists" in judge_prompt
 
     def test_continuation_prompts_share_silence_rule_but_gate_failure_does_not(self, hermes_home):
         from hermes_cli import goals

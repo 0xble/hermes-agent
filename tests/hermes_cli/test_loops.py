@@ -409,7 +409,7 @@ class TestTickLifecycle:
         state.next_due_at = time.time() - 1
         assert mgr.fire_tick() == "/recap"
 
-    def test_abandon_tick_rolls_back(self, hermes_home):
+    def test_abandon_tick_skips_without_refund(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
         mgr = LoopManager(session_id="t5")
@@ -418,7 +418,8 @@ class TestTickLifecycle:
         mgr.fire_tick()
         mgr.abandon_tick()
         assert mgr.state.awaiting_response is False
-        assert mgr.state.ticks_fired == 0
+        assert mgr.state.status == "active"
+        assert mgr.state.ticks_fired == 1
 
     def test_complete_tick_marker_stops(self, hermes_home):
         from hermes_cli.loops import LoopManager
@@ -943,6 +944,33 @@ class TestControls:
         mgr.fire_tick()
         mgr.pause(reason="user-interrupted")
         assert mgr.state.awaiting_response is False
+
+    def test_control_fence_is_assigned_by_the_save_chokepoint(self, hermes_home):
+        """Every control bumps the stored fence; a definition-only revise and the tick's own
+        claim/start do not; a stale cached copy can never write an older fence back."""
+        from hermes_cli.loops import LoopManager, load_loop, loop_control_generation
+
+        mgr = LoopManager(session_id="c4")
+        mgr.set("poll", interval_seconds=300)
+        gens = [load_loop("c4").control_generation]
+        stale = LoopManager(session_id="c4")
+        for control in (lambda m: m.pause(), lambda m: m.resume(), lambda m: m.clear()):
+            control(LoopManager(session_id="c4"))
+            gens.append(load_loop("c4").control_generation)
+        assert gens == sorted(set(gens)), gens
+        stale.state.status = "active"
+        stale._save()  # stale whole-row saves must not revive a newer clear or advance its fence
+        assert load_loop("c4").status == "cleared"
+        assert load_loop("c4").control_generation == gens[-1]
+        assert loop_control_generation("c4", default=None) is None  # retired: sync fence fails closed
+
+        fresh = LoopManager(session_id="c5")
+        fresh.set("poll", interval_seconds=300)
+        before = load_loop("c5").control_generation
+        assert fresh.fire_tick()
+        assert fresh.state.claim_phase == "started"
+        assert fresh.revise(reason="slower", interval_seconds=600)["ok"]
+        assert load_loop("c5").control_generation == before
 
 
 
