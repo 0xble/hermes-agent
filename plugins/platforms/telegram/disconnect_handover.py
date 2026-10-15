@@ -52,7 +52,11 @@ async def _wait_for_dispatch_settle(adapter, app) -> None:
             current = None if maximum is None or available is None else maximum - available
         processor_idle = current in (None, 0)
         inflight = getattr(adapter, "_inflight_update_ids", {})
-        if queue_empty and processor_idle and not inflight:
+        # Text/photo/media-group batches buffer already-fetched updates for a short delay before
+        # dispatch; releasing the lock first would strand them behind the drain gate.
+        buffered = any(getattr(adapter, name, None) for name in (
+            "_pending_text_batches", "_pending_photo_batches", "_media_group_events"))
+        if queue_empty and processor_idle and not inflight and not buffered:
             return
         await asyncio.sleep(0.01)
 

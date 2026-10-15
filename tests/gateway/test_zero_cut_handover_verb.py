@@ -89,6 +89,56 @@ def test_handover_verb_accepts_once_and_reports_status(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_handover_waits_for_buffered_text_batches_before_settling():
+    async def scenario():
+        adapter = SimpleNamespace(_inflight_update_ids={}, _pending_text_batches={"chat": object()})
+        app = SimpleNamespace(updater=None, update_queue=_Queue([]), bot=object())
+        adapter._app = app
+
+        async def flush_later():
+            await asyncio.sleep(0.05)
+            adapter._pending_text_batches.clear()
+
+        flusher = asyncio.create_task(flush_later())
+        result = await handover_stop_polling(adapter)
+        await flusher
+        assert result == {"settled": True}
+        assert adapter._pending_text_batches == {}
+
+    asyncio.run(scenario())
+
+
+def test_idle_handover_stops_outside_background_tasks_and_exits_cleanly(monkeypatch):
+    from gateway import zero_cut_handover_drain as drain
+
+    async def scenario():
+        runner = _Runner(active=1)
+        runner._background_tasks = set()
+        stopped = []
+
+        async def stop():
+            # _stop_impl cancels everything in _background_tasks; the stop task must survive that.
+            for task in list(runner._background_tasks):
+                task.cancel()
+            stopped.append(asyncio.current_task() not in runner._background_tasks)
+
+        runner.stop = stop
+        runner._retain_background_task = lambda task: (runner._background_tasks.add(task), task)[1]
+        runner._zero_cut_handover_state = {
+            "accepted": True, "updates_settled": True, "token_lock_released": True,
+            "active_turns": 1, "idle": False, "failed": None}
+        waiter = runner._retain_background_task(asyncio.create_task(drain._wait_for_idle(runner)))
+        await asyncio.sleep(0.12)
+        assert stopped == []  # an active turn keeps A alive
+        runner._active = 0
+        await asyncio.wait_for(waiter, 1)
+        await asyncio.wait_for(runner._zero_cut_stop_task, 1)
+        assert stopped == [True]
+        assert drain.status(runner)["idle"] is True
+
+    asyncio.run(scenario())
+
+
 def test_handover_verb_refuses_disabled_and_standby(monkeypatch):
     loop = asyncio.new_event_loop()
     try:

@@ -69,8 +69,9 @@ async def _wait_for_idle(runner) -> None:
     while True:
         status = _status(runner)
         if status["idle"]:
-            await runner.stop()
-            runner._request_clean_exit("zero_cut_handover")
+            # Own task with a strong ref outside _background_tasks: _stop_impl cancels that set, and
+            # cancelling the task that awaits _stop_task would skip _shutdown_event.set() (#12875).
+            runner._zero_cut_stop_task = asyncio.create_task(runner.stop(), name="zero-cut-handover-stop")
             return
         await asyncio.sleep(0.05)
 
