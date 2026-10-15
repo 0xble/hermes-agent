@@ -4,15 +4,21 @@ Extends the exit-code semantics table in ``terminal_tool`` with a bounded scan o
 output mapped to ONE short, actionable recovery hint. Rules: only fires on non-zero exit; first
 match wins, patterns ordered by observed production frequency; scans only the first
 ``_SCAN_CHARS`` so hints key on error headers, not deep context; hints state the *next action*
-in 1-2 sentences; pure function, no I/O or config reads.
+in 1-2 sentences. The general rules are pure; the pytest-specific runner hint performs only
+bounded local path-existence checks and never reads configuration or spawns a process.
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Callable, Optional
 
 _SCAN_CHARS = 4000
+
+_PYTEST_MISSING_RE = re.compile(
+    r"(?:No module named ['\"]?pytest['\"]?|pytest: command not found)"
+)
 
 
 def _regex_hint(pattern: str, message: str | Callable[[str], str], flags: int = 0) -> Callable[[str, str], Optional[str]]:
@@ -41,6 +47,57 @@ def _missing_command_hint(missing: str) -> str:
     return _MISSING_COMMAND_HINTS.get(missing) or (
         f"`{missing}` is not installed or not on PATH. Verify with `which {missing}`; install it "
         "or use an absolute path instead of retrying the same command.")
+
+
+def _project_roots(cwd: str | None) -> tuple[Path, ...]:
+    """Return the command directory and its nearest Git toplevel, if discoverable.
+
+    This deliberately uses filesystem checks rather than spawning Git: the helper runs while
+    formatting every failed terminal result and must stay cheap and fail-open for remote paths.
+    """
+    try:
+        path = Path(cwd or ".").expanduser()
+        if not path.is_dir():
+            path = path.parent
+        path = path.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return ()
+
+    roots = [path]
+    for parent in (path, *path.parents):
+        try:
+            is_git_root = (parent / ".git").exists()
+        except OSError:
+            is_git_root = False
+        if is_git_root:
+            if parent not in roots:
+                roots.append(parent)
+            break
+    return tuple(roots)
+
+
+def _pytest_missing_hint(cwd: str | None) -> str:
+    """Choose the repository-owned pytest runner without changing or retrying the command."""
+    roots = _project_roots(cwd)
+    for root in roots:
+        if (root / "scripts" / "run_tests.sh").exists():
+            runner = "`scripts/run_tests.sh <files>`"
+            break
+    else:
+        for root in roots:
+            if (root / ".venv" / "bin" / "python").exists():
+                runner = "`.venv/bin/python -m pytest`"
+                break
+        else:
+            for root in roots:
+                if (root / "pyproject.toml").exists() and (root / "uv.lock").exists():
+                    runner = "`uv run pytest`"
+                    break
+            else:
+                runner = "the project's virtualenv"
+    if runner == "the project's virtualenv":
+        return "Interpreter used lacks pytest; use the project's virtualenv."
+    return f"Interpreter used lacks pytest; use the repo's own runner: {runner}."
 
 
 # Ordered by production frequency — first match wins.
@@ -146,11 +203,13 @@ def annotate_masked_success(command: str, output: str) -> Optional[str]:
     return next((note for rx, note in _MASKING_SHAPES if rx.search(cmd)), None)
 
 
-def annotate_failure(command: str, exit_code: int, output: str) -> Optional[str]:
+def annotate_failure(command: str, exit_code: int, output: str, cwd: str | None = None) -> Optional[str]:
     """Return one short recovery hint for a failed command, or None (exit 0)."""
     if exit_code == 0:
         return None
     window = (output or "")[:_SCAN_CHARS]
+    if _PYTEST_MISSING_RE.search(window):
+        return _pytest_missing_hint(cwd)
     for fn in _OUTPUT_HINTS if window else ():
         try:
             if hint := fn(command or "", window):

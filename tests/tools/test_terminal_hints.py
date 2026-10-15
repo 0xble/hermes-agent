@@ -62,7 +62,60 @@ class TestModuleNotFound:
         assert "hermes_cli" in hint
 
 
-class TestGitShapes:
+class TestPytestMissing:
+    @staticmethod
+    def _output(shape="quoted"):
+        if shape == "command-not-found":
+            return "bash: pytest: command not found"
+        if shape == "bare":
+            return "ModuleNotFoundError: No module named pytest"
+        return "ModuleNotFoundError: No module named 'pytest'"
+
+    def test_repo_runner_hint_uses_scripts_runner(self, tmp_path):
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "run_tests.sh").touch()
+
+        hint = annotate_failure("python -m pytest tests/test_x.py", 1, self._output(), str(tmp_path))
+
+        assert hint is not None
+        assert "Interpreter used lacks pytest" in hint
+        assert "use the repo's own runner" in hint
+        assert "scripts/run_tests.sh <files>" in hint
+
+    def test_repo_runner_hint_uses_git_toplevel_venv(self, tmp_path):
+        repo = tmp_path / "repo"
+        cwd = repo / "tests"
+        (repo / ".git").mkdir(parents=True)
+        cwd.mkdir()
+        (repo / ".venv" / "bin").mkdir(parents=True)
+        (repo / ".venv" / "bin" / "python").touch()
+
+        hint = annotate_failure("python -m pytest", 1, self._output("bare"), str(cwd))
+
+        assert hint is not None
+        assert ".venv/bin/python -m pytest" in hint
+
+    def test_repo_runner_hint_uses_uv_lock(self, tmp_path):
+        (tmp_path / "pyproject.toml").touch()
+        (tmp_path / "uv.lock").touch()
+
+        hint = annotate_failure("pytest", 127, self._output("command-not-found"), str(tmp_path))
+
+        assert hint is not None
+        assert "uv run pytest" in hint
+
+    def test_repo_runner_hint_falls_back_to_project_virtualenv(self, tmp_path):
+        hint = annotate_failure("pytest", 127, self._output("command-not-found"), str(tmp_path))
+
+        assert hint is not None
+        assert "use the project's virtualenv" in hint
+
+    def test_unrelated_failure_gets_no_pytest_hint(self):
+        hint = annotate_failure("python x.py", 1, "Permission denied")
+
+        assert hint is None or "pytest" not in hint
+
+
 
     def test_branch_already_exists(self):
         out = "fatal: a branch named 'fix/x' already exists"
