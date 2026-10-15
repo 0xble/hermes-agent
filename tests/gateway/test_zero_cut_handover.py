@@ -296,7 +296,8 @@ def test_detached_disconnect_does_not_release_a_successor_lock(monkeypatch, tmp_
     old = object.__new__(TelegramAdapter)
     old.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
     old._platform_lock_scope, old._platform_lock_identity = "telegram-bot-token", "token"
-    assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]
+    old._platform_lock_nonce = "old-nonce"
+    assert status.acquire_scoped_lock("telegram-bot-token", "token", metadata={"nonce": "old-nonce"})[0]
     lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
 
     async def scenario():
@@ -310,7 +311,8 @@ def test_detached_disconnect_does_not_release_a_successor_lock(monkeypatch, tmp_
         await asyncio.sleep(0)
         outer.cancel()  # the gateway's disconnect budget gives up
         await asyncio.sleep(0.01)
-        assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]  # successor
+        assert status.acquire_scoped_lock(
+            "telegram-bot-token", "token", metadata={"nonce": "successor-nonce"})[0]  # successor
         finish.set()
         await asyncio.sleep(0.01)
 
@@ -329,7 +331,8 @@ def test_detached_disconnect_survives_garbage_collection_and_releases(monkeypatc
     old = object.__new__(TelegramAdapter)
     old.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
     old._platform_lock_scope, old._platform_lock_identity = "telegram-bot-token", "token"
-    assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]
+    old._platform_lock_nonce = "old-nonce"
+    assert status.acquire_scoped_lock("telegram-bot-token", "token", metadata={"nonce": "old-nonce"})[0]
     lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
 
     async def scenario():
@@ -352,3 +355,44 @@ def test_detached_disconnect_survives_garbage_collection_and_releases(monkeypatc
 
     asyncio.run(scenario())
     assert not lock_path.exists()
+
+
+def test_detached_disconnect_spares_successor_with_identical_timestamp(monkeypatch, tmp_path):
+    """Two acquisitions in the same clock tick still differ by nonce, so the successor survives."""
+    from gateway import status
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path))
+    monkeypatch.setattr(status, "_utc_now_iso", lambda: "2026-10-15T00:00:00.000000+00:00")
+    old = object.__new__(TelegramAdapter)
+    old.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
+    old._platform_lock_scope, old._platform_lock_identity = "telegram-bot-token", "token"
+    old._platform_lock_nonce = "old-nonce"
+    assert status.acquire_scoped_lock("telegram-bot-token", "token", metadata={"nonce": "old-nonce"})[0]
+    assert status.acquire_scoped_lock("telegram-bot-token", "token", metadata={"nonce": "new-nonce"})[0]
+    lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
+
+    async def teardown(*, zero_cut_handover):
+        zero_cut_handover()
+
+    asyncio.run(run_disconnect(old, teardown))
+    assert lock_path.exists()
+    assert old._platform_lock_identity is None
+
+
+def test_real_platform_lock_acquire_records_a_fresh_nonce_each_time(monkeypatch, tmp_path):
+    """Every acquire, including a same-PID reacquire, stamps a new owner nonce on disk."""
+    from gateway import status
+    from plugins.platforms.telegram.disconnect_handover import _lock_owner_nonce
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path))
+    first, second = object.__new__(TelegramAdapter), object.__new__(TelegramAdapter)
+    for adapter in (first, second):
+        adapter.platform = Platform.TELEGRAM
+        adapter._platform_lock_takeover_allowed = False
+        adapter._platform_lock_takeover_attempted = False
+    assert first._acquire_platform_lock("telegram-bot-token", "token", "Telegram bot token")
+    assert _lock_owner_nonce(first) == first._platform_lock_nonce
+    assert second._acquire_platform_lock("telegram-bot-token", "token", "Telegram bot token")
+    assert first._platform_lock_nonce != second._platform_lock_nonce
+    assert _lock_owner_nonce(first) == second._platform_lock_nonce
+    assert status._get_scope_lock_path("telegram-bot-token", "token").exists()
