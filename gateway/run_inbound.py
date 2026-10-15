@@ -757,8 +757,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             )
         elif not _interrupt_text and getattr(event, "media_urls", None):
             _interrupt_text = _build_media_placeholder(event)
-        # Delivered via adapter._pending_messages (read by _run_agent); never also buffered on self
-        # — that copy was never consumed and grew unbounded.
+        # Deliver through adapter._pending_messages, which _run_agent consumes. A second runner-side
+        # copy is never consumed and grows without bound.
         running_agent.interrupt(_interrupt_text)
 
     async def _hm_handle_running_session_message(

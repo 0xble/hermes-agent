@@ -154,6 +154,61 @@ async def test_live_or_restart_owner_keeps_claim_even_a_day_later(control_home, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["/status", "check the queue"])
+async def test_due_loop_defers_while_human_turn_owns_generation_and_lease(control_home, prompt):
+    """A due command or model wake cannot invalidate or consume a live human turn."""
+    runner, adapter, source, entry = native_runner(control_home)
+    manager = loops.LoopManager(entry.session_id)
+    manager.set(prompt, interval_seconds=60, times=2, route={
+        "platform": "telegram", "chat_id": source.chat_id,
+        "chat_type": "dm", "user_id": source.user_id,
+    })
+    manager.state.next_due_at = 0
+    manager._save()
+
+    delivered = []
+
+    async def handle(event):
+        delivered.append(event.text)
+        event._gateway_accepted = True
+        if event.text.lstrip().startswith("/"):
+            event._gateway_inline_command_handled = True
+        return "human result"
+
+    adapter.set_message_handler(handle)
+    key = entry.session_key
+    generation = runner._begin_session_run_generation(key)
+    lease = await runner._turn_leases.acquire(
+        entry.session_id, owner_key=key, generation=generation, timeout=1.0,
+    )
+    state = runner._session_state(key)
+    state.turn.lease_tokens[generation] = lease
+    runner._running_agents[key] = object()
+
+    await scan(runner, entry.session_id)
+    saved = loops.load_loop(entry.session_id)
+    assert runner._current_session_run_generation(key) == generation
+    assert saved.ticks_fired == 0 and not saved.awaiting_response
+    assert delivered == []
+
+    runner._release_turn_lease(key, generation)
+    assert generation not in state.turn.lease_tokens
+    assert runner._release_running_agent_state(key, run_generation=generation)
+    assert key not in runner._running_agents
+
+    await scan(runner, entry.session_id)
+    await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
+    saved = loops.load_loop(entry.session_id)
+    assert saved.ticks_fired == 1
+    assert len(delivered) == 1
+
+    # A second scan cannot replay the started tick, even while the synthetic turn is still settling.
+    await scan(runner, entry.session_id)
+    assert loops.load_loop(entry.session_id).ticks_fired == 1
+    runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 async def test_recovery_write_boundary_rechecks_live_owner(control_home):
     runner, _adapter, source, entry = native_runner(control_home)
     mgr = create_loop(entry, source)

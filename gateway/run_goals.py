@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
-import inspect
 import logging
 import time
 from contextlib import nullcontext, suppress
@@ -26,22 +25,6 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
-
-def _complete_loop_tick(manager, response: str, tick=None):
-    """Call native completion while tolerating older test/plugin seams."""
-    if "tick" in inspect.signature(manager.complete_tick).parameters:
-        return manager.complete_tick(response, tick=tick)
-    return manager.complete_tick(response)
-
-
-def fire_tick(manager, generation: int, can_claim):
-    """Call the fenced claim seam while tolerating older plugin/test managers."""
-    params = inspect.signature(manager.fire_tick).parameters
-    if "can_claim" in params:
-        return manager.fire_tick(generation, can_claim=can_claim)
-    if params:
-        return manager.fire_tick(generation)
-    return manager.fire_tick()
 
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
 _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
@@ -933,9 +916,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if outcome:
                 logger.warning("loop wakeup: %s for session %s; no external effect replayed", outcome, sid)
             return
-        if now < state.next_due_at or (
-            _turn_owner_exists() and not (state.prompt or "").lstrip().startswith("/")
-        ):
+        if now < state.next_due_at or _turn_owner_exists():
             # The adapter routes pending clarification replies before admission. A wake must
             # never enter that path as a fabricated human answer while another turn owns it.
             return
@@ -952,32 +933,31 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if check_paused("loop", logger) or (
-            _turn_owner_exists() and not (state.prompt or "").lstrip().startswith("/")
-        ):
+        if check_paused("loop", logger) or _turn_owner_exists():
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        generation = (
-            self._begin_session_run_generation(session_key)
-            if hasattr(self, "_begin_session_run_generation")
-            else (self._current_session_run_generation(session_key)
-                  if hasattr(self, "_current_session_run_generation") else 0)
-        )
+        if _turn_owner_exists():
+            return
+        begin_generation = getattr(self, "_begin_session_run_generation", None)
+        if callable(begin_generation):
+            generation = begin_generation(session_key)
+        else:
+            current_generation = getattr(self, "_current_session_run_generation", None)
+            generation = current_generation(session_key) if callable(current_generation) else 0
         is_run_current = getattr(self, "_is_session_run_current", None)
         if not callable(is_run_current):
             is_run_current = lambda _key, _generation: True
         wakeup = await self._run_in_executor_with_context(
             functools.partial(
-                fire_tick, mgr, generation,
-                lambda: (not _turn_owner_exists() or mgr.state.prompt.lstrip().startswith("/"))
-                and is_run_current(session_key, generation),
+                mgr.fire_tick, generation,
+                can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
             )
         )
         if not wakeup:
             return
-        if (_turn_owner_exists() and not wakeup.lstrip().startswith("/")) or not is_run_current(session_key, generation):
+        if _turn_owner_exists() or not is_run_current(session_key, generation):
             # The claim was consumed. Recovery will skip it after the current owner releases.
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
@@ -1051,7 +1031,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 settled_sid = (event.metadata or {}).get("loop_wakeup_session_id", sid)
                 settled_mgr = mgr if settled_sid == sid else LoopManager(session_id=settled_sid)
                 await self._run_in_executor_with_context(
-                    functools.partial(_complete_loop_tick, settled_mgr, "", tick)
+                    functools.partial(settled_mgr.complete_tick, "", tick=tick)
                 )
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)

@@ -993,6 +993,9 @@ def _loop_fire_runner(runner, *, accept=True):
 
     async def handle(event):
         event._gateway_accepted = accept
+        if event.text.lstrip().startswith("/"):
+            # This fake handler represents the adapter's inline command dispatch receipt.
+            event._gateway_inline_command_handled = True
 
     runner.adapter.handle_message = AsyncMock(side_effect=handle)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: runner.adapter}
@@ -1015,8 +1018,8 @@ async def _fire_then_compress(runner, state, prompt):
     manager._save()
     real_fire = LoopManager.fire_tick
 
-    def fire_then_compress(self):
-        wakeup = real_fire(self)
+    def fire_then_compress(self, run_generation=0, *, can_claim=None):
+        wakeup = real_fire(self, run_generation, can_claim=can_claim)
         _rotate_wake(state, "loop")  # compression lands between the claim and admission
         return wakeup
 

@@ -363,9 +363,9 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         _record("fire_tick")
         return real_fire(self, *args, **kwargs)
 
-    def _complete_tick(self, last_response):
+    def _complete_tick(self, last_response, *, tick=None):
         _record("complete_tick")
-        return real_complete(self, last_response)
+        return real_complete(self, last_response, tick=tick)
 
     orig_sleep = asyncio.sleep
     calls = {"n": 0}
