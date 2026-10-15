@@ -118,12 +118,19 @@ async def handle_local_busy(runner: Any, event: Any, source: Any, session_key: s
 
 
 async def queue_foreign_owner(runner: Any, event: Any, session_key: str) -> bool:
-    """Queue an inbound event behind a live foreign turn, without local admission."""
+    """Queue an inbound event behind a live foreign turn, without local admission.
+
+    A key already waiting in the watcher keeps queueing even after the marker clears, so a newer
+    message never jumps ahead of an older one in the gap before the watcher drains it.
+    """
     if not _enabled(runner):
         return False
-    marker = await asyncio.to_thread(_marker, runner.async_session_store, session_key)
-    if marker is None or marker["pid"] == os.getpid() or not _owner_live(marker["pid"]):
-        return False
+    waiting = session_key in (getattr(runner, "_zero_cut_busy_keys", None) or ())
+    marker = None
+    if not (waiting and _pending_for(runner, session_key)[1] is not None):
+        marker = await asyncio.to_thread(_marker, runner.async_session_store, session_key)
+        if marker is None or marker["pid"] == os.getpid() or not _owner_live(marker["pid"]):
+            return False
     accepted = runner._queue_or_replace_pending_event(session_key, event)
     if accepted:
         keys = getattr(runner, "_zero_cut_busy_keys", None)
