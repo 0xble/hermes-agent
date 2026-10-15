@@ -2314,14 +2314,6 @@ class GatewayTurnMixin:
                     prepared.persistence_session_id, prepared.persistence_owner,
                 )
                 if not _owned:
-                    _platform_message_id = getattr(event, "message_id", None) or getattr(
-                        event, "_hermes_recovery_id", None,
-                    )
-                    if _platform_message_id:
-                        _owned = await self.async_session_store.has_platform_message_id(
-                            session_entry.session_id, str(_platform_message_id),
-                        )
-                if not _owned:
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
                     )

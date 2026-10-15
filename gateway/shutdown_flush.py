@@ -504,6 +504,17 @@ def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_fo
 OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
 CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
 DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without transcript append
+# A stale (>24h) shutdown follow-up waits for its decline note's delivery path only this long.
+# Its session may be pruned, suspended, or never reconnect; without a bound the spool is kept
+# and re-scanned on every boot with no recorded outcome.
+_STALE_FOLLOWUP_RETENTION_SECS = 7 * 24 * 60 * 60
+
+
+def _drop_stale_followup(session_key: str) -> object:
+    """Record the one visible decision for a stale follow-up whose note cannot be sent."""
+    outcome_logger.info("Restart recovery outcome: session=%s outcome=%s",
+                        session_key, "skipped:stale:note-unavailable")
+    return DROP_PENDING
 
 
 def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
@@ -519,10 +530,15 @@ def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any], *, keep_ex
     """An expired drain arrival, or a spooled built-in control command, is never replayed.
 
     With ``keep_expired`` an expired spool is flagged ``_recovery_stale`` instead, so its follow-up
-    owner can decline it visibly rather than deleting a user's message without a word."""
-    if time.time() - path.stat().st_mtime > 24 * 60 * 60:
+    owner can decline it visibly rather than deleting a user's message without a word. Past
+    ``_STALE_FOLLOWUP_RETENTION_SECS`` it is also flagged ``_recovery_abandoned``: a note that still
+    cannot be delivered by then is given up with a logged outcome instead of re-scanned forever."""
+    age = time.time() - path.stat().st_mtime
+    if age > 24 * 60 * 60:
         if keep_expired:
             data["_recovery_stale"] = True
+            if age > _STALE_FOLLOWUP_RETENTION_SECS:
+                data["_recovery_abandoned"] = True
         else:
             logger.warning("Dropping expired drain-deferred message from %s", path)
             return True
@@ -595,6 +611,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         if resolved and resolved[1] is not None:
             session_id, target_db = resolved
     if not session_id:
+        if data.get("_recovery_abandoned") is True:
+            return _drop_stale_followup(session_key)  # pruned session: no note route will return
         logger.warning("Cannot recover pending message for %s: no session_id in flush file and "
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
@@ -604,13 +622,14 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         if claim is DROP_PENDING:
             return DROP_PENDING
         if data.get("_recovery_stale") is True and claim is False:
-            outcome_logger.info(
-                "Restart recovery outcome: session=%s outcome=%s",
-                session_key, "skipped:stale:note-unavailable")
-            return DROP_PENDING
+            return _drop_stale_followup(session_key)
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)
             return False
+        if claim is None and data.get("_recovery_abandoned") is True:
+            # Whatever blocks the note (offline adapter, pruned/suspended/mismatched entry, running
+            # session, failed auth check) has outlived the retention bound; decide once and stop.
+            return _drop_stale_followup(session_key)
         if claim is None:  # resume deferred until its delivery path is ready
             logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
                            "resume awaiting platform reconnect", session_key, path)

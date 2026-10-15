@@ -707,6 +707,57 @@ async def test_stale_shutdown_followup_waits_for_offline_adapter_then_notes_and_
     assert spool.with_name(spool.name + ".bad").exists()
 
 
+@pytest.mark.parametrize("pruned", ["entry", "session-id"])
+def test_40_day_stale_followup_for_pruned_session_is_dropped_once(tmp_path, monkeypatch, caplog, pruned):
+    """A pruned session cannot ever receive the stale note; bound its spool retention."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="stale question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    old = time.time() - 40 * 24 * 60 * 60
+    os.utime(spool, (old, old))
+    db = Mock()
+    store = runner.session_store
+    with store._lock:
+        store._entries.pop(entry.session_key)
+    resolver = ((lambda *args, **kwargs: (entry.session_id, db)) if pruned == "entry"
+                else (lambda *args, **kwargs: None))
+    deferred = partial(_defer_followup, runner, {}, None)
+    if pruned == "entry":  # the reviewer's path: the deferral callback itself says "keep" (None)
+        assert deferred(entry.session_key, entry.session_id, {
+            "drain_deferred": True, "shutdown_follow_up": True}, spool) is None
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(db, session_resolver=resolver, deferred_followup=deferred) == 0
+        # The next scan sees no spool and therefore cannot duplicate the decision.
+        assert recover_pending_to_db(db, session_resolver=resolver, deferred_followup=deferred) == 0
+
+    assert not spool.exists()
+    assert runner._startup_restore_queue == []
+    db.append_message.assert_not_called()
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:stale:note-unavailable"]
+
+
+def test_six_day_stale_followup_for_pruned_session_is_still_retained(tmp_path, monkeypatch, caplog):
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="stale question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    old = time.time() - 6 * 24 * 60 * 60
+    os.utime(spool, (old, old))
+    with runner.session_store._lock:
+        runner.session_store._entries.pop(entry.session_key)
+    db = Mock()
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=partial(_defer_followup, runner, {}, None),
+        ) == 0
+    assert spool.exists()
+    assert _outcome_lines(caplog) == []
+
+
 def test_stale_shutdown_followup_drop_logs_note_unavailable_outcome_once(
         tmp_path, monkeypatch, caplog):
     runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
