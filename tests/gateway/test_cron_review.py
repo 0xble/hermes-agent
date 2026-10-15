@@ -56,7 +56,10 @@ async def test_internal_review_captures_reply_without_any_send(response):
 
 
 @pytest.mark.asyncio
-async def test_busy_subject_is_refused_before_injection():
+async def test_busy_subject_is_refused_before_injection(monkeypatch):
+    import gateway.cron_review as cron_review
+    monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
     adapter = SimpleNamespace(_active_sessions={"key": object()}, _pending_messages={},
                               handle_message=AsyncMock())
@@ -68,8 +71,45 @@ async def test_busy_subject_is_refused_before_injection():
         _plugin_injection_authorized=lambda *a, **kw: True,
         _delivery_adapter_for=lambda source: adapter)
     with pytest.raises(RuntimeError, match="busy"):
-        await CronReviewControl(runner)._review("key", "sid", "review", 10)
+        await CronReviewControl(runner)._review("key", "sid", "review", 0.05)
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_review_waits_for_a_busy_subject_to_go_idle(monkeypatch):
+    import gateway.cron_review as cron_review
+    monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    adapter = SimpleNamespace(_active_sessions={"key": object()}, _pending_messages={})
+    entry = SimpleNamespace(origin=source, session_id="sid")
+    admitted = []
+
+    async def admit(adapter_, event):
+        assert "key" not in adapter._active_sessions
+        admitted.append(event)
+        event.metadata["_cron_review_capture"].set_result("PRESENT")
+
+    monkeypatch.setattr("gateway.wake.admit_internal_event", admit)
+
+    class Scope:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc):
+            return False
+
+    runner = SimpleNamespace(
+        _plugin_injection_accepting=lambda: True,
+        async_session_store=SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=entry)),
+        _restored_source=lambda entry: source,
+        _plugin_injection_authorized=lambda *a, **kw: True,
+        _delivery_adapter_for=lambda source: adapter,
+        _plugin_injection_scope=lambda source: Scope())
+    asyncio.get_running_loop().call_later(0.05, adapter._active_sessions.clear)
+    assert await CronReviewControl(runner)._review("key", "sid", "review", 5) == "PRESENT"
+    assert len(admitted) == 1
+    assert runner.async_session_store.lookup_by_session_key.await_count == 2
 
 
 @pytest.mark.asyncio

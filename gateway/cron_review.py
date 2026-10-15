@@ -10,6 +10,11 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+# How often a held review rechecks whether its subject topic has gone idle.
+_IDLE_POLL_SECONDS = 5.0
+# A review admitted with less budget than this would only time out unseen.
+_MIN_REVIEW_SECONDS = 60.0
+
 
 def is_review_event(event):
     return (getattr(event, "internal", False)
@@ -122,8 +127,23 @@ class CronReviewControl:
         adapter = runner._delivery_adapter_for(source)
         if adapter is None:
             raise RuntimeError("review subject adapter unavailable")
-        if key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
-            raise RuntimeError("review subject is busy; use original report")
+        # The subject topic is often mid-conversation when its report lands, so
+        # wait inside the review budget for it to go idle rather than skipping
+        # review outright; the on-time fallback still applies at the deadline.
+        loop = asyncio.get_running_loop()
+        end = loop.time() + seconds
+        waited = False
+        while key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
+            if end - loop.time() < _IDLE_POLL_SECONDS + _MIN_REVIEW_SECONDS:
+                raise RuntimeError("review subject is busy; use original report")
+            waited = True
+            await asyncio.sleep(_IDLE_POLL_SECONDS)
+        if waited:
+            # The conversation that kept the topic busy may have rotated its session.
+            entry = await runner.async_session_store.lookup_by_session_key(key)
+            if entry is None or entry.origin is None or entry.session_id != session_id:
+                raise RuntimeError("review subject session changed while waiting")
+        seconds = end - loop.time()
         capture = concurrent.futures.Future()
         event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=True,
