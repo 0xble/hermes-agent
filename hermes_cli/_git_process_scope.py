@@ -237,12 +237,19 @@ def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool
     if git_works_in(argv, str(cwd), None, places):
         return True
     # git_works_in compares lexically. A target reached through a symlinked
-    # -C or operand path is still the target, so resolve each path-like
-    # argument (realpath only reads link metadata) before ruling it unrelated.
-    resolved = [os.path.realpath(os.path.join(str(cwd), value))
-                for arg in argv[1:]
-                if (value := arg.partition("=")[2] if arg.startswith("-") else arg)]
-    return git_works_in(["git", *resolved], None, None, places)
+    # -C or operand path is still the target, so resolve path-like arguments
+    # (realpath only reads link metadata) before ruling the process unrelated.
+    # Git applies each relative -C to the previous -C directory, so resolve
+    # against every base in that chain. Over-matching only adds vetoes.
+    values = [arg.partition("=")[2] if arg.startswith("-") else arg for arg in argv[1:]]
+    bases = [str(cwd)]
+    args = iter(argv[1:])
+    for arg in args:
+        step = next(args, "") if arg == "-C" else arg[2:] if arg.startswith("-C") else None
+        if step:
+            bases.append(os.path.realpath(os.path.join(bases[-1], step)))
+    resolved = {os.path.realpath(os.path.join(base, value)) for base in bases for value in values if value}
+    return git_works_in(["git", *bases, *resolved], None, None, places)
 
 
 def _pack_held_proc(proc: Path, path: Path) -> bool:

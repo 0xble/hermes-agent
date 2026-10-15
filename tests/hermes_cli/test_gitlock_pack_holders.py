@@ -182,9 +182,14 @@ def test_unplaced_git_through_a_symlink_to_the_target_keeps_its_pack(scope, tmp_
     launch = tmp_path / "launch"
     launch.mkdir()
     (launch / "rel-alias").symlink_to(ours, target_is_directory=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "alias").symlink_to(ours, target_is_directory=True)
     pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
     for pid, argv in enumerate([("git", "-C", str(alias), "fetch"), ("git", "-C", "rel-alias", "fetch"),
-                                ("git", "upload-pack", "--stateless-rpc", "rel-alias")], start=200):
+                                ("git", "upload-pack", "--stateless-rpc", "rel-alias"),
+                                ("git", "-C", str(external), "-C", "alias", "fetch"),
+                                ("git", f"-C{external}", "-Calias", "fetch")], start=200):
         proc = _process(table, pid, launch, argv=argv)
         assert gitlock.clear_stale_tmp_packs(ours) == []
         assert pack.exists()
