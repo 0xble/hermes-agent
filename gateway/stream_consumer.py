@@ -32,8 +32,9 @@ from gateway.response_filters import (
     ends_with_partial_silence_marker as _ends_with_partial_silence_marker,
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker,
+    opens_with_silence_marker as _opens_with_silence_marker,
     strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
-    strip_trailing_silence_marker as _strip_trailing_silence_marker)
+    strip_edge_silence_markers as _strip_edge_silence_markers)
 from gateway.copy_blocks import CopyMarkerStreamFilter, adapter_sends_copy_blocks, copy_free_text_for
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
@@ -612,11 +613,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     await self._end_segment(tick)
                     self._signal_flush(tick.flush_event)
                     continue
+                if tick.got_segment_break:
+                    self._strip_segment_edge_markers()
 
                 if tick.got_done:
                     self._flush_think_buffer()
                     self._flush_copy_filter()
-                    # Strip a trailing standalone marker only from substantive interactive
+                    # Strip standalone edge markers only from substantive interactive
                     # replies. A bare marker remains unchanged for the existing silence path.
                     self._strip_final_marker_from_state()
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
@@ -762,7 +765,18 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         """Apply the interactive trailing-marker filter at the final delivery boundary."""
         if not self.cfg.strip_trailing_silence_markers:
             return text
-        return _strip_trailing_silence_marker(text)
+        return _strip_edge_silence_markers(text)
+
+    def _strip_segment_edge_markers(self) -> None:
+        """Drop standalone marker lines bracketing the current segment's prose before its
+        boundary edit; previews of that segment were held, so nothing visible changes."""
+        segment = self._accumulated[self._segment_start:]
+        cleaned = self._strip_final_silence_marker(segment)
+        if cleaned == segment:
+            return
+        self._accumulated = self._accumulated[:self._segment_start] + cleaned
+        if self._stream_ledger.endswith(segment):
+            self._stream_ledger = self._stream_ledger[:len(self._stream_ledger) - len(segment)] + cleaned
 
     @staticmethod
     def _strip_final_loop_complete_marker(text: str) -> str:
@@ -846,12 +860,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                                or (len(self._accumulated) >= self.cfg.buffer_threshold
                                    and not self._flood_strikes))
         # Defer mid-stream edits while the buffer could still resolve to a silence
-        # marker ("NO"→"NO_REPLY"), or while its last top-level line could be a trailing
-        # marker after prose; got_done always resolves the buffer.
+        # marker ("NO"→"NO_REPLY"), while its last top-level line could be a trailing
+        # marker after prose, or while it opens with a standalone marker line that the
+        # final strip will remove; got_done always resolves the buffer.
         _visible = self._clean_for_display(self._accumulated)
         _segment = self._clean_for_display(self._accumulated[self._segment_start:])
         return should_edit and not _is_partial_silence_marker(_segment) and not (
-            self.cfg.strip_trailing_silence_markers and _ends_with_partial_silence_marker(_visible)
+            self.cfg.strip_trailing_silence_markers and (
+                _ends_with_partial_silence_marker(_visible) or _opens_with_silence_marker(_segment))
         ) and not _ends_with_partial_loop_complete_marker(_visible)
 
     async def _split_first_send(self, tick: "_Tick") -> bool:

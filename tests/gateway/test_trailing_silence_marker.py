@@ -143,26 +143,76 @@ def test_non_streaming_persisted_assistant_row_lacks_trailing_marker(monkeypatch
     assert "NO_REPLY" not in agent.persisted_messages[-1]["content"]
 
 
-def test_bare_marker_is_preserved_for_existing_silence_filter():
-    from gateway.response_filters import strip_trailing_silence_marker
+_INCIDENT_PROSE = "Closing docs are signed.\n\nNext: wire the deposit Friday."
 
-    assert strip_trailing_silence_marker("NO_REPLY") == "NO_REPLY"
-    assert strip_trailing_silence_marker("[SILENT]") == "[SILENT]"
-    assert strip_trailing_silence_marker("no reply") == "no reply"
+
+@pytest.mark.parametrize("text", [
+    f"NO_REPLY\n\n{_INCIDENT_PROSE}",
+    f"{_INCIDENT_PROSE}\n\nNO_REPLY",
+    f"[SILENT]\n{_INCIDENT_PROSE}\n\nNO_REPLY",
+    f"\nNO_REPLY\n\n[SILENT]\n\n{_INCIDENT_PROSE}",
+])
+def test_marker_plus_prose_delivers_only_the_prose(text):
+    from gateway.response_filters import strip_edge_silence_markers
+
+    assert strip_edge_silence_markers(text) == _INCIDENT_PROSE
+
+
+def test_leading_marker_lookalikes_and_fenced_markers_are_content():
+    from gateway.response_filters import strip_edge_silence_markers
+
+    for text in ("NO_REPLY needed here, but here is the update.", "No reply from the bank yet.",
+                 "```text\nNO_REPLY\n```\nThat token ends relay turns."):
+        assert strip_edge_silence_markers(text) == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final", [
+    f"NO_REPLY\n\n{_INCIDENT_PROSE}", f"{_INCIDENT_PROSE}\n\nNO_REPLY",
+])
+async def test_non_streaming_gateway_delivery_strips_marker_beside_prose(monkeypatch, final):
+    _stub_gateway_run(monkeypatch)
+    runner = _ShapeRunner()
+    source = SimpleNamespace(chat_id="chat-1", platform=SimpleNamespace(value="telegram"))
+    response, intentional, _ = await runner._hmwa_shape_agent_response(
+        {"final_response": final, "messages": [], "api_calls": 1},
+        source, history=[], session_entry=SimpleNamespace(session_id="session-1"), session_key=None,
+        _quick_key=None, run_generation=0, _run_start_session_id="session-1",
+        _platform_name="telegram", _msg_start_time=0.0,
+    )
+
+    assert response == _INCIDENT_PROSE
+    assert intentional is False
+
+
+def test_persisted_assistant_row_lacks_leading_marker(monkeypatch):
+    agent = _PersistenceAgent()
+    verdict = _run_finish(monkeypatch, agent, f"NO_REPLY\n\n{_INCIDENT_PROSE}")
+
+    assert verdict.final_response == _INCIDENT_PROSE
+    assert agent.persisted_messages[-1]["content"] == _INCIDENT_PROSE
+
+
+def test_bare_marker_is_preserved_for_existing_silence_filter():
+    from gateway.response_filters import strip_edge_silence_markers
+
+    assert strip_edge_silence_markers("NO_REPLY") == "NO_REPLY"
+    assert strip_edge_silence_markers("[SILENT]") == "[SILENT]"
+    assert strip_edge_silence_markers("no reply") == "no reply"
 
 
 def test_marker_only_runs_collapse_to_one_marker_not_empty():
-    from gateway.response_filters import is_intentional_silence_response, strip_trailing_silence_marker
+    from gateway.response_filters import is_intentional_silence_response, strip_edge_silence_markers
 
     for text in ("NO_REPLY\n\nNO_REPLY", "[SILENT]\nNO_REPLY", "\n\nNO_REPLY\n"):
-        result = strip_trailing_silence_marker(text)
+        result = strip_edge_silence_markers(text)
         assert is_intentional_silence_response(result), (text, result)
 
 
 def test_consecutive_trailing_marker_lines_are_all_removed():
-    from gateway.response_filters import strip_trailing_silence_marker
+    from gateway.response_filters import strip_edge_silence_markers
 
-    assert strip_trailing_silence_marker("Done.\n\nNO_REPLY\n[SILENT]") == "Done."
+    assert strip_edge_silence_markers("Done.\n\nNO_REPLY\n[SILENT]") == "Done."
 
 
 def _run_finish(monkeypatch, agent, content):
