@@ -1439,9 +1439,6 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
-            from gateway import zero_cut_standby as zcs
-            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config):
-                continue
             # Skip empty primary credentials in multiplex mode; secondary profiles may supply the token.
             if _multiplex_on and not _platform_has_bot_credential(platform, platform_config):
                 logger.info(
@@ -1450,6 +1447,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                     "provide the token will still connect.", platform.value,
                 )
                 _multiplex_skipped_platforms.append(platform)
+                continue
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config):
                 continue
             enabled_platform_count += 1
             adapter = self._create_adapter(platform, platform_config)

@@ -103,6 +103,59 @@ async def test_promote_queues_failed_primary_connect_for_reconnect(monkeypatch):
     assert runner.adapters == {}
 
 
+@pytest.mark.asyncio
+async def test_promote_that_raises_stays_standby_and_a_retry_completes(monkeypatch):
+    platform = Platform.TELEGRAM
+    adapter = object()
+    primes = {"n": 0}
+
+    async def prime():
+        primes["n"] += 1
+        if primes["n"] == 1:
+            raise RuntimeError("state.db busy")
+
+    runner = SimpleNamespace(
+        adapters={},
+        _standby_deferred={},
+        _create_adapter=lambda p, c: adapter,
+        _wire_adapter_handlers=lambda a: None,
+        _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=True),
+        _publish_primary_adapter=lambda p, a: runner.adapters.__setitem__(p, a),
+        _start_prime_session_db_after_ready=prime,
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.defer_platform(runner, platform, object())
+    zcs.mark_ready()
+    with pytest.raises(RuntimeError):
+        await zcs.promote(runner)
+    assert zcs.is_standby() is True
+    assert zcs.readiness()["deferred"] == ["telegram"]  # nothing consumed, retry can serve it
+    assert await zcs.promote(runner) == {"promoted": True, "already": False, "failed": []}
+    assert runner.adapters[platform] is adapter
+    assert zcs.is_standby() is False
+
+
+@pytest.mark.asyncio
+async def test_prefilter_does_not_defer_multiplex_telegram_without_credential(monkeypatch, tmp_path):
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner._failed_platforms = {}
+    runner._multiplex_on = lambda: True
+    runner._abort_startup_if_shutdown_requested = lambda *args: asyncio.sleep(0, result=False)
+    runner._create_adapter = lambda *args: pytest.fail("no credential must not create Telegram")
+    monkeypatch.setattr("gateway.run._platform_has_bot_credential", lambda p, c: False)
+    _aborted, _enabled, skipped, _pending = await runner._start_prefilter_platforms()
+    assert skipped == [Platform.TELEGRAM]
+    assert zcs.readiness()["deferred"] == []
+
+
 def test_promote_verb_over_real_socket_refuses_until_ready(monkeypatch):
     home = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
     runner = SimpleNamespace(

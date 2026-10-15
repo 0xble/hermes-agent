@@ -1409,9 +1409,6 @@ class GatewayAdapterLifecycleMixin:
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            from gateway import zero_cut_standby as zcs
-            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config, profile=profile_name):
-                continue
             if platform in profile_map or platform in (
                     (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name) or {}):
                 continue
@@ -1424,6 +1421,9 @@ class GatewayAdapterLifecycleMixin:
                     "[MULTIPLEX] Profile '%s': skipping %s - no bot credential "
                     "in this profile's secrets", profile_name, platform.value,
                 )
+                continue
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config, profile=profile_name):
                 continue
             # Relay still uses process-level shared ingress; WhatsApp owns a session per profile.
             if multiplex and platform is Platform.RELAY:

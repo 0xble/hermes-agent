@@ -108,17 +108,27 @@ async def promote(runner) -> dict[str, Any]:
 
     # The standby opened no shared store; take ownership before any adapter can deliver a turn.
     _promoted = True
+    try:
+        return await _promote(runner)
+    except BaseException:
+        # Back to standby so a retry runs again, rather than answering "already" with nothing serving.
+        _promoted = False
+        logger.exception("Standby promotion failed; still standby, promotion may be retried")
+        raise
+
+
+async def _promote(runner) -> dict[str, Any]:
     await runner._start_prime_session_db_after_ready()
     homes = list((getattr(runner, "_served_profile_homes", None) or {}).items())
     if homes:
         await asyncio.to_thread(runner._restore_secondary_completion_ledgers, homes)
 
     failed: list[str] = []
-    deferred = dict(getattr(runner, "_standby_deferred", {}))
-    runner._standby_deferred = {}
-    for (profile, platform), config in deferred.items():
-        if profile is not None:
-            continue
+    deferred = getattr(runner, "_standby_deferred", None) or {}
+    # Consume entries one at a time so a promotion that raises midway leaves the rest for a retry.
+    for key in [k for k in list(deferred) if k[0] is None]:
+        config = deferred.pop(key)
+        platform = key[1]
         adapter = runner._create_adapter(platform, config)
         if adapter is None:
             logger.error("Promotion could not create deferred adapter %s", platform.value)
@@ -132,6 +142,8 @@ async def promote(runner) -> dict[str, Any]:
             continue
         runner._publish_primary_adapter(platform, adapter)
     secondary = sorted({profile for profile, _platform in deferred if profile is not None})
+    for key in [k for k in list(deferred) if k[0] is not None]:
+        deferred.pop(key)
     if secondary:
         await _promote_secondary_profiles(runner, secondary, failed)
 
