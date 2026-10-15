@@ -195,6 +195,19 @@ host fixture defects addressed here. Focused reruns establish repaired fixtures;
 the original full run is not reported as green. Candidate extension files are
 additionally included in both bounded and full fork validation.
 
+## Display watcher hosted-load race
+
+The `fork-ci-reliability` identity also covers `tests/tui_gateway/test_display_watch.py`.
+The process-wide lease watcher runs `_poll_runtime_files` every 0.5 seconds, while these tests
+invoke the same pass directly. Under hosted load, the background pass could claim a launcher
+liveness transition and update `_runtime_marks`, then spend time building the snapshot; the manual
+pass returned before that broadcast, so the test saw no `display.status` event. The test helper now
+serializes lease/runtime polls with one lock, preserving the real watcher and exact one-event
+assertion while making the observation wait for the claimed broadcast. The runtime already treats
+zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
+synchronization, not a production liveness correction. Retire when the watcher exposes an owned
+synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
+
 ## Nightly Linux notification regression
 
 The `fork-ci-reliability` identity covers the cut-completion notice assertion in

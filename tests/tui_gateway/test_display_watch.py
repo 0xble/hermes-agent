@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,9 +33,21 @@ def _wait_for(pred, timeout: float = 3.0) -> bool:
     return pred()
 
 
+def _serialize_polls(server, monkeypatch) -> None:
+    """Serialize manual and background watcher passes so an event claimed by the watcher is
+    broadcast before the manual poll returns."""
+    lock = threading.Lock()
+    for name in ("_poll_lease_files", "_poll_runtime_files"):
+        def locked(real=getattr(server, name)) -> None:
+            with lock:
+                real()
+        monkeypatch.setattr(server, name, locked)
+
+
 def _watching(server, home: Path, monkeypatch) -> list:
     from hermes_constants import hermes_home_key
     events: list = []
+    _serialize_polls(server, monkeypatch)
     monkeypatch.setattr(server, "_broadcast_global_event", lambda ev, payload=None: events.append((ev, payload)))
     monkeypatch.setattr(server, "_hermes_home", str(home))
     server._ensure_lease_watcher()
