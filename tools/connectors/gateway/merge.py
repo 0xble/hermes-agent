@@ -189,7 +189,7 @@ def batch_entry_error(value: Any) -> Optional[dict[str, Any]]:
     if not isinstance(value, Mapping) or value.get("success") is True:
         return None
     error = value.get("error")
-    if error in (None, "", False):
+    if not error:
         return None
     if isinstance(error, Mapping) and {"code", "message"} <= error.keys():
         return dict(error)

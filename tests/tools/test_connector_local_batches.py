@@ -197,6 +197,8 @@ def test_direct_local_batch_passes_successful_null_error_through_unchanged(recor
     ({"error": None}, None),
     ({"error": ""}, None),
     ({"error": False}, None),
+    ({"error": {}}, None),
+    ({"error": []}, None),
     ({"success": True, "error": "warned"}, None),
     ({"error": "boom"}, {"code": "TOOL_ERROR", "message": "boom"}),
     ({"success": False, "error": {"code": "X", "message": "m"}}, {"code": "X", "message": "m"}),
