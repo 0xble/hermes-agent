@@ -61,12 +61,23 @@ def _git_proc_running() -> bool:
         return False
 
 
-def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
-                 default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> List[str]:
+def _git_proc_running_for(repo_root: Path) -> bool:
+    from hermes_cli._git_process_scope import git_process_running_for
+
+    return git_process_running_for(repo_root, _git_proc_running)
+
+
+def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, repo_root: Path,
+                 min_age_seconds: Optional[int], default_age: int, skip_msg: str,
+                 log_removed: Callable[[Path, int], None], packs: bool = False) -> List[str]:
     """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
     if not directory.is_dir():
         return []
-    if _git_proc_running():
+    if packs:
+        from hermes_cli._git_process_scope import _linux_process_scope, tmp_pack_in_use
+
+        packs = _linux_process_scope  # non-Linux keeps its original one-shot global veto
+    if not packs and _git_proc_running_for(repo_root):
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
@@ -74,6 +85,12 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
     for entry in candidates():
         try:
             if entry.is_file() and (st := entry.stat()).st_mtime < cutoff:
+                if packs:
+                    if tmp_pack_in_use(repo_root, entry, lambda: _git_proc_running_for(repo_root)):
+                        continue
+                    current = entry.stat()
+                    if (current.st_dev, current.st_ino, current.st_mtime_ns) != (st.st_dev, st.st_ino, st.st_mtime_ns):
+                        continue
                 if os.name == "nt":
                     # git renames its transfer temps into place read-only; Windows refuses to
                     # unlink a read-only file (EACCES/13), so without clearing the write bit
@@ -101,7 +118,7 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
         git_dir, lambda: [git_dir / name for name in LOCK_NAMES],
-        min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
+        repo_root=repo_root, min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )
@@ -348,7 +365,7 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
 
     return _sweep_stale(
         pack_dir, _candidates,
-        min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS,
+        repo_root=repo_root, min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS, packs=True,
         skip_msg="git process running; skipping tmp-pack sweep",
         log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
     )

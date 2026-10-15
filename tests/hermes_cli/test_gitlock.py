@@ -76,7 +76,7 @@ def no_git_running(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: False)
+    monkeypatch.setattr(gitlock, "_git_proc_running_for", lambda _root: False)
 
 
 def test_clear_removes_stale_shallow_lock(repo: Path, no_git_running: None) -> None:
@@ -99,7 +99,7 @@ def test_clear_skips_sweep_while_git_running(repo: Path, monkeypatch: pytest.Mon
     """A running git process must block the sweep even for stale locks."""
     import hermes_cli.gitlock as gitlock
 
-    monkeypatch.setattr(gitlock, "_git_proc_running", lambda: True)
+    monkeypatch.setattr(gitlock, "_git_proc_running_for", lambda _root: True)
     _touch(repo / ".git" / "shallow.lock", STALE_LOCK_MIN_AGE_SECONDS + 60)
     removed = clear_stale_git_locks(repo)
     assert removed == []
