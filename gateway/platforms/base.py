@@ -30,16 +30,6 @@ from gateway.copy_blocks import (
 logger = logging.getLogger(__name__)
 
 
-def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
-    """Done-callback for a detached fatal-error handler task (carrier cancelled in
-    ``_notify_fatal_error``): retrieve its exception so asyncio never logs "never retrieved"."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        logger.error("Detached fatal-error handler task failed: %s", exc, exc_info=exc)
-
-
 # Audio exts for native audio delivery; Telegram's narrower sets stay separate (.m2a is audio to
 # Hermes but not to sendAudio).
 _AUDIO_MIME_TYPES = {
@@ -444,7 +434,7 @@ import contextvars as _contextvars
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import fence_state_after
+from gateway.platforms.helpers import consume_detached_handler_exception, fence_state_after
 from gateway.platforms.base_exec_approval import (
     approval_timeout_seconds, ea_action_labels, ea_default_reason_text, ea_header_text,
     ea_reason_label_text, ea_smart_deny_line_text, format_approval_deadline_line)
@@ -2468,7 +2458,7 @@ class BasePlatformAdapter(ABC):
             except asyncio.CancelledError:
                 # Carrier cancelled (our own teardown inside the handler): let it finish detached.
                 if not task.done():
-                    task.add_done_callback(_consume_detached_handler_exception)
+                    task.add_done_callback(consume_detached_handler_exception)
                 raise
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
@@ -5185,6 +5175,8 @@ class BasePlatformAdapter(ABC):
                     self._cleanup_finished_session_task(session_key, self._active_sessions.get(session_key))
                 return
         delivery_attempted = delivery_succeeded = required_delivery_failed = False  # feeds the processing-complete hook
+        from gateway.cron_review import ReviewCapture
+        review_capture = ReviewCapture(event)
 
         def _record_delivery(result, *, required: bool = False):
             nonlocal delivery_attempted, delivery_succeeded, required_delivery_failed
@@ -5197,7 +5189,7 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         _thread_metadata = _thread_metadata_for_event(event)
-        typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
+        typing_task = review_capture.start_typing(self, event, interrupt_event, _thread_metadata)
         from gateway.outbox import bind_event_turn, scoped_turn_entry, restore_turn
         turn_token = scoped_turn_entry()
         delivery_generation = None
@@ -5220,6 +5212,7 @@ class BasePlatformAdapter(ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            response = review_capture.capture_reply(response)
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -5304,6 +5297,7 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            review_capture.finish(error=RuntimeError("cron review turn cancelled"))
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
@@ -5313,7 +5307,7 @@ class BasePlatformAdapter(ABC):
             bind_event_turn(event)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            _thread_metadata = (await self._notify_turn_error(event, e, session_key)) or _thread_metadata
+            _thread_metadata = (await review_capture.notify_error(self, event, e, session_key)) or _thread_metadata
             # SystemExit/KeyboardInterrupt propagate; other BaseExceptions are contained.
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
