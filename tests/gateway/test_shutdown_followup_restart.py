@@ -206,6 +206,100 @@ async def test_recovered_followup_resumed_logs_after_predecessor_resumed(
 
 
 @pytest.mark.asyncio
+async def test_recovered_followup_with_both_ids_probes_transport_id_before_replay(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(
+        text="already handled", source=source, user_id=source.user_id, message_id="transport-1")
+    event._hermes_recovery_id = "recovery-1"
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": event.text, "platform_message_id": event.message_id,
+    })
+    claimed = []
+
+    async def handle(recovered):
+        claimed.append(recovered.text)
+        recovered._agent_turn_succeeded = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+            deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+    assert claimed == []
+    assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_recovered_followup_exception_uses_content_durability_probe(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, _source = _setup(tmp_path, monkeypatch)
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    spool = flush_dir / "pending-legacy-exception.json"
+    spool_ts = time.time() - 10
+    spool.write_text(json.dumps({
+        "session_key": entry.session_key, "reason": "shutdown_follow_up", "ts": spool_ts, "seq": -1,
+        "data": {"text": "legacy follow-up", "source_user_id": entry.origin.user_id,
+                 "user_id": entry.origin.user_id},
+    }))
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+    recovered = runner._startup_restore_queue.pop()
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": recovered.text, "timestamp": time.time(),
+    })
+
+    async def fail(_event):
+        raise RuntimeError("turn failed after durable input")
+
+    recovered._gateway_accepted = True
+    task = asyncio.create_task(fail(recovered))
+    task._hermes_event = recovered
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._observe_recovered_followup(adapter, recovered, entry.session_key, task=task)
+    assert len(adapter.sent) == 1
+    assert "still preserved" not in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed:noted"]
+    assert not spool.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["adapter-offline", "dispatch-failed"])
+async def test_recovered_followup_failure_logs_after_predecessor_outcome(
+        tmp_path, monkeypatch, caplog, failure):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="follow-up", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+    if failure == "adapter-offline":
+        runner._intake_adapter_for = lambda _source: None
+        runner._delivery_adapter_for = lambda _source: None
+    else:
+        async def reject(_event):
+            raise RuntimeError("dispatch failed")
+        adapter.handle_message = reject
+    with caplog.at_level("INFO", logger="gateway.run"):
+        runner._record_restart_resume_outcome(entry.session_key, "resumed")
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+    suffix = "note-unavailable" if failure == "adapter-offline" else "noted"
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=resumed",
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:{failure}:{suffix}",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_internal_recovered_followup_consumed_by_successor_reports_result(tmp_path, monkeypatch, caplog):
     """A pending-slot successor owns the turn result, not the parked recovery event."""
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)

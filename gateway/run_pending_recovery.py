@@ -84,10 +84,16 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
             return False
 
     followup = data.get("shutdown_follow_up") is True
-    durable = followup and input_already_durable(
-        runner.session_store, session_id,
-        data.get("recovery_id") or data.get("message_id"),
-        data.get("text"), data.get("_recovery_spool_ts"),
+    candidate_ids = recovered_input_candidate_ids(data.get("recovery_id"), data.get("message_id"))
+    durable = followup and (
+        any(input_already_durable(
+            runner.session_store, session_id, candidate_id,
+            data.get("text"), data.get("_recovery_spool_ts"),
+        ) for candidate_id in candidate_ids)
+        if candidate_ids else input_already_durable(
+            runner.session_store, session_id, None,
+            data.get("text"), data.get("_recovery_spool_ts"),
+        )
     )
     from gateway.run import (
         _auto_continue_freshness_window, _is_fresh_gateway_interruption,
@@ -155,6 +161,11 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
         # Compatibility for direct callers that are already on the gateway loop.
         runner._queue_startup_restore_event(event)
     return True
+
+
+def recovered_input_candidate_ids(recovery_id=None, message_id=None) -> set:
+    """Return every durable identity that can represent one recovered input."""
+    return {candidate_id for candidate_id in (recovery_id, message_id) if candidate_id is not None}
 
 
 def input_already_durable(store, session_id, message_id, content=None, spool_ts=None) -> bool:

@@ -70,7 +70,7 @@ class RestartRecoveryMixin:
 
     async def _recovered_input_durable(self, event) -> bool:
         """Whether this replayed input or its merged successor has written a durable user row."""
-        from gateway.run_pending_recovery import input_already_durable
+        from gateway.run_pending_recovery import input_already_durable, recovered_input_candidate_ids
         recovery_session_id = getattr(event, "_hermes_recovery_session_id", None)
         recovery_spool_ts = getattr(event, "_hermes_recovery_spool_ts", None)
         recovery_id = getattr(event, "_hermes_recovery_id", None)
@@ -81,20 +81,24 @@ class RestartRecoveryMixin:
             spool_ts = getattr(candidate, "_hermes_recovery_spool_ts", None)
             if spool_ts is None:
                 spool_ts = recovery_spool_ts
-            candidate_ids = {
-                candidate_id for candidate_id in (
-                    getattr(candidate, "_hermes_recovery_id", None),
-                    getattr(candidate, "message_id", None),
-                ) if candidate_id is not None
-            }
+            candidate_ids = recovered_input_candidate_ids(
+                getattr(candidate, "_hermes_recovery_id", None),
+                getattr(candidate, "message_id", None),
+            )
             if not candidate_ids and recovery_id is not None:
-                candidate_ids.add(recovery_id)
-            for candidate_id in candidate_ids:
-                if await asyncio.to_thread(
-                    input_already_durable, getattr(self, "session_store", None), session_id,
-                    candidate_id, getattr(candidate, "text", None), spool_ts,
-                ):
-                    return True
+                candidate_ids = recovered_input_candidate_ids(recovery_id)
+            if candidate_ids:
+                for candidate_id in candidate_ids:
+                    if await asyncio.to_thread(
+                        input_already_durable, getattr(self, "session_store", None), session_id,
+                        candidate_id, getattr(candidate, "text", None), spool_ts,
+                    ):
+                        return True
+            elif await asyncio.to_thread(
+                input_already_durable, getattr(self, "session_store", None), session_id,
+                None, getattr(candidate, "text", None), spool_ts,
+            ):
+                return True
         return False
 
     async def _retire_spool_once_input_durable(self, event) -> None:
@@ -262,7 +266,7 @@ class RestartRecoveryMixin:
                 event, session_key, f"skipped:{reason}{suffix}")
             return
         self._release_restart_followup_key(session_key)
-        self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
+        self._record_recovered_followup_outcome(event, session_key, f"skipped:{reason}{suffix}")
 
     async def _observe_recovered_followup(self, adapter, event, session_key: str, *, task=None) -> None:
         """Observe the actual turn, following a busy adapter's successor rather than its receipt."""
