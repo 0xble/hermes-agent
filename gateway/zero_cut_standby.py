@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -50,12 +51,33 @@ def readiness() -> dict[str, Any]:
     return {"slot": slot, "standby": is_standby(), "ready": _ready, "deferred": runner_deferred}
 
 
+async def _connect_deferred(runner, platform, adapter) -> bool:
+    """Connect one deferred adapter; a raise counts as a failed connect so promotion still completes."""
+    try:
+        return bool(await runner._connect_initial_adapter_with_timeout(adapter, platform))
+    except Exception:
+        logger.exception("Promotion connect raised for deferred adapter %s", platform.value)
+        return False
+
+
+def _queue_secondary_reconnect(runner, profile, platform, adapter) -> None:
+    """Hand a failed secondary to the profile's own reconnect slot, as a retryable fatal would."""
+    pending = runner._profile_failed_platforms
+    if not isinstance(pending, dict):
+        pending = runner._profile_failed_platforms = {}
+    profile_pending = pending.setdefault(profile, {})
+    if platform not in profile_pending:
+        profile_pending[platform] = runner._retain_background_task(asyncio.create_task(
+            runner._run_secondary_profile_reconnect(profile, platform, adapter),
+            name=f"secondary-reconnect:{profile}:{platform.value}"))
+
+
 async def promote(runner) -> dict[str, Any]:
     """Promote a ready standby in place, starting deferred adapters and autonomous services.
 
-    A deferred primary platform that fails to connect is queued for the reconnect watcher, the
-    same as a transient failure at normal startup, so a promoted gateway heals instead of
-    silently serving without Telegram. The payload names every failed platform.
+    A deferred platform that fails to connect (False or a raise) goes to the same reconnect path a
+    transient startup failure uses (primary queue or the profile's own reconnect task), so a promoted
+    gateway heals instead of silently serving without it. The payload names every failed platform.
     """
     global _promoted
     if _promoted:
@@ -65,8 +87,16 @@ async def promote(runner) -> dict[str, Any]:
     if not _ready:
         return {"promoted": False, "refused": "not_ready"}
 
+    # The standby opened no shared store; take ownership before any adapter can deliver a turn.
+    _promoted = True
+    await runner._start_prime_session_db_after_ready()
+    homes = list((getattr(runner, "_served_profile_homes", None) or {}).items())
+    if homes:
+        await asyncio.to_thread(runner._restore_secondary_completion_ledgers, homes)
+
     failed: list[str] = []
     deferred = dict(getattr(runner, "_standby_deferred", {}))
+    runner._standby_deferred = {}
     for (profile, platform), config in deferred.items():
         name = f"{profile}:{platform.value}" if profile else platform.value
         adapter = runner._create_adapter(platform, config)
@@ -78,21 +108,20 @@ async def promote(runner) -> dict[str, Any]:
             runner._wire_adapter_handlers(adapter)
         else:
             runner._configure_profile_adapter(adapter, profile, platform)
-        if not await runner._connect_initial_adapter_with_timeout(adapter, platform):
-            logger.error("Promotion could not connect deferred adapter %s", name)
+        if not await _connect_deferred(runner, platform, adapter):
+            logger.error("Promotion could not connect deferred adapter %s; queued for reconnect", name)
             failed.append(name)
             if profile is None:
                 runner._failed_platforms[platform] = runner._startup_retry_entry(platform, adapter, config)
             else:
                 await runner._safe_adapter_disconnect(adapter, platform)
+                _queue_secondary_reconnect(runner, profile, platform, adapter)
             continue
         if profile is None:
             runner._publish_primary_adapter(platform, adapter)
         else:
             runner._profile_adapters.setdefault(profile, {})[platform] = adapter
 
-    _promoted = True
-    runner._standby_deferred = {}
     await runner._start_finish_wiring(len(runner.adapters))
     runner._start_spawn_background_watchers()
     from gateway.run import _start_gateway_start_cron_and_housekeeping

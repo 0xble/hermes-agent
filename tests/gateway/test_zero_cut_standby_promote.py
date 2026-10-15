@@ -57,6 +57,7 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
         _wire_adapter_handlers=lambda a: calls.append("wire"),
         _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=True),
         _publish_primary_adapter=lambda p, a: (calls.append("publish"), runner.adapters.__setitem__(p, a)),
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0, result=calls.append("prime")),
         _start_finish_wiring=lambda count: asyncio.sleep(0, result=calls.append("finish")),
         _start_spawn_background_watchers=lambda: calls.append("watchers"),
         _safe_adapter_disconnect=lambda *args: asyncio.sleep(0),
@@ -71,6 +72,7 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
     assert runner.adapters[platform] is adapter
     assert runner._zero_cut_cron_handles == ("stop", "provider", "cron", "house")
     assert calls.count("publish") == 1
+    assert calls.index("prime") < calls.index("publish")  # shared store opened before serving
     assert zcs.is_standby() is False
 
 
@@ -88,6 +90,7 @@ async def test_promote_queues_failed_primary_connect_for_reconnect(monkeypatch):
         _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=False),
         _startup_retry_entry=lambda p, a, c: {"adapter": a, "config": c},
         _publish_primary_adapter=lambda p, a: pytest.fail("failed connect must not publish"),
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
         _start_finish_wiring=lambda count: asyncio.sleep(0),
         _start_spawn_background_watchers=lambda: None,
     )
@@ -104,6 +107,7 @@ def test_promote_verb_over_real_socket_refuses_until_ready(monkeypatch):
     home = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
     runner = SimpleNamespace(
         adapters={}, _standby_deferred={},
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
         _start_finish_wiring=lambda count: asyncio.sleep(0),
         _start_spawn_background_watchers=lambda: None,
     )
@@ -205,3 +209,38 @@ def test_promotion_does_not_spawn_a_second_reconnect_watcher():
     runner._start_spawn_background_watchers()
     assert spawned == ["reconnect"]
     assert "drain_control_watcher" in supervised
+
+
+@pytest.mark.asyncio
+async def test_promote_survives_connect_raise_and_queues_secondary(monkeypatch):
+    platform = Platform.TELEGRAM
+    adapter = object()
+    queued = []
+
+    async def boom(a, p):
+        raise RuntimeError("network down")
+
+    runner = SimpleNamespace(
+        adapters={},
+        _failed_platforms={},
+        _profile_failed_platforms={},
+        _standby_deferred={},
+        _create_adapter=lambda p, c: adapter,
+        _configure_profile_adapter=lambda a, prof, p: None,
+        _connect_initial_adapter_with_timeout=boom,
+        _safe_adapter_disconnect=lambda a, p: asyncio.sleep(0),
+        _run_secondary_profile_reconnect=lambda prof, p, a: asyncio.sleep(0, result=queued.append((prof, p, a))),
+        _retain_background_task=lambda task: task,
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.defer_platform(runner, platform, object(), profile="work")
+    zcs.mark_ready()
+    result = await zcs.promote(runner)
+    assert result == {"promoted": True, "already": False, "failed": ["work:telegram"]}
+    task = runner._profile_failed_platforms["work"][platform]
+    await task
+    assert queued == [("work", platform, adapter)]
+    assert zcs.is_standby() is False
