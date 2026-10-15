@@ -230,7 +230,6 @@ def test_goal_replace_records_continuation_prompt(state):
     from hermes_cli.session_controls import apply_control
 
     GoalManager("target").set("old")
-    GoalManager("target").pause("waiting")
     state.append_message("requester", "user", "Please replace the target goal with ship now")
     result = apply_control(
         "goal", "replace", "target", requester_sid="requester",
@@ -244,8 +243,9 @@ def test_goal_replace_records_continuation_prompt(state):
 
 @pytest.mark.parametrize("via", ["quote", "button"])
 @pytest.mark.parametrize("replacement_count", [1, 2])
-def test_replacement_boundary_resets_prior_scope_but_not_later_revisions(state, via, replacement_count):
-    """Both real authority paths supersede all prior contracts/criteria, not subsequent revisions."""
+def test_replacement_prompts_bind_only_the_current_contract(state, via, replacement_count):
+    """Both real authority paths supersede all prior contracts/criteria. Revision rows stay an audit
+    trail: neither the continuation nor the judge sees them, so nothing earlier comes back as binding."""
     import copy
     from unittest.mock import MagicMock, patch
     from hermes_cli.goals import GoalContract, GoalManager, judge_goal, load_goal
@@ -258,7 +258,7 @@ def test_replacement_boundary_resets_prior_scope_but_not_later_revisions(state, 
     ))
     manager.add_subgoal("production shard")
     assert manager.revise(reason="reword verification", contract={
-        "verification": "production migration fully verified",
+        "verification": "production migration verified. Signed migration receipt captured",
     })["ok"]
     original_revision = copy.deepcopy(manager.state.revisions[0])
 
@@ -282,13 +282,13 @@ def test_replacement_boundary_resets_prior_scope_but_not_later_revisions(state, 
     manager = replace("write a local design note", "design note exists")
     manager.add_subgoal("include local examples")
     assert manager.revise(reason="reword local verification", contract={
-        "verification": "design note reviewed",
+        "verification": "design note exists. Peer reviewed",
     })["ok"]
     if replacement_count == 2:
         manager = replace("write a local checklist", "local checklist exists")
         assert manager.state.subgoals == []
         assert manager.revise(reason="reword checklist verification", contract={
-            "verification": "local checklist reviewed",
+            "verification": "local checklist exists. Peer reviewed",
         })["ok"]
     history = copy.deepcopy(manager.state.revisions)
     assert history[0] == original_revision
@@ -299,30 +299,23 @@ def test_replacement_boundary_resets_prior_scope_but_not_later_revisions(state, 
         choices=[MagicMock(message=MagicMock(content='{"verdict": "continue", "reason": "more"}'))],
     )) as call_llm:
         judge_goal(manager.state.goal, "still working", contract=manager.state.contract,
-                   subgoals=manager.state.subgoals,
-                   revisions_block=manager.state.render_revisions_block())
+                   subgoals=manager.state.subgoals)
     prompts = [manager.next_continuation_prompt(), call_llm.call_args.kwargs["messages"][1]["content"]]
     for prompt in prompts:
-        for text in ("production migration verified", "production migration fully verified"):
-            assert f"superseded verification (no longer binding): {text}" in prompt
-            assert f"earlier verification: {text}" not in prompt
-        assert "superseded criteria (no longer binding): production shard" in prompt
-        assert "superseded constraints (no longer binding): do not lose production data" in prompt
-        assert "superseded boundaries (no longer binding): production shards only" in prompt
-        assert "superseded stop_when (no longer binding): production unavailable" in prompt
+        for text in ("production migration verified", "do not lose production data", "production shard",
+                     "production unavailable"):
+            assert text not in prompt
         if replacement_count == 2:
-            assert "superseded verification (no longer binding): design note exists" in prompt
-            assert "superseded verification (no longer binding): design note reviewed" in prompt
-            assert "superseded criteria (no longer binding): include local examples" in prompt
-            assert "earlier verification: local checklist exists" in prompt
+            assert "local checklist exists. Peer reviewed" in prompt
+            assert "design note exists" not in prompt and "include local examples" not in prompt
         else:
-            assert "earlier verification: design note exists" in prompt
-            assert "include local examples" in prompt
-        assert "agent, no user authority" in prompt
-    # Rendering changes no audit data; round-trip/reloading derives the same boundary.
+            assert "design note exists. Peer reviewed" in prompt and "include local examples" in prompt
+        for marker in ("This goal has been revised", "Revision history", "superseded", "no user authority",
+                       "earlier verification"):
+            assert marker not in prompt
+    # Prompt building changes no audit data.
     assert manager.state.revisions == history
     assert load_goal("target").revisions == history
-    assert load_goal("target").render_revisions_block() == manager.state.render_revisions_block()
 
 
 def test_button_approved_replace_records_user_authority(state):
@@ -337,12 +330,9 @@ def test_button_approved_replace_records_user_authority(state):
     revision = load_goal("target").revisions[-1]
     assert (revision["actor"], revision["authority"], revision["approved_by"]) == ("user", "button", "42")
     assert revision["user_message"] == 'Approved in Telegram: replace goal with "new objective: write docs"'
-    block = load_goal("target").render_revisions_block()
-    assert "approved by the user in Telegram" in block
-    assert "no user authority" not in block
     prompt = record["continuation_prompt"]
-    assert "earlier goal: old objective" not in prompt
-    assert "superseded goal (replaced with user authority, no longer binding): old objective" in prompt
+    assert "new objective: write docs" in prompt
+    assert "old objective" not in prompt
 
 
 def test_quote_replace_records_user_actor(state):
@@ -356,21 +346,19 @@ def test_quote_replace_records_user_actor(state):
     assert result["status"] == "applied"
     revision = load_goal("target").revisions[-1]
     assert (revision["actor"], revision["authority"]) == ("user", "quote")
-    assert 'cites the user: "replace the target goal with ship now"' in load_goal("target").render_revisions_block()
+    assert revision["user_quote"] == "replace the target goal with ship now"
 
 
 def test_direct_manager_quote_replace_records_user_authority(state):
-    """GoalManager.replace with a locally validated quote audits the same as apply_control."""
+    """A quote supplied without a command or approval button cannot authorize replacement."""
     from hermes_cli.goals import GoalManager, load_goal
 
     GoalManager("target").set("migrate database")
     _user(state, "target", "Please replace the goal with ship the release")
     result = GoalManager("target").replace(reason="pivot", goal="ship the release",
                                            user_quote="replace the goal with ship the release")
-    assert result["ok"] is True
-    revision = load_goal("target").revisions[-1]
-    assert (revision["actor"], revision["authority"]) == ("user", "quote")
-    assert "earlier goal: migrate database" not in load_goal("target").render_revisions_block()
+    assert result["error_code"] == "destructive_change_requires_command"
+    assert load_goal("target").goal == "migrate database"
 
 
 @pytest.mark.parametrize("header", ['[Replying to: "{0}"]', '[Replying to your previous message: "{0}"]'])
@@ -755,7 +743,7 @@ def test_new_goal_instance_is_strictly_later_under_a_frozen_clock(state, monkeyp
     if change == "replace":
         _user(state, "target", "Please switch this goal to watching the deploy")
         result = manager.replace(goal="watch the deploy", reason="x",
-                                 user_quote="switch this goal to watching the deploy")
+                                 actor="user", user_quote="switch this goal to watching the deploy")
         assert result["ok"], result
     else:
         manager.clear()
@@ -819,12 +807,12 @@ def test_direct_replace_quote_must_ask_for_a_replacement(state):
     result = GoalManager("target").replace(reason="pivot", goal="ship the release",
                                            user_quote="pause the goal while I think about it")
     # A hedged message never grants authority; a plain one that asks for something else mismatches.
-    assert (result["ok"], result["error_code"]) == (False, "user_quote_qualified")
+    assert (result["ok"], result["error_code"]) == (False, "destructive_change_requires_command")
     assert load_goal("target").goal == "migrate database"
     _user(state, "target", "Please pause the goal right now")
     result = GoalManager("target").replace(reason="pivot", goal="ship the release",
                                            user_quote="pause the goal right now")
-    assert (result["ok"], result["error_code"]) == (False, "user_quote_mismatch")
+    assert (result["ok"], result["error_code"]) == (False, "destructive_change_requires_command")
 
 
 def test_stale_manager_set_cannot_reuse_a_newer_goal_instance(state, monkeypatch):

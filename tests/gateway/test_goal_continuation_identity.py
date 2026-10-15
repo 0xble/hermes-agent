@@ -43,6 +43,19 @@ async def _post_turn_event(runner):
     return runner.adapter._pending_messages[runner.target.session_key]
 
 
+def _pause_before(action):
+    """Resume lifts any pause; a replacement lifts only a judge pause over the contract it supersedes."""
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager("target")
+    if action != "replace":
+        manager.pause()
+        return
+    manager.state.status, manager.state.last_verdict = "paused", "blocked"
+    manager.state.paused_reason = "judge blocked: needs approval"
+    manager._save()
+
+
 def _apply(state, action, **payload):
     from hermes_cli import session_controls
 
@@ -64,7 +77,7 @@ async def test_real_control_constructor_revalidated_at_idle_ingress(state, actio
 
     runner = _runner(state)
     GoalManager("target").set("old objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     record = _apply(state, action, **({"goal": "approved objective"} if action == "replace" else {}))
     event = await _control_event(runner, record)
     assert event.internal is False  # Production continuations are ordinary authorized ingress.
@@ -601,7 +614,7 @@ async def test_approved_control_continuation_refreshes_after_subgoal_add(
 
     runner = _runner(state)
     GoalManager("target").set("same objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     request = request_control("goal", action, "target", requester_sid="requester",
                               payload={"goal": "approved objective"} if action == "replace" else {})
     record = resolve_request(request["id"], "approve", "99")
@@ -677,8 +690,10 @@ async def test_historical_pause_cutoff_removes_old_slot_and_overflow_without_rem
         GatewayBusySessionMixin._clear_goal_pending_continuations(runner, key, adapter, before)
     )
     await runner._drain_session_controls()
-    assert runner.target.session_key not in runner.adapter._pending_messages
-    assert queue.conversation.queued_events == [fresh, human]
+    # The stale slot is removed; retained real work is promoted in FIFO order.
+    slot = runner.adapter._pending_messages.get(runner.target.session_key)
+    assert slot is not old
+    assert ([slot] if slot is not None else []) + queue.conversation.queued_events == [fresh, human]
 
 
 @pytest.mark.asyncio
@@ -809,7 +824,7 @@ async def test_superseded_continuation_turn_is_not_judged_against_the_new_goal(s
     after = load_goal("target")
     judged.assert_not_called()
     assert after.status == "active" and after.goal == "new objective"
-    assert after.turns_used == before.turns_used == 0
+    assert after.turns_used == before.turns_used == (1 if change == "replace" else 0)
     assert runner.target.session_key not in runner.adapter._pending_messages
 
 

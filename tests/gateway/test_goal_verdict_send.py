@@ -296,6 +296,7 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     elif case == "internal":
         event.internal = True
     elif case == "continuation":
+        # Gateway-authored continuation provenance; a human quoting the header is a user turn.
         event = runner._synthetic_prompt_event(
             event.source, "[Continuing toward your standing goal]\nGoal: repair",
             reply_expected=False, goal_continuation=True,

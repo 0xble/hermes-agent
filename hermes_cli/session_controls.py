@@ -37,7 +37,10 @@ def _current_profile() -> str:
 
 
 def _db():
-    return _get_session_db()
+    # Late-bound: this module is first imported lazily (from a goal replace), so a name bound at
+    # import time could pin whatever ``goals._get_session_db`` was at that moment.
+    from hermes_cli import goals
+    return goals._get_session_db()
 
 
 # A replacement (objective plus contract) must be shown whole on the approval card (one Telegram
@@ -447,8 +450,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
+                actor="user",
                 user_quote=str((authority or {}).get("quote") or ""),
-                user_messages=[str((authority or {}).get("message") or "")],
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
         return {"result": result, "state": getattr(manager, "state", None),

@@ -78,9 +78,9 @@ class GatewayGoalCommandsMixin:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
         A kickoff answers the user's own ``/goal`` message, so it keeps that message's id, channel
-        prompt and reply contract. A resume continuation is gateway-authored like every other goal
-        continuation: it is built by the shared synthetic-prompt constructor so a no-change tick
-        may end on the silence marker. Best-effort: failures only logged.
+        prompt and reply contract. A resumed or refreshed continuation is gateway-authored like
+        every other goal continuation: it is built by the shared synthetic-prompt constructor so
+        a no-change tick may end on the silence marker. Best-effort: failures only logged.
         """
         try:
             adapter, quick_key = self._adapter_and_key_for(event)

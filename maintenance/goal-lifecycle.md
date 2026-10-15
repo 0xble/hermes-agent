@@ -39,7 +39,7 @@ clears the goal once with one short notice, before dispute pause or timed backof
   pause records still resume on admitted real user input. Archived provenance:
   HERMES-071 (goals-and-turn-authority); upstream contribution
   [PR #123859](https://github.com/NousResearch/hermes-agent/pull/123859)
-  at `222b6591a0c0`, not yet released. Regression:
+  at `222b6591a0c0`. Regression:
   `scripts/run_tests.sh -j 6 tests/hermes_cli/test_goal_resolvable_blocker.py
   tests/hermes_cli/test_goals.py`; retire when the selected release passes this
   proof without the local prompt/notice adaptation. Rollback reverts only this
@@ -116,10 +116,10 @@ clears the goal once with one short notice, before dispute pause or timed backof
 
 - Fork patch identity: `goal-evidence-toggles`. Goal continuation prompts allow a collapsed `<details><summary>Evidence</summary>...</details>` block where the platform renders toggles, with the outcome visible above it and exact identifiers/output lines still quoted verbatim in backticks. The rich-message Telegram hint (`TELEGRAM_RICH_MESSAGES_HINT`, appended only when `platforms.telegram.extra.rich_messages` is enabled) folds dense secondary content (evidence, logs, ID/SHA lists, long verification detail and diffs), not short answers. Toggles render only on the rich-message path; the default MarkdownV2 path and rich fallbacks (CJK, math inside details, oversize, missing endpoint) would show raw tags, so the guidance must stay rich-gated. Citation extraction and ledger lookup continue reading the raw response; no renderer or judge policy change is needed. Upstream checked at `e06df9c2eae6901f4c88f464e0ae6e753c0428b8`: related open PRs [#2843](https://github.com/NousResearch/hermes-agent/pull/2843) and [#7369](https://github.com/NousResearch/hermes-agent/pull/7369) add different transport/reasoning collapse mechanisms and are not adopted. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_adaptive.py tests/hermes_cli/test_loops.py tests/gateway/test_telegram_rich_messages.py`. The adaptive tests prove backticked identifiers inside `<details>` reach the judge even when the matching tool result is outside the recent evidence window. Retire when the selected upstream has equivalent prompt guidance and passes these tests; rollback reverts this identity's static prompt strings and tests, with no state migration.
 
-- Fork patch identity: `unlimited-goal-budget`. `goals.max_turns: 0` is a durable unlimited sentinel: config consumers preserve zero, serialized and migrated goal rows round-trip it, and the standing-goal continuation checks skip only the finite budget pause. Kanban task budgets retain their existing single-shot and finite semantics. Done, blocked, judge-failure, dispute, wait, pause, resume, clear, and positive finite budgets remain unchanged. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/tui_gateway/test_goal_command.py`. Retire when the selected upstream release preserves zero through the same surfaces and passes this proof; rollback reverts this identity's normalization, budget guards, notices, docs, and tests.
+- Fork patch identity: `unlimited-goal-budget`. `goals.max_turns: 0` is a durable unlimited sentinel: config consumers preserve zero, serialized and migrated goal rows round-trip it, and standing-goal continuation checks skip only the finite budget pause. `GoalManager.replace()` keeps the current `turns_used` and `max_turns` unless the explicit replacement supplies a new `max_turns`, so an unlimited sentinel stays unlimited, a partially used finite budget keeps its remaining turns, and an exhausted finite budget remains exhausted and paused. Replacement does not reset or refund the turn budget. Only an explicit user removal directive yields unlimited. Kanban task budgets retain their existing single-shot and finite semantics. Done, blocked, judge-failure, dispute, wait, pause, resume, clear, and positive finite budgets remain unchanged. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goals.py tests/gateway/test_goal_max_turns_config.py tests/tui_gateway/test_goal_command.py`. Retire when the selected upstream release preserves zero through the same surfaces and passes this proof; rollback reverts this identity's normalization, budget guards, notices, docs, and tests.
 
 - Fork patch identity: `goal-adaptive`. Extends `goal-judge-evidence`. Own fork
-  patch, no upstream PR yet. Four parts:
+  patch. Four parts:
   - **Cited evidence.** Identifiers the response cites (backtick spans, quoted
     strings, SHAs, URLs, long ids, `N passed`) are located with `instr` in every
     tool result recorded since the goal was set, including compaction-archived
@@ -137,26 +137,74 @@ clears the goal once with one short notice, before dispute pause or timed backof
     prove it. A dispute counts toward the stall breaker, which pauses at 3
     instead of 2, unless the reply cites a recorded result that no earlier dispute
     in the streak cited. Rewording or dropping citations is not progress.
-  - **Revisions.** `GoalManager.revise()` records a versioned revision (actor,
-    reason, user quote with its source message, before, after). The judge prompt
-    shows every revision and every requirement it replaced, in full. The
-    continuation prompt shows the current version and the same history, with each
-    replaced requirement still binding unless its cited user message plainly
-    instructs the change, so the working agent cannot act on an unauthorized
-    weakening before the judge sees it. Changing the objective or
-    constraints, or dropping a subgoal, needs a verbatim quote of 12+ characters
-    from a real user message sent since the goal was set. The runtime proves only
-    that the user said it. The judge sees the complete source message, which may
-    be at most 4,000 characters (longer ones are refused, never excerpted), and
-    decides whether it plainly instructs the specific change. Otherwise it holds
-    the agent to the earlier requirement.
-  The judge prompt judges the end state, not the route. A remedied state
-  invariant stops blocking `done`, while a breached irreversible prohibition
-  returns BLOCKED.
-  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_adaptive.py`.
-  Live replay of two historical false-negative disputes against the real judge
-  is recorded in the PR. Rollback reverts the source change. `revisions` and
-  `last_dispute_evidence` default empty on old rows, and there is no migration.
+  - **Revisions.** `GoalManager.revise()` is additive-only on the agent path. It
+    computes an item-level diff for each changed contract field and subgoal list;
+    additions are applied, while an objective change or any removed/reworded
+    requirement is rejected with `destructive_change_requires_command`. Item
+    identity is exact after whitespace normalization, including case and
+    punctuation. The goal remains unchanged, active, and running, and the
+    response names `/goal replace <text>` and `/goal remove <kind> <n>`
+    as the explicit user commands. Evidence-backed verification replacements
+    must match a recorded eligible tool result and retain every existing normalized
+    check; they may add checks, not weaken them. Recorded output has no per-check
+    satisfied/obsolete/impossible disposition, so evidence-backed removal fails
+    closed after provenance validation. Evidence never authorizes changes to the
+    objective, constraints, or subgoals. Revision rows are a non-binding
+    audit trail and are not injected into continuation or judge prompts. Only
+    the current contract and subgoals bind; there is no retirement-marker layer.
+    A replace never refunds the turn budget and never lifts a user pause
+    (`/goal pause`, `/stop`, Ctrl+C, a session-control pause), an exhausted budget,
+    or a judge-infrastructure or barrier pause; only `/goal resume` does. It lifts
+    only a pause the judge set over the contract it supersedes (BLOCKED or disputed
+    completion). The silent-stall stop clears the goal, so there is nothing to
+    replace; `/goal <text>` starts a new one. A resume waiver reaches the judge from
+    the structured `/goal resume` rows, with their waived block reasons, never from
+    rendered history. Every manager mutation applies via `_mutate_current` against the live row in one
+    write transaction, so a stale command manager never undoes an evaluator commit (`test_goal_command_atomic.py`).
+    A failed durable transaction raises `GoalPersistenceError` without editing or
+    adopting local state. The shared command dispatcher returns an error with no
+    pending-continuation cleanup or prompt. Evaluator staging and the lightweight
+    fake-DB fallback remain unchanged. Contract commands and quality gates live in
+    `goals_contract_commands.py`; their facade dependencies are late-bound so the
+    shared evaluator and command test seams retain the same behavior. The silent
+    stall counter survives command mutations and legacy migration; its terminal
+    clear stays on the evaluator snapshot/CAS path and loses to a racing command.
+    The external `goal-lifecycle` plugin's
+    `goal_set` handler catches revision errors and returns an error object.
+  - **Explicit commands.** `/goal replace <text>` changes the objective and
+    `/goal remove <outcome|check|constraint|boundary|stop|subgoal> <n>` removes one numbered item
+    immediately. `/goal status` and `/goal show` render item numbers. Invalid
+    indexes fail cleanly; these commands never enter a pause or awaiting-user
+    state. Successful replacements/removals invalidate this session's queued
+    goal-generated continuations by event metadata (prefix fallback only for raw
+    strings), preserve human messages including quoted continuation headers, and
+    enqueue the current continuation behind retained FIFO messages. Paused goals
+    remain paused and do not enqueue a continuation.
+  Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_adaptive.py` and
+  the gateway/TUI goal command suites. Rollback reverts the source change; old
+  revision rows load once into current requirements, with a durable migration marker; users may remove restored items via `/goal remove`.
+  All reachable shipped formatter wordings (plain, contract, subgoal, gate-failure,
+  revision appendix, and barrier-lift notes) live in the generated data module
+  `goals_prompt_registry.py`. Regenerate it with
+  `python scripts/dev/snapshot_goal_prompt_history.py`, which walks the full goal
+  formatter history of `origin/main` and the current branch without importing
+  historical code. The synthetic-prompt classifier registers every wording; a
+  guard test rejects missing current constants or inline barrier notes. Persisted
+  rows stay out of both recall and retention while a provably separate human
+  suffix survives. Unframed legacy revision appendices remain fail-closed through
+  their end because quoted user text can span arbitrary paragraphs. Live
+  `MessageEvent` goal provenance remains authoritative; typing or quoting a goal
+  header does not turn a human event into an autonomous continuation.
+  A failed legacy-migration write returns the restored in-memory goal marked
+  pending, never absence. `/goal <text>` re-reads the live row and refuses to
+  overwrite an unsaved migration or an unreadable row. The next mutation retries
+  the migration in its ordinary transaction. A row that cannot be read or parsed
+  never raises out of `GoalManager` construction: the manager holds no state, so
+  user turns proceed and no revive, continuation or judge runs. `/goal status`
+  names the unreadable row, and `/goal clear` replaces a corrupt row with a
+  cleared tombstone without parsing it. Every other write still refuses it. Regression:
+  `tests/agent/test_synthetic_prompt_legacy_goals.py` and
+  `tests/hermes_cli/test_goal_legacy_revision_migration.py`.
 
 - Fork patch identity: `goal-continuation-gap`. Own fork patch, no upstream PR yet.
   Two autonomous-wake controls. (1) Gateway GoalManagers pace autonomous
