@@ -3630,6 +3630,7 @@ def _wait_for_external_cron_worker_body(
     *,
     execution_id: str,
     stderr_path: Optional[Path] = None,
+    wait_for_process_exit: bool = False,
 ) -> bool:
     """Preserve ``run_one_job``'s synchronous contract after handoff.
 
@@ -3637,7 +3638,8 @@ def _wait_for_external_cron_worker_body(
     The caller nevertheless waits while it remains alive so manual/background
     callers do not release their in-process guard or report stale job state.
     A gateway replacement may kill this waiter; it does not kill the scoped
-    worker or change its ledger ownership.
+    worker or change its ledger ownership. The legacy early-return mode is kept
+    for diagnostic callers that only need to observe a terminal ledger row.
     """
     def _is_terminal() -> bool:
         current = get_execution(execution_id)
@@ -3657,11 +3659,24 @@ def _wait_for_external_cron_worker_body(
             # the worker has since exited, consume its diagnostics below before
             # cleanup; only a still-live terminal worker needs background reaping.
             returncode = process.poll()
-            if returncode is None:
-                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-                reap_terminal_worker_in_background(process)
+            if returncode is not None and wait_for_process_exit:
                 return True
+            if returncode is None:
+                if not wait_for_process_exit:
+                    from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+                    reap_terminal_worker_in_background(process)
+                    return True
+                # A scheduler-owned claim must outlive a terminal ledger row while the
+                # detached process is still alive.  The worker can still be finishing
+                # delivery/teardown, and releasing here would permit a concurrent fire.
+                while returncode is None:
+                    try:
+                        returncode = process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = process.poll()
+                if wait_for_process_exit:
+                    return True
         # The worker can commit its terminal row and exit between the first
         # read and wait(). Re-read the exact attempt before declaring that
         # it died without terminalizing.
@@ -3710,13 +3725,32 @@ def _wait_for_external_cron_worker(
     handoff_files: tuple[Path, ...] = (),
     stderr_path: Optional[Path] = None,
 ) -> bool:
+    claim_key = _inflight_key(job_id) if job_id is not None else None
+    claim_owner = None
+    claim_home = None
+    wait_for_process_exit = False
+    if claim_key is not None:
+        with _running_lock:
+            claim_owner = _running_registration_owners.get(claim_key)
+            wait_for_process_exit = _external_worker_modes.get(claim_key) in {"scoped", "detached"}
+        claim_home = _inflight_home_path(claim_key[0])
     try:
         return _wait_for_external_cron_worker_body(
-            process, execution_id=execution_id, stderr_path=stderr_path
+            process,
+            execution_id=execution_id,
+            stderr_path=stderr_path,
+            # A scheduler-owned claim is released by the waiter only after the
+            # detached process exits, not when its durable row becomes terminal.
+            wait_for_process_exit=wait_for_process_exit,
         )
     except Exception as wait_error:
         raise _ExternalWorkerPostHandoffError(str(wait_error)) from wait_error
     finally:
+        worker_exited = False
+        with contextlib.suppress(Exception):
+            worker_exited = process.poll() is not None
+        if job_id is not None and worker_exited and claim_owner is not None:
+            release_running_job(job_id, home=claim_home, owner=claim_owner)
         if job_id is not None:
             with _running_lock:
                 key = _inflight_key(job_id)
