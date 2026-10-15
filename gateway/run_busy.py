@@ -206,6 +206,11 @@ class GatewayBusySessionMixin:
             kept = [e for e in overflow if not remove(e)]
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
+        # Retained real messages must precede any freshly enqueued continuation.
+        if isinstance(pending_slot, dict) and session_key not in pending_slot:
+            overflow = self._overflow_queue(session_key)
+            if overflow:
+                pending_slot[session_key] = overflow.pop(0)
         return removed
 
     def _get_max_concurrent_sessions(self) -> Optional[int]:
