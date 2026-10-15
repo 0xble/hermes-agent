@@ -6029,10 +6029,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file(force=force):
         return False
 
-    # Only the authoritative gateway may rewrite the store, and only before adapters, cron, the
-    # housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
-    _run_requested_state_db_compaction()
-
+    # Only the authoritative gateway (never a standby) may rewrite the store, and only before adapters,
+    # cron, the housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
+    if not is_standby():
+        _run_requested_state_db_compaction()
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
     # Now the attach channel answers: republish the host record with the settled served set.
