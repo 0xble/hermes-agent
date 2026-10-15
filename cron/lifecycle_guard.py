@@ -772,15 +772,26 @@ def _prefix_positions(
             return positions, True
         value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
+        positional_operand_seen = False
         while index < len(segment):
             token = segment[index]
             if token == "--":
                 index += 1
                 break
+            string_option_end = _string_command_option_end(segment, index, name)
+            if string_option_end is not None:
+                index = string_option_end
+                continue
             if token in value_options:
                 index += 2
                 continue
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
+                index += 1
+                continue
+            if name in {"su", "runuser"} and not positional_operand_seen:
+                # These tools accept the login/user operand before later options, e.g.
+                # ``su root -c '...'``; it is not the wrapped command boundary.
+                positional_operand_seen = True
                 index += 1
                 continue
             break
@@ -1008,19 +1019,68 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 # --- referenced-script discovery --------------------------------------------------------------
 
-def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
-    """Yield values given to *option*, including env's attached ``-S<command>`` form."""
-    prefix = option + "="
-    for position in range(start + 1, len(segment)):
+def _string_command_option_end(
+    segment: list[str], position: int, executable_name: str,
+) -> Optional[int]:
+    """Return the token after a string-command option's value, including short-option clusters.
+
+    ``getopt`` treats the rest of a short-option cluster as the value once it reaches a
+    value-taking option: both ``env -iS'...'`` and ``su -mc'...'`` are therefore attached
+    command strings, not flags followed by an executable operand.
+    """
+    token = segment[position]
+    for option in _STRING_COMMAND_OPTIONS.get(executable_name, ()):
+        if option.startswith("--"):
+            if token == option:
+                return min(position + 2, len(segment))
+            if token.startswith(option + "="):
+                return position + 1
+            continue
+        if token == option:
+            return min(position + 2, len(segment))
+        if not token.startswith("-") or token.startswith("--") or len(option) != 2:
+            continue
+        short_options = token[1:]
+        option_index = short_options.find(option[1:])
+        if option_index < 0:
+            continue
+        # The value-taking option consumes the rest of the cluster, or the next token when
+        # it is the final short flag.
+        return position + 1 if short_options[option_index + 1:] else min(position + 2, len(segment))
+    return None
+
+
+def _iter_option_values(
+    segment: list[str], start: int, option: str, *, stop: Optional[int] = None,
+) -> Iterator[str]:
+    """Yield values given to *option* before the wrapped command operand begins."""
+    limit = len(segment) if stop is None else min(stop, len(segment))
+    position = start + 1
+    while position < limit:
         token = segment[position]
-        if token == option and position + 1 < len(segment):
-            yield segment[position + 1]
-        elif token.startswith(prefix):
-            yield token[len(prefix):]
-        elif option == "-S" and token.startswith("-S") and len(token) > len(option):
-            # env accepts ``-S'bash script'`` as one shell token; shlex removes the
-            # quote and leaves the command attached to the short option.
-            yield token[len(option):]
+        if token == option:
+            if position + 1 < limit:
+                yield segment[position + 1]
+                position += 2
+                continue
+        elif token.startswith(option + "="):
+            yield token[len(option) + 1:]
+            position += 1
+            continue
+        elif option.startswith("-") and not option.startswith("--") and len(option) == 2:
+            short_options = token[1:] if token.startswith("-") and not token.startswith("--") else ""
+            option_index = short_options.find(option[1:])
+            if option_index >= 0:
+                attached = short_options[option_index + 1:]
+                if attached:
+                    yield attached
+                    position += 1
+                    continue
+                if position + 1 < limit:
+                    yield segment[position + 1]
+                    position += 2
+                    continue
+        position += 1
 
 
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
@@ -1137,11 +1197,12 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         if index is None:
             continue
         positions, _ = _prefix_positions(segment, index)
-        for position in positions:
+        for position_index, position in enumerate(positions):
             if position >= len(segment):
                 continue
+            stop = positions[position_index + 1] if position_index + 1 < len(positions) else len(segment)
             for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
-                yield from _iter_option_values(segment, position, option)
+                yield from _iter_option_values(segment, position, option, stop=stop)
         index = _executed_command_index(segment)
         if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
