@@ -54,7 +54,7 @@ def _effects(fake, events):
         query=fake.query,
         bootstrap=bootstrap,
         bootout=lambda label: events.append(("bootout", label)),
-        process_exists=lambda pid: False,
+        process_exists=lambda pid: fake.old_alive,
         monotonic=lambda: 0.0,
         sleep=lambda _: setattr(fake, "standby_ready", True),
         write_plist=lambda path, text: events.append(("plist", path.name, "b" in text)),
@@ -89,7 +89,7 @@ def test_handover_failed_does_not_promote(tmp_path):
     assert any(event[0] == "bootout" for event in events)
 
 
-def test_active_role_errors_and_reverse_are_refused(tmp_path):
+def test_active_role_errors_and_reverse_handover_is_supported(tmp_path):
     def query(home, verb, *, slot, timeout=2):
         if verb == "identify":
             return {"standby": False, "slot": slot}
@@ -98,12 +98,93 @@ def test_active_role_errors_and_reverse_are_refused(tmp_path):
     effects = HandoverEffects(query=query, bootout=lambda label: events.append(label))
     assert run_handover(home=tmp_path, timeout=1, effects=effects) == 1
 
-    def reverse(home, verb, *, slot, timeout=2):
-        if verb == "identify":
-            return {"standby": slot == "a", "slot": slot}
-        return {"standby": slot == "a", "ready": True}
-    assert run_handover(home=tmp_path, timeout=1,
-                        effects=HandoverEffects(query=reverse, bootout=lambda label: None)) == 1
+    class ReverseFake(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.booted = False
+            self.old_alive = True
+            self.handover_states = iter([{"accepted": True, "token_lock_released": False},
+                                         {"accepted": True, "token_lock_released": True}])
+
+        def query(self, home, verb, *, slot, timeout=2.0):
+            self.calls.append((verb, slot))
+            if slot == "b":
+                if verb == "identify":
+                    return {"slot": "b", "standby": False, "pid": 202}
+                if verb == "status":
+                    return {"slot": "b", "standby": False, "ready": True}
+                if verb == "handover":
+                    return {"accepted": True}
+                if verb == "handover-status":
+                    return next(self.handover_states)
+            if slot == "a":
+                if verb == "identify":
+                    return ({"slot": "a", "standby": True, "ready": self.standby_ready}
+                            if self.booted else None)
+                if verb == "status":
+                    return ({"slot": "a", "standby": not self.promoted, "ready": self.standby_ready}
+                            if self.booted else None)
+                if verb == "promote":
+                    self.promoted = True
+                    self.old_alive = False
+                    return {"promoted": True, "failed": []}
+            return None
+
+    fake, events = ReverseFake(), []
+    effects = _effects(fake, events)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    assert [event[0] for event in events] == ["plist", "bootstrap", "bootout"]
+    assert events[1][1].endswith(".b") is False
+    assert events[-1][1].endswith(".b")
+    assert any(slot == "b" and verb == "handover" for verb, slot in fake.calls)
+    assert any(slot == "a" and verb == "promote" for verb, slot in fake.calls)
+
+
+def test_active_dies_before_release_still_promotes_idle_and_only_boots_out_active(tmp_path):
+    class CrashFake(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.crashed = False
+
+        def query(self, home, verb, *, slot, timeout=2.0):
+            self.calls.append((verb, slot))
+            if slot == "a":
+                if verb == "identify":
+                    return {"slot": "a", "standby": False, "pid": 101} if not self.crashed else None
+                if verb == "status":
+                    return {"slot": "a", "standby": False, "ready": True} if not self.crashed else None
+                if verb == "handover":
+                    return {"accepted": True}
+                if verb == "handover-status":
+                    self.crashed = True
+                    return {"accepted": True, "token_lock_released": False}
+            if slot == "b":
+                if verb == "identify":
+                    return ({"slot": "b", "standby": True, "ready": self.standby_ready}
+                            if self.booted else None)
+                if verb == "status":
+                    return ({"slot": "b", "standby": not self.promoted, "ready": self.standby_ready}
+                            if self.booted else None)
+                if verb == "promote":
+                    self.promoted = True
+                    return {"promoted": True, "failed": []}
+            return None
+
+    fake, events = CrashFake(), []
+    effects = HandoverEffects(
+        query=fake.query,
+        bootstrap=lambda label, path: (events.append(("bootstrap", label)), setattr(fake, "booted", True)),
+        bootout=lambda label: events.append(("bootout", label)),
+        process_exists=lambda pid: fake.old_alive,
+        monotonic=lambda: 0.0,
+        sleep=lambda _: setattr(fake, "standby_ready", True),
+        write_plist=lambda path, text: events.append(("plist", path.name, "b" in text)),
+    )
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    bootouts = [event[1] for event in events if event[0] == "bootout"]
+    assert len(bootouts) == 1 and not bootouts[0].endswith(".b")
+    assert not any(event[1].endswith(".b") for event in events if event[0] == "bootout")
+    assert any(verb == "promote" and slot == "b" for verb, slot in fake.calls)
 
 
 def test_old_active_drains_past_the_budget_and_promoted_standby_is_never_booted_out(tmp_path):

@@ -24,9 +24,11 @@ from gateway.control_socket import GatewayControlServer, identify_gateway, query
 
 
 @pytest.fixture(autouse=True)
-def _reset_slot_state():
+def _reset_slot_state(monkeypatch):
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False} if slot == "a" else None)
     yield
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
@@ -97,20 +99,40 @@ def test_slot_defaults_to_a_and_reads_env_at_call_time(monkeypatch):
         assert gateway_slot.get_gateway_slot() == expected
 
 
-def test_slot_pin_is_stable(monkeypatch):
-    gateway_slot.reset_gateway_slot_for_tests()
+def test_role_is_resolved_from_the_other_slot(monkeypatch):
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
-    config = {"gateway": {"zero_cut_handover": {"enabled": True}}}
-    assert gateway_slot.pin_gateway_slot(config) == "b"
-    monkeypatch.delenv("HERMES_GATEWAY_SLOT")
-    assert gateway_slot.effective_gateway_slot() == "b"
-    gateway_slot.reset_gateway_slot_for_tests()
+    queries = []
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: queries.append(slot) or {"standby": False})
+    assert gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}}) == "b"
+    assert zero_cut_standby.is_standby()
+    assert queries == ["a"]
+
+
+def test_role_falls_back_to_active_when_other_slot_is_down_or_standby(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "a")
+    for other_status in (None, {"standby": True}):
+        gateway_slot.reset_gateway_slot_for_tests()
+        monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                            lambda home, slot, timeout, result=other_status: result)
+        gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+        assert not zero_cut_standby.is_standby()
+
+
+def test_flag_off_role_is_active_without_query(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda *args: pytest.fail("flag-off startup must not query the other slot"))
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": False}}})
+    assert not zero_cut_standby.is_standby()
 
 
 def test_standby_readiness_is_local(monkeypatch):
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False})
     gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
     assert zero_cut_standby.readiness() == {"slot": "b", "standby": True, "ready": False, "deferred": []}
     zero_cut_standby.mark_ready()

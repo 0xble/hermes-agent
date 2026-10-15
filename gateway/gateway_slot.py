@@ -1,10 +1,10 @@
 """Process slot identity for zero-cut gateway handover.
 
-A handover runs two launchd slots against ONE ``HERMES_HOME``: the active slot ``a`` and the
-standby slot ``b``. Only when ``gateway.zero_cut_handover.enabled`` is on AND this process is slot
-``b`` do its runtime lock, PID file and control socket take a ``.b`` suffix, so the standby claims
-them beside a live ``a``. Slot ``a`` and flag-off paths are the historical names, unchanged.
-Readers that look up "the" gateway of a home keep resolving slot ``a`` unless they pass a slot.
+A handover runs two launchd slots against ONE ``HERMES_HOME``: slot ``a`` and slot ``b``. Only when
+``gateway.zero_cut_handover.enabled`` is on AND this process's sibling reports a live active gateway
+does its runtime role become standby. Slot identity still controls suffixed runtime lock, PID file and
+control socket names; role and slot are independent. Readers that look up "the" gateway of a home keep
+resolving slot ``a`` unless they pass a slot.
 """
 
 from __future__ import annotations
@@ -15,22 +15,25 @@ from typing import Any
 SLOT_ACTIVE = "a"
 SLOT_STANDBY = "b"
 
-# Pinned once by gateway startup so every state path in one process uses one slot.
+# Pinned once by gateway startup so every state path in one process uses one slot and role.
 _PINNED_GATEWAY_SLOT: str | None = None
+_PINNED_GATEWAY_STANDBY: bool | None = None
 
 
 def pin_gateway_slot(config: Any = None) -> str:
-    """Pin this process to its effective gateway slot for the lifetime of the boot."""
-    global _PINNED_GATEWAY_SLOT
+    """Pin this process to its slot and active/standby role for the lifetime of the boot."""
+    global _PINNED_GATEWAY_SLOT, _PINNED_GATEWAY_STANDBY
     if _PINNED_GATEWAY_SLOT is None:
         _PINNED_GATEWAY_SLOT = _effective_gateway_slot_uncached(config)
+        _PINNED_GATEWAY_STANDBY = _resolve_gateway_role(_PINNED_GATEWAY_SLOT, config)
     return _PINNED_GATEWAY_SLOT
 
 
 def reset_gateway_slot_for_tests() -> None:
-    """Clear the process slot pin for isolated tests."""
-    global _PINNED_GATEWAY_SLOT
+    """Clear the process slot and role pins for isolated tests."""
+    global _PINNED_GATEWAY_SLOT, _PINNED_GATEWAY_STANDBY
     _PINNED_GATEWAY_SLOT = None
+    _PINNED_GATEWAY_STANDBY = None
 
 
 def get_gateway_slot() -> str:
@@ -56,6 +59,33 @@ def _effective_gateway_slot_uncached(config: Any = None) -> str:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
     return SLOT_STANDBY if is_zero_cut_handover_enabled(config) else SLOT_ACTIVE
+
+
+def _query_other_slot(home, slot: str, timeout: float) -> dict[str, Any] | None:
+    """Read one sibling slot's live status without making slot resolution recursive."""
+    from gateway.control_socket import query_gateway_control
+    return query_gateway_control(home, "status", slot=slot, timeout=timeout)
+
+
+def _resolve_gateway_role(slot: str, config: Any = None, *, timeout: float = 0.5) -> bool:
+    """Return whether ``slot`` should boot standby based on the sibling's live status."""
+    from gateway.config import is_zero_cut_handover_enabled
+    if not is_zero_cut_handover_enabled(config):
+        return False
+    from hermes_constants import get_hermes_home
+    other_slot = SLOT_STANDBY if slot == SLOT_ACTIVE else SLOT_ACTIVE
+    try:
+        status = _query_other_slot(get_hermes_home(), other_slot, timeout)
+    except (OSError, RuntimeError, ValueError, TypeError, ImportError):
+        return False
+    return bool(status and status.get("standby") is False)
+
+
+def effective_gateway_standby(config: Any = None) -> bool:
+    """Return this process's pinned role, resolving it once if startup has not pinned it yet."""
+    if _PINNED_GATEWAY_STANDBY is not None:
+        return _PINNED_GATEWAY_STANDBY
+    return _resolve_gateway_role(effective_gateway_slot(config), config)
 
 
 def effective_gateway_slot(config: Any = None) -> str:
