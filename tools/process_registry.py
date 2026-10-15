@@ -46,9 +46,7 @@ from tools.process_registry_results import (
     save_cut_pending_result,
 )
 from tools.process_registry_env_log import log_delta_command
-from tools.process_registry_wait import (
-    monotonic as _monotonic, wait_plan as _wait_plan,
-)
+from tools.process_registry_wait import monotonic as _monotonic, plan_for as _wait_plan
 
 logger = logging.getLogger(__name__)
 
@@ -1904,32 +1902,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             return False
 
     @staticmethod
-    def _completion_reaches_current_session(session: ProcessSession) -> bool:
-        """Whether the registry's completion drain would route this process to this session.
-
-        Ordinary process completions are addressed by the spawning session key. Processes
-        owned by a delegated ``sa-`` task are suppressed by the drain (the child result is
-        the deliverable) and are killed at child teardown unless explicitly handed off, so
-        they must never get the short, end-the-turn wait plan in their parent.
-        """
-        if str(session.owner_task_id or session.task_id or "").startswith("sa-"):
-            return False
-        from gateway.session_context import get_session_env
-
-        current_session_id = str(get_session_env("HERMES_SESSION_ID", "") or "")
-        current_session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "")
-        parent_session_id = str(session.parent_session_id or "")
-        session_key = str(session.session_key or "")
-        if parent_session_id and current_session_id:
-            return parent_session_id == current_session_id
-        if session_key and current_session_key:
-            return session_key == current_session_key
-        # Legacy/CLI callers may have no session routing metadata at all. Preserve
-        # their existing local completion behavior, while failing closed whenever a
-        # process does carry an origin that is not the current session.
-        return not parent_session_id and not session_key
-
-    @staticmethod
     def _owns_event(evt: dict, session_key: str, owns_event, is_async_delegation: bool) -> bool:
         """Routing verdict for one drained event (see drain_notifications); False = requeue."""
         evt_session_key = str(evt.get("session_key") or "")
@@ -2210,8 +2182,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     def wait(self, session_id: str, timeout: int = None) -> dict:
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
-        ``timeout`` defaults to 30 seconds only when the process has notify_on_complete and
-        its notice can reach this session, otherwise to TERMINAL_TIMEOUT; it is clamped by
+        ``timeout`` defaults per ``process_registry_wait.wait_plan`` and is clamped by
         TERMINAL_TIMEOUT. Returns a dict
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
@@ -2228,10 +2199,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         if session is None:
             return _not_found(session_id)
         timeout_note = None
-        default_timeout, guidance = _wait_plan(
-            bool(session.notify_on_complete), max_timeout,
-            completion_reaches_session=self._completion_reaches_current_session(session),
-        )
+        default_timeout, guidance = _wait_plan(session, max_timeout)
         effective_timeout = default_timeout if timeout is None else timeout
         if timeout and timeout > max_timeout:
             effective_timeout = max_timeout

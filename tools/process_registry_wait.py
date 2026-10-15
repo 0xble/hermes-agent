@@ -26,6 +26,39 @@ def can_receive_later() -> bool:
     return async_delivery_supported() and not is_delegated_child_context()
 
 
+def completion_reaches_session(session) -> bool:
+    """Whether the registry's completion drain would route this process to this session.
+
+    Processes owned by a delegated ``sa-`` task are suppressed by the drain (the child
+    result is the deliverable) and are killed at child teardown unless explicitly handed
+    off, so they never get the short, end-the-turn plan in their parent. The spawning
+    session id is checked first because the gateway drops a notice across a user
+    boundary such as /new, which keeps the chat's session key.
+    """
+    if str(session.owner_task_id or session.task_id or "").startswith("sa-"):
+        return False
+    from gateway.session_context import get_session_env
+
+    current_session_id = str(get_session_env("HERMES_SESSION_ID", "") or "")
+    current_session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "")
+    parent_session_id = str(session.parent_session_id or "")
+    session_key = str(session.session_key or "")
+    if parent_session_id and current_session_id:
+        return parent_session_id == current_session_id
+    if session_key and current_session_key:
+        return session_key == current_session_key
+    # Legacy/CLI callers may have no session routing metadata at all. Preserve
+    # their existing local completion behavior, while failing closed whenever a
+    # process does carry an origin that is not the current session.
+    return not parent_session_id and not session_key
+
+
+def plan_for(session, max_timeout: int) -> Tuple[int, str]:
+    """``wait_plan`` for a registry process session."""
+    return wait_plan(bool(session.notify_on_complete), max_timeout,
+                     completion_reaches_session=completion_reaches_session(session))
+
+
 def wait_plan(
     notify_on_complete: bool,
     max_timeout: int,
