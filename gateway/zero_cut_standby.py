@@ -50,19 +50,13 @@ def readiness() -> dict[str, Any]:
     return {"slot": slot, "standby": is_standby(), "ready": _ready, "deferred": runner_deferred}
 
 
-def readiness_for_runner(runner) -> dict[str, Any]:
-    """Return readiness with the runner's deferred platform names when available."""
-    result = readiness()
-    entries = getattr(runner, "_standby_deferred", {})
-    result["deferred"] = [
-        f"{profile}:{platform.value}" if profile else platform.value
-        for profile, platform in entries
-    ]
-    return result
-
-
 async def promote(runner) -> dict[str, Any]:
-    """Promote a ready standby in place, starting deferred adapters and autonomous services."""
+    """Promote a ready standby in place, starting deferred adapters and autonomous services.
+
+    A deferred primary platform that fails to connect is queued for the reconnect watcher, the
+    same as a transient failure at normal startup, so a promoted gateway heals instead of
+    silently serving without Telegram. The payload names every failed platform.
+    """
     global _promoted
     if _promoted:
         return {"promoted": True, "already": True}
@@ -71,27 +65,31 @@ async def promote(runner) -> dict[str, Any]:
     if not _ready:
         return {"promoted": False, "refused": "not_ready"}
 
+    failed: list[str] = []
     deferred = dict(getattr(runner, "_standby_deferred", {}))
     for (profile, platform), config in deferred.items():
+        name = f"{profile}:{platform.value}" if profile else platform.value
         adapter = runner._create_adapter(platform, config)
         if adapter is None:
-            logger.warning("Promotion could not create deferred adapter %s:%s", profile, platform.value)
+            logger.error("Promotion could not create deferred adapter %s", name)
+            failed.append(name)
             continue
         if profile is None:
             runner._wire_adapter_handlers(adapter)
-            connected = await runner._connect_initial_adapter_with_timeout(adapter, platform)
-            if not connected:
+        else:
+            runner._configure_profile_adapter(adapter, profile, platform)
+        if not await runner._connect_initial_adapter_with_timeout(adapter, platform):
+            logger.error("Promotion could not connect deferred adapter %s", name)
+            failed.append(name)
+            if profile is None:
+                runner._failed_platforms[platform] = runner._startup_retry_entry(platform, adapter, config)
+            else:
                 await runner._safe_adapter_disconnect(adapter, platform)
-                continue
+            continue
+        if profile is None:
             runner._publish_primary_adapter(platform, adapter)
         else:
-            profile_map = (getattr(runner, "_profile_adapters", None) or {}).setdefault(profile, {})
-            runner._configure_profile_adapter(adapter, profile, platform)
-            connected = await runner._connect_initial_adapter_with_timeout(adapter, platform)
-            if not connected:
-                await runner._safe_adapter_disconnect(adapter, platform)
-                continue
-            profile_map[platform] = adapter
+            runner._profile_adapters.setdefault(profile, {})[platform] = adapter
 
     _promoted = True
     runner._standby_deferred = {}
@@ -99,7 +97,7 @@ async def promote(runner) -> dict[str, Any]:
     runner._start_spawn_background_watchers()
     from gateway.run import _start_gateway_start_cron_and_housekeeping
     runner._zero_cut_cron_handles = _start_gateway_start_cron_and_housekeeping(runner)
-    return {"promoted": True, "already": False}
+    return {"promoted": True, "already": False, "failed": failed}
 
 
 def reset_for_tests() -> None:
