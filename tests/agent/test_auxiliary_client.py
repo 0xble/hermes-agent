@@ -1527,8 +1527,10 @@ class TestIsRateLimitError:
     def test_timed_out_408_keeps_the_timeout_label(self):
         class RequestTimeout(Exception):
             status_code = 408
+        class RequestRejected(Exception):
+            status_code = 408
         assert _is_server_error(RequestTimeout("request timed out")) is False
-        assert _is_server_error(RequestTimeout("request rejected")) is True
+        assert _is_server_error(RequestRejected("request rejected")) is True
 
     def test_wrapped_auth_unavailable_503_is_a_fallback_reason(self):
         class RelayAuthUnavailable(Exception):
