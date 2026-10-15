@@ -165,6 +165,38 @@ def test_presend_gate_counts_tool_schemas_in_the_final_request(tmp_path):
         assert run_preflight_gate(agent, **kwargs, tools_for_api=huge_tools).action == "break"
 
 
+def test_presend_gate_lowers_an_oversized_output_cap_instead_of_withholding(tmp_path):
+    """Input fits with room to answer; only the configured cap overflows → shrink it and send."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "chat_completions"
+    agent.context_compressor.context_length = 32000
+    agent.max_tokens = 30000
+    agent._ephemeral_max_output_tokens = None
+    rows = [{"role": "user", "content": "inspect only " * 400}]
+    with patch.object(agent, "_compress_context") as compress:
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    compress.assert_not_called()
+    assert verdict.action == "fallthrough" and not verdict.failed
+    shrunk = agent._ephemeral_max_output_tokens
+    assert shrunk is not None and 4096 <= shrunk < 30000
+
+
+def test_presend_gate_keeps_the_cap_when_too_little_answer_runway_remains(tmp_path):
+    """A shrunk cap below a useful runway is not a fix: recover or withhold as before."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "chat_completions"
+    agent.context_compressor.context_length = 8000
+    agent.max_tokens = 4000
+    agent._ephemeral_max_output_tokens = None
+    rows = [{"role": "user", "content": "inspect only " * 1200}]
+    with patch.object(agent, "_compress_context", side_effect=lambda m, *a, **k: (m, "")):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    assert verdict.action == "break" and verdict.failed
+    assert agent._ephemeral_max_output_tokens is None
+
+
 # ── Gap 2: the replayed trigger is not duplicated in transcript or request ──
 
 def test_admitted_trigger_in_history_is_reused_not_reappended(tmp_path):

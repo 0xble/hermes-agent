@@ -59,8 +59,17 @@ def run_preflight_gate(
 
     # A known hard-window breach cannot defer to real usage: some servers truncate
     # instead of rejecting. Measure the final request, not a stale usage anchor.
-    from agent.compression_recovery import request_fits
+    from agent.compression_recovery import affordable_output_cap, request_fits
     window = getattr(agent.context_compressor, "context_length", None)
+    if (api_messages is not None and isinstance(window, int) and window > 0
+            and getattr(agent, "api_mode", None) != "codex_app_server"
+            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
+        # Input that fits with a useful answer runway only needs a smaller output cap, the
+        # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
+        shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
+        if shrunk is not None:
+            agent._ephemeral_max_output_tokens = shrunk
+            logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
     if (api_messages is not None and isinstance(window, int) and window > 0
             and getattr(agent, "api_mode", None) != "codex_app_server"
             and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
@@ -81,7 +90,7 @@ def run_preflight_gate(
             v.messages = recovered
             v.active_system_prompt = prompt
             v.conversation_history = conversation_history_after_compression(agent, recovered)
-            if request_fits(agent, recovered, prompt):
+            if request_fits(agent, recovered, prompt, tools=tools_for_api):
                 v._preflight_compression_blocked = False
                 v._last_preflight_pressure = request_pressure_tokens
                 v.action = "continue"

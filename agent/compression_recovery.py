@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Optional
 
 from agent.model_metadata import estimate_request_tokens_rough
 
@@ -86,23 +86,45 @@ def admit_before_compaction(agent: Any, messages: list, history: list, user: dic
 
 
 def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False, tools=None) -> bool:
-    compressor = agent.context_compressor
-    window = compressor.context_length
+    window = agent.context_compressor.context_length
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return False  # unknown fit cannot authorize a mechanical archive or send
     # Reserve the output cap the transport will actually send (a None cap resolves to the native
     # default on Anthropic) when the endpoint validates input + cap against the window. Endpoints
     # that instead stop generation at the window (Claude 4.5+) keep only an explicitly selected
     # cap as answer runway, so a native ceiling equal to the window does not force compaction.
-    # Plus estimator/transport framing headroom.
     from agent.chat_completion_helpers import effective_wire_max_output_tokens, selected_max_output_tokens
     cap, enforced = effective_wire_max_output_tokens(agent)
     if not enforced:
         cap = selected_max_output_tokens(agent)
     output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
-    reserve = max(1024, int(window * 0.05))
+    return _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools) + output + _reserve(window) < window
+
+
+def affordable_output_cap(agent: Any, messages: list, *, tools=None) -> Optional[int]:
+    """Largest output cap that fits beside this assembled wire request, or None when the input
+    leaves less than a useful answer runway. Lets the pre-send gate lower an oversized cap (as the
+    provider's "max_tokens too large" clamp would) instead of withholding a request whose input fits."""
+    window = agent.context_compressor.context_length
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        return None
+    room = window - _reserve(window) - _request_input_tokens(agent, messages, "", wire=True, tools=tools) - 1
+    return room if room >= _MIN_SHRUNK_OUTPUT_TOKENS else None
+
+
+# Below this runway, compaction serves the turn better than a truncated answer.
+_MIN_SHRUNK_OUTPUT_TOKENS = 4096
+
+
+def _reserve(window: int) -> int:
+    """Estimator/transport framing headroom."""
+    return max(1024, int(window * 0.05))
+
+
+def _request_input_tokens(agent: Any, messages: list, prompt: str, *, wire: bool, tools) -> int:
     effective_prompt = (prompt or "") + ("" if wire else (getattr(agent, "ephemeral_system_prompt", "") or ""))
-    request_tools = tools if wire else getattr(agent, "tools", None)
+    # Price the tool schemas the request actually sends when the caller has them.
+    request_tools = tools if (wire or tools is not None) else getattr(agent, "tools", None)
     # Native Responses sends a checkpoint-pruned projection, not the durable
     # transcript. Reuse the route-aware estimator without a stale usage anchor.
     from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
@@ -116,10 +138,9 @@ def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False,
     native = estimate_native_responses_preflight_tokens(
         agent, messages, system_prompt=native_prompt, tools=request_tools,
     )
-    tokens = native if native is not None else estimate_request_tokens_rough(
+    return native if native is not None else estimate_request_tokens_rough(
         messages, system_prompt=effective_prompt, tools=request_tools,
     )
-    return tokens + output + reserve < window
 
 
 def recovery_projection(agent: Any, messages: list) -> list:
