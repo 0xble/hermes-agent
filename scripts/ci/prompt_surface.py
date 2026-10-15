@@ -82,6 +82,10 @@ def _pin_environment() -> None:
     # Import zoneinfo-backed modules before pinning ``sys.platform``. On macOS, changing it
     # first makes Python's stdlib look for the Linux sysconfig-data module and breaks ``zoneinfo``.
     import hermes_time
+    # Import native platform extensions before pinning sys.platform. psutil selects its
+    # compiled module from the real host platform at import time; importing it afterward
+    # makes a macOS interpreter look for the Linux extension and drops browser/terminal tools.
+    import psutil  # noqa: F401
     sys.platform = "linux"  # skills index ``platforms:`` gate
 
     hermes_time.now = lambda: FIXED_NOW  # type: ignore[assignment]

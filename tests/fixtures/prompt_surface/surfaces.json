@@ -3,9 +3,9 @@
     "prompt_tokens": {
       "context": 249,
       "stable": 1935,
-      "volatile": 1824
+      "volatile": 1866
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -21,6 +21,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -48,9 +49,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1445,
-      "volatile": 1824
+      "volatile": 1867
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -66,6 +67,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -93,9 +95,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1866,
-      "volatile": 1823
+      "volatile": 1865
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -111,6 +113,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -138,9 +141,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 2640,
-      "volatile": 1820
+      "volatile": 1863
     },
-    "tool_tokens": 14522,
+    "tool_tokens": 14600,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -156,6 +159,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -183,9 +187,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1445,
-      "volatile": 1824
+      "volatile": 1866
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -201,6 +205,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -228,9 +233,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1317,
-      "volatile": 1824
+      "volatile": 1867
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -246,6 +251,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -273,9 +279,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1579,
-      "volatile": 1825
+      "volatile": 1868
     },
-    "tool_tokens": 15001,
+    "tool_tokens": 15079,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -291,6 +297,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -319,9 +326,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1349,
-      "volatile": 1825
+      "volatile": 1868
     },
-    "tool_tokens": 14366,
+    "tool_tokens": 14444,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -337,6 +344,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",
@@ -364,9 +372,9 @@
     "prompt_tokens": {
       "context": 0,
       "stable": 1418,
-      "volatile": 1825
+      "volatile": 1868
     },
-    "tool_tokens": 14393,
+    "tool_tokens": 14471,
     "tools": [
       "browser_back",
       "browser_cdp",
@@ -382,6 +390,7 @@
       "browser_snapshot",
       "browser_type",
       "browser_upload",
+      "browser_vault_list",
       "browser_vision",
       "clarify",
       "delegate_task",

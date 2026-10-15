@@ -83,7 +83,7 @@ def test_resolve_single_connector_entry_returns_sentinel():
 
 def test_resolve_multi_local_batch_returns_lossless_local_sentinel():
     first = {"name": "some_local_tool", "arguments": {"query": "alpha", "limit": 20}}
-    name, _args, err = resolve_underlying_call({"calls": [first, {"name": "another_local", "arguments": {}}]})
+    name, args, err = resolve_underlying_call({"calls": [first, {"name": "another_local", "arguments": {}}]})
     assert err is None
     assert name == LOCAL_BATCH_SENTINEL
     assert args["calls"] == [first, {"name": "another_local", "arguments": {}}]
@@ -509,7 +509,7 @@ def test_peel_keeps_mixed_and_local_batches_as_sequential_barrier():
         {"name": "connectors__gmail__SEND_EMAIL", "arguments": {}},
         {"name": "write_file", "arguments": {"path": "x"}},
     ]}
-    name, _args = _peel_bridge_call("tool_call", mixed)
+    name, args = _peel_bridge_call("tool_call", mixed)
     assert name == "tool_call"  # barrier: mixed entries are not admitted as one parallel unit
     assert args == mixed
 

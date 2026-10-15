@@ -357,8 +357,8 @@
                 "grok",
                 "kimi",
                 "llama",
-                "minimax",
                 "mimo",
+                "minimax",
                 "mistral",
                 "nemotron",
                 "nova",
@@ -808,6 +808,7 @@
                 "code_execution",
                 "communication",
                 "computer_use",
+                "connector",
                 "delegation",
                 "file",
                 "home_automation",
@@ -1031,12 +1032,16 @@
           "properties": {
             "error_class": {
               "enum": [
+                "alias",
                 "blocked",
+                "connection_required",
+                "connector_backend",
                 "contract_violation",
                 "exception",
                 "interrupted",
                 "invalid_arguments",
                 "none",
+                "not_allowed",
                 "timeout",
                 "tool_error",
                 "unknown"
@@ -1176,12 +1181,12 @@
             },
             "ram_bucket": {
               "enum": [
-                "lt_8g",
-                "8g_to_16g",
                 "16g_to_32g",
                 "32g_to_64g",
                 "64g_to_128g",
+                "8g_to_16g",
                 "gte_128g",
+                "lt_8g",
                 "unknown"
               ]
             },
@@ -1195,10 +1200,10 @@
             },
             "version_age_bucket": {
               "enum": [
-                "lt_7d",
-                "7d_to_30d",
                 "30d_to_90d",
+                "7d_to_30d",
                 "gte_90d",
+                "lt_7d",
                 "unknown"
               ]
             }
@@ -1934,12 +1939,16 @@
             },
             "error_class": {
               "enum": [
+                "alias",
                 "blocked",
+                "connection_required",
+                "connector_backend",
                 "contract_violation",
                 "exception",
                 "interrupted",
                 "invalid_arguments",
                 "none",
+                "not_allowed",
                 "timeout",
                 "tool_error",
                 "unknown"
@@ -2341,11 +2350,11 @@
             },
             "window_bucket": {
               "enum": [
-                "lt_32k",
-                "32k_to_128k",
                 "128k_to_256k",
                 "256k_to_1m",
+                "32k_to_128k",
                 "gte_1m",
+                "lt_32k",
                 "unknown"
               ]
             }
@@ -2384,12 +2393,12 @@
           "properties": {
             "latency_bucket": {
               "enum": [
-                "lt_500ms",
-                "500ms_to_1s",
                 "1s_to_2s",
                 "2s_to_5s",
+                "500ms_to_1s",
                 "5s_to_10s",
-                "gte_10s"
+                "gte_10s",
+                "lt_500ms"
               ]
             },
             "surface": {
@@ -2488,6 +2497,7 @@
               "enum": [
                 "failed",
                 "noop",
+                "partial",
                 "refused",
                 "success"
               ]
@@ -2973,12 +2983,12 @@
               "enum": [
                 "0",
                 "1",
-                "2",
-                "3_to_5",
-                "6_to_10",
                 "11_to_25",
+                "2",
                 "26_to_50",
+                "3_to_5",
                 "51_to_100",
+                "6_to_10",
                 "gte_101"
               ]
             },
@@ -3000,12 +3010,12 @@
             },
             "tokens_bucket": {
               "enum": [
-                "lt_2k",
-                "2k_to_10k",
                 "10k_to_50k",
-                "50k_to_200k",
                 "200k_to_1m",
+                "2k_to_10k",
+                "50k_to_200k",
                 "gte_1m",
+                "lt_2k",
                 "unknown"
               ]
             },
@@ -3013,12 +3023,12 @@
               "enum": [
                 "0",
                 "1",
-                "2",
-                "3_to_5",
-                "6_to_10",
                 "11_to_25",
+                "2",
                 "26_to_50",
+                "3_to_5",
                 "51_to_100",
+                "6_to_10",
                 "gte_101"
               ]
             }
@@ -3075,12 +3085,12 @@
             },
             "tokens_bucket": {
               "enum": [
-                "lt_2k",
-                "2k_to_10k",
                 "10k_to_50k",
-                "50k_to_200k",
                 "200k_to_1m",
+                "2k_to_10k",
+                "50k_to_200k",
                 "gte_1m",
+                "lt_2k",
                 "unknown"
               ]
             }
@@ -3120,12 +3130,12 @@
           "properties": {
             "original_size_bucket": {
               "enum": [
-                "lt_1k",
-                "1k_to_10k",
-                "10k_to_50k",
-                "50k_to_100k",
                 "100k_to_500k",
+                "10k_to_50k",
+                "1k_to_10k",
+                "50k_to_100k",
                 "gte_500k",
+                "lt_1k",
                 "unknown"
               ]
             },
@@ -3181,12 +3191,12 @@
             "tool_schema_tokens_bucket": {
               "enum": [
                 "0",
-                "lt_2k",
-                "2k_to_5k",
-                "5k_to_10k",
                 "10k_to_20k",
                 "20k_to_40k",
-                "gte_40k"
+                "2k_to_5k",
+                "5k_to_10k",
+                "gte_40k",
+                "lt_2k"
               ]
             }
           },
@@ -3269,6 +3279,7 @@
                 "image_gen",
                 "kanban",
                 "memory",
+                "onboarding",
                 "project",
                 "safe",
                 "search",
@@ -3386,11 +3397,11 @@
             "active_minutes_bucket": {
               "enum": [
                 "0",
-                "lt_5m",
-                "5m_to_30m",
-                "30m_to_2h",
                 "2h_to_6h",
-                "gte_6h"
+                "30m_to_2h",
+                "5m_to_30m",
+                "gte_6h",
+                "lt_5m"
               ]
             },
             "active_profile_count_bucket": {
@@ -3450,11 +3461,11 @@
             "active_minutes_bucket": {
               "enum": [
                 "0",
-                "lt_5m",
-                "5m_to_30m",
-                "30m_to_2h",
                 "2h_to_6h",
-                "gte_6h"
+                "30m_to_2h",
+                "5m_to_30m",
+                "gte_6h",
+                "lt_5m"
               ]
             },
             "surface": {
@@ -3513,9 +3524,9 @@
             "turns_before_switch_bucket": {
               "enum": [
                 "1",
+                "11_to_30",
                 "2_to_3",
                 "4_to_10",
-                "11_to_30",
                 "gte_31"
               ]
             }
@@ -3755,10 +3766,6 @@
                 "first_message",
                 "free_tier_ready",
                 "guide",
-                "guide_connectors",
-                "guide_first_build",
-                "guide_layout",
-                "guide_look",
                 "guide_skip",
                 "model_pick",
                 "provider_api_key",
@@ -4234,11 +4241,8 @@
                 "browser_snapshot",
                 "browser_type",
                 "browser_upload",
-                "browser_vault_enter_code",
-                "browser_vault_fill",
+                "browser_vault",
                 "browser_vault_list",
-                "browser_vault_save_login",
-                "browser_vault_unlock",
                 "browser_vision",
                 "clarify",
                 "close_terminal",
@@ -4284,6 +4288,8 @@
                 "read_window_below",
                 "search_files",
                 "session_search",
+                "set_theme",
+                "setup_beat",
                 "setup_choose",
                 "show_tip",
                 "skill_manage",
@@ -4550,6 +4556,7 @@
                 "code_execution",
                 "communication",
                 "computer_use",
+                "connector",
                 "delegation",
                 "file",
                 "home_automation",

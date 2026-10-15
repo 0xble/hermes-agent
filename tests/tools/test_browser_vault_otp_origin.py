@@ -36,7 +36,7 @@ def otp(monkeypatch, tmp_path):
 
 def _enter(handle="op:otp-origin"):
     # Exercise the actual registered handler, including the page-operation fence.
-    return json.loads(registry.dispatch("browser_vault_enter_code", {"handle": handle}, task_id="otp"))
+    return json.loads(registry.dispatch("browser_vault", {"action": "enter_code", "handle": handle}, task_id="otp"))
 
 
 @pytest.mark.parametrize("origin", ["https://evil.test", "http://login.test", "https://login.test:8443", "https://login.test.evil.test"])
@@ -92,7 +92,7 @@ def test_otp_alias_origin_skips_consent_when_confirmation_disabled(otp, monkeypa
 
 
 def test_otp_disabled_confirmation_logs_cross_domain_warning(otp, monkeypatch, caplog):
-    backend, write = otp
+    _backend, _write = otp
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
         "vault": {"confirm_alias_fills": False, "origin_aliases": {"op:otp-origin": ["https://evil.test"]}},
     })

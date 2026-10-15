@@ -102,7 +102,7 @@ After difficult/iterative tasks, offer to save as a skill. If a skill you loaded
 
 Only proceed without loading a skill if genuinely none are relevant to the task.
 
-Active Hermes profile: default. Other profiles (if any) live under /var/folders/bm<HERMES_HOME>/profiles/<name>/. Each profile has its own skills/, plugins/, cron/, and memories/ that affect a different session than this one. Do not modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
+Active Hermes profile: default. Other profiles (if any) live under /var/folders/bm/tg1hpxvx6zs8tnfd81927lfc0000gn/T/prompt-surface-46ma7yoc/home/.hermes/profiles/<name>/. Each profile has its own skills/, plugins/, cron/, and memories/ that affect a different session than this one. Do not modify another profile's skills/plugins/cron/memories unless the user explicitly directs you to.
 
 Conversation started: Thursday, January 15, 2026 (UTC, UTC+00:00)
 Model: anthropic/claude-sonnet-4.5
@@ -111,8 +111,8 @@ Platform: cron
 # Hermes runtime environment
 
 Host: <HOST_OS>
-User home directory: /var/folders/bm<HOME>
+User home directory: /var/folders/bm/tg1hpxvx6zs8tnfd81927lfc0000gn/T/prompt-surface-46ma7yoc/home
 Current working directory: <HOME>/plain
-Scratch directory: /var/folders/bm<HERMES_HOME>/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
+Scratch directory: /var/folders/bm/tg1hpxvx6zs8tnfd81927lfc0000gn/T/prompt-surface-46ma7yoc/home/.hermes/cache/scratch (TMPDIR points here; write temporary files and probes there, never under the system temp dir; entries idle for 24h are pruned)
 
 <!-- End Hermes runtime environment -->
