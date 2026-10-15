@@ -332,7 +332,78 @@ def _secondary_runner(tmp_path, connect):
     runner._safe_adapter_disconnect = lambda adapter, platform: asyncio.sleep(0)
     runner._schedule_secondary_profile_startup_reconnect = (
         lambda profile, platform, adapter: reconnects.append((profile, platform)))
+    runner.statuses = {}
+    runner._update_platform_runtime_status = lambda key, **kw: runner.statuses.__setitem__(key, kw)
     return runner, scopes, reconnects
+
+
+@pytest.mark.asyncio
+async def test_promote_flags_a_secondary_whose_adapter_cannot_be_created(monkeypatch, tmp_path):
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    runner, _scopes, reconnects = _secondary_runner(tmp_path, lambda a, p: asyncio.sleep(0, result=True))
+    runner._served_profile_homes = {"work": tmp_path / "work"}
+    runner._create_adapter = lambda platform, config: None
+    zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile="work")
+    zcs.mark_ready()
+    result = await zcs.promote(runner)
+    assert result["failed"] == ["work:telegram"]
+    assert runner.statuses["work:telegram"]["needs_attention"] is True  # visibly unserved, not dropped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heals", [True, False])
+async def test_promote_primary_create_none_is_flagged_and_queued_when_it_can_heal(monkeypatch, heals):
+    platform = Platform.TELEGRAM
+    config = object()
+    statuses = {}
+    runner = SimpleNamespace(
+        adapters={}, _failed_platforms={}, _standby_deferred={},
+        _create_adapter=lambda p, c: None,
+        _adapter_may_heal=lambda p, c: heals,
+        _startup_retry_entry=lambda p, a, c: {"adapter": a, "config": c},
+        _update_platform_runtime_status=lambda key, **kw: statuses.__setitem__(key, kw),
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.defer_platform(runner, platform, config)
+    zcs.mark_ready()
+    result = await zcs.promote(runner)
+    assert result["failed"] == ["telegram"]
+    assert statuses["telegram"]["needs_attention"] is True
+    assert (platform in runner._failed_platforms) is heals
+
+
+@pytest.mark.asyncio
+async def test_promote_primary_create_raise_keeps_it_deferred_for_retry(monkeypatch):
+    platform = Platform.TELEGRAM
+    calls = {"n": 0}
+    adapter = object()
+
+    def create(p, c):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("plugin import failed")
+        return adapter
+
+    runner = SimpleNamespace(
+        adapters={}, _failed_platforms={}, _standby_deferred={},
+        _create_adapter=create, _wire_adapter_handlers=lambda a: None,
+        _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=True),
+        _publish_primary_adapter=lambda p, a: runner.adapters.__setitem__(p, a),
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.defer_platform(runner, platform, object())
+    zcs.mark_ready()
+    with pytest.raises(RuntimeError):
+        await zcs.promote(runner)
+    assert zcs.is_standby() and zcs.readiness()["deferred"] == ["telegram"]
+    assert (await zcs.promote(runner))["failed"] == []
+    assert runner.adapters[platform] is adapter
 
 
 @pytest.mark.asyncio

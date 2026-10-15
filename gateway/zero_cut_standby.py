@@ -75,20 +75,33 @@ def _existing_claims(runner) -> dict:
 
 async def _promote_secondary_profiles(runner, profiles: list[str], failed: list[str]) -> None:
     """Start deferred secondaries through the normal per-profile path (runtime scope, credential and
-    listener conflict refusal, startup reconnect), in the served order, after the primary is live."""
+    listener conflict refusal, startup reconnect), in the served order, after the primary is live.
+
+    A secondary that ends unserved (creation returned None or raised, or a duplicate claim was refused)
+    is stamped ``<profile>:telegram`` needs-attention, so it is visibly unserved rather than dropped."""
     from gateway.config import Platform
     homes = getattr(runner, "_served_profile_homes", None) or {}
     claimed = _existing_claims(runner)
+    tg = Platform.TELEGRAM.value
+
+    def unserved(profile: str, why: str) -> None:
+        failed.append(f"{profile}:{tg}")
+        retrying = Platform.TELEGRAM in ((getattr(runner, "_profile_failed_platforms", None) or {}).get(profile) or {})
+        if not retrying:
+            runner._update_platform_runtime_status(
+                f"{profile}:{tg}", platform_state="fatal", error_code="promotion_unserved",
+                error_message=f"Telegram was not started at standby promotion: {why}", needs_attention=True)
+
     for profile in [p for p in homes if p in profiles]:
         try:
             await runner._start_one_profile_adapters(profile, homes[profile], claimed)
         except Exception:
             logger.exception("Promotion could not start deferred adapters for profile %s", profile)
         if Platform.TELEGRAM not in (runner._profile_adapters.get(profile) or {}):
-            failed.append(f"{profile}:{Platform.TELEGRAM.value}")
+            unserved(profile, "adapter unavailable or credential already claimed (see gateway log)")
     for profile in [p for p in profiles if p not in homes]:
         logger.error("Promotion has no served home for deferred profile %s", profile)
-        failed.append(f"{profile}:{Platform.TELEGRAM.value}")
+        unserved(profile, "no served home for this profile")
 
 
 async def promote(runner) -> dict[str, Any]:
@@ -130,12 +143,24 @@ async def _promote(runner) -> dict[str, Any]:
     deferred = getattr(runner, "_standby_deferred", None) or {}
     # Consume entries one at a time so a promotion that raises midway leaves the rest for a retry.
     for key in [k for k in list(deferred) if k[0] is None]:
-        config = deferred.pop(key)
+        config = deferred[key]
         platform = key[1]
+        # A raise leaves the entry deferred, so the retry that promote()'s rollback allows can start it.
         adapter = runner._create_adapter(platform, config)
+        deferred.pop(key)
         if adapter is None:
+            # Same classification an active boot makes (_start_prefilter_platforms): only a platform
+            # that can heal without a config change joins the reconnect queue; either way it is flagged.
+            from gateway.run_adapters import _adapter_unavailable_message
+            heals = runner._adapter_may_heal(platform, config)
             logger.error("Promotion could not create deferred adapter %s", platform.value)
             failed.append(platform.value)
+            runner._update_platform_runtime_status(
+                platform.value, platform_state="retrying" if heals else "fatal",
+                error_code="adapter_unavailable",
+                error_message=_adapter_unavailable_message(platform, retrying=heals), needs_attention=True)
+            if heals:
+                runner._failed_platforms[platform] = runner._startup_retry_entry(platform, None, config)
             continue
         runner._wire_adapter_handlers(adapter)
         if not await _connect_deferred(runner, platform, adapter):
