@@ -25,21 +25,30 @@ _PREVIEW_RETENTION_SECONDS = 86400 * 7
 _prepared_paths: set[str] = set()
 _prepared_lock = threading.Lock()
 _SPLIT_PREVIEW_PREFIX = "\x00hermes-split-preview:"
+# Strong refs for cleanup scheduled on an already-running loop (bare tasks can be GC'd).
+_cleanup_tasks: set = set()
 
 
 def _delete_recovered_previews(ctx, delete, message_ids, *, label: str) -> None:
     """Run adapter cleanup on the gateway loop that owns its async transport."""
     loop = getattr(ctx, "_loop_for_step", None)
+    try:
+        current = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+    if current is not None:
+        # Already on a running loop (normally the gateway loop itself): blocking here
+        # would deadlock it and asyncio.run would raise, so schedule best-effort cleanup.
+        logger.debug("%s: scheduling cleanup on the running loop", label)
+        task = current.create_task(delete(message_ids, label=label, skip_sentinel=False))
+        _cleanup_tasks.add(task)
+        task.add_done_callback(_cleanup_tasks.discard)
+        return
     if loop is not None and loop.is_running():
-        try:
-            current = asyncio.get_running_loop()
-        except RuntimeError:
-            current = None
-        if current is not loop:
-            asyncio.run_coroutine_threadsafe(
-                delete(message_ids, label=label, skip_sentinel=False), loop,
-            ).result(timeout=10)
-            return
+        asyncio.run_coroutine_threadsafe(
+            delete(message_ids, label=label, skip_sentinel=False), loop,
+        ).result(timeout=10)
+        return
     asyncio.run(delete(message_ids, label=label, skip_sentinel=False))
 
 

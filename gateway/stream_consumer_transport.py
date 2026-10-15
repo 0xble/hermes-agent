@@ -573,8 +573,9 @@ class StreamTransportMixin:
         if isinstance(raw_response, dict) and raw_response.get("skipped"):
             # Adapter deferred the edit (Telegram's shared send+edit slot was busy): nothing
             # changed on screen, so the visible prefix and flood state stay as they were and the
-            # next tick retries with the newer text.
-            await self._journal_preview(self._last_sent_text, self._message_id)
+            # next tick retries with the newer text. An in-flight split seal keeps its fence row.
+            if not getattr(self, "_split_delivery_journal_pending", False):
+                await self._journal_preview(self._last_sent_text, self._message_id)
             return True
         self._already_sent = True
         self._adopted_unconfirmed = None

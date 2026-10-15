@@ -304,6 +304,47 @@ async def test_split_head_ack_is_journaled_before_split_send_returns():
     assert "head-id" in row["content"]
 
 
+@pytest.mark.asyncio
+async def test_deferred_edit_during_split_seal_keeps_split_fence():
+    """A busy-slot 'skipped' edit while sealing a split head must not overwrite the split fence row."""
+    async def journal(content, message_id):
+        record(content=content, message_id=message_id)
+
+    async def edit(**kwargs):
+        return SendResult(success=True, message_id="m1", raw_response={"skipped": True})
+
+    consumer = GatewayStreamConsumer(SimpleNamespace(edit_message=edit), "chat",
+                                     config=StreamConsumerConfig(cursor=""), on_preview=journal)
+    consumer._message_id = "m1"
+    consumer._last_sent_text = "partial"
+    consumer._split_delivery_journal_pending = True
+    await consumer._journal_split_delivery(["m1"])
+    assert await consumer._edit_existing("sealed head", finalize=True, is_turn_final=False)
+    row = recovery.load_preview("key", "sid", "old")
+    assert row["content"].startswith(recovery._SPLIT_PREVIEW_PREFIX)
+    assert "m1" in row["content"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_cleanup_on_running_loop_schedules_instead_of_asyncio_run(monkeypatch):
+    """Called on the gateway loop thread itself, cleanup is scheduled there, never asyncio.run."""
+    gateway_loop = asyncio.get_running_loop()
+    calls = []
+
+    async def delete(message_ids, *, label, skip_sentinel):
+        calls.append((list(message_ids), asyncio.get_running_loop()))
+
+    def boom(*args, **kwargs):
+        raise AssertionError("asyncio.run inside a running loop")
+
+    monkeypatch.setattr(recovery.asyncio, "run", boom)
+    recovery._delete_recovered_previews(
+        SimpleNamespace(_loop_for_step=gateway_loop), delete, ["head-id"], label="test",
+    )
+    await asyncio.sleep(0)
+    assert calls == [(["head-id"], gateway_loop)]
+
+
 def test_schema_and_purge_run_once_per_process(monkeypatch):
     calls = []
     real = recovery._prepare_journal

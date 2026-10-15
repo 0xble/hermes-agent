@@ -740,6 +740,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                              message_id=getattr(source, "message_id", None), internal=True)
         if resume_marker:
             # Keep the transport reply anchor for threading, but admit each interruption marker
+            # under its own outbox identity so one marker resumes at most once.
             setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
         return event
 
