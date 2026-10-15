@@ -852,6 +852,11 @@ def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_
     key = scheduler._inflight_key(job_id, tmp_path)
     with scheduler._running_lock:
         scheduler._external_worker_claims[key] = (old_owner, process)
+        scheduler._external_worker_modes[key] = "detached"
+        scheduler._scope_isolated_job_ids.add(key)
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
+        scheduler._running_worker_pids[key] = 424242
         scheduler._running_since[key] = time.time() - 10_000
         scheduler._running_allowance_s[key] = 1.0
 
@@ -862,6 +867,13 @@ def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_
         # The late reaper's owner-fenced release is a no-op for the swept owner.
         scheduler.release_running_job(job_id, home=tmp_path, owner=old_owner, force=True)
         assert scheduler.try_register_running_job(job_id, owner=successor)
+        # The successor inherits none of the dead worker's metadata.
+        with scheduler._running_lock:
+            assert key not in scheduler._external_worker_modes
+            assert key not in scheduler._scope_isolated_job_ids
+            assert key not in scheduler._restart_safe_waiter_job_ids
+            assert key not in scheduler._restart_safe_external_worker_job_ids
+            assert key not in scheduler._running_worker_pids
         scheduler.release_running_job(job_id, home=tmp_path, owner=successor)
         assert not scheduler.is_job_running(job_id, home=tmp_path)
         assert key not in scheduler._external_worker_claims
@@ -869,6 +881,11 @@ def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_
         scheduler.release_running_job(job_id, home=tmp_path, owner=successor, force=True)
         with scheduler._running_lock:
             scheduler._external_worker_claims.pop(key, None)
+            scheduler._external_worker_modes.pop(key, None)
+            scheduler._scope_isolated_job_ids.discard(key)
+            scheduler._restart_safe_waiter_job_ids.discard(key)
+            scheduler._restart_safe_external_worker_job_ids.discard(key)
+            scheduler._running_worker_pids.pop(key, None)
 
 
 def test_stale_waiter_cleanup_does_not_erase_successor_metadata(monkeypatch, tmp_path):
