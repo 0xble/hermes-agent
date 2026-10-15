@@ -32,7 +32,7 @@ from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
-    strip_trailing_silence_marker,
+    strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.session import (
@@ -1725,11 +1725,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         # Webhook delivery is an autonomous lane with a looser first/last-line silence rule;
-        # leave its marker semantics unchanged. Interactive replies drop a trailing standalone
-        # marker from substantive text before the silence verdict, so a marker-only run that
+        # leave its marker semantics unchanged. Interactive replies drop standalone edge
+        # markers from substantive text before the silence verdict, so a marker-only run that
         # collapses to one marker still goes through the silence guard below.
         if source.platform != Platform.WEBHOOK:
-            response = strip_trailing_silence_marker(response)
+            response = strip_edge_silence_markers(response)
         _intentional_silence = self._is_intentional_silence(agent_result, response)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
