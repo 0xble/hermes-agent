@@ -4,6 +4,7 @@ import asyncio
 import json
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -227,6 +228,33 @@ async def test_merged_internal_recovery_spool_retires_after_successor_input_is_d
 
 
 @pytest.mark.asyncio
+async def test_recovery_probe_accepts_merged_successor_transport_id(tmp_path, monkeypatch):
+    """A merged successor's real platform id is durable for its recovered predecessor."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    recovered = MessageEvent(
+        text="internal completion", source=source, user_id=source.user_id,
+        internal=True, message_type=MessageType.PHOTO,
+    )
+    assert flush_pending_to_file({entry.session_key: recovered}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+    recovered = runner._startup_restore_queue.pop()
+    successor = MessageEvent(
+        text="existing photo", source=source, user_id=source.user_id,
+        message_id="transport-successor", internal=True, message_type=MessageType.PHOTO,
+    )
+    adapter._pending_messages[entry.session_key] = successor
+    merge_pending_message_event(adapter._pending_messages, entry.session_key, recovered)
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": successor.text, "platform_message_id": successor.message_id,
+    })
+
+    assert await runner._recovered_input_durable(recovered)
+
+
+@pytest.mark.asyncio
 async def test_recovery_ignores_unrelated_inflight_result_before_merged_successor(
     tmp_path, monkeypatch, caplog
 ):
@@ -313,6 +341,86 @@ def test_idless_recovered_followup_whose_input_is_already_durable_is_dropped(tmp
         deferred_followup=partial(_defer_followup, runner, {}, None)) == 0
     assert runner._startup_restore_queue == []
     assert not list((tmp_path / "pending_messages").glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_recovered_followup_real_gateway_turn_persists_recovery_id_at_turn_start(tmp_path, monkeypatch):
+    """The admitted gateway path forwards and persists an internal recovery key."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="internal side effect", source=source, user_id=source.user_id, internal=True)
+    recovery_id = "hermes-recovery-real-path"
+    event._hermes_recovery_id = recovery_id
+
+    class _RecordingAsyncStore:
+        def __init__(self):
+            self._store = self
+            self.rows = []
+
+        async def append_to_transcript(self, _session_id, row, **_kwargs):
+            self.rows.append(dict(row))
+
+        async def update_session(self, *_args, **_kwargs):
+            return None
+
+        async def clear_resume_pending(self, *_args, **_kwargs):
+            return None
+
+    async_store = _RecordingAsyncStore()
+    runner.session_store = async_store
+    runner._async_session_store = async_store
+    runner._session_db = None
+    runner._hm_admit_event = AsyncMock(return_value=(event, source, True))
+    runner._hm_is_registered_command = lambda _event: False
+    runner._hm_estop_gate = lambda *_args: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = lambda *_args: None
+    runner._hm_evict_reaped_agent = AsyncMock()
+    runner._is_session_running = lambda _key: False
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._external_drain_active = False
+    runner._claim_active_session_slot = lambda *_args: (None, None)
+    runner._hm_rescue_orphaned_fifo = lambda event, source, internal, _key: (event, source, internal)
+    state = SimpleNamespace(
+        turn=SimpleNamespace(lease=None, agent=None, event=None, started_ts=None),
+        conversation=SimpleNamespace(last_turn_started_at=None),
+    )
+    runner._session_state = lambda _key: state
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._persist_active_agents = lambda: None
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
+    runner._hmwa_prepare_turn = AsyncMock(return_value=(
+        runner._PreparedTurn([], "", event.text, None, None, None, entry.session_id), {}
+    ))
+    runner._set_session_env = lambda _context: None
+    runner._clear_session_env = lambda _tokens: None
+    runner._is_session_run_current = lambda *_args: True
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._hmwa_stop_typing_for_turn = AsyncMock()
+    runner._hmwa_shape_agent_response = AsyncMock(return_value=("", False, []))
+    runner._hmwa_prepend_reasoning = lambda _result, response, *_args: response
+    runner._hmwa_post_turn_hooks = AsyncMock()
+    runner._hmwa_classify_turn_failure = lambda *_args: (False, False, False)
+    runner._hmwa_compression_exhaustion_reset = AsyncMock(side_effect=lambda _result, response, entry, *_args: (response, entry))
+    runner._hmwa_deliver_turn_response = AsyncMock(return_value=None)
+    runner._clear_durable_active_turn = AsyncMock()
+    runner._release_running_agent_state = Mock()
+    runner._release_turn_lease = Mock()
+    runner._delivery_adapter_for = lambda _source: adapter
+    runner._restore_pending_one_turn_model_override = Mock()
+    runner._quick_command_alias_text = lambda _event: None
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": "",
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+    })
+
+    await runner._handle_message(event)
+
+    assert runner._run_agent.await_args.kwargs["recovery_id"] == recovery_id
+    user_rows = [row for row in async_store.rows if row.get("role") == "user"]
+    assert user_rows and user_rows[-1]["platform_message_id"] == recovery_id
+    assert "message_id" not in user_rows[-1]
 
 
 @pytest.mark.asyncio

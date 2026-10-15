@@ -1997,6 +1997,11 @@ class GatewayTurnMixin:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
+        elif getattr(event, "_hermes_recovery_id", None):
+            # Internal shutdown follow-ups have no transport message id. Keep their
+            # synthetic dedupe key on the persisted user row without leaking it into
+            # transport identity fields.
+            _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
     async def _hmwa_store_turn_prompt_tokens(
@@ -2537,6 +2542,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
+                recovery_id=getattr(event, "_hermes_recovery_id", None),
                 channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
@@ -4385,6 +4391,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                recovery_id=getattr(pending_event, "_hermes_recovery_id", None),
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,

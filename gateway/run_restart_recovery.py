@@ -71,16 +71,20 @@ class RestartRecoveryMixin:
             spool_ts = getattr(candidate, "_hermes_recovery_spool_ts", None)
             if spool_ts is None:
                 spool_ts = recovery_spool_ts
-            candidate_recovery_id = getattr(candidate, "_hermes_recovery_id", None)
-            if candidate_recovery_id is None:
-                candidate_recovery_id = getattr(candidate, "message_id", None)
-            if candidate_recovery_id is None:
-                candidate_recovery_id = recovery_id
-            if await asyncio.to_thread(
-                input_already_durable, getattr(self, "session_store", None), session_id,
-                candidate_recovery_id, getattr(candidate, "text", None), spool_ts,
-            ):
-                return True
+            candidate_ids = {
+                candidate_id for candidate_id in (
+                    getattr(candidate, "_hermes_recovery_id", None),
+                    getattr(candidate, "message_id", None),
+                ) if candidate_id is not None
+            }
+            if not candidate_ids and recovery_id is not None:
+                candidate_ids.add(recovery_id)
+            for candidate_id in candidate_ids:
+                if await asyncio.to_thread(
+                    input_already_durable, getattr(self, "session_store", None), session_id,
+                    candidate_id, getattr(candidate, "text", None), spool_ts,
+                ):
+                    return True
         return False
 
     async def _retire_spool_once_input_durable(self, event) -> None:
