@@ -1149,6 +1149,9 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             _running_allowance_s.pop(key, None)
             _running_futures.pop(key, None)
             _running_cancel_events.pop(key, None)
+            # The worker behind any external claim has exited (checked above); drop it so a
+            # successor's owner-fenced release is not blocked by the dead claim's owner.
+            _external_worker_claims.pop(key, None)
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 

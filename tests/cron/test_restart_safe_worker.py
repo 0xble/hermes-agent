@@ -838,6 +838,39 @@ def test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error(
         scheduler.release_running_job(job_id, home=tmp_path, owner=owner)
 
 
+def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_path):
+    """Sweep wins the race with the reaper: the dead claim must not block a successor's release."""
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-exited-detached-swept"
+    job = {"id": job_id, "schedule": {"kind": "interval", "minutes": 1}}
+    old_owner = object()
+    process = Mock()
+    process.poll.return_value = 0  # the worker has exited; the reaper has not run yet
+    assert scheduler.try_register_running_job(job_id, owner=old_owner)
+    key = scheduler._inflight_key(job_id, tmp_path)
+    with scheduler._running_lock:
+        scheduler._external_worker_claims[key] = (old_owner, process)
+        scheduler._running_since[key] = time.time() - 10_000
+        scheduler._running_allowance_s[key] = 1.0
+
+    monkeypatch.setattr(scheduler, "_latest_executions_for_releasable_claims", lambda: {})
+    successor = object()
+    try:
+        assert scheduler.sweep_stale_inflight([job]) == [job_id]
+        # The late reaper's owner-fenced release is a no-op for the swept owner.
+        scheduler.release_running_job(job_id, home=tmp_path, owner=old_owner, force=True)
+        assert scheduler.try_register_running_job(job_id, owner=successor)
+        scheduler.release_running_job(job_id, home=tmp_path, owner=successor)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+        assert key not in scheduler._external_worker_claims
+    finally:
+        scheduler.release_running_job(job_id, home=tmp_path, owner=successor, force=True)
+        with scheduler._running_lock:
+            scheduler._external_worker_claims.pop(key, None)
+
+
 def test_stale_waiter_cleanup_does_not_erase_successor_metadata(monkeypatch, tmp_path):
     import cron.scheduler as scheduler
 
