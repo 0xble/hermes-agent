@@ -373,6 +373,63 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
             kernel.proc.wait(timeout=10)
             self.assertFalse(kernel.alive())
 
+    def test_lru_eviction_reports_state_reset(self):
+        with _kernel_config(max_session_kernels=1):
+            first = self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self.assertFalse(first["kernel"]["state_reset"])
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            after = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+        self.assertEqual(after["status"], "error", after)
+        self.assertIn("NameError", after.get("error", ""))
+        self.assertFalse(after["kernel"]["reused"])
+        self.assertTrue(after["kernel"]["state_reset"])
+        self.assertIn("kernel evicted", after["kernel"]["note"])
+        self.assertIn("re-create variables", after["kernel"]["note"])
+
+    def test_conversation_reset_drops_eviction_signal(self):
+        from tools.approval import clear_session
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            clear_session("conv-a")
+            after = self._run_as("conv-a", "print('hello')", task_id="turn-new")
+        self.assertEqual(after["status"], "success", after)
+        self.assertFalse(after["kernel"]["state_reset"], after)
+        self.assertNotIn("note", after["kernel"])
+
+    def test_eviction_signal_is_present_when_replacement_spawn_fails(self):
+        from unittest.mock import patch
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            with patch("tools.code_kernel._spawn", side_effect=OSError("spawn failed")):
+                failed = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+        self.assertEqual(failed["status"], "error", failed)
+        self.assertTrue(failed["kernel"]["state_reset"], failed)
+        self.assertIn("re-create variables", failed["kernel"]["note"])
+
+    def test_reset_during_failing_recovery_call_does_not_restore_note(self):
+        from unittest.mock import patch
+
+        from tools.approval import clear_session
+
+        def _spawn_then_reset(*_args, **_kwargs):
+            clear_session("conv-a")
+            raise BrokenPipeError("kernel killed by session reset")
+
+        with _kernel_config(max_session_kernels=1):
+            self._run_as("conv-a", "x = 41", task_id="turn-a")
+            self._run_as("conv-b", "y = 1", task_id="turn-b")
+            with patch("tools.code_kernel._spawn", side_effect=_spawn_then_reset):
+                failed = self._run_as("conv-a", "print(x + 1)", task_id="turn-a-2")
+            self.assertEqual(failed["status"], "error", failed)
+            after = self._run_as("conv-a", "print('hello')", task_id="turn-new")
+        self.assertEqual(after["status"], "success", after)
+        self.assertFalse(after["kernel"]["state_reset"], after)
+        self.assertNotIn("note", after["kernel"])
+
     def test_idle_kernels_are_reaped(self):
         import time as time_module
 

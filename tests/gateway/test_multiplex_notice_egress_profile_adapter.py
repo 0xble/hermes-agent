@@ -28,6 +28,7 @@ class _Adapter:
 
     async def handle_message(self, event):
         self.handled.append(event.text)
+        event._gateway_accepted = True  # the admission receipt a real adapter returns
 
 
 def _runner():
@@ -97,6 +98,9 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
 
     monkeypatch.setattr(loops, "LoopManager", _Mgr)
     monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda sid: False)
+    # The fake manager stores no loop row; this test covers bot routing, not the tick fence.
+    from hermes_cli import session_controls
+    monkeypatch.setattr(session_controls, "loop_wake_is_current", lambda *_a, **_k: True)
     r = _runner()
     r._running = True
     route = {"platform": "telegram", "chat_id": "42", "chat_type": "dm", "user_id": "42", "profile": "sec"}

@@ -863,6 +863,7 @@ class TestRunJobSessionPersistence:
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
              patch("cron.scheduler._preflight_job_config", return_value=None), \
+             patch("cron.scheduler._open_cron_session_db", return_value=fake_db), \
              patch("hermes_state_registry.acquire", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",

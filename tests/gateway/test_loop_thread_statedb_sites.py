@@ -72,17 +72,18 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_goal_continuation_recheck_runs_off_the_loop():
+async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
+    import hermes_cli.session_controls as session_controls
     from gateway.turn_context import TurnContext
 
     runner = object.__new__(GatewayRunner)
     threads = []
 
-    def still_active(session_id):
+    def refresh(event, session_id):
         threads.append(threading.get_ident())
-        return False
+        return None
 
-    runner._goal_still_active_for_session = still_active
+    monkeypatch.setattr(session_controls, "refresh_goal_continuation", refresh)
 
     async def delivered(*_args, **_kwargs):
         # Pin the first-response delivery outcome: an undelivered response defers the follow-up

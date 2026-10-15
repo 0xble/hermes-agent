@@ -150,6 +150,7 @@ except ImportError:
 import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
+from plugins.platforms.telegram.disconnect_handover import run_disconnect
 
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig, normalize_telegram_rich_messages
@@ -4037,11 +4038,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
-        # Persist the day's volume first, so a restart cannot forget the last minute of calls.
+        await run_disconnect(self, self._disconnect)
+
+    async def _disconnect(self, *, zero_cut_handover: Optional[Callable[[], None]]) -> None:
+        # Persist the day's volume first (SQLite off the event loop), so a restart cannot forget the last minute of calls.
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is not None:
             try:
-                # SQLite stays off the event loop.
                 await asyncio.to_thread(quota.flush)
             except Exception:
                 logger.debug("[%s] daily volume flush on disconnect failed", self.name, exc_info=True)
@@ -4052,9 +4055,10 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
-        # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
-        # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        # Release the bot-token lock now so a wedged close cannot block the reconnect watcher (#80598).
+        # Zero-cut handover instead holds it until updater.stop() is done or bounded out.
+        if not zero_cut_handover:
+            self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
@@ -4070,20 +4074,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         # Cancellation callbacks may have run while awaited; the fence stays authoritative.
         self._polling_progress_accepting = False
         self._send_path_degraded = True
-        # Cancel deferred post-connect housekeeping so it cannot fire into a half-torn-down bot client.
-        # Cancel deferred post-connect housekeeping (command-menu / DM-topic / status-indicator Bot API
-        # calls) so it cannot fire into a half-torn-down bot client (#46298). getattr guards the
-        # object.__new__ test pattern where __init__ (which sets this attr) is never called.
         post_connect_task = getattr(self, "_post_connect_task", None)
         if post_connect_task and not post_connect_task.done():
             post_connect_task.cancel()
             await self._await_disconnect_step(
                 asyncio.gather(post_connect_task, return_exceptions=True), _DISCONNECT_STEP_TIMEOUT, "post-connect cancel")
         self._post_connect_task = None
-        # Cancel the heartbeat (and webhook-mode identity loop) before tearing down the app.
         await self._cancel_task_attr("_polling_heartbeat_task", "heartbeat cancel")
         await self._cancel_task_attr("_bot_identity_refresh_task", "identity-refresh cancel")
-        # Mark the bot "Offline" while its HTTP client is still alive. Opt-in, non-fatal.
         with contextlib.suppress(Exception):
             await self._await_disconnect_step(self._set_status_indicator(online=False), _DISCONNECT_STEP_TIMEOUT, "status-indicator update")
         await self._await_disconnect_step(self._cancel_pending_delivery_tasks(), _DISCONNECT_STEP_TIMEOUT, "pending-delivery cancel")
@@ -4093,15 +4091,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                 if self._app.updater and self._app.updater.running:
                     try:
                         await self._await_disconnect_step(self._app.updater.stop(), _UPDATER_STOP_TIMEOUT, "updater.stop()")
-                    except Exception as stop_error:
+                    except Exception as stop_error:  # health: allow BLE001 -- teardown boundary; tracebacks can carry the bot token, so log redacted text
                         logger.warning(
                             "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
+                if zero_cut_handover:
+                    zero_cut_handover()
                 # app.stop()/shutdown() can also block on a half-dead httpx pool.
                 # Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
                     await self._await_disconnect_step(self._app.stop(), _DISCONNECT_STEP_TIMEOUT, "app.stop()")
                 await self._await_disconnect_step(self._app.shutdown(), _DISCONNECT_STEP_TIMEOUT, "app.shutdown()")
-            except Exception as e:
+            except Exception as e:  # health: allow BLE001 -- teardown boundary; tracebacks can carry the bot token, so log redacted text
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
@@ -5062,6 +5062,21 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return await self._send_prompt(
             "send_update_prompt", chat_id, metadata, build, thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
 
+    async def send_control_request(
+        self, chat_id: str, text: str, request_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a durable session-control approval request with Approve/Deny buttons."""
+        def build():
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Approve", callback_data=f"ctl:a:{request_id}"),
+                InlineKeyboardButton("Deny", callback_data=f"ctl:d:{request_id}"),
+            ]])
+            return self.format_message(text), keyboard, None
+        return await self._send_prompt(
+            "send_control_request", chat_id, metadata, build,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+
     # Template attrs for the shared _format_exec_approval core (HTML mode). Properties, not class
     # constants: the wording comes from the catalog for the language active at send time, and the
     # translated text is HTML-escaped BEFORE the <b> wrapper (a stray ``&``/``<`` would break the card).
@@ -5576,6 +5591,62 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             if data.startswith(prefix):
                 await handler(query, data, cb)
                 return
+        if data.startswith("ctl:"):
+            await self._handle_session_control_callback(query, data, cb)
+            return
+
+    def _session_control_callback_scope(self, query, cb: Dict[str, Any], user_id: str):
+        """Async runtime scope of the profile that owns the tapped chat (a no-op single-profile)."""
+        import contextlib
+        runner = getattr(self, "gateway_runner", None)
+        scope_for = getattr(runner, "_async_profile_scope_for_source", None)
+        chat_id = cb.get("chat_id")
+        if not callable(scope_for) or chat_id is None:
+            return contextlib.nullcontext()
+        thread_id = cb.get("thread_id")
+        source = self.build_source(
+            chat_id=str(chat_id),
+            chat_type=self._normalize_chat_type(cb.get("chat_type"), is_forum=thread_id is not None),
+            user_id=user_id or None, user_name=cb.get("user_name"),
+            thread_id=str(thread_id) if thread_id is not None else None)
+        return scope_for(source)
+
+    async def _handle_session_control_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """Resolve durable session-control requests after the normal callback allowlist gate."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"a", "d"}:
+            return
+        if not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        request_id = parts[2]
+        try:
+            from hermes_cli.session_controls import resolve_request
+            user_id = str(getattr(query.from_user, "id", ""))
+            # The request lives in the store of the profile that owns this chat: resolve under that
+            # profile's runtime scope, never the ambient launch profile's (multiplexed gateways).
+            async with self._session_control_callback_scope(query, cb, user_id):
+                record = await asyncio.to_thread(
+                    resolve_request, request_id, "approve" if parts[1] == "a" else "deny", user_id)
+        except Exception:
+            logger.exception("[%s] session-control callback failed", self.name)
+            record = None
+        if record is None:
+            text = "already resolved or expired"
+            await query.answer(text=text[:_TOAST_LIMIT])
+            return
+        who = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        status = str(record.get("status") or "failed")
+        label = "✓ Approved" if status == "applied" else "✗ Denied" if status == "denied" else status.title()
+        await query.answer(text=label[:_TOAST_LIMIT])
+        message = getattr(query, "message", None)
+        message_text = getattr(message, "text", None) or ""
+        if not message_text:
+            return
+        await self._edit_html_quiet(
+            query,
+            f"{_html.escape(message_text)}\n\n"
+            f"<b>{_html.escape(label)} by {_html.escape(who)}</b>",
+        )
 
     async def _claim_callback_state(self, query, cb: dict[str, Any], state: dict, key, denial: str, resolved: str, *, pop: bool = True):
         """Auth-gate a button tap, then claim its pending entry; None (after answering) when refused or expired."""

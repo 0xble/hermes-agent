@@ -10,6 +10,7 @@ never saw verdicts. This test locks in the fix.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -140,7 +141,10 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     mgr = GoalManager(session_entry.session_id)
     mgr.set("polish the docs")
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)):
+    # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -168,7 +172,10 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     state.turns_used = 2
     save_goal(session_entry.session_id, state)
 
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)):
+    # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)), \
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -194,7 +201,7 @@ def _blocked_goal(session_id: str):
     mgr.set("run both agent sessions end to end")
     with patch(
         "hermes_cli.goals.judge_goal",
-        return_value=("blocked", "needs the user to approve the login card", False, None, False),
+        return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
     ):
         assert mgr.evaluate_after_turn("May I use your login?")["status"] == "paused"
     return mgr
@@ -289,7 +296,11 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     elif case == "internal":
         event.internal = True
     elif case == "continuation":
-        event.text = "[Continuing toward your standing goal]\nGoal: repair"
+        event = runner._synthetic_prompt_event(
+            event.source, "[Continuing toward your standing goal]\nGoal: repair",
+            reply_expected=False, goal_continuation=True,
+            goal_session_id=entry.session_id, goal_state=GoalManager(entry.session_id).state,
+        )
     elif case == "heartbeat":
         event = runner._synthetic_prompt_event(event.source, "[Heartbeat — periodic check]")
         event._heartbeat_session_id = entry.session_id
@@ -314,7 +325,8 @@ async def test_gateway_non_user_or_rejected_input_cannot_revive(hermes_home, mon
     runner._run_agent = run_agent
     with patch("hermes_cli.goals.judge_goal") as judge:
         await runner._handle_message(event)
-    if case in {"unauthorized", "rejected-preparation", "lease-timeout"}:
+    if case in {"continuation", "unauthorized", "rejected-preparation", "lease-timeout"}:
+        # A paused goal's continuation is rejected at ingress, not merely barred from revival.
         assert not observed
     else:
         assert len(observed) == 1

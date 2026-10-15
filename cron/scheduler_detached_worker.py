@@ -17,13 +17,24 @@ import threading
 from typing import Optional
 
 
+def normalize_hard_wall_timeout(value) -> Optional[float]:
+    """Positive finite seconds; None/zero/empty clears a per-job override."""
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.") from None
+    if isinstance(value, bool) or not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("hard_wall_timeout_seconds must be positive finite seconds or 0 to clear.")
+    return seconds or None
+
+
 def hard_wall_timeout_seconds(job: Optional[dict] = None) -> float:
     """Job override or finite profile bound, separate from inactivity/script limits."""
-    from cron.jobs import _normalize_hard_wall_timeout
-
     if job:
         try:
-            override = _normalize_hard_wall_timeout(job.get("hard_wall_timeout_seconds"))
+            override = normalize_hard_wall_timeout(job.get("hard_wall_timeout_seconds"))
             if override is not None:
                 return override
         except ValueError:

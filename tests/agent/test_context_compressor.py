@@ -529,6 +529,29 @@ class TestSummarizeToolResultRefusals:
         assert pruned_again[1]["content"] == summary
 
 
+    def test_dedupe_does_not_stub_unread_pending_results(self, compressor):
+        repeated = "same refusal result " * 40
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "old", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "old", "content": repeated},
+            {"role": "user", "content": "run these calls"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "new-a", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+                {"id": "new-b", "type": "function", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "new-a", "content": repeated},
+            {"role": "tool", "tool_call_id": "new-b", "content": repeated},
+        ]
+        out, count = compressor._prune_old_tool_results(messages, protect_tail_count=2)
+        by_id = {m.get("tool_call_id"): m.get("content") for m in out if m.get("role") == "tool"}
+        assert by_id["new-a"] == repeated
+        assert by_id["new-b"] == repeated
+        assert by_id["old"] != repeated
+        assert count >= 1
+
+
 class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000

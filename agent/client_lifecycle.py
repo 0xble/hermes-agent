@@ -112,10 +112,10 @@ class ClientLifecycleMixin:
             owners = getattr(self, "_process_owner_task_ids", ())
             for process in process_registry.list_sessions():
                 if process["owner_task_id"] in owners and process["status"] == "running":
-                    # An explicitly persisted job (terminal persist_on_release=true) survives
-                    # agent close — session end, compression, error recovery (#41225). The
-                    # user can still stop it on purpose via process_manage kill.
-                    if process.get("persist_on_release"):
+                    # Restart-surviving jobs are also lifecycle-persistent: agent.close() must
+                    # leave them for the successor gateway to recover. Explicit process kills still
+                    # use their non-lifecycle source and reach them.
+                    if process.get("persist_on_release") or process.get("survive_restart"):
                         continue
                     process_registry.kill_process(
                         process["session_id"], source="agent_close", consume_output=True,

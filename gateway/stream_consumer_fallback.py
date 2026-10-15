@@ -32,6 +32,13 @@ class StreamFallbackMixin:
                 return reply_to_id
             self._message_id = str(result.message_id)
             self._track_preview_ids_from_result(result)
+            if getattr(self, "_split_delivery_journal_pending", False):
+                # The ACKed head must be in the split fence before control returns
+                # to the caller; a crash in that gap otherwise leaves an owned,
+                # visible chunk with no durable owner.
+                await self._journal_split_delivery(self._preview_message_ids)
+            else:
+                await self._journal_preview(text, str(result.message_id), force=True)
             self._already_sent = True
             self._last_sent_text = text
             self._notify_new_message()
@@ -42,6 +49,8 @@ class StreamFallbackMixin:
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
+        if self._adoption_unconfirmed():
+            return ""  # write-ahead crash text no edit has confirmed on screen
         prefix = self._last_sent_text or ""
         if self.cfg.cursor and prefix.endswith(self.cfg.cursor):
             prefix = prefix[:-len(self.cfg.cursor)]
@@ -150,6 +159,7 @@ class StreamFallbackMixin:
         # the answer ("sent only the second half" symptom).
         if (stale_message_id and stale_message_id != last_message_id
                 and not self._fallback_preserve_partial_messages and continuation == final_text):
+            await self._journal_preview("", force=True)  # forget before deleting what it names
             await self._delete_previews([stale_message_id], label="Fallback partial",
                                         skip_sentinel=False)
 
@@ -262,6 +272,7 @@ class StreamFallbackMixin:
             return "ambiguous" if self._send_failure_may_have_delivered(result) else "failed"
 
         new_message_id = getattr(result, "message_id", None)
+        await self._journal_preview("", force=True)  # forget before deleting what it names
         # Telegram reports delete failure by returning False; the flood window that
         # broke the finalize can reject this too — one bounded retry.
         await self._delete_previews(stale_ids, skip=new_message_id, label="Empty fallback",
@@ -431,6 +442,7 @@ class StreamFallbackMixin:
             await self._close_empty_native_bubble("Silence-marker native stream close failed: %s")
 
         stale_ids = self._stale_preview_ids(segment_only=True)
+        await self._journal_preview("", force=True)  # forget before deleting what it names
         await self._delete_previews(stale_ids, label="Silence-marker")
         self._preview_message_ids.difference_update(stale_ids)
         self._message_id = None

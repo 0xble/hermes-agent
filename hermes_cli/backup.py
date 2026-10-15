@@ -1621,17 +1621,6 @@ def _prune_prefixed_zips(backup_dir: Path, prefix: str, keep: int, what: str) ->
     return deleted
 
 
-def _prune_incomplete_zips(backup_dir: Path, prefix: str, what: str) -> int:
-    """Keep only the newest ``<prefix>*.incomplete.zip`` salvage archive; return count deleted.
-
-    Salvage archives never count toward normal retention, so repeated failing runs would
-    otherwise pile up without bound.
-    """
-    salvage = _newest_first(backup_dir, lambda p: p.is_file() and p.name.startswith(prefix)
-                            and p.name.lower().endswith(_INCOMPLETE_ZIP_SUFFIX))
-    return _prune_oldest(salvage, 1, Path.unlink, f"incomplete {what}")
-
-
 def _create_prefixed_full_backup(
     hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str,
     *, outcome: Optional[dict] = None, raise_errors: bool = False) -> Optional[Path]:

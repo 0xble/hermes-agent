@@ -60,6 +60,11 @@ class CLIChatTurnMixin:
         """
         from cli import ChatConsole, _ChatTurn, _DIM, _RST, _accent_hex, _cprint, set_secret_capture_callback
         from tools.process_registry_notifications import TimelineNotification
+        # Credential/setup failures can return before settlement. They must not reuse the
+        # previous turn's result or assistant text, and must keep the non-dict "never ran"
+        # result that the single-query exit contract maps to credential exit codes.
+        self._last_turn_result = None
+        self._last_turn_started = False
         # Single-query and direct chat callers do not go through run().
         set_secret_capture_callback(self._secret_capture_callback)
         # Reset per turn; only a real interrupt flips it, so early returns leave it False.
@@ -120,8 +125,10 @@ class CLIChatTurnMixin:
                 self._prompt_duration = 0.0
                 # Daemon: closing the terminal tab (SIGHUP) must not be kept alive by it.
                 agent_thread = threading.Thread(target=self._chat_run_agent, args=(turn, message), daemon=True)
+                self._last_turn_started = True
                 agent_thread.start()
                 interrupt_msg = self._chat_monitor_agent_thread(turn, agent_thread)
+                self._last_turn_result = turn.result  # settlement repeats this; post-turn hooks need it regardless
                 self._chat_settle_turn(turn)
                 return self._chat_render_turn(turn, agent_thread, interrupt_msg)
             except Exception as e:

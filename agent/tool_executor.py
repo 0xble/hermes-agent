@@ -413,6 +413,11 @@ def _unwrap_tool_search_call(
         underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
         if err or not underlying:
             return function_name, function_args, None
+        if underlying == _ts.LOCAL_BATCH_SENTINEL:
+            # The turn splitter expands in-bound local batches before execution, so
+            # one reaching here is oversized or a direct caller. Keep the wrapper so
+            # the synthetic sentinel never leaks into hooks, guardrails, or the feed.
+            return function_name, function_args, _ts.local_batch_cap_error(len(underlying_args["calls"]))
         if underlying == _ts.CONNECTOR_BATCH_SENTINEL:
             # Both executors retain the wrapper: scope/probe/hooks run per entry
             # in the batch dispatcher, not against a synthetic registry name.

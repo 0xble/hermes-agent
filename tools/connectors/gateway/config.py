@@ -14,12 +14,22 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_CALLS_PER_DISPATCH",
     "ConnectorConfig",
+    "batch_cap_error",
     "connectors_available",
     "load_config",
 ]
 
 # Context cap, not a wire limit; the gateway batch cap is deliberately unreachable.
 MAX_CALLS_PER_DISPATCH = 10
+
+
+def batch_cap_error(count: int) -> Optional[str]:
+    """The one cap check for every tool_call batch path (local, connector, splitter):
+    an error message when ``count`` exceeds the dispatch bound, else None."""
+    if count <= MAX_CALLS_PER_DISPATCH:
+        return None
+    return (f"too many calls: {count} > max {MAX_CALLS_PER_DISPATCH}. "
+            "Retry with fewer calls per batch.")
 
 _FALSE_STRINGS = frozenset({"false", "0", "no", "off", ""})
 

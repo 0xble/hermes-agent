@@ -126,6 +126,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
+        on_preview: Optional[Callable] = None,
         run_still_current: Optional[Callable[[], bool]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -135,6 +136,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # tool-progress bubble goes BELOW it); on_before_finalize once (pause typing).
         self._on_new_message = on_new_message
         self._on_before_finalize = on_before_finalize
+        self._on_preview = on_preview
+        self._recovered_send_uncertain = False
+        # Set when a crash-journaled preview is adopted; cleared by the first landed edit. The
+        # row is write-ahead, so until then its text is not known to be on screen: it forces the
+        # first edit, counts as neither visible nor delivered, and the adopted id survives a
+        # segment boundary (see _reset_segment_state). Holds the adopted id: any path that
+        # retargets ``_message_id`` (fallback resend, split) ends it implicitly.
+        self._adopted_unconfirmed: Optional[str] = None
         self._initial_reply_to_id = initial_reply_to_id
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
@@ -163,6 +172,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
         self._last_edit_overflowed = False  # last _send_or_edit split into continuations
+        self._split_delivery_journal_pending = False
         self._flood_strikes = 0
         self._current_edit_interval = self.cfg.edit_interval  # adaptive backoff
         self._delivered_commentary_texts: list[str] = []
@@ -396,7 +406,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         back to the gateway's real final send, same gate as ``delivered_final_matches``)."""
         target = self._clean_for_display(copy_free_text_for(self.adapter, text or "")).strip()
         seen = [*self._delivered_commentary_texts, *self._delivered_segment_texts]
-        if self._already_sent:
+        if self._already_sent and not self._adoption_unconfirmed():
             seen.append(self._visible_prefix())
         return bool(target) and any(sent.strip() == target for sent in seen)
 
@@ -476,13 +486,20 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        # An adopted crash preview nothing has confirmed yet is not delivered text, and it
+        # stays the edit target across the boundary so the resumed turn's first real content
+        # replaces it instead of leaving the stale partial frozen above a new message.
+        adopted = ((self._message_id, self._message_created_ts, self._last_sent_text)
+                   if self._adoption_unconfirmed() else None)
         # Retain the segment's visible text so has_delivered_text still matches.
-        finalized = self._clean_for_display(self._last_sent_text).strip()
+        finalized = "" if adopted else self._clean_for_display(self._last_sent_text).strip()
         if finalized:
             self._delivered_segment_texts.append(finalized)
         # Also clears the final flags: what we delivered was an interim preamble.  Safe:
         # got_done returns before any reset; run.py reads flags after the task exits.
         self._reset_message_state()
+        if adopted:
+            self._message_id, self._message_created_ts, self._last_sent_text = adopted
         # Telegram-shaped drafts: bump draft_id so the next segment animates as a fresh
         # preview below the tool-progress bubbles.  Stream-is-the-message adapters keep
         # ONE stream per turn — a bump there left one frozen message per segment.
@@ -635,6 +652,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
                 if tick.got_done:
                     await self._finalize_turn(tick)
+                    if self._final_response_sent or self._turn_split_delivery:
+                        # Split turns too: their row would point at a sealed head chunk.
+                        await self._journal_preview("", force=True)
                     return
 
                 if tick.commentary_text is not None:
@@ -844,12 +864,19 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
         reply_to = self._initial_reply_to_id
         heads_delivered = len(chunks) > 1
+        sealed_head_ids = []
+        # The first head send is already visible before _enter_split_delivery can
+        # retire the normal preview row. Fence that whole window durably.
+        self._split_delivery_journal_pending = True
+        await self._journal_split_delivery(sealed_head_ids)
         for chunk in chunks[:-1]:
             new_id = await self._send_new_chunk(chunk, reply_to, final=tick.got_done)
             if new_id is None or new_id == reply_to:
                 heads_delivered = False  # keep the full text intact for the gateway fallback
                 break
             reply_to = new_id
+            sealed_head_ids.append(new_id)
+            await self._journal_split_delivery(sealed_head_ids)
 
         if heads_delivered:
             # truncate_message suffixes multi-chunk output with " (n/n)"; the tail is the LIVE
@@ -860,7 +887,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # Flag BEFORE the tail send: fresh-final replaces every tracked preview
             # with one message, which is only valid while the active message holds
             # the whole answer — deleting sealed heads drops delivered text.
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
         # Heads are sealed (or a later head failed): never edit a sealed message with
         # the unsplit payload — the tail is sent fresh, or the fallback path retries.
         self._message_id = None
@@ -873,7 +900,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # ``_already_sent`` may be True from prior state — only heads + tail count.
             self._final_response_sent = heads_delivered and tail_delivered
             if self._final_response_sent:
-                self._turn_split_delivery = True
+                await self._enter_split_delivery()
                 self._mark_final_delivered(record=self._accumulated)
             return True
         if tick.got_segment_break:
@@ -898,13 +925,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             # finalize=True: the sealed chunk is never edited again, so it needs its
             # rich-text pass now.  is_turn_final=False: a split head is not the
             # answer, so fresh-final must not mark the turn delivered on it.
+            self._split_delivery_journal_pending = True
+            await self._journal_split_delivery([self._message_id])
             ok = await self._send_or_edit(chunk, finalize=True, is_turn_final=False)
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
+            await self._journal_split_delivery(self._preview_message_ids | {self._message_id})
             self._accumulated = self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""
-            self._turn_split_delivery = True
+            await self._enter_split_delivery()
 
     async def _push_update(self, tick: _Tick) -> None:
         """Send/edit this tick's visible text (cursor-suffixed unless finalizing)."""

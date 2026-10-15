@@ -21,11 +21,9 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
+from gateway.gateway_slot import process_slot_filename, sibling_lock_name
 from gateway.status_inline_source import (
-    command_line_runs_inline_source,
-    inline_bootstrap_argv,
-    inline_source_flag_index,
-)
+    command_line_runs_inline_source, inline_bootstrap_argv, inline_source_flag_index)
 from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
 from hermes_cli._subprocess_compat import pid_exists_stdlib
 from utils import atomic_json_write
@@ -305,11 +303,11 @@ def scoped_lock_owner_label(record: Optional[dict[str, Any]]) -> Optional[str]:
 
 
 def _get_pid_path() -> Path:
-    return _get_process_hermes_home() / "gateway.pid"
+    return _get_process_hermes_home() / process_slot_filename("gateway.pid")
 
 
 def _get_gateway_lock_path(pid_path: Optional[Path] = None) -> Path:
-    return (pid_path or _get_pid_path()).with_name(_GATEWAY_LOCK_FILENAME)
+    return (pid_path := pid_path or _get_pid_path()).with_name(sibling_lock_name(pid_path.name, _GATEWAY_LOCK_FILENAME))
 
 
 def _get_runtime_status_path() -> Path:

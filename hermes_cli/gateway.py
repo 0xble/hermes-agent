@@ -4149,7 +4149,6 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
             log_cmd.append("-l")
         subprocess.run(log_cmd, timeout=10, check=False)
 
-
 # =============================================================================
 # Launchd (macOS)
 # =============================================================================
@@ -4157,6 +4156,7 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 
 from hermes_cli.gateway_launchd import (
     get_launchd_label,
+    get_launchd_slot_labels,
     _probe_launchd_domain_for_label,
     _launchd_domain,
     _LAUNCHD_JOB_UNLOADED_EXIT_CODES,

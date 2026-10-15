@@ -1,4 +1,8 @@
 """Job-level visibility for a recovered, acknowledged worker death."""
+import logging
+
+# Logged under the scheduler name so existing log filters and alerts keep matching.
+logger = logging.getLogger("cron.scheduler")
 
 
 def record_unknown_worker_outcome(
@@ -59,3 +63,24 @@ def external_worker_exited_reason(returncode: int | None) -> str:
         "execution, without writing a durable terminal state; whether side effects ran "
         "is unknown."
     )
+
+
+def finish_interrupted_run(job: dict, execution_id: str, delivery_error) -> None:
+    """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
+    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
+    from cron import scheduler
+    if delivery_error:
+        try:
+            # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
+            # — but it could not know that the notice we just tried to send never left the process (the
+            # adapters were torn down first, #82232). Record the delivery failure on its own via update_job:
+            # mark_job_run also advances next_run_at and the repeat counter, and running that a second time
+            # for one run would skip a fire or auto-delete the job early.
+            from cron.jobs import update_job
+            update_job(job["id"], {"last_delivery_error": delivery_error})
+        except Exception as _rec_err:
+            logger.debug(
+                "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err, exc_info=True)
+    scheduler.finish_execution(
+        execution_id, success=False,
+        error="Run stopped before finishing; no terminal result was recorded.")

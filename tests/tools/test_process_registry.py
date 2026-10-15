@@ -271,6 +271,11 @@ def test_bounded_kill_all_receipt_lock_contention_does_not_block_signals(registr
 
     home = tmp_path / "home"
     monkeypatch.setattr(receipts, "get_hermes_home", lambda: home)
+    # A leaf child: a real recursive children() walk scans every host process on
+    # macOS and alone can spend the 0.4s budget under load before any signal is sent.
+    import psutil
+
+    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
     proc = _spawn_python_sleep(30)
     held = threading.Event()
     release = threading.Event()
@@ -4287,6 +4292,13 @@ def test_kill_all_signals_all_targets_before_shared_grace(registry, monkeypatch,
         "_daemon_term_grace_seconds",
         staticmethod(lambda: 0.2),
     )
+    # These leaf children have no descendants. A real recursive children() walk
+    # enumerates every host process on macOS (psutil builds a full ppid map, up to
+    # ~1s per sweep phase under load), which spends the 1.0s deadline before the
+    # shared grace is even measured and makes the fenced count 0.
+    import psutil
+
+    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
     command = [
         sys.executable,
         "-c",

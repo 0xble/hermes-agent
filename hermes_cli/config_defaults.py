@@ -1854,10 +1854,10 @@ DEFAULT_CONFIG = {
 
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
-        # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
-        # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
-        # created this way are user-owned in the same flat jobs table. Interactive toolsets
-        # (messaging/clarify) stay denied in cron regardless.
+        "review": {"excluded_threads": []},  # Topic thread IDs that never receive opted-in reviewed reports.
+        # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by default: policy-denied
+        # in cron context to prevent unattended scheduling loops. Jobs created this way are user-owned in the same flat
+        # jobs table. Interactive toolsets (messaging/clarify) stay denied in cron regardless.
         "allow_agent_scheduling": False,
         # Pre-dispatch validation: before building any agent machinery, verify the provider API key
         # resolves (unless a fallback chain exists), attached skills are ready, and delivery
@@ -2158,9 +2158,9 @@ DEFAULT_CONFIG = {
         "export": {"otlp": {"enabled": False, "endpoint": "", "headers_env": {}}},
     },
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
+        "zero_cut_handover": {"enabled": False},
         "guardian": {"enabled": False},
-        # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
-        # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
+        # Seconds a SIGTERM-interrupted agent unwinds before teardown; short to fit the stop budget.
         "signal_interrupt_grace_timeout": 1,
         # In-band restart wait cap for live background delegation units. 0 = do not wait for delegations.
         "restart_delegation_timeout": 900,

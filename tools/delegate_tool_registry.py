@@ -246,6 +246,11 @@ def _owns_subagent_record(record: dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
+def _now() -> float:
+    """Wall clock for list observations; a module seam so tests never patch the time module."""
+    return time.time()
+
+
 def _list_payload(parent_agent: Any) -> dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -259,8 +264,8 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
             "model": r.get("model"),
-            "status": r.get("status"),
-            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+            "status": r.get("status"), "tool_count": r.get("tool_count", 0),
+            "running_seconds": round(_now() - started, 1) if isinstance(started, (int, float)) else None,
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
@@ -281,7 +286,7 @@ def _list_payload(parent_agent: Any) -> dict[str, Any]:
                 "goal": r.get("goal"),
                 "model": r.get("model"),
                 "status": "queued",
-                "running_seconds": round(time.time() - (r.get("queued_at") or r.get("dispatched_at") or time.time()), 1),
+                "running_seconds": round(_now() - (r.get("queued_at") or r.get("dispatched_at") or _now()), 1),
                 "accepting_steer": False,
                 "live_transcript": None,
                 "queue_reason": r.get("queue_reason", "async pool capacity"),
@@ -341,8 +346,8 @@ def _owns_durable_delegation(record: Dict[str, Any], parent_agent: Any) -> bool:
 # the interrupted work is not safe to resume automatically.
 _RESUME_REFUSALS = {
     "no_such_delegation": (
-        "No durable record for delegation '{sid}'. Only background delegations dispatched by this "
-        "installation are recoverable, and terminal records are pruned after a retention window."
+        "No durable record remains for delegation '{sid}'. It may have been pruned after retention; "
+        "check the transcript paths in the completion message before dispatching replacement work."
     ),
     "not_interrupted": (
         "Delegation '{sid}' is not an interrupted single-task delegation awaiting recovery (it is "
@@ -376,7 +381,7 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
     normal ``delegate_task`` spawn — so the replacement child goes through every
     existing spawn gate and shows up in the parent's own transcript.
     """
-    from tools.delegation_resume import build_recovery_instruction, claim_resume, inspect_resumable
+    from tools.delegation_resume import build_recovery_instruction, claim_batch_resume, claim_resume, inspect_resumable
 
     sid = (subagent_id or "").strip()
     if not sid:
@@ -402,20 +407,24 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
             "action": "resume", "delegation_id": sid, "status": "retry_claimed",
             "attempt": record["retry_attempt"] + 1, "reason": record["retry_reason"],
             "goal": (record.get("task") or {}).get("goal"),
+            **({"tasks": record["recovery_tasks"]} if record.get("recovery_tasks") else {}),
             "recovery_context": build_recovery_instruction(record),
-            "note": ("Nothing has been spawned yet. Now call delegate_task with this goal and pass "
-                     "'recovery_context' verbatim as the task's context; that spawn is linked to this retry "
-                     "lineage automatically. If you do not spawn it, Hermes reports the task as stopped."),
+            "note": ("Nothing has been spawned yet. If 'tasks' is present, call delegate_task(tasks=<returned tasks list>); "
+                     "otherwise call delegate_task with this goal and pass 'recovery_context' verbatim as context. "
+                     "That spawn is linked to this retry lineage automatically. If you do not spawn it, Hermes reports "
+                     "the task as stopped."),
         }, ensure_ascii=False)
     record, reason = inspect_resumable(sid)
-    if reason is None and record is not None and not _owns_durable_delegation(record, parent_agent):
+    if record is not None and not _owns_durable_delegation(record, parent_agent):
         # Ownership is checked BEFORE the claim so a foreign caller cannot burn
         # the one recovery claim belonging to another conversation.
         return tool_error(
             f"Delegation '{sid}' does not belong to this conversation. Only the session that "
             "dispatched a delegation can recover it."
         )
-    if reason is None:
+    if reason == "batch_delegation":
+        record, reason = claim_batch_resume(sid)
+    elif reason is None:
         record, reason = claim_resume(sid)
     if reason is not None or record is None:
         return tool_error(_RESUME_REFUSALS.get(reason or "", _RESUME_REFUSALS["not_interrupted"]).format(sid=sid))
@@ -424,22 +433,24 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
         "delegation_id": sid,
         "status": "recovery_claimed",
         "goal": (record.get("task") or {}).get("goal"),
+        **({"tasks": record["recovery_tasks"]} if record.get("recovery_tasks") else {}),
         "recovery_context": build_recovery_instruction(record),
         "note": (
             "This claim is one-shot and already spent — no second recovery brief will be issued for "
-            "this delegation. Nothing has been spawned. To act on it, call delegate_task normally "
-            "with the original goal and pass 'recovery_context' verbatim as the task's context. The "
-            "replacement subagent must verify current workspace and external state before doing any "
+            "this delegation. Nothing has been spawned. If 'tasks' is present, call "
+            "delegate_task(tasks=<returned tasks list>), preserving each child's context verbatim. "
+            "Otherwise call delegate_task with the original goal and pass 'recovery_context' verbatim "
+            "as the task's context. The replacement subagent must verify current workspace and external state before doing any "
             "new work: the interrupted run may have completed side effects it never reported."
         ),
     }, ensure_ascii=False)
 
 
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop/resume. Runs in-turn (never backgrounded) over the
-    same registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+    """In-turn list/steer/stop/resume, scoped to the conversation's spawn tree."""
     if action == "list":
-        return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+        from tools.delegate_tool_progress import _list_observation
+        return json.dumps(_list_observation(parent_agent, _list_payload(parent_agent)), ensure_ascii=False)
     if action == "resume":
         return _handle_resume_action(subagent_id, parent_agent)
 

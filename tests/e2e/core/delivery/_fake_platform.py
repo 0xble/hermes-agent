@@ -386,6 +386,12 @@ def _serve(spool: Path) -> None:  # pragma: no cover - runs in the child process
     from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig, StreamingConfig
     from gateway.platform_registry import PlatformEntry, platform_registry
     from gateway.run import GatewayRunner
+    from utils import fast_safe_load
+
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_data = fast_safe_load(config_path.read_text(encoding="utf-8")) or {}
+    configured_platforms = config_data.get("platforms", {}) if isinstance(config_data, dict) else {}
+    restart_resume_policy = config_data.get("restart_resume_policy") if isinstance(config_data, dict) else None
 
     cls = _adapter_class()
     platforms = {}
@@ -396,14 +402,18 @@ def _serve(spool: Path) -> None:  # pragma: no cover - runs in the child process
             allow_all_env=f"{name.upper()}_ALLOW_ALL_USERS"))
         os.environ[f"{name.upper()}_ALLOW_ALL_USERS"] = "true"
         plat = Platform(name)
+        platform_data = configured_platforms.get(name, {}) if isinstance(configured_platforms, dict) else {}
+        platform_extra = platform_data.get("extra", {}) if isinstance(platform_data, dict) else {}
         platforms[plat] = PlatformConfig(enabled=True, token="fake-token",
-                                         home_channel=HomeChannel(platform=plat, chat_id="home", name="home"))
+                                         home_channel=HomeChannel(platform=plat, chat_id="home", name="home"),
+                                         extra=dict(platform_extra) if isinstance(platform_extra, dict) else {})
 
     config = GatewayConfig(
         platforms=platforms,
         streaming=StreamingConfig(enabled=True, transport="edit", edit_interval=0.05, buffer_threshold=24,
                                   cursor=""),
         loop_watchdog=False, write_sessions_json=False, multiplex_profiles=False,
+        restart_resume_policy=restart_resume_policy,
     )
 
     async def handle_rpc(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:

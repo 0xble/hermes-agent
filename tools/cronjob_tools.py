@@ -672,6 +672,22 @@ def _with_guidance(result: dict[str, Any], job: dict[str, Any], deliver: Optiona
     return result
 
 
+def _review_value(raw: Optional[str], *, clear: bool = False) -> Optional[dict]:
+    if clear and raw is not None:
+        raise ValueError("review_json and clear_review are mutually exclusive")
+    if clear:
+        return None
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"review_json must be valid JSON: {exc.msg}") from None
+    if not isinstance(value, dict):
+        raise ValueError("review_json must be a JSON object")
+    return value
+
+
 def _action_create(a: dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
@@ -731,6 +747,7 @@ def _action_create(a: dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]),
             hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            review=_review_value(a["review_json"], clear=bool(a["clear_review"])),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -910,6 +927,8 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["interpreter"] is not None:
         # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
         updates["interpreter"] = a["interpreter"]
+    if a["review_json"] is not None or a["clear_review"]:
+        updates["review"] = _review_value(a["review_json"], clear=bool(a["clear_review"]))
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -1069,6 +1088,8 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
+    review_json: Optional[str] = None,
+    clear_review: bool = False,
     allow_shrink: bool = False) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
@@ -1161,6 +1182,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
+            "review_json": {
+                "type": "string",
+                "description": "CLI/operator lane: JSON with contract, subject, optional deadline_minutes (default 10), rerun_deadline_minutes (default 20) and max_reruns (0 or 1, default 1). Requires deliver=local."
+            },
+            "clear_review": {
+                "type": "boolean",
+                "description": "CLI/operator lane: clear the job's review declaration."
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1229,7 +1258,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "allow_shrink")
+    "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review")
 
 
 def _cronjob_handler(args, **kw):

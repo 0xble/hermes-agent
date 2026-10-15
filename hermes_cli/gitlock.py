@@ -61,12 +61,17 @@ def _git_proc_running() -> bool:
         return False
 
 
-def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
-                 default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> list[str]:
-    """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
+def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, repo_root: Path,
+                 min_age_seconds: Optional[int], default_age: int, skip_msg: str,
+                 log_removed: Callable[[Path, int], None], packs: bool = False) -> list[str]:
+    """Shared age-floor sweep; packs use holder-scoped Linux liveness, locks stay global."""
     if not directory.is_dir():
         return []
-    if _git_proc_running():
+    if packs:
+        from hermes_cli._git_process_scope import _linux_process_scope, tmp_pack_in_use
+
+        packs = _linux_process_scope  # non-Linux keeps the original global veto
+    if not packs and _git_proc_running():
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
@@ -74,6 +79,13 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, m
     for entry in candidates():
         try:
             if entry.is_file() and (st := entry.stat()).st_mtime < cutoff:
+                if packs:
+                    if tmp_pack_in_use(repo_root, entry, lambda: _git_proc_running()):
+                        continue
+                    current = entry.stat()
+                    if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
+                            st.st_dev, st.st_ino, st.st_mtime_ns):
+                        continue
                 if os.name == "nt":
                     # git renames its transfer temps into place read-only; Windows refuses to
                     # unlink a read-only file (EACCES/13), so without clearing the write bit
@@ -101,7 +113,7 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
     git_dir = Path(repo_root) / ".git"
     return _sweep_stale(
         git_dir, lambda: [git_dir / name for name in LOCK_NAMES],
-        min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
+        repo_root=repo_root, min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )
@@ -334,10 +346,13 @@ def _migrate_earlier_maintenance_keys(repo_root: Path) -> None:
 
 
 def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
-    """Remove aborted-transfer temp pack files; same contract as clear_stale_git_locks.
+    """Remove aged aborted-transfer pack files with conservative liveness checks.
 
-    Resolves ``.git/objects/pack`` for a checkout and ``objects/pack`` for a bare repo such as
-    the checkpoint store — a ``git gc`` killed by a timeout strands the same debris there."""
+    Non-Linux keeps the system-wide Git-process guard. Linux scopes Git ownership
+    to the target/shared repository and visible pack holders, while unknown or
+    inaccessible evidence still vetoes removal. Resolves ``.git/objects/pack``
+    for a checkout and ``objects/pack`` for a bare repo such as the checkpoint
+    store — a ``git gc`` killed by a timeout strands the same debris there."""
     pack_dir = _pack_dir(repo_root)
 
     def _candidates():
@@ -348,7 +363,7 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
 
     return _sweep_stale(
         pack_dir, _candidates,
-        min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS,
+        repo_root=repo_root, min_age_seconds=min_age_seconds, default_age=STALE_TMP_PACK_MIN_AGE_SECONDS, packs=True,
         skip_msg="git process running; skipping tmp-pack sweep",
         log_removed=lambda p, size: logger.info("Removed aborted-fetch pack debris %s (%d bytes)", p, size),
     )

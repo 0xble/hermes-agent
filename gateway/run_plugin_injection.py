@@ -124,13 +124,19 @@ class GatewayPluginInjectionMixin:
         return authorized
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        expected_session_id: Optional[str] = None,
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Route a plugin turn, optionally pinned to the caller's original conversation."""
         if not self._plugin_injection_accepting():
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
+            return False
+        # A key can be rebound by /new or /resume between the caller's lookup and ours.
+        # Keep the caller's identity through admission and execution, never re-stamp the new one.
+        session_id = entry.session_id if expected_session_id is None else expected_session_id
+        if entry.session_id != session_id:
             return False
 
         from gateway.session_identity import replace_source
@@ -142,19 +148,29 @@ class GatewayPluginInjectionMixin:
         if adapter is None:
             return False
 
-        async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
-                metadata={
-                    "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
-                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
-                    "gateway_session_strict": True,
-                },
-            ))
+        event = MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+                "gateway_session_key": session_key, "gateway_session_id": session_id,
+                "gateway_session_strict": True,
+            },
+        )
+        from gateway.wake import WakeNotAccepted, admit_internal_event
+        try:
+            async with self._plugin_injection_scope(source):
+                # True only on the adapter's admission receipt: a busy queue can refuse the event
+                # without raising, and callers treat True as a durable delivery acknowledgement.
+                await admit_internal_event(adapter, event)
+        except WakeNotAccepted:
+            logger.info(
+                "Plugin message injection not admitted: plugin=%s session=%s", plugin_id, session_key,
+            )
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
-            plugin_id, session_key, entry.session_id,
+            plugin_id, session_key, session_id,
         )
         return True
 

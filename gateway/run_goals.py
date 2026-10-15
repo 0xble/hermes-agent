@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import time
 from contextlib import nullcontext, suppress
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 
@@ -166,7 +167,8 @@ class GatewayGoalsMixin:
     @staticmethod
     def _synthetic_prompt_event(
         source: Any, text: str, *, internal: bool = False, reply_expected: Optional[bool] = None,
-        goal_continuation: bool = False,
+        goal_continuation: bool = False, goal_session_id: str = "",
+        goal_state: Any = None, goal_fingerprint: Optional[str] = None, goal_instance: Optional[float] = None,
     ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
@@ -178,11 +180,27 @@ class GatewayGoalsMixin:
         continuation on a no-change tick). A typed message absorbed into the same turn still
         restores the human contract through ``MessageEvent.absorb_reply_expected``.
         """
+        metadata = {}
+        if goal_continuation:
+            from hermes_cli.session_controls import _definition_fingerprint
+            # Instance fences replacement; definition edits refresh when the queue is consumed.
+            fingerprint = goal_fingerprint if goal_fingerprint is not None else _definition_fingerprint(
+                "goal", goal_state.to_json() if goal_state is not None else None,
+            )
+            metadata = {
+                GOAL_CONTINUATION_METADATA_KEY: True,
+                "goal_continuation_session_id": goal_session_id,
+                "goal_continuation_fingerprint": fingerprint,
+                "goal_continuation_instance": (
+                    goal_instance if goal_instance is not None else getattr(goal_state, "created_at", None)
+                ),
+                "goal_continuation_created_at": time.time(),
+            }
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
             reply_expected=reply_expected,
-            metadata={GOAL_CONTINUATION_METADATA_KEY: True} if goal_continuation else {},
+            metadata=metadata,
         )
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
@@ -499,6 +517,21 @@ class GatewayGoalsMixin:
                 logger.debug("goal stop: notice failed: %s", exc)
             return True
 
+    def _post_turn_goal_identity(self, event) -> Dict[str, Any]:
+        """Plain-data identity of the turn whose response the post-turn goal judge evaluates."""
+        if event is None:
+            return {"user_turn": False, "goal_instance": None, "loop_tick": None}
+        metadata = getattr(event, "metadata", None) or {}
+        instance = metadata.get("goal_continuation_instance") if metadata.get(
+            GOAL_CONTINUATION_METADATA_KEY) else None
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        loop_tick = None
+        if metadata.get(LOOP_WAKE_METADATA_KEY):
+            loop_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
+        return {"user_turn": self._is_user_turn_event(event),
+                "goal_instance": instance if type(instance) in (int, float) else None,
+                "loop_tick": loop_tick}
+
     def _is_user_turn_event(self, event) -> bool:
         """An admitted turn the user sent, not a wake, continuation, heartbeat or relayed message."""
         return not (getattr(event, "internal", False)
@@ -536,6 +569,7 @@ class GatewayGoalsMixin:
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
         user_initiated: bool = False, external_event: bool = False,
+        goal_instance: Optional[float] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -552,6 +586,12 @@ class GatewayGoalsMixin:
         if mgr is None:
             return
         if not mgr.is_active():
+            return
+        # A continuation turn answers the goal instance it was stamped for. If that goal was
+        # replaced or cleared and re-set while the turn ran, its response is not evidence for the
+        # new goal: judging it would spend the new goal's turns and verdicts on old work.
+        if goal_instance is not None and getattr(mgr.state, "created_at", None) != goal_instance:
+            logger.info("goal continuation: turn answered a superseded goal instance; not judged")
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -586,7 +626,10 @@ class GatewayGoalsMixin:
             if adapter and _quick_key:
                 # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
                 self._enqueue_fifo(
-                    _quick_key, self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True), adapter,
+                    _quick_key, self._synthetic_prompt_event(
+                        source, prompt, reply_expected=False, goal_continuation=True,
+                        goal_session_id=mgr.session_id, goal_state=mgr.state,
+                    ), adapter,
                 )
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
@@ -596,9 +639,11 @@ class GatewayGoalsMixin:
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
-        # Error notices and interrupted partial replies are not goal progress.
-        # Events from legacy/direct callers without an outcome retain text fallback.
-        if getattr(event, "_agent_turn_succeeded", None) is False:
+        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        successful = is_successful_goal_turn(
+            agent_result, final_text, succeeded=getattr(event, "_agent_turn_succeeded", None),
+        )
+        if not successful:
             final_text = ""
         try:
             session_entry = await self.async_session_store.get_or_create_session(
@@ -607,22 +652,47 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        # Unsuccessful or empty responses must not drive /goal, but an in-flight /loop tick
-        # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion, {})]
-        if final_text.strip():
-            # A process or delegation result injected by the completion path is new evidence and
-            # may pierce the continuation gap, including one drained behind a goal continuation
-            # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
-            # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
-            # metadata, never derived from message text.
+        # Failed/interrupted turns stay out of /goal. Successful empty turns still carry
+        # tool evidence; an in-flight /loop tick always needs release/rescheduling.
+        # The terminal turn's identity: a queued chain carries its last turn's, not the head's.
+        identity = getattr(event, "_post_turn_goal_identity", None)
+        if not isinstance(identity, dict):
+            identity = (self._post_turn_goal_identity(event) if event is not None
+                        else {"user_turn": not is_internal, "goal_instance": None, "loop_tick": None})
+        # The loop tick this turn (or chain) actually ran: the latest stamped loop wake in a queued
+        # chain, else the head event's own. A turn that ran no loop wake owns no tick.
+        loop_tick = getattr(event, "_post_turn_loop_tick", None) or identity.get("loop_tick")
+        if not loop_tick and event is not None:
+            loop_tick = self._post_turn_goal_identity(event).get("loop_tick")
+        hooks = [("loop completion", self._post_turn_loop_completion,
+                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
+        if successful:
+            # Any delivery into the session is fresh evidence and pierces a goal wait: process or
+            # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
+            # pacing wakes (continuations, /loop ticks, heartbeats) stay on the quiet ladder. The
+            # markers are gateway-set metadata, never derived from message text. A completion drained
+            # behind a continuation head keeps its origin on the head event.
             metadata = getattr(event, "metadata", None) or {}
-            external_event = metadata.get("notification_origin") == "process_registry_synthetic"
-            turn_is_user = self._is_user_turn_event(event) if event is not None else not is_internal
-            hooks.insert(0, (
-                "goal continuation", self._post_turn_goal_continuation,
-                {"user_initiated": turn_is_user, "external_event": external_event},
-            ))
+            from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+            own_pacing_wake = is_internal and event is not None and (
+                self._is_goal_continuation_event(event)
+                or bool(metadata.get(LOOP_WAKE_METADATA_KEY))
+                or bool(getattr(event, "_heartbeat_session_id", None))
+                # Restart recovery re-runs an interrupted turn; it is not new outside evidence.
+                or getattr(event, "_restart_note_expected", None) is not None
+                or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
+            )
+            external_event = (
+                metadata.get("notification_origin") == "process_registry_synthetic"
+                or (is_internal and event is not None and not own_pacing_wake)
+            )
+            # A queued chain is judged once, on its terminal turn's response (identity above).
+            goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
+            # A stamped continuation turn is judged only against the goal instance it served.
+            instance = identity.get("goal_instance")
+            if type(instance) in (int, float):
+                goal_kwargs["goal_instance"] = instance
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             try:
                 await hook(
@@ -636,8 +706,15 @@ class GatewayGoalsMixin:
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
         """Text for /goal and /loop after a gateway turn. Streamed turns return None from
         _handle_message_with_agent (already_sent); the delivered reply is stashed on the event."""
-        # Delivery strips display-only control markers (LOOP_COMPLETE) from the returned text;
-        # the raw reply it stashed is authoritative for /loop completion detection.
+        # Explicit model output is authoritative even when empty. Delivery normalization can
+        # manufacture notices that must never become goal/loop judgment evidence.
+        model_text = getattr(event, "_agent_final_response", None)
+        if isinstance(model_text, str):
+            return model_text
+        from hermes_cli.goal_turn_outcome import model_final_response
+        if isinstance(agent_result, dict) and "final_response" in agent_result:
+            return model_final_response(agent_result)
+        # Older callers stash only the pre-marker-stripping delivery text.
         raw = getattr(event, "_raw_final_response", None)
         if isinstance(raw, str) and raw.strip():
             return raw
@@ -651,8 +728,35 @@ class GatewayGoalsMixin:
         streamed = getattr(event, "_streamed_final_response", None)
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
+    async def _release_unsettled_loop_tick(self, event: Any, *, ran: bool) -> None:
+        """Release a stamped loop claim when an admitted wake never reaches post-turn hooks.
+
+        The scheduler has already marked the tick in flight before handing the event to the adapter.
+        Admission can still return early, for example on the active-session cap or a lease timeout.
+        Those paths must roll back exactly the wake they carried, and the DB write stays in the
+        executor because SessionDB is not event-loop safe.
+        """
+        if ran or event is None or getattr(event, "_loop_tick_settled", False):
+            return
+        metadata = getattr(event, "metadata", None) or {}
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        if not metadata.get(LOOP_WAKE_METADATA_KEY) or metadata.get("loop_wakeup_command"):
+            return
+        session_id = metadata.get("loop_wakeup_session_id")
+        instance = metadata.get("loop_wakeup_instance")
+        fired = metadata.get("loop_wakeup_tick")
+        if not isinstance(session_id, str) or not session_id or type(instance) not in (int, float) or type(fired) is not int:
+            return
+        from hermes_cli.loops import LoopManager
+        manager = LoopManager(session_id=session_id)
+        await self._run_in_executor_with_context(
+            functools.partial(manager.abandon_tick, tick=(instance, fired))
+        )
+        event._loop_tick_settled = True
+
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
+        loop_tick: Optional[tuple] = None,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -665,10 +769,18 @@ class GatewayGoalsMixin:
         state = mgr.state if mgr is not None else None
         if state is None or not state.awaiting_response:
             return
+        if loop_tick is None and state.last_fired_at >= getattr(self, "_gateway_started_at", 0.0):
+            # This turn ran no loop wake, and the in-flight tick was claimed by this process, so its
+            # own stamped wake will settle it. Only a tick claimed before this gateway started (whose
+            # wake was lost or carried no identity) is released by the next turn, never wedged.
+            return
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        # A stamped wake completes only the tick it carried (a stop and re-set in between means a
+        # newer tick is in flight that this response never answered).
+        decision = await self._run_in_executor_with_context(
+            functools.partial(mgr.complete_tick, final_response or "", tick=loop_tick))
         msg = decision.get("message") or ""
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
@@ -748,19 +860,31 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            await adapter.handle_message(
-                self._synthetic_prompt_event(
-                    source, wakeup, internal=True, reply_expected=False, goal_continuation=False,
-                )
+            event = self._synthetic_prompt_event(
+                source, wakeup, internal=True, reply_expected=False, goal_continuation=False,
             )
+            # Every tick carries its claimed identity so a pause or stop before the turn (or the
+            # command) starts drops the obsolete work.
+            from hermes_cli.session_controls import loop_wake_metadata
+            is_command = wakeup.lstrip().startswith("/")
+            event.metadata.update(loop_wake_metadata(sid, mgr.state, command=is_command))
+            # Require the adapter's admission receipt: a refusal without an exception (an
+            # occupied internal slot) must roll the tick back for the next scan, never leave it
+            # claimed with no turn to settle it.
+            from gateway.wake import admit_internal_event
+            await admit_internal_event(adapter, event)
             # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick immediately (caps + scheduling).
-            if wakeup.lstrip().startswith("/"):
+            # completion hook — complete the tick once the command was admitted (caps +
+            # scheduling). The command wake's fence accepts this exact tick even when that
+            # completion reached a cap, so the final requested run is never dropped.
+            if is_command:
                 await self._run_in_executor_with_context(mgr.complete_tick, "")
         except Exception as exc:
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
+            # Off-loop: the rollback is a conditional SessionDB write and, when compression
+            # migrated the loop after fire_tick(), follows the claim to the continuation.
             with suppress(Exception):
-                mgr.abandon_tick()
+                await self._run_in_executor_with_context(mgr.abandon_tick)
 
     async def _goal_wakeup_fire_one(self, sid: str) -> None:
         """Resume one idle parked /goal whose wait barrier has lifted.
@@ -813,13 +937,9 @@ class GatewayGoalsMixin:
             mgr = GoalManager(
                 session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
             )
-            notice = mgr.rearm_live_barrier()
-            return mgr, notice, mgr.lifted_barrier_prompt()
+            return mgr, mgr.lifted_barrier_prompt()
 
-        mgr, barrier_notice, prompt = await self._run_in_executor_with_context(_check)
-        if barrier_notice:
-            with suppress(Exception):
-                await self._send_goal_status_notice(source, barrier_notice, notice_kind="wait-age")
+        mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
@@ -835,7 +955,10 @@ class GatewayGoalsMixin:
         since = mgr.state.waiting_since
         logger.info("goal wakeup: barrier lifted for session %s (%s); resuming",
                     sid, mgr.state.waiting_reason or mgr.state.waiting_on_session or mgr.state.waiting_on_pid)
-        event = self._synthetic_prompt_event(source, prompt, reply_expected=False, goal_continuation=True)
+        event = self._synthetic_prompt_event(
+            source, prompt, reply_expected=False, goal_continuation=True,
+            goal_session_id=sid, goal_state=mgr.state,
+        )
         event.metadata["gateway_session_key"] = key
         if resume_marker is not None:
             cleared = await self.async_session_store.clear_resume_pending(

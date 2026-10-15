@@ -159,6 +159,19 @@ def _dispatch(mgr, arg):
     return dispatch_goal_command(mgr, arg, authorize_gate=lambda: None)
 
 
+@pytest.mark.parametrize("bad", [
+    "Ship it " * 130,
+    "Ship it\nverify: PR #551 is merged",
+    "Delete the obsolete topic\nconstraints: read-only; no changes",
+    "Ship it\nverify: 1. Run tests\n2. Read logs\n3. Review output",
+])
+def test_goal_command_warns_without_blocking_authoring_findings(bad):
+    mgr = goals.GoalManager("goal-authoring-warning")
+    result = _dispatch(mgr, bad)
+    assert result.error is False
+    assert "Goal authoring warning" in result.output
+
+
 @pytest.mark.parametrize('command, paused, status', [
     ('resume last goal', False, 'active'), ('continue the work', True, 'active'),
     ('pause for now', False, 'paused'), ('status please', False, 'active'),

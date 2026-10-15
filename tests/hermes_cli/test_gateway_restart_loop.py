@@ -1846,13 +1846,12 @@ class TestLifecycleGuardNeverRaises:
         assert self._scan(f"source {zshrc}") is False
 
 
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Directories are not scripts (#86753). Devices stay fail-closed
-        # where the OS actually exposes them (POSIX /dev/null).
-        # The important contract is: verdict, not exception.
+    def test_directory_and_dev_null_are_harmless_not_crash(self, tmp_path):
+        # Directories are not scripts (#86753); preserve their existing verdict.
         assert self._scan(f"bash {tmp_path}") is False
         if os.name != "nt":
-            assert self._scan("bash /dev/null") is True
+            # Executing /dev/null as a shell script runs no commands.
+            assert self._scan("bash /dev/null") is False
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
