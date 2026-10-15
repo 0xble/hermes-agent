@@ -4318,9 +4318,11 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
-                # Preparation consumed or refused the follow-up; it will not run as a turn.
-                from gateway.shutdown_flush import retire_queue_checkpoint
-                retire_queue_checkpoint(pending_event, reason="followup_not_prepared")
+                # Preparation can fail before transcript admission (including a media/profile
+                # lookup failure). Keep the checkpoint; only an explicit user-visible discard may
+                # retire accepted input.
+                logger.warning("Queued follow-up for %s was not prepared; retaining its checkpoint",
+                               session_key or "?")
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)

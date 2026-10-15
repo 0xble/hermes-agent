@@ -87,6 +87,8 @@ _NON_OVERFLOW_REASONS = frozenset({
     FailoverReason.upstream_blocked.value,
     FailoverReason.model_entitlement.value,
     FailoverReason.model_not_found.value,
+    # Local preflight stopped before sending; the accepted input must be retained and persisted.
+    "input_retained",
 })
 
 

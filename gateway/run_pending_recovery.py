@@ -111,7 +111,8 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
 def _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events):
     """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
     followup = data.get("shutdown_follow_up") is True
-    if followup and input_already_durable(
+    queue_checkpoint = data.get("queue_accepted") is True
+    if (followup or queue_checkpoint) and input_already_durable(
         runner.session_store, session_id, data.get("message_id"),
         data.get("text"), data.get("persist_text"), data.get("dedupe"),
     ):
@@ -122,7 +123,9 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     event = _recovered_followup_event(data, source, author_id, key=key, session_id=session_id)
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
-    if followup:
+    if followup or queue_checkpoint:
+        # Both shutdown follow-ups and queue-accepted checkpoints are recovery-owned: adapter
+        # admission is not transcript durability, so their spool stays until the turn proves it.
         setattr(event, "_hermes_recovery_session_key", key)
         setattr(event, "_hermes_recovery_session_id", session_id)
     if recovered_events is not None:

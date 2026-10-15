@@ -78,6 +78,8 @@ def test_turn_start_preflight_timeout_returns_typed_result_not_exception():
     assert result["failed"] is True
     assert result["completed"] is False
     assert result["compression_exhausted"] is True
+    assert result["failure_reason"] == "input_retained"
+    assert result["failure_retryable"] is True
     assert result["turn_exit_reason"] == "context_compression_timeout"
     # The actionable preflight guidance survives into both user-facing fields.
     assert "provider call was not sent" in result["final_response"]

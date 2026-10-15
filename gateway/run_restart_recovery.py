@@ -181,11 +181,18 @@ class RestartRecoveryMixin:
             await self._follow_startup_resume_turn(adapter, event, session_key, task)
             succeeded = getattr(event, "_agent_turn_succeeded", None)
             if isinstance(succeeded, bool):
-                # A failed real turn may have tool effects; never replay it just because it did
-                # not produce a successful final. Its request remains in the durable transcript.
-                self._retire_recovered_followup_spool(event)
+                # A successful completed turn owns the input through its normal persistence contract.
+                # A failed turn is different: preflight can fail before persistence, so its result
+                # alone is never proof; require the transcript probe before retiring.
+                if succeeded is True or await self._recovered_input_durable(event):
+                    self._retire_recovered_followup_spool(event)
+                else:
+                    logger.warning(
+                        "Retaining recovered follow-up spool for %s: turn ended before its input "
+                        "was durable (succeeded=%s)", session_key, succeeded,
+                    )
                 # A real turn replied or reported its own failure; the "still preserved"
-                # notice would be false once the spool is gone, so neither path sends it.
+                # notice is only suppressed when the spool was actually retired.
                 self._release_restart_followup_key(session_key)
                 self._record_restart_resume_outcome(
                     session_key, "resumed" if succeeded else "skipped:turn-failed")
@@ -271,7 +278,11 @@ class RestartRecoveryMixin:
             if getattr(event, "_gateway_accepted", False) is not True:
                 return False
             spool = getattr(event, "_hermes_recovery_spool", None)
-            if spool is not None and not recovered:
+            # Recovery-owned queue checkpoints stay until the turn's transcript admission callback
+            # retires them; adapter acceptance is not durability. Legacy non-checkpoint startup files
+            # have no recovery observer and may be retired after an explicit gateway receipt.
+            if (spool is not None and not recovered
+                    and not getattr(event, "_hermes_queue_checkpoint", False)):
                 spool.unlink(missing_ok=True)
         except Exception:
             # One bad replay must not abort the drain: the remaining queued

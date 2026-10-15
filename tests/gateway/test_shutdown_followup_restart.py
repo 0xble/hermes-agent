@@ -12,7 +12,8 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run_pending_recovery import _defer_followup
 from gateway.session import SessionStore
-from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
+from gateway.shutdown_flush import checkpoint_queued_event, flush_pending_to_file, recover_pending_to_db
+from hermes_state import SessionDB
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -93,7 +94,7 @@ async def test_restored_followup_accepted_without_turn_gets_note_and_skipped_out
 
 
 @pytest.mark.asyncio
-async def test_restored_followup_failed_real_turn_gets_no_preserved_notice(tmp_path, monkeypatch, caplog):
+async def test_restored_followup_failed_real_turn_retains_undurable_spool(tmp_path, monkeypatch, caplog):
     runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
     event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
@@ -112,9 +113,8 @@ async def test_restored_followup_failed_real_turn_gets_no_preserved_notice(tmp_p
     with caplog.at_level("INFO", logger="gateway.run"):
         await runner._drain_startup_restore_queue()
         await asyncio.gather(*list(runner._background_tasks))
-    # The spool is retired, so a "still preserved" notice would be false; the turn reported itself.
-    assert adapter.sent == []
-    assert not list((tmp_path / "pending_messages").glob("*.json"))
+    # The failed result is not durability proof; the only copy must remain for retry/recovery.
+    assert list((tmp_path / "pending_messages").glob("*.json"))
     outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
     assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed"]
     assert entry.session_key not in runner._restart_followup_keys
@@ -142,6 +142,68 @@ async def test_restored_followup_dropped_before_session_resolution_keeps_spool(t
     assert spool.exists()
     outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
     assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=skipped:accepted-without-turn:noted"]
+
+
+@pytest.mark.asyncio
+async def test_queue_accepted_checkpoint_stays_until_dispatch_turn_is_durable(tmp_path, monkeypatch):
+    """Queue checkpoints are recovery-owned too; adapter acceptance alone is not durability."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="queued before restart", source=source, user_id=source.user_id,
+                         message_id="queue-recovery-1")
+    assert checkpoint_queued_event(entry.session_key, event)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    recover_pending_to_db(
+        db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+
+    async def failed_turn(recovered):
+        # No transcript row: this models a failure before durable turn admission.
+        recovered._agent_turn_succeeded = False
+
+    async def handle(recovered):
+        recovered._gateway_accepted = True
+        adapter._session_tasks[entry.session_key] = asyncio.create_task(failed_turn(recovered))
+
+    adapter.handle_message = handle
+    assert await runner._drain_startup_restore_queue() == 1
+    await asyncio.gather(*list(runner._background_tasks))
+    assert spool.exists()
+
+
+@pytest.mark.asyncio
+async def test_preflight_timeout_keeps_recovered_spool_when_no_input_row_lands(tmp_path, monkeypatch):
+    """The retained/not-sent preflight result must not let the observer retire its only copy."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="over-window but retained", source=source, user_id=source.user_id,
+                         message_id="preflight-retained-1")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    db = SessionDB(db_path=tmp_path / "state.db")
+    recover_pending_to_db(
+        db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+        deferred_followup=partial(_defer_followup, runner, {}, None),
+    )
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+
+    async def failed_preflight(recovered):
+        from agent.conversation_loop import _preflight_timeout_result
+        from agent.turn_context import PreflightCompressionTimedOut
+        from gateway.run_turn import is_context_overflow_failure_result
+        result = _preflight_timeout_result(SimpleNamespace(_session_messages=[]),
+                                           PreflightCompressionTimedOut("provider call was not sent"), [])
+        assert result["failed"] is True
+        assert is_context_overflow_failure_result(result, history_len=100) is False
+        recovered._agent_turn_succeeded = False
+
+    async def handle(recovered):
+        recovered._gateway_accepted = True
+        adapter._session_tasks[entry.session_key] = asyncio.create_task(failed_preflight(recovered))
+
+    adapter.handle_message = handle
+    assert await runner._drain_startup_restore_queue() == 1
+    await asyncio.gather(*list(runner._background_tasks))
+    assert spool.exists()
 
 
 @pytest.mark.asyncio

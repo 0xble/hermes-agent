@@ -1377,7 +1377,9 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any
     return _partial_turn_result(
         str(exc), list(getattr(agent, "_session_messages", None) or conversation_history or []), 0,
         failed=True, compression_exhausted=True, turn_exit_reason="context_compression_timeout",
-        failure_reason="context_overflow", failure_retryable=False,
+        # The conversation and this accepted input are retained: preflight never sent a provider
+        # request and therefore must not enter the context-overflow skip-persistence path.
+        failure_reason="input_retained", failure_retryable=True,
     )
 
 
