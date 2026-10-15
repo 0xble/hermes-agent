@@ -1,4 +1,7 @@
-"""Cached controls must edit the live loop row, never restore an older lifecycle."""
+"""Cached controls must edit the live loop row, never restore an older lifecycle.
+
+User controls apply to the stored row; agent revisions commit only against their exact snapshot.
+"""
 
 from typing import Any
 
@@ -78,24 +81,19 @@ def test_stale_controls_preserve_the_current_lifecycle(store, newer, operation, 
         assert after.created_at == before.created_at
         assert after.times == before.times
         assert after.until == before.until
-    if newer == "clear":
-        assert not result or result.get("error_code") == "no_loop"
+    if operation in {"revise", "replace"}:
+        # Agent edits commit only against the exact snapshot they read: a stale one is
+        # rejected and refreshed, never applied over the newer lifecycle or in-flight tick.
+        assert result["ok"] is False and result["error_code"] == "state_changed"
+        assert after.to_json() == before.to_json()
+    elif newer == "clear":
+        assert not result
         assert after.to_json() == before.to_json()
     elif operation == "save":
         assert after.to_json() == before.to_json()
     else:
-        assert result and (not isinstance(result, dict) or result["ok"])
+        assert result
         assert after.ticks_fired == before.ticks_fired
-        if operation == "revise":
-            assert after.interval_seconds == 600
-            assert after.awaiting_response == before.awaiting_response
-            assert after.created_at == before.created_at
-            assert after.control_generation == before.control_generation
-            assert after.version == before.version + 1
-        if newer == "tick":
-            assert after.awaiting_response and after.ticks_fired == 1
-            assert after.run_generation == 7
-            assert after.next_due_at == before.next_due_at
         if newer == "replace":
             assert after.prompt == "deployment readiness"
     if operation == "clear":
@@ -168,3 +166,23 @@ def test_cursor_owned_stale_settle_cannot_clear_a_successor_tick(store):
     store._execute_write(transaction)
     after = load_loop("cursor-settle")
     assert after.status == "paused"
+
+
+def test_cursor_owned_revision_and_settlement_commit_inside_the_owner_transaction(store):
+    """The exact-snapshot CAS runs through the owner's cursor, never a second (deadlocking) lock."""
+    from hermes_cli.loops import LoopManager, load_loop
+
+    manager = LoopManager("cursor-commit")
+    manager.set("watch", interval_seconds=300)
+    assert manager.fire_tick()
+
+    def transaction(cursor):
+        owned = LoopManager("cursor-commit", cursor=cursor)
+        assert owned.revise(reason="poll less often", interval_seconds=600)["ok"]
+        return owned.complete_tick("still watching")
+
+    decision = store._execute_write(transaction)
+    after = load_loop("cursor-commit")
+    assert decision["status"] == "active" and decision["stopped"] is False
+    assert after.interval_seconds == 600 and after.version == 2
+    assert not after.awaiting_response and after.ticks_fired == 1

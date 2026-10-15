@@ -6,6 +6,7 @@ Pre-turn hygiene compression carries the started tick to the child, which the
 fence follows. An unrelated route (a /resume elsewhere) defers and a pause blocks.
 """
 import asyncio
+import logging
 
 import pytest
 
@@ -82,7 +83,8 @@ async def test_hygiene_rotation_runs_and_settles_tick_once_on_child(control_home
 
 
 @pytest.mark.asyncio
-async def test_resume_elsewhere_during_preparation_defers_without_settling(control_home):
+async def test_resume_elsewhere_during_preparation_defers_without_settling(control_home, caplog):
+    caplog.set_level(logging.INFO, logger="gateway.run_loop_wake")
     runner, adapter, source, entry = native_runner(control_home)
     parent = entry.session_id
     create_loop(entry, source)
@@ -101,6 +103,9 @@ async def test_resume_elsewhere_during_preparation_defers_without_settling(contr
         assert saved.status == "active" and saved.awaiting_response and saved.claim_phase == "started"
         assert saved.ticks_fired == 1
         assert loops.load_loop("unrelated") is None
+        # The suppressed exit names the session, tick and reason for operators.
+        assert (f"Discarding loop wake for session {parent} tick {_tick(saved)}: "
+                "superseded during turn preparation") in caplog.text
     finally:
         runner.session_store.close_all_db_handles()
 

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER, is_intentional_silence_response
 from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES
 from hermes_cli.loops_revisions import LoopRevisionsMixin
-from hermes_cli.lifecycle_snapshot import snapshot_control
+from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
 
 logger = logging.getLogger(__name__)
 
@@ -550,6 +550,24 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
     return saved
 
 
+def _overlay(live: LoopState, staged: LoopState) -> None:
+    """Copy a staged loop onto the live row; ``save_loop`` still assigns the writer-owned tokens."""
+    snapshot = LoopState.from_json(staged.to_json())
+    for item in fields(LoopState):
+        setattr(live, item.name, getattr(snapshot, item.name))
+
+
+def _tick_outcome_applies(stored: Optional[LoopState], instance: Any, fired_ticks: int,
+                          expected_phase: Optional[str] = None, owns_turn=None) -> bool:
+    """The one fence for every tick outcome: still this in-flight tick, and no live owner."""
+    return bool(
+        stored is not None and stored.status == "active" and stored.awaiting_response
+        and stored.created_at == instance and stored.ticks_fired == fired_ticks
+        and (expected_phase is None or stored.claim_phase == expected_phase)
+        and (owns_turn is None or not owns_turn())
+    )
+
+
 def clear_loop(session_id: str) -> None:
     """Retire the current loop without overwriting a concurrent definition or tick."""
     LoopManager(session_id).clear()
@@ -695,9 +713,7 @@ class LoopManager(LoopRevisionsMixin):
         A failed read also yields None; keep the cached state then, or a transient DB error during a
         wakeup would drop ``awaiting_response`` handling and wedge the tick. Rows are never deleted
         (stop marks them cleared), so None with a cached state means the read failed."""
-        # A cursor owner holds the write lock; reading outside it would block on that same lock.
-        fresh = (load_loop(self.session_id) if self._cursor is None
-                 else load_loop(self.session_id, cursor=self._cursor))
+        fresh = self._load()
         if fresh is not None or self._state is None:
             self._state = fresh
             self._mark_synced()
@@ -708,14 +724,41 @@ class LoopManager(LoopRevisionsMixin):
     def has_loop(self) -> bool:
         return self._state is not None and self._state.status in {"active", "paused"}
 
-    def _mutate_current(self, apply, *, failure=None) -> Any:
-        """Validate and edit the live row atomically, adopting it only on success."""
-        saved = save_loop(self.session_id, cursor=self._cursor, apply=apply)
-        if saved is None:
+    def _load(self) -> Optional[LoopState]:
+        # A cursor owner holds the write lock; reading outside it would block on that same lock.
+        return (load_loop(self.session_id) if self._cursor is None
+                else load_loop(self.session_id, cursor=self._cursor))
+
+    def _mutate_current(self, apply, *, failure=None, tick_lifecycle: bool = False) -> Any:
+        """Run one command against the stored row, then publish only the durable winner.
+
+        ``apply`` validates and edits the live row inside the write transaction and returns the
+        command result; it may be replayed on lock contention. The shared snapshot boundary then
+        adopts the committed row unless a newer same-manager command already published, so a
+        rejected command still refreshes this manager. A failed write publishes nothing and
+        returns ``failure``; cursor owners see the error instead.
+        """
+        from hermes_cli.loops_snapshot import LoopPersistenceError
+
+        if not self.session_id:
+            return apply(self._state)  # intentionally ephemeral: there is no stored row
+        written = []
+
+        def commit() -> Optional[LoopState]:
+            saved = save_loop(self.session_id, cursor=self._cursor, apply=apply,
+                              tick_lifecycle=tick_lifecycle)
+            if saved is None:
+                raise LoopPersistenceError("loop write failed")
+            written.append(saved)
+            return saved[0]
+
+        try:
+            # Rows are never deleted, so a failed winner read keeps the committed row.
+            commit_and_publish_snapshot(self, None, commit, lambda: self._load() or written[-1][0])
+        except LoopPersistenceError:
             return failure
-        self._state, result = saved
         self._mark_synced()
-        return result
+        return written[-1][1]
 
     def _save(self) -> Optional[LoopState]:
         """Legacy snapshot edits are CAS-only; commands use ``_mutate_current``."""
@@ -724,18 +767,16 @@ class LoopManager(LoopRevisionsMixin):
             # Staged settlement/revision: the snapshot CAS commits, never this direct write.
             from hermes_cli.loops_snapshot import assert_loop_snapshot
             db, expected = snapshot
-            assert_loop_snapshot(self.session_id, expected, db)
+            assert_loop_snapshot(self.session_id, expected, db, cursor=self._cursor)
             return self._state
         candidate = self._state
 
         def apply(stored):
             if stored is not None and stored.to_json() == self._synced_json and candidate is not None:
-                snapshot = LoopState.from_json(candidate.to_json())
-                for item in fields(LoopState):
-                    setattr(stored, item.name, getattr(snapshot, item.name))
-            return stored
+                _overlay(stored, candidate)
 
-        return self._mutate_current(apply)
+        self._mutate_current(apply)
+        return self._state
 
     def status_line(self) -> str:
         s = self._state
@@ -801,12 +842,19 @@ class LoopManager(LoopRevisionsMixin):
             next_due_at=now,
             route=dict(route or {}),
         )
-        saved = save_loop(self.session_id, state, cursor=self._cursor)
-        if saved is None:
-            raise ValueError("loop could not be saved")
-        self._state = saved[0]
+        if not self.session_id:
+            self._state = state  # intentionally ephemeral
+            return state
+
+        def commit() -> LoopState:
+            saved = save_loop(self.session_id, state, cursor=self._cursor)
+            if saved is None:
+                raise ValueError("loop could not be saved")
+            return saved[0]
+
+        commit_and_publish_snapshot(self, None, commit, lambda: self._load() or state)
         self._mark_synced()
-        return state
+        return self._state
 
     @snapshot_control
     def pause(self, reason: str = "user-paused") -> Optional[LoopState]:
@@ -908,44 +956,28 @@ class LoopManager(LoopRevisionsMixin):
             self._mark_synced()
             return True
 
-        def write(conn) -> Optional[LoopState]:
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
-            ).fetchone()
-            stored = _parse_state(row[0]) if row and row[0] else None
+        def apply(stored: Optional[LoopState]) -> bool:
             if (
                 stored is None or stored.status != "active" or stored.awaiting_response
                 or (can_claim is not None and not can_claim())
                 or stored.created_at != s.created_at or stored.ticks_fired != s.ticks_fired
                 or stored.control_generation != s.control_generation
             ):
-                return None
+                return False
             # Another writer's schedule since this manager's last sync governs: a revise,
             # pause/resume or cadence change can postpone the tick. A revise since load fires the
             # stored definition.
             rescheduled = stored.next_due_at != self._synced_due_at or stored.version != s.version
             if rescheduled and time.time() < stored.next_due_at:
-                return None
-            base = s if stored.version == s.version else stored
-            claimed = _parse_state(base.to_json())
+                return False
+            claimed = _parse_state((s if stored.version == s.version else stored).to_json())
             claim(claimed)
-            save_loop(self.session_id, claimed, cursor=conn, tick_lifecycle=True)
-            return claimed
+            _overlay(stored, claimed)
+            return True
 
-        try:
-            # A cursor owner already holds the write transaction: run the same guarded
-            # stored-row check through it, never an unconditional cached-state write.
-            claimed = write(self._cursor) if self._cursor is not None else db._execute_write(write)
-        except Exception as exc:
-            if self._cursor is not None:
-                raise  # transaction owners must see failures, as save_loop(cursor=...) does
-            logger.debug("LoopManager: tick claim write failed: %s", exc, exc_info=True)
-            return False
-        if claimed is None:
-            self.refresh()
-            return False
-        self._adopt(claimed)
-        return True
+        # A cursor owner already holds the write transaction: the same guarded stored-row check
+        # runs through it, and its failures propagate as save_loop(cursor=...) does.
+        return bool(self._mutate_current(apply, failure=False, tick_lifecycle=True))
 
     def _save_tick_outcome(self, fired_ticks: int, settle, *, expected_phase=None, owns_turn=None) -> bool:
         """Settle the fired tick on the stored loop inside one write transaction.
@@ -958,8 +990,10 @@ class LoopManager(LoopRevisionsMixin):
         definition survives while the tick still clears awaiting_response."""
         s = self._state
         if getattr(self, "_evaluation_snapshot", None) is not None:
-            # Staged by mutate_loop_snapshot: the snapshot CAS is the conditional write.
-            if s is None:
+            # Staged by mutate_loop_snapshot: the snapshot CAS is the conditional write, and the
+            # staged copy is the snapshot it validates, so the same outcome fence applies to it.
+            if not _tick_outcome_applies(s, getattr(s, "created_at", None), fired_ticks,
+                                         expected_phase, owns_turn):
                 return False
             settle(s)
             return True
@@ -972,52 +1006,22 @@ class LoopManager(LoopRevisionsMixin):
             self._mark_synced()
             return True
 
-        def write(conn) -> Optional[LoopState]:
-            row = conn.execute(
-                "SELECT value FROM state_meta WHERE key = ?", (_meta_key(self.session_id),)
-            ).fetchone()
-            stored = _parse_state(row[0]) if row and row[0] else None
-            if (
-                stored is None or stored.status != "active" or not stored.awaiting_response
-                or stored.created_at != s.created_at or stored.ticks_fired != fired_ticks
-                or (expected_phase is not None and stored.claim_phase != expected_phase)
-                or (owns_turn is not None and owns_turn())
-            ):
-                return None
-            settle(stored)
-            save_loop(self.session_id, stored, cursor=conn, tick_lifecycle=True)
-            return stored
+        instance = s.created_at
 
-        try:
-            settled = write(self._cursor) if self._cursor is not None else db._execute_write(write)
-        except Exception as exc:
-            if self._cursor is not None:
-                raise  # transaction owners must see failures, as save_loop(cursor=...) does
-            logger.debug("LoopManager: tick outcome write failed: %s", exc, exc_info=True)
-            return False
-        if settled is None and self._follow_compression():
-            # Compression migrated the loop (verbatim, same instance and tick) after this manager
-            # loaded it; the claim now lives on the continuation. Settle it there, under the same
-            # conditional fence, so an abandoned or completed tick never strands the child at
-            # awaiting_response. A user pause or stop on the child still rejects the outcome.
-            try:
-                settled = db._execute_write(write)
-            except Exception as exc:
-                logger.debug("LoopManager: tick outcome write failed: %s", exc)
+        def apply(stored: Optional[LoopState]) -> bool:
+            if not _tick_outcome_applies(stored, instance, fired_ticks, expected_phase, owns_turn):
                 return False
-        if settled is None:
-            self.refresh()
-            return False
-        self._adopt(settled)
-        return True
+            settle(stored)
+            return True
 
-    def _adopt(self, stored: LoopState) -> None:
-        """Publish a committed row in place so callers holding ``state`` observe it."""
-        if self._state is not None:
-            self._state.__dict__.update(stored.__dict__)
-        else:
-            self._state = stored
-        self._mark_synced()
+        if self._mutate_current(apply, failure=False, tick_lifecycle=True):
+            return True
+        # Compression migrated the loop (verbatim, same instance and tick) after this manager
+        # loaded it; the claim now lives on the continuation. Settle it there, under the same
+        # conditional fence, so an abandoned or completed tick never strands the child at
+        # awaiting_response. A user pause or stop on the child still rejects the outcome.
+        return self._follow_compression() and bool(
+            self._mutate_current(apply, failure=False, tick_lifecycle=True))
 
     def _follow_compression(self) -> bool:
         """Rebind this manager to a verified compression continuation holding the same loop."""

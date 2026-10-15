@@ -575,10 +575,11 @@ _REPLACE_REQUEST = "please replace the loop with replacement work now"
 
 
 def _public_loop_controls():
-    return sorted(
-        name for name in vars(loops.LoopManager)
+    # Inherited controls count too: revise and replace live on the revisions mixin.
+    return sorted({
+        name for cls in loops.LoopManager.__mro__[:-1] for name in vars(cls)
         if not name.startswith("_") and name not in _LOOP_NON_CONTROL_API
-    )
+    })
 
 
 def _route(source):
@@ -1521,6 +1522,7 @@ async def test_matching_compression_tip_rehomes_loop_without_losing_claim(contro
         else:
             assert parent.status == "cleared"
             assert child is not None
+            child.mutation_id = before.mutation_id  # every durable write gets a fresh token
             assert child.to_json() == before.to_json()
         assert not adapter._background_tasks  # migration never replays the in-flight tick
     finally:
