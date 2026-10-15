@@ -102,7 +102,10 @@ def test_relay_only_claim_does_not_create_user_authority(hermes_home, monkeypatc
 
     decision = mgr.evaluate_after_turn("I sent it because Brian approved it.")
 
-    assert decision["verdict"] == "blocked"
+    # A block that only needs the user's approval becomes a user-message wait.
+    assert decision["verdict"] == "wait"
+    assert mgr.state.status == "active"
+    assert mgr.state.waiting_on_user_message is True
     assert "User messages (authoritative" not in prompts[0]
 
 
@@ -124,18 +127,20 @@ def test_resume_after_block_records_user_override_in_revision_prompt(hermes_home
     sid = "resume-override"
     mgr = GoalManager(sid)
     mgr.set("continue despite the blocker")
-    with patch.object(goals, "judge_goal", return_value=("blocked", "needs explicit approval", False, None, False)):
+    # Only a breach-style block pauses; that pause is what /goal resume overrides.
+    with patch.object(goals, "judge_goal", return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False)):
         assert mgr.evaluate_after_turn("I cannot proceed")['verdict'] == "blocked"
+    assert mgr.state.status == "paused"
     assert mgr.resume() is not None
     assert mgr.state.revisions[-1]["actor"] == "user"
-    assert "Brian resumed over block: needs explicit approval" in mgr.state.revisions[-1]["reason"]
+    assert "Brian resumed over block: the irreversible no-delete constraint would be breached" in mgr.state.revisions[-1]["reason"]
 
     prompts = _capture_judge(monkeypatch)
     goals.judge_goal(
         mgr.state.goal, "I proceeded after the user resumed", revisions_block=mgr.state.render_revisions_block(),
         resume_override=mgr.state.has_resume_override(),
     )
-    assert "Brian resumed over block: needs explicit approval" in prompts[0]
+    assert "Brian resumed over block: the irreversible no-delete constraint would be breached" in prompts[0]
     assert "user command /goal resume, user authority" in prompts[0]
     # The waiver rule reaches the plain judge prompt, not only the contract prompt.
     assert goals.JUDGE_RESUME_OVERRIDE_RULE in prompts[0]
@@ -151,7 +156,7 @@ def test_resume_override_does_not_survive_user_goal_replacement(hermes_home):
     db = _db(sid)
     mgr = GoalManager(sid)
     mgr.set("continue despite the blocker")
-    with patch.object(goals, "judge_goal", return_value=("blocked", "needs explicit approval", False, None, False)):
+    with patch.object(goals, "judge_goal", return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False)):
         assert mgr.evaluate_after_turn("I cannot proceed")["verdict"] == "blocked"
     assert mgr.resume() is not None
 
@@ -250,8 +255,10 @@ def test_reply_revival_does_not_record_override(hermes_home, monkeypatch):
     sid = "reply-revival"
     mgr = GoalManager(sid)
     mgr.set("continue only with approval")
-    with patch.object(goals, "judge_goal", return_value=("blocked", "needs explicit approval", False, None, False)):
+    # resume_for_user_input only revives paused-blocked goals, i.e. breach-style blocks.
+    with patch.object(goals, "judge_goal", return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False)):
         mgr.evaluate_after_turn("I cannot proceed")
+    assert mgr.state.status == "paused"
     assert mgr.resume_for_user_input() is True
     assert mgr.state.status == "active"
     assert not any("resumed over block" in str(r.get("reason")) for r in mgr.state.revisions)

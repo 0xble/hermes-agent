@@ -667,13 +667,25 @@ class GatewayGoalsMixin:
         hooks = [("loop completion", self._post_turn_loop_completion,
                   {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
         if successful:
-            # A process or delegation result injected by the completion path is new evidence and
-            # may pierce the continuation gap, including one drained behind a goal continuation
-            # (the chain's terminal origin is copied onto the head event). Other autonomous wakes
-            # (/loop ticks, goal continuations, heartbeats) are paced. The marker is gateway-set
-            # metadata, never derived from message text.
+            # Any delivery into the session is fresh evidence and pierces a goal wait: process or
+            # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
+            # pacing wakes (continuations, /loop ticks, heartbeats) stay on the quiet ladder. The
+            # markers are gateway-set metadata, never derived from message text. A completion drained
+            # behind a continuation head keeps its origin on the head event.
             metadata = getattr(event, "metadata", None) or {}
-            external_event = metadata.get("notification_origin") == "process_registry_synthetic"
+            from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+            own_pacing_wake = is_internal and event is not None and (
+                self._is_goal_continuation_event(event)
+                or bool(metadata.get(LOOP_WAKE_METADATA_KEY))
+                or bool(getattr(event, "_heartbeat_session_id", None))
+                # Restart recovery re-runs an interrupted turn; it is not new outside evidence.
+                or getattr(event, "_restart_note_expected", None) is not None
+                or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
+            )
+            external_event = (
+                metadata.get("notification_origin") == "process_registry_synthetic"
+                or (is_internal and event is not None and not own_pacing_wake)
+            )
             # A queued chain is judged once, on its terminal turn's response (identity above).
             goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
             # A stamped continuation turn is judged only against the goal instance it served.
@@ -925,13 +937,9 @@ class GatewayGoalsMixin:
             mgr = GoalManager(
                 session_id=sid, default_max_turns=max_turns, min_continuation_gap_seconds=min_gap,
             )
-            notice = mgr.rearm_live_barrier()
-            return mgr, notice, mgr.lifted_barrier_prompt()
+            return mgr, mgr.lifted_barrier_prompt()
 
-        mgr, barrier_notice, prompt = await self._run_in_executor_with_context(_check)
-        if barrier_notice:
-            with suppress(Exception):
-                await self._send_goal_status_notice(source, barrier_notice, notice_kind="wait-age")
+        mgr, prompt = await self._run_in_executor_with_context(_check)
         if not prompt:
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
