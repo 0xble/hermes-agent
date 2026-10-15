@@ -318,7 +318,7 @@ class RestartRecoveryMixin:
 
     async def _dispatch_startup_restore_event(self, event, recovery_key: str) -> bool:
         """Separate adapter admission from a recovered follow-up's actual turn completion."""
-        recovered = getattr(event, "_hermes_recovered_followup", False) is True
+        recovered = getattr(event, "_hermes_recovery_session_key", None) is not None
         try:
             if getattr(event, "_hermes_recovered_declined", False) is True:
                 # Never auto-run an input recovery could not attribute or still trust: send the
