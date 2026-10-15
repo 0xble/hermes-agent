@@ -233,54 +233,13 @@ def test_failed_lifecycle_write_never_reports_success_or_changes_state(db, monke
     assert goals.load_goal(SID).to_json() == before
 
 
-@pytest.mark.parametrize("command,edited", COMMANDS, ids=[c for c, _ in COMMANDS])
-def test_stale_contract_command_preserves_live_silent_stall_counter(db, command, edited):
-    _seed()
-    stale = goals.GoalManager(SID)
-    live = goals.load_goal(SID)
-    live.consecutive_silent_no_progress = 2
-    goals.save_goal(SID, live)
-
-    result = _dispatch(stale, command)
-
-    stored = goals.load_goal(SID)
-    assert not result.error and edited(stored)
-    assert stored.consecutive_silent_no_progress == 2
-    assert stale.state.consecutive_silent_no_progress == 2
-
-
-def test_silent_stall_clear_is_staged_and_loses_to_concurrent_command(db, monkeypatch):
-    manager = _seed()
-    manager.state.max_turns = 0
-    manager.state.consecutive_silent_no_progress = 2
-    manager._save()
-    real_save = goals.GoalManager._save
-    seen = []
-
-    def race_at_stall_clear(evaluator):
-        if evaluator.state.status == "cleared" and not seen:
-            assert evaluator._evaluation_snapshot is not None
-            seen.append(True)
-            goals.GoalManager(SID).add_subgoal("Concurrent criterion")
-        return real_save(evaluator)
-
-    monkeypatch.setattr(goals.GoalManager, "_save", race_at_stall_clear)
-    decision = manager.evaluate_after_turn("[SILENT]", user_initiated=False)
-
-    stored = goals.load_goal(SID)
-    assert seen and decision["verdict"] == "interrupted"
-    assert stored.status == "active" and stored.consecutive_silent_no_progress == 2
-    assert "Concurrent criterion" in stored.subgoals
-    assert "Goal stopped" not in decision["message"]
-
-
-def test_resume_resets_live_silent_stall_counter(db):
+def test_resume_resets_no_progress_ladder(db):
     manager = _seed()
     live = goals.load_goal(SID)
-    live.consecutive_silent_no_progress = 2
+    live.consecutive_no_progress = 2
     goals.save_goal(SID, live)
 
     manager.resume()
 
-    assert goals.load_goal(SID).consecutive_silent_no_progress == 0
-    assert manager.state.consecutive_silent_no_progress == 0
+    assert goals.load_goal(SID).consecutive_no_progress == 0
+    assert manager.state.consecutive_no_progress == 0

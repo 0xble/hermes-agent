@@ -145,7 +145,7 @@ def test_revision_persistence_failure_is_not_ephemeral_success(tmp_path, monkeyp
         db.close()
 
 
-@pytest.mark.parametrize("operation", ["stop_waiting", "clear_lifted_wait", "rearm_live_barrier"])
+@pytest.mark.parametrize("operation", ["stop_waiting", "clear_lifted_wait"])
 def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch, operation):
     from contextlib import contextmanager
 
@@ -177,8 +177,7 @@ def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch
             monkeypatch.setattr(manager, "_save", checked_save)
             assert manager.stop_waiting()
         else:
-            target = ("clear_goal_wait_if_since" if operation == "clear_lifted_wait"
-                      else "rearm_goal_barrier_if_since")
+            target = "clear_goal_wait_if_since"
             write = getattr(goals, target)
 
             def checked_write(*args, **kwargs):
@@ -186,13 +185,7 @@ def test_wait_controls_serialize_with_snapshot_publication(tmp_path, monkeypatch
                 return write(*args, **kwargs)
 
             monkeypatch.setattr(goals, target, checked_write)
-            if operation == "clear_lifted_wait":
-                assert manager.clear_lifted_wait(manager.state.waiting_since)
-            else:
-                monkeypatch.setattr(goals, "_pid_alive", lambda _pid: True)
-                monkeypatch.setattr(goals.time, "time", lambda: manager.state.waiting_since + goals._MAX_BARRIER_WAIT_S + 1)
-                manager.rearm_live_barrier()
-                assert manager.state.barrier_rearms == 1
+            assert manager.clear_lifted_wait(manager.state.waiting_since)
         assert not entered
         assert manager.state.to_json() == goals.load_goal(manager.session_id).to_json()
     finally:

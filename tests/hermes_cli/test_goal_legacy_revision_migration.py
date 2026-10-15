@@ -221,16 +221,18 @@ def test_migration_write_failure_leaves_legacy_row_retryable_without_partial_per
     assert loaded.revisions[0]["legacy_binding_migrated"] is True
 
 
-def test_legacy_migration_preserves_silent_stall_counter(db):
+def test_legacy_migration_preserves_no_progress_ladder(db):
     legacy = _seed(db)
-    legacy.consecutive_silent_no_progress = 2
+    legacy.consecutive_no_progress = 2
+    legacy.backoff_level = 2
     db.set_meta("goal:legacy", legacy.to_json())
 
     migrated = goals.load_goal("legacy")
 
-    assert migrated.consecutive_silent_no_progress == 2
+    assert migrated.consecutive_no_progress == migrated.backoff_level == 2
     assert OLD_CHECK in migrated.contract.verification
-    assert json.loads(db.get_meta("goal:legacy"))["consecutive_silent_no_progress"] == 2
+    stored = json.loads(db.get_meta("goal:legacy"))
+    assert stored["consecutive_no_progress"] == stored["backoff_level"] == 2
 
 
 @pytest.mark.parametrize("stale_manager", [False, True])

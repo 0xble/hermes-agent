@@ -256,6 +256,7 @@ class GoalRevisionsMixin:
         state.backoff_level = 0
         state.last_progress_fingerprint = None
         state.last_verdict = None
+        state.last_reason = None
         revision = {"at": time.time(), "actor": "user", "kind": "replace", "reason": reason,
                     "authority": authority.get("via") if approved else "explicit_command",
                     "user_quote": user_quote if approved else "",

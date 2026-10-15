@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from hermes_cli import goals
@@ -109,6 +109,9 @@ def _turn_event(src, text, *, internal, origin=None, loop_wake=False):
     if loop_wake:
         from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
         metadata[LOOP_WAKE_METADATA_KEY] = True
+    if goals.is_goal_continuation_text(text):
+        # The gateway marks the continuations it enqueues; classification reads that provenance.
+        metadata[GOAL_CONTINUATION_METADATA_KEY] = True
     return MessageEvent(text=text, message_type=MessageType.TEXT, source=src, internal=internal, metadata=metadata)
 
 

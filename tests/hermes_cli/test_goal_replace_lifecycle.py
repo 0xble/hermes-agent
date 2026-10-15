@@ -110,11 +110,6 @@ def _blocked(manager):
     manager.state.paused_reason = goals._BLOCKED_PAUSE_PREFIX + "needs the API key"
 
 
-def _disputed(manager):
-    manager.state.last_verdict = "continue"
-    manager.state.paused_reason = goals._DISPUTED_PAUSE_PREFIX + "no proof the audit passed"
-
-
 def _budget(manager):
     manager.state.turns_used = manager.state.max_turns = 2
     manager.state.paused_reason = "turn budget exhausted (2/2)"
@@ -126,7 +121,6 @@ def _reason(text):
 
 PAUSES = [
     ("blocked", _blocked, True),
-    ("disputed", _disputed, True),
     ("user", _reason("user-paused"), False),
     ("stop", _reason("user-interrupted (/stop)"), False),
     ("ctrl-c", _reason("user-interrupted (Ctrl+C)"), False),

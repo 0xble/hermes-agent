@@ -49,29 +49,6 @@ def test_revision_validation(hermes_home):
 
 
 
-def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
-    mgr = GoalManager(session_id="rev-roundtrip")
-    mgr.set("Ship X", max_turns=100)
-    assert mgr.state is not None
-    mgr.state.consecutive_disputes = 2
-    goals.save_goal("rev-roundtrip", mgr.state)
-    assert mgr.revise(reason="clarify", contract={"outcome": "X live"})["ok"]
-    assert mgr.state.consecutive_disputes == 0
-    state = load_goal("rev-roundtrip")
-    assert state is not None
-    assert goals.GoalState.from_json(state.to_json()).revisions == state.revisions
-
-
-
-def test_legacy_state_without_revisions_loads():
-    legacy = json.dumps({"goal": "g", "status": "active", "turns_used": 3})
-    state = goals.GoalState.from_json(legacy)
-    assert state.revisions == [] and state.last_dispute_evidence == ""
-    assert state.goal == "g" and state.turns_used == 3
-    assert state.contract.is_empty()
-
-
-
 def test_citations_far_apart_in_one_result_each_get_an_excerpt(hermes_home):
     sid = "cite-far"
     db = _db(sid)
@@ -87,23 +64,6 @@ def test_citations_far_apart_in_one_result_each_get_an_excerpt(hermes_home):
     excerpted = [c["excerpt"] for c in result["cited"] if not c["excerpt"].startswith("(inside")]
     assert any("proof_start=aaaa1111" in e for e in excerpted)
     assert any("proof_end=bbbb2222" in e for e in excerpted)
-
-
-
-DISPUTED = ("continue", "tests missing", False, {"disputed": True}, False)
-
-
-def test_rewording_or_dropping_citations_is_not_new_evidence(hermes_home):
-    mgr = GoalManager(session_id="dispute-reword")
-    mgr.set("ship", max_turns=100)
-    # Alternate: cite result 7, cite nothing, cite result 7 through other wording.
-    # The fingerprint key carries each turn's differing citation wording.
-    seq = iter([{"cited": [], "unresolved": [], "evidence_ids": ids, "fingerprint": fp}
-                for ids, fp in ((["7"], "7:proof a"), ([], ""), (["7"], "7:proof b"))])
-    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
-            patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(seq)):
-        decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
-    assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]
 
 
 
