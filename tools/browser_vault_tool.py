@@ -1092,6 +1092,20 @@ def _confirm_alias_fill(label: str, origin: str, saved_origins: tuple[str, ...])
 # Schemas + registration
 # ---------------------------------------------------------------------------
 
+BROWSER_VAULT_LIST_SCHEMA = {
+    "name": "browser_vault_list",
+    "description": "List saved vault items without returning secret values.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["login", "payment", "address", "protected_field"]},
+            "origin": {"type": "string"},
+        },
+        "required": [],
+    },
+}
+
+
 BROWSER_VAULT_SCHEMA = {
     "name": "browser_vault",
     "description": (
@@ -1120,6 +1134,51 @@ BROWSER_VAULT_SCHEMA = {
         "required": ["action"],
     },
 }
+
+
+def _private_protected_field_refusal(task_id: str, browser_key: str) -> str | None:
+    """Only an owned, locally spawned Chromium session with no shared CDP route is safe."""
+    from tools import browser_tool as bt
+    from tools.browser_camofox import is_camofox_mode
+    from tools.browser_tool_cdp import _get_cdp_override
+    from tools.browser_tool_session import _shares_bot_desktop_browser
+
+    key = browser_key if bt._last_session_key(task_id) == browser_key else None
+    with bt._cleanup_lock:
+        session = bt._active_sessions.get(key) if key else None
+    features = (session or {}).get("features") or {}
+    private = (
+        not is_camofox_mode()
+        and not _get_cdp_override()
+        and session is not None
+        and session.get("session_key") == key
+        and session.get("owner_task_id") == task_id
+        and bool(session.get("session_name"))
+        and features.get("local") is True
+        and not any(features.get(flag) for flag in ("real_profile", "lightpanda", "cdp_override"))
+        and not session.get("cdp_url")
+        and not session.get("bb_session_id")
+        and not _shares_bot_desktop_browser(session)
+    )
+    if private:
+        return None
+    return json.dumps({
+        "success": False,
+        "error_type": "private_browser_required",
+        "error": "Birth-date fills only run in a private per-task local browser. "
+                 "This browser may be shared with another task or process (Camofox accounts, "
+                 "attached/CDP, Bot Desktop, cloud and unverified sessions are refused). "
+                 "Navigate in a fresh local browser session for this task first.",
+    })
+
+
+def _handle_vault_list(args: dict[str, Any], **kwargs) -> str:
+    return browser_vault_list(kind=args.get("kind"), origin=args.get("origin"))
+
+
+def _handle_vault_fill(args: dict[str, Any], **kwargs) -> str:
+    tid = kwargs.get("task_id")
+    return _fenced_page_op(tid, lambda: browser_vault_fill(handle=str(args.get("handle") or ""), task_id=tid))
 
 
 def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
@@ -1162,6 +1221,16 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
 from tools.registry import no_cache_check_fn, registry
 
 _check_vault_available = no_cache_check_fn(_check_vault_available)
+
+registry.register(
+    name="browser_vault_list",
+    toolset="browser",
+    schema=BROWSER_VAULT_LIST_SCHEMA,
+    handler=_handle_vault_list,
+    check_fn=_check_vault_available,
+    emoji="🔐",
+)
+
 
 registry.register(
     name="browser_vault",

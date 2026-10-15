@@ -119,6 +119,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             )
 
 
+    @staticmethod
+    def _start_free_tier_bootstrap() -> None:
+        """Run the one-per-process free-tier identity bootstrap; it records failures itself."""
+        from hermes_cli.free_tier_bootstrap import run_bootstrap
+        run_bootstrap(announce=False)
+
     def _start_startup_warmup(self) -> None:
         """Kick off the boot turn-machinery warm-up so it overlaps the network-bound platform
         connects; ``_finish_startup_restore`` awaits it (bounded)."""
@@ -146,6 +152,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 logger.debug("multiplex launch-scope entry failed for boot probe %s; running unscoped",
                              getattr(fn, "__name__", fn), exc_info=True)
         return await loop.run_in_executor(None, copy_context().run, fn)
+
+    async def _run_free_tier_bootstrap(self) -> None:
+        """Run free-tier identity bootstrap under the same launch-profile scope as warm-ups."""
+        await self._run_boot_probe_in_launch_scope(self._start_free_tier_bootstrap)
 
     async def _warm_turn_prerequisites(self) -> None:
         """Initialize turn machinery on an executor thread before the gate opens. Never raises: a
