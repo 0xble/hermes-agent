@@ -165,6 +165,8 @@ def test_control_socket_client_round_trip(tmp_path):
     assert not thread.is_alive()
 
 
-def test_zero_cut_drill_labels(tmp_path, monkeypatch):
+def test_drill_home_gets_its_own_slot_labels_not_the_live_ones(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes-zero-cut"))
-    assert get_launchd_slot_labels() == ("ai.hermes.gateway.zero-cut", "ai.hermes.gateway.zero-cut.b")
+    active, standby = get_launchd_slot_labels()
+    assert active.startswith("ai.hermes.gateway-") and active != "ai.hermes.gateway"
+    assert standby == f"{active}.b"
