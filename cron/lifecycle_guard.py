@@ -372,6 +372,10 @@ _STRING_COMMAND_OPTIONS = {
     "runuser": ("-c", "--command", "--session-command"),
 }
 
+# Wrappers whose trailing arguments reach a shell (util-linux ``run_shell`` passes everything after
+# the user operand, including after ``--``); their command-string scan is never bounded.
+_SHELL_TAIL_WRAPPERS = frozenset({"su", "runuser"})
+
 # Wrappers whose first non-option operand is a VALUE, not the command (`timeout 60 bash x.sh`).
 _TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
 
@@ -1151,6 +1155,81 @@ def _iter_option_values(
         position += 1
 
 
+def _sudo_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when sudo's options before *end* may include ``-s``/``-i`` (shell mode).
+
+    Deliberately generous: any ``s``/``i`` in a short-option token counts, so an attached value
+    such as ``-usi`` over-flags rather than hiding a shell-mode payload.
+    """
+    for token in segment[start + 1:end]:
+        if token in {"--shell", "--login"}:
+            return True
+        if token.startswith("-") and not token.startswith("--") and ("s" in token or "i" in token):
+            return True
+    return False
+
+
+def _doas_shell_mode(segment: list[str], start: int, end: int) -> bool:
+    """True when doas has selected shell mode (``-s``) before its command tail."""
+    return any(token == "-s" or (token.startswith("-") and not token.startswith("--") and "s" in token)
+               for token in segment[start + 1:end])
+
+
+def _runuser_command_mode(segment: list[str], start: int) -> bool:
+    """True only when runuser provably runs ``-u USER COMMAND`` (execvp, no shell).
+
+    Any unknown option leaves the mode unproven, so the caller keeps the fail-closed shell reading.
+    """
+    position = start + 1
+    while position < len(segment):
+        token = segment[position]
+        if token == "--":
+            return False
+        matched_option, _, option_end = _getopt_value_option(segment, position, "runuser")
+        if matched_option in {"-u", "--user"}:
+            return True
+        if matched_option is None and token.startswith("-") and token != "-" and \
+                not _getopt_token_recognized(token, "runuser"):
+            return False
+        position = option_end if matched_option is not None else position + 1
+    return False
+
+
+def _iter_shell_tail_payloads(segment: list[str], start: int) -> Iterator[str]:
+    """Yield every possible shell payload of an su/runuser invocation at *start*.
+
+    util-linux su/runuser parse with a permuting ``getopt_long`` (``-c`` may follow the user
+    operand), and ``run_shell`` hands every argument left after the user, including everything
+    after ``--``, to the target shell. No token after the wrapper is a safe stop, so the option scan
+    is unbounded and, unless ``runuser -u`` provably execs a command directly, every later token
+    (and every attached ``-c``/``--command=`` value) is scanned as shell source.
+    """
+    name = _executable_name(segment[start])
+    seen: set[str] = set()
+
+    def once(value: str) -> Iterator[str]:
+        if value and value not in seen:
+            seen.add(value)
+            yield value
+
+    for option in _STRING_COMMAND_OPTIONS.get(name, ()):
+        for value in _iter_option_values(segment, start, option):
+            yield from once(value)
+    if name == "runuser" and _runuser_command_mode(segment, start):
+        return
+    for token in segment[start + 1:]:
+        yield from once(token)
+        if token.startswith("--"):
+            _, separator, attached = token.partition("=")
+            if separator:
+                yield from once(attached)
+        elif token.startswith("-"):
+            # Clustered/attached short forms: ``-c{cmd}``, ``-fc{cmd}``, ``-lc{cmd}``.
+            for offset, character in enumerate(token[1:], start=2):
+                if character == "c":
+                    yield from once(token[offset:])
+
+
 def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
     """Yield the scripts the token at *index* executes, if any."""
     if index >= len(segment):
@@ -1275,17 +1354,35 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
         for position_index, position in enumerate(positions):
             if position >= len(segment):
                 continue
-            # Bound the option scan only at a proven boundary: every option before it was
-            # recognized (or ended by ``--``). Otherwise an unknown value-taking option could make
-            # its value look like the command and hide a later ``-S``/``-c``; scan to segment end.
-            proven = position_index < len(boundaries) and boundaries[position_index]
-            stop = positions[position_index + 1] if proven and position_index + 1 < len(positions) else None
-            for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[position]), ()):
+            name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
+            next_position = positions[position_index + 1] if position_index + 1 < len(positions) else None
+            if name == "sudo" and next_position is not None and _sudo_shell_mode(segment, position, next_position):
+                # ``sudo -s|-i CMD...`` joins its operands into ``$SHELL -c``; scan each one as source.
+                yield from segment[next_position:]
+            if name == "doas" and next_position is not None and _doas_shell_mode(segment, position, next_position):
+                # ``doas -s CMD...`` likewise feeds its command tail to a shell.
+                yield from segment[next_position:]
+            # Bound the option scan only where the program itself stops parsing options: a proven
+            # boundary (every option before it recognized, or ended by ``--``) whose next token is
+            # a real command name. An option-shaped "command" (``env -i -- -S ...``) is not proven.
+            proven = (
+                position_index < len(boundaries) and boundaries[position_index]
+                and next_position is not None and next_position < len(segment)
+                and not segment[next_position].startswith("-")
+            )
+            stop = next_position if proven else None
+            for option in _STRING_COMMAND_OPTIONS.get(name, ()):
                 yield from _iter_option_values(segment, position, option, stop=stop)
         ambiguous = _ambiguous_positions(segment, positions, boundaries)
         for position in ambiguous:
             # Any later token may be the real command: treat each wrapper/shell there unbounded.
             name = _executable_name(segment[position])
+            if name in _SHELL_TAIL_WRAPPERS:
+                yield from _iter_shell_tail_payloads(segment, position)
+                continue
             for option in _STRING_COMMAND_OPTIONS.get(name, ()):
                 yield from _iter_option_values(segment, position, option)
             if name in _SHELL_EXECUTABLES:

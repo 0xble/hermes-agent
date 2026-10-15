@@ -368,3 +368,56 @@ def test_natural_heavy_slot_peel_reaches_wrapped_script(tmp_path, trusted_slot):
         + [str(trusted_slot), "--label", "proof", "--", "nohup", "bash", str(restart)]
     )
     assert scan_gateway_lifecycle(command) == (True, None)
+
+
+# util-linux su/runuser permute options (``-c`` may follow operands) and hand everything after the
+# user operand, including after ``--``, to the target shell: no token is a safe scan stop.
+_SHELL_TAIL_PAYLOAD_TAILS = [
+    "su -- root -c {payload}",
+    "su root -- -c {payload}",
+    "su - root -- -c {payload}",
+    "su -l root -- -c {payload}",
+    "su root -- -lc {payload}",
+    "su root -- extra -c {payload}",
+    "runuser root -- -c {payload}",
+    "runuser -- root -c {payload}",
+    "sudo -u root -- su root -- -c {payload}",
+    "sudo su root extra -c {payload}",
+    "su root extra -c {payload}",
+    "runuser root extra -c {payload}",
+    "su root extra --command={payload}",
+    "su root extra --command {payload}",
+    "su root x --session-command {payload}",
+    "su root x --session-command={payload}",
+    "su root -- {payload}",
+    "env -i -- -S {payload}",
+    "sudo -s {payload}",
+    "sudo -i {payload}",
+    "sudo -u root -s -- {payload}",
+]
+
+
+@pytest.mark.parametrize("tail", _SHELL_TAIL_PAYLOAD_TAILS)
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_su_runuser_trailing_and_double_dash_payloads_are_scanned(
+    tmp_path, trusted_slot, tail, prefix,
+):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    command = f"{prefix.format(trusted=trusted_slot)}{tail.format(payload=payload)}"
+    assert scan_gateway_lifecycle(command) == (True, None), command
+
+
+@pytest.mark.parametrize("tail", [
+    "su -- root -c 'printf ok'",
+    "su root -- -c 'printf ok'",
+    "su root extra -c 'printf ok'",
+    "runuser root -- -c 'printf ok'",
+    "sudo -s 'printf ok'",
+    "su - root",
+    "runuser -u bob -- ls -l",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_su_runuser_trailing_benign_payloads_are_allowed(trusted_slot, tail, prefix):
+    command = f"{prefix.format(trusted=trusted_slot)}{tail}"
+    assert scan_gateway_lifecycle(command) == (False, None), command
