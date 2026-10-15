@@ -246,6 +246,11 @@ def _owns_subagent_record(record: Dict[str, Any], parent_agent: Any) -> bool:
     # Compression rotation on either side: compare lineage tips.
     return _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, _resolve_session_lineage(parent_sid, parent_agent)}
 
+def _now() -> float:
+    """Wall clock for list observations; a module seam so tests never patch the time module."""
+    return time.time()
+
+
 def _list_payload(parent_agent: Any) -> Dict[str, Any]:
     with _active_subagents_lock:
         records = list(_active_subagents.values())
@@ -259,8 +264,8 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
             "parent_id": r.get("parent_id"),
             "goal": r.get("goal"),
             "model": r.get("model"),
-            "status": r.get("status"),
-            "running_seconds": round(time.time() - started, 1) if isinstance(started, (int, float)) else None,
+            "status": r.get("status"), "tool_count": r.get("tool_count", 0),
+            "running_seconds": round(_now() - started, 1) if isinstance(started, (int, float)) else None,
             "accepting_steer": bool(r.get("accepting_steer", False)),
             "live_transcript": getattr(r.get("agent"), "_live_transcript_path", None),
         })
@@ -281,7 +286,7 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
                 "goal": r.get("goal"),
                 "model": r.get("model"),
                 "status": "queued",
-                "running_seconds": round(time.time() - (r.get("queued_at") or r.get("dispatched_at") or time.time()), 1),
+                "running_seconds": round(_now() - (r.get("queued_at") or r.get("dispatched_at") or _now()), 1),
                 "accepting_steer": False,
                 "live_transcript": None,
                 "queue_reason": r.get("queue_reason", "async pool capacity"),
@@ -442,10 +447,10 @@ def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
 
 
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop/resume. Runs in-turn (never backgrounded) over the
-    same registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+    """In-turn list/steer/stop/resume, scoped to the conversation's spawn tree."""
     if action == "list":
-        return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+        from tools.delegate_tool_progress import _list_observation
+        return json.dumps(_list_observation(parent_agent, _list_payload(parent_agent)), ensure_ascii=False)
     if action == "resume":
         return _handle_resume_action(subagent_id, parent_agent)
 
