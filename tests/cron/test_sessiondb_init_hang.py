@@ -145,7 +145,7 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, _output, final_response, _error = run_job(job)
+            success, _output, final_response, error = run_job(job)
 
         # Env-resolved bound was passed to Future.result — not the 10s default,
         # and not an unbounded call.
@@ -187,9 +187,7 @@ class TestSessionDbInitTimeout:
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            success, _output, _final_response, _error = run_job(job)
-
-        # Config value was passed through — not the 10s default.
+            success, _output, _final_response, error = run_job(job)
         assert timeouts == [0.2] * 3
         assert success is False
         assert "session store unavailable; run not started" in error
