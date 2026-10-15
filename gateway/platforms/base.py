@@ -2000,6 +2000,9 @@ class BasePlatformAdapter(ABC):
     supports_code_blocks: bool = False
     # Typing indicator renders TEXT (status line); the gateway then feeds set_status_text().
     supports_status_text: bool = False
+    # Platform adapters may override the regular typing heartbeat cadence. Telegram narrows this
+    # from its own Bot API expiry window; every other adapter keeps the historical 2s default.
+    typing_refresh_interval: float = 2.0
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat. In-memory only: the
@@ -3598,6 +3601,15 @@ class BasePlatformAdapter(ABC):
             cleaned = cleaned.replace(raw, '')
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
+    def _typing_tick_retry_delay(self, result: Any, *, timed_out: bool, failed: bool) -> Optional[float]:
+        """Seconds before retrying one ``_keep_typing`` tick, or ``None`` to wait for the next tick.
+        The 2s default cadence already re-covers a missed tick, so the base adapter never retries."""
+        return None
+
+    def _typing_tick_anchor_before_send(self) -> bool:
+        """Whether a typing tick's deadline starts before its send request."""
+        return False
+
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
                            stop_event: asyncio.Event | None = None) -> None:
         """Refresh the typing indicator every ``interval`` seconds until cancelled (platform typing
@@ -3605,23 +3617,44 @@ class BasePlatformAdapter(ABC):
         setStatus disables the compose box). Each ``send_typing`` is bounded by a sub-interval
         timeout so one slow round-trip is abandoned before the next tick, not the bubble lapsing."""
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
+                deadline = loop.time() + interval if self._typing_tick_anchor_before_send() else None
                 if chat_id not in self._typing_paused:
-                    try:
-                        await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
-                                               timeout=_send_typing_timeout)
-                    except TimeoutError:
-                        pass  # Slow network — abandon this tick, stay on schedule.
-                    except Exception as typing_err:
-                        logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                    retry_used = False
+                    while True:
+                        timed_out = failed = False
+                        result = None
+                        try:
+                            result = await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
+                                                           timeout=_send_typing_timeout)
+                        except TimeoutError:
+                            timed_out = True
+                        except Exception as typing_err:
+                            failed = True
+                            logger.debug("[%s] send_typing error (non-fatal): %s", self.name, typing_err)
+                        if deadline is None:
+                            deadline = loop.time() + interval
+                        retry_delay = self._typing_tick_retry_delay(
+                            result, timed_out=timed_out, failed=failed)
+                        # Retry only if the sleep plus a full bounded send still ends before the
+                        # next regular tick; otherwise low intervals send two actions back to back.
+                        remaining = deadline - loop.time()
+                        if (retry_used or retry_delay is None
+                                or remaining <= retry_delay + _send_typing_timeout):
+                            break
+                        retry_used = True
+                        await asyncio.sleep(retry_delay)
+                        if (stop_event is not None and stop_event.is_set()) or chat_id in self._typing_paused:
+                            break
+                if deadline is None:
+                    deadline = loop.time() + interval
                 if stop_event is None:
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0.0, deadline - loop.time()))
                     continue
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + interval
                 while not stop_event.is_set():
                     remaining = deadline - loop.time()
                     if remaining <= 0:
@@ -3632,6 +3665,10 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
+            cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+            if cancel_retrigger is not None:
+                with contextlib.suppress(Exception):
+                    cancel_retrigger(chat_id, metadata)
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
             self._typing_paused.discard(chat_id)
@@ -3642,6 +3679,10 @@ class BasePlatformAdapter(ABC):
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
+        cancel_retrigger = getattr(self, "_cancel_typing_retrigger", None)
+        if cancel_retrigger is not None:
+            with contextlib.suppress(Exception):
+                cancel_retrigger(chat_id, metadata)
         self._typing_paused.add(chat_id)
         try:
             if typing_task is not None and not typing_task.done():
@@ -4999,7 +5040,7 @@ class BasePlatformAdapter(ABC):
         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
         if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
             return None
-        kwargs: dict[str, Any] = {"metadata": metadata}
+        kwargs: dict[str, Any] = {"interval": self.typing_refresh_interval, "metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event
         return asyncio.create_task(self._keep_typing(event.source.chat_id, **kwargs))
