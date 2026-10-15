@@ -993,6 +993,9 @@ def _loop_fire_runner(runner, *, accept=True):
 
     async def handle(event):
         event._gateway_accepted = accept
+        if event.text.lstrip().startswith("/"):
+            # This fake handler represents the adapter's inline command dispatch receipt.
+            event._gateway_inline_command_handled = True
 
     runner.adapter.handle_message = AsyncMock(side_effect=handle)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: runner.adapter}
@@ -1015,8 +1018,8 @@ async def _fire_then_compress(runner, state, prompt):
     manager._save()
     real_fire = LoopManager.fire_tick
 
-    def fire_then_compress(self):
-        wakeup = real_fire(self)
+    def fire_then_compress(self, run_generation=0, *, can_claim=None):
+        wakeup = real_fire(self, run_generation, can_claim=can_claim)
         _rotate_wake(state, "loop")  # compression lands between the claim and admission
         return wakeup
 
@@ -1051,20 +1054,25 @@ async def test_admission_follows_loop_migrated_after_fire_tick_and_settles_on_ch
 
 
 @pytest.mark.asyncio
-async def test_admission_refused_after_compression_rolls_back_the_child_claim(state):
+async def test_admission_refused_after_compression_skips_the_child_claim(state):
     from hermes_cli.loops import LoopManager, load_loop
 
     runner = _loop_fire_runner(_runner(state), accept=False)
     await _fire_then_compress(runner, state, "check the queue")
     runner.adapter.handle_message.assert_awaited_once()
     child = load_loop("compression-child")
-    assert child.awaiting_response is False
-    assert child.ticks_fired == 0
+    # fire_tick atomically starts the tick before admission. A later adapter refusal therefore
+    # leaves the started tick for recovery, which skips it without replaying or refunding it.
+    assert child.awaiting_response is True
+    assert child.ticks_fired == 1
     manager = LoopManager("compression-child")
+    assert manager.recover_tick()
+    child = load_loop("compression-child")
+    assert child.awaiting_response is False and child.ticks_fired == 1
     manager.state.next_due_at = 0
     manager._save()
-    assert manager.fire_tick()  # the next scan fires the tick again
-    assert load_loop("compression-child").ticks_fired == 1
+    assert manager.fire_tick()  # the next cadence fires a fresh tick
+    assert load_loop("compression-child").ticks_fired == 2
 
 
 @pytest.mark.asyncio

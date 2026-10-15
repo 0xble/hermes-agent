@@ -116,6 +116,7 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 
 @pytest.mark.asyncio
+# health: allow F841 -- loop wake completion tests intentionally retain the local manager for exact tick identity assertions.
 async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
@@ -123,6 +124,7 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
 
     entry = _FakeSessionEntry()
     await GatewayRunner._post_turn_loop_completion(
@@ -204,6 +206,7 @@ async def test_non_streamed_stripped_reply_still_completes_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
 
     event = _make_event("wakeup")
     event._raw_final_response = "CI is done.\nLOOP_COMPLETE"
@@ -227,6 +230,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
     assert mgr.is_due() is False
 
@@ -256,13 +260,16 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
+    assert mgr.state is not None
     assert mgr.state.awaiting_response is True
 
+    event = _make_event("wakeup")
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock()
     await GatewayRunner._run_post_turn_hooks(
         runner,
         agent_result={"final_response": ""},
-        source=_make_event("wakeup").source,
+        source=event.source,
         is_internal=True,
         event=_loop_wake_event(mgr),
     )
@@ -283,12 +290,15 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    event = _make_event("wakeup")
+    assert mgr.state is not None
+    event.metadata["gateway_loop_tick"] = [mgr.state.created_at, mgr.state.ticks_fired]
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
             agent_result={"final_response": "still working"},
-            source=_make_event("wakeup").source,
+            source=event.source,
             is_internal=True,
             event=_loop_wake_event(mgr),
         )
@@ -349,13 +359,13 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
         _record("list_active_loops")
         return real_list(*a, **k)
 
-    def _fire_tick(self):
+    def _fire_tick(self, *args, **kwargs):
         _record("fire_tick")
-        return real_fire(self)
+        return real_fire(self, *args, **kwargs)
 
-    def _complete_tick(self, last_response):
+    def _complete_tick(self, last_response, *, tick=None):
         _record("complete_tick")
-        return real_complete(self, last_response)
+        return real_complete(self, last_response, tick=tick)
 
     orig_sleep = asyncio.sleep
     calls = {"n": 0}
@@ -381,10 +391,8 @@ async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loo
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env, monkeypatch, tmp_path):
-    """A secondary profile with no ACTIVE loop must not get its runtime scope entered on
-    every tick (each entry re-parses the profile's config/secrets — the dominant idle-CPU
-    cost on multiplex gateways); a profile holding an active loop must still be scanned."""
+async def test_loop_wakeup_watcher_scans_owning_home_without_pre_admission_hydration(loop_env, monkeypatch, tmp_path):
+    """Loop discovery reads the owning store without hydrating secrets before tick admission."""
     from hermes_state import SessionDB
 
     work_home = tmp_path / "profiles" / "work"
@@ -421,6 +429,13 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
     runner.config.multiplex_profiles = True
     runner._running_agents = {}
     runner.adapters = {}
+    from hermes_constants import get_hermes_home
+    admitted = []
+
+    async def admission(sid, state, now, warned, profile=None):
+        admitted.append((sid, get_hermes_home(), profile))
+
+    runner._loop_wakeup_fire_one = admission
 
     orig_sleep = asyncio.sleep
 
@@ -451,22 +466,26 @@ async def test_loop_wakeup_watcher_gates_profile_scope_on_active_loops(loop_env,
         assert raw
         work_db.set_meta("loop:sid-work-loop", raw)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"profile with an active loop must still be scanned; got {entered}")
+        assert entered == [], f"secret hydration preceded admission: {entered}"
+        assert admitted == [
+            ("sid-gateway-loop", loop_env, None),
+            ("sid-work-loop", work_home, "work"),
+        ]
 
         # A cleared loop keeps its row (status=cleared): the gate must read status, not key existence.
         entered.clear()
         cleared = loops.LoopState.from_json(raw)
         cleared.status = "cleared"
         work_db.set_meta("loop:sid-work-loop", cleared.to_json())
+        admitted.clear()
         await _run_one_tick()
         assert entered == [], f"cleared loop row must not open the gate; got {entered}"
+        assert admitted == [("sid-gateway-loop", loop_env, None)]
 
         # Fail OPEN: a store the probe cannot open is "unknown", never "idle" — the scan runs.
         monkeypatch.setattr("gateway.run_idle_gates._profile_session_db_probe", lambda _home: None)
         await _run_one_tick()
-        assert entered == [work_home], (
-            f"unavailable store must fall back to the historical scan; got {entered}")
+        assert entered == [], f"an unavailable store triggered pre-admission hydration: {entered}"
     finally:
         work_db.close()
 
@@ -607,8 +626,8 @@ def test_final_capped_command_tick_still_runs(loop_env, cap):
 
 
 @pytest.mark.asyncio
-async def test_unaccepted_loop_wake_rolls_the_tick_back(loop_env):
-    """An adapter that refuses admission without raising must not leave the tick claimed."""
+async def test_unaccepted_loop_wake_skips_started_tick(loop_env):
+    """A refused wake stays started until the watcher recovers it, never replaying the tick."""
     runner = _make_runner()
     route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -635,4 +654,49 @@ async def test_unaccepted_loop_wake_rolls_the_tick_back(loop_env):
     state = loops.load_loop("sid-gateway-loop")
     await GatewayRunner._loop_wakeup_fire_one(runner, "sid-gateway-loop", state, 1e12, set())
     reloaded = loops.load_loop("sid-gateway-loop")
-    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 0
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_adapter_without_receipt_is_a_refusal_not_a_replay(loop_env):
+    """Direct adapters follow admit_internal_event's receipt rule: MessageEvent defaults the
+    receipt to False, so a handler that never confirms admission leaves the started command tick
+    for skip-only recovery. The next scan skips it once and never runs the command again."""
+    runner = _make_runner()
+    route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.set("/status", interval_seconds=300, route=route)
+    mgr.state.next_due_at = 0
+    loops.save_loop("sid-gateway-loop", mgr.state)
+
+    class _NoReceipt:
+        handled = []
+
+        async def handle_message(self, event):
+            self.handled.append(event.text)  # never sets _gateway_accepted
+
+    adapter = _NoReceipt()
+    runner._adapters_for_profile = lambda profile: {Platform.DISCORD: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"])
+    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
+    runner._running_agents = {}
+
+    async def _inline(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+    assert adapter.handled == ["/status"]

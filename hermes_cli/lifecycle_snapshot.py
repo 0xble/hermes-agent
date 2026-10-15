@@ -26,9 +26,14 @@ def commit_and_publish_snapshot(
     run inside that boundary; never publish over their changed in-memory state.
     Return whether the staged snapshot still won, so evaluators can suppress a
     superseded continuation or settlement message as well as stale state.
+
+    Stored-row commands derive their staged row inside the write transaction: they pass
+    ``staged=None`` and ``commit`` returns the row it wrote (or validated unchanged).
     """
     with manager._snapshot_lock:
-        commit()
+        committed = commit()
+        if staged is None:
+            staged = committed
         original = manager.state
         expected_memory = original.to_json() if original is not None else None
         winner = read()
@@ -37,7 +42,7 @@ def commit_and_publish_snapshot(
         ):
             manager._state = winner
             return False
-        if winner is not None and winner.to_json() == staged.to_json():
+        if winner is not None and staged is not None and winner.to_json() == staged.to_json():
             if preserve_reference and original is not None:
                 original.__dict__.update(staged.__dict__)
                 manager._state = original
