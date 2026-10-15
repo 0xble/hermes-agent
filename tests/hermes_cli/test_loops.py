@@ -793,6 +793,31 @@ class TestTickLifecycle:
         assert mgr.state.next_due_at >= time.time() + _NO_PROGRESS_BACKOFF_S[0] - 1
         assert "unachievable" in decision["message"]
 
+    def test_until_judge_blocked_honors_times_cap(self, hermes_home):
+        from hermes_cli.loops import LoopManager
+
+        mgr = LoopManager(session_id="t11b-cap-times")
+        state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green", times=1)
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
+            decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
+        assert decision["stopped"] is True
+        assert decision["status"] == "done"
+
+    def test_until_judge_blocked_honors_max_ticks_cap(self, hermes_home, monkeypatch):
+        from hermes_cli.loops import LoopManager
+
+        monkeypatch.setattr("hermes_cli.loops.max_ticks_default", lambda: 1)
+        mgr = LoopManager(session_id="t11b-cap-max")
+        state = mgr.set("poll", interval_seconds=300, until="the deleted repo's CI is green")
+        state.next_due_at = time.time() - 1
+        mgr.fire_tick()
+        with patch("hermes_cli.goals.judge_goal", return_value=("blocked", "repo no longer exists", False, None, False)):
+            decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
+        assert decision["stopped"] is True
+        assert decision["status"] in {"done", "paused"}
+
     def test_until_judge_is_not_called_for_a_silent_tick(self, hermes_home):
         """A bare [SILENT] is the wakeup prompt's no-change reply: no evidence, so no model call."""
         from hermes_cli.loops import LoopManager

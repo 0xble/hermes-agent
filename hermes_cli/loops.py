@@ -1300,10 +1300,19 @@ class LoopManager(LoopRevisionsMixin):
                 # An unachievable stop condition is no-progress evidence, not a terminal loop
                 # failure. Keep the loop active and use the shared quiet ladder before retrying.
                 why = f"stop condition judged unachievable: {reason}"
-                if not self._save_tick_outcome(
-                    s.ticks_fired, lambda state: self._settle_blocked_until(state, now)
-                ):
+                cap: Optional[Tuple[str, str, str]] = None
+
+                def settle_blocked(state: LoopState) -> None:
+                    nonlocal cap
+                    self._settle_blocked_until(state, now)
+                    cap = self._cap_stop(state)
+                    if cap is not None:
+                        self._apply_stop(state, cap[0], cap[1])
+
+                if not self._save_tick_outcome(s.ticks_fired, settle_blocked):
                     return self._superseded_result()
+                if cap is not None:
+                    return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
                 return {
                     "status": "active", "stopped": False, "reason": why,
                     "message": f"⏳ Loop still active — {why}; next check delayed.",
