@@ -2413,8 +2413,9 @@ class GatewayTurnMixin:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         # The outbound string (or streamed None) loses the raw result's outcome.
-        # Fail closed through preparation, execution and delivery exceptions.
-        event._agent_turn_succeeded = False
+        # Keep this unset until session resolution succeeds: a strict-pinned recovered event
+        # dropped by /new or suspension was never a failed turn and must retain its spool.
+        event._agent_turn_succeeded = None
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2428,6 +2429,7 @@ class GatewayTurnMixin:
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
+        event._agent_turn_succeeded = False
         source, session_entry, session_key = resolved
         from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
         if (

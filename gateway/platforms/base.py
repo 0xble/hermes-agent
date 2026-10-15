@@ -4272,6 +4272,11 @@ class BasePlatformAdapter(ABC):
         if not checkpointed_merge_pending_message_event(
             self._pending_messages, session_key, state.event, merge_text=True,
         ):
+            # The debounce timer has already been canceled. Keep the burst in the ordinary pending
+            # slot so shutdown's synchronous flush can spool it; never strand the only copy in the
+            # debounce store after a failed checkpoint refresh.
+            merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
+            store.pop(session_key, None)
             return False
         store.pop(session_key, None)
         return True

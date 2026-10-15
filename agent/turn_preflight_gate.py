@@ -61,8 +61,9 @@ def run_preflight_gate(
     # instead of rejecting. Measure the final request, not a stale usage anchor.
     from agent.compression_recovery import affordable_output_cap, request_fits
     window = getattr(agent.context_compressor, "context_length", None)
+    can_shrink_output = getattr(agent, "api_mode", None) not in {"codex_app_server", "bedrock_converse"}
     if (api_messages is not None and isinstance(window, int) and window > 0
-            and getattr(agent, "api_mode", None) != "codex_app_server"
+            and can_shrink_output
             and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
         # Input that fits with a useful answer runway only needs a smaller output cap, the
         # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
@@ -90,6 +91,11 @@ def run_preflight_gate(
             v.messages = recovered
             v.active_system_prompt = prompt
             v.conversation_history = conversation_history_after_compression(agent, recovered)
+            if can_shrink_output and not request_fits(agent, recovered, prompt, tools=tools_for_api):
+                shrunk = affordable_output_cap(agent, recovered, tools=tools_for_api)
+                if shrunk is not None:
+                    agent._ephemeral_max_output_tokens = shrunk
+                    logger.info("Post-recovery fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
             if request_fits(agent, recovered, prompt, tools=tools_for_api):
                 v._preflight_compression_blocked = False
                 v._last_preflight_pressure = request_pressure_tokens

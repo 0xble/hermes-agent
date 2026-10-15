@@ -197,7 +197,42 @@ def test_presend_gate_keeps_the_cap_when_too_little_answer_runway_remains(tmp_pa
     assert agent._ephemeral_max_output_tokens is None
 
 
+def test_presend_gate_shrinks_output_cap_again_after_compaction(tmp_path):
+    """Compaction can create useful runway even when the original request had none."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "chat_completions"
+    agent.context_compressor.context_length = 16000
+    agent.max_tokens = 14000
+    agent._ephemeral_max_output_tokens = None
+    rows = [{"role": "user", "content": "before compaction " * 5000}]
+    recovered = [{"role": "user", "content": "compact summary " * 1200}]
+    with patch.object(agent, "_compress_context", return_value=(recovered, "")):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    assert verdict.action == "continue" and not verdict.failed
+    assert agent._ephemeral_max_output_tokens is not None
+    assert 4096 <= agent._ephemeral_max_output_tokens < agent.max_tokens
+
+
+def test_bedrock_preflight_does_not_arm_ignored_ephemeral_output_cap(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "bedrock_converse"
+    agent.context_compressor.context_length = 8000
+    agent.max_tokens = 7000
+    agent._ephemeral_max_output_tokens = None
+    rows = [{"role": "user", "content": "inspect only " * 500}]
+    with patch.object(agent, "_compress_context", side_effect=lambda m, *a, **k: (m, "")):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    assert verdict.action == "break" and verdict.failed
+    assert agent._ephemeral_max_output_tokens is None
+    from agent.chat_completion_helpers import selected_max_output_tokens
+    agent._ephemeral_max_output_tokens = 4000
+    assert selected_max_output_tokens(agent) == 7000
+
+
 # ── Gap 2: the replayed trigger is not duplicated in transcript or request ──
+
 
 def test_admitted_trigger_in_history_is_reused_not_reappended(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
