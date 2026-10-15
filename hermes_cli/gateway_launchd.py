@@ -400,11 +400,13 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
-def generate_launchd_plist(release_target: Path | None = None) -> str:
+def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a") -> str:
     """Render a candidate definition without moving ``current`` first.
 
     The release updater must persist these exact bytes in its write-ahead record
     before changing pointers. Normal callers retain the existing service output.
+    ``slot="b"`` renders the zero-cut standby job: the ``.b`` label plus ``HERMES_GATEWAY_SLOT=b``;
+    the default active slot is byte-identical to the historical output.
     """
     from html import escape
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
@@ -412,7 +414,8 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
     hermes_home = str(_gw().get_hermes_home().resolve())
     log_dir = _gw().get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    label = _gw().get_launchd_label()
+    label = get_launchd_slot_labels()[1] if slot == "b" else _gw().get_launchd_label()
+    slot_env = "\n        <key>HERMES_GATEWAY_SLOT</key>\n        <string>b</string>" if slot == "b" else ""
     # launchd's default PATH misses Homebrew, nvm, cargo…; prepend venv/bin + node dirs (as in the
     # systemd unit) so node stays resolvable even if the shell PATH changes, then the shell PATH.
     priority_dirs = _gw()._build_service_path_dirs()
@@ -477,7 +480,7 @@ def generate_launchd_plist(release_target: Path | None = None) -> str:
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
-        <string>1</string>
+        <string>1</string>{slot_env}
     </dict>
 
     <key>LimitLoadToSessionType</key>
