@@ -1,5 +1,6 @@
 """Tests for tools/terminal_hints.py — output-pattern failure hints."""
 
+import shlex
 from unittest.mock import patch as mock_patch
 
 
@@ -94,7 +95,20 @@ class TestPytestMissing:
 
         assert hint is not None
         # The runner lives at the toplevel, so the hint must resolve from tests/.
-        assert f"{repo.resolve()}/.venv/bin/python -m pytest" in hint
+        assert f"{shlex.quote(str(repo.resolve()))}/.venv/bin/python -m pytest" in hint
+
+    def test_toplevel_runner_path_with_spaces_is_shell_quoted(self, tmp_path):
+        repo = tmp_path / "my repo"
+        cwd = repo / "tests"
+        (repo / ".git").mkdir(parents=True)
+        cwd.mkdir()
+        (repo / "scripts").mkdir()
+        (repo / "scripts" / "run_tests.sh").touch()
+
+        hint = annotate_failure("python -m pytest", 1, self._output("bare"), str(cwd))
+
+        assert hint is not None
+        assert f"'{repo.resolve()}'/scripts/run_tests.sh <files>" in hint
 
     def test_plugin_missing_is_not_pytest_missing(self, tmp_path):
         out = "ModuleNotFoundError: No module named 'pytest_asyncio'"

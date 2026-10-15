@@ -11,6 +11,7 @@ bounded local path-existence checks and never reads configuration or spawns a pr
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -94,7 +95,7 @@ def _pytest_missing_hint(cwd: str | None) -> str:
             # A runner found at the Git toplevel must still resolve from a subdirectory cwd.
             # `uv run` already discovers the project upward, so it needs no prefix.
             if index and also_required is None:
-                runner = f"{root}/{runner}"
+                runner = f"{shlex.quote(str(root))}/{runner}"
             return f"Interpreter used lacks pytest; use the repo's own runner: `{runner}`."
     return "Interpreter used lacks pytest; use the project's virtualenv."
 
