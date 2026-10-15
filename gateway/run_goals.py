@@ -825,6 +825,39 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 sid, tip,
             )
 
+    async def _stale_resume_pending_marker(self, key: str, entry: Any) -> tuple:
+        """Return ``(owned, stale_marker)`` for idle work that would wake *key*.
+
+        Startup auto-resume owns a fresh restart marker. Once its bounded freshness window
+        expires, it will no longer schedule this session; do not let that stale marker wedge
+        otherwise eligible idle work forever. The snapshot lets the caller CAS-clear it so a
+        successor that refreshed the marker wins rather than being stolen by the idle ticker.
+        Legacy entries without last_resume_marked_at use updated_at, matching startup recovery.
+        """
+        if not getattr(entry, "resume_pending", False):
+            return False, None
+        from gateway.run import (
+            _auto_continue_freshness_window, _is_fresh_gateway_interruption,
+            _resume_pending_marker_timestamp,
+        )
+
+        marker = await self.async_session_store.get_resume_pending_marker(key)
+        if marker is None:
+            return True, None  # marker disappeared or the session was replaced; retry on the next scan
+        marked_at = _resume_pending_marker_timestamp(entry, marker)
+        if _is_fresh_gateway_interruption(marked_at, window_secs=_auto_continue_freshness_window()):
+            return True, None  # restart auto-resume still owns this chat
+        return False, marker
+
+    async def _clear_stale_resume_pending(self, key: str, marker: Optional[tuple], sid: str, owner: str) -> bool:
+        """CAS-clear a stale marker snapshot; False when it changed or the session disappeared."""
+        if marker is None:
+            return True
+        if not await self.async_session_store.clear_resume_pending(key, expected_marker=marker):
+            return False
+        logger.info("%s: stale resume_pending cleared for session %s; idle ticker owns continuation", owner, sid)
+        return True
+
     async def _loop_wakeup_fire_one(  # health: allow CC -- ordered wake admission combines strict pins, busy gates, claim CAS, and adapter receipt.
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
@@ -860,7 +893,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not session_key:
             return
 
-        def _turn_owner_exists() -> bool:
+        def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
                 return True
             if session_key in getattr(adapter, "_active_sessions", {}):
@@ -868,14 +901,15 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             with suppress(Exception):
                 if self._queue_depth(session_key, adapter=adapter) > 0:
                     return True
-            with suppress(Exception):
-                entry = self.session_store._entries.get(session_key)
-                if entry is not None and getattr(entry, "resume_pending", False):
-                    return True
+            if include_marker:
+                with suppress(Exception):
+                    entry = self.session_store._entries.get(session_key)
+                    if entry is not None and getattr(entry, "resume_pending", False):
+                        return True
             return False
 
-        # A reset makes the route resolve to a different durable session. Clear only with that
-        # positive proof; route lookup or adapter failures above retain the row for retry.
+        # The route may resolve to a different durable session after compression, /resume, a
+        # topic rebind or /new. Only compression carries the loop; the others defer untouched.
         try:
             lookup = getattr(self.session_store, "lookup_by_session_key", None)
             current = (
@@ -886,9 +920,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             logger.debug("loop wakeup: session ownership lookup failed", exc_info=True)
             return
         if current is not None and current.session_id != sid:
-            # Compression deliberately carries conversation responsibility forward; an
-            # explicit /new reset does not. Follow the existing compression tip before
-            # retiring an orphaned old row.
+            # Compression deliberately carries conversation responsibility forward. /resume and
+            # topic rebinds are reversible, so the loop waits until the route returns; explicit
+            # /new retires it in the reset handler, never here.
             try:
                 tip = await self._run_in_executor_with_context(
                     lambda: self.session_store._db_for_key(session_key).get_compression_tip(sid)
@@ -898,13 +932,20 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 return
             if tip == current.session_id:
                 await self._migrate_compressed_loop(sid, tip)
-                return
-            try:
-                await self._run_in_executor_with_context(
-                    lambda: LoopManager(session_id=sid).clear()
-                )
-            except Exception:
-                logger.debug("loop wakeup: orphan cleanup failed", exc_info=True)
+            return
+
+        if not state.awaiting_response and now < state.next_due_at:
+            return
+        entry = None
+        with suppress(Exception):
+            entry = self.session_store._entries.get(session_key)
+        marker_owned, stale_marker = await self._stale_resume_pending_marker(session_key, entry)
+        if marker_owned:
+            return
+        if stale_marker is not None and (
+            _turn_owner_exists(include_marker=False)
+            or not await self._clear_stale_resume_pending(session_key, stale_marker, sid, "loop wakeup")
+        ):
             return
 
         if state.awaiting_response:
@@ -1067,25 +1108,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
 
-        resume_marker = None
-        if getattr(entry, "resume_pending", False):
-            # Startup auto-resume owns a fresh restart marker. Once its bounded freshness window
-            # expires, it will no longer schedule this session; do not let that stale marker wedge
-            # an otherwise eligible parked goal forever. Snapshot + CAS-clear so a successor that
-            # refreshed the marker wins rather than being stolen by the idle ticker. Legacy entries
-            # without last_resume_marked_at use updated_at, matching startup recovery.
-            from gateway.run import (
-                _auto_continue_freshness_window, _is_fresh_gateway_interruption,
-                _resume_pending_marker_timestamp,
-            )
-
-            resume_marker = await self.async_session_store.get_resume_pending_marker(key)
-            if resume_marker is None:
-                return  # marker disappeared or the session was replaced; retry on the next scan
-            marked_at = _resume_pending_marker_timestamp(entry, resume_marker)
-            if _is_fresh_gateway_interruption(
-                    marked_at, window_secs=_auto_continue_freshness_window()):
-                return  # restart auto-resume still owns this chat
+        marker_owned, resume_marker = await self._stale_resume_pending_marker(key, entry)
+        if marker_owned:
+            return
 
         max_turns = self._goal_max_turns_from_config()
         min_gap = self._goal_min_continuation_gap_from_config()
@@ -1117,19 +1142,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             goal_session_id=sid, goal_state=mgr.state,
         )
         event.metadata["gateway_session_key"] = key
-        if resume_marker is not None:
-            cleared = await self.async_session_store.clear_resume_pending(
-                key, expected_marker=resume_marker,
-            )
-        else:
-            cleared = True
-        if not cleared:
+        if not await self._clear_stale_resume_pending(key, resume_marker, sid, "goal wakeup"):
             return  # marker changed or the session disappeared; retry on the next scan
-        if resume_marker is not None:
-            logger.info(
-                "goal wakeup: stale resume_pending cleared for session %s; idle ticker owns continuation",
-                sid,
-            )
         from gateway.wake import WakeNotAccepted, admit_internal_event
 
         try:

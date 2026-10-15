@@ -718,7 +718,9 @@ def test_stale_manager_claim_never_regresses_stored_control_generation(control_h
             f"stale claim after {control} wrote generation {stored.control_generation} "
             f"over stored {controlled.control_generation}"
         )
-        assert loops.loop_control_generation(sid) == stored.control_generation
+        # A retired loop leaves no local fence, so its stale wakes fail the sync check closed.
+        expected = None if stored.status == "cleared" else stored.control_generation
+        assert loops.loop_control_generation(sid, default=None) == expected
         if claimed:
             assert stored.status == "active" and stored.awaiting_response
             assert stored.created_at == controlled.created_at

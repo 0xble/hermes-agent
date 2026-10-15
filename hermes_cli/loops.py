@@ -404,23 +404,35 @@ class LoopState:
 
 
 _META_PREFIX = "loop:"
-_CONTROL_GENERATIONS: Dict[str, int] = {}
+# Keyed by (store home, session) so multiplexed profiles never share a fence. Retired loops drop
+# out; the stored row stays authoritative for them and the sync fence treats absence as stale.
+_CONTROL_GENERATIONS: Dict[Tuple[str, str], int] = {}
 
 
 def _meta_key(session_id: str) -> str:
     return f"{_META_PREFIX}{session_id}"
 
 
+def _control_generation_key(session_id: str) -> Tuple[str, str]:
+    from hermes_constants import hermes_home_key
+
+    return hermes_home_key(), session_id
+
+
 def _remember_control_generation(session_id: str, state: Optional[LoopState]) -> None:
     if not session_id or state is None:
         return
-    current = _CONTROL_GENERATIONS.get(session_id, 0)
-    _CONTROL_GENERATIONS[session_id] = max(current, int(getattr(state, "control_generation", 0) or 0))
+    key = _control_generation_key(session_id)
+    if state.status == "cleared":
+        _CONTROL_GENERATIONS.pop(key, None)
+        return
+    current = _CONTROL_GENERATIONS.get(key, 0)
+    _CONTROL_GENERATIONS[key] = max(current, int(getattr(state, "control_generation", 0) or 0))
 
 
-def loop_control_generation(session_id: str) -> int:
+def loop_control_generation(session_id: str, default: Optional[int] = 0) -> Optional[int]:
     """Return the process-local fence for synchronous gateway execution-entry checks."""
-    return _CONTROL_GENERATIONS.get(session_id, 0)
+    return _CONTROL_GENERATIONS.get(_control_generation_key(session_id), default)
 
 
 def _get_session_db() -> Optional[Any]:

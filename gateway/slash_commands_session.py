@@ -174,12 +174,17 @@ class GatewaySessionCommandsMixin:
         if old_session_id:
             async def _retire_old_controls():
                 def retire():
-                    with contextlib.suppress(Exception):
-                        from hermes_cli.loops import LoopManager
-                        LoopManager(session_id=old_session_id).clear()
-                    with contextlib.suppress(Exception):
-                        from hermes_cli.goals import GoalManager
-                        GoalManager(session_id=old_session_id).clear()
+                    from hermes_cli.goals import GoalManager
+                    from hermes_cli.loops import LoopManager
+
+                    for kind, manager in (("loop", LoopManager), ("goal", GoalManager)):
+                        try:
+                            manager(session_id=old_session_id).clear()
+                        except Exception:
+                            logger.warning(
+                                "/new: failed to retire %s for session %s", kind, old_session_id,
+                                exc_info=True,
+                            )
                 await self._run_in_executor_with_context(retire)
             await _retire_old_controls()
         await self._cleanup_old_agent_for_reset(session_key)

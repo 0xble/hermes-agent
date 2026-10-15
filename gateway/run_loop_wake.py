@@ -105,7 +105,7 @@ class GatewayLoopWakeMixin:
             if callable(key_for_source) and callable(current_run) else True
         )
         return (
-            loop_control_generation(sid) == int(control_generation)
+            loop_control_generation(sid, default=None) == int(control_generation)
             and run_ok
         )
 
