@@ -721,7 +721,8 @@ class CLILoopsMixin:
                 pass
             _cprint(f"  {_DIM}{t('cli.loop.paused_interrupted')}{_RST}")
             return
-        decision = mgr.complete_tick(self._last_assistant_response_text())
+        response, successful = self._post_turn_response()
+        decision = mgr.complete_tick(response if successful else "")
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None):
             _cprint(f"  {_DIM}{t('cli.loop.remaining', label=mgr.state.remaining_label())}{_RST}")
@@ -736,12 +737,23 @@ class CLILoopsMixin:
         if mgr is not None and mgr.resume_for_user_input():
             _cprint(f"  ▶ Goal resumed: {mgr.state.goal}")
 
+    def _post_turn_response(self) -> tuple[str, bool]:
+        """Read only the current turn result; a started turn without one is unsuccessful."""
+        from hermes_cli.goal_turn_outcome import is_successful_goal_turn
+        if getattr(self, "_last_turn_started", True) is False:
+            return "", False  # chat() returned before the model ran (credentials/setup)
+        result = getattr(self, "_last_turn_result", None)
+        if not isinstance(result, dict):
+            return "", False  # a started turn with no result cannot reuse transcript text
+        response = str(result.get("final_response") or "")
+        return response, is_successful_goal_turn(result, response)
+
     def _maybe_continue_goal_after_turn(self) -> None:
         """Post-turn hook: judge the goal and maybe re-queue a continuation. A real user
         message already queued preempts judging (re-judged after their turn). Ctrl+C
         AUTO-PAUSES instead of judging — the judge on partial output nearly always says
         "continue" and would re-queue exactly what was cancelled; pausing is recoverable
-        via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
+        via ``/goal resume``. Successful empty turns still reach the evaluator."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
         mgr = self._get_goal_manager()
         if mgr is None:
@@ -775,10 +787,8 @@ class CLILoopsMixin:
             _cprint(f"  {_DIM}{t('cli.goal.paused_interrupted')}{_RST}")
             return
 
-        # Empty/whitespace responses are almost always transient failures (API error,
-        # empty stream): judging would say "continue" and trip the parse-failure backstop.
-        last_response = self._last_assistant_response_text()
-        if not last_response.strip():
+        last_response, successful = self._post_turn_response()
+        if not successful:
             return
         _active_deleg = 0
         try:

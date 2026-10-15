@@ -52,12 +52,21 @@ clears the goal once with one short notice, before dispute pause or timed backof
 - Fork patch identity: `goal-pause-race`. Evaluation runs on an isolated snapshot and atomically
   compares that snapshot with the durable row before committing any verdict. Every durable
   mutation carries a fresh token, including pause/resume cycles returning to equal values.
+  Versioned revisions use the same transaction owner and exact canonical comparison,
+  including legacy rows without a token. Revision authority lookup runs on an isolated
+  copy. Stale revisions return `state_changed` and reload the winner, including a
+  conflict at a no-op return or the final write. Operational read/write errors return
+  `persistence_failed`, log the cause, and publish no staged state. An empty session ID
+  remains explicitly ephemeral for both revisions and evaluation.
+  The `goal-adaptive` revision body is moved unchanged to
+  `hermes_cli/goals_revisions.py`; its quote and retained-requirement policy is unchanged.
   Stale evaluations and failed persistence never authorize continuation. Commands remain
   authoritative before evaluation, during gates/judging, and at the final write boundary.
   Our upstream [PR #124017](https://github.com/NousResearch/hermes-agent/pull/124017)
   now carries this complete atomic settlement and mutation-token contract.
   Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_evaluation_atomic.py
-  tests/hermes_cli/test_goals.py tests/hermes_cli/test_goal_gates.py`.
+  tests/hermes_cli/test_goal_revision_atomic.py tests/hermes_cli/test_goals.py
+  tests/hermes_cli/test_goal_gates.py tests/hermes_cli/test_goal_adaptive.py`.
 
 - Fork patch identity: `goal-judge-evidence`. Own fork patch, no upstream PR yet.
   The judge receives an evidence ledger: up to 8 recent non-bookkeeping tool
@@ -90,6 +99,11 @@ clears the goal once with one short notice, before dispute pause or timed backof
   Retire when the selected upstream passes the same recorded-capability proof;
   rollback restores only these evidence/read-only classifications. No schema or
   live-state migration is needed.
+
+- Fork patch identity: `goal-lifecycle`. Goal/loop/session-control snapshot settlement follows a
+  validated compression child after a parent CAS race, while cursor-bound managers stay inside
+  their caller's write transaction. Regression: `scripts/run_tests.sh tests/gateway/test_goal_continuation_identity.py
+  tests/hermes_cli/test_session_controls.py tests/gateway/test_session_control_watcher.py`.
 
 - Fork patch identity: `goal-done-repeat-silence`. Own fork patch for PR #531. Autonomous continuation replies distinguish the first done/blocker report from an unchanged repeat: the first done claim remains visible and must include exact Evidence; an unchanged done claim or unchanged blocker/input need must be exactly `[SILENT]`. Changed state, new evidence, or a changed blocker makes the next report visible again. Silent repeats still reach `judge_goal()`. On a silent autonomous recheck, the runtime passes the newest visible final report in this goal's SessionDB history (since `created_at`, at most 500 assistant rows) verbatim, excluding hidden rows, compression summaries and tool-call commentary. No completion-phrase recognizer remains. The per-turn judge input labels it as the agent's last visible report and applies the existing 4,000-character head plus 3,000-character tail bound; report text never enters the stable system prefix. Citations resolve from the full report through the existing lifetime-bounded evidence finders, including proof outside the eight-row ledger and citations in an omitted middle. Plain, subgoal and contract judges decide whether the report claims and proves completion. A newer non-completion report replaces the older done report and its citations by construction. Prose is not proof, and no eligible visible report leaves the original silent judge input unchanged.
   Three autonomous silent CONTINUE or disputed verdicts without a real break in silence and with no new eligible non-read-only evidence rows clear the goal through the convergence-breaker path and emit one short `Goal stopped` notice. This uses the existing no-progress threshold (`DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 3`) and terminal `cleared` status, not a user-resumable pause or a rearmed timer. The persisted streak resets only on new eligible non-read-only evidence, user-initiated turns (including silence markers), visible autonomous replies, DONE or BLOCKED. These facts reset at evaluator entry or when the verdict becomes known, before early returns. Read-only/status-only evidence does not reset it. Pacing/continuation-gap, timed-backoff/no-progress, parked and delegation-wait exits that do not judge, silent quality-gate failures, and transport/parse failures preserve it. The judged increment is persisted even when pacing or backoff prevents immediate dispatch; the terminal silent-stall rule takes precedence over dispute pause and timed no-progress backoff. Later stale turns, restarts and user messages do not replay the stop notice. Existing visible dispute pauses remain unchanged; silent disputes use this non-blocking backstop. The existing gateway notice path delivers the terminal notice; its `✗` prefix makes the shared classifier treat it as a protected outcome, so daily-quota shedding cannot drop the only record that the goal ended. No delivery-level duplicate filter or gateway source change is needed. Regression: `scripts/run_tests.sh tests/hermes_cli/test_goal_judge_evidence.py tests/gateway/test_goal_continuation_notice_dedupe.py` covers plain/subgoal/contract newest-report input, emoji/heading/bullet and ordinary completion reports with citations older than the ledger across silent repeats, newer failed-verification reports replacing older done reports, bounded head/tail with omitted citations still resolved, no-visible-report input equivalence, goal-lifetime isolation, real-break resets before failing gates or waits, unchanged nonjudging exits, and one-notice terminal convergence under the gateway default 900-second continuation gap with expired timers advanced. Retire when upstream supplies the same first-visible/unchanged-silent reply contract, newest-visible-report citation handling without phrase matching and bounded non-blocking stall behavior; rollback reverts this identity's prompt, judge-input, counter and tests, with old serialized rows defaulting the silent counter to zero.
@@ -176,6 +190,54 @@ Any admitted real user turn can revive a blocker pause, including a question abo
 the blocker. This adopts upstream's conversational recovery policy, not semantic
 proof that the blocker is solved. The next judge may block again. Explicit user
 pauses remain authoritative.
+
+## Successful Empty Turn Admission
+
+Fork patch identity: `goal-turn-outcome`. No upstream implementation of this shared
+admission boundary was found in the owner preflight against upstream
+`63d0b94120027d487c9a5235b9ec64b696af1b26`. Gateway, CLI, TUI and Desktop admit successful turns
+to the goal evaluator even when the response is empty or whitespace. Failure
+notices, interrupted replies and incomplete turns are not progress. Explicit
+outcomes are authoritative; only legacy callers without an outcome retain the
+nonempty-text fallback. Existing iteration-summary handoffs require a nonempty
+result summary and nonempty evaluator input, with no failed/interrupted/error/partial
+outcome. An explicit unsuccessful surface outcome still excludes the turn.
+The CLI resets its outcome before credential/setup work and uses the current raw
+result's response, never an earlier assistant message or rendered failure notice.
+Loop cleanup remains independent
+of goal admission. This changes no user-authority, provenance, display/silence or
+revision semantics; the full revision history contract above remains binding.
+
+Admission means the evaluator may examine the boundary, not that it proved
+completion or progress. Successful empty/tool-only turns retain runtime evidence,
+and `judge_goal` judges them from it: blank text is shown to the judge as
+`JUDGE_EMPTY_RESPONSE_PLACEHOLDER`, and the judge is skipped only when the text
+is blank and there is no evidence, visible report or citation. Evidence-free
+callers (loops, kanban, the bare-text fallback) therefore keep the blank skip.
+Automatic bare silence still follows the existing silent-turn policy. A silent
+stall, a disputed completion claim, a no-progress streak, and an explicit wait
+remain distinct: this patch introduces no stall threshold or new terminal behavior.
+Read-only/no-evidence automatic turns still use the existing backoff, and timed,
+pid/session/delegation waits retain their existing wake rules. CAS controls which
+state may be committed, without changing verdict, cadence, or revision authority.
+
+The `goal-judge-evidence` helpers moved to `hermes_cli/goal_evidence.py` retain
+their goal-module exports and original explanatory docstrings. Browser-console
+status classification remains owned by
+[External-Wait Goal Backoff](goal-external-wait-backoff.md), independently of
+success admission and completion judgment.
+
+Proof: the `test_goal_empty_turn.py` suites in gateway and tui_gateway plus
+`tests/hermes_cli/test_cli_goal_empty_turn.py` enter the real surface hooks and
+evaluator with isolated SessionDB evidence. They cover successful empty/tool-only
+turns, generated failure-copy exclusion, incomplete/interrupted rejection, and
+loop-claim release independent of goal admission. Classification is covered by
+`tests/hermes_cli/test_goal_readonly_evidence.py`. The real judge boundary,
+with only `call_llm` patched, is covered by
+`tests/hermes_cli/test_goal_judge_empty_turn.py`. TUI handoff tests keep the
+result summary consistent with the evaluator input.
+Rollback reverts this boundary; there is no schema migration or configuration.
+Retire when upstream provides the same outcome-based admission on all surfaces.
 
 - Fork patch identity: `goal-user-authority`. Own fork patch, no upstream PR yet.
   The judge sees what the user actually typed since the goal was set, in an

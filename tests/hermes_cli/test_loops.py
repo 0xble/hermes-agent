@@ -816,6 +816,23 @@ class TestTickLifecycle:
 
 
 class TestSelfPacedBackoff:
+    def test_superseded_self_paced_release_uses_floor_when_delay_missing(self, hermes_home):
+        from copy import deepcopy
+        from hermes_cli.loops import LoopManager, _get_session_db, self_paced_floor_seconds
+        from hermes_cli.loops_snapshot import _release_superseded_tick
+
+        mgr = LoopManager(session_id="sp-superseded-floor")
+        mgr.set("watch the queue")
+        mgr.fire_tick()
+        mgr.state.current_delay = 0.0
+        mgr.state.interval_seconds = 0.0
+        mgr._save()
+        original = deepcopy(mgr.state)
+        before = time.time()
+        _release_superseded_tick(mgr, original, _get_session_db())
+        assert mgr.state.awaiting_response is False
+        assert mgr.state.next_due_at >= before + self_paced_floor_seconds()
+
     def test_backoff_doubles_on_unchanged_and_resets_on_change(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
