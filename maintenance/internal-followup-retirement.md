@@ -37,12 +37,18 @@ or per-user session the shutdown follow-up spool binds it to the turn's source
 (author, chat) and a recovery id before writing, so restart recovery can
 attribute and run it. In a shared group or thread session the runner does not
 know who sent the leftover, so the spool keeps no author and recovery declines
-it with `author-missing` rather than running it as the wrong user. A
-shutdown follow-up that recovery still declines (no recorded author, possible
-duplicate, or older than the 24h drain window) never runs: it gets one
-`Restart recovery outcome: ... outcome=skipped:<reason>:noted` line, one visible
-resend note to its session origin, and its spool is quarantined with `.bad`. If
-no adapter can carry the note, the spool is retained for a later boot.
+it with `author-missing` rather than running it as the wrong user. Durability is
+checked before stale or author-missing classification: a durable input is
+silently dropped only when the same fresh, admitted `resume_pending` startup
+path will continue it; otherwise it gets the hedged `possibly-duplicate` note,
+one outcome, and quarantine, never replay. A shutdown follow-up that recovery
+still declines (no recorded author, possible duplicate, or older than the 24h
+drain window) never runs: it gets one `Restart recovery outcome: ...
+outcome=skipped:<reason>:noted` line, one visible note (hedged for a possible
+duplicate), and its spool is quarantined with `.bad`. If no adapter can carry
+the note, the spool is retained for a later boot. A stale spool whose note
+remains unavailable is retained for at most 7 days, then deleted with
+`skipped:stale:note-unavailable` and no `.bad` quarantine.
 
 ## Source surfaces
 

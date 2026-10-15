@@ -34,28 +34,34 @@ def pending_home_for_key(runner, session_key: str) -> Path | None:
     return Path(served[owner]) if owner in served else None
 
 
+def _queue_declined_followup(runner, data, path, reason, source, adapter, recovered_events):
+    """Route a declined shutdown follow-up through the normal visible-note observer."""
+    if data.get("shutdown_follow_up") is not True or adapter is None:
+        return False
+    event = _recovered_followup_event(
+        data, source, data.get("source_user_id") or data.get("user_id") or getattr(source, "user_id", None))
+    setattr(event, "_hermes_recovered_followup", True)
+    setattr(event, "_hermes_recovered_declined", True)
+    setattr(event, "_hermes_recovery_decline_reason", reason)
+    setattr(event, "_hermes_recovery_spool", path)
+    # No _hermes_recovery_session_key: a declined input never runs, so it must not displace
+    # the predecessor's own resume decision the way an accepted follow-up does.
+    if recovered_events is not None:
+        recovered_events.append(event)
+    else:
+        runner._queue_startup_restore_event(event)
+    return True
+
+
+def _fresh_admitted_resume(runner, entry):
+    """Return the shared startup admission result, or None when the marker will not continue."""
+    return runner._resume_admission(entry)[0]
+
+
 def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
                     breaker_tripped=False, reconnect_recovery=False, recovered_events=None):
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
-    def _decline_followup(reason, source, adapter):
-        """Route a declined shutdown follow-up through the normal visible-note observer."""
-        if data.get("shutdown_follow_up") is not True or adapter is None:
-            return False
-        event = _recovered_followup_event(
-            data, source, data.get("source_user_id") or data.get("user_id") or getattr(source, "user_id", None))
-        setattr(event, "_hermes_recovered_followup", True)
-        setattr(event, "_hermes_recovered_declined", True)
-        setattr(event, "_hermes_recovery_decline_reason", reason)
-        setattr(event, "_hermes_recovery_spool", path)
-        # No _hermes_recovery_session_key: a declined input never runs, so it must not displace
-        # the predecessor's own resume decision the way an accepted follow-up does.
-        if recovered_events is not None:
-            recovered_events.append(event)
-        else:
-            runner._queue_startup_restore_event(event)
-        return True
-
     origin = getattr(eligible.get(key), "origin", None) if key in eligible else None
     if platform is not None and origin is not None and origin.platform != platform:
         return OTHER_PLATFORM_PENDING
@@ -81,15 +87,26 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         elif not (entry and entry is eligible.get(key) and entry.resume_pending
                   and entry.session_id == session_id and entry.origin):
             return False
+
+    followup = data.get("shutdown_follow_up") is True
+    durable = followup and input_already_durable(
+        runner.session_store, session_id,
+        data.get("recovery_id") or data.get("message_id"),
+        data.get("text"), data.get("_recovery_spool_ts"),
+    )
+    if durable and _fresh_admitted_resume(runner, entry) is not None:
+        # The startup scheduler owns the durable turn; deleting its replay copy is safe.
+        return DROP_PENDING
+
     from gateway.run import (
         _auto_continue_freshness_window, _is_fresh_gateway_interruption,
         _resume_pending_marker_timestamp,
     )
-    if not drain_deferred:
+    if not drain_deferred and not durable:
         marker = _resume_pending_marker_timestamp(entry)
         if not _is_fresh_gateway_interruption(marker, window_secs=_auto_continue_freshness_window()):
             return False
-    if runner._is_session_running(key):
+    if runner._is_session_running(key) and not durable:
         return None if drain_deferred else False
     source = runner._restored_source(entry)
     if drain_deferred and platform is not None and source.platform != platform:
@@ -100,7 +117,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
             logger.warning("Dropping unauthorized drain-deferred message from %s", path)
-            if data.get("shutdown_follow_up") is True:
+            if followup:
                 # Never message an origin that is no longer authorized, but still decide visibly.
                 logger.info("Restart recovery outcome: session=%s outcome=%s",
                             key, "skipped:unauthorized:note-unavailable")
@@ -108,34 +125,24 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
-    if ready is None:
+    if ready is None and not durable:
         return False
-    # Older spools lack authorship; never guess who issued a command in shared chats. A shutdown
-    # follow-up we cannot safely run still gets one outcome and a visible note, never silence.
+    # Durable input always takes precedence over stale and author-missing reasons. If the shared
+    # admission did not own it, preserve the hedged note rather than replaying or deleting silently.
     author_id = data.get("source_user_id") or data.get("user_id")
-    decline = None
-    if not data.get("internal") and (not isinstance(author_id, str) or not author_id.strip()):
+    decline = "possibly-duplicate" if durable else None
+    if decline is None and not data.get("internal") and (not isinstance(author_id, str) or not author_id.strip()):
         decline = "author-missing"
-    elif data.get("_recovery_stale") is True:
+    elif decline is None and data.get("_recovery_stale") is True:
         decline = "stale"
-    elif (data.get("shutdown_follow_up") is True
-          and data.get("message_id") is None and data.get("recovery_id") is None
-          and input_already_durable(
-              runner.session_store, session_id, None, data.get("text"),
-              data.get("_recovery_spool_ts"))):
-        # Legacy id-less spools have no identity stronger than their content. A matching row may
-        # be an unrelated later message, and a resume_pending marker is not proof that a resume
-        # will run (it may be stale or not admitted). So always decline visibly: never run it,
-        # never delete the only recovery copy silently. The hedged note stays honest even when a
-        # resume does run.
-        decline = "possibly-duplicate"
-    adapter, source = ready
     if decline is not None:
-        if data.get("shutdown_follow_up") is not True:
+        if not followup:
             return False
+        adapter = runner._delivery_adapter_for(source) if ready is None else ready[0]
         if adapter is None:
             return None  # keep it until the note can be delivered
-        return _decline_followup(decline, source, adapter)
+        return _queue_declined_followup(runner, data, path, decline, source, adapter, recovered_events)
+    adapter, source = ready
     if adapter is None:
         return None
     return _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events)
@@ -151,10 +158,20 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
         data.get("text"),
         data.get("_recovery_spool_ts"),
     ):
-        # A previous boot's turn persisted this input before the restart cut it: the turn's own
-        # resume_pending marker owns it now, and replaying the prompt could repeat tool effects.
-        logger.info("Dropping recovered follow-up for %s: its turn already persisted it", key)
-        return DROP_PENDING
+        store = runner.session_store
+        with store._lock:  # noqa: SLF001 — use the same marker snapshot as startup admission
+            store._ensure_loaded_locked()  # noqa: SLF001
+            entry = store._entries.get(key)  # noqa: SLF001
+        if entry is not None and _fresh_admitted_resume(runner, entry) is not None:
+            logger.info("Dropping recovered follow-up for %s: its durable turn has a fresh admitted resume", key)
+            return DROP_PENDING
+        adapter = runner._delivery_adapter_for(source)
+        if adapter is None:
+            return None
+        # A durable input with no admitted startup resume is never replayed. Keep the only copy
+        # visible until the hedged note is delivered, then quarantine it through the observer.
+        return _queue_declined_followup(
+            runner, data, path, "possibly-duplicate", source, adapter, recovered_events)
     event = _recovered_followup_event(data, source, author_id)
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)

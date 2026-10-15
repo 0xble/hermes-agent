@@ -29,6 +29,16 @@ class RestartRecoveryMixin:
             recorded.add(session_key)
             logger.info("Restart recovery outcome: session=%s outcome=%s", session_key, outcome)
 
+    def _record_recovered_followup_outcome(self, event, session_key: str, outcome: str) -> None:
+        """Record one terminal outcome per recovered follow-up spool, not per session."""
+        decided = getattr(self, "_declined_followup_outcomes", None)
+        if decided is None:
+            decided = self._declined_followup_outcomes = set()
+        marker = str(getattr(event, "_hermes_recovery_spool", None) or id(event))
+        if marker not in decided:
+            decided.add(marker)
+            logger.info("Restart recovery outcome: session=%s outcome=%s", session_key, outcome)
+
     def _release_restart_followup_key(self, session_key: str) -> None:
         """Allow a later reconnect scan to handle a recovered follow-up after it settles."""
         keys = getattr(self, "_restart_followup_keys", None)
@@ -248,16 +258,8 @@ class RestartRecoveryMixin:
             if spool is not None:
                 quarantine_pending_spool(spool, f"declined shutdown follow-up: {reason}")
         if declined:
-            # This input is its own recovery item: decide it once per spool, independently of the
-            # predecessor turn's outcome for the same session (and never release that turn's claim).
-            decided = getattr(self, "_declined_followup_outcomes", None)
-            if decided is None:
-                decided = self._declined_followup_outcomes = set()
-            marker = str(getattr(event, "_hermes_recovery_spool", None) or id(event))
-            if marker not in decided:
-                decided.add(marker)
-                logger.info("Restart recovery outcome: session=%s outcome=%s",
-                            session_key, f"skipped:{reason}{suffix}")
+            self._record_recovered_followup_outcome(
+                event, session_key, f"skipped:{reason}{suffix}")
             return
         self._release_restart_followup_key(session_key)
         self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
@@ -276,8 +278,11 @@ class RestartRecoveryMixin:
                 # A real turn replied or reported its own failure; the "still preserved"
                 # notice would be false once the spool is gone, so neither path sends it.
                 self._release_restart_followup_key(session_key)
-                self._record_restart_resume_outcome(
-                    session_key, "resumed" if succeeded else "skipped:turn-failed")
+                outcome = "resumed" if succeeded else "skipped:turn-failed"
+                if not succeeded and await self._recovered_input_durable(event):
+                    self._record_recovered_followup_outcome(event, session_key, outcome)
+                else:
+                    self._record_restart_resume_outcome(session_key, outcome)
                 return
         except asyncio.CancelledError:
             self._release_restart_followup_key(session_key)
@@ -300,8 +305,8 @@ class RestartRecoveryMixin:
                     # The input is durable, so there is no spool to retain; log the note's real
                     # fate even when shutdown cancels the send.
                     self._release_restart_followup_key(session_key)
-                    self._record_restart_resume_outcome(
-                        session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
+                    self._record_recovered_followup_outcome(
+                        event, session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
                 return
         finally:
             watcher.cancel()
