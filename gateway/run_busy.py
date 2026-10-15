@@ -19,7 +19,7 @@ from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text
+from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text, is_fyi_relay_text
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -907,8 +907,6 @@ class GatewayBusySessionMixin:
         if not self._admit_bot_message_for_source(event.source):
             return True
         event._bot_loop_admitted = True
-        if await self._hm_try_passive_fyi_relay(event, event.source, session_key, busy=True):
-            return True
 
         if await self._route_plaintext_approval_while_busy(event, session_key):
             event._gateway_accepted = True  # consumed by the blocked approval, an admission
@@ -917,6 +915,9 @@ class GatewayBusySessionMixin:
             self._preserve_drain_event(session_key, event)
             return True
         effective_mode = self._effective_busy_input_mode(event.source)
+        if is_fyi_relay_text(getattr(event, "text", None)):
+            # Passive FYIs are transcript notifications, never an interruption of active work.
+            effective_mode = "queue"
         if self._draining:
             # A command not bypassed by the adapter still uses the ordinary busy
             # dispatch path, never the busy-input interrupt/queue lane.

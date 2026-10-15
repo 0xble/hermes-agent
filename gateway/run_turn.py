@@ -27,7 +27,7 @@ from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
@@ -2205,19 +2205,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
-        # A drained passive FYI is admitted during _run_agent, but its row must follow every row from
-        # this outer turn, including session_meta and the failed-turn closing notice.
-        for passive_event in agent_result.pop("_deferred_passive_fyi_events", []):
-            if await self._hm_try_passive_fyi_relay(
-                passive_event, passive_event.source, session_key, after_turn=True,
-            ):
-                continue
-            requeue = getattr(self, "_queue_or_replace_pending_event", None)
-            if callable(requeue):
-                requeue(session_key, passive_event)
-            else:
-                logger.warning("Dropping deferred passive FYI with no pending-event queue: %s", session_key)
-
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -4127,23 +4114,48 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         pending_event = None
         pending = None
         if result and adapter and session_key:
+            from gateway.response_filters import is_fyi_relay_text
+
+            passive_events = []
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            if pending_event and await self._hm_try_passive_fyi_relay(
-                pending_event, pending_event.source, session_key, after_turn=True, defer=True,
+            while pending_event and (
+                pending_event.source.platform == Platform.TELEGRAM
+                and getattr(pending_event, "message_type", None) == MessageType.TEXT
+                and not getattr(pending_event, "internal", False)
+                and not getattr(pending_event, "_gateway_human_text_merged", False)
+                and getattr(pending_event, "reply_expected", None) is not True
+                and is_fyi_relay_text(getattr(pending_event, "text", None))
+                and self._relay_fyi_passive_enabled()
             ):
-                # The passive event is admitted now but written only after the outer turn's transcript
-                # persistence, so session_meta/user/assistant/failed-turn rows stay ahead of it.
-                if isinstance(result, dict):
-                    result.setdefault("_deferred_passive_fyi_events", []).append(pending_event)
+                if self._draining:
+                    self._preserve_drain_event(session_key, pending_event)
                 else:
-                    logger.warning("Cannot defer passive FYI after non-dict turn result; requeueing it")
-                    self._queue_or_replace_pending_event(session_key, pending_event)
-                # Passive FYIs are admitted without a follow-up model turn.
-                return None, pending
-            elif result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+                    passive_events.append(pending_event)
+                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+
+            if passive_events:
+                # Keep ordinary queued work ahead of passive FYIs. The current ordinary event runs
+                # in-band; the FYIs then re-enter the adapter's normal idle admission after the
+                # complete turn (including any recursive queued turns) is persisted.
+                overflow = self._overflow_queue(session_key)
+                queued = []
+                next_slot = getattr(adapter, "_pending_messages", {}).pop(session_key, None)
+                if next_slot is not None:
+                    queued.append(next_slot)
+                if overflow is not None:
+                    queued.extend(overflow)
+                    overflow.clear()
+                queued.extend(passive_events)
+                if queued:
+                    getattr(adapter, "_pending_messages", {})[session_key] = queued.pop(0)
+                    if overflow is not None:
+                        overflow.extend(queued)
+
+            if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if result.get("interrupt_source") or _is_control_interrupt_message(interrupt_message):
                     logger.info(
