@@ -1439,6 +1439,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
+            from gateway import zero_cut_standby as zcs
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config):
+                continue
             # Skip empty primary credentials in multiplex mode; secondary profiles may supply the token.
             if _multiplex_on and not _platform_has_bot_credential(platform, platform_config):
                 logger.info(
@@ -1749,15 +1752,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         self, connected_count: int, enabled_platform_count: int, startup_retryable_errors: list,
         startup_nonretryable_errors: list,
     ) -> bool:
-        """Log/degrade when a configured platform failed to start; return True when startup must exit.
-
-        The SHARED gate for every platform, not the api_server path: a configured platform that never
-        came up must leave a loud, observable trace (ERROR + a ``degraded`` runtime state) even while
-        sibling platforms serve normally. One WARNING next to "Gateway running with N platform(s)" let
-        a gateway with no API server at all look healthy for half an hour (api_server lost the bind
-        race against the gateway it was replacing, and nothing retried).
-        """
+        """Log/degrade when a configured platform failed to start; return True when startup must exit."""
         from gateway.run import _write_runtime_status_quiet
+        from gateway.zero_cut_standby import is_standby
+        if is_standby() and getattr(self, "_standby_deferred", None):
+            logger.info("Standby has deferred platforms; continuing without connections until promotion")
+            return False
         if connected_count != 0:
             self._reset_transient_exit_streak()  # a platform connected: the backend recovered
             if startup_nonretryable_errors:
@@ -1815,19 +1815,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             logger.info("Gateway will continue running for cron job execution.")
             return False
         if startup_retryable_errors:
-            # All retryable: stay alive (cron runs, watcher recovers) rather than systemd restart-loop.
             logger.warning(
                 "Gateway started with no connected platforms — %d platform(s) queued for retry: %s",
                 len(startup_retryable_errors), "; ".join(startup_retryable_errors),
             )
             _write_runtime_status_quiet(gateway_state="degraded", exit_reason=None)
-        # No adapter for any enabled platform: fleet nodes share one config.yaml but hold a subset of
-        # credentials, so degrade gracefully.
         logger.warning(
-            # Fall through to the normal "running" state — reconnect watcher takes it from here. In fleet
-            # deployments the same config.yaml is shared across nodes that may only have credentials for a
-            # subset of platforms. Rather than failing hard, degrade gracefully and allow cron jobs to run
-            # (#5196).
             "No adapter could be created for any of the %d configured platform(s). "
             "Check that required dependencies are installed and credentials are set. "
             "Gateway will continue for cron job execution; platforms whose plugin may still register "
@@ -1872,6 +1865,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            return
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
         self._restart_resume_outcomes = set()
         await self._start_post_connect_services(connected_count)
@@ -1951,6 +1947,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            self._spawn_reconnect_watcher()
+            return
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:

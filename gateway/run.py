@@ -5760,6 +5760,7 @@ async def _start_gateway_start_control_socket(runner):
         )
 
         from gateway.cron_review import CronReviewControl
+        from gateway import zero_cut_standby as zcs
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5772,9 +5773,8 @@ async def _start_gateway_start_control_socket(runner):
                            "serve-profile": serve_profile_verb(runner),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
-                           # A plugin installed/enabled by another process loads now and re-wires the
-                           # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result()})
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5788,14 +5788,14 @@ async def _start_gateway_start_control_socket(runner):
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    from gateway.zero_cut_standby import is_standby
+    if is_standby():
+        return (None, None, None, None)
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
     cron_stop = threading.Event()
-    # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
-    # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
-    # on that flag left every non-launch profile's jobs in a store no ticker visited: they
-    # silently never fired.
+    # ONE process ticks every profile.
     try:
         cron_profile_homes = _cron_tick_profile_homes(runner.config)
     except Exception as exc:
@@ -5807,18 +5807,13 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
     if isinstance(cron_provider, InProcessCronScheduler) and cron_profile_homes:
-        # Live enumerator: the ticker re-reads profiles/ every cycle so a profile created while
-        # the gateway runs gets its jobs fired without a restart (hot-serve).
+        # Live enumerator covers profiles created while the gateway runs.
         cron_start_kwargs["profile_homes"] = lambda: _cron_tick_profile_homes(runner.config)
         # Stand down, per tick, for a profile whose OWN gateway process ticks it.
         cron_start_kwargs["profile_gate"] = _cron_profile_gate
-        # Per-profile adapters so each profile's cron output goes via its own bot, not the
-        # default's. Absent (no multiplexed adapters), delivery for a secondary profile falls
-        # back to the primary's routed adapters or fails closed — the job still FIRES.
+        # Per-profile adapters preserve delivery ownership for secondaries.
         cron_start_kwargs["profile_adapters"] = getattr(runner, "_profile_adapters", None)
-        # runner.adapters belongs to the LAUNCH profile (``default``, or the ``--profile``
-        # name); naming it keeps the ticker from routing a secondary's cron through that bot
-        # and lets a named multiplexer's own jobs reuse its live adapters.
+        # Name the launch profile so secondary jobs do not route through its bot.
         cron_start_kwargs["default_profile"] = runner._primary_profile_name
         logger.info(
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
@@ -5828,7 +5823,7 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active)
-    # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
+    # Supervised ticker respawns.
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
@@ -5852,7 +5847,6 @@ def _start_gateway_start_cron_and_housekeeping(runner):
                 "restart`) so the profile env loads.",
                 getattr(cron_provider, "name", "external"))
 
-    # Gateway-only housekeeping runs independently of the cron provider; shares cron_stop for shutdown.
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping, args=(cron_stop,),
         kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
@@ -5881,10 +5875,16 @@ async def _start_gateway_shutdown_tail(
 
     _best_effort(_stop_keepalive)
 
+    # Promotion may have started cron; use its handles.
+    if cron_stop is None:
+        cron_stop, cron_provider, cron_thread, housekeeping_thread = getattr(
+            runner, "_zero_cut_cron_handles", (None, None, None, None))
     # Stop cron and housekeeping cooperatively; an in-flight delivery runs on this event loop.
-    cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    if cron_stop is not None:
+        cron_stop.set()
+    if cron_provider is not None:
+        _stop_cron_provider(cron_provider)
+    if cron_thread is not None and not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
     await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
