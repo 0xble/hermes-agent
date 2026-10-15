@@ -209,9 +209,26 @@ async def test_review_reaching_a_busy_session_fails_its_capture_and_never_queues
         internal=True, reply_expected=False, allow_gateway_control=False,
         metadata={"_cron_review_capture": capture})
     await adapter._handle_message_while_active(event, "key")
+    assert event._gateway_accepted is True  # the caller sees the busy cause, not a wake refusal
     with pytest.raises(RuntimeError, match="busy"):
         capture.result(timeout=0)
     busy_handler.assert_not_awaited()
     adapter._message_handler.assert_not_awaited()
     assert "key" not in adapter._pending_messages
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_runner_running_session_fast_path_fails_a_review_instead_of_interrupting():
+    from gateway.run_inbound import GatewayInboundMixin
+    capture = Future()
+    event = MessageEvent(text="review", source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="139328"),
+        internal=True, reply_expected=False, allow_gateway_control=False,
+        metadata={"_cron_review_capture": capture})
+    runner = SimpleNamespace(_draining=False)  # any further attribute access would fail the test
+    result = await GatewayInboundMixin._hm_handle_running_session_message(
+        runner, event, event.source, "key")
+    assert result is None
+    with pytest.raises(RuntimeError, match="busy"):
+        capture.result(timeout=0)

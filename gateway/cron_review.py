@@ -22,6 +22,20 @@ def is_review_event(event):
             and metadata.get("_cron_review_capture") is not None)
 
 
+def fail_busy_review(event) -> bool:
+    """Fail a review that reached a busy session; return whether it was a review.
+
+    Every busy entry point calls this so a review is never queued, merged, or used
+    to interrupt a live turn.
+    """
+    if not is_review_event(event):
+        return False
+    future = event.metadata["_cron_review_capture"]
+    if not future.done():
+        future.set_exception(RuntimeError("review subject is busy; use original report"))
+    return True
+
+
 def private_turn_response(event, agent_result):
     from gateway.warning_notifications import diagnostic_wake_muted
     if is_review_event(event):
