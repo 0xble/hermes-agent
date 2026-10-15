@@ -1957,6 +1957,7 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_a
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
+        agent._fallback_episode_cooled = True
     return False
 
 
@@ -2145,6 +2146,16 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
     return True, None
 
 
+def _finalize_fallback_route(agent, provider: str) -> None:
+    """Apply bookkeeping shared by a normal fallback bind and an earlier-route reclaim."""
+    rewrite_prompt_model_identity(agent, agent.model, provider)
+    _reset_stale_streak(agent)
+    from agent.native_compaction import resolve_native_compaction_capabilities
+    agent.runtime_capabilities = resolve_native_compaction_capabilities(
+        model=agent.model, base_url=agent.base_url, provider=provider,
+        is_codex_backend=provider == "openai-codex")
+    agent._provider_fallback_route = (str(agent.model), str(provider))
+
 def try_activate_fallback(
     agent, reason: "FailoverReason | None" = None, reset_at=None, *,
     _shared_cooldown_record=None,
@@ -2158,10 +2169,16 @@ def try_activate_fallback(
     """
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     shared_adoption = isinstance(_shared_cooldown_record, dict)
+    new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
+    if new_fallback_episode and not shared_adoption:
+        # A stale monotonic deadline from an older episode must not authorize
+        # mid-turn recovery for an uncooled fallback.
+        agent._fallback_episode_cooled = False
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     if shared_adoption:
         agent._shared_primary_cooldown_record = _shared_cooldown_record
+        agent._fallback_episode_cooled = True
         remaining = max(0, math.ceil(float(_shared_cooldown_record.get("reset_at", 0)) - time.time()))
         agent._rate_limited_until = time.monotonic() + remaining
         agent._rate_limit_backoff_count = int(_shared_cooldown_record.get("backoff_count", 0) or 0)
@@ -2191,8 +2208,6 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
-            rewrite_prompt_model_identity(agent, fb_model, fb_provider)
-
             use_generic_notice, notice = _rate_limit_fallback_notice(
                 agent, reason, shared_adoption, old_model, fb_model, fb_provider)
             if use_generic_notice:
@@ -2208,17 +2223,10 @@ def try_activate_fallback(
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
-            agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+            _finalize_fallback_route(agent, fb_provider)
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
-            # The stale-call streak measured the OLD provider; carrying it over would
-            # short-circuit the fresh fallback before its first stream attempt.
-            _reset_stale_streak(agent)
-            from agent.native_compaction import resolve_native_compaction_capabilities
-            agent.runtime_capabilities = resolve_native_compaction_capabilities(
-                model=agent.model, base_url=agent.base_url, provider=fb_provider,
-                is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
             if fb_provider == "nous":

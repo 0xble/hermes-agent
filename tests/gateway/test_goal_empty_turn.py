@@ -59,6 +59,9 @@ async def test_gateway_turn_evaluates_empty_success_and_releases_loop(hermes_hom
     loop = loops.LoopManager(entry.session_id)
     loop.set("Check the deployment", interval_seconds=300, until="deployment healthy")
     assert loop.fire_tick()
+    # Only the stamped wake settles a tick this process claimed; carry that identity.
+    from hermes_cli.session_controls import loop_wake_metadata
+    event.metadata = {**(event.metadata or {}), **loop_wake_metadata(entry.session_id, loop.state)}
     db = goals._get_session_db()
     db.ensure_session(entry.session_id, source="telegram")
     judged = []
@@ -136,10 +139,11 @@ def test_post_turn_dict_is_authoritative_over_legacy_display_stashes(model_text)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_text", ["", "[SILENT]", "Verified.\nLOOP_COMPLETE"])
 async def test_muted_diagnostic_turn_still_captures_model_text(monkeypatch, model_text):
-    from gateway import run_turn
+    from gateway import warning_notifications
     from gateway.run_turn import GatewayTurnMixin
 
-    monkeypatch.setattr(run_turn, "diagnostic_wake_muted", lambda event: True)
+    # Delivery privacy is decided by cron_review.private_turn_response, which reads this helper.
+    monkeypatch.setattr(warning_notifications, "diagnostic_wake_muted", lambda event: True)
     event = SimpleNamespace()
     result = {"final_response": model_text, "completed": True}
     delivered = await GatewayTurnMixin()._hmwa_deliver_turn_response(

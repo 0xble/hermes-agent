@@ -10,7 +10,7 @@ import copy
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
 
@@ -63,6 +63,13 @@ def _commit(session_id: str, expected: str, state: LoopState, db: Any) -> None:
         raise LoopPersistenceError from exc
 
 
+def _mark_synced(manager: Any) -> None:
+    """Record the published row's schedule; tick claims treat any other value as a reschedule."""
+    mark = getattr(manager, "_mark_synced", None)
+    if callable(mark):
+        mark()
+
+
 def _same_tick(first: LoopState, second: LoopState) -> bool:
     if not first.awaiting_response or not second.awaiting_response:
         return False
@@ -75,30 +82,39 @@ def _same_tick(first: LoopState, second: LoopState) -> bool:
 
 
 @snapshot_control
-def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> None:
+def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Optional[Tuple[str, str, str]]:
     """Release only the SAME tick on the winner, never apply its obsolete verdict.
 
     A revision may preserve awaiting_response. Leaving that claim behind would
     wedge the loop. Pauses, clears, replacements and newer ticks are untouched.
     Cleanup uses another CAS so it cannot overwrite a second concurrent edit.
     """
-    from hermes_cli.loops import LoopState, enforce_loop_run_cap, self_paced_floor_seconds
+    from hermes_cli.loops import LoopState, self_paced_floor_seconds
     winner = _read_loop(manager.session_id, db)
     manager._state = winner
+    _mark_synced(manager)
     if winner is None or winner.status != "active" or not _same_tick(original, winner):
         return
     expected = winner.to_json()
     updated = LoopState.from_json(expected)
     updated.awaiting_response = False
-    if not enforce_loop_run_cap(updated):
+    updated.current_delay = updated.interval_seconds if updated.mode == "interval" else updated.current_delay
+    cap = manager._cap_stop(updated)
+    if cap is None:
         updated.next_due_at = time.time() + (updated.current_delay or updated.interval_seconds or self_paced_floor_seconds())
+    else:
+        manager._apply_stop(updated, cap[0], cap[1])
     try:
         commit_and_publish_snapshot(
             manager, updated, lambda: _commit(manager.session_id, expected, updated, db),
             lambda: _read_loop(manager.session_id, db), preserve_reference=False,
         )
+        _mark_synced(manager)
+        return cap
     except LoopSnapshotChanged:
         manager._state = _read_loop(manager.session_id, db)
+        _mark_synced(manager)
+        return None
 
 
 @snapshot_control
@@ -106,6 +122,7 @@ def _reload_if_readable(manager: Any, db: Any) -> None:
     if db is not None:
         try:
             manager._state = _read_loop(manager.session_id, db)
+            _mark_synced(manager)
         except LoopPersistenceError:
             logger.warning("Could not reload loop %s; retaining in-memory state", manager.session_id)
 
@@ -151,16 +168,23 @@ def mutate_loop_snapshot(manager: Any, method: str, *args, **kwargs) -> dict[str
             lambda: _commit(manager.session_id, expected, staged.state, db),
             lambda: _read_loop(manager.session_id, db),
         )
+        _mark_synced(manager)
         if settlement and not published:
             return _failure(manager, True, "state_changed", "loop changed after settlement committed")
         return result
     except LoopSnapshotChanged:
         try:
             if settlement:
-                _release_superseded_tick(manager, initial, db)
+                # The winner's caps still apply to the released claim, but the obsolete verdict is
+                # never published: callers see state_changed with no user-visible message.
+                released = _release_superseded_tick(manager, initial, db)
+                if released is not None:
+                    return {"status": released[0], "stopped": True, "reason": released[1],
+                            "message": "", "error_code": "state_changed"}
             else:
                 with manager._snapshot_lock:
                     manager._state = _read_loop(manager.session_id, db)
+                    _mark_synced(manager)
         except LoopPersistenceError:
             logger.warning("Could not reload or release superseded loop %s", manager.session_id, exc_info=True)
             return _failure(manager, settlement, "persistence_failed",

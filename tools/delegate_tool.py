@@ -322,6 +322,12 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    # Session that started this delegation chain (the topic); inherited down nested children
+    # so relay guards hold even when a child runs on a thread without the parent's context.
+    inherited_root = getattr(parent_agent, "_delegation_root_session_id", None)
+    child._delegation_root_session_id = (
+        inherited_root if isinstance(inherited_root, str) and inherited_root else str(parent_sid or "")
+    )
     _apply_child_compression_cap(child, delegation_cfg)
     child._max_retry_wait_s = _max_retry_wait_seconds(routing_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent

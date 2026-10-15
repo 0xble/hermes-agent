@@ -770,7 +770,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("job_timezone", "job_timezone"), ("interpreter", "interpreter"),
-                   ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"))
+                   ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"),
+                   ("review_json", "review_json"), ("clear_review", "clear_review"))
 
 
 def _job_api_kwargs(args) -> Dict[str, Any]:

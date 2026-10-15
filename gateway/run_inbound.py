@@ -8,7 +8,6 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 import asyncio
 import concurrent.futures  # noqa: F401 -- kept public after the plugin-injection move
 import json
@@ -20,6 +19,7 @@ from pathlib import Path
 
 from agent.i18n import t
 from gateway.config import Platform
+from gateway.cron_review import is_review_event
 from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
@@ -35,7 +35,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -266,6 +266,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             self._queue_startup_restore_event(event)
             return None
 
+        # Adapter admission can precede this task by an arbitrary delay on an idle lane.
+        from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
+        if is_gateway_wake(event) and not await self._run_in_executor_with_context(
+                internal_wake_is_current, event):
+            return None
         if is_internal:
             await _admit_outbox_event(self, event, source)
             return event, source, True
@@ -1498,6 +1503,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
             logger.info("Rejecting new active session %s: max_concurrent_sessions reached", _quick_key)
+            await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
@@ -1530,6 +1536,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                await self._release_unsettled_loop_tick(event, ran=False)
                 return t("gateway.busy.another_turn_running")
             try:
                 await self._run_post_turn_hooks(
@@ -1943,9 +1950,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         return paths
 
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
-        """Persist the exact resolved routing key for this running turn."""
+        """Persist the exact resolved routing key for this running turn; never a cron review's, which boot would resume."""
         try:
-            token = await self.async_session_store.mark_turn_active(
+            token = None if is_review_event(event) else await self.async_session_store.mark_turn_active(
                 session_key, human=bool(getattr(self, "_is_user_turn_event", lambda _event: not event.internal)(event))
             )
         except Exception as exc:
