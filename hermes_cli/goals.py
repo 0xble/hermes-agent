@@ -112,7 +112,13 @@ _GOAL_AUTHORING_REQUIRED_EFFECTS = {
     "alter": ("alter", "altered"),
 }
 _GOAL_AUTHORING_CLAUSE_START = r"(?:^|[.;:!?\n]\s*|,\s*|\b(?:and|then)\s+)(?:please\s+)?"
-_GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|was|were|gets?|got)\s+(?:\w+ly\s+)?"
+# Present-tense end states only: "was deleted" or "were sent" report the past.
+_GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|gets?)\s+(?:\w+ly\s+)?"
+# A question or relative clause ("whether the topic is deleted", "files that are
+# removed") asks about the state instead of requiring it.
+_GOAL_AUTHORING_EMBEDDED_RE = re.compile(
+    r"(?i)\b(?:whether|if|which|why|how|what|that|when|where|who|whose)\b"
+)
 _GOAL_AUTHORING_SCOPED_EFFECTS = {
     "relay": {"relay"}, "send": {"send"}, "delete": {"delete", "remove"},
     "deploy": {"deploy"}, "merge": {"merge"},
@@ -122,10 +128,16 @@ _GOAL_AUTHORING_SCOPED_EFFECTS = {
 def goal_authoring_required_effects(text: str) -> set[str]:
     """Return mutation effects ``text`` commands or names as its end state."""
     text = text.strip()
+    clauses = re.split(r"[.;:!?\n]", text)
     effects: set[str] = set()
     for effect, (base, participle) in _GOAL_AUTHORING_REQUIRED_EFFECTS.items():
-        if (re.search(rf"(?i){_GOAL_AUTHORING_CLAUSE_START}{base}\b", text)
-                or re.search(rf"(?i){_GOAL_AUTHORING_END_STATE}{participle}\b", text)):
+        if re.search(rf"(?i){_GOAL_AUTHORING_CLAUSE_START}{base}\b", text):
+            effects.add(effect)
+            continue
+        end_state = re.compile(rf"(?i){_GOAL_AUTHORING_END_STATE}{participle}\b")
+        if any((match := end_state.search(clause))
+               and not _GOAL_AUTHORING_EMBEDDED_RE.search(clause[:match.start()])
+               for clause in clauses):
             effects.add(effect)
     return effects
 

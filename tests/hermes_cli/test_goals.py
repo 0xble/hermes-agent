@@ -251,6 +251,12 @@ class TestGoalManager:
         ("Compare three CRMs", "Brian has a written comparison of three CRMs"),
         ("Review the goal-authoring change", "Exact-head review returns a verdict"),
         ("Report which topics were sent to the wrong chat", ""),
+        ("Determine whether the topic was deleted", ""),
+        ("Check if the migration is deployed", ""),
+        ("Explain why updates are sent late", ""),
+        ("Verify that the backup is written nightly", ""),
+        ("List files that were removed last week", ""),
+        ("Identify what should be deleted", ""),
     ])
     def test_goal_authoring_allows_read_only_investigations(self, goal, outcome):
         from hermes_cli.goals import goal_authoring_findings
