@@ -148,6 +148,19 @@ async def test_slice_2_delivered_event_mid_wait_makes_exactly_one_judge_call(her
     assert judge.call_count == 0
     assert goals.GoalManager(entry.session_id).is_waiting()
 
+    # Restart recovery re-runs an interrupted turn; it is not outside evidence either.
+    for mark in ("restart-note", "resume-marker"):
+        recovery = MessageEvent(text="", message_type=MessageType.TEXT, source=src, internal=True)
+        if mark == "restart-note":
+            recovery._restart_note_expected = (entry.session_id, "k", "m", True)
+        else:
+            recovery._outbox_admission_id = "resume:marker-1"
+        with patch.object(goals, "judge_goal", return_value=("continue", "x", False, None, False)) as judge:
+            await runner._run_post_turn_hooks(agent_result={"final_response": "resumed"}, source=src,
+                                              is_internal=True, event=recovery)
+        assert judge.call_count == 0, mark
+        assert goals.GoalManager(entry.session_id).is_waiting(), mark
+
     # A delivered event is fresh evidence: exactly one judge call, wait lifted, continuation queued.
     if delivery == "cron":
         event = MessageEvent(text="Cron job 'numbers-watch' output: Q3 numbers posted.",
@@ -319,3 +332,73 @@ def test_slice_7_old_rows_with_removed_fields_load_and_run(hermes_home):
     assert decision["status"] == "active"
     for name in _REMOVED_FIELDS:
         assert name not in json.loads(goals.load_goal(sid).to_json())
+
+
+# --- Review regressions: pacing never spins, outages back off, breaches naming Brian pause ---
+
+
+def _repeat_evidence(*_a, **_k):
+    # Non-read-only, but the same recorded result every turn: no new progress.
+    return [{"tool": "terminal", "call": '{"command": "cd /repo && gh pr checks 611"}',
+             "output": "pending", "timestamp": 1.0}]
+
+
+def test_slice_3_repeated_non_read_only_evidence_backs_off(hermes_home, monkeypatch):
+    from hermes_cli import goals
+
+    clock = [time.time()]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    sid = "slice-3-repeat"
+    _manager(sid)
+    waits = []
+    with patch.object(goals, "collect_goal_evidence", _repeat_evidence), \
+            patch("agent.auxiliary_client.call_llm",
+                  return_value=_judge_reply({"verdict": "continue", "reason": "CI still pending"})):
+        for _ in range(5):
+            d = goals.GoalManager(sid).evaluate_after_turn("checked CI, still pending", user_initiated=False)
+            stored = goals.load_goal(sid)
+            waits.append(stored.waiting_seconds)
+            clock[0] = max(clock[0], stored.waiting_until) + 1
+    # The first turn records the fingerprint as new progress; every repeat climbs the ladder.
+    assert waits[1:] == [900, 3600, 14400, 86400]
+    assert goals.load_goal(sid).status == "active"
+
+
+def test_slice_4_persistent_outage_backs_off_on_the_ladder(hermes_home, monkeypatch):
+    from hermes_cli import goals
+
+    class APIStatusError(Exception):
+        status_code = 500
+
+    clock = [time.time()]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    sid = "slice-4-backoff"
+    _manager(sid)
+    waits, messages = [], []
+    with patch.object(goals, "collect_goal_evidence", _repeat_evidence), \
+            patch("agent.auxiliary_client.call_llm", side_effect=APIStatusError("HTTP 500")):
+        for _ in range(5):
+            d = goals.GoalManager(sid).evaluate_after_turn("working", user_initiated=False)
+            messages.append(d["message"])
+            stored = goals.load_goal(sid)
+            waits.append(stored.waiting_seconds)
+            clock[0] = max(clock[0], stored.waiting_until) + 1
+    assert waits == [900, 3600, 14400, 86400, 86400]
+    assert goals.load_goal(sid).status == "active"
+    assert [m for m in messages if m] == [goals.JUDGE_OUTAGE_NOTICE]
+
+
+@pytest.mark.parametrize("reason", [
+    "The agent merged to main, which the goal's constraints forbid without Brian's sign-off.",
+    "The agent already sent the external email the user said must not be sent; the user decides next steps.",
+])
+def test_slice_5_breach_naming_the_user_still_pauses(hermes_home, reason):
+    from hermes_cli import goals
+
+    sid = "slice-5-breach-user"
+    mgr = _manager(sid)
+    with patch("agent.auxiliary_client.call_llm",
+               return_value=_judge_reply({"verdict": "blocked", "reason": reason})):
+        decision = mgr.evaluate_after_turn("done", user_initiated=True)
+    assert decision["status"] == "paused"
+    assert goals.load_goal(sid).waiting_on_user_message is False

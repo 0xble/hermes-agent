@@ -6,6 +6,7 @@ notice creation and durable reload use production code.
 """
 from __future__ import annotations
 
+import uuid
 import json
 import subprocess
 import sys
@@ -123,7 +124,8 @@ async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_hom
             )
         # The post-lift automatic turn does real work, so it continues rather than parking on the ladder.
         with patch.object(goals, "_session_waiting", return_value=False), patch.object(goals, "_pid_alive", return_value=False), \
-                patch.object(goals, "_evidence_only_read_only_status", return_value=False):
+                patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
             mgr = await _turn(harness, "The release is still awaiting live validation.")
     assert len(adapter.sent) == 1, "unchanged reason was sent again after the barrier lift"
     assert mgr.state.last_continuation_notice_key == original_key
@@ -143,7 +145,8 @@ async def test_new_reason_after_silent_turn_is_deliverable(hermes_home):
     new_reason = "The canary found a new delivery failure requiring correction"
     with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
         # A material automatic report (real work this turn) must remain visible after silence.
-        with patch.object(goals, "_evidence_only_read_only_status", return_value=False):
+        with patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
             await _turn(harness, "The canary found a delivery failure.")
         await _turn(harness, "The correction is in progress.", user=True)
     assert len(adapter.sent) == 2

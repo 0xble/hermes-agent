@@ -678,6 +678,9 @@ class GatewayGoalsMixin:
                 self._is_goal_continuation_event(event)
                 or bool(metadata.get(LOOP_WAKE_METADATA_KEY))
                 or bool(getattr(event, "_heartbeat_session_id", None))
+                # Restart recovery re-runs an interrupted turn; it is not new outside evidence.
+                or getattr(event, "_restart_note_expected", None) is not None
+                or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
             )
             external_event = (
                 metadata.get("notification_origin") == "process_registry_synthetic"

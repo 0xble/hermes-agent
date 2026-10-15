@@ -611,13 +611,13 @@ JUDGE_SYSTEM_PROMPT = (
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
     "fabricate a deliverable that cannot exist, OR\n"
-    "- Progress needs user input or an external prerequisite to proceed, "
-    "and no authorized investigation or independent work remains right now. "
-    "This is a resolvable blocker, NOT proof the whole goal is unachievable.\n"
-    "Before choosing BLOCKED, prefer CONTINUE if the agent can investigate, "
-    "adapt its method, or do independent authorized work. Return BLOCKED "
-    "with the precise missing input or prerequisite in the reason; BLOCKED "
-    "pauses the goal rather than completing it.\n"
+    "- A constraint was breached, or an irreversible action the goal forbids "
+    "has already happened, so the user must decide what happens next.\n"
+    "If progress only needs user input (an answer, approval or decision), that is "
+    "NOT BLOCKED: return WAIT with ``wait_on_user_message`` instead. Before "
+    "choosing BLOCKED, prefer CONTINUE if the agent can investigate, adapt its "
+    "method, or do independent authorized work. Return BLOCKED with the precise "
+    "breach or reason in the reason; BLOCKED pauses the goal.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
     "sign-in or token failure), quote the error text verbatim in the reason "
     "and attribute it only to a provider, service or credential the response "
@@ -1649,8 +1649,9 @@ def _truthy(value: Any) -> bool:
 
 # BLOCKED reasons that are a real stop rather than a wait for the user's answer.
 _BLOCKED_PAUSE_RE = re.compile(
-    r"\b(?:breach\w*|violat\w*|irreversible|constraint|forbidden|prohibited|impossible|"
-    r"unachievable|cannot be (?:achieved|done|completed|satisfied)|no longer (?:exists|possible)|"
+    r"\b(?:breach\w*|violat\w*|irreversibl\w*|constraints?|forbid\w*|prohibit\w*|impossible|"
+    r"unachievable|must not|must never|should not have|cannot be (?:achieved|done|completed|satisfied|undone)|"
+    r"no longer (?:exists|possible)|already (?:sent|deleted|merged|published|posted|paid|pushed|removed)|"
     r"nothing (?:left|more) to try|no remaining (?:options|approaches))\b",
     re.I,
 )
@@ -3468,7 +3469,14 @@ class GoalManager(GoalRevisionsMixin):
         if user_initiated or external_event:
             state.consecutive_no_progress = 0
             state.backoff_level = 0
-        automatic_read_only = not user_initiated and not external_event and not new_eligible_non_read_only
+        # An automatic turn makes progress only with new, actionable tool evidence the judge could
+        # assess. Read-only status checks, a repeated evidence fingerprint, or a judge that could not
+        # answer all count as no progress, so the turn backs off on the shared ladder.
+        automatic_read_only = not user_initiated and not external_event and (
+            not new_eligible_non_read_only
+            or not (new_progress or evidence_scan_truncated_for_turn)
+            or bool(transport_failed) or bool(parse_failed)
+        )
         if automatic_read_only:
             # WAIT and CONTINUE share one durable no-progress streak. Changing status output,
             # judge wording, and a repeated parked turn are not actionable progress.

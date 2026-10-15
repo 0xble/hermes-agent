@@ -17,6 +17,7 @@ silently stalling goal loops on messaging gateways.
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 
 import pytest
@@ -189,7 +190,8 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     with patch(
         "hermes_cli.goals.judge_goal",
         return_value=("continue", "still needs work", False, None, False),
-    ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False):
+    ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,

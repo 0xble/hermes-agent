@@ -9,6 +9,7 @@ never saw verdicts. This test locks in the fix.
 
 from __future__ import annotations
 
+import uuid
 import asyncio
 from datetime import datetime
 from pathlib import Path
@@ -142,7 +143,8 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
     # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
     with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)), \
-            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False):
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
@@ -172,7 +174,8 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
 
     # Real (non-read-only) work this turn, so pacing does not park it on the no-progress ladder.
     with patch("hermes_cli.goals.judge_goal", return_value=("continue", "keep going", False, None, False)), \
-            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False):
+            patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
         await runner._post_turn_goal_continuation(
             session_entry=session_entry,
             source=src,
