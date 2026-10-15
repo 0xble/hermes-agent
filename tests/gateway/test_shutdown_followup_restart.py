@@ -449,6 +449,35 @@ async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_
 
 
 @pytest.mark.asyncio
+async def test_restored_followup_exception_after_input_retirement_gets_turn_failed_note(tmp_path, monkeypatch, caplog):
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    payload = json.loads(spool.read_text())
+    recovery_id = payload["data"]["recovery_id"]
+    recovered = _recovered_followup_event(payload["data"], source, source.user_id)
+    recovered._hermes_recovered_followup = True
+    recovered._hermes_recovery_session_key = entry.session_key
+    recovered._hermes_recovery_session_id = entry.session_id
+    recovered._hermes_recovery_spool_ts = payload["ts"]
+    recovered._hermes_recovery_spool = spool
+    recovered._gateway_accepted = True
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": recovered.text, "platform_message_id": recovery_id,
+    })
+    runner._follow_startup_resume_turn = AsyncMock(side_effect=RuntimeError("turn exploded"))
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._observe_recovered_followup(_adapter, recovered, entry.session_key)
+    from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+    # The spool is gone, so the turn-failed note is sent and the "still preserved" one is not.
+    assert _adapter.sent == [PARTIAL_FAILED_TURN_NOTICE]
+    assert not spool.exists()
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed"]
+
+
+@pytest.mark.asyncio
 async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_path, monkeypatch):
     """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
     from gateway import run
@@ -646,6 +675,43 @@ async def test_draining_string_followup_in_shared_session_is_unauthored_and_decl
     assert _outcome_lines(caplog) == [
         f"Restart recovery outcome: session={entry.session_key} outcome=skipped:author-missing:noted"]
     assert not spool.exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_idless_duplicate_content_is_declined_not_deleted(tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    spool = flush_dir / "pending-legacy.json"
+    spool.write_text(json.dumps({
+        "session_key": entry.session_key, "reason": "shutdown_follow_up", "ts": time.time() - 10, "seq": -1,
+        "data": {"text": "continue", "source_user_id": source.user_id, "user_id": source.user_id},
+    }))
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "continue", "platform_message_id": "later-message",
+        "timestamp": time.time(),
+    })
+    with caplog.at_level("INFO", logger="gateway.run"):
+        recover_pending_to_db(
+            Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+            deferred_followup=partial(_defer_followup, runner, {}, None))
+        await runner._drain_startup_restore_queue()
+        await asyncio.gather(*list(runner._background_tasks))
+    assert adapter.sent and "send it again" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
+    assert not spool.exists()
+    assert spool.with_name(spool.name + ".bad").exists()
+
+
+@pytest.mark.asyncio
+async def test_noninternal_idless_event_gets_recovery_id_at_flush(tmp_path, monkeypatch):
+    _runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="continue", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    payload = json.loads(next((tmp_path / "pending_messages").glob("*.json")).read_text())
+    assert payload["data"].get("message_id") is None
+    assert payload["data"]["recovery_id"].startswith("hermes-recovery-")
 
 
 @pytest.mark.asyncio

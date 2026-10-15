@@ -83,10 +83,10 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         serialised = _serialise_value(value)
         if serialised is None or not has_user_content(serialised):
             return False
-        # Internal follow-ups have no transport id, but their durable user row still needs a
-        # stable dedupe key. Keep it in a recovery-only field: replay must never expose the key
-        # to reply routing, threading, or any other transport-facing consumer.
-        if serialised.get("internal") is True and not serialised.get("message_id") and not serialised.get("recovery_id"):
+        # Any id-less follow-up needs a stable recovery-only dedupe key. This includes ordinary
+        # MessageEvents flushed from a non-internal queue: leaving those on the legacy content
+        # fallback lets a later identical message destroy the only recovery copy.
+        if not serialised.get("message_id") and not serialised.get("recovery_id"):
             serialised["recovery_id"] = f"hermes-recovery-{uuid.uuid4().hex}"
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True

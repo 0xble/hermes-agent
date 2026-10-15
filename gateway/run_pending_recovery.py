@@ -118,6 +118,15 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         decline = "author-missing"
     elif data.get("_recovery_stale") is True:
         decline = "stale"
+    elif (data.get("shutdown_follow_up") is True
+          and data.get("message_id") is None and data.get("recovery_id") is None
+          and input_already_durable(
+              runner.session_store, session_id, None, data.get("text"),
+              data.get("_recovery_spool_ts"))):
+        # Legacy id-less spools have no identity stronger than their content. A matching row may
+        # be an unrelated later message, so preserve the bytes and make the uncertainty visible;
+        # never silently delete the only recovery copy.
+        decline = "possibly-duplicate"
     adapter, source = ready
     if decline is not None:
         if data.get("shutdown_follow_up") is not True:
@@ -169,6 +178,10 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
     if not session_id:
         return False
     if message_id is None:
+        # Content has no identity. Without a spool timestamp there is no safe compatibility bound,
+        # so legacy payloads must not be treated as already durable.
+        if spool_ts is None:
+            return False
         probe = getattr(store, "has_user_message_content", None)
         if not content or not callable(probe):
             return False

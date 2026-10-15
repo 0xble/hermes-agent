@@ -203,28 +203,33 @@ class RestartRecoveryMixin:
             else:
                 await self._finish_restart_recovery(session_key, outcome.removeprefix("skipped:"))
 
+    async def _deliver_recovered_followup_note(self, event, session_key: str, content: str) -> bool:
+        """Send one recovered-follow-up notice inside the event's own profile scope."""
+        from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
+        try:
+            # Restore observers run outside any profile scope; a multiplexed secondary
+            # profile's notice must resolve its own locale, metadata and config.
+            home = self._resolve_profile_home_for_source(event.source)
+            async with _async_profile_runtime_scope(home) if home else nullcontext():
+                send = self._deliver_platform_notice(event.source, content)
+                timeout = _startup_restore_drain_timeout_secs()
+                return bool(await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None))
+        except Exception:
+            logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
+            return False
+
     async def _finish_recovered_followup(self, event, session_key: str, reason: str) -> None:
         """A future turn can outlive its predecessor's marker; its refusal still needs a note."""
-        from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
 
         declined = getattr(event, "_hermes_recovered_declined", False) is True
         # A declined input never ran, so the predecessor's interruption note does not cover it.
         noted = False if declined else self._interruption_note_delivered(session_key)
         if not noted:
-            try:
-                # Restore observers run outside any profile scope; a multiplexed secondary
-                # profile's notice must resolve its own locale, metadata and config.
-                home = self._resolve_profile_home_for_source(event.source)
-                async with _async_profile_runtime_scope(home) if home else nullcontext():
-                    send = self._deliver_platform_notice(
-                        event.source,
-                        t("gateway.restart.followup_declined_notice" if declined
-                          else "gateway.restart.followup_recovery_notice"),
-                    )
-                    timeout = _startup_restore_drain_timeout_secs()
-                    noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
-            except Exception:
-                logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
+            noted = await self._deliver_recovered_followup_note(
+                event, session_key,
+                t("gateway.restart.followup_declined_notice" if declined
+                  else "gateway.restart.followup_recovery_notice"),
+            )
         suffix = ":noted" if noted else ":note-unavailable"
         if declined and noted:
             # The user now knows to resend it: keep the bytes for manual recovery, but never
@@ -272,6 +277,16 @@ class RestartRecoveryMixin:
         except Exception:
             reason = "turn-failed"
             logger.warning("Restored follow-up failed for %s", session_key, exc_info=True)
+            # The input row is durable before the model call, so the watcher may already have
+            # retired the spool. The input is then no longer preserved and nothing replays an
+            # in-process failure: send the failed-turn note, never the false preserved notice.
+            if await self._recovered_input_durable(event):
+                from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+                self._retire_recovered_followup_spool(event)
+                await self._deliver_recovered_followup_note(event, session_key, PARTIAL_FAILED_TURN_NOTICE)
+                self._release_restart_followup_key(session_key)
+                self._record_restart_resume_outcome(session_key, "skipped:turn-failed")
+                return
         finally:
             watcher.cancel()
         await self._finish_recovered_followup(event, session_key, reason)
