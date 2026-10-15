@@ -6,8 +6,11 @@ goal hosts share this owner so those paths also work on standalone mixins.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum, auto
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class _CommandDispatch(Enum):
@@ -46,23 +49,32 @@ class GatewayLoopWakeMixin:
 
     async def _loop_wake_execution_current(
         self, sid: str, tick: tuple, source: Any, *, run_generation: Optional[int] = None,
-    ) -> Optional[int]:
-        """Revalidate an admitted wake after an executor hop and return the stored control fence.
+    ) -> Optional[tuple]:
+        """Revalidate an admitted wake after an executor hop: ``(owning sid, stored control fence)``.
 
         Admission already started the tick. This stored-row read preserves cross-process controls;
         the synchronous event fence additionally covers local controls in the executor return gap.
+        A route that moved to the fence session's compression successor follows the migrated row;
+        any other route (a /resume elsewhere) defers.
         """
         from hermes_cli.loops import LoopManager
+        from hermes_cli.session_controls import migrated_successor
 
         key_for_source = getattr(self, "_session_key_for_source", None)
         session_key = key_for_source(source) if callable(key_for_source) else None
 
-        def _exact_started_tick() -> Optional[int]:
+        def _exact_started_tick() -> Optional[tuple]:
             lookup = getattr(getattr(self, "session_store", None), "lookup_by_session_key", None)
             current = lookup(session_key) if callable(lookup) and session_key else None
-            if callable(lookup) and session_key and (current is None or current.session_id != sid):
-                return None
-            state = LoopManager(sid).state
+            owner = sid
+            if callable(lookup) and session_key:
+                if current is None:
+                    return None
+                if current.session_id != sid:
+                    if migrated_successor("loop", sid) != current.session_id:
+                        return None
+                    owner = current.session_id
+            state = LoopManager(owner).state
             if not (
                 state is not None
                 and state.status == "active"
@@ -72,9 +84,15 @@ class GatewayLoopWakeMixin:
                 and (run_generation is None or int(getattr(state, "run_generation", 0) or 0) == int(run_generation))
             ):
                 return None
-            return int(getattr(state, "control_generation", 0) or 0)
+            return owner, int(getattr(state, "control_generation", 0) or 0)
 
         return await self._run_in_executor_with_context(_exact_started_tick)
+
+    def _log_loop_wake_suppressed(self, event: Any, reason: str) -> None:
+        """Name every fence-suppressed loop wake: the started tick stays for recovery to skip."""
+        identity = self._loop_wake_command_identity(event)
+        if identity is not None:
+            logger.info("Discarding loop wake for session %s tick %s: %s", identity[0], identity[1], reason)
 
     def _loop_wake_execution_fence_sync(self, event: Any, fence: Optional[tuple]) -> bool:
         """Final local supersede check, with no yield before effect invocation.
@@ -168,12 +186,22 @@ class GatewayLoopWakeMixin:
             self._current_session_run_generation(self._session_key_for_source(source))
             if hasattr(self, "_current_session_run_generation") else 0
         )
-        control = await self._loop_wake_execution_current(
+        current = await self._loop_wake_execution_current(
             sid, tick, source, run_generation=generation,
         )
-        if control is None or (fence is not None and control != fence[3]):
+        if current is None:
             return False
-        if fence is None:
-            fence = (sid, tick, generation, control)
+        owner, control = current
+        if fence is not None and control != fence[3]:
+            return False
+        if owner != sid:
+            if not metadata.get("loop_wakeup"):
+                return False
+            # Compression carried the started tick to the route's child; execution and settlement
+            # follow it there, exactly as the model-boundary rebind would.
+            from hermes_cli.session_controls import _rebind_wake_session
+            _rebind_wake_session(metadata, "loop_wakeup_session_id", owner)
+        if fence is None or owner != sid:
+            fence = (owner, tick, generation, control)
             event._gateway_loop_execution_fence = fence
         return self._loop_wake_execution_fence_sync(event, fence)

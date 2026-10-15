@@ -2485,6 +2485,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         )
 
         if not await self._prepare_loop_wake_execution(event, source):
+            self._log_loop_wake_suppressed(event, "superseded before session resolution")
             return
         _owned_loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
         if _owned_loop_fence is not None:
@@ -2526,6 +2527,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         event._restart_note_marker_api_available = _resume_marker_reader_available
         event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
         if not await self._prepare_loop_wake_execution(event, source):
+            self._log_loop_wake_suppressed(event, "superseded before turn preparation")
             return
         prepared, _session_env_tokens = await self._hmwa_prepare_turn(
             event, source, session_entry, session_key, _quick_key, run_generation,
@@ -2536,6 +2538,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
         try:
             if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during turn preparation")
                 return
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -2562,6 +2565,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _loop_tick = self._loop_wake_command_identity(event)
             _loop_tick = _loop_tick[1] if _loop_tick is not None else None
             if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during agent:start hooks")
                 return
             if _loop_tick is not None:
                 event._gateway_loop_tick = _loop_tick
@@ -2606,6 +2610,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
             if not started:
+                self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 

@@ -1396,7 +1396,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     ) -> Tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
         async def _loop_command_current() -> bool:
-            return await self._prepare_loop_wake_execution(event, source)
+            if await self._prepare_loop_wake_execution(event, source):
+                return True
+            self._log_loop_wake_suppressed(event, "superseded before command dispatch")
+            return False
 
         if not await _loop_command_current():
             return True, None
@@ -1564,6 +1567,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         # passes the "already running" guard and spins up a duplicate agent for the same session.
         _loop_fence = getattr(event, "_gateway_loop_execution_fence", None)
         if not self._loop_wake_execution_fence_sync(event, _loop_fence):
+            self._log_loop_wake_suppressed(event, "superseded before the session slot claim")
             return None
         _active_session_lease, _limit_message = self._claim_active_session_slot(_quick_key, source)
         if _limit_message is not None:
@@ -1579,6 +1583,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if not self._loop_wake_execution_fence_sync(event, _loop_fence):
             if _active_session_lease is not None:
                 _active_session_lease.release()
+            self._log_loop_wake_suppressed(event, "superseded before the running-agent sentinel")
             return None
         _run_generation = (
             _loop_fence[2] if _loop_fence is not None
