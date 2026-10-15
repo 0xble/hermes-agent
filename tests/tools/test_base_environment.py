@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import tools.environments.base as base_environment
 import tools.terminal_tool_sudo as terminal_tool_sudo
 from tools.environments.base import BaseEnvironment, _load_json_store
 from tools.environments.base_output import _BoundedOutputCollector
@@ -70,6 +71,24 @@ def test_nopasswd_probe_runs_sudo_n_inside_backend_only_when_supported(
     assert run.called is probed
     if probed:
         assert run.call_args.args[0] == "sudo -n true"
+
+
+def test_execute_explains_host_exit_and_does_not_retry(monkeypatch):
+    env = _TestableEnv()
+    env._snapshot_ready = True
+    run_bash = MagicMock()
+    monkeypatch.setattr(env, "_run_bash", run_bash)
+    monkeypatch.setattr(base_environment, "_enter_foreground_spawn", lambda: False)
+
+    result = env.execute("printf 'must not run'")
+
+    assert result["returncode"] == 130
+    assert "[host is exiting: command not started]" in result["output"]
+    assert "Hermes is restarting or shutting down" in result["output"]
+    assert "command was NOT run" in result["output"]
+    assert "work will resume after restart" in result["output"]
+    assert "Do not retry this command in this turn" in result["output"]
+    run_bash.assert_not_called()
 
 
 class TestBoundedOutputCollector:
