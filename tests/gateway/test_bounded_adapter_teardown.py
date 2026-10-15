@@ -43,6 +43,7 @@ async def test_zero_cut_teardown_does_not_cancel_disconnect_before_updater_stop(
     adapter.platform = Platform.TELEGRAM
     adapter.gateway_runner.config = GatewayConfig(zero_cut_handover_enabled=True)
     adapter.cancel_background_tasks = AsyncMock()
+    adapter._platform_lock_identity = None
     adapter._release_platform_lock = lambda: (lock_released.append(True), released.set())
 
     async def disconnect(**_kwargs):

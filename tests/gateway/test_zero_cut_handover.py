@@ -9,6 +9,7 @@ from hermes_cli import gateway_launchd
 from gateway.config import GatewayConfig, Platform, is_zero_cut_handover_enabled
 from gateway.config_loader import bridge_toplevel_keys
 from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.disconnect_handover import run_disconnect
 
 
 def test_zero_cut_handover_defaults_off():
@@ -285,3 +286,34 @@ def test_disconnect_flag_on_cancels_and_releases_when_updater_stop_times_out(mon
     asyncio.run(scenario())
     assert stop_cancelled == [True]
     assert events.index("release") < events.index("app.stop")
+
+
+def test_detached_disconnect_does_not_release_a_successor_lock(monkeypatch, tmp_path):
+    """A same-process successor re-acquires the token lock while the old teardown still runs."""
+    from gateway import status
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path))
+    old = object.__new__(TelegramAdapter)
+    old.gateway_runner = SimpleNamespace(config=GatewayConfig(zero_cut_handover_enabled=True))
+    old._platform_lock_scope, old._platform_lock_identity = "telegram-bot-token", "token"
+    assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]
+    lock_path = status._get_scope_lock_path("telegram-bot-token", "token")
+
+    async def scenario():
+        finish = asyncio.Event()
+
+        async def teardown(*, zero_cut_handover):
+            await finish.wait()
+            zero_cut_handover()
+
+        outer = asyncio.ensure_future(run_disconnect(old, teardown))
+        await asyncio.sleep(0)
+        outer.cancel()  # the gateway's disconnect budget gives up
+        await asyncio.sleep(0.01)
+        assert status.acquire_scoped_lock("telegram-bot-token", "token")[0]  # successor
+        finish.set()
+        await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+    assert lock_path.exists()
+    assert old._platform_lock_identity is None

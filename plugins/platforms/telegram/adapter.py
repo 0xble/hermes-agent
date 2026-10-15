@@ -4042,7 +4042,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
         await run_disconnect(self, self._disconnect)
 
-    async def _disconnect(self, *, zero_cut_handover: bool) -> None:
+    async def _disconnect(self, *, zero_cut_handover: Optional[Callable[[], None]]) -> None:
         # Persist the day's volume first (SQLite off the event loop), so a restart cannot forget the last minute of calls.
         quota = self.__dict__.get("_telegram_daily_quota")
         if quota is not None:
@@ -4097,7 +4097,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                         logger.warning(
                             "[%s] updater.stop() failed during disconnect: %s", self.name, _redact_telegram_error_text(stop_error))
                 if zero_cut_handover:
-                    self._release_platform_lock()
+                    zero_cut_handover()
                 # app.stop()/shutdown() can also block on a half-dead httpx pool.
                 # Detach-on-timeout so disconnect always returns (#80598).
                 if self._app.running:
