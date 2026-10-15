@@ -1384,6 +1384,47 @@ class TestPruneSessions:
         assert session["id"] == "new"
 
 
+    def test_prune_batches_write_transactions_and_yields(self, db, monkeypatch):
+        import hermes_state_maintenance
+
+        old = time.time() - 200 * 86400
+        for index in range(51):
+            sid = f"old-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (old, sid))
+        db._conn.commit()
+
+        pauses = []
+        monkeypatch.setattr(hermes_state_maintenance.time, "sleep", pauses.append)
+        assert db.prune_sessions(older_than_days=90) == 51
+        assert db._read_one("SELECT COUNT(*) FROM sessions WHERE id LIKE 'old-%'")[0] == 0
+        # 51 victims => 25 + 25 + 1, with a release/yield between each transaction.
+        assert pauses == [0.01, 0.01]
+
+
+    def test_prune_preserves_guarded_compression_lineage_across_batches(self, db, monkeypatch):
+        root = "lineage-root"
+        db.create_session(root, source="cli")
+        db.end_session(root, end_reason="compression")
+        for index in range(24):
+            sid = f"filler-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        child = "lineage-child"
+        db.create_session(child, source="cli", parent_session_id=root)
+        db.end_session(child, end_reason="done")
+        old = time.time() - 200 * 86400
+        db._conn.execute("UPDATE sessions SET started_at = ?", (old,))
+        db._conn.commit()
+
+        monkeypatch.setattr(db, "_guarded_ids", lambda _conn, ids: {child} if child in ids else set())
+
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 24
+        assert db.get_session(root) is not None
+        assert db.get_session(child) is not None
+
+
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
         # Backdate but don't end

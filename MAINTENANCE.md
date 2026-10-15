@@ -107,6 +107,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Outbox coalesced sweep | Deferred outbox redelivery runs as one sweep per store and adapter identity, with serialized recovery, closed connections, durable receipts and held rows logged once | Outbox retry scheduling, `recover()`, receipts, held-row reporting or store connections | [Outbox coalesced sweep](maintenance/outbox-coalesced-sweep.md) |
 | Async delegation ledger off the loop | Every state.db ledger claim, settle, replay and auto-resume call from gateway async code runs in a worker thread, so a slow WAL checkpoint cannot trip the liveness watchdog | Durable completion claim/settle, startup replay, or auto-resume scheduling from the gateway loop | [Async delegation ledger off the loop](maintenance/async-delegation-ledger-off-loop.md) |
 | Gateway loop state.db guard | The event-loop thread never waits on state.db or session-store locks, and a restart cannot start its resume/cron herd at once | Gateway async code touching state.db or the session store, or boot-time concurrency | [Gateway loop state.db guard](maintenance/gateway-loop-statedb-guard.md) |
+| State.db prune lock batching | Automatic session retention deletes run only in the deletion window and in short transactions, with actionable long-lock diagnostics | Session auto-prune, retention maintenance, SQLite write-lock diagnostics, or pruning regressions | [State.db prune lock batching](maintenance/state-db-prune-lock-batching.md) |
 | Desktop idle session refresh cost | Bound metadata serialization and preview projection without changing polling or session-list semantics | Change watcher signatures, preview SQL or recent session-list queries | [Desktop idle CPU](maintenance/desktop-idle-cpu.md) |
 | File-tool recovery | Recover malformed regexes transparently and provide resolved missing paths and complete patch ambiguity locations | File/search/patch diagnostics, fuzzy strategies, or upstream file-tool recovery changes | [File-tool recovery](maintenance/file-tool-recovery.md) |
 | Bounded filename search | Keep ripgrep filename walks on a small CPU budget without changing content-search parallelism | `search_files(target='files')`, ripgrep command construction, or filename-search regressions | [Bounded filename search](maintenance/bounded-filename-search.md) |
@@ -176,6 +177,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Secret-safe provider diagnostics | Check the selected custom HTTP endpoint without exposing credentials through argv, responses or logs | Provider diagnostic helper, credential resolution or output/logging changes | [Secret-safe provider diagnostics](maintenance/io-safe-provider-probe.md) |
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
 | Deferred local tool_call batching | Multi-entry local `tool_call` batches run losslessly, bounded and interruptible through each entry's ordinary pipeline, with entry-indexed, non-misleading errors | Tool Search bridge, `tool_call` batching, local batch splitter, or connector batch dispatch changes | [Deferred local batch](maintenance/deferred-local-batch.md) |
+
+## Active patch record: state.db prune lock batching
+
+- **Patch identity:** `state-prune-lock-batching`.
+- **Behavior:** Automatic session retention pruning waits for the configured deletion window, deletes sessions and their FTS-triggered messages in short idempotent transactions with guard-safe compression lineage handling, and reports long write-lock holds with callback and pid. Non-Linux lock diagnostics no longer claim a holder released just before the deadline when `/proc/locks` is unavailable.
+- **Source surfaces:** `gateway/run.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_lockowners.py`, and focused state/gateway/CLI tests.
+- **Upstream status:** No equivalent upstream fix for the combined daytime gate, bounded prune transactions, and macOS diagnostic correction.
+- **Focused regression:** `uv run --with pytest --with pytest-asyncio pytest -q tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py`.
+- **Retirement:** Remove when upstream provides equivalent deletion-window gating, bounded guard-safe pruning, and cross-platform long-lock diagnostics.
+- **Rollback:** Revert the commit carrying `Fork-Patch: state-prune-lock-batching`.
 
 ## Active patch record: relay silence (S1)
 
