@@ -133,6 +133,188 @@ class TestJudgeGoal:
 
 class TestGoalManager:
 
+    @pytest.mark.parametrize(
+        "goal,contract,code",
+        [
+            ("x " * 301, None, "length"),
+            ("Ship the release", {"verification": "PR #551 is merged"}, "stale_identifier"),
+            ("Delete the obsolete topic", {"constraints": "Read-only; no changes"}, "readonly_mutation"),
+            ("Ship the release", {"verification": "1. Run tests\n2. Read logs\n3. Review output"}, "verification_checklist"),
+            ("Ship the release", {"verification": "Fixes, flood evidence, restart logs, and closed or assigned plan items read back."}, "verification_checklist"),
+        ],
+    )
+    def test_goal_authoring_rules_have_deterministic_findings(self, goal, contract, code):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(goal, contract)
+        assert [finding.code for finding in findings] == [code]
+
+    @pytest.mark.parametrize("goal", [
+        "Run 50 evals",
+        "Write docs for job 42 scheduling",
+        "Keep build 2026 green",
+        "Migrate the cafe5678 table",
+        "~/plans/a1b2c3d.md",
+        "The dashboard is green, the alert is quiet, and logs are clean.",
+    ])
+    def test_goal_authoring_allowed_numeric_labels_and_live_outcome(self, goal):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(goal) == []
+
+    @pytest.mark.parametrize("goal", [
+        "Finish scoring the curated source lists using Brian's Round 3 calibration decisions, with the scoring skill deployed. Plan: ~/Workspace/projects/source-scoring/plan.md\nverify: Every list meets the calibration threshold or is marked for rework, and the deployed skill scores a fresh list.\nconstraints: Don't add, remove, or reclassify list entries.\nstop when: Brian's Round 3 calibration decisions are needed.",
+        "The credential broker is retired and agents use 1Password directly through service accounts.\nverify: Agents read secrets from each non-Private vault without the broker, and no broker process or config remains.\nconstraints: Never print secrets, rotate credentials without Brian, or touch LPG or Meridian infrastructure.\nstop when: Brian needs to approve the service accounts on his Mac.",
+    ])
+    def test_goal_authoring_approved_shapes_are_clean(self, goal):
+        from hermes_cli.goals import parse_contract, goal_authoring_findings
+        headline, contract = parse_contract(goal)
+        assert goal_authoring_findings(headline, contract) == []
+
+    def test_goal_authoring_revision_cap_preserves_legacy_small_fix(self):
+        from hermes_cli.goals import goal_authoring_findings
+        current = len("Keep the service healthy") + len("The service is healthy.")
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"verification": "x " * 400},
+            previous_total=current, changed_fields={"verification"},
+        )[0].code == "length"
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"constraints": "legacy " * 100, "verification": "X is live"},
+            previous_total=700, changed_fields={"verification"},
+        ) == []
+
+    def test_goal_authoring_revision_checks_cross_field_contradictions(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(
+            "Delete the obsolete topic",
+            {"constraints": "Read-only; no changes", "verification": "topic is gone"},
+            previous_total=100,
+            changed_fields={"goal"},
+        )
+        assert [finding.code for finding in findings] == ["readonly_mutation"]
+        assert goal_authoring_findings(
+            "Keep the service healthy",
+            {"constraints": "Read-only; no changes", "verification": "Verify no deploys occurred"},
+        ) == []
+
+    def test_goal_authoring_checks_waits_in_outcome_and_not_measurement_windows(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings(
+            "Keep the service healthy", {"outcome": "Wait for 24 hours before declaring success"}
+        )
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+        assert goal_authoring_findings(
+            "Keep the service healthy", {"verification": "The service remains healthy and the report covers the last 7 days."}
+        ) == []
+
+    def test_goal_authoring_rejects_explicit_wait_over_a_measurement_window(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings("Wait for the last 7 days before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+
+    def test_goal_authoring_rejects_fixed_wait_in_goal(self):
+        from hermes_cli.goals import goal_authoring_findings
+
+        findings = goal_authoring_findings("Wait for 24 hours before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+        findings = goal_authoring_findings("Wait 24 hours before declaring success")
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+
+    @pytest.mark.parametrize("goal,constraints", [
+        ("Deploy the new API", "No deletions of user data"),
+        ("Ship the fix", "Don't merge without Brian's approval"),
+        ("Write the weekly report", "No sends to clients"),
+        ("Create the migration plan", "Do not deploy to production"),
+    ])
+    def test_goal_authoring_allows_scoped_hard_limits(self, goal, constraints):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(goal, {"constraints": constraints}) == []
+
+    @pytest.mark.parametrize("goal,constraints", [
+        ("Modify the service", "read-only; no changes"),
+        ("Deploy the new API", "No deploys."),
+        ("Remove the stale topic", "Never delete"),
+    ])
+    def test_goal_authoring_flags_limits_that_forbid_the_outcome(self, goal, constraints):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings(goal, {"constraints": constraints})
+        assert [finding.code for finding in findings] == ["readonly_mutation"]
+
+    @pytest.mark.parametrize("goal,outcome", [
+        ("Audit recent config changes", ""),
+        ("Find which commit added the regression", ""),
+        ("Investigate why the deploy failed", ""),
+        ("Explain the update flow", ""),
+        ("Write up the root cause of the outage", ""),
+        ("Compare three CRMs", "Brian has a written comparison of three CRMs"),
+        ("Review the goal-authoring change", "Exact-head review returns a verdict"),
+        ("Report which topics were sent to the wrong chat", ""),
+        ("Determine whether the topic was deleted", ""),
+        ("Check if the migration is deployed", ""),
+        ("Explain why updates are sent late", ""),
+        ("Verify that the backup is written nightly", ""),
+        ("List files that were removed last week", ""),
+        ("Identify what should be deleted", ""),
+        ("Check whether the migration is deployed and the backup is written", ""),
+        ("Report which topics are sent and are deleted", ""),
+    ])
+    def test_goal_authoring_allows_read_only_investigations(self, goal, outcome):
+        from hermes_cli.goals import goal_authoring_findings
+        contract = {"constraints": "Read-only; no changes"}
+        if outcome:
+            contract["outcome"] = outcome
+        assert goal_authoring_findings(goal, contract) == []
+
+    @pytest.mark.parametrize("goal,contract", [
+        ("The obsolete topic is deleted", {"constraints": "read-only"}),
+        ("Fix the config and deploy", {"constraints": "No deploys."}),
+        ("Clean up stale topics", {"outcome": "Stale topics are removed", "constraints": "Never delete"}),
+        ("Draft the summary, then send it", {"constraints": "no changes"}),
+        ("Report which topics were sent, then the summary is sent", {"constraints": "no changes"}),
+    ])
+    def test_goal_authoring_flags_required_end_states_and_later_clauses(self, goal, contract):
+        from hermes_cli.goals import goal_authoring_findings
+        assert [finding.code for finding in goal_authoring_findings(goal, contract)] == ["readonly_mutation"]
+
+    def test_goal_authoring_unrelated_revision_skips_legacy_contradiction(self):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(
+            "Delete the topic", {"constraints": "Read-only", "verification": "topic gone"},
+            previous_total=50, changed_fields={"verification"},
+        ) == []
+
+    @pytest.mark.parametrize("verification", [
+        "The service remains healthy over the last 24 hours.",
+        "The service remains healthy and the 24-hour error rate is below 1%.",
+        "Monitoring shows the 7-day error budget intact.",
+        "Errors remain below 1% for the past 2 weeks.",
+    ])
+    def test_goal_authoring_allows_hour_and_week_measurement_windows(self, verification):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings("Keep the service healthy", {"verification": verification}) == []
+
+    def test_goal_authoring_flags_after_duration_waits(self):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings(
+            "Keep the service healthy", {"verification": "Check the dashboard again after 24 hours."}
+        )
+        assert [finding.code for finding in findings] == ["fixed_wait"]
+
+    def test_goal_authoring_length_finding_names_the_contract(self):
+        from hermes_cli.goals import goal_authoring_findings
+        findings = goal_authoring_findings("Keep X healthy", {"constraints": "y " * 400})
+        assert ("length", "contract") in [(finding.code, finding.field) for finding in findings]
+
+    @pytest.mark.parametrize("goal", [
+        "Resolve 0xble/agents#435",
+        "Fix importer per ~/plans/pr#12/plan.md until issue 42 is closed",
+    ])
+    def test_goal_authoring_path_exemption_keeps_real_references(self, goal):
+        from hermes_cli.goals import goal_authoring_findings
+        assert "stale_identifier" in [finding.code for finding in goal_authoring_findings(goal)]
+
     def test_set_then_status(self, hermes_home):
         from hermes_cli.goals import GoalManager
 
