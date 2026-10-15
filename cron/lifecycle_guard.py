@@ -770,25 +770,26 @@ def _prefix_positions(
         name = _executable_name(segment[index])
         if name not in _TRANSPARENT_COMMAND_PREFIXES:
             return positions, True
-        value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
         index += 1
         positional_operand_seen = False
+        user_option_seen = False
         while index < len(segment):
             token = segment[index]
             if token == "--":
                 index += 1
                 break
-            string_option_end = _string_command_option_end(segment, index, name)
-            if string_option_end is not None:
-                index = string_option_end
-                continue
-            if token in value_options:
-                index += 2
+            matched_option, _, option_end = _getopt_value_option(segment, index, name)
+            if matched_option is not None:
+                if name == "runuser" and matched_option in {"-u", "--user"}:
+                    # runuser's -u/--user forms select the account in option syntax; unlike
+                    # ``su root``, the next non-option token is already the command.
+                    user_option_seen = True
+                index = option_end
                 continue
             if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
                 index += 1
                 continue
-            if name in {"su", "runuser"} and not positional_operand_seen:
+            if name in {"su", "runuser"} and not positional_operand_seen and not user_option_seen:
                 # These tools accept the login/user operand before later options, e.g.
                 # ``su root -c '...'``; it is not the wrapped command boundary.
                 positional_operand_seen = True
@@ -1019,35 +1020,43 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 # --- referenced-script discovery --------------------------------------------------------------
 
-def _string_command_option_end(
+def _getopt_value_option(
     segment: list[str], position: int, executable_name: str,
-) -> Optional[int]:
-    """Return the token after a string-command option's value, including short-option clusters.
+) -> tuple[Optional[str], Optional[str], int]:
+    """Parse the first value-taking option in one getopt token.
 
-    ``getopt`` treats the rest of a short-option cluster as the value once it reaches a
-    value-taking option: both ``env -iS'...'`` and ``su -mc'...'`` are therefore attached
-    command strings, not flags followed by an executable operand.
+    Short-option clusters are walked left to right. Flag-only characters continue; the first
+    value-taking option consumes the rest of the token, or the next token when no attached value
+    remains. Returning the consumed option and end position gives both wrapper peeling and command
+    string discovery one getopt-correct parser.
     """
     token = segment[position]
-    for option in _STRING_COMMAND_OPTIONS.get(executable_name, ()):
-        if option.startswith("--"):
-            if token == option:
-                return min(position + 2, len(segment))
-            if token.startswith(option + "="):
-                return position + 1
+    value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(executable_name, frozenset())
+    string_options = _STRING_COMMAND_OPTIONS.get(executable_name, ())
+    all_options = value_options | set(string_options)
+
+    if token.startswith("--"):
+        name, separator, attached = token.partition("=")
+        if name not in all_options:
+            return None, None, position + 1
+        if separator:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+
+    if not token.startswith("-") or token == "-":
+        return None, None, position + 1
+    short_options = token[1:]
+    for offset, character in enumerate(short_options):
+        name = f"-{character}"
+        if name not in all_options:
             continue
-        if token == option:
-            return min(position + 2, len(segment))
-        if not token.startswith("-") or token.startswith("--") or len(option) != 2:
-            continue
-        short_options = token[1:]
-        option_index = short_options.find(option[1:])
-        if option_index < 0:
-            continue
-        # The value-taking option consumes the rest of the cluster, or the next token when
-        # it is the final short flag.
-        return position + 1 if short_options[option_index + 1:] else min(position + 2, len(segment))
-    return None
+        attached = short_options[offset + 1:]
+        if attached:
+            return name, attached, position + 1
+        value = segment[position + 1] if position + 1 < len(segment) else None
+        return name, value, min(position + 2, len(segment))
+    return None, None, position + 1
 
 
 def _iter_option_values(
@@ -1057,29 +1066,14 @@ def _iter_option_values(
     limit = len(segment) if stop is None else min(stop, len(segment))
     position = start + 1
     while position < limit:
-        token = segment[position]
-        if token == option:
-            if position + 1 < limit:
-                yield segment[position + 1]
-                position += 2
-                continue
-        elif token.startswith(option + "="):
-            yield token[len(option) + 1:]
-            position += 1
+        matched_option, value, option_end = _getopt_value_option(
+            segment, position, _executable_name(segment[start]),
+        )
+        if matched_option is not None:
+            if matched_option == option and value is not None:
+                yield value
+            position = option_end
             continue
-        elif option.startswith("-") and not option.startswith("--") and len(option) == 2:
-            short_options = token[1:] if token.startswith("-") and not token.startswith("--") else ""
-            option_index = short_options.find(option[1:])
-            if option_index >= 0:
-                attached = short_options[option_index + 1:]
-                if attached:
-                    yield attached
-                    position += 1
-                    continue
-                if position + 1 < limit:
-                    yield segment[position + 1]
-                    position += 2
-                    continue
         position += 1
 
 

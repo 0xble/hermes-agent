@@ -243,6 +243,52 @@ def test_string_option_scan_stops_at_wrapped_command(tmp_path, trusted_slot):
     assert scan_gateway_lifecycle(command) == (False, None)
 
 
+@pytest.mark.parametrize("tail", [
+    "env -uPS sh -c {payload}",
+    "env -uS sh -c {payload}",
+    "env -C/x/S sh -c {payload}",
+    "env -u PS sh -c {payload}",
+    "env --unset=PS sh -c {payload}",
+    "env --chdir=/x/S sh -c {payload}",
+    "env -i -- sh -c {payload}",
+    "runuser -u bob timeout 5 bash {child}",
+    "runuser -u bob nice -n 5 bash {child}",
+    "runuser -u bob {child}",
+    "runuser -ubob timeout 5 bash {child}",
+    "runuser --user=bob nice -n 5 bash {child}",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_getopt_clusters_and_runuser_user_option_scan_wrapped_commands(
+    tmp_path, trusted_slot, tail, prefix,
+):
+    child = _script(tmp_path, "child.sh", "#!/bin/sh\nhermes gateway restart\n")
+    payload = shlex.quote(f"bash {child}")
+    command = f"{prefix.format(trusted=trusted_slot)}{tail.format(payload=payload, child=child)}"
+    assert scan_gateway_lifecycle(command) == (True, None), command
+
+
+@pytest.mark.parametrize("tail", [
+    "env -uPS sh -c 'printf ok'",
+    "env -uS sh -c 'printf ok'",
+    "env -C/x/S sh -c 'printf ok'",
+    "env -u PS sh -c 'printf ok'",
+    "env --unset=PS sh -c 'printf ok'",
+    "env --chdir=/x/S sh -c 'printf ok'",
+    "env -i -- sh -c 'printf ok'",
+    "runuser -u bob timeout 5 true",
+    "runuser -u bob nice -n 5 true",
+    "runuser -u bob true",
+    "runuser -ubob timeout 5 true",
+    "runuser --user=bob nice -n 5 true",
+])
+@pytest.mark.parametrize("prefix", ["", "{trusted} --label proof -- "])
+def test_getopt_clusters_and_runuser_user_option_benign_commands_are_allowed(
+    trusted_slot, tail, prefix,
+):
+    command = f"{prefix.format(trusted=trusted_slot)}{tail}"
+    assert scan_gateway_lifecycle(command) == (False, None), command
+
+
 @pytest.mark.parametrize(
     ("outer_nohups", "tail"),
     [
