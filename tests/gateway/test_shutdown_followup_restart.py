@@ -486,6 +486,39 @@ async def test_restored_followup_exception_after_input_retirement_gets_turn_fail
 
 
 @pytest.mark.asyncio
+async def test_restored_followup_turn_failed_note_cancel_still_logs_once(tmp_path, monkeypatch, caplog):
+    """Shutdown cancelling the failed-turn note still logs one outcome and releases the key."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    payload = json.loads(spool.read_text())
+    recovered = _recovered_followup_event(payload["data"], source, source.user_id)
+    recovered._hermes_recovered_followup = True
+    recovered._hermes_recovery_session_key = entry.session_key
+    recovered._hermes_recovery_session_id = entry.session_id
+    recovered._hermes_recovery_spool_ts = payload["ts"]
+    recovered._hermes_recovery_spool = spool
+    recovered._gateway_accepted = True
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": recovered.text,
+        "platform_message_id": payload["data"]["recovery_id"],
+    })
+    runner._restart_followup_keys = {entry.session_key}
+    runner._follow_startup_resume_turn = AsyncMock(side_effect=RuntimeError("turn exploded"))
+
+    async def cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    runner._deliver_recovered_followup_note = cancelled
+    with caplog.at_level("INFO", logger="gateway.run"), pytest.raises(asyncio.CancelledError):
+        await runner._observe_recovered_followup(_adapter, recovered, entry.session_key)
+    assert entry.session_key not in runner._restart_followup_keys
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:turn-failed:note-unavailable"]
+
+
+@pytest.mark.asyncio
 async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_path, monkeypatch):
     """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
     from gateway import run

@@ -292,12 +292,16 @@ class RestartRecoveryMixin:
             if await self._recovered_input_durable(event):
                 from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
                 self._retire_recovered_followup_spool(event)
-                noted = await self._deliver_recovered_followup_note(
-                    event, session_key, text=PARTIAL_FAILED_TURN_NOTICE)
-                # The input is durable, so there is no spool to retain; log the note's real fate.
-                self._release_restart_followup_key(session_key)
-                self._record_restart_resume_outcome(
-                    session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
+                noted = False
+                try:
+                    noted = await self._deliver_recovered_followup_note(
+                        event, session_key, text=PARTIAL_FAILED_TURN_NOTICE)
+                finally:
+                    # The input is durable, so there is no spool to retain; log the note's real
+                    # fate even when shutdown cancels the send.
+                    self._release_restart_followup_key(session_key)
+                    self._record_restart_resume_outcome(
+                        session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
                 return
         finally:
             watcher.cancel()
