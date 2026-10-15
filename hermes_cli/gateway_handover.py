@@ -1,0 +1,228 @@
+"""Zero-cut gateway slot handover orchestration.
+
+The orchestration is deliberately separate from the large gateway lifecycle module.  All
+launchd and process effects are passed as small callables so the state machine can be tested
+without touching a live gateway or launchctl.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import subprocess
+import time
+from typing import Any, Callable
+
+from gateway.control_socket import query_gateway_control
+from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY
+from gateway.config import is_zero_cut_handover_enabled
+from hermes_constants import get_hermes_home
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class HandoverEffects:
+    """Injectable external effects used by :func:`run_handover`."""
+
+    query: Callable[..., dict[str, Any] | None] = query_gateway_control
+    bootstrap: Callable[[str, Path], None] | None = None
+    bootout: Callable[[str], None] | None = None
+    process_exists: Callable[[int], bool] = _pid_exists
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    write_plist: Callable[[Path, str], None] | None = None
+
+
+def _launchctl_runner(args: list[str]) -> None:
+    subprocess.run(["launchctl", *args], check=True, timeout=30)
+
+
+def _default_bootstrap(label: str, plist_path: Path) -> None:
+    from hermes_cli.gateway_launchd import bootstrap_launchd_label
+    bootstrap_launchd_label(label, plist_path, runner=_launchctl_runner)
+
+
+def _default_bootout(label: str) -> None:
+    from hermes_cli.gateway_launchd import bootout_launchd_label
+    bootout_launchd_label(label, runner=_launchctl_runner)
+
+
+def _default_write_plist(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents, encoding="utf-8")
+
+
+def _effects(effects: HandoverEffects | None) -> HandoverEffects:
+    if effects is not None:
+        return effects
+    return HandoverEffects(
+        process_exists=_pid_exists,
+        bootstrap=_default_bootstrap,
+        bootout=_default_bootout,
+        write_plist=_default_write_plist,
+    )
+
+
+def _query(effects: HandoverEffects, home: Path, verb: str, slot: str) -> dict[str, Any] | None:
+    try:
+        return effects.query(home, verb, slot=slot, timeout=2.0)
+    except TypeError:
+        # Keep the seam friendly to tiny test doubles and older local callers.
+        return effects.query(home, verb, slot=slot)
+
+
+def _slot_snapshot(effects: HandoverEffects, home: Path, slot: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read both identity and live status; roles are never inferred from filenames."""
+    return _query(effects, home, "identify", slot), _query(effects, home, "status", slot)
+
+
+def _deadline(effects: HandoverEffects, budget: float) -> float:
+    return effects.monotonic() + max(float(budget), 0.0)
+
+
+def _poll(effects: HandoverEffects, deadline: float, fn: Callable[[], bool]) -> bool:
+    while True:
+        if fn():
+            return True
+        if effects.monotonic() >= deadline:
+            return False
+        effects.sleep(min(0.1, max(0.0, deadline - effects.monotonic())))
+
+
+def _slot_plist_path(label: str) -> Path:
+    from hermes_cli.gateway import get_launchd_plist_path
+    return get_launchd_plist_path().with_name(f"{label}.plist")
+
+
+def _failure(effects: HandoverEffects, standby_label: str, message: str, *, cleanup: bool = True) -> int:
+    if cleanup:
+        try:
+            assert effects.bootout is not None
+            effects.bootout(standby_label)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:  # cleanup must not hide the handover reason
+            print(f"✗ {message}; also failed to boot out standby: {exc}")
+            return 1
+    print(f"✗ {message}")
+    return 1
+
+
+def run_handover(*, home: Path | None = None, enabled: bool | None = None,
+                 timeout: float, effects: HandoverEffects | None = None) -> int:
+    """Perform one A→B handover and return a CLI exit code."""
+    home = Path(home or get_hermes_home()).expanduser().resolve()
+    fx = _effects(effects)
+    if enabled is False:
+        print("✗ Zero-cut gateway handover is disabled (set gateway.zero_cut_handover.enabled: true).")
+        return 2
+
+    from hermes_cli.gateway_launchd import generate_launchd_plist, get_launchd_slot_labels
+    active_label, standby_label = get_launchd_slot_labels()
+    snapshots = {slot: _slot_snapshot(fx, home, slot) for slot in (SLOT_ACTIVE, SLOT_STANDBY)}
+    active_slots = [slot for slot, (identity, _status) in snapshots.items()
+                    if identity is not None and identity.get("standby") is False]
+    if len(active_slots) != 1:
+        return _failure(fx, standby_label, f"refusing handover: expected exactly one active slot, found {len(active_slots)}", cleanup=False)
+    active_slot = active_slots[0]
+    if active_slot != SLOT_ACTIVE:
+        return _failure(fx, standby_label, "reverse handover not supported yet (only active slot a → standby slot b)", cleanup=False)
+
+    idle_identity, idle_status = snapshots[SLOT_STANDBY]
+    if idle_identity is not None and idle_identity.get("standby") is not True:
+        return _failure(fx, standby_label, "refusing handover: idle slot is active", cleanup=False)
+    reused = idle_identity is not None or idle_status is not None
+    if reused and not bool((idle_status or idle_identity or {}).get("ready")):
+        return _failure(fx, standby_label, "refusing handover: standby slot is running but not ready")
+
+    if not reused:
+        assert fx.bootstrap is not None and fx.write_plist is not None
+        plist_path = _slot_plist_path(standby_label)
+        fx.write_plist(plist_path, generate_launchd_plist(slot=SLOT_STANDBY))
+        try:
+            fx.bootstrap(standby_label, plist_path)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            print(f"✗ could not bootstrap standby {standby_label}: {exc}")
+            return 1
+
+    budget_deadline = _deadline(fx, timeout)
+    if not _poll(fx, budget_deadline, lambda: bool(
+        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("ready") is True and
+        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("standby") is True)):
+        return _failure(fx, standby_label, "standby did not become ready before the handover budget expired")
+
+    accepted = _query(fx, home, "handover", SLOT_ACTIVE)
+    if not accepted or accepted.get("accepted") is not True:
+        return _failure(fx, standby_label, f"active gateway refused handover: {accepted or 'no response'}")
+
+    state_holder: list[dict[str, Any] | None] = [None]
+    if not _poll(fx, budget_deadline, lambda: _handover_released(fx, home, state_holder, SLOT_ACTIVE)):
+        state = state_holder[0]
+        reason = (state or {}).get("failed") or (state or {}).get("reason") or "active gateway failed to release the token lock"
+        return _failure(fx, standby_label, str(reason))
+    handover_state = state_holder[0]
+    if (handover_state or {}).get("failed") or (handover_state or {}).get("status") == "failed":
+        return _failure(fx, standby_label, str((handover_state or {}).get("failed") or "handover failed"))
+
+    promoted = _query(fx, home, "promote", SLOT_STANDBY)
+    failed = (promoted or {}).get("failed") or []
+    if failed:
+        print(f"⚠ promotion reported failed platforms: {', '.join(map(str, failed))}")
+    if not promoted or promoted.get("promoted") is not True:
+        return _failure(fx, standby_label, f"standby promotion failed: {promoted or 'no response'}")
+    if not _poll(fx, budget_deadline, lambda: bool(
+        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("standby") is False)):
+        return _failure(fx, standby_label, "standby did not verify promotion")
+
+    old_pid = ((snapshots[SLOT_ACTIVE][0] or {}).get("pid") or
+               (snapshots[SLOT_ACTIVE][1] or {}).get("pid"))
+    if not _poll(fx, budget_deadline, lambda: _old_active_exited(fx, home, old_pid)):
+        return _failure(fx, standby_label, "old active gateway did not exit")
+    assert fx.bootout is not None
+    try:
+        fx.bootout(active_label)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"✗ new standby is promoted, but could not boot out old slot {active_label}: {exc}")
+        return 1
+    print(f"✓ Gateway handover complete: {active_label} → {standby_label}")
+    return 0
+
+
+def _handover_released(fx: HandoverEffects, home: Path, holder: list[Any], slot: str) -> bool:
+    state = _query(fx, home, "handover-status", slot)
+    holder[0] = state
+    if not state:
+        return False
+    if state.get("failed") or state.get("status") == "failed":
+        return True
+    return state.get("token_lock_released") is True
+
+
+def _old_active_exited(fx: HandoverEffects, home: Path, pid: Any) -> bool:
+    identity = _query(fx, home, "identify", SLOT_ACTIVE)
+    if identity is None:
+        return True
+    try:
+        return pid is not None and not fx.process_exists(int(pid))
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def cmd_handover(args) -> int:
+    from hermes_cli.config import load_config_readonly
+    config = load_config_readonly()
+    if not is_zero_cut_handover_enabled(config):
+        return run_handover(enabled=False, timeout=0)
+    from hermes_cli.gateway import _get_restart_drain_timeout
+    return run_handover(timeout=_get_restart_drain_timeout())

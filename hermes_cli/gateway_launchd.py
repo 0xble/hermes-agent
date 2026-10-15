@@ -29,6 +29,11 @@ def _gw():
 
 def get_launchd_label() -> str:
     """Return the launchd service label, scoped per profile."""
+    home = _gw().get_hermes_home().resolve()
+    # Isolated drill homes use a human-readable suffix so their two labels are
+    # auditable without consulting a path hash (e.g. ~/.hermes-zero-cut).
+    if home.name == ".hermes-zero-cut":
+        return "ai.hermes.gateway.zero-cut"
     suffix = _gw()._profile_suffix()
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
@@ -1111,3 +1116,17 @@ def launchd_status(deep: bool = False):
             print()
             print("Recent logs:")
             subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+
+
+# Explicit-label primitives used by zero-cut handover. The command runner is
+# injectable so tests never execute launchctl.
+def bootstrap_launchd_label(label: str, plist_path: Path, *, domain: str | None = None, runner=None) -> None:
+    """Bootstrap exactly ``label`` from ``plist_path`` into one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootstrap", domain or f"gui/{os.getuid()}", str(plist_path)])
+
+
+def bootout_launchd_label(label: str, *, domain: str | None = None, runner=None) -> None:
+    """Boot out exactly ``label`` from one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootout", f"{domain or f'gui/{os.getuid()}'}/{label}"])
