@@ -167,6 +167,7 @@ def test_retryable_failed_turn_is_eligible(clear_kanban_env):
         pytest.param(_failed(reason="rate_limit"), id="quota-wall"),
         pytest.param(_failed(reason="billing"), id="billing-wall"),
         pytest.param(_failed(reason="upstream_rate_limit"), id="upstream-quota-wall"),
+        pytest.param(_failed(reason="input_retained"), id="preflight-input-retained"),
         pytest.param(_interrupted(), id="interrupt"),
         pytest.param(_settled(), id="terminal-settlement"),
         pytest.param(_partial(), id="unfinished-nonfailed"),

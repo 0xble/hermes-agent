@@ -87,3 +87,37 @@ async def test_queued_followup_persists_authored_text():
     kwargs = runner._run_agent.await_args.kwargs
     assert kwargs["message"] == f"{note}\n\nthe follow-up"
     assert kwargs["persist_user_message"] == "the follow-up"
+
+
+
+@pytest.mark.asyncio
+async def test_refused_queued_followup_retires_its_checkpoint(monkeypatch):
+    """Preparation returns None only after refusing an @ injection and notifying the user, so the
+    accepted checkpoint is a deliberate discard: retire it rather than replay it on every restart."""
+    runner = _runner()
+    runner._MAX_INTERRUPT_DEPTH = 8
+    runner._run_agent = AsyncMock()
+    runner._is_goal_continuation_event = MagicMock(return_value=False)
+    runner._session_key_for_source = MagicMock(return_value="agent:main:discord:dm:dm1")
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value=None)
+    retired = []
+    monkeypatch.setattr("gateway.shutdown_flush.retire_queue_checkpoint",
+                        lambda event, reason: retired.append((event, reason)) or True)
+    source = _discord_source()
+    turn_ctx = SimpleNamespace(
+        source=source, session_id="sid", session_key="agent:main:discord:dm:dm1", run_generation=1,
+        _interrupt_depth=0, history=[], _status_thread_metadata=None, context_prompt=None,
+        result_holder=[None],
+    )
+    pending_event = SimpleNamespace(
+        source=source, message_id="6003", channel_prompt=None, message_type=None, internal=False, metadata={},
+        reply_expected=None,
+    )
+
+    await GatewayRunner._run_agent_queued_followup(
+        runner, turn_ctx, adapter=None, pending="@file:/etc/shadow", pending_event=pending_event,
+        response="resp", result={"interrupted": True, "messages": []}, stream_task=None,
+    )
+
+    runner._run_agent.assert_not_awaited()
+    assert retired == [(pending_event, "context_injection_refused")]

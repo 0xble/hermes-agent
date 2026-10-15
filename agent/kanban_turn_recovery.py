@@ -69,6 +69,9 @@ _NON_RECOVERABLE_REASONS = frozenset({
     FailoverReason.rate_limit.value,
     FailoverReason.billing.value,
     FailoverReason.upstream_rate_limit.value,
+    # Preflight could not fit or compact the context; the input is retained and nothing was
+    # sent, so an in-place retry would fail the same preflight.
+    "input_retained",
 })
 
 #: ``turn_exit_reason`` prefixes that mean the turn already went through a
