@@ -68,9 +68,11 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
     if not directory.is_dir():
         return []
     if packs:
-        from hermes_cli._git_process_scope import _linux_process_scope, tmp_pack_in_use
+        from hermes_cli._git_process_scope import INSPECTION_RETRY_SECONDS, _linux_process_scope, tmp_pack_in_use
 
         packs = _linux_process_scope  # non-Linux keeps the original global veto
+        # One bounded re-check budget per sweep, shared by every candidate.
+        retry_until = time.monotonic() + INSPECTION_RETRY_SECONDS
     if not packs and _git_proc_running():
         logger.debug(skip_msg)
         return []
@@ -80,7 +82,7 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
         try:
             if entry.is_file() and (st := entry.stat()).st_mtime < cutoff:
                 if packs:
-                    if tmp_pack_in_use(repo_root, entry, lambda: _git_proc_running()):
+                    if tmp_pack_in_use(repo_root, entry, lambda: _git_proc_running(), retry_until=retry_until):
                         continue
                     current = entry.stat()
                     if (current.st_dev, current.st_ino, current.st_mtime_ns) != (
