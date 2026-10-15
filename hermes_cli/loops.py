@@ -896,6 +896,9 @@ class LoopManager(LoopRevisionsMixin):
             if state.next_due_at <= now:
                 return False
             state.next_due_at = now
+            if state.mode == "self_paced":
+                state.backoff_level = 0
+                state.current_delay = float(self_paced_floor_seconds())
             return True
 
         return bool(self._mutate_current(apply, failure=False))

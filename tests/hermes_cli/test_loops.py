@@ -885,13 +885,15 @@ class TestSelfPacedBackoff:
         from hermes_cli.loops import LoopManager, wake_loop_for_external_event
 
         mgr = LoopManager(session_id="external-wake")
-        state = mgr.set("watch the queue", interval_seconds=24 * 60 * 60)
+        state = mgr.set("watch the queue")
         state.next_due_at = time.time() + 60 * 60
+        state.backoff_level = 3
         mgr._save()
         assert wake_loop_for_external_event("external-wake") is True
         assert wake_loop_for_external_event("external-wake") is False
         fresh = LoopManager(session_id="external-wake")
         assert fresh.is_due()
+        assert fresh.state is not None and fresh.state.backoff_level == 0
         assert fresh.fire_tick() is not None
         assert fresh.fire_tick() is None
 
