@@ -1700,7 +1700,6 @@ _BLOCKED_ON_USER_RE = re.compile(
     re.I,
 )
 
-
 def _parse_wait_until(raw: str) -> Optional[float]:
     """Epoch for an ISO-8601 ``wait_until``. A timestamp without an offset is the host's local
     wall-clock time (the judge prompt shows local time), not UTC."""

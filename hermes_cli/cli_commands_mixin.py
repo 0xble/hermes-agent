@@ -2015,11 +2015,6 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         result = dispatch_loop_command(mgr, arg)
         for line in (result.get("output") or "").splitlines():
             _cp(f"  {line}")
-        if result.get("created"):
-            with suppress(Exception):
-                from hermes_cli.loops import goal_blocks_loop_tick
-                if goal_blocks_loop_tick(mgr.session_id):
-                    _cp(_dim_line(_t("loop.goal_defers_note")))
 
     def _handle_subgoal_command(self, cmd: str) -> None:
         """Dispatch /subgoal: bare → show, ``<text>`` → append, ``remove <n>`` (1-based), ``clear``.

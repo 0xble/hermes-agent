@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX, SILENCE_MARKER, is_intentional_silence_response
-from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES
+from hermes_cli.goals import _AUTONOMOUS_REPLY_RULES, _NO_PROGRESS_BACKOFF_S
 from hermes_cli.loops_revisions import LoopRevisionsMixin
 from hermes_cli.lifecycle_snapshot import commit_and_publish_snapshot, snapshot_control
 
@@ -31,10 +31,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_INTERVAL_SECONDS = 30
 # Backstop tick budget so an unattended loop can't run forever. 0 = unlimited; config loops.max_ticks.
 DEFAULT_MAX_TICKS = 100
-# Self-paced mode: start at the floor, double while replies are unchanged, cap at the
-# ceiling, snap back to the floor on any change.
+# Self-paced mode: start at the configured floor, then use the same quiet no-progress ladder as
+# goals while replies are unchanged; snap back to the floor on any change.
 DEFAULT_SELF_PACED_FLOOR_SECONDS = 60
-DEFAULT_SELF_PACED_CEILING_SECONDS = 15 * 60
+DEFAULT_SELF_PACED_CEILING_SECONDS = _NO_PROGRESS_BACKOFF_S[-1]
 
 # Completion sentinel the wakeup prompt teaches the agent to emit.
 LOOP_COMPLETE_MARKER = "LOOP_COMPLETE"
@@ -347,6 +347,13 @@ class LoopState:
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
     last_response_digest: str = ""    # self-paced change detection
+    # Last fired tick count that consumed a trusted external wake; at most one early wake per settled tick.
+    last_external_wake_tick: int = -1
+    # Non-blocking overlap guidance returned by loop_set results when a goal already owns this session.
+    goal_warning: Optional[str] = None
+    # Shared no-progress ladder index. It advances on unchanged self-paced replies and one-shot
+    # --until blocks, and resets when a reply changes or a user revises/resumes the loop.
+    backoff_level: int = 0
     paused_reason: Optional[str] = None
     last_stop_reason: Optional[str] = None
     # Gateway routing (platform / chat_id / chat_type / thread_id) captured at creation so the
@@ -375,6 +382,7 @@ class LoopState:
             "mode": data.get("mode", "interval"),
             "paused_reason": data.get("paused_reason"),
             "last_stop_reason": data.get("last_stop_reason"),
+            "goal_warning": data.get("goal_warning"),
             "route": route if isinstance(route, dict) else {},
             "revisions": revisions if isinstance(revisions, list) else [],
         }
@@ -841,6 +849,7 @@ class LoopManager(LoopRevisionsMixin):
             created_at=now,
             next_due_at=now,
             route=dict(route or {}),
+            goal_warning=_active_goal_loop_warning(self.session_id) or None,
         )
         if not self.session_id:
             self._state = state  # intentionally ephemeral
@@ -872,12 +881,46 @@ class LoopManager(LoopRevisionsMixin):
             if state is None or state.status == "cleared":
                 return None
             state.status, state.paused_reason, state.awaiting_response = "active", None, False
+            state.backoff_level = 0
+            state.last_response_digest = ""
+            if state.mode == "self_paced":
+                state.current_delay = float(self_paced_floor_seconds())
             # Re-arm relative to now so a long pause doesn't fire instantly N times.
             delay = state.current_delay or state.interval_seconds or self_paced_floor_seconds()
             state.next_due_at = time.time() + min(delay, 5.0)
             return state
 
         return self._mutate_current(apply)
+
+    @snapshot_control
+    def wake_now_for_external_event(self) -> bool:
+        """Make one idle loop tick due immediately for trusted outside evidence.
+
+        The stored-row mutation is a no-op while a tick is already in flight, so repeated delivery
+        signals cannot create duplicate ticks.
+        """
+        def apply(state):
+            if state is None or state.status != "active" or state.awaiting_response:
+                return False
+            now = time.time()
+            minimum_gap = state.interval_seconds or self_paced_floor_seconds()
+            if (
+                state.next_due_at <= now
+                or state.ticks_fired <= state.last_external_wake_tick
+                or (state.last_fired_at and now - state.last_fired_at < minimum_gap)
+            ):
+                return False
+            state.next_due_at = now
+            state.last_external_wake_tick = state.ticks_fired
+            state.backoff_level = 0
+            state.last_response_digest = ""
+            if state.mode == "self_paced":
+                state.current_delay = float(self_paced_floor_seconds())
+            else:
+                state.current_delay = state.interval_seconds
+            return True
+
+        return bool(self._mutate_current(apply, failure=False))
 
     @snapshot_control
     def clear(self) -> bool:
@@ -1186,13 +1229,35 @@ class LoopManager(LoopRevisionsMixin):
         if state.mode == "self_paced":
             floor = self_paced_floor_seconds()
             if digest and digest == state.last_response_digest:
-                state.current_delay = min(max(state.current_delay, floor) * 2, self_paced_ceiling_seconds())
+                level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+                state.current_delay = float(min(
+                    max(floor, _NO_PROGRESS_BACKOFF_S[level]),
+                    self_paced_ceiling_seconds(),
+                ))
+                state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             else:
                 state.current_delay = float(floor)
+                state.backoff_level = 0
             state.last_response_digest = digest
         else:
             state.current_delay = state.interval_seconds
+            state.backoff_level = 0
         state.next_due_at = now + state.current_delay
+
+    @staticmethod
+    def _settle_blocked_until(state: LoopState, now: float) -> None:
+        """Keep an unachievable --until loop active, with one step of quiet backoff."""
+        state.awaiting_response = False
+        level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
+        delay = _NO_PROGRESS_BACKOFF_S[level]
+        if state.mode == "self_paced":
+            delay = min(max(self_paced_floor_seconds(), delay), self_paced_ceiling_seconds())
+            state.current_delay = float(delay)
+        else:
+            delay = max(delay, state.interval_seconds)
+            state.current_delay = state.interval_seconds
+        state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
+        state.next_due_at = now + delay
 
     def complete_tick(self, last_response: str, *, tick: Optional[Tuple[Any, Any]] = None) -> Dict[str, Any]:
         """Settle the finished wakeup turn through the durable snapshot/CAS boundary.
@@ -1254,10 +1319,26 @@ class LoopManager(LoopRevisionsMixin):
                 return self._stop("done", f"stop condition met: {reason}",
                                   f"✓ Loop finished after {ticks} — {reason}", **judged)
             if verdict == "blocked":
-                # Unachievable stop condition: pause so the user can re-scope, don't spin.
+                # An unachievable stop condition is no-progress evidence, not a terminal loop
+                # failure. Keep the loop active and use the shared quiet ladder before retrying.
                 why = f"stop condition judged unachievable: {reason}"
-                return self._stop("paused", why,
-                                  f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.", **judged)
+                cap: Optional[Tuple[str, str, str]] = None
+
+                def settle_blocked(state: LoopState) -> None:
+                    nonlocal cap
+                    self._settle_blocked_until(state, now)
+                    cap = self._cap_stop(state)
+                    if cap is not None:
+                        self._apply_stop(state, cap[0], cap[1])
+
+                if not self._save_tick_outcome(s.ticks_fired, settle_blocked):
+                    return self._superseded_result()
+                if cap is not None:
+                    return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
+                return {
+                    "status": "active", "stopped": False, "reason": why,
+                    "message": f"⏳ Loop still active — {why}; next check delayed.",
+                }
 
         # 3-4. --times user cap (done) and config backstop budget (paused, recoverable), judged at
         # settle time against the stored definition so a revise mid-tick cannot lift either.
@@ -1289,6 +1370,30 @@ def enforce_loop_run_cap(state: LoopState) -> Optional[Dict[str, Any]]:
         return None
     LoopManager._apply_stop(state, cap[0], cap[1])
     return {"status": cap[0], "stopped": True, "reason": cap[1], "message": cap[2]}
+
+
+def wake_loop_for_external_event(session_id: str) -> bool:
+    """Pierce an active loop's delay for one admitted trusted external event."""
+    try:
+        return LoopManager(session_id=session_id).wake_now_for_external_event()
+    except Exception:
+        return False
+
+
+def _active_goal_loop_warning(session_id: Optional[str]) -> str:
+    """Return the non-blocking loop/goal overlap warning, if a goal owns this session."""
+    if not session_id:
+        return ""
+    try:
+        from hermes_cli.goals import GoalManager
+        if GoalManager(session_id=session_id).is_active():
+            return (
+                "⚠ An active goal already owns this session: loop ticks defer while the goal is active; "
+                "keep this as a separate recurring duty only if that deferral is intended."
+            )
+    except Exception:
+        pass
+    return ""
 
 
 def goal_blocks_loop_tick(session_id: str) -> bool:
@@ -1376,6 +1481,9 @@ def dispatch_loop_command(
     lines = [f"↻ Loop set ({state.cadence_label()}): {state.prompt}"]
     if replacing:
         lines.append("(replaced the previous loop for this session)")
+    overlap_warning = _active_goal_loop_warning(mgr.session_id)
+    if overlap_warning:
+        lines.append(overlap_warning)
     if parsed["interval_seconds"] is not None and parsed["interval_seconds"] < state.interval_seconds:
         lines.append(
             f"(interval raised to the {format_interval(state.interval_seconds)} minimum — "
@@ -1399,7 +1507,7 @@ def dispatch_loop_command(
 
 __all__ = [
     "LoopState", "LoopManager", "parse_loop_args", "parse_interval_token", "format_interval",
-    "response_signals_complete", "goal_blocks_loop_tick", "load_loop", "save_loop", "clear_loop",
+    "response_signals_complete", "goal_blocks_loop_tick", "wake_loop_for_external_event", "load_loop", "save_loop", "clear_loop",
     "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "loop_control_generation",
     "LOOP_COMPLETE_MARKER",
     "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",

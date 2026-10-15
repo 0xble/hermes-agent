@@ -407,6 +407,7 @@ def test_slice_5_breach_naming_the_user_still_pauses(hermes_home, reason):
 @pytest.mark.parametrize("reason", [
     "The goal's constraints require Brian's sign-off before merging; awaiting his approval.",
     "The agent must not send the DM until Brian approves the wording.",
+    "The PR must not be merged until Brian approves it.",
 ])
 def test_slice_5_constraint_requiring_approval_is_a_user_wait(hermes_home, reason):
     from hermes_cli import goals
