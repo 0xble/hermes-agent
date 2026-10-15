@@ -29,11 +29,6 @@ def _gw():
 
 def get_launchd_label() -> str:
     """Return the launchd service label, scoped per profile."""
-    home = _gw().get_hermes_home().resolve()
-    # Isolated drill homes use a human-readable suffix so their two labels are
-    # auditable without consulting a path hash (e.g. ~/.hermes-zero-cut).
-    if home.name == ".hermes-zero-cut":
-        return "ai.hermes.gateway.zero-cut"
     suffix = _gw()._profile_suffix()
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
