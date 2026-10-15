@@ -6,6 +6,7 @@ notice creation and durable reload use production code.
 """
 from __future__ import annotations
 
+import uuid
 import json
 import subprocess
 import sys
@@ -48,6 +49,14 @@ async def _turn(harness, response, *, user=False):
     return GoalManager(entry.session_id)
 
 
+def _lift_wait(entry):
+    """Let the current quiet ladder rung elapse, as the idle wakeup ticker would observe it."""
+    mgr = GoalManager(entry.session_id)
+    if mgr.state.waiting_until:
+        mgr.state.waiting_until = 1.0
+        mgr._save()
+
+
 def _restart_db():
     # A fresh handle must read from disk, not the previous manager or cache.
     for db in goals._DB_CACHE.values():
@@ -66,6 +75,7 @@ async def test_silent_automatic_turn_rejudges_without_manufacturing_continuation
             await _turn(harness, "A partial result is ready.", user=True)
         previous = GoalManager(entry.session_id).state.last_continuation_notice_key
         adapter.sent.clear()
+        adapter._pending_messages.clear()  # drop the user turn's own continuation
         _restart_db()
         judge.reset_mock()
         mgr = await _turn(harness, marker)
@@ -75,130 +85,8 @@ async def test_silent_automatic_turn_rejudges_without_manufacturing_continuation
     assert mgr.state.last_continuation_notice_key == previous
     assert mgr.state.status == "active"
     assert mgr.state.consecutive_no_progress == 1
-    assert key in adapter._pending_messages  # silence must not disable goal execution
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("disputed", [False, True])
-@pytest.mark.parametrize("read_only_tool", [None, "read_file", "terminal"])
-async def test_silent_no_evidence_stall_stops_with_one_notice_after_reload(hermes_home, disputed, read_only_tool):
-    harness = _harness(hermes_home)
-    _, adapter, entry, _, key = harness
-    limit = goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS
-    for i in range(limit):
-        adapter._pending_messages.clear()  # consume the previously admitted turn
-        _restart_db()
-        if read_only_tool:
-            db = goals._get_session_db()
-            assert db is not None
-            db.ensure_session(entry.session_id, source="telegram")
-            arguments = {"command": "git status --short"} if read_only_tool == "terminal" else {"path": "release.md"}
-            db.append_message(entry.session_id, "assistant", "", tool_calls=[{
-                "id": f"read-only-{i}", "type": "function",
-                "function": {"name": read_only_tool, "arguments": json.dumps(arguments)},
-            }])
-            db.append_message(entry.session_id, "tool", f"Unchanged release status {i}",
-                              tool_name=read_only_tool, tool_call_id=f"read-only-{i}")
-        with patch.object(goals, "judge_goal", return_value=(
-            "continue", f"Criterion still lacks proof ({i})", False,
-            {"disputed": True} if disputed else None, False,
-        )):
-            mgr = await _turn(harness, "NO_REPLY" if i % 2 else "[SILENT]")
-        if i < limit - 1:
-            assert mgr.is_active() and key in adapter._pending_messages
-            assert adapter.sent == []
-    assert not mgr.is_active() and not mgr.has_goal()
-    assert mgr.state.status == "cleared", "a silent stall must not pause waiting for the user"
-    assert not mgr.is_parked() and mgr.state.waiting_until == 0
-    assert mgr.state.backoff_level == 0
-    assert mgr.next_continuation_prompt() is None
-    assert key not in adapter._pending_messages
-    assert len(adapter.sent) == 1
-    assert "Goal stopped" in adapter.sent[0] and "no new evidence" in adapter.sent[0]
-    assert "/goal resume" not in adapter.sent[0]
-    _restart_db()
-    with patch.object(goals, "judge_goal") as judge:
-        # Already-admitted stale turns and a later user message must not replay the notice.
-        await _turn(harness, "NO_REPLY", user=True)
-        await _turn(harness, "status", user=True)
-        judge.assert_not_called()
-    assert len(adapter.sent) == 1
-    assert GoalManager(entry.session_id).state.status == "cleared"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("disputed", [False, True])
-@pytest.mark.parametrize("interleave", [None, "backoff", "timed-wait", "delegation-wait"])
-async def test_default_gap_silent_judgments_converge_across_nonjudging_waits(hermes_home, monkeypatch, disputed, interleave):
-    harness = _harness(hermes_home)
-    runner, adapter, entry, source, key = harness
-    # Omit the gap override: exercise the actual gateway default/config reader.
-    runner.config.goals = {"max_turns": 0}
-    gap = runner._goal_min_continuation_gap_from_config()
-    assert gap == goals.DEFAULT_MIN_CONTINUATION_GAP_SECONDS
-    mgr = GoalManager(entry.session_id)
-    mgr.set("Publish the wiki", max_turns=0)
-    clock = [time.time() + 1]
-    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
-    verdict = ("continue", REASON, False, {"disputed": True} if disputed else None, False)
-    with patch.object(goals, "judge_goal", return_value=verdict) as judge:
-        mgr = await _turn(harness, "[SILENT]")
-        assert judge.call_count == 1 and mgr.state.consecutive_silent_no_progress == 1
-        adapter._pending_messages.clear()
-        if interleave:
-            # These are already-established waits. Their held turns do not invoke the judge and
-            # must neither invent a fresh notice nor erase the earlier silent judgment.
-            if interleave == "backoff":
-                mgr._no_progress_wait(mgr.state, "no progress yet")
-            elif interleave == "timed-wait":
-                mgr.wait_for_seconds(60, reason="external check pending")
-            else:
-                mgr.wait_for_seconds(60, reason="delegation pending", on_delegations=1)
-            mgr.state.last_wait_notice_key = mgr._wait_notice_key(mgr.state)
-            mgr._save()
-            _restart_db()
-            with patch.object(goals, "count_active_delegations", return_value=1 if interleave == "delegation-wait" else 0):
-                mgr = await _turn(harness, "NO_REPLY")
-            assert judge.call_count == 1
-            assert mgr.state.consecutive_silent_no_progress == 1
-            assert adapter.sent == []
-            clock[0] = mgr.state.waiting_until + 1
-
-        # The second actual judgment is followed by a pacing early return, not dispatch. The
-        # increment must already be durable there, and the held turn must leave it unchanged.
-        clock[0] += 1
-        _restart_db()
-        mgr = await _turn(harness, "NO_REPLY")
-        assert judge.call_count == 2 and mgr.state.consecutive_silent_no_progress == 2
-        assert goals.is_continuation_gap_wait(mgr.state)
-        assert adapter.sent == [] and key not in adapter._pending_messages
-        _restart_db()
-        mgr = await _turn(harness, "[SILENT]")
-        assert judge.call_count == 2 and mgr.state.consecutive_silent_no_progress == 2
-        assert adapter.sent == []
-        clock[0] = mgr.state.waiting_until + 1
-        _restart_db()
-        mgr = await _turn(harness, "[SILENT]")
-        assert judge.call_count == 3
-        assert mgr.state.consecutive_silent_no_progress == 3
-        assert mgr.state.status == "cleared" and not mgr.has_goal()
-        assert mgr.state.waiting_until == 0 and not mgr.is_parked()
-        assert mgr.state.backoff_level == 0 and mgr.state.consecutive_no_progress == 0
-        assert key not in adapter._pending_messages and mgr.next_continuation_prompt() is None
-        assert len(adapter.sent) == 1 and adapter.sent[0].startswith("✗ Goal stopped:")
-        # The real stop notice must classify as a protected outcome, or daily-quota shedding drops it.
-        from gateway.platforms.base import OUTBOUND_FINAL
-        from gateway.run_goals import _goal_notice_outbound_class
-        assert _goal_notice_outbound_class(adapter.sent[0]) == OUTBOUND_FINAL
-        notice = list(adapter.sent)
-        for _ in range(2):
-            clock[0] += gap + 1
-            _restart_db()
-            await runner._post_turn_goal_continuation(
-                session_entry=entry, source=source, final_response="NO_REPLY",
-            )
-        assert judge.call_count == 3 and adapter.sent == notice
-        assert GoalManager(entry.session_id).state.status == "cleared"
+    assert key not in adapter._pending_messages  # quiet no-progress turns park silently
+    assert mgr.state.waiting_until > mgr.state.waiting_since
 
 
 @pytest.mark.asyncio
@@ -234,7 +122,10 @@ async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_hom
                  entry.session_id, original_key],
                 check=True, capture_output=True, text=True,
             )
-        with patch.object(goals, "_session_waiting", return_value=False), patch.object(goals, "_pid_alive", return_value=False):
+        # The post-lift automatic turn does real work, so it continues rather than parking on the ladder.
+        with patch.object(goals, "_session_waiting", return_value=False), patch.object(goals, "_pid_alive", return_value=False), \
+                patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
             mgr = await _turn(harness, "The release is still awaiting live validation.")
     assert len(adapter.sent) == 1, "unchanged reason was sent again after the barrier lift"
     assert mgr.state.last_continuation_notice_key == original_key
@@ -248,12 +139,15 @@ async def test_new_reason_after_silent_turn_is_deliverable(hermes_home):
     _, adapter, entry, _, _ = harness
     with patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)):
         await _turn(harness, "Initial result.", user=True)
-    await _turn(harness, "NO_REPLY")
+        await _turn(harness, "NO_REPLY")  # quiet no-progress turn: parks silently on the ladder
+    _lift_wait(entry)
     _restart_db()
     new_reason = "The canary found a new delivery failure requiring correction"
     with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
-        # A material automatic report must remain visible after silence.
-        await _turn(harness, "The canary found a delivery failure.")
+        # A material automatic report (real work this turn) must remain visible after silence.
+        with patch.object(goals, "_evidence_only_read_only_status", return_value=False), \
+            patch.object(goals, "_goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
+            await _turn(harness, "The canary found a delivery failure.")
         await _turn(harness, "The correction is in progress.", user=True)
     assert len(adapter.sent) == 2
     assert REASON in adapter.sent[0] and new_reason in adapter.sent[1]
@@ -264,8 +158,11 @@ async def test_new_reason_after_silent_turn_is_deliverable(hermes_home):
 @pytest.mark.parametrize("verdict,prefix,status", [("done", "✓ Goal achieved", "done"), ("blocked", "⏸ Goal blocked", "paused")])
 async def test_outcome_and_input_blocker_survive_silent_turn(hermes_home, verdict, prefix, status):
     harness = _harness(hermes_home)
-    _, adapter, _, _, _ = harness
-    await _turn(harness, "NO_REPLY")
+    _, adapter, entry, _, _ = harness
+    with patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)):
+        await _turn(harness, "NO_REPLY")  # quiet no-progress turn: parks silently on the ladder
+    assert adapter.sent == []
+    _lift_wait(entry)
     _restart_db()
     with patch.object(goals, "judge_goal", return_value=(verdict, "A material result needs attention", False, None, False)):
         mgr = await _turn(harness, "The canary result is available.")
@@ -291,7 +188,7 @@ async def test_explicit_goal_controls_still_confirm_and_reset_notice_identity(he
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active_delegations", [0, 1])
 async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(hermes_home, active_delegations):
-    """Synthetic NO_REPLY preserves the existing parked condition through backoff."""
+    """Quiet ladder parks stay silent and keep their notice identity through backoff and reload."""
     harness = _harness(hermes_home)
     _, adapter, entry, _, _ = harness
     with patch.object(goals, "count_active_delegations", return_value=active_delegations), patch.object(
@@ -299,8 +196,8 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
     ), patch.object(goals, "judge_goal", return_value=("continue", REASON, False, None, False)):
         for _ in range(1 if active_delegations else goals.DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS):
             mgr = await _turn(harness, "Waiting for the external review.")
-        first = [m for m in adapter.sent if m.startswith("⏳")]
-        assert len(first) == 1
+        assert mgr.is_parked()
+        assert adapter.sent == []  # the no-progress ladder is quiet, with or without delegations
         original_key = mgr.state.last_wait_notice_key
         original_turns = mgr.state.turns_used
         original_level = mgr.state.backoff_level
@@ -315,9 +212,9 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
                 judge.assert_called_once()
             assert mgr.state.last_wait_notice_key == original_key
             assert mgr.state.status == "active" and mgr.is_parked()
-        assert [m for m in adapter.sent if m.startswith("⏳")] == first
+        assert adapter.sent == []
         assert mgr.state.turns_used == original_turns + 2
-        assert mgr.state.backoff_level >= original_level
+        assert mgr.state.backoff_level == original_level + 2  # each silent re-park climbs the ladder
         # Prove the durable identity in an actual fresh interpreter too.
         subprocess.run(
             [sys.executable, "-c",
@@ -330,6 +227,12 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
         mgr._save()
         new_reason = "review returned a new blocker"
         with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
-            await _turn(harness, "The review returned a new blocker.")
-        parked = [m for m in adapter.sent if m.startswith("⏳")]
-        assert len(parked) == 2 and "new blocker" in parked[-1]
+            mgr = await _turn(harness, "The review returned a new blocker.")
+        # A new judge reason alone is not progress: still a silent ladder park, never auto-cleared.
+        assert adapter.sent == []
+        assert mgr.state.status == "active" and mgr.is_parked()
+        with patch.object(goals, "judge_goal", return_value=("continue", new_reason, False, None, False)):
+            mgr = await _turn(harness, "What is the review blocker?", user=True)
+        # A user turn pierces the park, resets the ladder, and reports the new reason.
+        assert len(adapter.sent) == 1 and new_reason in adapter.sent[0]
+        assert mgr.state.backoff_level == 0 and not mgr.is_parked()

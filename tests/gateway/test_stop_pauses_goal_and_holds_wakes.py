@@ -84,7 +84,7 @@ def _active_goal(session_id: str):
 def _blocked_goal(session_id: str):
     mgr = _active_goal(session_id)
     with patch("hermes_cli.goals.judge_goal",
-               return_value=("blocked", "needs the user to answer", False, None, False)):
+               return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False)):
         assert mgr.evaluate_after_turn("May I proceed?")["status"] == "paused"
     return mgr
 
