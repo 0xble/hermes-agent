@@ -17,9 +17,12 @@ records the event it actually consumes and restart recovery carries that task's
 terminal result back to the parked recovery event. The recovery outcome is then
 `resumed` or `skipped:turn-failed`, rather than `accepted-without-turn`.
 
-A draining turn's leftover `/steer` or interrupt text is only a string. The
-shutdown follow-up spool binds it to the turn's source (author, chat) and a
-recovery id before writing, so restart recovery can attribute and run it. A
+A draining turn's leftover `/steer` or interrupt text is only a string. In a DM
+or per-user session the shutdown follow-up spool binds it to the turn's source
+(author, chat) and a recovery id before writing, so restart recovery can
+attribute and run it. In a shared group or thread session the runner does not
+know who sent the leftover, so the spool keeps no author and recovery declines
+it with `author-missing` rather than running it as the wrong user. A
 shutdown follow-up that recovery still declines (no recorded author, or older
 than the 24h drain window) never runs: it gets one `Restart recovery outcome:
 ... outcome=skipped:<reason>:noted` line, one visible resend note to its
