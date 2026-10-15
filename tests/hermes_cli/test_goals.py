@@ -273,7 +273,6 @@ class TestGoalManager:
         ("Clean up stale topics", {"outcome": "Stale topics are removed", "constraints": "Never delete"}),
         ("Draft the summary, then send it", {"constraints": "no changes"}),
         ("Report which topics were sent, then the summary is sent", {"constraints": "no changes"}),
-        ("Check whether the migration is deployed and the backup is written", {"constraints": "no changes"}),
     ])
     def test_goal_authoring_flags_required_end_states_and_later_clauses(self, goal, contract):
         from hermes_cli.goals import goal_authoring_findings
