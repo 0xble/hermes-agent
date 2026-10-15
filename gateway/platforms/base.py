@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- this PR must retain the cross-session command admission and strict wake-fence paths in this facade; the moved helper boundary is tracked for follow-up extraction.
 """Base platform adapter interface; every platform adapter inherits from BasePlatformAdapter."""
 
 import asyncio
@@ -3833,6 +3834,7 @@ class BasePlatformAdapter(ABC):
         response = await self._message_handler(event)
         # The handler ran the command: that is this event's admission, whatever the reply's fate.
         # Scheduled command wakes (a /loop tick of /status) count their tick on this receipt.
+        event._gateway_inline_command_handled = True
         event._gateway_accepted = True
         from gateway.outbox import active_turn, bind_event_turn, restore_turn, run_turn_child
         token = bind_event_turn(event)
@@ -4471,8 +4473,9 @@ class BasePlatformAdapter(ABC):
         # Otherwise it lands in _pending_messages as a follow-up turn and the answer is
         # discarded.  Same shape as the /approve deadlock fix (PR #4926): agent thread
         # blocked on Event.wait, message must reach the resolver before being a new turn.
-        # See #4926.
-        if not cmd and event.allow_gateway_control:
+        # See #4926. Gateway-authored synthetic events (internal) never answer a human prompt;
+        # they take the normal busy-session queue below.
+        if not cmd and event.allow_gateway_control and not event.internal:
             try:
                 from tools import clarify_gateway as _clarify_mod
                 _has_text_clarify = _clarify_mod.get_pending_for_session(

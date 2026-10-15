@@ -108,12 +108,12 @@ def test_superseded_tick_cleanup_enforces_winners_run_cap_after_judge_exception(
 
 
 @pytest.mark.parametrize("cap", ["times", "max_ticks"])
-def test_abandon_tick_preserves_exhausted_cap_after_rollback(hermes_home, cap):
+def test_abandon_tick_preserves_exhausted_cap(hermes_home, cap):
     manager = loops.LoopManager("loop-abandon-cap")
     manager.set("Check the deployment", interval_seconds=300, times=10)
     assert manager.fire_tick()
-    # An older completed run has already spent the revised budget; this failed
-    # injection can roll back only its own claim, not restore another run.
+    # An older completed run has already spent the revised budget. A started tick is
+    # skip-only, so its release keeps the count and the exhausted cap still stops the loop.
     assert manager.state is not None
     manager.state.ticks_fired = 2
     setattr(manager.state, cap, 1)
@@ -121,7 +121,7 @@ def test_abandon_tick_preserves_exhausted_cap_after_rollback(hermes_home, cap):
     manager.abandon_tick()
     after = loops.load_loop(manager.session_id)
     assert after is not None
-    assert after.ticks_fired == 1
+    assert after.ticks_fired == 2
     assert after.awaiting_response is False
     assert after.status == ("done" if cap == "times" else "paused")
     assert manager.state.to_json() == after.to_json()
@@ -242,7 +242,10 @@ def test_conflict_cleanup_cannot_release_another_claim(hermes_home, monkeypatch,
             control = loops.LoopManager(manager.session_id)
             if second_change == "new_tick":
                 control.abandon_tick()
-                # Re-use every legacy claim field. Only the new claim ID distinguishes it.
+                # Abandon is skip-only and keeps the count; rewind it so the refire re-uses
+                # every legacy claim field. Only the new claim ID distinguishes it.
+                control.state.ticks_fired = original.ticks_fired - 1
+                control._save()
                 monkeypatch.setattr(loops.time, "time", lambda: original.last_fired_at)
                 control.state.next_due_at = original.last_fired_at
                 assert control.fire_tick()
@@ -269,7 +272,7 @@ def test_conflict_cleanup_cannot_release_another_claim(hermes_home, monkeypatch,
     assert manager.state.to_json() == saved[-1]
 
 
-@pytest.mark.parametrize("operation", ["revise", "settle"])
+@pytest.mark.parametrize("operation", ["revise", "settle", "claim"])
 @pytest.mark.parametrize("owner", ["same", "other"])
 @pytest.mark.parametrize("change", ["pause", "clear", "replace"])
 def test_loop_preserves_same_manager_controls_after_commit(tmp_path, monkeypatch, operation, owner, change):
@@ -296,9 +299,14 @@ def test_loop_preserves_same_manager_controls_after_commit(tmp_path, monkeypatch
             return result
 
         monkeypatch.setattr(db, "_execute_write", interleave)
-        result = (manager.revise(reason="Less polling", interval_seconds=600) if operation == "revise"
-                  else manager.complete_tick("checked"))
-        assert result.get("ok", not result.get("stopped")) is True
+        result = {"revise": lambda: manager.revise(reason="Less polling", interval_seconds=600),
+                  "settle": lambda: manager.complete_tick("checked"),
+                  # The atomic claim+start CAS publishes through the same snapshot boundary.
+                  "claim": manager.fire_tick}[operation]()
+        if operation == "claim":
+            assert result  # the claim committed before the newer command published
+        else:
+            assert result.get("ok", not result.get("stopped")) is True
         if operation == "settle":
             assert result["error_code"] == "state_changed"
             assert result["message"] == ""
@@ -397,3 +405,31 @@ def test_same_manager_controls_cannot_mutate_the_settled_claim(hermes_home, monk
     assert saved and loops.load_loop(manager.session_id).to_json() == saved[-1]
     assert manager.state.to_json() == saved[-1]
     assert manager.state.awaiting_response is (change != "pause_resume")
+
+
+@pytest.mark.parametrize("verdict", ["continue", "done"])
+def test_settlement_follows_compression_onto_the_child_holding_the_same_claim(hermes_home, monkeypatch, verdict):
+    db = loops._get_session_db()
+    db.create_session("loop-parent", "cli")
+    manager = loops.LoopManager("loop-parent")
+    manager.set("Check the deployment", interval_seconds=300, until="deployment healthy")
+    assert manager.fire_tick()
+    calls = []
+
+    def judge(*args, **kwargs):
+        if not calls:  # compression lands while the first judgment is in flight
+            db.end_session("loop-parent", "compression")
+            db.create_session("loop-child", "cli", parent_session_id="loop-parent")
+            assert loops.migrate_loop_to_session("loop-parent", "loop-child", reason="compression")
+        calls.append(manager.session_id)
+        return verdict, "deployment healthy", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", judge)
+    decision = manager.complete_tick("The deployment is healthy")
+    child = loops.load_loop("loop-child")
+    assert calls == ["loop-parent", "loop-child"]
+    assert loops.load_loop("loop-parent").status == "cleared"
+    assert not child.awaiting_response and child.ticks_fired == 1
+    assert child.status == ("done" if verdict == "done" else "active")
+    assert decision["stopped"] is (verdict == "done")
+    assert manager.state.to_json() == child.to_json()
