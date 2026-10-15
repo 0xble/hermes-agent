@@ -1,6 +1,8 @@
 """Standby Telegram deferral and in-place promotion seams."""
 
 import asyncio
+import shutil
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,7 +66,7 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
     zcs.mark_ready()
     first = await zcs.promote(runner)
     second = await zcs.promote(runner)
-    assert first == {"promoted": True, "already": False}
+    assert first == {"promoted": True, "already": False, "failed": []}
     assert second == {"promoted": True, "already": True}
     assert runner.adapters[platform] is adapter
     assert runner._zero_cut_cron_handles == ("stop", "provider", "cron", "house")
@@ -72,17 +74,95 @@ async def test_promote_connects_once_starts_cron_and_is_idempotent(monkeypatch):
     assert zcs.is_standby() is False
 
 
-def test_promote_control_socket_refuses_until_ready(tmp_path):
+@pytest.mark.asyncio
+async def test_promote_queues_failed_primary_connect_for_reconnect(monkeypatch):
+    platform = Platform.TELEGRAM
+    config = object()
+    adapter = object()
+    runner = SimpleNamespace(
+        adapters={},
+        _failed_platforms={},
+        _standby_deferred={},
+        _create_adapter=lambda p, c: adapter,
+        _wire_adapter_handlers=lambda a: None,
+        _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=False),
+        _startup_retry_entry=lambda p, a, c: {"adapter": a, "config": c},
+        _publish_primary_adapter=lambda p, a: pytest.fail("failed connect must not publish"),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.defer_platform(runner, platform, config)
+    zcs.mark_ready()
+    result = await zcs.promote(runner)
+    assert result == {"promoted": True, "already": False, "failed": ["telegram"]}
+    assert runner._failed_platforms[platform] == {"adapter": adapter, "config": config}
+    assert runner.adapters == {}
+
+
+def test_promote_verb_over_real_socket_refuses_until_ready(monkeypatch):
+    home = Path(tempfile.mkdtemp(prefix="hgw-", dir="/tmp"))
+    runner = SimpleNamespace(
+        adapters={}, _standby_deferred={},
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+
     async def scenario():
-        server = GatewayControlServer(tmp_path, verb_handlers={"promote": lambda: {"promoted": False, "refused": "not_ready"}})
+        loop = asyncio.get_running_loop()
+        verb = lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), loop).result()
+        server = GatewayControlServer(home, verb_handlers={"promote": verb})
         assert await server.start()
+
+        def ask():
+            return query_gateway_control(home, "promote", slot="b")
         try:
-            return await asyncio.get_running_loop().run_in_executor(
-                None, lambda: query_gateway_control(tmp_path, "promote", slot="b"))
+            before = await loop.run_in_executor(None, ask)
+            zcs.mark_ready()
+            first = await loop.run_in_executor(None, ask)
+            again = await loop.run_in_executor(None, ask)
+            return before, first, again
         finally:
             await server.stop()
 
-    assert asyncio.run(scenario())["refused"] == "not_ready"
+    try:
+        before, first, again = asyncio.run(scenario())
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    assert before is not None and first is not None and again is not None
+    assert before["promoted"] is False and before["refused"] == "not_ready"
+    assert first["promoted"] is True and first["already"] is False
+    assert again["promoted"] is True and again["already"] is True
+
+
+def test_promote_refused_on_active_slot(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "a")
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    zcs.mark_ready()
+    assert asyncio.run(zcs.promote(SimpleNamespace())) == {"promoted": False, "refused": "not_standby"}
+
+
+@pytest.mark.asyncio
+async def test_flag_off_slot_b_creates_telegram_as_today(monkeypatch, tmp_path):
+    from gateway.run import GatewayRunner
+
+    gateway_slot.reset_gateway_slot_for_tests()
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": False}}})
+    assert zcs.is_standby() is False
+    created = []
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="secret")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner._failed_platforms = {}
+    runner._abort_startup_if_shutdown_requested = lambda *args: asyncio.sleep(0, result=False)
+    runner._create_adapter = lambda platform, config: created.append(platform)
+    await runner._start_prefilter_platforms()
+    assert created == [Platform.TELEGRAM]
+    assert zcs.readiness()["deferred"] == []
 
 
 @pytest.mark.asyncio
