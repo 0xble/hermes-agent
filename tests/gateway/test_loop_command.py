@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -122,6 +122,7 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
@@ -144,6 +145,7 @@ async def test_post_turn_completion_does_not_stop_a_loop_revised_during_the_turn
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt A"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     loops.save_loop("sid-gateway-loop", mgr.state)
     fired = loops.LoopManager(session_id="sid-gateway-loop")
@@ -204,6 +206,7 @@ async def test_non_streamed_stripped_reply_still_completes_loop_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
@@ -228,6 +231,7 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
@@ -253,11 +257,53 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
 
 
 @pytest.mark.asyncio
+async def test_loop_tick_is_not_reclassified_as_external_evidence(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+    event = _loop_wake_event(mgr)
+    runner._post_turn_goal_continuation = AsyncMock()
+    with patch("hermes_cli.loops.wake_loop_for_external_event") as wake:
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "still working"},
+            source=event.source,
+            is_internal=True,
+            event=event,
+        )
+    wake.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_trusted_external_result_wakes_loop_once(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    event = _make_event("result")
+    event.internal = True
+    event.metadata = {"notification_origin": "delegation_result", "notification_category": "result"}
+    runner._post_turn_goal_continuation = AsyncMock()
+    with patch("hermes_cli.loops.wake_loop_for_external_event", return_value=True) as wake:
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "delegation completed"},
+            source=event.source,
+            is_internal=True,
+            event=event,
+        )
+    wake.assert_called_once_with("sid-gateway-loop")
+
+
+@pytest.mark.asyncio
 async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
     assert mgr.state is not None
@@ -287,6 +333,7 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
@@ -496,6 +543,7 @@ async def test_post_turn_completion_judges_only_the_tick_its_wake_carried(loop_e
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll prompt A"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     loops.save_loop("sid-gateway-loop", mgr.state)
     fired_a = loops.LoopManager(session_id="sid-gateway-loop")
@@ -536,6 +584,7 @@ async def test_unstamped_turn_does_not_settle_a_tick_this_gateway_claimed(loop_e
     runner._gateway_started_at = time.time() - 60
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     loops.save_loop("sid-gateway-loop", mgr.state)
     assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
@@ -553,6 +602,7 @@ async def test_unstamped_turn_releases_a_tick_claimed_before_this_gateway_starte
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     loops.save_loop("sid-gateway-loop", mgr.state)
     assert loops.LoopManager(session_id="sid-gateway-loop").fire_tick() is not None
@@ -590,6 +640,7 @@ async def test_chain_loop_tick_settles_the_wake_a_human_follow_up_queued_behind(
     runner._gateway_started_at = time.time() - 60
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    assert mgr.state is not None
     mgr.state.next_due_at = time.time() - 1
     loops.save_loop("sid-gateway-loop", mgr.state)
     fired = loops.LoopManager(session_id="sid-gateway-loop")
