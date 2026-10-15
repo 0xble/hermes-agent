@@ -475,6 +475,9 @@ DEFAULT_GATE_MAX_RETRIES = 3
 # Automatic no-progress waits are one quiet ladder. They are not a failure
 # condition: a goal remains active and a real event resets the ladder.
 _NO_PROGRESS_BACKOFF_S = (15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60)
+# Timed waits are not clamped to a polling window; this is only a sanity ceiling against
+# a typo'd year. Events (user message, delivered notification) still pierce any wait.
+_MAX_TIMED_WAIT_S = 30 * 24 * 60 * 60
 DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS = 1
 # Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
 _GATE_OUTPUT_TAIL_CHARS = 3000
@@ -1009,7 +1012,6 @@ class GoalState:
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
-    judge_outage_notice_sent: bool = False
     # User-added criteria (/subgoal). Both the judge and continuation prompts include them.
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
@@ -1073,7 +1075,6 @@ class GoalState:
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_on_user_message=bool(data.get("waiting_on_user_message")),
-            judge_outage_notice_sent=bool(data.get("judge_outage_notice_sent")),
             waiting_reason=data.get("waiting_reason"),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
@@ -1646,6 +1647,33 @@ def _truthy(value: Any) -> bool:
     return value is True
 
 
+# BLOCKED reasons that are a real stop rather than a wait for the user's answer.
+_BLOCKED_PAUSE_RE = re.compile(
+    r"\b(?:breach\w*|violat\w*|irreversible|constraint|forbidden|prohibited|impossible|"
+    r"unachievable|cannot be (?:achieved|done|completed|satisfied)|no longer (?:exists|possible)|"
+    r"nothing (?:left|more) to try|no remaining (?:options|approaches))\b",
+    re.I,
+)
+# BLOCKED reasons that only need the user's answer, approval or decision.
+_BLOCKED_ON_USER_RE = re.compile(
+    r"\b(?:brian|user|you|owner|operator)\b|\b(?:approv\w*|permission|sign-?off|decision|decide|"
+    r"confirm\w*|answer|input|credentials?|login|consent)\b",
+    re.I,
+)
+
+
+def _parse_wait_until(raw: str) -> Optional[float]:
+    """Epoch for an ISO-8601 ``wait_until``. A timestamp without an offset is the host's local
+    wall-clock time (the judge prompt shows local time), not UTC."""
+    try:
+        when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.astimezone()  # interpret naive as local time
+    return when.timestamp()
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
 
@@ -1694,16 +1722,9 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if isinstance(until, (int, float)) and float(until) > time.time():
         return "wait", reason, False, {"until": float(until)}
     if isinstance(until, str) and until.strip():
-        try:
-            stamp = until.strip().replace("Z", "+00:00")
-            when = datetime.fromisoformat(stamp)
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            epoch = when.timestamp()
-            if epoch > time.time():
-                return "wait", reason, False, {"until": epoch}
-        except ValueError:
-            pass
+        epoch = _parse_wait_until(until)
+        if epoch is not None and epoch > time.time():
+            return "wait", reason, False, {"until": epoch}
     seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
@@ -2641,6 +2662,26 @@ def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: in
     return [_REPLY_QUOTE_RE.sub("", row["content"], count=1) for row in rows if _is_user_typed(row)]
 
 
+# One notice per judge outage for the whole process, not one per goal: a provider outage
+# hits every active goal at once. Any successful judge response ends the outage.
+_JUDGE_OUTAGE_LOCK = threading.Lock()
+_JUDGE_OUTAGE_ACTIVE = False
+JUDGE_OUTAGE_NOTICE = "⚠ Goal judge unavailable; goals stay active and back off until it recovers."
+
+
+def _judge_outage_notice(*, failed: bool) -> str:
+    """Return the outage notice exactly once per outage; ``failed=False`` ends the outage."""
+    global _JUDGE_OUTAGE_ACTIVE
+    with _JUDGE_OUTAGE_LOCK:
+        if not failed:
+            _JUDGE_OUTAGE_ACTIVE = False
+            return ""
+        if _JUDGE_OUTAGE_ACTIVE:
+            return ""
+        _JUDGE_OUTAGE_ACTIVE = True
+        return JUDGE_OUTAGE_NOTICE
+
+
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": message}
@@ -3180,6 +3221,8 @@ class GoalManager(GoalRevisionsMixin):
             target = f"session:{state.waiting_on_session}"
         elif state.waiting_on_pid is not None:
             target = f"pid:{state.waiting_on_pid}"
+        elif state.waiting_on_user_message:
+            target = "user-message"
         elif state.waiting_on_delegations:
             target = "delegations"
         else:
@@ -3247,18 +3290,10 @@ class GoalManager(GoalRevisionsMixin):
                 return None
         elif wait_directive.get("until"):
             raw_until = wait_directive["until"]
-            if isinstance(raw_until, str):
-                try:
-                    when = datetime.fromisoformat(raw_until.replace("Z", "+00:00"))
-                    if when.tzinfo is None:
-                        when = when.replace(tzinfo=timezone.utc)
-                    until = when.timestamp()
-                except ValueError:
-                    return None
-            else:
-                until = float(raw_until)
-            if until <= time.time():
+            until = _parse_wait_until(raw_until) if isinstance(raw_until, str) else float(raw_until)
+            if until is None or until <= time.time():
                 return None
+            until = min(until, time.time() + _MAX_TIMED_WAIT_S)
             self._park(reason, waiting_until=until, waiting_seconds=max(0, int(until - time.time())))
             tgt = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
         elif wait_directive.get("user_message"):
@@ -3271,7 +3306,7 @@ class GoalManager(GoalRevisionsMixin):
                 requested = max(requested, _NO_PROGRESS_BACKOFF_S[level])
                 state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
             delegation_floor = 10 * 60 if active_delegations else 0
-            seconds = max(requested, delegation_floor, min_seconds)
+            seconds = min(max(requested, delegation_floor, min_seconds), _MAX_TIMED_WAIT_S)
             self.wait_for_seconds(seconds, reason=reason, on_delegations=active_delegations)
             tgt = f"{seconds}s"
         return self._wait_notice_decision(
@@ -3363,10 +3398,13 @@ class GoalManager(GoalRevisionsMixin):
         )
         if state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False):
             holds, age_notice, pause_reason = self._stage_live_barrier()
-            if getattr(state, "waiting_on_user_message", False):
-                if not (user_initiated or external_event):
-                    return self._waiting_decision(state)
+            # A real user message or delivered external event is fresh evidence: it pierces
+            # every wait kind and re-judges now. Synthetic continuation wakes do not.
+            if user_initiated or external_event:
                 state.clear_wait(preserve_notice_key=True)
+                holds, age_notice, pause_reason = False, None, None
+            elif getattr(state, "waiting_on_user_message", False):
+                return self._waiting_decision(state)
             if pause_reason:
                 return _decision("paused", False, None, "blocked", pause_reason,
                                  f"⏸ Goal paused — blocker: {pause_reason}. Use /goal resume after checking the target.")
@@ -3456,12 +3494,10 @@ class GoalManager(GoalRevisionsMixin):
         # BLOCKED is NOT done: pause for missing user input, an external prerequisite, or
         # an impossible goal. A recoverable dependency must never be called unachievable.
         if verdict == "blocked":
-            needs_user = bool(re.search(
-                r"\b(?:brian|user|you)\b.*\b(?:approve|answer|decide|input|confirm|weigh|permission)"
-                r"|\b(?:needs|waiting on)\s+(?:brian|you|the user)\b"
-                r"|\bneeds\s+user\s+input\b",
-                reason, re.I,
-            ))
+            # Only a real irreversible-constraint breach or a goal with nothing left to try
+            # pauses. Every other BLOCKED (approval, decision, credentials, an answer) is a
+            # wait on the user's next message: the goal stays active and no /goal resume chore.
+            needs_user = bool(_BLOCKED_ON_USER_RE.search(reason or "")) and not _BLOCKED_PAUSE_RE.search(reason or "")
             if needs_user:
                 return self._apply_wait_directive({"user_message": True}, reason)
             return self._pause_decision(
@@ -3475,18 +3511,22 @@ class GoalManager(GoalRevisionsMixin):
             self._save()
             return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
 
-        # Judge outages fail open. Keep the goal active and send one quiet diagnostic per outage.
-        if transport_failed or parse_failed:
-            notice = ""
-            if not getattr(state, "judge_outage_notice_sent", False):
-                state.judge_outage_notice_sent = True
-                notice = "Goal judge unavailable; staying active and backing off until it recovers."
-            return _decision("active", False, None, "continue", reason, notice)
-        state.judge_outage_notice_sent = False
+        # Judge outages fail open as CONTINUE (judge_goal already maps them) and take the normal
+        # continue/ladder path below, so a persistent outage backs off instead of pausing. One
+        # process-wide notice per outage, not one per goal.
+        # Unparseable output is a model-quality problem, not an outage: it continues silently.
+        outage_notice = "" if parse_failed else _judge_outage_notice(failed=bool(transport_failed))
 
-        # No-progress is a single quiet wait ladder. It never clears or pauses the goal.
-        if state.consecutive_no_progress >= DEFAULT_MAX_CONSECUTIVE_NO_PROGRESS:
-            return self._no_progress_wait(state, reason, active_delegations=active_delegations, min_seconds=gap_floor)
+        def _with_outage(decision: Dict[str, Any]) -> Dict[str, Any]:
+            if outage_notice and decision.get("status") == "active":
+                decision["message"] = outage_notice
+            return decision
+
+        # Every automatic no-progress CONTINUE parks on the shared quiet ladder immediately.
+        # This is the sole pacing rule: no separate continuation-gap threshold or clear breaker.
+        if verdict == "continue" and automatic_read_only:
+            return _with_outage(self._no_progress_wait(
+                state, reason, active_delegations=active_delegations, min_seconds=gap_floor))
 
         if state.max_turns > 0 and state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)
@@ -3496,7 +3536,8 @@ class GoalManager(GoalRevisionsMixin):
         if verdict == "continue" and not user_initiated and active_delegations > 0 and (
             not new_progress or _evidence_only_read_only_status(turn_evidence)
         ):
-            return self._delegation_no_progress_wait(state, reason, active_delegations, min_seconds=gap_floor)
+            return _with_outage(self._delegation_no_progress_wait(
+                state, reason, active_delegations, min_seconds=gap_floor))
 
         reason_text = (reason or "").strip()
         # Reuse S1's durable notice identity so continuation and parked-state notices
@@ -3507,6 +3548,10 @@ class GoalManager(GoalRevisionsMixin):
         else:
             state.last_continuation_notice_key = notice_key
             notice = f"↻ Continuing toward goal ({_goal_budget_label(state.turns_used, state.max_turns)}): {reason}"
+        if outage_notice:
+            notice = outage_notice
+        elif transport_failed or parse_failed:
+            notice = ""
         self._save()
         return _decision(
             "active", True, self.next_continuation_prompt(), "continue", reason,

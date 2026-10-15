@@ -194,7 +194,7 @@ def _blocked_goal(session_id: str):
     mgr.set("run both agent sessions end to end")
     with patch(
         "hermes_cli.goals.judge_goal",
-        return_value=("blocked", "needs the user to approve the login card", False, None, False),
+        return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
     ):
         assert mgr.evaluate_after_turn("May I use your login?")["status"] == "paused"
     return mgr

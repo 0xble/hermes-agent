@@ -1340,7 +1340,7 @@ class TestBlockedGoalResumesOnUserInput:
         mgr.set("run the two agent sessions end to end")
         with patch(
             "hermes_cli.goals.judge_goal",
-            return_value=("blocked", "needs the user to approve the login card", False, None, False),
+            return_value=("blocked", "the irreversible no-delete constraint would be breached", False, None, False),
         ):
             decision = mgr.evaluate_after_turn("I need your approval before copying the login.")
         assert decision["status"] == "paused"
