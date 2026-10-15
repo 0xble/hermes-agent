@@ -1808,7 +1808,9 @@ def save_jobs_document(document: Any) -> None:
     if not isinstance(jobs, list):
         raise ValueError("Cron jobs document must contain a jobs list")
     with _jobs_lock():
-        _save_jobs_unlocked(jobs, replace=True, document=document)
+        # Keep the shrink-merge guard: under the degraded (in-process only) lock a sibling's
+        # create may have landed after the caller read the document.
+        _save_jobs_unlocked(jobs, document=document)
 
 
 _MISSING = object()

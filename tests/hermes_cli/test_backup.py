@@ -2869,6 +2869,36 @@ class TestRestoreCronJobsIfEmptied:
         assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c"]
         assert restored["format"] == "cron-v1"
 
+    def test_restore_keeps_job_created_after_its_read(self, tmp_path, monkeypatch):
+        """A sibling create landing after restore read the live file survives the write."""
+        from cron import jobs as cron_jobs
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps({"jobs": [
+            {"id": "a", "prompt": "one"}, {"id": "b", "prompt": "two"},
+            {"id": "c", "prompt": "three"},
+        ]}), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+        jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "prompt": "one"}]}), encoding="utf-8")
+
+        real_load = cron_jobs.load_jobs
+
+        def load_then_sibling_create(*args, **kwargs):
+            loaded = real_load(*args, **kwargs)
+            doc = json.loads(jobs_path.read_text(encoding="utf-8"))
+            doc["jobs"].append({"id": "sibling", "prompt": "new"})
+            jobs_path.write_text(json.dumps(doc), encoding="utf-8")
+            return loaded
+
+        monkeypatch.setattr(cron_jobs, "load_jobs", load_then_sibling_create)
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        restored = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c", "sibling"]
+
 
     def test_non_utf8_journal_does_not_stop_restore(self, tmp_path):
         from hermes_cli.backup import restore_cron_jobs_if_emptied
