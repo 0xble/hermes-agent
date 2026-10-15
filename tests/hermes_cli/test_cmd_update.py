@@ -1,6 +1,7 @@
 """Git trampoline recovery; branch updates use the real target-identity suite."""
 
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -121,9 +122,60 @@ class TestGitTrampolineSelfHeal:
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: profile_home)
 
         candidates = _portable_git_candidates()
-        assert candidates[0] == (
-            root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
-        assert candidates[1] == (
-            profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
-        )
+        git_core = ("libexec", "git-core", "git.exe")
+        envs = ("clangarm64", "ucrt64", "mingw64", "mingw32")
+        assert candidates == [
+            *(root / "git" / env / Path(*git_core) for env in envs),
+            *(profile_home / "git" / env / Path(*git_core) for env in envs),
+        ]
+
+
+def _fake_git_for_windows(root, env, *, output="git version 2.56.0.windows.2"):
+    """A Git for Windows tree whose only git-core binary lives under *env*; it prints *output*."""
+    exe = root / env / "libexec" / "git-core" / "git.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text(f"#!/bin/sh\necho '{output}'\n", encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
+@pytest.mark.platforms("not windows")  # the fake git.exe is a POSIX shell script
+class TestLocateRealGitLayouts:
+    """_locate_real_git across Git for Windows layouts, probing real executables.
+
+    Git for Windows v2.56.0 moved the x64 tree from ``mingw64`` to ``ucrt64``; the
+    locator must find git-core in either layout (and arm64's ``clangarm64``).
+    """
+
+    @pytest.fixture
+    def roots(self, tmp_path, monkeypatch):
+        from hermes_cli import update_cmd_git
+
+        program_files = tmp_path / "Program Files" / "Git"
+        monkeypatch.setattr(update_cmd_git, "_GIT_FOR_WINDOWS_ROOTS", (program_files,))
+        monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", lambda: [])
+        return program_files
+
+    @pytest.mark.parametrize("env", ["ucrt64", "mingw64", "clangarm64"])
+    def test_finds_git_core_in_each_layout(self, roots, env):
+        exe = _fake_git_for_windows(roots, env)
+        assert update_cmd._locate_real_git() == exe
+
+    def test_skips_a_guarded_candidate(self, roots):
+        _fake_git_for_windows(roots, "ucrt64", output="BUG (fork bomb): check your PATH")
+        healthy = _fake_git_for_windows(roots, "mingw64")
+        assert update_cmd._locate_real_git() == healthy
+
+    def test_none_without_git_core(self, roots):
+        roots.mkdir(parents=True)
+        assert update_cmd._locate_real_git() is None
+
+    def test_finds_managed_portable_git_ucrt64(self, tmp_path, monkeypatch):
+        import hermes_constants
+        from hermes_cli import update_cmd_git
+
+        monkeypatch.setattr(update_cmd_git, "_GIT_FOR_WINDOWS_ROOTS", ())
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: tmp_path)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+        exe = _fake_git_for_windows(tmp_path / "git", "ucrt64")
+        assert update_cmd._locate_real_git() == exe

@@ -43,6 +43,19 @@ async def _post_turn_event(runner):
     return runner.adapter._pending_messages[runner.target.session_key]
 
 
+def _pause_before(action):
+    """Resume lifts any pause; a replacement lifts only a judge pause over the contract it supersedes."""
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager("target")
+    if action != "replace":
+        manager.pause()
+        return
+    manager.state.status, manager.state.last_verdict = "paused", "blocked"
+    manager.state.paused_reason = "judge blocked: needs approval"
+    manager._save()
+
+
 def _apply(state, action, **payload):
     from hermes_cli import session_controls
 
@@ -64,7 +77,7 @@ async def test_real_control_constructor_revalidated_at_idle_ingress(state, actio
 
     runner = _runner(state)
     GoalManager("target").set("old objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     record = _apply(state, action, **({"goal": "approved objective"} if action == "replace" else {}))
     event = await _control_event(runner, record)
     assert event.internal is False  # Production continuations are ordinary authorized ingress.
@@ -601,7 +614,7 @@ async def test_approved_control_continuation_refreshes_after_subgoal_add(
 
     runner = _runner(state)
     GoalManager("target").set("same objective")
-    GoalManager("target").pause()
+    _pause_before(action)
     request = request_control("goal", action, "target", requester_sid="requester",
                               payload={"goal": "approved objective"} if action == "replace" else {})
     record = resolve_request(request["id"], "approve", "99")
@@ -677,8 +690,10 @@ async def test_historical_pause_cutoff_removes_old_slot_and_overflow_without_rem
         GatewayBusySessionMixin._clear_goal_pending_continuations(runner, key, adapter, before)
     )
     await runner._drain_session_controls()
-    assert runner.target.session_key not in runner.adapter._pending_messages
-    assert queue.conversation.queued_events == [fresh, human]
+    # The stale slot is removed; retained real work is promoted in FIFO order.
+    slot = runner.adapter._pending_messages.get(runner.target.session_key)
+    assert slot is not old
+    assert ([slot] if slot is not None else []) + queue.conversation.queued_events == [fresh, human]
 
 
 @pytest.mark.asyncio
@@ -809,7 +824,7 @@ async def test_superseded_continuation_turn_is_not_judged_against_the_new_goal(s
     after = load_goal("target")
     judged.assert_not_called()
     assert after.status == "active" and after.goal == "new objective"
-    assert after.turns_used == before.turns_used == 0
+    assert after.turns_used == before.turns_used == (1 if change == "replace" else 0)
     assert runner.target.session_key not in runner.adapter._pending_messages
 
 
@@ -993,6 +1008,9 @@ def _loop_fire_runner(runner, *, accept=True):
 
     async def handle(event):
         event._gateway_accepted = accept
+        if event.text.lstrip().startswith("/"):
+            # This fake handler represents the adapter's inline command dispatch receipt.
+            event._gateway_inline_command_handled = True
 
     runner.adapter.handle_message = AsyncMock(side_effect=handle)
     runner._adapters_for_profile = lambda profile: {Platform.TELEGRAM: runner.adapter}
@@ -1015,8 +1033,8 @@ async def _fire_then_compress(runner, state, prompt):
     manager._save()
     real_fire = LoopManager.fire_tick
 
-    def fire_then_compress(self):
-        wakeup = real_fire(self)
+    def fire_then_compress(self, run_generation=0, *, can_claim=None):
+        wakeup = real_fire(self, run_generation, can_claim=can_claim)
         _rotate_wake(state, "loop")  # compression lands between the claim and admission
         return wakeup
 
@@ -1051,20 +1069,25 @@ async def test_admission_follows_loop_migrated_after_fire_tick_and_settles_on_ch
 
 
 @pytest.mark.asyncio
-async def test_admission_refused_after_compression_rolls_back_the_child_claim(state):
+async def test_admission_refused_after_compression_skips_the_child_claim(state):
     from hermes_cli.loops import LoopManager, load_loop
 
     runner = _loop_fire_runner(_runner(state), accept=False)
     await _fire_then_compress(runner, state, "check the queue")
     runner.adapter.handle_message.assert_awaited_once()
     child = load_loop("compression-child")
-    assert child.awaiting_response is False
-    assert child.ticks_fired == 0
+    # fire_tick atomically starts the tick before admission. A later adapter refusal therefore
+    # leaves the started tick for recovery, which skips it without replaying or refunding it.
+    assert child.awaiting_response is True
+    assert child.ticks_fired == 1
     manager = LoopManager("compression-child")
+    assert manager.recover_tick()
+    child = load_loop("compression-child")
+    assert child.awaiting_response is False and child.ticks_fired == 1
     manager.state.next_due_at = 0
     manager._save()
-    assert manager.fire_tick()  # the next scan fires the tick again
-    assert load_loop("compression-child").ticks_fired == 1
+    assert manager.fire_tick()  # the next cadence fires a fresh tick
+    assert load_loop("compression-child").ticks_fired == 2
 
 
 @pytest.mark.asyncio

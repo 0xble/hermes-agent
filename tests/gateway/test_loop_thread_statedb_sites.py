@@ -94,7 +94,7 @@ async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
     source = _source()
     ctx = TurnContext(source=source, context_prompt="", channel_prompt=None, session_key="k",
                       session_id="sess", run_generation=1, history=[])
-    pending = MessageEvent(text="[Continuing toward your standing goal]\nGoal: ship", source=source)
+    pending = MessageEvent(text="[Continuing toward your standing goal]\nGoal: ship", source=source, metadata={"goal_continuation": True})
     assert runner._is_goal_continuation_event(pending)
     loop_thread = _arm()
     out = await runner._run_agent_queued_followup(ctx, None, pending.text, pending, "done",

@@ -3,8 +3,8 @@
 The scheduler claims the tick (``awaiting_response``) and stamps it on the wake. Once the adapter
 accepts the wake, only that wake's post-turn loop completion settles the tick: an unstamped later
 turn deliberately leaves a tick this process claimed alone. A turn that exits after admission but
-before the hooks (``max_concurrent_sessions`` rejection, turn-lease timeout) must therefore roll
-the tick back itself, or the loop stays in flight and the watcher never fires it again.
+before the hooks (``max_concurrent_sessions`` rejection, turn-lease timeout) must therefore skip
+this started tick itself, or the loop stays in flight and the watcher never fires it again.
 """
 
 from __future__ import annotations
@@ -88,8 +88,12 @@ async def test_accepted_loop_wake_that_never_ran_rolls_back_its_tick(
     runner._run_agent.assert_not_awaited()
     stored = load_loop(sid)
     assert stored.awaiting_response is False
-    assert stored.ticks_fired == 0  # nothing ran: the claim is undone, not counted
-    # The next scan can fire the loop again.
+    assert stored.ticks_fired == 1  # started ticks are skipped, never replayed
+    # The skipped tick is not replayed immediately; the normal cadence schedules the next one.
+    assert LoopManager(session_id=sid).fire_tick() is None
+    stored.next_due_at = 0
+    from hermes_cli.loops import save_loop
+    save_loop(sid, stored)
     assert LoopManager(session_id=sid).fire_tick()
 
 

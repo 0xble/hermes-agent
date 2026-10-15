@@ -66,7 +66,7 @@ async def test_restart_marker_from_secondary_session_notifies_via_its_own_bot(tm
     r = _runner()
     src = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42", profile="sec")
     event = MessageEvent(text="/restart", message_type=MessageType.TEXT, source=src, message_id="7")
-    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)))
+    (tmp_path / ".restart_notify.json").write_text(json.dumps(_restart_notify_payload(event)), encoding="utf-8")
 
     assert await r._send_restart_notification() == ("telegram", "42", None)
     assert r._profile_adapters["sec"][Platform.TELEGRAM].sent == ["42"]
@@ -81,7 +81,7 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
     fired = []
 
     class _Mgr:
-        state = SimpleNamespace(ticks_fired=1)
+        state = SimpleNamespace(ticks_fired=1, created_at=1.0, control_generation=0)
 
         def __init__(self, session_id=None):
             pass
@@ -89,7 +89,10 @@ async def test_loop_wakeup_from_secondary_route_fires_through_its_own_bot(monkey
         def is_due(self, now):
             return True
 
-        def fire_tick(self):
+        def fire_tick(self, run_generation=0, *, can_claim=None):
+            # Mirrors LoopManager.fire_tick: admission claims only while the gateway still owns the run.
+            if can_claim is not None and not can_claim():
+                return None
             fired.append(1)
             return "tick"
 

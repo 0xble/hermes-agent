@@ -158,21 +158,61 @@ def _strip_trailing_marker_lines(
     return kept if kept.strip() or not preserve_bare else last_marker
 
 
-def strip_trailing_silence_marker(text: Any, *, respect_fences: bool = True) -> Any:
-    """Remove the run of top-level standalone silence-marker lines ending substantive text.
+def _strip_leading_marker_lines(text: str, is_marker) -> tuple[str, str]:
+    """Strip consecutive marker lines (and blank lines between them) opening *text*.
 
-    One or more consecutive trailing marker lines are removed. The exact interactive
-    silence rule remains authoritative for a bare marker, so a bare marker is returned
-    unchanged, and a response made only of marker lines collapses to its last marker so
-    it still reaches the intentional-silence path rather than the empty-response one.
-    Marker-looking lines inside fenced code are content, not control text.
+    The first line can never sit inside a fence, and the scan stops at the first
+    non-marker line, so a later fence cannot hide or expose anything here.
+    Returns ``(rest, last_marker)``; ``last_marker`` is empty when nothing was removed.
+    """
+    lines = text.splitlines(keepends=True)
+    start = 0
+    last_marker = ""
+    while start < len(lines):
+        if not lines[start].strip():
+            start += 1
+            continue
+        if not is_marker(lines[start]):
+            break
+        last_marker = lines[start].strip()
+        start += 1
+    if not last_marker:
+        return text, ""
+    return "".join(lines[start:]).lstrip("\r\n"), last_marker
+
+
+def opens_with_silence_marker(text: Any) -> bool:
+    """True when the first non-blank line of ``text`` is a standalone silence marker.
+
+    Streaming previews hold while this is true, so a reply that opens
+    ``NO_REPLY\\n\\n<prose>`` never shows (or push-notifies) the marker before the
+    final strip removes it. The first line can never be inside a fence.
+    """
+    if not isinstance(text, str):
+        return False
+    return bool(_strip_leading_marker_lines(text, is_intentional_silence_response)[1])
+
+
+def strip_edge_silence_markers(text: Any, *, respect_fences: bool = True) -> Any:
+    """Remove top-level standalone silence-marker lines opening or ending substantive text.
+
+    A model sometimes emits the marker *and* prose (``NO_REPLY\\n\\nUpdate: ...`` or
+    ``Done.\\n\\nNO_REPLY``). The prose is the reply; the marker line is control text the
+    user must never see. Consecutive marker runs at either edge are removed. The exact
+    interactive silence rule remains authoritative for a bare marker, so a bare marker
+    is returned unchanged, and a response made only of marker lines collapses to its
+    last marker so it still reaches the intentional-silence path rather than the
+    empty-response one. Marker-looking lines inside fenced code are content.
     ``respect_fences=False`` is only for raw text whose fence-aware visible form
     (think blocks removed) already proved the trailing lines are top-level.
     """
     if not isinstance(text, str) or is_intentional_silence_response(text):
         return text
+    rest, leading_marker = _strip_leading_marker_lines(text, is_intentional_silence_response)
+    if leading_marker and not rest.strip():
+        return leading_marker
     return _strip_trailing_marker_lines(
-        text, is_intentional_silence_response,
+        rest, is_intentional_silence_response,
         respect_fences=respect_fences, preserve_bare=True,
     )
 

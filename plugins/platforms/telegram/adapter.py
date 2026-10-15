@@ -16,7 +16,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, cast
 from hermes_cli import setup_platforms
 
 logger = logging.getLogger(__name__)
@@ -209,6 +209,12 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # machinery (delivery ledger, streaming fallback) owns the wait instead of the coroutine pinning its worker
 # — a 97-minute penalty on the boot path froze inbound on every platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+# Sentinel: cancel typing re-arms for every topic in a chat (chat-level pause carries no metadata).
+_ALL_TOPICS: Any = object()
+# One quick retry for a keep-typing tick shed by lock contention, a timeout or an error; at a 4.5s
+# cadence a dropped tick otherwise lets the ~5s bubble lapse until the next tick.
+_TYPING_TICK_RETRY_SECS = 0.5
+_TYPING_SKIPPED_LOCK_BUSY = "lock_busy"
 
 # Shared per-chat outbound budget (#116312, #107612): Telegram counts every Bot API call to a chat
 # against ONE per-chat allowance. The clock lives in chat_budget.py and is installed at PTB's request
@@ -1041,17 +1047,22 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         self._allow_cjk_rich_messages: bool = self._coerce_bool_extra("allow_cjk_rich_messages", False)
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
+        # Stay below Telegram's ~5s expiry while reducing steady-state sendChatAction volume.
+        self.typing_refresh_interval = self._coerce_float_extra(
+            "typing_refresh_interval_seconds", 4.5, min_value=1.0, max_value=4.75)
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
         self._telegram_typing_cooldown_until: Dict[str, float] = {}
         self._telegram_typing_cooldown_seconds: float = self._coerce_float_extra(
             "typing_cooldown_seconds", 30.0, min_value=1.0, max_value=300.0)
-        # Post-send typing re-arm: scheduled, deduped and rate-limited per chat. Awaiting a
+        # Post-send typing re-arm: scheduled, deduped and rate-limited per chat/topic. Awaiting a
         # sendChatAction round-trip on the send path shares the loop with the getUpdates long-polls,
         # and under concurrent streaming it starved them until they rotted into CLOSE-WAIT (#111727).
-        self._telegram_typing_retrigger_tasks: Dict[str, asyncio.Task] = {}
-        self._telegram_typing_retrigger_at: Dict[str, float] = {}
-        # Telegram's bubble lasts ~5s and _keep_typing already refreshes every 2s, so the re-arm only
-        # has to cover the gap left by a landed message. 0 restores a call per intermediate send.
+        self._telegram_typing_retrigger_tasks: Dict[tuple[str, Optional[str]], asyncio.Task] = {}
+        self._telegram_typing_retrigger_trailing_tasks: Dict[tuple[str, Optional[str]], asyncio.Task] = {}
+        self._telegram_typing_retrigger_at: Dict[tuple[str, Optional[str]], float] = {}
+        # Telegram's bubble lasts ~5s and _keep_typing refreshes at the configured 4.5s cadence, so
+        # the re-arm covers the gap left by a landed message. 0 removes the time window; a re-arm
+        # already in flight for the topic still absorbs a burst, so there is never more than one.
         self._telegram_typing_retrigger_interval: float = self._coerce_float_extra(
             "typing_retrigger_min_interval_seconds", 2.0, min_value=0.0, max_value=30.0)
         # Buffer album/photo bursts into a single MessageEvent instead of self-interrupting turns.
@@ -4297,6 +4308,64 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
                     return self._record_send_flood_cooldown(chat_id, wait)
                 raise
 
+    def _typing_retrigger_task_maps(self) -> "tuple[Dict[tuple[str, Optional[str]], asyncio.Task], Dict[tuple[str, Optional[str]], asyncio.Task]]":
+        """Per-topic immediate and trailing re-arm task maps. Created lazily because tests build adapters
+        via ``object.__new__()`` (no ``__init__``)."""
+        tasks = cast(Dict[tuple[str, Optional[str]], asyncio.Task], self.__dict__.setdefault("_telegram_typing_retrigger_tasks", {}))
+        trailing_tasks = cast(Dict[tuple[str, Optional[str]], asyncio.Task], self.__dict__.setdefault(
+            "_telegram_typing_retrigger_trailing_tasks", {}))
+        return tasks, trailing_tasks
+
+    def _typing_retrigger_key(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> tuple[str, Optional[str]]:
+        return str(chat_id), self._metadata_thread_id(metadata)
+
+    def _typing_retrigger_paused(self, chat_id: str) -> bool:
+        paused = getattr(self, "_typing_paused", None) or ()
+        return chat_id in paused or str(chat_id) in paused
+
+    def _cancel_typing_retrigger(self, chat_id: str, metadata: Any = _ALL_TOPICS) -> None:
+        """Cancel re-arms for one topic (``metadata`` given, ``None`` = the chat's non-topic lane), or for
+        every topic in the chat when no metadata is passed (chat-level pause). Safe from the sync agent
+        thread: a task owned by another thread's loop is cancelled on it."""
+        chat_key = str(chat_id)
+        topic_key = None if metadata is _ALL_TOPICS else self._typing_retrigger_key(chat_id, metadata)
+
+        def _matches(key: tuple[str, Optional[str]]) -> bool:
+            return key == topic_key if topic_key is not None else key[0] == chat_key
+
+        # The event loop may insert into these maps while this runs on the agent thread, so iterate a
+        # snapshot (``tuple(d)`` copies atomically under the GIL); a live iteration could raise
+        # "dictionary changed size" and the caller's suppress would silently skip the cancellation.
+        for task_map in self._typing_retrigger_task_maps():
+            for key in [key for key in tuple(task_map) if _matches(key)]:
+                task = task_map.pop(key, None)
+                if task is None or task.done():
+                    continue
+                task_loop = task.get_loop()
+                try:
+                    on_task_loop = asyncio.get_running_loop() is task_loop
+                except RuntimeError:
+                    on_task_loop = False
+                if on_task_loop:
+                    task.cancel()
+                else:
+                    with contextlib.suppress(RuntimeError):  # loop already closed
+                        task_loop.call_soon_threadsafe(task.cancel)
+        # Drop the rate-limit stamps too, so per-topic keys do not accumulate for the adapter's life.
+        # Done after cancellation so a stamp-cleanup failure can never preempt it.
+        sent_at = self.__dict__.get("_telegram_typing_retrigger_at")
+        if sent_at:
+            with contextlib.suppress(RuntimeError):
+                for key in [key for key in tuple(sent_at) if _matches(key)]:
+                    sent_at.pop(key, None)
+
+    def pause_typing_for_chat(self, chat_id: str) -> None:
+        """Pause typing and drop pending post-send re-arms for every topic in this chat.
+        The pause API is chat-level, so it lacks metadata and intentionally cancels all topic keys."""
+        super().pause_typing_for_chat(chat_id)
+        with contextlib.suppress(Exception):
+            self._cancel_typing_retrigger(chat_id)
+
     async def _retrigger_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> None:
         """Re-arm typing after an intermediate send (Telegram clears it when a message lands). Skipped on
         the FINAL reply (``metadata["notify"]``): the refresh loop is gone and no API cancels the bubble.
@@ -4304,37 +4373,84 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         Scheduled, never awaited: ``sendChatAction`` is a fire-and-forget UI hint, and awaiting its TLS
         round-trip on the send path after *every* streamed chunk pinned the event loop the ``getUpdates``
         long-polls live on until they rotted into CLOSE-WAIT while the adapter still reported connected
-        (#111727). ``_keep_typing`` already refreshes every 2s, so one in-flight re-arm per chat, at most
-        one per ``typing_retrigger_min_interval_seconds``, covers the gap a landed message leaves."""
-        if (metadata or {}).get("notify") or not getattr(getattr(self, "config", None), "typing_indicator", True):
+        (#111727). A request inside the limiter window (``typing_retrigger_min_interval_seconds``, default 2s)
+        gets one trailing re-arm at the window's end; further requests coalesce into it, and turn cleanup
+        or ``pause_typing_for_chat`` cancels it."""
+        key = self._typing_retrigger_key(chat_id, metadata)
+        if (metadata or {}).get("notify"):
+            self._cancel_typing_retrigger(chat_id, metadata)
             return
-        # __dict__.setdefault: tests build adapters via object.__new__() (no __init__).
-        tasks: Dict[str, asyncio.Task] = self.__dict__.setdefault("_telegram_typing_retrigger_tasks", {})
-        sent_at: Dict[str, float] = self.__dict__.setdefault("_telegram_typing_retrigger_at", {})
-        key = str(chat_id)
-        in_flight = tasks.get(key)
-        if in_flight is not None and not in_flight.done():
+        if not getattr(getattr(self, "config", None), "typing_indicator", True):
+            self._cancel_typing_retrigger(chat_id, metadata)
             return
+        # Paused chats (approval/clarify waits, or the stream consumer's pre-finalize pause) get no
+        # re-arm, matching _keep_typing, which skips them on every tick.
+        if self._typing_retrigger_paused(chat_id):
+            self._cancel_typing_retrigger(chat_id, metadata)
+            return
+        tasks, trailing_tasks = self._typing_retrigger_task_maps()
+        sent_at: Dict[tuple[str, Optional[str]], float] = self.__dict__.setdefault("_telegram_typing_retrigger_at", {})
         loop = asyncio.get_running_loop()
+        interval = getattr(self, "_telegram_typing_retrigger_interval", 2.0)
         now = loop.time()
-        # Stamped at scheduling time, not completion, so a burst of chunks cannot all pass while the
-        # first round-trip is still open.
-        if now - sent_at.get(key, float("-inf")) < getattr(self, "_telegram_typing_retrigger_interval", 2.0):
+        tracked = getattr(self, "_background_tasks", None)
+
+        def _track(task: asyncio.Task, task_map: Dict[tuple[str, Optional[str]], asyncio.Task]) -> None:
+            task_map[key] = task
+            task.add_done_callback(lambda done: task_map.get(key) is done and task_map.pop(key, None))
+            # Shutdown cancels _background_tasks, so a detached re-arm cannot outlive the adapter.
+            if isinstance(tracked, set):
+                tracked.add(task)
+                task.add_done_callback(tracked.discard)
+
+        active = tasks.get(key)
+        trailing = trailing_tasks.get(key)
+        if (active is not None and not active.done()) or (trailing is not None and not trailing.done()):
+            needs_trailing = True
+        else:
+            needs_trailing = now - sent_at.get(key, float("-inf")) < interval
+        if needs_trailing:
+            # Coalesce only into a trailing re-arm that is still waiting. Once its send starts it moves
+            # to ``tasks`` (below), so a message landing during that send schedules a fresh re-arm.
+            if trailing is not None and not trailing.done():
+                return
+            due_at = sent_at.get(key, now) + interval
+
+            async def _trailing() -> None:
+                try:
+                    active_task = tasks.get(key)
+                    if active_task is not None and not active_task.done():
+                        await active_task
+                    await asyncio.sleep(max(0.0, due_at - loop.time()))
+                    active_task = tasks.get(key)
+                    if active_task is not None and not active_task.done():
+                        await active_task
+                    # A pause can land while this waited (e.g. before an edit-only final reply).
+                    if self._typing_retrigger_paused(chat_id):
+                        return
+                    current = asyncio.current_task()
+                    if current is not None and trailing_tasks.get(key) is current:
+                        # Hand over from "waiting" to "in flight": still one request per key.
+                        trailing_tasks.pop(key, None)
+                        tasks[key] = current
+                        current.add_done_callback(lambda done: tasks.get(key) is done and tasks.pop(key, None))
+                    sent_at[key] = loop.time()
+                    await self.send_typing(chat_id, metadata=metadata)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[%s] Telegram typing trailing re-arm failed", self.name)
+
+            _track(loop.create_task(_trailing()), trailing_tasks)
             return
+
         sent_at[key] = now
 
         async def _quiet() -> None:
             with contextlib.suppress(Exception):
                 await self.send_typing(chat_id, metadata=metadata)
 
-        task = loop.create_task(_quiet())
-        tasks[key] = task
-        task.add_done_callback(lambda done: tasks.get(key) is done and tasks.pop(key, None))
-        # Shutdown cancels _background_tasks, so a detached re-arm cannot outlive the adapter.
-        tracked = getattr(self, "_background_tasks", None)
-        if isinstance(tracked, set):
-            tracked.add(task)
-            task.add_done_callback(tracked.discard)
+        _track(loop.create_task(_quiet()), tasks)
 
     @durable_egress("send")
     async def send(
@@ -6706,25 +6822,37 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if not self._bot_meters_chat_budget():
             self._chat_budget().reserve(chat_id)
 
-    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Send typing indicator."""
+    def _typing_tick_retry_delay(self, result: Any, *, timed_out: bool, failed: bool) -> Optional[float]:
+        """Retry a keep-typing tick once, soon, when lock contention, a timeout or an error dropped it.
+        Budget, flood and cooldown sheds are deliberate and are not retried."""
+        if result == _TYPING_SKIPPED_LOCK_BUSY or timed_out or failed:
+            return _TYPING_TICK_RETRY_SECS
+        return None
+
+    def _typing_tick_anchor_before_send(self) -> bool:
+        return True
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Send typing indicator. Returns ``_TYPING_SKIPPED_LOCK_BUSY`` when a delivery held the chat lock."""
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
-                await live.send_typing(chat_id, metadata)
-            return
+                return await live.send_typing(chat_id, metadata)
+            return None
         key = str(normalize_telegram_chat_id(chat_id))
         # Typing is cosmetic: one chat-wide budget for every session's loop, shed (never queued)
         # when the chat's slot or its typing share is spent.
         if self._chat_budget().typing_blocked(key) or self._daily_sheds(key, OUTBOUND_PROGRESS):
-            return
+            return None
         lock = self.__dict__.get("_telegram_chat_send_locks", {}).get(key)
         owner = self.__dict__.get("_telegram_chat_send_lock_owners", {}).get(key)
         if lock is not None and lock.locked() and owner is not asyncio.current_task():
-            # A cosmetic tick is stale by the time a real delivery releases the lock.
-            return
+            # A cosmetic tick is stale by the time a real delivery releases the lock; _keep_typing
+            # retries it once shortly instead (edits never re-arm, so a dropped tick would lapse).
+            return _TYPING_SKIPPED_LOCK_BUSY
         async with self._chat_send_lock(chat_id):
             await self._send_typing_locked(chat_id, metadata)
+        return None
 
     async def _send_typing_locked(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> None:
         """Keep a typing probe behind the same flood check as other outbound calls."""

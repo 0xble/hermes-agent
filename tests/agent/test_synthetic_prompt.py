@@ -207,8 +207,14 @@ def _template_id(template: str) -> str:
     import hermes_cli.heartbeat as heartbeat
     import hermes_cli.loops as loops
 
-    return next(name for module in (goals, heartbeat, loops) for name, value in vars(module).items()
-                if name.endswith("_TEMPLATE") and value is template)
+    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
+
+    for module in (goals, heartbeat, loops):
+        for name, value in vars(module).items():
+            if name.endswith("_TEMPLATE") and value == template:
+                return name
+    row = next(row for row in GOAL_PROMPT_REGISTRY if row["template"] == template)
+    return f"registry-{row['formatter']}-{row['source_commits'][0][:8]}"
 
 
 def test_review_repro_contract_continuation_nested_in_a_plain_goal_stays_generated():
@@ -252,7 +258,7 @@ def test_a_template_nested_in_another_templates_payload_never_leaks(outer, inner
 def test_revised_continuation_is_generated_through_its_end(revision_lines):
     """The revision block has no closing marker and carries multi-line goal text, so nothing after it
     can be proven human: a revised continuation is generated in full, including any merged text."""
-    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+    from hermes_cli.goals_legacy_prompts import _LEGACY_CONTINUATION_REVISIONS_TEMPLATE as CONTINUATION_REVISIONS_TEMPLATE
 
     revised = _goal_prompt() + CONTINUATION_REVISIONS_TEMPLATE.format(revision_lines=revision_lines)
 
@@ -817,7 +823,7 @@ def test_prefetch_for_the_session_just_left_never_starts_after_the_switch():
 def test_human_suffix_quoting_the_revision_header_is_kept():
     """Review of 489f721 (P2): the revised-continuation guard must anchor on the generated seam, not
     on the revision header appearing anywhere, or a quoting human suffix is dropped."""
-    from hermes_cli.goals import CONTINUATION_REVISIONS_TEMPLATE
+    from hermes_cli.goals_legacy_prompts import _LEGACY_CONTINUATION_REVISIONS_TEMPLATE as CONTINUATION_REVISIONS_TEMPLATE
 
     header = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0].strip()
     suffix = f'Why does it say "{header}"? I never revised it.'

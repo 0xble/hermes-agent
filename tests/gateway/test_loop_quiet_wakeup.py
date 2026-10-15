@@ -206,9 +206,8 @@ async def test_fired_loop_wake_is_dropped_once_its_tick_is_no_longer_running(
 
 
 @pytest.mark.asyncio
-async def test_busy_command_loop_tick_is_admitted_and_counted_through_active_adapter(hermes_home, monkeypatch):
-    """A /status loop tick reaching a busy chat runs inline on the real adapter; that dispatch is
-    an admission, so the tick counts once and the times=1 cap finishes the loop."""
+async def test_busy_loop_tick_defers_until_active_turn_releases_session(hermes_home, monkeypatch):
+    """A due loop never claims or bumps the run while another turn owns the session."""
     import asyncio
 
     from gateway.platforms.base import BasePlatformAdapter, SendResult
@@ -241,15 +240,19 @@ async def test_busy_command_loop_tick_is_admitted_and_counted_through_active_ada
 
     adapter = ActiveAdapter()
     handled = []
+    events = []
 
     async def handler(event):
+        events.append(event)
         handled.append(event.get_command())
+        event._gateway_inline_command_handled = True
+        event._gateway_accepted = True
         return "status: busy"
 
     adapter.set_message_handler(handler)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42")
     key = adapter._event_session_key(MessageEvent(text="", message_type=MessageType.TEXT, source=source))
-    adapter._active_sessions[key] = asyncio.Event()  # a turn is running in this chat
+    runner_owner = object()  # installed below once the runner exists
 
     import hermes_cli.loops as loops
     monkeypatch.setattr(loops, "LoopManager", lambda session_id: mgr)
@@ -260,13 +263,24 @@ async def test_busy_command_loop_tick_is_admitted_and_counted_through_active_ada
         user_id=evt["user_id"], user_name=evt.get("user_name"),
     )
     runner._session_key_for_source = lambda source: key
+    runner._running_agents[key] = runner_owner
+    generation = runner._begin_session_run_generation(key)
     await runner._loop_wakeup_fire_one("loop-sid", mgr.state, 1e12, set())
+
+    stored = load_loop("loop-sid")
+    assert handled == []
+    assert stored.ticks_fired == 0 and not stored.awaiting_response
+    assert runner._current_session_run_generation(key) == generation
+
+    runner._running_agents.pop(key)
+    await runner._loop_wakeup_fire_one("loop-sid", stored, 1e12, set())
+    await asyncio.gather(*adapter._background_tasks, return_exceptions=True)
 
     assert handled == ["status"]
     assert adapter.sent == ["status: busy"]
     stored = load_loop("loop-sid")
     assert stored.ticks_fired == 1
-    assert stored.status == "done"
+    assert events and events[0]._gateway_accepted is True and events[0]._gateway_inline_command_handled is True
 
 
 def test_untagged_internal_events_are_not_loop_fenced():

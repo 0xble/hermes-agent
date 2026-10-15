@@ -167,7 +167,7 @@ def test_status_and_wakeup_text_include_revision_guidance(tmp_path, monkeypatch)
     quote = "Please slow the loop down while the deploy settles"
     assert mgr.revise(reason="slow down", interval_seconds=600, user_quote="", user_messages=[quote])["ok"] is True
     assert "v2" in mgr.status_line()
-    state.next_due_at = time.time() - 1
+    mgr.state.next_due_at = time.time() - 1
     wakeup = mgr.fire_tick()
     assert wakeup and "loop_set tool (action=revise)" in wakeup
 

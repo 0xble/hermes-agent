@@ -26,16 +26,8 @@ from typing import Optional
 
 from agent.memory_provider import is_trivial_prompt
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
-from hermes_cli.goals import (
-    CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE,
-    CONTINUATION_PROMPT_TEMPLATE,
-    CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE,
-    CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE,
-    CONTINUATION_REVISIONS_TEMPLATE,
-    GOAL_WAIT_LIFTED_NOTE_OPEN,
-    KANBAN_GOAL_CONTINUATION_TEMPLATE,
-    KANBAN_GOAL_FINALIZE_TEMPLATE,
-)
+from hermes_cli.goals import KANBAN_GOAL_CONTINUATION_TEMPLATE, KANBAN_GOAL_FINALIZE_TEMPLATE
+from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
 from hermes_cli.heartbeat import HEARTBEAT_PROMPT_TEMPLATE, _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE
 from hermes_cli.loops import (
     WAKEUP_PROMPT_TEMPLATE,
@@ -120,41 +112,53 @@ class _TemplateMatcher:
         return -1 if last < 0 else last + len(self.terminal)
 
 
-# Match complete generated prompts from their defining templates. The formatter literals make this
-# stricter than a loose prefix while the fields absorb any copied formatter prose inside untrusted
-# payloads and leave only the final generated boundary.
-_INJECTED_TURN_PATTERNS = tuple((kind, template, _TemplateMatcher(template)) for kind, template in (
-    ("goal", CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE),
-    ("goal", CONTINUATION_PROMPT_TEMPLATE),
-    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE),
-    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE),
-    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE),
-    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", WAKEUP_PROMPT_TEMPLATE),
-    # Stored rows rendered with earlier wording keep it; legacy rows carry no display_kind, so
-    # only these literals keep them out of memory recall and retention.
-    ("heartbeat", _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE),
-    ("loop", _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _PREVIOUS_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE),
-    ("loop", _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE),
-    ("loop", _ORIGINAL_WAKEUP_PROMPT_TEMPLATE),
-))
-# Opens the revision history GoalManager appends after a revised goal's continuation. Its lines
+# Match complete generated prompts from every defining goal formatter wording ever shipped. The
+# registry is generated from origin/main and this branch, so persisted rows from old releases remain
+# synthetic even after a formatter wording changes.
+_GOAL_PROMPT_PATTERNS = tuple(
+    ("goal", str(row["template"]), _TemplateMatcher(str(row["template"])))
+    for row in GOAL_PROMPT_REGISTRY
+    if row["formatter"] in {"plain", "contract", "subgoals", "gate_failed"}
+)
+_INJECTED_TURN_PATTERNS = (
+    *_GOAL_PROMPT_PATTERNS,
+    ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
+    ("kanban", KANBAN_GOAL_FINALIZE_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_FINALIZE_TEMPLATE)),
+    ("heartbeat", HEARTBEAT_PROMPT_TEMPLATE, _TemplateMatcher(HEARTBEAT_PROMPT_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(WAKEUP_PROMPT_TEMPLATE)),
+    ("heartbeat", _PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE, _TemplateMatcher(_PREVIOUS_HEARTBEAT_PROMPT_TEMPLATE)),
+    ("loop", _PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_PREVIOUS_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _PREVIOUS_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_PREVIOUS_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_SILENCE_CONTRACT_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_SILENCE_CONTRACT_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_GOAL_RULES_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _GOAL_RULES_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_GOAL_RULES_WAKEUP_PROMPT_TEMPLATE)),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE, _TemplateMatcher(_ORIGINAL_WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE)),
+    ("loop", _ORIGINAL_WAKEUP_PROMPT_TEMPLATE, _TemplateMatcher(_ORIGINAL_WAKEUP_PROMPT_TEMPLATE)),
+)
+# Opens the revision history older GoalManagers appended after a revised goal's continuation. Its lines
 # carry earlier goal text, revision reasons and quoted user messages, any of which may span lines
 # or paragraphs, and it has no closing marker, so no text after it can be proven human.
-_REVISION_BLOCK_OPEN = CONTINUATION_REVISIONS_TEMPLATE.split("{revision_lines}", 1)[0]
-# GoalManager appends the block directly to a continuation's terminal literal, so a revised
+_REVISION_BLOCK_OPENS = tuple(
+    str(row["template"]).split("{revision_lines}", 1)[0]
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "revisions"
+)
+_GOAL_WAIT_LIFTED_NOTE_OPENS = tuple(
+    str(row["template"])
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "barrier_lift"
+)
+_GOAL_WAIT_LIFTED_NOTE_MATCHERS = tuple(
+    _TemplateMatcher(str(row["template"]))
+    for row in GOAL_PROMPT_REGISTRY if row["formatter"] == "barrier_lift_note"
+)
+# GoalManager appended the block directly to a continuation's terminal literal, so a revised
 # continuation always contains terminal + block opening verbatim. Anchoring on that pair keeps a
 # human suffix that merely quotes the revision header from being dropped as generated.
 _REVISED_CONTINUATION_SEAMS = tuple(
-    matcher.terminal + _REVISION_BLOCK_OPEN
+    matcher.terminal + opening
     for kind, _template, matcher in _INJECTED_TURN_PATTERNS if kind == "goal"
+    for opening in _REVISION_BLOCK_OPENS
 )
 
 
@@ -198,8 +202,13 @@ def _user_after_injected_turn(content: str) -> str | None:
     if not suffix.startswith("\n"):
         return None
     suffix = suffix.strip()
-    if match_kind == "goal" and suffix.startswith(GOAL_WAIT_LIFTED_NOTE_OPEN):
+    if match_kind == "goal" and (
+        suffix.startswith(_GOAL_WAIT_LIFTED_NOTE_OPENS)
+        or any(matcher.match_end(suffix) >= 0 for matcher in _GOAL_WAIT_LIFTED_NOTE_MATCHERS)
+    ):
         # GoalManager appends one generated single-line barrier-lift note to an idle-woken continuation.
+        # Exact historical notes are registered as templates; retain the existing opening fallback
+        # for runtime outcome text that cannot be reconstructed from a transcript.
         note, _newline, rest = suffix.partition("\n")
         if not note.endswith("]"):
             return None

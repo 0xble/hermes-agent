@@ -167,6 +167,26 @@ class GatewaySessionCommandsMixin:
         # keeps the slot from becoming a zombie that silently drops all later messages (#28686). Idempotent,
         # so the run's finally calling it again is harmless.
         old_entry = self.session_store._entries.get(session_key)
+        old_session_id = getattr(old_entry, "session_id", None) if old_entry else None
+        # /new is an explicit user boundary: retire conversation-scoped standing
+        # responsibility before the first await. Compression is the only existing
+        # migration path and remains separate.
+        if old_session_id:
+            async def _retire_old_controls():
+                def retire():
+                    from hermes_cli.goals import GoalManager
+                    from hermes_cli.loops import LoopManager
+
+                    for kind, manager in (("loop", LoopManager), ("goal", GoalManager)):
+                        try:
+                            manager(session_id=old_session_id).clear()
+                        except Exception:
+                            logger.warning(
+                                "/new: failed to retire %s for session %s", kind, old_session_id,
+                                exc_info=True,
+                            )
+                await self._run_in_executor_with_context(retire)
+            await _retire_old_controls()
         await self._cleanup_old_agent_for_reset(session_key)
         self._evict_cached_agent(session_key)
         # Conversation boundary: ALL conversation-scoped per-session state + security state in one

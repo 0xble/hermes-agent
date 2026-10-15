@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -296,15 +297,64 @@ def _pack_held_proc(proc: Path, path: Path) -> bool:
     return False
 
 
-def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -> bool:
+def _exited(proc: Path) -> bool:
+    """The process is gone, or is a single-threaded zombie that holds nothing.
+
+    A zombie has released its descriptors, mappings and cwd and can never run again, so
+    it can neither hold nor write a pack. Its unreadable cwd/environ/fd is not unknown
+    ownership. A zombie thread-group leader with live threads (``Threads:`` > 1) is still
+    a running process and stays a veto, as does any status we cannot read.
+    """
+    try:
+        status = proc.joinpath("status").read_text(encoding="utf-8-sig", errors="replace")
+    except FileNotFoundError:
+        return not proc.exists()  # only a vanished /proc/<pid> proves the process is gone
+    except OSError:
+        return False
+    fields: dict[str, str] = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        fields[key] = value.strip()
+    state = fields.get("State", "")[:1]
+    threads = fields.get("Threads", "")
+    return state in ("Z", "X") and threads.isdecimal() and int(threads) <= 1
+
+
+# Short-lived processes on a busy host (an exiting Git whose cwd is already gone, a child
+# mid-exec whose environ is briefly unreadable) fail inspection for milliseconds. Such a
+# veto is re-checked within this per-sweep budget; positive ownership or holder proof,
+# and any inspection failure that persists for the whole budget, still veto.
+INSPECTION_RETRY_SECONDS = 2.0
+_INSPECTION_RETRY_PAUSE = 0.05
+
+
+def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool], *,
+                    retry_until: Optional[float] = None) -> bool:
     """Packs need holder proof; launch-relative Git elsewhere need not veto them.
 
     Unknown metadata/config/output shapes and inaccessible live processes remain vetoes.
+    A veto that rests only on a failed inspection is re-scanned until ``retry_until``
+    (a ``time.monotonic()`` deadline), so a transient process state on a busy host does
+    not strand the candidate; the answer is still a complete scan with no veto.
     Non-Linux retains the existing repository/global probe; stale locks remain on
     the separate global process guard in gitlock.py.
     """
     if not _linux_process_scope:
         return fallback()
+    while True:
+        verdict = _scan_pack_owners(repo_root, path)
+        if verdict is not _INSPECTION_FAILED:
+            return verdict
+        if retry_until is None or time.monotonic() >= retry_until:
+            return True
+        time.sleep(_INSPECTION_RETRY_PAUSE)
+
+
+_INSPECTION_FAILED = object()
+
+
+def _scan_pack_owners(repo_root: Path, path: Path):
+    """True on ownership/holder proof, False when no process vetoes, else _INSPECTION_FAILED."""
     try:
         target = _repository_dirs(Path(repo_root).resolve())
     except (OSError, RuntimeError, ValueError):
@@ -318,6 +368,7 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -
         processes = list(_PROC_ROOT.iterdir())
     except (OSError, RuntimeError, ValueError):
         return True
+    failed = False
     for proc in processes:
         if not proc.name.isdecimal():
             continue
@@ -334,16 +385,19 @@ def tmp_pack_in_use(repo_root: Path, path: Path, fallback: Callable[[], bool]) -
             if _pack_held_proc(proc, path):
                 return True
         except (OSError, RuntimeError, ValueError, StopIteration, IndexError):
+            if _exited(proc):
+                continue  # gone or a zombie mid-reap: it holds and writes nothing
             try:
                 uid = proc.stat().st_uid
             except FileNotFoundError:
                 continue
             except OSError:
-                return True
+                failed = True
+                continue
             if _uninspectable_non_git(name, uid, path.parent):
                 continue
-            return True
-    return False
+            failed = True
+    return _INSPECTION_FAILED if failed else False
 
 
 def _uninspectable_non_git(name: Optional[str], uid: int, directory: Path) -> bool:
