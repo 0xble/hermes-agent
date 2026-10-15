@@ -2084,10 +2084,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         from gateway.zero_cut_standby import is_standby
         if not is_standby():
             await self._start_recover_previous_run()
-        # From here on shutdown may write a clean receipt: this boot has made the crash/clean
-        # decision and processed the previous run's recovery state.
         self._suppress_clean_shutdown_receipt = False
-        await self._start_prime_session_db_after_ready()
+        if not is_standby():  # a standby opens no shared store until promotion
+            await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
         if getattr(self.config, "durable_outbox_enabled", False):
             from gateway.outbox import open_outbox, recover
