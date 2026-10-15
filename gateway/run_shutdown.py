@@ -1808,10 +1808,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             from agent.auxiliary_client import cleanup_stale_async_clients
             cleanup_stale_async_clients()
 
-    # Stuck-loop (restart failure) counters
     def _stuck_loop_counts_path(self) -> Path:
         from gateway.run import _hermes_home
-        return _hermes_home / self._STUCK_LOOP_FILE
+        from gateway.gateway_slot import process_slot_filename
+        return _hermes_home / process_slot_filename(self._STUCK_LOOP_FILE)
 
     @staticmethod
     def _read_json_counts(path: Path) -> Optional[dict]:

@@ -339,11 +339,12 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     from gateway.config import GatewayConfig
 
     calls = []
+    mode = {"exit_cleanly": True, "ready_at_cron": None}
 
     class FakeRunner:
         def __init__(self, config):
             self.config = config
-            self.should_exit_cleanly = True
+            self.should_exit_cleanly = mode["exit_cleanly"]
             self.exit_reason = None
             self.exit_code = None
             self._running = True
@@ -351,6 +352,12 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
         async def start(self):
             calls.append("runner.start")
             return True
+
+        async def wait_for_shutdown(self):
+            calls.append("wait_for_shutdown")
+
+        def _start_systemd_watchdog(self):
+            pass
 
     class NoopThread:
         def __init__(self, *args, **kwargs):
@@ -403,6 +410,24 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.delenv("HERMES_GATEWAY_SLOT")
     assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
     assert "host_attach" in calls
+    assert zero_cut_standby.readiness()["ready"] is False  # a clean early exit never reports ready
+
+    # A serving standby reports ready only after cron and housekeeping have started.
+    def start_cron(runner):
+        mode["ready_at_cron"] = zero_cut_standby.readiness()["ready"]
+        return (None, None, None, None)
+
+    async def shutdown_tail(*args, **kwargs):
+        return True
+
+    mode["exit_cleanly"] = False
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_run, "_start_gateway_start_cron_and_housekeeping", start_cron)
+    monkeypatch.setattr(gateway_run, "_start_gateway_shutdown_tail", shutdown_tail)
+    assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
+    assert mode["ready_at_cron"] is False
+    assert zero_cut_standby.readiness()["ready"] is True
 
 
 @pytest.mark.asyncio
@@ -426,17 +451,26 @@ async def test_standby_shutdown_skips_markers(monkeypatch, tmp_path):
     runner._signal_initiated_shutdown = False
     runner._stop_requested_by_signal = False
     runner._update_runtime_status = lambda *args: None
+    runner._STUCK_LOOP_FILE = ".restart_failure_counts"
+    active_counts = tmp_path / ".restart_failure_counts"
+    active_counts.write_text('{"agent:main:telegram:dm:1": 2}', encoding="utf-8")
     ctx = GatewayShutdownMixin._StopContext(
-        deferred_count=lambda: 0, active_agents={}, timed_out=False, started_at=time.monotonic())
+        deferred_count=lambda: 0, active_agents={"agent:main:telegram:dm:1": object()},
+        timed_out=False, started_at=time.monotonic())
     monkeypatch.setattr(status, "remove_pid_file", lambda: None)
     monkeypatch.setattr(status, "release_gateway_runtime_lock", lambda: None)
     monkeypatch.setattr(status, "flush_runtime_status_async", lambda **kwargs: asyncio.sleep(0, result=True))
     monkeypatch.setattr(gateway_run, "_shutdown_gateway_health_export", lambda *args: None)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr("gateway.restart_loop_guard.record_planned_exit", lambda: pytest.fail("standby recorded planned exit"))
 
     await runner._stop_persist_exit_state(ctx)
     assert not (tmp_path / ".clean_shutdown").exists()
     assert not (tmp_path / ".gateway-planned-restart.json").exists()
+    # The stuck-loop counter is per slot: the active slot's counts stay byte-identical.
+    assert active_counts.read_text(encoding="utf-8") == '{"agent:main:telegram:dm:1": 2}'
+    standby_counts = tmp_path / gateway_slot.slot_filename(".restart_failure_counts", "b")
+    assert json.loads(standby_counts.read_text(encoding="utf-8")) == {"agent:main:telegram:dm:1": 1}
 
 
 def test_backup_and_cleanup_skip_standby_runtime_names(tmp_path):
