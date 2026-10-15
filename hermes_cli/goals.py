@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections.abc import Mapping
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.goal_evidence import (
@@ -46,6 +47,335 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# Goal text is a compact outcome contract, not a work log.  Keep this rule in
+# the core so the slash command and model-callable goal tool cannot drift.
+GOAL_AUTHORING_MAX_CHARS = 600
+# The cap is on the complete goal contract. Keep this alias for callers that
+# imported the earlier name; a single field cannot exceed the total cap either.
+GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS = GOAL_AUTHORING_MAX_CHARS
+_GOAL_AUTHORING_FIELDS = ("goal", "outcome", "verification", "constraints", "boundaries", "stop_when")
+_GOAL_AUTHORING_NUMBERED_STEP_RE = re.compile(r"(?m)^\s*(?:\d+[.)]|[-*]\s*\d+[.)])\s+")
+_GOAL_AUTHORING_BULLET_RE = re.compile(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+")
+_GOAL_AUTHORING_STALE_REF_RES = (
+    re.compile(r"(?i)(?<![\w])(?:pr|pull\s+request|issue|pull)\s*#?\s*\d+(?!\w)|(?:[\w./-]+)#\d+(?!\w)"),
+    re.compile(r"(?i)(?<![\w])run(?:\s+id)?\s*#?\s*\d{6,}(?!\w)"),
+    re.compile(r"(?<!\w)#\d+(?!\w)"),
+)
+_GOAL_AUTHORING_SHA_RE = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
+# Blanket limits contradict any mutating outcome. Effect-specific limits such as
+# "no deploys" contradict only the same effect, and only when unqualified: "no
+# deletions of user data" or "don't merge without approval" are real hard limits.
+_GOAL_AUTHORING_BLANKET_LIMIT_RE = re.compile(
+    r"(?i)\b(?:read[- ]only|no\s+changes?|without\s+changes?|do(?:es)?\s+not\s+change|don't\s+change)\b"
+)
+_GOAL_AUTHORING_LIMIT_NEGATION = r"(?:no|do(?:es)?\s+not|don't|never)\s+"
+_GOAL_AUTHORING_LIMIT_END = r"\s*(?:[.;,!]|$)"
+_GOAL_AUTHORING_SCOPED_LIMITS = {
+    "relay": r"relay(?:s|ing)?",
+    "send": r"send(?:s|ing)?",
+    "delete": r"delet(?:e|es|ions?|ing)|remov(?:e|es|als?|ing)",
+    "deploy": r"deploy(?:s|ing|ments?)?",
+    "merge": r"merg(?:e|es|ing)",
+}
+_GOAL_AUTHORING_DURATION = r"\d+\s*[- ]?(?:hours?|hrs?|days?|weeks?|h|d|w)\b"
+_GOAL_AUTHORING_METRIC_WINDOW_RE = re.compile(
+    r"(?i)\b\d+[- ](?:hour|hr|day|week)s?[- ](?:error|rate|window|metric|budget|average|"
+    r"p\d+|uptime|success|availability|latency|total|count|trend|report|summary)"
+)
+_GOAL_AUTHORING_LOOKBACK_RE = re.compile(r"(?i)\b(?:last|past|previous|prior|trailing|rolling)\b")
+
+
+# A goal *requires* a mutation only when it commands one ("Delete the topic",
+# "fix it and deploy") or names it as the end state ("the topic is deleted").
+# Nouns and incidental past forms ("audit recent changes", "find which commit
+# added the bug", "why the deploy failed") describe read-only work.
+_GOAL_AUTHORING_REQUIRED_EFFECTS = {
+    "delete": ("delete", "deleted"),
+    "remove": ("remove", "removed"),
+    "relay": ("relay", "relayed"),
+    "send": ("send", "sent"),
+    "deploy": ("deploy", "deployed"),
+    "merge": ("merge", "merged"),
+    "ship": ("ship", "shipped"),
+    "install": ("install", "installed"),
+    "publish": ("publish", "published"),
+    "write": (r"write(?!\s+up\b)", "written"),
+    "create": ("create", "created"),
+    "restart": ("restart", "restarted"),
+    "commit": ("commit", "committed"),
+    "update": ("update", "updated"),
+    "modify": ("modify", "modified"),
+    "change": ("change", "changed"),
+    "add": ("add", "added"),
+    "move": ("move", "moved"),
+    "rename": ("rename", "renamed"),
+    "alter": ("alter", "altered"),
+}
+_GOAL_AUTHORING_CLAUSE_START = r"(?:^|[.;:!?\n]\s*|,\s*|\b(?:and|then)\s+)(?:please\s+)?"
+# Present-tense end states only: "was deleted" or "were sent" report the past.
+_GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|gets?)\s+(?:\w+ly\s+)?"
+# A question or relative clause ("whether the topic is deleted", "files that are
+# removed") asks about the state instead of requiring it.
+_GOAL_AUTHORING_EMBEDDED_RE = re.compile(
+    r"(?i)\b(?:whether|if|which|why|how|what|that|when|where|who|whose)\b"
+)
+_GOAL_AUTHORING_END_STATE_BOUNDARY_RE = re.compile(r"(?i),|\bthen\b")
+_GOAL_AUTHORING_SCOPED_EFFECTS = {
+    "relay": {"relay"}, "send": {"send"}, "delete": {"delete", "remove"},
+    "deploy": {"deploy"}, "merge": {"merge"},
+}
+
+
+def goal_authoring_required_effects(text: str) -> set[str]:
+    """Return mutation effects ``text`` commands or names as its end state."""
+    text = text.strip()
+    clauses = re.split(r"[.;:!?\n]", text)
+    effects: set[str] = set()
+    for effect, (base, participle) in _GOAL_AUTHORING_REQUIRED_EFFECTS.items():
+        if re.search(rf"(?i){_GOAL_AUTHORING_CLAUSE_START}{base}\b", text):
+            effects.add(effect)
+            continue
+        end_state = re.compile(rf"(?i){_GOAL_AUTHORING_END_STATE}{participle}\b")
+        for clause in clauses:
+            match = end_state.search(clause)
+            while match:
+                # A marker in an earlier subclause asks about that subclause;
+                # a later clause may still independently require a mutation.
+                boundaries = [boundary for boundary in _GOAL_AUTHORING_END_STATE_BOUNDARY_RE.finditer(
+                    clause, 0, match.start()
+                ) if not re.match(
+                    r"(?i)\s*(?:is|are|be|been|gets?)\b", clause[boundary.end():]
+                )]
+                segment_start = boundaries[-1].end() if boundaries else 0
+                if not _GOAL_AUTHORING_EMBEDDED_RE.search(clause[segment_start:match.start()]):
+                    effects.add(effect)
+                    break
+                match = end_state.search(clause, match.end())
+            if effect in effects:
+                break
+    return effects
+
+
+def goal_authoring_readonly_contradiction(readonly: str, mutation: str) -> bool:
+    """True when a limit forbids an effect the goal/outcome requires.
+
+    Only commanded effects or required end states count; a read-only audit of
+    "recent changes" or "why the deploy failed" is not a contradiction.
+    """
+    if not readonly or not mutation:
+        return False
+    required = goal_authoring_required_effects(mutation)
+    if not required:
+        return False
+    if _GOAL_AUTHORING_BLANKET_LIMIT_RE.search(readonly):
+        return True
+    for name, limit in _GOAL_AUTHORING_SCOPED_LIMITS.items():
+        bare = re.compile(rf"(?i)\b{_GOAL_AUTHORING_LIMIT_NEGATION}(?:{limit}){_GOAL_AUTHORING_LIMIT_END}")
+        if bare.search(readonly) and required & _GOAL_AUTHORING_SCOPED_EFFECTS[name]:
+            return True
+    return False
+
+
+def goal_authoring_fixed_wait(value: str) -> str | None:
+    """Return the fixed elapsed-time wait in ``value``; measurement windows are evidence, not waits."""
+    for match in _GOAL_AUTHORING_FIXED_WAIT_RE.finditer(value):
+        text = match.group(0)
+        if not re.search(_GOAL_AUTHORING_DURATION, text, re.IGNORECASE):
+            return text
+        if re.match(r"(?i)\s*(?:wait|after)\b", text):
+            return text
+        context = value[max(0, match.start() - 18):match.end() + 24]
+        if re.search(r"(?i)\bwait\b", context):
+            return text
+        duration = re.search(_GOAL_AUTHORING_DURATION, text, re.IGNORECASE)
+        absolute = match.start() + duration.start()
+        if (_GOAL_AUTHORING_LOOKBACK_RE.search(context)
+                or ("from" in context.lower() and "full" in context.lower())
+                or _GOAL_AUTHORING_METRIC_WINDOW_RE.match(value, absolute)):
+            continue
+        return text
+    return None
+_GOAL_AUTHORING_RECEIPT_RE = re.compile(
+    r"(?i)\b(?:read\s*back|receipt|logs?|tests?|checks?|review|closed|assigned|merged|passed|"
+    r"fixed|restarted|deployed|verified)\b"
+)
+_GOAL_AUTHORING_FIXED_WAIT_RE = re.compile(
+    r"(?i)(?:\bsoak(?:\s+test)?\b|\bobservation\s+window\b|\bstable\s+observation\b|"
+    r"\b(?:stay(?:s|ed)?|remain(?:s|ed)?|hold(?:s|ing)?|maintain(?:s|ed)?|observe|wait|monitor(?:ing)?)\b"
+    r".{0,60}?\b(?:for\s+)?\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b|"
+    r"\bafter\s+\d+\s*[- ]?(?:hour|hr|day|week|h|d|w)s?\b)"
+)
+
+
+@dataclass(frozen=True)
+class GoalAuthoringFinding:
+    """One deterministic authoring warning shared by every goal surface."""
+
+    code: str
+    field: str
+    message: str
+    fix: str
+
+    def render(self) -> str:
+        return f"{self.field}: {self.message} Fix: {self.fix}"
+
+
+def _goal_authoring_values(goal: Any, contract: Any) -> dict[str, str]:
+    if isinstance(contract, Mapping):
+        data = contract
+    elif contract is None:
+        data = {}
+    else:
+        data = {field_name: getattr(contract, field_name, "") for field_name in _GOAL_AUTHORING_FIELDS[1:]}
+    return {"goal": str(goal or "").strip(), **{
+        field_name: str(data.get(field_name) or "").strip()
+        for field_name in _GOAL_AUTHORING_FIELDS[1:]
+    }}
+
+
+def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
+    """Do not call a plan/file path a stale identifier merely because it has digits."""
+    token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
+    token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
+    token_end = min(token_end_candidates, default=len(text))
+    token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
+    # owner/repo#N is a PR/issue reference, not a file path, even though it has a slash.
+    if re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", token):
+        return False
+    return "/" in token or "\\" in token or bool(
+        re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
+    )
+
+
+def _goal_authoring_is_ordinal_hash(text: str, start: int) -> bool:
+    """Allow ordinal rankings such as ``Ranked #1`` while rejecting bare receipts."""
+    return bool(re.search(r"(?i)\b(?:ranked|top)\s*$", text[max(0, start - 24):start]))
+
+
+def _goal_authoring_is_ordinary_identifier(text: str, start: int, end: int) -> bool:
+    """Allow human identifiers such as ``cafe5678`` when clearly naming a table."""
+    context = text[max(0, start - 32):min(len(text), end + 32)]
+    return bool(re.search(r"(?i)\b(?:table|column|record|dataset)\b", context))
+
+
+def goal_authoring_findings(
+    goal: Any,
+    contract: Any = None,
+    *,
+    previous_total: int | None = None,
+    changed_fields: set[str] | None = None,
+) -> list[GoalAuthoringFinding]:
+    """Return stable warnings for compact, outcome-shaped goal contracts.
+
+    ``changed_fields`` preserves legacy-revision behavior: an already oversized
+    contract can receive a small unrelated fix, while a revision cannot make an
+    in-cap contract oversized.  The slash command displays these findings; the
+    model-callable tool rejects them.
+    """
+    values = _goal_authoring_values(goal, contract)
+    checked = set(changed_fields or _GOAL_AUTHORING_FIELDS)
+    findings: list[GoalAuthoringFinding] = []
+    total = sum(len(values[name]) for name in _GOAL_AUTHORING_FIELDS)
+    changed_total = sum(len(values[name]) for name in checked if name in values)
+    if changed_fields is None:
+        over_cap = total > GOAL_AUTHORING_MAX_CHARS
+    else:
+        over_cap = ((previous_total is None or previous_total <= GOAL_AUTHORING_MAX_CHARS)
+                    and total > GOAL_AUTHORING_MAX_CHARS) or changed_total > GOAL_AUTHORING_MAX_CHARS
+    if over_cap:
+        field = "goal" if all(not values[name] for name in _GOAL_AUTHORING_FIELDS[1:]) else "contract"
+        findings.append(GoalAuthoringFinding(
+            "length", field, f"totals {total} characters; keep the outcome contract at or below "
+            f"{GOAL_AUTHORING_MAX_CHARS}", "move steps, receipts, and ordering to the linked plan file",
+        ))
+
+    for field_name in _GOAL_AUTHORING_FIELDS:
+        value = values[field_name]
+        if field_name not in checked or not value:
+            continue
+        if len(value) > GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS and field_name != "goal":
+            findings.append(GoalAuthoringFinding(
+                "field_length", field_name,
+                f"is {len(value)} characters; maximum is {GOAL_AUTHORING_CONTRACT_FIELD_MAX_CHARS}",
+                "keep this field outcome-shaped and move detail to the plan file",
+            ))
+        for pattern in _GOAL_AUTHORING_STALE_REF_RES:
+            match = next((candidate for candidate in pattern.finditer(value)
+                          if not (pattern is _GOAL_AUTHORING_STALE_REF_RES[-1]
+                                  and _goal_authoring_is_ordinal_hash(value, candidate.start()))
+                          and not _goal_authoring_text_is_path(value, candidate.start(), candidate.end())), None)
+            if match:
+                findings.append(GoalAuthoringFinding(
+                    "stale_identifier", field_name,
+                    f"contains stale-prone identifier {match.group(0)!r}",
+                    "name the live outcome instead of a PR, issue, CI/run ID, or other transient receipt",
+                ))
+                break
+        for match in _GOAL_AUTHORING_SHA_RE.finditer(value):
+            token = match.group(1)
+            if not (any(char.isdigit() for char in token) and any(char in "abcdef" for char in token)):
+                continue
+            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
+                continue
+            findings.append(GoalAuthoringFinding(
+                "stale_identifier", field_name,
+                f"contains commit-SHA-like identifier {token!r}",
+                "remove the SHA and describe the live state it proves",
+            ))
+            break
+
+    # Cross-field contradictions inspect the whole current contract whenever a
+    # revision touches either side, so a goal change cannot turn an existing
+    # read-only limit into a contradiction. Unrelated fixes (verification,
+    # stop_when) to a legacy contradictory contract are not blocked.
+    readonly = " ".join(values[name] for name in ("constraints", "boundaries"))
+    mutation = " ".join(values[name] for name in ("goal", "outcome"))
+    touches_contradiction = checked & {"goal", "outcome", "constraints", "boundaries"}
+    if touches_contradiction and goal_authoring_readonly_contradiction(readonly, mutation):
+        findings.append(GoalAuthoringFinding(
+            "readonly_mutation", "constraints/boundaries",
+            "declares read-only/no-change limits while the outcome requires a mutation",
+            "replace the blanket read-only limit with the specific systems or effects that must not change",
+        ))
+
+    if "goal" in checked and _GOAL_AUTHORING_NUMBERED_STEP_RE.search(values["goal"]):
+        findings.append(GoalAuthoringFinding(
+            "numbered_steps", "goal", "contains a numbered step list",
+            "state the outcome and move the steps to the plan file",
+        ))
+    for field_name in ("goal", "outcome", "verification"):
+        value = values[field_name] if field_name in checked else ""
+        if not value:
+            continue
+        wait_text = goal_authoring_fixed_wait(value)
+        if wait_text:
+            findings.append(GoalAuthoringFinding(
+                "fixed_wait", field_name,
+                f"uses a fixed waiting window ({wait_text})",
+                "use a watcher or cron for elapsed-time waits and verify the resulting live state",
+            ))
+
+    verification = values["verification"] if "verification" in checked else ""
+    if verification:
+        checklist = bool(_GOAL_AUTHORING_BULLET_RE.search(verification) or
+                          _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
+                          re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        separators = len(re.findall(r"[,;]", verification))
+        if separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
+            checklist = True
+        if checklist:
+            findings.append(GoalAuthoringFinding(
+                "verification_checklist", "verification",
+                "is a step/receipt checklist rather than one live end-state outcome",
+                "state one observable result and put per-step checks in the plan file",
+            ))
+    return findings
+
+
+def format_goal_authoring_warning(findings: list[GoalAuthoringFinding]) -> str:
+    if not findings:
+        return ""
+    return "⚠ Goal authoring warning:\n" + "\n".join(f"- {finding.render()}" for finding in findings)
 # Autonomous goal continuations are deliberately sparse: a real user message or a
 # process/delegation result is fresh evidence and continues immediately, while a
 # continuation-only chain dispatches at most one turn per this interval. Gateway

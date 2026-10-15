@@ -19,6 +19,12 @@ clears the goal once with one short notice, before dispute pause or timed backof
 
 ## Provenance and adaptation
 
+- Fork patch identity: `goal-authoring-check`. The shared goal-authoring
+  validator warns on `/goal` and rejects agent-authored contracts that exceed
+  the compact shape, carry stale identifiers, contradict read-only limits with
+  mutations, or turn verification into a checklist. Retire when the selected
+  upstream baseline provides equivalent admission and warning behavior.
+
 - Fork patch identity: `slice-3-goal-lifecycle`. The original goal lifecycle slice: `goal_set`
   honors the profile budget and surfaces agent `goal_set` receipts as notices.
 - Fork patch identity: `goal-criteria-completeness`. Own upstream contribution:
