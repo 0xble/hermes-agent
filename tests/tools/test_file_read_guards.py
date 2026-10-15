@@ -416,6 +416,32 @@ class TestFileDedup(unittest.TestCase):
         self.assertTrue(_background_review_has_read(Path(self._tmpfile)))
 
     @patch("tools.file_tools._get_file_ops")
+    def test_sandbox_read_bypasses_dedup_before_write(self, mock_ops):
+        """A sandbox read after a parent read must not hand write_file an empty stub."""
+        from tools.code_execution_rpc import _handle_rpc_request
+
+        fake = _make_fake_ops(content="line one\nline two\n", file_size=20)
+        fake.write_file = MagicMock(return_value=_FakeReadResult())
+        mock_ops.return_value = fake
+        path = self._tmpfile
+
+        parent = json.loads(read_file_tool(path, task_id="dup"))
+        assert parent["content"] == "line one\nline two\n"
+
+        def dispatch(name, args):
+            return read_file_tool(args["path"], task_id="dup")
+
+        nested = json.loads(_handle_rpc_request(
+            {"tool": "read_file", "args": {"path": path}},
+            allowed_tools=frozenset({"read_file"}), tool_call_counter=[0], max_tool_calls=2,
+            dispatch=dispatch, tool_call_log=[], call_start=time.monotonic(), where="test",
+        ))
+        self.assertEqual(nested["content"], parent["content"])
+        written = json.loads(write_file_tool(path, nested.get("content", ""), task_id="dup"))
+        self.assertNotIn("error", written)
+        fake.write_file.assert_called_once_with(os.path.realpath(path), "line one\nline two\n")
+
+    @patch("tools.file_tools._get_file_ops")
     def test_write_rejects_internal_read_status_text(self, mock_ops):
         """write_file must not persist internal read_file status text."""
         fake = MagicMock(env=None)
