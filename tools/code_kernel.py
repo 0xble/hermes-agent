@@ -262,9 +262,16 @@ class CellAuthority:
         if not self.active:
             return tool_error("No active execute_code cell: the cell this kernel call "
                               "belonged to has settled, so its tool authority is retired.")
-        return self.ctx.run(self._invoke, tool_name, tool_args)
+        # The cell context was copied at cell start, so a flag the RPC handler set for this
+        # call is not in it. Forward the sandbox-read flag explicitly.
+        from tools.file_tools import sandbox_read_active
+        return self.ctx.run(self._invoke, tool_name, tool_args, sandbox_read_active())
 
-    def _invoke(self, tool_name: str, tool_args: dict) -> str:
+    def _invoke(self, tool_name: str, tool_args: dict, sandbox_read: bool = False) -> str:
+        if sandbox_read:
+            from tools.file_tools import sandbox_read_context
+            with sandbox_read_context():
+                return self._invoke(tool_name, tool_args)
         from model_tools import handle_function_call
         from tools.code_execution_rpc import nested_tool_call_id
         previous = None

@@ -4469,6 +4469,13 @@ class BasePlatformAdapter(ABC):
         # merged event is likewise unaddressed; a typed human event restores the visible fallback.
         from gateway.response_filters import apply_agent_origin_reply_expectation
         apply_agent_origin_reply_expectation(event)
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            # A hidden cron review must never queue behind a live turn: a queued event is
+            # later drained in-band without its capture and would post its reply. The
+            # scheduler sends the original report on time instead.
+            event._gateway_accepted = True  # handled: the busy cause reaches the caller
+            return
         # Bypass commands run inline: queued they'd leak as user text (/new) or deadlock
         # (/approve, /deny — the agent is blocked on Event.wait).  Dispatch inline by
         # calling the message handler directly and sending the response.  Do NOT use

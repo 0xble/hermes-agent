@@ -10,10 +10,30 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+# How often a held review rechecks whether its subject topic has gone idle.
+_IDLE_POLL_SECONDS = 5.0
+# A review admitted with less budget than this would only time out unseen.
+_MIN_REVIEW_SECONDS = 60.0
+
 
 def is_review_event(event):
-    return (getattr(event, "internal", False)
-            and (getattr(event, "metadata", None) or {}).get("_cron_review_capture") is not None)
+    metadata = getattr(event, "metadata", None)
+    return (getattr(event, "internal", False) is True and isinstance(metadata, dict)
+            and metadata.get("_cron_review_capture") is not None)
+
+
+def fail_busy_review(event) -> bool:
+    """Fail a review that reached a busy session; return whether it was a review.
+
+    Every busy entry point calls this so a review is never queued, merged, or used
+    to interrupt a live turn.
+    """
+    if not is_review_event(event):
+        return False
+    future = event.metadata["_cron_review_capture"]
+    if not future.done():
+        future.set_exception(RuntimeError("review subject is busy; use original report"))
+    return True
 
 
 def private_turn_response(event, agent_result):
@@ -122,8 +142,35 @@ class CronReviewControl:
         adapter = runner._delivery_adapter_for(source)
         if adapter is None:
             raise RuntimeError("review subject adapter unavailable")
-        if key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
-            raise RuntimeError("review subject is busy; use original report")
+        # The subject topic is often mid-conversation when its report lands, so
+        # wait inside the review budget for it to go idle rather than skipping
+        # review outright; the on-time fallback still applies at the deadline.
+        loop = asyncio.get_running_loop()
+        end = loop.time() + seconds
+        waited = False
+        while key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
+            if end - loop.time() < _IDLE_POLL_SECONDS + _MIN_REVIEW_SECONDS:
+                raise RuntimeError("review subject is busy; use original report")
+            waited = True
+            await asyncio.sleep(_IDLE_POLL_SECONDS)
+        if waited:
+            # Anything resolved before the wait may be stale: the gateway may now be
+            # draining (a drain is what idles a busy topic), the conversation may have
+            # rotated its session, the adapter may have reconnected, or a grant changed.
+            if not runner._plugin_injection_accepting():
+                raise RuntimeError("gateway not accepting review turns")
+            entry = await runner.async_session_store.lookup_by_session_key(key)
+            if entry is None or entry.origin is None or entry.session_id != session_id:
+                raise RuntimeError("review subject session changed while waiting")
+            source = replace_source(runner._restored_source(entry))
+            if not runner._plugin_injection_authorized(source, plugin_id="cron-review", target=key):
+                raise RuntimeError("review subject is not authorized")
+            adapter = runner._delivery_adapter_for(source)
+            if adapter is None:
+                raise RuntimeError("review subject adapter unavailable")
+            if key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
+                raise RuntimeError("review subject is busy; use original report")
+        seconds = end - loop.time()
         capture = concurrent.futures.Future()
         event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=True,

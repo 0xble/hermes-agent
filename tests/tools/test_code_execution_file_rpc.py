@@ -13,6 +13,63 @@ from tools.code_execution_tool import generate_hermes_tools_module
 from tools.code_execution_rpc import _rpc_poll_loop
 
 
+@pytest.mark.parametrize("transport", ["uds", "file"])
+def test_generated_tool_errors_raise_and_block_empty_fallback(transport):
+    """A failed read must stop read-modify-write code before it can write empty text."""
+    namespace = {}
+    exec(generate_hermes_tools_module(["read_file", "write_file"], transport=transport), namespace)
+    writes = []
+    fail_existing = False
+
+    def dispatch(name, args):
+        if name == "read_file" and (args["path"] == "missing" or fail_existing):
+            result = {"error": f"File not found: {args['path']}"}
+        elif name == "read_file":
+            result = {"content": "original\n", "total_lines": 1}
+        else:
+            writes.append(args)
+            result = {"status": "success"}
+        return namespace["_parse_tool_result"](name, result)
+
+    namespace["_call"] = dispatch
+    assert namespace["read_file"]("existing")["content"] == "original\n"
+    with pytest.raises(namespace["HermesToolError"], match="read_file failed: File not found: missing"):
+        namespace["read_file"]("missing")
+    fail_existing = True
+    with pytest.raises(namespace["HermesToolError"], match="File not found: existing"):
+        content = namespace["read_file"]("existing").get("content", "")
+        namespace["write_file"]("existing", content)
+    assert writes == []
+    with pytest.raises(namespace["HermesToolError"], match="content was not returned"):
+        namespace["_parse_tool_result"]("read_file", {"status": "unchanged", "content_returned": False})
+
+
+@pytest.mark.parametrize("transport", ["uds", "file"])
+def test_retry_does_not_retry_hermes_tool_error(transport):
+    namespace = {}
+    exec(generate_hermes_tools_module(["read_file"], transport=transport), namespace)
+    attempts = []
+
+    def fail():
+        attempts.append(None)
+        raise namespace["HermesToolError"]("read_file", "File not found: missing")
+
+    with pytest.raises(namespace["HermesToolError"], match="read_file failed: File not found: missing"):
+        namespace["retry"](fail, max_attempts=3, delay=0)
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("transport", ["uds", "file"])
+def test_non_file_tool_error_envelope_is_returned(transport):
+    namespace = {}
+    exec(generate_hermes_tools_module(["terminal"], transport=transport), namespace)
+    namespace["_call"] = lambda name, args: namespace["_parse_tool_result"](
+        name, {"error": "command failed", "exit_code": 124}
+    )
+
+    assert namespace["terminal"]("sleep 10", timeout=1) == {"error": "command failed", "exit_code": 124}
+
+
 CALLS = {
     "web_search": {"query": "fixture", "limit": 3},
     "web_extract": {"urls": ["https://example.test"], "char_limit": 3000},
@@ -90,7 +147,7 @@ def test_generated_file_rpc_kwargs_correlation_and_authority(tmp_path, monkeypat
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda i: namespace["terminal"](f"tag-{i}", 3, "/tmp"), range(8)))
         assert [r["args"]["command"] for r in results] == [f"tag-{i}" for i in range(8)]
-        assert "not available" in namespace["_call"]("unauthorized-tool", {})["error"]
+        assert "not available in execute_code" in namespace["_call"]("unauthorized-tool", {})["error"]
         assert "limit reached" in namespace["terminal"]("over-budget")["error"]
         assert counter == [budget] and len(seen) == len(log) == budget
     finally:

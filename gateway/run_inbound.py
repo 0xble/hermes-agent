@@ -766,6 +766,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            # The runner slot can still be live when the adapter guard is not (reconnect,
+            # handoff turn); a hidden review must neither interrupt nor queue behind it.
+            return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         if self._draining and not self._hm_is_registered_command(event):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):

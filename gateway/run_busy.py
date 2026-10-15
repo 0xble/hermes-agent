@@ -528,6 +528,9 @@ class GatewayBusySessionMixin:
         """Keep admitted drain arrivals in the regular adapter FIFO for shutdown flushing.
 
         Returns whether the event was preserved (FIFO or durable spool)."""
+        from gateway.cron_review import fail_busy_review
+        if fail_busy_review(event):
+            return False  # a hidden review cannot outlive this process; the original report goes out
         setattr(event, "_drain_deferred", True)
         if self._queue_or_replace_pending_event(session_key, event):
             return True
