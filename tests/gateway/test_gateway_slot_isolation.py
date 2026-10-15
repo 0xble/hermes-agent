@@ -109,6 +109,17 @@ def test_role_is_resolved_from_the_other_slot(monkeypatch):
     assert queries == ["a"]
 
 
+def test_start_gateway_pin_without_config_reads_the_home_flag_for_the_role(monkeypatch, tmp_path):
+    """start_gateway pins with config=None; the role must read config.yaml like the slot does, or a
+    slot-b process boots active and fights the live slot for the bot token (found in a real drill)."""
+    (tmp_path / "config.yaml").write_text("gateway:\n  zero_cut_handover:\n    enabled: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot", lambda home, slot, timeout: {"standby": False})
+    assert gateway_slot.pin_gateway_slot(None) == "b"
+    assert zero_cut_standby.is_standby()
+
+
 def test_role_falls_back_to_active_when_other_slot_is_down_or_standby(monkeypatch):
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "a")
     for other_status in (None, {"standby": True}):

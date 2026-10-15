@@ -70,6 +70,9 @@ def _query_other_slot(home, slot: str, timeout: float) -> dict[str, Any] | None:
 def _resolve_gateway_role(slot: str, config: Any = None, *, timeout: float = 0.5) -> bool:
     """Return whether ``slot`` should boot standby based on the sibling's live status."""
     from gateway.config import is_zero_cut_handover_enabled
+    if config is None:  # same source the slot resolver reads; None alone would mean "flag off"
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
     if not is_zero_cut_handover_enabled(config):
         return False
     from hermes_constants import get_hermes_home
