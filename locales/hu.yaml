@@ -330,6 +330,7 @@ gateway:
     tip: "\n✦ Tipp: {tip}"
   restart:
     followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     in_progress: "⏳ Az átjáró újraindítása már folyamatban van..."
     restarting: "♻ Átjáró újraindítása. Ha 60 másodpercen belül nem kapsz értesítést, indítsd újra a konzolból a `hermes gateway restart` paranccsal."
   resume:

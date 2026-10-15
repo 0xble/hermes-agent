@@ -327,6 +327,7 @@ gateway:
     tip: "\n✦ نصيحة: {tip}"
   restart:
     followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     in_progress: "⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل..."
     restarting: "♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`."
   resume:

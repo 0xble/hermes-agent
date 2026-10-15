@@ -556,3 +556,104 @@ def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_er
         runner, {entry.session_key: entry}, Platform.TELEGRAM, entry.session_key,
         entry.session_id, data, path, reconnect_recovery=True,
     ) is None
+
+
+def _outcome_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
+
+
+@pytest.mark.asyncio
+async def test_draining_string_followup_is_spooled_with_authorship_then_recovered_and_run(
+        tmp_path, monkeypatch, caplog):
+    """A leftover /steer or interrupt is only a string; shutdown must still spool its author."""
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    runner._draining = True
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: None)
+    runner._promote_queued_event = lambda key, adapter, event: event
+    event, text = await runner._run_agent_drain_pending(
+        {"final_response": "done", "pending_steer": "the steered question"}, adapter, source, entry.session_key)
+    assert event is None and text is None
+    [spool] = list((tmp_path / "pending_messages").glob("*.json"))
+    data = json.loads(spool.read_text())["data"]
+    assert data["source_user_id"] == source.user_id
+    assert data.get("internal") is False
+    # The steer has no transport id of its own; the turn's message id must not be reused for it.
+    assert data.get("message_id") is None and data["recovery_id"].startswith("hermes-recovery-")
+
+    runner._draining = False
+    db = Mock()
+    assert recover_pending_to_db(
+        db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+    db.append_message.assert_not_called()
+    called = []
+
+    async def handle(recovered):
+        called.append((recovered.text, recovered.source.user_id))
+        recovered._agent_turn_succeeded = True
+
+    adapter.set_message_handler(handle)
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert await runner._drain_startup_restore_queue() == 1
+        await asyncio.gather(*list(adapter._background_tasks))
+        await asyncio.gather(*list(runner._background_tasks))
+    assert called == [("the steered question", source.user_id)]
+    assert _outcome_lines(caplog) == [f"Restart recovery outcome: session={entry.session_key} outcome=resumed"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_text_only_shutdown_followup_gets_one_outcome_one_note_and_quarantine(
+        tmp_path, monkeypatch, caplog):
+    """The live stranded spool: data has only text, so it can never run, but it cannot stay silent."""
+    runner, adapter, entry, _source = _setup(tmp_path, monkeypatch)
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    spool = flush_dir / "pending-legacy.json"
+    spool.write_text(json.dumps({
+        "session_key": entry.session_key, "reason": "shutdown_follow_up", "ts": 1792018782, "seq": -1,
+        "data": {"text": "a real question with no recorded author"}}))
+    ran = []
+
+    async def handle(event):
+        ran.append(event.text)
+        event._agent_turn_succeeded = True
+
+    adapter.set_message_handler(handle)
+    db = Mock()
+    with caplog.at_level("INFO", logger="gateway.run"):
+        for _boot in range(2):  # a second boot must not re-process or re-log it
+            recover_pending_to_db(
+                db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+                deferred_followup=partial(_defer_followup, runner, {}, None))
+            await runner._drain_startup_restore_queue()
+            await asyncio.gather(*list(runner._background_tasks))
+    db.append_message.assert_not_called()
+    assert ran == []
+    assert len(adapter.sent) == 1 and "send it again" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:author-missing:noted"]
+    assert not spool.exists()
+    assert (flush_dir / "pending-legacy.json.bad").exists()
+
+
+@pytest.mark.asyncio
+async def test_legacy_text_only_shutdown_followup_is_retained_while_note_cannot_be_sent(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, _source = _setup(tmp_path, monkeypatch)
+    flush_dir = tmp_path / "pending_messages"
+    flush_dir.mkdir(parents=True, exist_ok=True)
+    spool = flush_dir / "pending-legacy.json"
+    spool.write_text(json.dumps({
+        "session_key": entry.session_key, "reason": "shutdown_follow_up", "ts": 1792018782, "seq": -1,
+        "data": {"text": "a real question with no recorded author"}}))
+    runner._delivery_adapter_for = lambda source: None
+    runner._intake_adapter_for = lambda source: None
+    db = Mock()
+    with caplog.at_level("INFO", logger="gateway.run"):
+        recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=partial(_defer_followup, runner, {}, None))
+        await runner._drain_startup_restore_queue()
+    db.append_message.assert_not_called()
+    assert spool.exists()
+    assert adapter.sent == []

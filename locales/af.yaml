@@ -327,6 +327,7 @@ gateway:
     tip: "\n✦ Wenk: {tip}"
   restart:
     followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
     in_progress: "⏳ Gateway-herbegin reeds aan die gang..."
     restarting: "♻ Herbegin van gateway. As jy nie binne 60 sekondes in kennis gestel word nie, herbegin vanaf die konsole met `hermes gateway restart`."
   resume:

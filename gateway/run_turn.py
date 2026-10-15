@@ -4093,8 +4093,26 @@ class GatewayTurnMixin:
             # Spool before dropping the local reference so startup recovery can replay it.
             from gateway.shutdown_flush import flush_pending_to_file
             # Media-only events can have no text even after transcription; persist the resolved
-            # user-turn placeholder instead of writing an unrecoverable empty-text event.
+            # user-turn placeholder instead of writing an unrecoverable empty-text event.  A
+            # runner-level interrupt can be only a string, so bind it back to this turn's source
+            # before spooling; otherwise _serialise_value has no author or transport identity to
+            # preserve and restart recovery must decline it as an unsafe shared-chat input.
             spool_value = pending_event if pending_event and pending_event.text else pending
+            if isinstance(spool_value, str):
+                import uuid
+                from gateway.platforms.base import MessageEvent
+                # A leftover /steer or interrupt text has no transport id of its own (reusing the
+                # turn's message id would make recovery mistake it for the answered predecessor),
+                # so give it the recovery-only dedupe key internal follow-ups already use.
+                spool_value = MessageEvent(text=spool_value, source=source,
+                                           user_id=getattr(source, "user_id", None))
+                setattr(spool_value, "_hermes_recovery_id", f"hermes-recovery-{uuid.uuid4().hex}")
+            elif spool_value is not None and not getattr(spool_value, "internal", False):
+                event_source = getattr(spool_value, "source", None) or source
+                if (isinstance(event_source, SessionSource) and not event_source.user_id
+                        and getattr(source, "user_id", None)):
+                    from gateway.session_identity import replace_source
+                    spool_value.source = replace_source(event_source, user_id=source.user_id)
             try:
                 preserved = flush_pending_to_file({session_key or "": spool_value}, reason="shutdown_follow_up")
             except Exception:

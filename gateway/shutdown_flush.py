@@ -344,6 +344,18 @@ def _remove_replayed(path: Path, session_id: str) -> None:
                      "delete it by hand, or the next start writes that row again", session_id, path, exc)
 
 
+def quarantine_pending_spool(path: Path, why: str) -> bool:
+    """Move a pending spool out of every replay glob, keeping it on disk for manual recovery."""
+    target = path.with_name(path.name + QUARANTINE_SUFFIX)
+    try:
+        path.replace(target)
+    except OSError as exc:
+        logger.error("Could not quarantine pending message %s (%s): %s", path, why, exc)
+        return False
+    logger.warning("Quarantined pending message %s to %s (%s); it will not be replayed", path, target, why)
+    return True
+
+
 def _quarantine_spool_file(path: Path, session_id: str, exc: BaseException) -> None:
     """Move a spool file whose row the database rejected out of every replay, so it cannot hold its
     session's later rows back on every write and every restart. It stays on disk for manual recovery."""
@@ -502,11 +514,17 @@ def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -
     return data
 
 
-def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any]) -> bool:
-    """An expired drain arrival, or a spooled built-in control command, is never replayed."""
+def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any], *, keep_expired: bool = False) -> bool:
+    """An expired drain arrival, or a spooled built-in control command, is never replayed.
+
+    With ``keep_expired`` an expired spool is flagged ``_recovery_stale`` instead, so its follow-up
+    owner can decline it visibly rather than deleting a user's message without a word."""
     if time.time() - path.stat().st_mtime > 24 * 60 * 60:
-        logger.warning("Dropping expired drain-deferred message from %s", path)
-        return True
+        if keep_expired:
+            data["_recovery_stale"] = True
+        else:
+            logger.warning("Dropping expired drain-deferred message from %s", path)
+            return True
     from gateway.platforms.event import MessageEvent
     from hermes_cli.commands import resolve_command
     command = MessageEvent(
@@ -553,7 +571,9 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     data = _upgrade_shutdown_follow_up(payload, data)
     data = {**data, "_recovery_spool_ts": payload.get("ts")}
     text = data.get("text", "")
-    if data.get("drain_deferred") is True and _drop_drain_deferred(path, text, data):
+    if data.get("drain_deferred") is True and _drop_drain_deferred(
+            path, text, data,
+            keep_expired=data.get("shutdown_follow_up") is True and deferred_followup is not None):
         return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
@@ -581,6 +601,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
     if deferred_followup is not None:
         claim = deferred_followup(session_key, session_id, data, path)
         if claim is DROP_PENDING:
+            return DROP_PENDING
+        if data.get("_recovery_stale") is True and (claim is None or claim is False):
+            # The owner could not even route a note for it; keep the old expiry rather than
+            # retaining a day-old input forever.
+            logger.warning("Dropping expired drain-deferred message from %s", path)
             return DROP_PENDING
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)

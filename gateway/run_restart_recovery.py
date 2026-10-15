@@ -207,7 +207,9 @@ class RestartRecoveryMixin:
         """A future turn can outlive its predecessor's marker; its refusal still needs a note."""
         from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
 
-        noted = self._interruption_note_delivered(session_key)
+        declined = getattr(event, "_hermes_recovered_declined", False) is True
+        # A declined input never ran, so the predecessor's interruption note does not cover it.
+        noted = False if declined else self._interruption_note_delivered(session_key)
         if not noted:
             try:
                 # Restore observers run outside any profile scope; a multiplexed secondary
@@ -216,13 +218,33 @@ class RestartRecoveryMixin:
                 async with _async_profile_runtime_scope(home) if home else nullcontext():
                     send = self._deliver_platform_notice(
                         event.source,
-                        t("gateway.restart.followup_recovery_notice"),
+                        t("gateway.restart.followup_declined_notice" if declined
+                          else "gateway.restart.followup_recovery_notice"),
                     )
                     timeout = _startup_restore_drain_timeout_secs()
                     noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
             except Exception:
                 logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
         suffix = ":noted" if noted else ":note-unavailable"
+        if declined and noted:
+            # The user now knows to resend it: keep the bytes for manual recovery, but never
+            # replay or re-announce this input on a later boot.
+            from gateway.shutdown_flush import quarantine_pending_spool
+            spool = getattr(event, "_hermes_recovery_spool", None)
+            if spool is not None:
+                quarantine_pending_spool(spool, f"declined shutdown follow-up: {reason}")
+        if declined:
+            # This input is its own recovery item: decide it once per spool, independently of the
+            # predecessor turn's outcome for the same session (and never release that turn's claim).
+            decided = getattr(self, "_declined_followup_outcomes", None)
+            if decided is None:
+                decided = self._declined_followup_outcomes = set()
+            marker = str(getattr(event, "_hermes_recovery_spool", None) or id(event))
+            if marker not in decided:
+                decided.add(marker)
+                logger.info("Restart recovery outcome: session=%s outcome=%s",
+                            session_key, f"skipped:{reason}{suffix}")
+            return
         self._release_restart_followup_key(session_key)
         self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
 
@@ -296,8 +318,14 @@ class RestartRecoveryMixin:
 
     async def _dispatch_startup_restore_event(self, event, recovery_key: str) -> bool:
         """Separate adapter admission from a recovered follow-up's actual turn completion."""
-        recovered = getattr(event, "_hermes_recovery_session_key", None) is not None
+        recovered = getattr(event, "_hermes_recovered_followup", False) is True
         try:
+            if getattr(event, "_hermes_recovered_declined", False) is True:
+                # Never auto-run an input recovery could not attribute or still trust: send the
+                # visible note (retaining the spool if no adapter can carry it yet).
+                await self._finish_recovered_followup(
+                    event, recovery_key, getattr(event, "_hermes_recovery_decline_reason", "declined"))
+                return False
             source = getattr(event, "source", None)
             adapter = self._intake_adapter_for(source)
             if adapter is None and getattr(event, "_hermes_recovered_followup", False):

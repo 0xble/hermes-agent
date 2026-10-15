@@ -38,6 +38,24 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
                     breaker_tripped=False, reconnect_recovery=False, recovered_events=None):
     # A queued message is a future turn; appending it to the interrupted transcript
     # makes the recovery note answer that message instead.
+    def _decline_followup(reason, source, adapter):
+        """Route a declined shutdown follow-up through the normal visible-note observer."""
+        if data.get("shutdown_follow_up") is not True or adapter is None:
+            return False
+        event = _recovered_followup_event(
+            data, source, data.get("source_user_id") or data.get("user_id") or getattr(source, "user_id", None))
+        setattr(event, "_hermes_recovered_followup", True)
+        setattr(event, "_hermes_recovered_declined", True)
+        setattr(event, "_hermes_recovery_decline_reason", reason)
+        setattr(event, "_hermes_recovery_spool", path)
+        # No _hermes_recovery_session_key: a declined input never runs, so it must not displace
+        # the predecessor's own resume decision the way an accepted follow-up does.
+        if recovered_events is not None:
+            recovered_events.append(event)
+        else:
+            runner._queue_startup_restore_event(event)
+        return True
+
     origin = getattr(eligible.get(key), "origin", None) if key in eligible else None
     if platform is not None and origin is not None and origin.platform != platform:
         return OTHER_PLATFORM_PENDING
@@ -82,17 +100,31 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
             logger.warning("Dropping unauthorized drain-deferred message from %s", path)
+            if data.get("shutdown_follow_up") is True:
+                # Never message an origin that is no longer authorized, but still decide visibly.
+                logger.info("Restart recovery outcome: session=%s outcome=%s",
+                            key, "skipped:unauthorized:note-unavailable")
             return DROP_PENDING
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
     if ready is None:
         return False
-    # Older spools lack authorship; never guess who issued a command in shared chats.
+    # Older spools lack authorship; never guess who issued a command in shared chats. A shutdown
+    # follow-up we cannot safely run still gets one outcome and a visible note, never silence.
     author_id = data.get("source_user_id") or data.get("user_id")
+    decline = None
     if not data.get("internal") and (not isinstance(author_id, str) or not author_id.strip()):
-        return False
+        decline = "author-missing"
+    elif data.get("_recovery_stale") is True:
+        decline = "stale"
     adapter, source = ready
+    if decline is not None:
+        if data.get("shutdown_follow_up") is not True:
+            return False
+        if adapter is None:
+            return None  # keep it until the note can be delivered
+        return _decline_followup(decline, source, adapter)
     if adapter is None:
         return None
     return _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events)
