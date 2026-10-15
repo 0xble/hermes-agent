@@ -380,7 +380,7 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.setattr(gateway_run, "_start_gateway_claim_pid_file", lambda **kwargs: True)
     monkeypatch.setattr(gateway_run, "_start_gateway_start_control_socket", lambda runner: settle())
     monkeypatch.setattr(gateway_run, "_start_gateway_configure_logging", lambda *a, **k: None)
-    monkeypatch.setattr(gateway_run, "_run_requested_state_db_compaction", lambda: None)
+    monkeypatch.setattr(gateway_run, "_run_requested_state_db_compaction", lambda: calls.append("compact"))
     monkeypatch.setattr(gateway_run, "_refresh_host_gateway_record", lambda *a: calls.append("refresh"))
     monkeypatch.setattr(gateway_run, "_log_standalone_profiles_at_boot", lambda *a: None)
     monkeypatch.setattr(gateway_run, "_ensure_windows_gateway_venv_imports", lambda: None)
@@ -404,12 +404,14 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
     assert "host_attach" not in calls and "claim" not in calls
     assert "record_startup" not in calls
+    assert "compact" not in calls  # only the authoritative gateway rewrites state.db
 
     calls.clear()
     gateway_slot.reset_gateway_slot_for_tests()
     monkeypatch.delenv("HERMES_GATEWAY_SLOT")
     assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
     assert "host_attach" in calls
+    assert "compact" in calls
     assert zero_cut_standby.readiness()["ready"] is False  # a clean early exit never reports ready
 
     # A serving standby reports ready only after cron and housekeeping have started.
