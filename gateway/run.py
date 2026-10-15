@@ -195,17 +195,6 @@ def hygiene_compaction_recovered(
     return compression_made_progress(msg_count, new_count, approx_tokens, new_tokens)
 
 
-def _hygiene_compression_timeout_message(
-    *, total_exhausted: bool, elapsed: float, idle_timeout: float, progress_observed: bool) -> str:
-    """Describe the host timeout that actually ended hygiene compression. Chat users cannot edit
-    model config, so the copy names /compress, /new and `hermes doctor`, never a config key or the
-    raw second counts (those stay in the gateway log)."""
-    lead = t("gateway.compress.hygiene_timeout")
-    if total_exhausted:
-        return lead
-    return lead + t("gateway.compress.hygiene_timeout_doctor_hint")
-
-
 def _cached_agent_for_hygiene(gateway, session_key: str):
     """The cached live AIAgent for ``session_key`` (or the pending sentinel / None), read under the cache lock."""
     cache = getattr(gateway, "_agent_cache", None)
@@ -5768,9 +5757,13 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
+        from gateway.cron_review import CronReviewControl
+        _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
-            verb_handlers={"pause-for-update": _pause_for_update_handler,
+            verb_handlers={"cron-review": _cron_review_control.submit,
+                           "cron-review-result": _cron_review_control.result,
+                           "pause-for-update": _pause_for_update_handler,
                            "agent-update": _agent_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
                            "unserve-profile": unserve_profile_verb(runner),
