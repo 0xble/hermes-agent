@@ -98,6 +98,15 @@ def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
     )
 
 
+def _dispatch_sandbox_read(dispatch, tool_name: str, tool_args: dict):
+    """Dispatch nested tools with a real read for sandbox read_file calls."""
+    if tool_name != "read_file":
+        return dispatch(tool_name, tool_args)
+    from tools.file_tools import sandbox_read_context
+    with sandbox_read_context():
+        return dispatch(tool_name, tool_args)
+
+
 def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_counter: list,
                         max_tool_calls: int, dispatch, tool_call_log: list, call_start: float,
                         where: str) -> str:
@@ -117,7 +126,7 @@ def _handle_rpc_request(request: dict, *, allowed_tools: frozenset, tool_call_co
     # Silence handler status prints so they don't leak into the CLI spinner.
     try:
         with thread_scoped_silence():
-            result = dispatch(tool_name, tool_args)
+            result = _dispatch_sandbox_read(dispatch, tool_name, tool_args)
     except Exception as exc:
         logger.error("Tool call failed in %s: %s", where, exc, exc_info=True)
         result = tool_error(str(exc))
