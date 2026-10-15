@@ -1409,12 +1409,12 @@ class GatewayAdapterLifecycleMixin:
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Runtime re-scan of a served profile (config/.env changed): only platforms that are not
-            # already live or queued for reconnect are built — never a second poller on the same bot.
+            from gateway import zero_cut_standby as zcs
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config, profile=profile_name):
+                continue
             if platform in profile_map or platform in (
                     (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name) or {}):
                 continue
-            # No credential in THIS profile's scope: an adapter would fan inbound across every such profile.
             with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                 has_credential = _platform_has_bot_credential(platform, platform_config)
             if multiplex and not has_credential:
