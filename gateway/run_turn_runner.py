@@ -1836,10 +1836,12 @@ class TurnRunner:
                 kwargs["moa_config"] = ctx.moa_config
             if persist_user_timestamp_override is not None:
                 kwargs["persist_user_timestamp"] = persist_user_timestamp_override
-            # The RAW inbound id (not event_message_id, the reply anchor) rides the persisted user
-            # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
-            if ctx.inbound_message_id is not None:
-                kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
+            # The raw inbound id (not event_message_id, the reply anchor) rides the persisted user
+            # turn. Recovered internal follow-ups use a dedicated recovery key here; it must never
+            # become event.message_id/source.message_id or reach transport routing.
+            persist_id = ctx.inbound_message_id or ctx.recovery_id
+            if persist_id is not None:
+                kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
                 return agent.run_conversation(api_message, **kwargs)

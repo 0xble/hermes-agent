@@ -1910,6 +1910,11 @@ def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) 
             # Recovery may be watching an absorbed event while the successor persists the
             # merged slot. Keep the live successor reachable for its durability probe.
             setattr(candidate, "_hermes_absorbed_into", existing)
+    recovery_id = getattr(event, "_hermes_recovery_id", None)
+    if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
+        # A recovered event may be consumed by this pending successor. Carry only the
+        # persistence/durability key; event.message_id and source.message_id remain transport ids.
+        setattr(existing, "_hermes_recovery_id", recovery_id)
 
 
 def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], session_key: str,

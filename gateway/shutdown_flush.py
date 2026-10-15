@@ -83,10 +83,10 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         if serialised is None or not has_user_content(serialised):
             return False
         # Internal follow-ups have no transport id, but their durable user row still needs a
-        # stable dedupe key. Stamp it into the replay payload at flush time so the recovered
-        # event carries the same value through ``_hmwa_user_transcript_entry``.
-        if serialised.get("internal") is True and not serialised.get("message_id"):
-            serialised["message_id"] = f"hermes-recovery-{uuid.uuid4().hex}"
+        # stable dedupe key. Keep it in a recovery-only field: replay must never expose the key
+        # to reply routing, threading, or any other transport-facing consumer.
+        if serialised.get("internal") is True and not serialised.get("message_id") and not serialised.get("recovery_id"):
+            serialised["recovery_id"] = f"hermes-recovery-{uuid.uuid4().hex}"
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
@@ -251,6 +251,9 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        recovery_id = getattr(value, "_hermes_recovery_id", None)
+        if recovery_id is not None and _json_safe(recovery_id):
+            result["recovery_id"] = recovery_id
         for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
                      "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)

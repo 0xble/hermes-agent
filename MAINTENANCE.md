@@ -356,7 +356,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 ## Active patch record: internal recovered follow-up retirement
 
 - **Patch identity:** `internal-followup-retirement`.
-- **Behavior:** Id-less internal recovered follow-ups retire their spool once the exact user row is durable, and busy pending-slot successors propagate their terminal turn result back to recovery. This prevents duplicate replay and logs `resumed` or `skipped:turn-failed` instead of `accepted-without-turn`.
+- **Behavior:** Id-less internal recovered follow-ups carry a synthetic recovery id outside transport identity; the id is persisted on the user row and retires the spool once that row is durable. Legacy spools without a recovery id use exact content plus spool timestamp as a fallback. Busy pending-slot successors propagate their terminal turn result back to recovery. This prevents duplicate replay and logs `resumed` or `skipped:turn-failed` instead of `accepted-without-turn`.
 - **Source surfaces:** `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`, `gateway/platforms/base.py`, `gateway/session_transcript.py`, `hermes_state_messages.py`, `gateway/shutdown_flush.py`, and `tests/gateway/test_shutdown_followup_restart.py`.
 - **Focused regression:** `uv run --offline --group dev pytest -q -p no:cacheprovider tests/gateway/test_restart_recovery_outcomes.py tests/gateway/test_restart_resume_admission_identity.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_real_adapter.py tests/gateway/test_shutdown_followup_restart.py`.
 - **Rollback:** Revert the commit carrying `Fork-Patch: internal-followup-retirement`.

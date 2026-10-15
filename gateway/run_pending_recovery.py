@@ -104,7 +104,7 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     if followup and input_already_durable(
         runner.session_store,
         session_id,
-        data.get("message_id"),
+        data.get("recovery_id") or data.get("message_id"),
         data.get("text"),
         data.get("_recovery_spool_ts"),
     ):
@@ -130,9 +130,9 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
 def input_already_durable(store, session_id, message_id, content=None, spool_ts=None) -> bool:
     """True when a turn already wrote this replayed input as a user row of *session_id*.
 
-    Platform-backed events use their exact id. Internal events have no transport id, so their
-    exact user content is the durable identity available to recovery; this prevents a spool left
-    behind by a crash between the transcript write and unlink from replaying on the next boot.
+    ``message_id`` is the recovery id for new internal spools, or the real platform id for
+    platform-backed events. A missing id means a legacy internal spool, so use its content and
+    timestamp only as a compatibility fallback; new spools never take this path.
     """
     if not session_id:
         return False
@@ -165,6 +165,12 @@ def _recovered_followup_event(data, source, author_id):
     from gateway.platforms.event import MessageEvent
     from gateway.session_identity import replace_source
     message_id = data.get("message_id")
+    recovery_id = data.get("recovery_id")
+    # Spools written by the pre-dedicated-field implementation carried the recovery key in
+    # message_id. Treat that legacy synthetic value as recovery metadata rather than transport
+    # identity, while preserving genuine platform message ids.
+    if recovery_id is None and isinstance(message_id, str) and message_id.startswith("hermes-recovery-"):
+        recovery_id, message_id = message_id, None
     source = replace_source(
         source, message_id=message_id, user_id=author_id,
         user_name=data.get("source_user_name") or data.get("user_name"),
@@ -172,7 +178,7 @@ def _recovered_followup_event(data, source, author_id):
         is_bot=bool(data.get("source_is_bot", False)),
         role_authorized=bool(data.get("source_role_authorized", False)),
     )
-    return MessageEvent(
+    event = MessageEvent(
         text=data.get("text") or "", message_type=recovered_message_type(data), source=source,
         user_id=data.get("user_id") or author_id,
         user_name=data.get("user_name") or source.user_name,
@@ -190,6 +196,9 @@ def _recovered_followup_event(data, source, author_id):
         metadata=data.get("metadata") or {},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
+    if recovery_id is not None:
+        setattr(event, "_hermes_recovery_id", recovery_id)
+    return event
 
 
 def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None, recovered_events=None) -> int:

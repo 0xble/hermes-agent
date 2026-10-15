@@ -2,15 +2,16 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from functools import partial
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import merge_pending_message_event
+from gateway.platforms.base import _reply_anchor_for_event, merge_pending_message_event
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run_pending_recovery import _defer_followup
+from gateway.run_pending_recovery import _defer_followup, _recovered_followup_event
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -31,6 +32,24 @@ def _setup(tmp_path, monkeypatch):
     runner._delivery_adapter_for = lambda source: adapter
     runner._thread_metadata_for_source = lambda source: {}
     return runner, adapter, entry, source
+
+
+def test_recovered_internal_event_keeps_recovery_key_out_of_transport_identity(tmp_path, monkeypatch):
+    _runner, _adapter, _entry, source = _setup(tmp_path, monkeypatch)
+    recovered = _recovered_followup_event(
+        {
+            "text": "internal completion",
+            "internal": True,
+            "recovery_id": "hermes-recovery-test",
+            "user_id": source.user_id,
+        },
+        replace(source, platform=Platform.SLACK),
+        source.user_id,
+    )
+    assert recovered.message_id is None
+    assert recovered.source.message_id is None
+    assert getattr(recovered, "_hermes_recovery_id") == "hermes-recovery-test"
+    assert _reply_anchor_for_event(recovered) is None
 
 
 @pytest.mark.asyncio
@@ -182,7 +201,10 @@ async def test_merged_internal_recovery_spool_retires_after_successor_input_is_d
 
     async def successor():
         runner.session_store.append_to_transcript(
-            entry.session_id, {"role": "user", "content": consumed.text}
+            entry.session_id, {
+                "role": "user", "content": consumed.text,
+                "platform_message_id": getattr(recovered, "_hermes_recovery_id"),
+            }
         )
         persisted.set()
         await release.wait()
@@ -281,10 +303,10 @@ def test_idless_recovered_followup_whose_input_is_already_durable_is_dropped(tmp
     event = MessageEvent(text="internal completion", source=source, user_id=source.user_id, internal=True)
     assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
     spool = next((tmp_path / "pending_messages").glob("*.json"))
-    synthetic_id = json.loads(spool.read_text())["data"]["message_id"]
-    assert synthetic_id.startswith("hermes-recovery-")
+    recovery_id = json.loads(spool.read_text())["data"]["recovery_id"]
+    assert recovery_id.startswith("hermes-recovery-")
     runner.session_store.append_to_transcript(entry.session_id, {
-        "role": "user", "content": "internal completion", "platform_message_id": synthetic_id,
+        "role": "user", "content": "internal completion", "platform_message_id": recovery_id,
     })
     assert recover_pending_to_db(
         Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
@@ -303,12 +325,14 @@ async def test_idless_recovered_followup_spool_retires_when_input_row_lands(tmp_
                           deferred_followup=partial(_defer_followup, runner, {}, None))
     spool = next((tmp_path / "pending_messages").glob("*.json"))
     payload = json.loads(spool.read_text())
-    synthetic_id = payload["data"]["message_id"]
-    assert synthetic_id.startswith("hermes-recovery-")
+    recovery_id = payload["data"]["recovery_id"]
+    assert recovery_id.startswith("hermes-recovery-")
     recovered = runner._startup_restore_queue[0]
-    assert recovered.message_id == synthetic_id
+    assert recovered.message_id is None
+    assert recovered.source.message_id is None
+    assert getattr(recovered, "_hermes_recovery_id") == recovery_id
     runner.session_store.append_to_transcript(entry.session_id, {
-        "role": "user", "content": event.text, "platform_message_id": synthetic_id,
+        "role": "user", "content": event.text, "platform_message_id": recovery_id,
     })
     await asyncio.wait_for(runner._retire_spool_once_input_durable(recovered), 2)
     assert not spool.exists()

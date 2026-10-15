@@ -63,6 +63,7 @@ class RestartRecoveryMixin:
         from gateway.run_pending_recovery import input_already_durable
         recovery_session_id = getattr(event, "_hermes_recovery_session_id", None)
         recovery_spool_ts = getattr(event, "_hermes_recovery_spool_ts", None)
+        recovery_id = getattr(event, "_hermes_recovery_id", None)
         for candidate in self._recovery_probe_events(event):
             session_id = getattr(candidate, "_hermes_recovery_session_id", None)
             if session_id is None:
@@ -70,9 +71,14 @@ class RestartRecoveryMixin:
             spool_ts = getattr(candidate, "_hermes_recovery_spool_ts", None)
             if spool_ts is None:
                 spool_ts = recovery_spool_ts
+            candidate_recovery_id = getattr(candidate, "_hermes_recovery_id", None)
+            if candidate_recovery_id is None:
+                candidate_recovery_id = getattr(candidate, "message_id", None)
+            if candidate_recovery_id is None:
+                candidate_recovery_id = recovery_id
             if await asyncio.to_thread(
                 input_already_durable, getattr(self, "session_store", None), session_id,
-                getattr(candidate, "message_id", None), getattr(candidate, "text", None), spool_ts,
+                candidate_recovery_id, getattr(candidate, "text", None), spool_ts,
             ):
                 return True
         return False
@@ -82,10 +88,11 @@ class RestartRecoveryMixin:
 
         ``handle_message`` returns once the session task exists, before the turn has leased the
         session or persisted anything, so the spool is the only copy until the turn writes its
-        input row (``_persist_turn_start`` stamps the inbound id before the first model call). After
+        input row (``_persist_turn_start`` stamps the inbound or recovery id before the first model call). After
         that row exists, a restart falls to the turn's ``resume_pending`` marker and boot recovery
         drops the spool instead of replaying a prompt that may have had effects. Legacy payloads
-        without a synthetic id retire when their turn reports a result.
+        without a recovery id use the content/timestamp fallback and retire when their turn reports
+        a result.
         """
         while not await self._recovered_input_durable(event):
             await asyncio.sleep(_INPUT_DURABLE_POLL_S)
