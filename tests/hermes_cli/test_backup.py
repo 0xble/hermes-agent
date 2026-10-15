@@ -2845,6 +2845,30 @@ class TestRestoreCronJobsIfEmptied:
         assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
         assert json.loads(jobs_path.read_text(encoding="utf-8")) == expected
 
+    def test_partial_restore_drops_malformed_live_entries(self, tmp_path):
+        from hermes_cli.backup import restore_cron_jobs_if_emptied
+        hermes_home = tmp_path / ".hermes"
+        jobs_path = hermes_home / "cron" / "jobs.json"
+        jobs_path.parent.mkdir(parents=True, exist_ok=True)
+        jobs_path.write_text(json.dumps({
+            "jobs": [
+                {"id": "a", "prompt": "one"}, {"id": "b", "prompt": "two"},
+                {"id": "c", "prompt": "three"},
+            ],
+        }), encoding="utf-8")
+        snap_id = self._make_snapshot(hermes_home)
+        assert snap_id
+
+        jobs_path.write_text(json.dumps({
+            "jobs": [42, {"id": "a", "prompt": "one"}], "format": "cron-v1",
+        }), encoding="utf-8")
+
+        assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
+        restored = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert all(isinstance(job, dict) for job in restored["jobs"])
+        assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c"]
+        assert restored["format"] == "cron-v1"
+
 
     def test_non_utf8_journal_does_not_stop_restore(self, tmp_path):
         from hermes_cli.backup import restore_cron_jobs_if_emptied

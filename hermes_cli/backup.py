@@ -1548,12 +1548,9 @@ def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] =
         with cron_jobs.use_cron_store(home):
             with cron_jobs._jobs_lock():
                 live_doc = _load_cron_jobs_doc(live_path)
-                loaded_jobs = cron_jobs.load_jobs()
-                live_jobs = (
-                    _cron_jobs_list(live_doc)
-                    if live_doc is not None
-                    else loaded_jobs
-                )
+                # load_jobs() drops malformed entries; use its normalized jobs and keep only the
+                # live document's wrapper metadata, so a raw non-object entry is never written back.
+                live_jobs = cron_jobs.load_jobs()
                 live_ids = {
                     str(job.get("id")) for job in live_jobs
                     if isinstance(job, dict) and job.get("id")
