@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -392,7 +393,8 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.setattr(gateway_run, "_settle_and_shutdown_mcp", settle)
     monkeypatch.setattr(gateway_run, "_best_effort", lambda fn, *a, **k: fn())
     monkeypatch.setattr(gateway_run.threading, "Thread", NoopThread)
-    monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: object())
+    # Not the main thread (so no signal handlers), but still a valid thread for logging records.
+    monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: threading.Thread(name="not-main"))
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("gateway.code_skew.record_boot_fingerprint", lambda: None)
     monkeypatch.setattr("gateway.lifecycle_ledger.record_startup", lambda: calls.append("record_startup"))
