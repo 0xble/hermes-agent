@@ -1039,16 +1039,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 await admit_internal_event(adapter, event)
             else:
                 # Lightweight/plugin adapters predate the explicit admission-receipt surface, but
-                # they still need the same compression/control fence before handling a wake. The
-                # optional acceptance flag is honored when a test/plugin supplies it; absence keeps
-                # the legacy direct-handler contract.
+                # they still need the same compression/control fence before handling a wake, and
+                # the same receipt rule as admit_internal_event: MessageEvent defaults the receipt
+                # to False, so a handler that never confirms admission is a refusal and the started
+                # tick is left for skip-only recovery.
                 from hermes_cli.session_controls import internal_wake_is_current
                 if not await self._run_in_executor_with_context(
                     functools.partial(internal_wake_is_current, event)
                 ):
                     raise RuntimeError("loop wake superseded before direct adapter admission")
                 await adapter.handle_message(event)
-                if getattr(event, "_gateway_accepted", None) is False:
+                if getattr(event, "_gateway_accepted", False) is not True:
                     raise RuntimeError("loop wake not accepted by direct adapter")
             rebound_sid = (event.metadata or {}).get("loop_wakeup_session_id")
             if rebound_sid and rebound_sid != sid:

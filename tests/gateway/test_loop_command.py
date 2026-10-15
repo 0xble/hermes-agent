@@ -659,3 +659,44 @@ async def test_unaccepted_loop_wake_skips_started_tick(loop_env):
         runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_adapter_without_receipt_is_a_refusal_not_a_replay(loop_env):
+    """Direct adapters follow admit_internal_event's receipt rule: MessageEvent defaults the
+    receipt to False, so a handler that never confirms admission leaves the started command tick
+    for skip-only recovery. The next scan skips it once and never runs the command again."""
+    runner = _make_runner()
+    route = {"platform": "discord", "chat_id": "chat-loop", "chat_type": "channel", "user_id": "u"}
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.set("/status", interval_seconds=300, route=route)
+    mgr.state.next_due_at = 0
+    loops.save_loop("sid-gateway-loop", mgr.state)
+
+    class _NoReceipt:
+        handled = []
+
+        async def handle_message(self, event):
+            self.handled.append(event.text)  # never sets _gateway_accepted
+
+    adapter = _NoReceipt()
+    runner._adapters_for_profile = lambda profile: {Platform.DISCORD: adapter}
+    runner._build_process_event_source = lambda evt: SessionSource(
+        platform=Platform.DISCORD, chat_id=evt["chat_id"], chat_type=evt["chat_type"],
+        user_id=evt["user_id"])
+    runner._session_key_for_source = lambda source: "agent:main:discord:channel:chat-loop"
+    runner._running_agents = {}
+
+    async def _inline(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is True and reloaded.ticks_fired == 1
+    await GatewayRunner._loop_wakeup_fire_one(
+        runner, "sid-gateway-loop", loops.load_loop("sid-gateway-loop"), 1e12, set())
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded.awaiting_response is False and reloaded.ticks_fired == 1
+    assert adapter.handled == ["/status"]
