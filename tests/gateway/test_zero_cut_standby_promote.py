@@ -176,3 +176,32 @@ async def test_shutdown_tail_accepts_none_handles(monkeypatch):
     assert await _start_gateway_shutdown_tail(
         runner, None, None, None, None, None, planned, planned, [False]
     ) is True
+
+
+def test_promotion_does_not_spawn_a_second_reconnect_watcher():
+    from gateway.run import GatewayRunner
+
+    spawned, supervised = [], []
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._failed_platforms = {}
+    runner._reconnect_watcher_task = None
+
+    class LiveTask:
+        def done(self):
+            return False
+
+    def spawn_reconnect():
+        spawned.append("reconnect")
+        runner._reconnect_watcher_task = LiveTask()
+
+    runner._spawn_reconnect_watcher = spawn_reconnect
+    runner._spawn_supervised = lambda fn, name, **kw: supervised.append(name)
+    runner._scale_to_zero_should_arm = lambda: False
+    runner._log_scale_to_zero_not_armed_reason = lambda: None
+    runner._start_spawn_background_watchers()  # standby: reconnect watcher only
+    assert spawned == ["reconnect"] and supervised == []
+    zcs.mark_ready()
+    zcs._promoted = True  # what promote() sets before spawning the deferred watchers
+    runner._start_spawn_background_watchers()
+    assert spawned == ["reconnect"]
+    assert "drain_control_watcher" in supervised

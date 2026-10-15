@@ -1958,9 +1958,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 "Starting reconnection watcher for %d failed platform(s): %s",
                 len(self._failed_platforms), ", ".join(p.value for p in self._failed_platforms),
             )
-        # Supervised: an escaping exception is restarted with backoff instead of stranding queued
-        # platforms (the ensure hook only runs on a NEW fatal). ``on_spawn`` keeps the handle current.
-        self._spawn_reconnect_watcher()
+        # Supervised reconnect watcher; a standby already spawned it, so promotion must not add a second.
+        if getattr(self, "_reconnect_watcher_task", None) is None or self._reconnect_watcher_task.done():
+            self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
