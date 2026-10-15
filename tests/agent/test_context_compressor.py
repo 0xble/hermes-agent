@@ -550,6 +550,8 @@ class TestSummarizeToolResultRefusals:
         assert by_id["old"] != repeated
         assert count >= 1
 
+
+class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000
         assert compressor.should_compress() is False
