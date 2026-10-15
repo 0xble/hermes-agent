@@ -42,6 +42,11 @@ def _repository_dirs(cwd: Path, git_dir: Optional[str] = None) -> set[Path]:
     """Resolve ordinary, bare and linked-worktree metadata without executing Git."""
     if git_dir is not None:
         metadata = (cwd / git_dir).resolve()
+        # An explicit --git-dir/GIT_DIR that does not name a repository Git would accept is
+        # unknown ownership, not proof the process is elsewhere. Git may have chdir'd (for
+        # example into core.worktree) after reading it, so a relative path no longer resolves.
+        if not metadata.is_dir() or not _is_git_directory(metadata):
+            raise ValueError("explicit git dir is not a repository here")
     else:
         metadata = None
         for parent in (cwd, *cwd.parents):

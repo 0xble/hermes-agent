@@ -236,6 +236,24 @@ def test_absolute_git_dir_of_a_target_worktree_keeps_its_pack(scope, tmp_path):
     assert pack.exists()
 
 
+def test_unresolvable_explicit_git_dir_is_unknown_not_unrelated(scope, tmp_path):
+    """Git with core.worktree chdirs into the work tree after reading a relative --git-dir, so
+    the argv path no longer resolves from /proc cwd. That is unknown ownership, so the pack stays."""
+    table, ours, _ = scope
+    worktree = tmp_path / "configured-worktree"
+    worktree.mkdir()
+    for pid, (argv, env) in enumerate([
+        (("git", "--git-dir=ours/.git", "status"), ("GIT_DIR=.git",)),
+        (("git", "--git-dir", "missing/.git", "fetch"), ()),
+        (("git", "status"), ("GIT_DIR=does-not-exist",)),
+    ], start=400):
+        proc = _process(table, pid, worktree, argv=argv, env=env)
+        pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_live")
+        assert gitlock.clear_stale_tmp_packs(ours) == [], argv
+        assert pack.exists()
+        shutil.rmtree(proc)
+
+
 def test_replaced_or_touched_pack_is_not_deleted_after_holder_proof(scope, monkeypatch):
     _, ours, _ = scope
     pack = _aged(ours / ".git" / "objects" / "pack" / "tmp_pack_dead")
