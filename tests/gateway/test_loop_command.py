@@ -279,6 +279,25 @@ async def test_loop_tick_is_not_reclassified_as_external_evidence(loop_env):
 
 
 @pytest.mark.asyncio
+async def test_trusted_external_result_wakes_loop_once(loop_env):
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
+    event = _make_event("result")
+    event.internal = True
+    event.metadata = {"notification_origin": "delegation_result", "notification_category": "result"}
+    runner._post_turn_goal_continuation = AsyncMock()
+    with patch("hermes_cli.loops.wake_loop_for_external_event", return_value=True) as wake:
+        await GatewayRunner._run_post_turn_hooks(
+            runner,
+            agent_result={"final_response": "delegation completed"},
+            source=event.source,
+            is_internal=True,
+            event=event,
+        )
+    wake.assert_called_once_with("sid-gateway-loop")
+
+
+@pytest.mark.asyncio
 async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
