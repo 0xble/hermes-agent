@@ -638,15 +638,14 @@ def anthropic_wire_output_cap(
     context_length: Optional[int] = None, base_url: str | None = None, preserve_dots: bool = False,
     output_ceiling: Optional[int] = None,
 ) -> int:
-    """``max_tokens`` :func:`build_anthropic_kwargs` puts on the wire for these inputs (native
-    default, window clamp, manual-thinking floor), without building the request."""
+    """``max_tokens`` :func:`build_anthropic_kwargs` puts on the wire for these inputs."""
     if not _is_nous_portal_endpoint(base_url):
         model = normalize_model_name(model, preserve_dots=preserve_dots)
     cap = _clamped_anthropic_max_tokens(max_tokens, model, context_length)
-    if reasoning_config and isinstance(reasoning_config, dict):
-        cap = _thinking_kwargs(reasoning_config, model, cap).get("max_tokens", cap)
     if output_ceiling is not None:
         cap = min(cap, output_ceiling)
+    if reasoning_config and isinstance(reasoning_config, dict):
+        cap = _thinking_kwargs(reasoning_config, model, cap).get("max_tokens", cap)
     return cap
 
 
@@ -703,6 +702,9 @@ def build_anthropic_kwargs(
         model = normalize_model_name(model, preserve_dots=preserve_dots)
     # Non-positive/non-finite values fail locally instead of 400-ing upstream.
     effective_max_tokens = _clamped_anthropic_max_tokens(max_tokens, model, context_length)
+    if output_ceiling is not None:
+        # Apply the turn ceiling before provider protocol floors such as manual-thinking budget.
+        effective_max_tokens = min(effective_max_tokens, output_ceiling)
     to_wire = _oauth_wire_namer(anthropic_tools) if is_oauth else None
     if to_wire:
         system = _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_wire)
@@ -732,8 +734,6 @@ def build_anthropic_kwargs(
     # long tool runs.
     if reasoning_config and isinstance(reasoning_config, dict):
         kwargs.update(_thinking_kwargs(reasoning_config, model, effective_max_tokens))
-    if output_ceiling is not None:
-        kwargs["max_tokens"] = min(kwargs["max_tokens"], output_ceiling)
     # Safety net so upstream 4.6 -> 4.7 migrations don't need coordinated edits everywhere callers
     # (auxiliary_client, ...) set sampling params.
     if _forbids_sampling_params(model):

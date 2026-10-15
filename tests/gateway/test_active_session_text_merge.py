@@ -146,7 +146,7 @@ async def test_cross_sender_debounce_checkpoint_failure_preserves_pending_event(
         await adapter._queue_text_debounce(key, incoming)
     assert adapter._pending_messages[key] is pending
     assert "incoming" in adapter._pending_messages[key].text
-    assert incoming._gateway_accepted is True
+    assert incoming._gateway_accepted is False
 
 
 @pytest.mark.asyncio

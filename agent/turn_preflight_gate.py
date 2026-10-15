@@ -23,6 +23,28 @@ def _clear_preflight_output_state(agent: Any) -> None:
     agent._ephemeral_max_output_tokens = None
 
 
+def _arm_output_ceiling(agent: Any, shrunk: int) -> bool:
+    """Arm a turn output ceiling only when the builder would honor it.
+
+    Provider protocol floors (Anthropic manual-thinking ``budget_tokens + 4096``, Gemini's
+    thinking raise) win over the ceiling, so a route whose floor sits above ``shrunk`` gets no
+    ceiling at all; the caller's fit check then fails and the recover-or-withhold path runs.
+    """
+    previous = (getattr(agent, "_preflight_output_ceiling", None),
+                getattr(agent, "_ephemeral_max_output_tokens", None))
+    if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
+        agent._preflight_output_ceiling = shrunk
+    agent._ephemeral_max_output_tokens = shrunk
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens
+    cap, _enforced = effective_wire_max_output_tokens(agent)
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > shrunk:
+        agent._preflight_output_ceiling, agent._ephemeral_max_output_tokens = previous
+        logger.info("Pre-send fit: route output floor %s exceeds affordable cap %s; not lowering",
+                    f"{cap:,}", f"{shrunk:,}")
+        return False
+    return True
+
+
 def run_preflight_gate(
     agent: Any, *, request_pressure_tokens: Any, _moa_prepared_request: Any,
     pending_moa_prepared_request: Any, messages: Any, system_message: Any, user_message: Any,
@@ -75,10 +97,7 @@ def run_preflight_gate(
         # Input that fits with a useful answer runway only needs a smaller output cap, the
         # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
         shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
-        if shrunk is not None:
-            if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
-                agent._preflight_output_ceiling = shrunk
-            agent._ephemeral_max_output_tokens = shrunk
+        if shrunk is not None and _arm_output_ceiling(agent, shrunk):
             logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
     if (api_messages is not None and isinstance(window, int) and window > 0
             and getattr(agent, "api_mode", None) != "codex_app_server"
@@ -102,10 +121,7 @@ def run_preflight_gate(
             v.conversation_history = conversation_history_after_compression(agent, recovered)
             if can_shrink_output and not request_fits(agent, recovered, prompt, tools=tools_for_api):
                 shrunk = affordable_output_cap(agent, recovered, tools=tools_for_api)
-                if shrunk is not None:
-                    if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
-                        agent._preflight_output_ceiling = shrunk
-                    agent._ephemeral_max_output_tokens = shrunk
+                if shrunk is not None and _arm_output_ceiling(agent, shrunk):
                     logger.info("Post-recovery fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
             if request_fits(agent, recovered, prompt, tools=tools_for_api):
                 v._preflight_compression_blocked = False

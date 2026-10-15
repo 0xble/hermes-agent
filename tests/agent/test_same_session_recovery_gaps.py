@@ -474,3 +474,73 @@ def test_same_id_different_content_is_new_input_not_replaced_by_history(tmp_path
     assert [m["content"] for m in sent if m["role"] == "user"][-1] == "different accepted instruction"
     durable = [r["content"] for r in db.get_messages(agent.session_id, include_inactive=True) if r["role"] == "user"]
     assert durable == ["first version", "different accepted instruction"]
+
+
+# ── Preflight output ceiling never undercuts a provider thinking floor ──
+
+
+def test_anthropic_output_ceiling_keeps_manual_thinking_floor():
+    from agent.anthropic_adapter import anthropic_wire_output_cap, build_anthropic_kwargs
+    reasoning = {"enabled": True, "effort": "medium"}
+    kwargs = build_anthropic_kwargs(
+        "claude-3-7-sonnet-20250219", [{"role": "user", "content": "hi"}], None, None, reasoning,
+        context_length=64_000, output_ceiling=5_000,
+    )
+    assert kwargs["thinking"]["budget_tokens"] == 8_000
+    assert kwargs["max_tokens"] == 8_000 + 4_096 > kwargs["thinking"]["budget_tokens"]
+    assert anthropic_wire_output_cap(
+        "claude-3-7-sonnet-20250219", None, reasoning, context_length=64_000, output_ceiling=5_000,
+    ) == kwargs["max_tokens"]
+
+
+def test_preflight_does_not_report_fit_for_cap_below_anthropic_thinking_floor(tmp_path):
+    from agent.compression_recovery import affordable_output_cap, request_fits
+    from tests.agent.test_same_session_recovery import _anthropic_agent
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _anthropic_agent(db, "claude-3-7-sonnet-20250219")
+    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+    rows = [{"role": "user", "content": "input " * 35_500}]
+    shrunk = affordable_output_cap(agent, rows, tools=[])
+    assert shrunk is not None and shrunk <= 8_000  # a ceiling here would be <= budget_tokens
+    with patch.object(agent, "_compress_context", side_effect=lambda m, *a, **k: (m, "")):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    assert verdict.action == "break" and verdict.failed
+    assert agent._preflight_output_ceiling is None
+    assert not request_fits(agent, rows, "", wire=True, tools=[])
+    sent = agent._build_api_kwargs(rows)
+    assert sent["max_tokens"] > sent["thinking"]["budget_tokens"]
+    db.close()
+
+
+def test_chat_output_ceiling_keeps_gemini_thinking_raise():
+    from agent.transports.chat_completions import resolve_chat_max_tokens
+    reasoning = {"enabled": True, "effort": "medium"}
+    raised = resolve_chat_max_tokens("gemini-3-pro-preview", reasoning, None, 100_000)
+    assert resolve_chat_max_tokens("gemini-3-pro-preview", reasoning, 5_000, 100_000,
+                                   output_ceiling=5_000) == 65_535
+    assert resolve_chat_max_tokens("gemini-3-pro-preview", reasoning, None, 4_096,
+                                   output_ceiling=2_000) == 65_535
+    # Without a thinking raise the ceiling still lowers the cap.
+    assert resolve_chat_max_tokens("test/model", reasoning, None, 100_000, output_ceiling=5_000) == 5_000
+
+
+def test_preflight_does_not_arm_ceiling_below_gemini_thinking_raise(tmp_path):
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens
+    from agent.compression_recovery import request_fits
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    agent.api_mode = "chat_completions"
+    agent.model = "gemini-3-pro-preview"
+    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+    agent.context_compressor.context_length = 80_000
+    agent.max_tokens = 16_000
+    agent._ephemeral_max_output_tokens = None
+    rows = [{"role": "user", "content": "input " * 20_000}]
+    assert effective_wire_max_output_tokens(agent)[0] == 65_535
+    with patch.object(agent, "_compress_context", side_effect=lambda m, *a, **k: (m, "")):
+        verdict = _gate(agent, copy.deepcopy(rows), messages=rows)
+    assert verdict.action == "break" and verdict.failed
+    assert agent._preflight_output_ceiling is None
+    assert effective_wire_max_output_tokens(agent)[0] == 65_535
+    assert not request_fits(agent, rows, "", wire=True, tools=[])
+    db.close()

@@ -111,7 +111,10 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
 def _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events):
     """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
     followup = data.get("shutdown_follow_up") is True
-    if followup and input_already_durable(runner.session_store, session_id, data.get("message_id")):
+    if followup and input_already_durable(
+        runner.session_store, session_id, data.get("message_id"),
+        data.get("text"), data.get("text"),
+    ):
         # A previous boot's turn persisted this input before the restart cut it: the turn's own
         # resume_pending marker owns it now, and replaying the prompt could repeat tool effects.
         logger.info("Dropping recovered follow-up for %s: its turn already persisted it", key)
@@ -130,11 +133,13 @@ def _claim_recovered_followup(runner, key, session_id, data, path, source, autho
     return True
 
 
-def input_already_durable(store, session_id, message_id) -> bool:
-    """True when a turn already wrote this platform message as a user row of *session_id*.
+def input_already_durable(
+    store, session_id, message_id, user_message=None, persist_user_message=None,
+) -> bool:
+    """True when a turn wrote this id with the same logical input content.
 
-    The agent stamps the raw inbound id on the turn's user row at turn start, before the first
-    model call, so this is the turn's durable-start point for a replayed input.
+    The transcript wrapper can compare content itself.  A direct SessionDB has the row lookup but
+    only exposes the historical id-only probe, so compare its returned rows here instead.
     """
     probe = getattr(store, "has_platform_message_id", None)
     if not session_id or message_id is None or not callable(probe):
@@ -142,7 +147,28 @@ def input_already_durable(store, session_id, message_id) -> bool:
     try:
         tip_for = getattr(store, "_compression_tip_for_session_id", None)
         tip = tip_for(session_id) if callable(tip_for) else session_id
-        return any(bool(probe(sid, str(message_id))) for sid in dict.fromkeys((session_id, tip)) if sid)
+        session_ids = dict.fromkeys((session_id, tip))
+        get_rows = getattr(store, "get_messages_by_platform_message_id", None)
+        if user_message is not None or persist_user_message is not None:
+            from agent.turn_context import _same_trigger_content
+            if callable(get_rows):
+                return any(
+                    _same_trigger_content(row.get("content"), user_message, persist_user_message)
+                    for sid in session_ids if sid
+                    for row in get_rows(sid, str(message_id))
+                )
+            import inspect
+            try:
+                accepts_content = len(inspect.signature(probe).parameters) >= 4
+            except (TypeError, ValueError):
+                accepts_content = False
+            if not accepts_content:
+                return False
+            return any(
+                bool(probe(sid, str(message_id), user_message, persist_user_message))
+                for sid in session_ids if sid
+            )
+        return any(bool(probe(sid, str(message_id))) for sid in session_ids if sid)
     except Exception:
         logger.debug("Recovered follow-up durability probe failed for %s", session_id, exc_info=True)
         return False

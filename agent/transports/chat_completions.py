@@ -337,17 +337,18 @@ def _swap_developer_role(sanitized: list, model_lower: str) -> list:
 def resolve_chat_max_tokens(model: str, reasoning_config: Any, ephemeral: Any, max_tokens: Any,
                             profile_max: Any = None, output_ceiling: Any = None) -> Any:
     """Output-cap value the chat builder sends (before the provider's param-name mapping), or None
-    when the request omits it: one-shot cap, configured cap, then profile default, each raised for
-    Gemini thinking. A turn-scoped preflight ceiling is applied after provider-specific raises."""
+    when the request omits it: one-shot cap, configured cap, then profile default. A turn-scoped
+    preflight ceiling is applied first; provider protocol raises such as Gemini thinking win."""
     value = None
     for candidate in (ephemeral, max_tokens):
         if candidate is not None:
+            if output_ceiling is not None:
+                candidate = min(candidate, output_ceiling)
             value = _raise_gemini_thinking_max_tokens(model, reasoning_config, candidate)
             break
     if value is None and profile_max:
-        value = _raise_gemini_thinking_max_tokens(model, reasoning_config, profile_max)
-    if value is not None and output_ceiling is not None:
-        value = min(value, output_ceiling)
+        candidate = min(profile_max, output_ceiling) if output_ceiling is not None else profile_max
+        value = _raise_gemini_thinking_max_tokens(model, reasoning_config, candidate)
     return value
 
 

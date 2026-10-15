@@ -243,6 +243,32 @@ def test_followup_spool_whose_input_is_already_durable_is_dropped_not_replayed(t
     assert not list((tmp_path / "pending_messages").glob("*.json"))
 
 
+def test_followup_spool_with_same_id_but_corrected_text_is_replayed(tmp_path, monkeypatch):
+    """A reused platform id is not enough to retire a corrected shutdown follow-up."""
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="corrected side effect", source=source, user_id=source.user_id, message_id="m-9")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "original side effect", "platform_message_id": "m-9"})
+    assert recover_pending_to_db(
+        Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+        deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+    assert [event.text for event in runner._startup_restore_queue] == ["corrected side effect"]
+    assert list((tmp_path / "pending_messages").glob("*.json")), "replayed follow-up must keep its spool"
+
+
+def test_input_already_durable_compares_content_on_a_direct_session_db(tmp_path):
+    """A bare SessionDB has an id-only probe; content must still decide durability."""
+    from gateway.run_pending_recovery import input_already_durable
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = db.create_session("direct", "telegram")
+    db.append_message(sid, "user", "original", platform_message_id="m-10")
+    assert input_already_durable(db, sid, "m-10", "original", "original")
+    assert not input_already_durable(db, sid, "m-10", "corrected", "corrected")
+    db.close()
+
+
 def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_error(tmp_path, monkeypatch):
     runner, _adapter, entry, _source = _setup(tmp_path, monkeypatch)
     entry.origin = None

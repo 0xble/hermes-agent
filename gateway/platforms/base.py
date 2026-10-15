@@ -4227,7 +4227,9 @@ class BasePlatformAdapter(ABC):
                         # Preserve the event for shutdown spooling when durable admission is temporarily
                         # unavailable. Sender attribution was checked above, so this merge is safe.
                         merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                        event._gateway_accepted = True
+                        # The in-memory merge preserves the only copy for shutdown spooling, but
+                        # checkpoint failure means the transport must not acknowledge this update.
+                        event._gateway_accepted = False
                         return
                 return
         now = time.monotonic()
