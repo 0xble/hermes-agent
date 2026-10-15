@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+outcome_logger = logging.getLogger("gateway.run")
 
 # Reason tag for transcript messages dropped by the in-memory pending cap during live
 # operation. Payloads carry the full transcript message dict for verbatim replay.
@@ -602,10 +603,10 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         claim = deferred_followup(session_key, session_id, data, path)
         if claim is DROP_PENDING:
             return DROP_PENDING
-        if data.get("_recovery_stale") is True and (claim is None or claim is False):
-            # The owner could not even route a note for it; keep the old expiry rather than
-            # retaining a day-old input forever.
-            logger.warning("Dropping expired drain-deferred message from %s", path)
+        if data.get("_recovery_stale") is True and claim is False:
+            outcome_logger.info(
+                "Restart recovery outcome: session=%s outcome=%s",
+                session_key, "skipped:stale:note-unavailable")
             return DROP_PENDING
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)

@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import time
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -657,3 +659,70 @@ async def test_legacy_text_only_shutdown_followup_is_retained_while_note_cannot_
     db.append_message.assert_not_called()
     assert spool.exists()
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_stale_shutdown_followup_waits_for_offline_adapter_then_notes_and_quarantines(
+        tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="stale question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    old = time.time() - 2 * 24 * 60 * 60
+    os.utime(spool, (old, old))
+    runner._delivery_adapter_for = lambda source: None
+    runner._intake_adapter_for = lambda source: None
+    db = Mock()
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=partial(_defer_followup, runner, {}, None),
+        )
+    assert spool.exists()
+    assert _outcome_lines(caplog) == []
+
+    runner._delivery_adapter_for = lambda source: adapter
+    runner._intake_adapter_for = lambda source: adapter
+    ran = []
+
+    async def handle(recovered):
+        ran.append(recovered.text)
+        recovered._agent_turn_succeeded = True
+
+    adapter.set_message_handler(handle)
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=partial(_defer_followup, runner, {}, None),
+        ) == 1
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+
+    assert ran == []
+    assert len(adapter.sent) == 1
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:stale:noted"]
+    assert not spool.exists()
+    assert spool.with_name(spool.name + ".bad").exists()
+
+
+def test_stale_shutdown_followup_drop_logs_note_unavailable_outcome_once(
+        tmp_path, monkeypatch, caplog):
+    runner, _adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="stale question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    old = time.time() - 2 * 24 * 60 * 60
+    os.utime(spool, (old, old))
+    db = Mock()
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=lambda *args: False,
+        ) == 0
+
+    assert not spool.exists()
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:stale:note-unavailable"]
