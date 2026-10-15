@@ -178,15 +178,23 @@ def _slot_labels(home: Path) -> tuple[str, str]:
             os.environ["HERMES_HOME"] = old
 
 
+_PEER_VERIFIED: set[str] = set()  # one successful observer lookup per peer per process
+
+
 def _peer_username(effects: Effects, peer: str) -> str | None:
     """Resolve ``peer`` to the drill bot only by its fixed user id (the observer is the telegram CLI,
     not code under test). Returns ``BOT_USERNAME`` when ``peer`` is that id or that username and the
     id is present in the user's chat list, else None."""
     if str(peer).lstrip("@").lower() not in {str(BOT_USER_ID), BOT_USERNAME}:
         return None
+    if peer in _PEER_VERIFIED:
+        return BOT_USERNAME
     data = _telegram_json(["--agent", "chats", "--limit", "200"])
     items = data if isinstance(data, list) else []
-    return BOT_USERNAME if any(isinstance(c, Mapping) and c.get("id") == BOT_USER_ID for c in items) else None
+    if any(isinstance(c, Mapping) and c.get("id") == BOT_USER_ID for c in items):
+        _PEER_VERIFIED.add(peer)
+        return BOT_USERNAME
+    return None
 
 
 def _would_kill_production_gateway(effects: Effects, labels: tuple[str, str]) -> bool:

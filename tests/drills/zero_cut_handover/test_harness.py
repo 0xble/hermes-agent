@@ -252,10 +252,12 @@ def test_peer_resolver_requires_the_drill_bot_id_in_the_real_chat_list_shape(mon
         calls.append(argv)
         return harness.CommandResult(stdout=json.dumps(chats))
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.setattr(harness, "_PEER_VERIFIED", set())
     effects = FakeWorld(Path("/tmp")).effects()
     assert harness._peer_username(effects, "8899335561") == "brianle_hermes_handover_bot"
     assert harness._peer_username(effects, "@brianle_hermes_handover_bot") == "brianle_hermes_handover_bot"
     assert calls and calls[0][0] == harness.TELEGRAM
     assert harness._peer_username(effects, "2027045491") is None  # never the live bot or the user
     chats.pop(0)
+    harness._PEER_VERIFIED.clear()
     assert harness._peer_username(effects, "8899335561") is None  # id must exist in the account
