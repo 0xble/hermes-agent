@@ -56,6 +56,16 @@ kernel was evicted earlier or killed at the boundary. Remote kernels share the
 cap without an eviction note; a dead or disconnected remote kernel reports
 `kernel.state_lost`.
 
+## Foreground heavy-slot queue waits
+
+Foreground local heavy commands now bound their shared-slot admission wait to
+`min(120, max(10, effective_timeout // 3))` via `HEAVY_SLOT_MAX_WAIT`, while
+background commands keep the helper's unbounded wait. Exit 75 from a bounded wait
+states that the command did not run, preserves the queue position in the helper
+output, and directs the next attempt to background execution with completion
+notification. Provenance: 1,196 terminal calls timed out over two days, including
+432 pytest and 202 unittest calls; dotfiles#941 added the host helper support.
+
 ## Retirement
 
 Retire when an upstream equivalent preserves unread pending tool results and
