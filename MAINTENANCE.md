@@ -173,6 +173,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Agent friction repairs | Preserve unread pending tool results during dedupe and tell execute_code when an LRU kernel eviction discarded state | Context-pruning dedupe, session-kernel eviction, or their regression tests | [Agent friction repairs](maintenance/agent-friction-repairs.md) |
 | Secret-safe provider diagnostics | Check the selected custom HTTP endpoint without exposing credentials through argv, responses or logs | Provider diagnostic helper, credential resolution or output/logging changes | [Secret-safe provider diagnostics](maintenance/io-safe-provider-probe.md) |
 | Provider-reported cost | Capture a provider's finite per-call billed amount and persist it so every existing reader displays it exactly once, without changing estimated/actual combine semantics | Usage normalization, `estimate_usage_cost`, main-turn cost persistence, or `update_token_counts` cost columns | [Provider-reported cost](maintenance/provider-reported-cost.md) |
+| Desktop checkout-source hand-off fixture | The source hand-off test's spawn mock echoes the Desktop's `HERMES_UPDATE_STARTED_AT` instead of re-reading the clock, so legacy claim correlation cannot miss on a second boundary | `apps/desktop/electron/updater/checkout-source.test.ts` or legacy hand-off started-at correlation changes | [Desktop checkout-source hand-off fixture](maintenance/desktop-checkout-source-fixture.md) |
 
 ## Active patch record: relay silence (S1)
 

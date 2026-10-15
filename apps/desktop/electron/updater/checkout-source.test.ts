@@ -14,6 +14,8 @@ import * as updaterProcess from '../updater-process'
 import { type CheckoutStrategyDeps, createCheckoutStrategy } from './checkout'
 import { readSourceUpdate, type SourceUpdate } from './checkout-source'
 
+import type { UpdaterApplyResultWire } from './index'
+
 const execute: typeof execFile.__promisify__ = promisify(execFile)
 const repository: string = path.resolve(import.meta.dirname, '../../../..')
 const python: string = process.env.HERMES_PYTHON || 'python3'
@@ -424,8 +426,13 @@ urllib.request.build_opener = local_build
       (command: string, args: string[], options: SpawnOptions): updaterProcess.UpdaterChild => {
         spawned.push({ command, args, options })
         // C2: a hand-off has started only once the script takes the Desktop's
-        // bridge marker in its own (live, foreign) name — do that here.
-        fs.writeFileSync(markerPath(home), `${process.ppid}\n${Math.floor(Date.now() / 1000)}\n`)
+        // bridge marker in its own (live, foreign) name — do that here. The
+        // fixture script has no protocol line, so the claim is correlated by
+        // started-at: echo HERMES_UPDATE_STARTED_AT like posix.sh does. A fresh
+        // Date.now() here disagrees with the Desktop's value whenever a
+        // wall-clock second ticks between the two reads (likely under load),
+        // and the hand-off then fails with updater-spawn-failed.
+        fs.writeFileSync(markerPath(home), `${process.ppid}\n${options.env?.HERMES_UPDATE_STARTED_AT}\n`)
 
         return { unref: (): void => {} }
       }
@@ -459,7 +466,11 @@ urllib.request.build_opener = local_build
       fs.writeFileSync(script, '')
       // The hand-off itself re-resolves through the real forced Python probe, not the replay.
       replayedSourceUpdate = undefined
-      expect(await strategy.apply()).toMatchObject({ ok: true, handedOff: true })
+      const applied: UpdaterApplyResultWire = await strategy.apply()
+      expect(applied, JSON.stringify({ applied, log: vi.mocked(deps.rememberLog).mock.calls })).toMatchObject({
+        ok: true,
+        handedOff: true
+      })
       const handoff: (typeof spawned)[number] | undefined = spawned.pop()
       // The update ran and released its claim; the next apply starts clean.
       fs.rmSync(markerPath(home), { force: true })
