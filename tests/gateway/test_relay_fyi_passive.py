@@ -48,6 +48,9 @@ def runner(monkeypatch):
         append_to_transcript=store.append_to_transcript,
     )
     runner._test_store = store
+    runner._sessions = {}
+    runner._is_session_running = MagicMock(return_value=False)
+    runner._refresh_agent_cache_message_count = AsyncMock()
 
     async def run_in_executor(fn, *args, **kwargs):
         return fn(*args, **kwargs)
@@ -89,6 +92,16 @@ async def test_fyi_is_persisted_unchanged_without_a_turn(runner):
             },
         )
     ]
+    runner._refresh_agent_cache_message_count.assert_awaited_once_with("session-key", "target-session")
+
+
+@pytest.mark.asyncio
+async def test_idle_fyi_rechecks_session_before_persisting(runner):
+    runner._is_session_running = MagicMock(side_effect=[True])
+    event = _event(FYI)
+
+    assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key") is False
+    assert runner._test_store.rows == []
 
 
 @pytest.mark.asyncio
@@ -176,13 +189,52 @@ async def test_unbound_session_keeps_turn_path(runner):
 
 @pytest.mark.asyncio
 async def test_busy_fyi_is_queued_for_ordered_idle_persistence(runner):
-    runner._queue_or_replace_pending_event = MagicMock()
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
     event = _event(FYI)
 
     assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key", busy=True) is True
     runner._queue_or_replace_pending_event.assert_called_once_with("session-key", event)
     assert event._gateway_accepted is True
     assert runner._test_store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_busy_fyi_queue_failure_is_not_marked_accepted(runner):
+    runner._queue_or_replace_pending_event = MagicMock(return_value=False)
+    event = _event(FYI)
+
+    assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key", busy=True) is False
+    assert event._gateway_accepted is False
+    assert runner._test_store.rows == []
+
+
+class _DrainAdapter:
+    def __init__(self, event):
+        self._pending_messages = {"session-key": event}
+
+    def get_pending_message(self, session_key):
+        return self._pending_messages.pop(session_key, None)
+
+
+@pytest.mark.asyncio
+async def test_busy_fyi_is_persisted_by_post_turn_drain_without_followup(runner):
+    event = _event(FYI)
+    adapter = _DrainAdapter(event)
+    runner._test_store.rows.extend([
+        ("target-session", {"role": "user", "content": "current turn"}),
+        ("target-session", {"role": "assistant", "content": "completed"}),
+    ])
+    runner._run_agent = AsyncMock(side_effect=AssertionError("passive FYI started a follow-up turn"))
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {"final_response": "completed"}, adapter, event.source, "session-key",
+    )
+
+    assert pending_event is None
+    assert pending is None
+    assert [row[1]["content"] for row in runner._test_store.rows] == ["current turn", "completed", FYI]
+    runner._refresh_agent_cache_message_count.assert_awaited_once_with("session-key", "target-session")
+    runner._run_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio

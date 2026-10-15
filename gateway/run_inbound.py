@@ -334,12 +334,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return True
 
     async def _hm_try_passive_fyi_relay(
-        self, event: "MessageEvent", source: SessionSource, session_key: str, *, busy: bool = False,
+        self, event: "MessageEvent", source: SessionSource, session_key: str, *,
+        busy: bool = False, after_turn: bool = False,
     ) -> bool:
         """Persist one unaddressed Telegram FYI relay without creating an agent turn.
 
-        A busy session queues the event through the normal FIFO and lets the idle path persist it after
-        the current turn, preserving turn ordering. Anything uncertain falls back to normal handling.
+        A busy session queues the event through the normal FIFO and lets the post-turn drain persist it
+        after the current turn, preserving turn ordering. Anything uncertain falls back to normal
+        handling. ``after_turn`` is used only by that drain: the outer turn is still marked active while
+        its already-flushed rows are followed by this passive row.
         """
         from gateway.response_filters import is_fyi_relay_text
         if (
@@ -352,15 +355,18 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             or not is_fyi_relay_text(getattr(event, "text", None))
         ):
             return False
-        session_store = getattr(self, "async_session_store", None)
-        if session_store is None:
-            return False
+        session_store = self.async_session_store
         try:
             session_entry = await session_store.lookup_by_session_key(session_key)
         except Exception:
             logger.debug("FYI relay session lookup failed; falling back to a turn", exc_info=True)
             return False
         if session_entry is None or not getattr(session_entry, "session_id", None):
+            return False
+        # The idle admission path has several awaits between its first running check and this point.
+        # Re-check the same sentinel-backed guard before doing any transcript write; a turn that began
+        # meanwhile must own the FYI through the ordinary interrupt/turn path instead.
+        if not busy and not after_turn and self._is_session_running(session_key):
             return False
 
         def _active_wakes():
@@ -371,7 +377,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return load_goal(session_entry.session_id), load_loop(session_entry.session_id)
 
         try:
-            goal_state, loop_state = await getattr(self, "_run_in_executor_with_context")(_active_wakes)
+            goal_state, loop_state = await self._run_in_executor_with_context(_active_wakes)
         except Exception:
             logger.debug("FYI relay goal/loop lookup failed; falling back to a turn", exc_info=True)
             return False
@@ -381,9 +387,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         ):
             return False
         if busy:
-            getattr(self, "_queue_or_replace_pending_event")(session_key, event)
-            event._gateway_accepted = True
-            return True
+            accepted = self._queue_or_replace_pending_event(session_key, event)
+            event._gateway_accepted = accepted
+            return accepted
+        if not after_turn and self._is_session_running(session_key):
+            return False
 
         timestamp = getattr(event, "timestamp", None)
         try:
@@ -393,14 +401,17 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         row = {"role": "user", "content": event.text, "timestamp": timestamp}
         if getattr(event, "message_id", None):
             row["message_id"] = str(event.message_id)
-        session_store = getattr(self, "async_session_store", None)
-        if session_store is None:
-            return False
         try:
             await session_store.append_to_transcript(session_entry.session_id, row)
         except Exception:
             logger.warning("FYI relay transcript append failed; falling back to a turn", exc_info=True)
             return False
+        try:
+            await self._refresh_agent_cache_message_count(session_key, session_entry.session_id)
+        except Exception:
+            # The transcript row is already durable; cache continuity is best effort and must not
+            # turn a successful passive admission into a model turn.
+            logger.debug("FYI relay agent-cache rebaseline failed", exc_info=True)
         return True
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
@@ -1638,8 +1649,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
             return _result
+        # Commands and passive-relay admission both await. A turn can claim the session during those
+        # awaits, so route through the busy-session path instead of appending an FYI mid-transcript.
+        if self._is_session_running(_quick_key):
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
         if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
             return None
+        if self._is_session_running(_quick_key):
+            return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.

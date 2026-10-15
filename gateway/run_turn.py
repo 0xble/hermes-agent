@@ -4118,7 +4118,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+            if pending_event and await self._hm_try_passive_fyi_relay(
+                pending_event, pending_event.source, session_key, after_turn=True,
+            ):
+                # Passive FYIs are already durable in transcript order after the completed turn. Do not
+                # hand them to _run_agent_queued_followup: that path is a real model turn and would make
+                # a busy-session FYI behave differently from an idle one.
+                pending_event = None
+            elif result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if result.get("interrupt_source") or _is_control_interrupt_message(interrupt_message):
                     logger.info(
