@@ -107,11 +107,11 @@ def _slot_plist_path(label: str) -> Path:
     return get_launchd_plist_path().with_name(f"{label}.plist")
 
 
-def _failure(effects: HandoverEffects, standby_label: str, message: str, *, cleanup: bool = True) -> int:
+def _failure(effects: HandoverEffects, idle_label: str, message: str, *, cleanup: bool = True) -> int:
     if cleanup:
         try:
             assert effects.bootout is not None
-            effects.bootout(standby_label)
+            effects.bootout(idle_label)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:  # cleanup must not hide the handover reason
             print(f"✗ {message}; also failed to boot out standby: {exc}")
             return 1
@@ -129,90 +129,110 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         return 2
 
     from hermes_cli.gateway_launchd import generate_launchd_plist, get_launchd_slot_labels
-    active_label, standby_label = get_launchd_slot_labels()
+    labels = get_launchd_slot_labels()
+    label_by_slot = {SLOT_ACTIVE: labels[0], SLOT_STANDBY: labels[1]}
     snapshots = {slot: _slot_snapshot(fx, home, slot) for slot in (SLOT_ACTIVE, SLOT_STANDBY)}
     active_slots = [slot for slot, (identity, _status) in snapshots.items()
                     if identity is not None and identity.get("standby") is False]
     if len(active_slots) != 1:
-        return _failure(fx, standby_label, f"refusing handover: expected exactly one active slot, found {len(active_slots)}", cleanup=False)
+        return _failure(fx, labels[1], f"refusing handover: expected exactly one active slot, found {len(active_slots)}", cleanup=False)
     active_slot = active_slots[0]
-    if active_slot != SLOT_ACTIVE:
-        return _failure(fx, standby_label, "reverse handover not supported yet (only active slot a → standby slot b)", cleanup=False)
+    idle_slot = SLOT_STANDBY if active_slot == SLOT_ACTIVE else SLOT_ACTIVE
+    active_label = label_by_slot[active_slot]
+    idle_label = label_by_slot[idle_slot]
 
-    idle_identity, idle_status = snapshots[SLOT_STANDBY]
-    if idle_identity is not None and idle_identity.get("standby") is not True:
-        return _failure(fx, standby_label, "refusing handover: idle slot is active", cleanup=False)
+    idle_identity, idle_status = snapshots[idle_slot]
+    idle_snapshot = idle_identity or idle_status
+    if idle_snapshot is not None and idle_snapshot.get("standby") is not True:
+        return _failure(fx, idle_label, "refusing handover: idle slot is active", cleanup=False)
     reused = idle_identity is not None or idle_status is not None
     if reused and not bool((idle_status or idle_identity or {}).get("ready")):
-        return _failure(fx, standby_label, "refusing handover: standby slot is running but not ready")
+        return _failure(fx, idle_label, "refusing handover: standby slot is running but not ready")
 
     if not reused:
         assert fx.bootstrap is not None and fx.write_plist is not None
-        plist_path = _slot_plist_path(standby_label)
-        fx.write_plist(plist_path, generate_launchd_plist(slot=SLOT_STANDBY))
+        plist_path = _slot_plist_path(idle_label)
+        fx.write_plist(plist_path, generate_launchd_plist(slot=idle_slot))
         try:
-            fx.bootstrap(standby_label, plist_path)
+            fx.bootstrap(idle_label, plist_path)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            print(f"✗ could not bootstrap standby {standby_label}: {exc}")
+            print(f"✗ could not bootstrap standby {idle_label}: {exc}")
             return 1
 
     budget_deadline = _deadline(fx, timeout)
     if not _poll(fx, budget_deadline, lambda: bool(
-        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("ready") is True and
-        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("standby") is True)):
-        return _failure(fx, standby_label, "standby did not become ready before the handover budget expired")
+        (_query(fx, home, "status", idle_slot) or {}).get("ready") is True and
+        (_query(fx, home, "status", idle_slot) or {}).get("standby") is True)):
+        return _failure(fx, idle_label, "standby did not become ready before the handover budget expired")
 
-    accepted = _query(fx, home, "handover", SLOT_ACTIVE)
+    accepted = _query(fx, home, "handover", active_slot)
     if not accepted or accepted.get("accepted") is not True:
-        return _failure(fx, standby_label, f"active gateway refused handover: {accepted or 'no response'}")
+        return _failure(fx, idle_label, f"active gateway refused handover: {accepted or 'no response'}")
 
+    old_identity, old_status = snapshots[active_slot]
+    old_pid = ((old_identity or {}).get("pid") or (old_status or {}).get("pid"))
     state_holder: list[dict[str, Any] | None] = [None]
-    if not _poll(fx, budget_deadline, lambda: _handover_released(fx, home, state_holder, SLOT_ACTIVE)):
+    if not _poll(fx, budget_deadline,
+                 lambda: _handover_released(fx, home, state_holder, active_slot, old_pid)):
         state = state_holder[0]
         reason = (state or {}).get("failed") or (state or {}).get("reason") or "active gateway failed to release the token lock"
-        return _failure(fx, standby_label, str(reason))
+        return _failure(fx, idle_label, str(reason))
     handover_state = state_holder[0]
     if (handover_state or {}).get("failed") or (handover_state or {}).get("status") == "failed":
-        return _failure(fx, standby_label, str((handover_state or {}).get("failed") or "handover failed"))
+        return _failure(fx, idle_label, str((handover_state or {}).get("failed") or "handover failed"))
 
-    promoted = _query(fx, home, "promote", SLOT_STANDBY)
+    promoted = _query(fx, home, "promote", idle_slot)
     failed = (promoted or {}).get("failed") or []
     if failed:
         print(f"⚠ promotion reported failed platforms: {', '.join(map(str, failed))}")
     if not promoted or promoted.get("promoted") is not True:
-        return _failure(fx, standby_label, f"standby promotion failed: {promoted or 'no response'}")
-    # From here the standby owns Telegram: no failure path may boot it out.
+        return _failure(fx, idle_label, f"standby promotion failed: {promoted or 'no response'}")
+    # From here the idle slot owns Telegram: no failure path may boot it out.
     if not _poll(fx, budget_deadline, lambda: bool(
-        (_query(fx, home, "status", SLOT_STANDBY) or {}).get("standby") is False)):
-        print(f"⚠ {standby_label} accepted promotion but has not reported active status yet; leaving it running")
+        (_query(fx, home, "status", idle_slot) or {}).get("standby") is False)):
+        print(f"⚠ {idle_label} accepted promotion but has not reported active status yet; leaving it running")
 
     # The old slot finishes its own in-flight turns with no drain budget (zero-cut), then exits 0.
-    old_pid = ((snapshots[SLOT_ACTIVE][0] or {}).get("pid") or
-               (snapshots[SLOT_ACTIVE][1] or {}).get("pid"))
-    print(f"… {standby_label} is serving; waiting for {active_label} to finish its in-flight turns and exit")
-    _poll(fx, float("inf"), lambda: _old_active_exited(fx, home, old_pid))
+    print(f"… {idle_label} is serving; waiting for {active_label} to finish its in-flight turns and exit")
+    _poll(fx, float("inf"), lambda: _old_active_exited(fx, home, old_pid, active_slot))
     assert fx.bootout is not None
     try:
         fx.bootout(active_label)
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f"✗ new standby is promoted, but could not boot out old slot {active_label}: {exc}")
-        return 1
-    print(f"✓ Gateway handover complete: {active_label} → {standby_label}")
+        if _query(fx, home, "identify", active_slot) is None:
+            print(f"⚠ {active_label} was already gone after promotion; continuing")
+        else:
+            print(f"✗ new standby is promoted, but could not boot out old slot {active_label}: {exc}")
+            return 1
+    print(f"✓ Gateway handover complete: {active_label} → {idle_label}")
     return 0
 
 
-def _handover_released(fx: HandoverEffects, home: Path, holder: list[Any], slot: str) -> bool:
+def _handover_released(fx: HandoverEffects, home: Path, holder: list[Any], slot: str,
+                      old_pid: Any) -> bool:
     state = _query(fx, home, "handover-status", slot)
     holder[0] = state
-    if not state:
-        return False
-    if state.get("failed") or state.get("status") == "failed":
+    if state and (state.get("failed") or state.get("status") == "failed"):
         return True
-    return state.get("token_lock_released") is True
+    if state and state.get("token_lock_released") is True:
+        return True
+    identity = _query(fx, home, "identify", slot)
+    dead = identity is None
+    if not dead and old_pid is not None:
+        try:
+            dead = not fx.process_exists(int(old_pid))
+        except (TypeError, ValueError, OSError):
+            dead = False
+    if dead:
+        if not isinstance(holder[0], dict) or not holder[0].get("active_died"):
+            print(f"⚠ active slot {slot} died mid-drain; treating its token lock as released")
+            holder[0] = {**(state or {}), "active_died": True}
+        return True
+    return False
 
 
-def _old_active_exited(fx: HandoverEffects, home: Path, pid: Any) -> bool:
-    identity = _query(fx, home, "identify", SLOT_ACTIVE)
+def _old_active_exited(fx: HandoverEffects, home: Path, pid: Any, slot: str) -> bool:
+    identity = _query(fx, home, "identify", slot)
     if identity is None:
         return True
     try:
