@@ -362,13 +362,13 @@ MATCH_LINES_CAP = 20
 
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
                            replace_all: bool = False, *,
-                           diagnostics: Optional[dict] = None) -> tuple[str, int, Optional[str], Optional[str]]:
+                           diagnostics: Optional[dict] = None,
+                           correction_notes: Optional[list[str]] = None) -> tuple[str, int, Optional[str], Optional[str]]:
     """Find and replace via the strategy chain.
 
     Returns ``(new_content, match_count, strategy_name, error)``; on failure
-    ``(content, 0, None, error)``. When supplied, ``diagnostics`` receives
-    the ambiguous match_count and up to MATCH_LINES_CAP 1-based starting
-    match_lines, with match_lines_truncated set when more exist.
+    ``(content, 0, None, error)``. Successful escape corrections append their
+    explanation to ``correction_notes`` when supplied by a tool caller.
     """
     if not old_string:
         # Actionable recovery text: a terse "cannot be empty" leaves the model

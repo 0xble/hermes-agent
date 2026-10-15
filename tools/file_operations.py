@@ -1624,6 +1624,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
         from tools.fuzzy_match import boundary_note, fuzzy_find_and_replace
         diagnostics: dict = {}
+        correction_notes: list[str] = []
         new_content, match_count, strategy, error = fuzzy_find_and_replace(
             content, old_string, new_string, replace_all, diagnostics=diagnostics, correction_notes=correction_notes)
         if error or match_count == 0:
