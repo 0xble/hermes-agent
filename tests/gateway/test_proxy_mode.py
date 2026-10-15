@@ -314,6 +314,101 @@ class TestRunAgentProxyDispatch:
         assert len([row for row in store.rows if row.get("role") == "user"]) == 1
         assert len([row for row in store.rows if row.get("role") == "assistant"]) == 1
 
+    @pytest.mark.asyncio
+    async def test_recovered_proxy_turn_persists_assistant_row_to_local_session_db(self, monkeypatch):
+        """A local session DB must not make closeout skip the DB for a proxy reply: the remote
+        agent never wrote to this gateway's DB, so the assistant row must land beside the
+        pre-written user row."""
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        source = _make_source()
+
+        class _DbStore:
+            """Mirrors SessionTranscript: skip_db=True rows reach only the JSONL mirror."""
+
+            def __init__(self):
+                self.db_rows = []
+
+            async def has_platform_message_id(self, session_id, platform_message_id):
+                return any(row.get("platform_message_id") == platform_message_id for row in self.db_rows)
+
+            async def append_to_transcript(self, session_id, row, skip_db=False):
+                if not skip_db:
+                    self.db_rows.append(dict(row))
+
+        store = _DbStore()
+        monkeypatch.setattr(GatewayRunner, "async_session_store", property(lambda _self: store))
+
+        async def _proxy(**kwargs):
+            return {
+                "final_response": "remote answer",
+                "messages": [
+                    {"role": "user", "content": "recovered follow-up"},
+                    {"role": "assistant", "content": "remote answer"},
+                ],
+                "history_offset": 0,
+                "tools": [],
+            }
+
+        runner._run_agent_via_proxy = _proxy
+        result = await runner._run_agent_inner(
+            message="recovered follow-up", context_prompt="", history=[], source=source,
+            session_id="test-session-123", session_key="test-key", run_generation=7,
+            recovery_id="hermes-recovery-123", persist_user_message="recovered follow-up",
+            persist_user_timestamp=123.0,
+        )
+        # A real local session DB is configured on this gateway.
+        runner._session_db_pinned = object()
+        runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+        runner._refresh_agent_cache_message_count = AsyncMock()
+        await runner._hmwa_persist_turn_transcript(
+            event=types.SimpleNamespace(
+                message_id=None, _hermes_recovery_id="hermes-recovery-123", internal=True,
+            ),
+            source=source,
+            session_entry=types.SimpleNamespace(session_id="test-session-123", session_key="test-key"),
+            session_key="test-key",
+            agent_result=result,
+            agent_messages=result["messages"],
+            prepared=types.SimpleNamespace(
+                history=[], message_text="recovered follow-up", persist_user_message="recovered follow-up",
+                persist_user_timestamp=123.0, persist_user_display_kind=None, persistence_owner=None,
+                hygiene_adoption_epoch=0,
+            ),
+            response="remote answer",
+            agent_failed_early=False,
+            hidden_reasoning_incomplete=False,
+            is_context_overflow_failure=False,
+        )
+        user_rows = [row for row in store.db_rows if row.get("role") == "user"]
+        assistant_rows = [row for row in store.db_rows if row.get("role") == "assistant"]
+        assert len(user_rows) == 1
+        assert user_rows[0]["platform_message_id"] == "hermes-recovery-123"
+        assert [row["content"] for row in assistant_rows] == ["remote answer"]
+
+    @pytest.mark.asyncio
+    async def test_legacy_idless_proxy_recovery_does_not_use_session_key_as_message_id(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        rows = []
+
+        class _Store:
+            async def has_platform_message_id(self, session_id, platform_message_id):
+                return any(row.get("platform_message_id") == platform_message_id for row in rows)
+
+            async def append_to_transcript(self, session_id, row, **kwargs):
+                rows.append(dict(row))
+
+        monkeypatch.setattr(GatewayRunner, "async_session_store", property(lambda _self: _Store()))
+        for text in ("first legacy follow-up", "second legacy follow-up"):
+            assert await runner._hmwa_persist_proxy_recovery_user_row(
+                session_id="s", message=text, inbound_message_id=None, recovery_id=None,
+                recovery_session_key="test-key", persist_user_message=None, persist_user_timestamp=1.0,
+                persist_user_display_kind=None, persist_user_display_metadata=None,
+            ) is True
+        assert [row["content"] for row in rows] == ["first legacy follow-up", "second legacy follow-up"]
+        assert all("platform_message_id" not in row for row in rows)
+
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
 

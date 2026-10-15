@@ -2021,7 +2021,9 @@ class GatewayTurnMixin:
         if recovery_id is None and recovery_session_key is None:
             return False
         store = self.async_session_store
-        platform_message_id = inbound_message_id or recovery_id or recovery_session_key
+        # A legacy id-less recovery has no dedupe key of its own; never stamp the session key as
+        # one (it would collide across recoveries). Restart recovery uses its content fallback.
+        platform_message_id = inbound_message_id or recovery_id
         row = {
             "role": "user",
             "content": persist_user_message if persist_user_message is not None else message,
@@ -2086,6 +2088,10 @@ class GatewayTurnMixin:
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
         _proxy_user_row_persisted = bool(agent_result.get("_gateway_user_turn_persisted"))
+        if _proxy_user_row_persisted:
+            # A proxy turn ran remotely and never wrote this gateway's session DB; the pre-dispatch
+            # user row went to the DB, so the assistant side must too (skip_db=False).
+            agent_persisted = False
 
         if is_context_overflow_failure:
             pass  # Skip all transcript writes — don't grow a broken session
@@ -4149,16 +4155,26 @@ class GatewayTurnMixin:
             # before spooling; otherwise _serialise_value has no author or transport identity to
             # preserve and restart recovery must decline it as an unsafe shared-chat input.
             spool_value = pending_event if pending_event and pending_event.text else pending
+            # Only a non-shared session (DM or per-user key) has a single participant who must
+            # be the author. In a shared session another participant may have sent the leftover,
+            # so leave it unauthored: recovery then declines it visibly instead of running it as
+            # the wrong user.
+            _bind_turn_author = (isinstance(source, SessionSource)
+                                 and not self._is_shared_session_source(source))
             if isinstance(spool_value, str):
                 import uuid
                 from gateway.platforms.base import MessageEvent
+                from gateway.session_identity import replace_source
                 # A leftover /steer or interrupt text has no transport id of its own (reusing the
                 # turn's message id would make recovery mistake it for the answered predecessor),
                 # so give it the recovery-only dedupe key internal follow-ups already use.
-                spool_value = MessageEvent(text=spool_value, source=source,
-                                           user_id=getattr(source, "user_id", None))
+                spool_source = source if _bind_turn_author or not isinstance(source, SessionSource) else (
+                    replace_source(source, user_id=None, user_name=None, user_id_alt=None))
+                spool_value = MessageEvent(text=spool_value, source=spool_source,
+                                           user_id=getattr(spool_source, "user_id", None))
                 setattr(spool_value, "_hermes_recovery_id", f"hermes-recovery-{uuid.uuid4().hex}")
-            elif spool_value is not None and not getattr(spool_value, "internal", False):
+            elif (spool_value is not None and _bind_turn_author
+                    and not getattr(spool_value, "internal", False)):
                 event_source = getattr(spool_value, "source", None) or source
                 if (isinstance(event_source, SessionSource) and not event_source.user_id
                         and getattr(source, "user_id", None)):

@@ -604,6 +604,51 @@ async def test_draining_string_followup_is_spooled_with_authorship_then_recovere
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shared", ["group", "thread"])
+async def test_draining_string_followup_in_shared_session_is_unauthored_and_declined(
+        tmp_path, monkeypatch, caplog, shared):
+    """In a shared session another participant may have sent the leftover text, so the turn's
+    author must not be stamped on it: recovery declines it visibly instead of running it."""
+    runner, adapter, _entry, _source = _setup(tmp_path, monkeypatch)
+    runner.config.group_sessions_per_user = shared != "group"
+    runner.config.thread_sessions_per_user = False
+    source = make_restart_source(chat_id="-100777", chat_type="group",
+                                 thread_id="42" if shared == "thread" else None)
+    entry = runner.session_store.get_or_create_session(source)
+    runner._draining = True
+    monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda adapter, key: None)
+    runner._promote_queued_event = lambda key, adapter, event: event
+    event, text = await runner._run_agent_drain_pending(
+        {"final_response": "done", "pending_steer": "someone else's steer"}, adapter, source, entry.session_key)
+    assert event is None and text is None
+    [spool] = list((tmp_path / "pending_messages").glob("*.json"))
+    data = json.loads(spool.read_text())["data"]
+    assert not data.get("source_user_id") and not data.get("user_id")
+
+    runner._draining = False
+    ran = []
+
+    async def handle(recovered):
+        ran.append(recovered.text)
+        recovered._agent_turn_succeeded = True
+
+    adapter.set_message_handler(handle)
+    db = Mock()
+    with caplog.at_level("INFO", logger="gateway.run"):
+        recover_pending_to_db(
+            db, session_resolver=lambda *args, **kwargs: (entry.session_id, db),
+            deferred_followup=partial(_defer_followup, runner, {}, None))
+        await runner._drain_startup_restore_queue()
+        await asyncio.gather(*list(runner._background_tasks))
+    db.append_message.assert_not_called()
+    assert ran == []
+    assert len(adapter.sent) == 1 and "send it again" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:author-missing:noted"]
+    assert not spool.exists()
+
+
+@pytest.mark.asyncio
 async def test_legacy_text_only_shutdown_followup_gets_one_outcome_one_note_and_quarantine(
         tmp_path, monkeypatch, caplog):
     """The live stranded spool: data has only text, so it can never run, but it cannot stay silent."""
