@@ -1369,14 +1369,13 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> Dict[str, Any
     logger.warning(
         "Turn-start preflight compression timed out — ending turn with typed recovery result: %s", exc,
     )
-    # Clear the tripwire slot note_turn_start registered (the early return skips the persist
-    # funnel). The user row is deliberately NOT persisted (#7100).
+    # Admission precedes risky compaction; expose that intact snapshot on early exit.
     from agent.agent_runtime_helpers import note_turn_persisted
     note_turn_persisted(agent)
     # Not _COMPRESSION_TIMEOUT_FINAL_RESPONSE — that describes a different state
     # (compression ran, could not reduce); the exception text carries the guidance.
     return _partial_turn_result(
-        str(exc), list(conversation_history or []), 0,
+        str(exc), list(getattr(agent, "_session_messages", None) or conversation_history or []), 0,
         failed=True, compression_exhausted=True, turn_exit_reason="context_compression_timeout",
         failure_reason="context_overflow", failure_retryable=False,
     )
@@ -1634,6 +1633,7 @@ def _run_conversation_turn(
     agent._last_persistence_error_cause = None
     agent._compression_adoption_failed = False
     agent._ephemeral_reasoning_off = False
+    agent._preflight_output_ceiling = None
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
 

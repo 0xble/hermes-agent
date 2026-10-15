@@ -233,7 +233,7 @@ async def test_queued_relay_origin_stays_silent_and_queue_event_keeps_metadata(m
     runner = gateway_run.GatewayRunner(GatewayConfig())
     queued = []
     runner._delivery_adapter_for = lambda source: object()
-    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    runner._enqueue_fifo = lambda session_key, event, adapter: (queued.append(event) or True)
     event = MessageEvent(
         text=f"/queue {_relay_text()}", source=_source(), message_id="queue-msg-1"
     )
@@ -297,7 +297,7 @@ async def test_addressed_relay_queue_keeps_its_ack():
     runner = gateway_run.GatewayRunner(GatewayConfig())
     queued = []
     runner._delivery_adapter_for = lambda source: object()
-    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    runner._enqueue_fifo = lambda session_key, event, adapter: (queued.append(event) or True)
     event = MessageEvent(
         text=f"/queue {_relay_text()}", source=_source(), message_id="queue-msg-3", reply_expected=True
     )
@@ -313,7 +313,7 @@ async def test_typed_queue_keeps_its_ack():
     runner = gateway_run.GatewayRunner(GatewayConfig())
     queued = []
     runner._delivery_adapter_for = lambda source: object()
-    runner._enqueue_fifo = lambda session_key, event, adapter: queued.append(event)
+    runner._enqueue_fifo = lambda session_key, event, adapter: (queued.append(event) or True)
     event = MessageEvent(text="/queue please handle this", source=_source(), message_id="queue-msg-2")
 
     reply = await runner._busy_queue_command(event, "session", event.source)

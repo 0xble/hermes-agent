@@ -12,6 +12,9 @@ from gateway.shutdown_flush import (
     flush_pending_to_file,
     recover_pending_to_db,
 )
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 
 
 def _make_flush_dir(tmp_path: Path) -> Path:
@@ -44,15 +47,7 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
     )
-    event = MagicMock()
-    event.text = "user message"
-    event.session_id = "20260728_120000_abc"
-    event.platform = "telegram"
-    event.sender_id = "456"
-    event.sender_name = "Alice"
-    event.reply_to = None
-    event.media = None
-    event.raw_event = None
+    event = _overflow_event("user message", "20260728_120000_abc")
 
     count = flush_pending_to_file({"session_key_1": event}, reason="adapter_shutdown")
     assert count == 1
@@ -270,15 +265,11 @@ def test_get_flush_dir_uses_get_hermes_home(tmp_path, monkeypatch):
 
 
 def _overflow_event(text: str, session_id: str = "20260901_120000_fifo"):
-    event = MagicMock()
-    event.text = text
+    event = MessageEvent(text=text, source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="1", chat_type="dm",
+        user_id="1572286605", user_name="tester",
+    ))
     event.session_id = session_id
-    event.platform = "telegram"
-    event.sender_id = "1572286605"
-    event.sender_name = "tester"
-    event.reply_to = None
-    event.media = None
-    event.raw_event = None
     return event
 
 
@@ -367,9 +358,16 @@ def test_draining_follow_up_is_spooled_for_startup_recovery(tmp_path, monkeypatc
         {"final_response": "done"}, object(), MagicMock(), "agent:main:telegram:dm:1"))
     assert event is None and text is None
     db = MagicMock()
-    assert recover_pending_to_db(db) == 1
-    assert db.append_message.call_args.kwargs["content"] == "next turn"
-    assert list(flush_dir.glob("*.json")) == []
+    claimed = []
+
+    def restore_followup(key, sid, data, path):
+        claimed.append((key, sid, data, path))
+        return True
+
+    assert recover_pending_to_db(db, deferred_followup=restore_followup) == 1
+    assert claimed[0][2]["text"] == "next turn"
+    db.append_message.assert_not_called()
+    assert claimed[0][3].exists()  # The queue owner retires it only after durable admission.
 
 
 def test_draining_follow_up_spool_initialization_failure_does_not_abort_turn(monkeypatch, caplog):

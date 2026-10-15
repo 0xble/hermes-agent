@@ -17,6 +17,12 @@ from agent.turn_preflight import PreflightGateVerdict, run_preflight_compression
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _clear_preflight_output_state(agent: Any) -> None:
+    """Do not carry a failed turn's preflight cap into the cached agent's next turn."""
+    agent._preflight_output_ceiling = None
+    agent._ephemeral_max_output_tokens = None
+
+
 def run_preflight_gate(
     agent: Any, *, request_pressure_tokens: Any, _moa_prepared_request: Any,
     pending_moa_prepared_request: Any, messages: Any, system_message: Any, user_message: Any,
@@ -24,7 +30,7 @@ def run_preflight_gate(
     compression_attempts: Any, max_compression_attempts: Any, effective_task_id: Any,
     final_response: Any, failed: Any, _turn_exit_reason: Any, _compression_timeout_exhausted: Any,
     _preflight_compression_blocked: Any, _provider_overflow_recovery_pending: Any,
-    _last_preflight_pressure: Any,
+    _last_preflight_pressure: Any, api_messages: Any = None, tools_for_api: Any = None,
 ) -> PreflightGateVerdict:
     """Run the pre-API guard chain in the original order. ``_last_preflight_pressure`` is
     consumed here (set to None) and re-armed only by a compression pass, so a blocked
@@ -55,6 +61,67 @@ def run_preflight_gate(
         with suppress(Exception):
             agent.iteration_budget.refund()
         v.action = "break"
+        _clear_preflight_output_state(agent)
+        return v
+
+    # A known hard-window breach cannot defer to real usage: some servers truncate
+    # instead of rejecting. Measure the final request, not a stale usage anchor.
+    from agent.compression_recovery import affordable_output_cap, request_fits
+    window = getattr(agent.context_compressor, "context_length", None)
+    can_shrink_output = getattr(agent, "api_mode", None) not in {"codex_app_server", "bedrock_converse"}
+    if (api_messages is not None and isinstance(window, int) and window > 0
+            and can_shrink_output
+            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
+        # Input that fits with a useful answer runway only needs a smaller output cap, the
+        # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
+        shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
+        if shrunk is not None:
+            if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
+                agent._preflight_output_ceiling = shrunk
+            agent._ephemeral_max_output_tokens = shrunk
+            logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
+    if (api_messages is not None and isinstance(window, int) and window > 0
+            and getattr(agent, "api_mode", None) != "codex_app_server"
+            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
+        from agent.conversation_compression import conversation_history_after_compression
+        from agent.turn_context_compaction import _refund_api_call
+        v.api_call_count = _refund_api_call(agent, v.api_call_count)
+        before = list(messages)
+        recovered, prompt = messages, active_system_prompt
+        if getattr(agent, "compression_enabled", True):
+            try:
+                recovered, prompt = agent._compress_context(
+                    messages, system_message, task_id=effective_task_id,
+                    approx_tokens=request_pressure_tokens,
+                )
+            except Exception:
+                logger.warning("Hard-window recovery failed; retaining the same session", exc_info=True)
+        if recovered != before:
+            v.messages = recovered
+            v.active_system_prompt = prompt
+            v.conversation_history = conversation_history_after_compression(agent, recovered)
+            if can_shrink_output and not request_fits(agent, recovered, prompt, tools=tools_for_api):
+                shrunk = affordable_output_cap(agent, recovered, tools=tools_for_api)
+                if shrunk is not None:
+                    if getattr(agent, "api_mode", None) not in {"bedrock_converse", "codex_app_server"}:
+                        agent._preflight_output_ceiling = shrunk
+                    agent._ephemeral_max_output_tokens = shrunk
+                    logger.info("Post-recovery fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
+            if request_fits(agent, recovered, prompt, tools=tools_for_api):
+                v._preflight_compression_blocked = False
+                v._last_preflight_pressure = request_pressure_tokens
+                v.action = "continue"
+                return v
+        v.final_response = (
+            "The complete request cannot safely fit the model window. No provider call was sent. "
+            "This session, its history and accepted input are retained; retry /compress "
+            "when the summary route is available."
+        )
+        v.failed = True
+        v._turn_exit_reason = "context_compression_timeout"
+        v._compression_timeout_exhausted = True
+        v.action = "break"
+        _clear_preflight_output_state(agent)
         return v
 
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
@@ -87,7 +154,7 @@ def run_preflight_gate(
             f"{_last_preflight_pressure:,}",
             f"{request_pressure_tokens:,}",
         )
-    return run_preflight_compression(
+    result = run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
@@ -100,3 +167,6 @@ def run_preflight_gate(
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
+    if result.action == "break":
+        _clear_preflight_output_state(agent)
+    return result

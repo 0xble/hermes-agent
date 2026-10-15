@@ -478,6 +478,10 @@ class GatewayAgentCacheMixin:
         self._bump_session_model_override_epoch(session_key)
         state = self._peek_session_state(session_key)
         if state is not None:
+            # The /queue overflow dies with the conversation; retire its checkpoints so a
+            # restart does not replay discarded work into the successor session.
+            from gateway.shutdown_flush import retire_queue_checkpoints
+            retire_queue_checkpoints(list(state.conversation.queued_events), reason=reason)
             state.conversation.clear()
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
@@ -681,6 +685,10 @@ class GatewayAgentCacheMixin:
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
             wake = parked if getattr(parked, "internal", False) else None
+            if parked is not None and wake is None:
+                # The stale human follow-up is discarded; its checkpoint must not replay it.
+                from gateway.shutdown_flush import retire_queue_checkpoint
+                retire_queue_checkpoint(parked, reason="stop_discard")
             if wake is None:
                 overflow = self._overflow_queue(session_key) or []
                 wake = next((e for e in overflow if getattr(e, "internal", False)), None)

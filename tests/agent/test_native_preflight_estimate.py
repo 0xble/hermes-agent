@@ -97,6 +97,39 @@ def test_preflight_wrapper_falls_back_to_generic_when_ineligible():
     assert _preflight_request_tokens(agent, messages, "") == generic
 
 
+def test_hard_window_gate_accepts_checkpoint_pruned_native_request(tmp_path):
+    from unittest.mock import patch
+
+    from hermes_state import SessionDB
+    from tests.agent.test_same_session_recovery import _agent
+    from tests.agent.test_same_session_recovery_gaps import _gate
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent = _agent(db)
+    route = vars(_codex_agent())
+    for name, value in route.items():
+        if name not in {"context_compressor", "tools"}:
+            setattr(agent, name, value)
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent.compression_checkpoint_required = False
+    agent.context_compressor.context_length = 32_768
+    agent._preflight_threshold_tokens = lambda: 24_576
+    rows = _history_with_checkpoint()
+    api_messages = [{"role": "system", "content": "be brief"}] + rows
+    native = estimate_native_responses_preflight_tokens(agent, api_messages, system_prompt="be brief")
+    assert native < 1_024
+    assert estimate_request_tokens_rough(api_messages) > 32_768
+
+    with patch.object(agent, "_compress_context", side_effect=lambda m, *a, **k: (m, "")) as compress:
+        verdict = _gate(agent, api_messages, messages=rows, request_pressure_tokens=native)
+
+    compress.assert_not_called()
+    assert verdict.action == "fallthrough" and not verdict.failed
+    assert verdict.messages is rows
+    assert verdict.api_call_count == 1
+    db.close()
+
+
 # ── Mid-turn pre-API guard parity (#96995) ────────────────────────────────
 # The mid-turn guard in conversation_loop must measure the same pruned wire
 # payload the turn-prologue preflight does (#96644/#96155); before #96995 it

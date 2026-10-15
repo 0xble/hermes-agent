@@ -119,6 +119,30 @@ async def test_restored_followup_failed_real_turn_gets_no_preserved_notice(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_restored_followup_dropped_before_session_resolution_keeps_spool(tmp_path, monkeypatch, caplog):
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="saved question", source=source, user_id=source.user_id)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    recover_pending_to_db(Mock(), session_resolver=lambda *args, **kwargs: (entry.session_id, Mock()),
+                          deferred_followup=partial(_defer_followup, runner, {}, None))
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+
+    async def dropped_before_turn(recovered):
+        recovered._gateway_accepted = True
+        # Mirrors _handle_message_with_agent: strict session resolution can return None before
+        # the turn outcome is initialized, so this is not a failed turn.
+        adapter._session_tasks[entry.session_key] = asyncio.create_task(asyncio.sleep(0))
+
+    adapter.handle_message = dropped_before_turn
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._drain_startup_restore_queue()
+        await asyncio.gather(*list(runner._background_tasks))
+    assert spool.exists()
+    outcomes = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Restart recovery outcome:")]
+    assert outcomes == [f"Restart recovery outcome: session={entry.session_key} outcome=skipped:accepted-without-turn:noted"]
+
+
+@pytest.mark.asyncio
 async def test_restored_followup_notice_is_sent_inside_its_profile_scope(tmp_path, monkeypatch):
     """A multiplexed secondary profile's follow-up notice resolves that profile's runtime."""
     from gateway import run

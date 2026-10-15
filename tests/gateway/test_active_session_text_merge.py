@@ -33,6 +33,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     SendResult,
+    TextDebounceState,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
@@ -112,6 +113,40 @@ def _make_adapter() -> BasePlatformAdapter:
 
 def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageEvent:
     return adapter._text_debounce[session_key].event
+
+
+@pytest.mark.asyncio
+async def test_debounce_checkpoint_failure_moves_burst_to_pending_for_shutdown():
+    adapter = _make_adapter()
+    key = build_session_key(_make_event("first").source)
+    event = _make_event("first")
+    adapter._text_debounce[key] = TextDebounceState(
+        event=event, task=None, first_ts=0.0, last_ts=0.0,
+    )
+    with patch("gateway.platforms.base.checkpointed_merge_pending_message_event", return_value=False):
+        assert await adapter._flush_text_debounce_now(key) is False
+    assert key not in adapter._text_debounce
+    assert adapter._pending_messages[key] is event
+
+
+@pytest.mark.asyncio
+async def test_cross_sender_debounce_checkpoint_failure_preserves_pending_event():
+    """A failed checkpoint must not drop a cross-sender follow-up already mergeable into pending."""
+    adapter = _make_adapter()
+    key = build_session_key(_make_event("first", user_id="u1").source)
+    state_event = _make_event("buffered", user_id="u1")
+    pending = _make_event("pending", user_id="u2")
+    incoming = _make_event("incoming", user_id="u2")
+    adapter._text_debounce[key] = TextDebounceState(
+        event=state_event, task=None, first_ts=0.0, last_ts=0.0,
+    )
+    adapter._pending_messages[key] = pending
+    with patch.object(adapter, "_flush_text_debounce_now", new=AsyncMock(return_value=False)), \
+            patch("gateway.platforms.base.checkpointed_merge_pending_message_event", return_value=False):
+        await adapter._queue_text_debounce(key, incoming)
+    assert adapter._pending_messages[key] is pending
+    assert "incoming" in adapter._pending_messages[key].text
+    assert incoming._gateway_accepted is True
 
 
 @pytest.mark.asyncio

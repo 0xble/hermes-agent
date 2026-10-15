@@ -71,6 +71,7 @@ def agent():
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
         a.compression_enabled = True
+        a.max_tokens = 1024
         a.save_trajectories = False
         return a
 
@@ -136,7 +137,8 @@ def test_long_context_retry_carrier_survives_failure_flush(agent, muted, monkeyp
         captured.append((kind, text))
         original(kind, text)
     monkeypatch.setattr(agent, "_buffer_retry_message", capture)
-    with (patch("agent.model_metadata.estimate_request_tokens_rough", return_value=_SENTINEL_TOKENS),
+    with (patch("agent.compression_recovery.estimate_request_tokens_rough", return_value=128),
+          patch("agent.model_metadata.estimate_request_tokens_rough", return_value=_SENTINEL_TOKENS),
           patch.object(agent, "_compress_context", return_value=([{"role": "user", "content": "compressed"}], "compressed prompt")),
           patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"),
           patch.object(agent, "_cleanup_task_resources")):

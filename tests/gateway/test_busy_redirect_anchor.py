@@ -143,7 +143,7 @@ async def test_addressed_relay_steer_queue_fallback_keeps_its_ack():
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
     queued = []
     runner._delivery_adapter_for = lambda _source: object()
-    runner._enqueue_fifo = lambda _key, queued_event, _adapter: queued.append(queued_event)
+    runner._enqueue_fifo = lambda _key, queued_event, _adapter: (queued.append(queued_event) or True)
     runner._peek_session_state = lambda _key: None
     event = MessageEvent(
         text="/steer [relay from=agent@example.com receipt=receipt-4]\nplease answer me",
@@ -162,7 +162,7 @@ async def test_steer_queue_fallback_marks_relay_origin_unaddressed():
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
     queued = []
     runner._delivery_adapter_for = lambda _source: object()
-    runner._enqueue_fifo = lambda _key, queued_event, _adapter: queued.append(queued_event)
+    runner._enqueue_fifo = lambda _key, queued_event, _adapter: (queued.append(queued_event) or True)
     runner._peek_session_state = lambda _key: None
     event = MessageEvent(
         text="/steer [relay from=agent@example.com receipt=receipt-1]\nplease handle this",
@@ -182,7 +182,7 @@ async def test_typed_steer_queue_fallback_keeps_its_ack():
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
     queued = []
     runner._delivery_adapter_for = lambda source: object()
-    runner._enqueue_fifo = lambda session_key, queued_event, adapter: queued.append(queued_event)
+    runner._enqueue_fifo = lambda session_key, queued_event, adapter: (queued.append(queued_event) or True)
     runner._peek_session_state = lambda session_key: None
     event = MessageEvent(text="/steer please handle this", source=source, message_id="steer-2")
 

@@ -452,17 +452,18 @@ class GatewayTurnMixin:
         pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         if strict_session:
             session_entry = await self.async_session_store.lookup_by_session_key(expected_session_key)
-            if session_entry is None or not pinned_session_id or not await GatewayTurnMixin._wake_pin_matches(
-                    self, event, pinned_session_id, session_entry.session_id):
+            if (session_entry is None or not pinned_session_id
+                    or getattr(session_entry, "suspended", False)
+                    or not await GatewayTurnMixin._wake_pin_matches(
+                        self, event, pinned_session_id, session_entry.session_id)):
                 logger.warning(
-                    "Dropping internally routed event: expected session id=%s is no longer current for key=%s",
+                    "Dropping internally routed event: expected owner id=%s is changed, missing or stopped for key=%s",
                     pinned_session_id or "missing", expected_session_key or "missing",
                 )
                 return
             pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
         else:
-            # Internal wakes observe reset policy without counting as user activity, or periodic
-            # notifications keep the routing key alive across every daily/idle boundary.
+            # Internal wakes must not keep a routing key alive across idle/reset boundaries.
             session_entry = await self.async_session_store.get_or_create_session(
                 source, touch_activity=not bool(getattr(event, "internal", False)),
             )
@@ -1939,43 +1940,10 @@ class GatewayTurnMixin:
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
     ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
-        if agent_result.get("compression_deferred"):
-            logger.info(
-                "Compression deferred for session %s — the compression "
-                "lock is held by a concurrent compressor. Keeping the "
-                "session intact; the next message retries normally.",
-                session_entry.session_id if session_entry else "?",
-            )
-        elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
-            async with self._session_model_override_lock(session_key):
-                new_entry = await self.async_session_store.reset_session(session_key)
-                self._evict_cached_agent(session_key)
-                # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-                self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
-            if new_entry is not None:
-                # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
-                # switches the next message back onto the bloated child and re-triggers exhaustion
-                # forever. No-op on non-topic lanes.
-                # Compression rotated session_entry.session_id to the oversized compressed child earlier
-                # this turn (the agent-result sync above), and that _sync also rewrote the (chat_id,
-                # thread_id) -> bloated-child binding. reset_session swaps in a clean, parentless session,
-                # but without re-syncing the binding the next inbound message in this topic gets
-                # switch_session'd back onto the bloated child by the binding-heal walk, reloads the
-                # oversized transcript, and re-triggers compression exhaustion forever (#35809 — regression
-                # of the #9893/#10063 auto-reset).
-                session_entry = new_entry
-                await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
-                )
-            response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
+        """Compression failure pauses the existing conversation; it is not /new."""
+        if agent_result.get("compression_exhausted") or agent_result.get("compression_deferred"):
+            logger.info("Compression recovery paused with session %s retained.",
+                        session_entry.session_id if session_entry else "?")
         return response, session_entry
 
     @staticmethod
@@ -2059,8 +2027,13 @@ class GatewayTurnMixin:
             if agent_failed_early or hidden_reasoning_incomplete:
                 # Transient failure / hidden-reasoning incomplete: persist the user message without
                 # the provider error text (a gateway hint, not model output). Dedupe on platform
-                # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                # message_id + logical content (Telegram retries after transient failures).
+                if (
+                    event.message_id
+                    and await store.has_platform_message_id(
+                        sid, str(event.message_id), _user_row.get("content"), _user_row.get("content")
+                    )
+                ):
                     logger.info(
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
@@ -2440,8 +2413,9 @@ class GatewayTurnMixin:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         # The outbound string (or streamed None) loses the raw result's outcome.
-        # Fail closed through preparation, execution and delivery exceptions.
-        event._agent_turn_succeeded = False
+        # Keep this unset until session resolution succeeds: a strict-pinned recovered event
+        # dropped by /new or suspension was never a failed turn and must retain its spool.
+        event._agent_turn_succeeded = None
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -2455,6 +2429,7 @@ class GatewayTurnMixin:
         resolved = await self._hmwa_resolve_session(event, source)
         if resolved is None:
             return
+        event._agent_turn_succeeded = False
         source, session_entry, session_key = resolved
         from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
         if (
@@ -2543,6 +2518,7 @@ class GatewayTurnMixin:
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
+                queued_event=event,
                 channel_prompt=_turn_channel_prompt, internal=event.internal, event_metadata=dict(event.metadata or {}),
                 moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
@@ -3309,6 +3285,9 @@ class GatewayTurnMixin:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            # Only a terminal SSE acknowledgement or actual generated content
+            # proves the remote handled the input. HTTP/transport errors do not.
+            "_proxy_input_handled": saw_done or bool(full_response),
         }
 
     async def _run_agent(
@@ -4065,12 +4044,21 @@ class GatewayTurnMixin:
                 steer_event = MessageEvent(
                     text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
                 )
-                if session_key:
-                    self._enqueue_fifo(session_key, steer_event, adapter)
-                logger.debug(
-                    "Enqueued leftover /steer behind pending message for session %s: '%s...'",
-                    session_key or "?", leftover_steer[:40],
-                )
+                admitted = bool(session_key and self._enqueue_fifo(session_key, steer_event, adapter))
+                if admitted:
+                    logger.debug(
+                        "Enqueued leftover /steer behind pending message for session %s: '%s...'",
+                        session_key or "?", leftover_steer[:40],
+                    )
+                else:
+                    # Keep both eventless follow-ups in the current turn when the durable
+                    # FIFO checkpoint cannot be written; never consume the steer on a false
+                    # admission receipt.
+                    pending = f"{pending}\n\n{leftover_steer}"
+                    logger.warning(
+                        "Could not enqueue leftover /steer for session %s; retaining it in-band",
+                        session_key or "?",
+                    )
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4083,6 +4071,8 @@ class GatewayTurnMixin:
                             "Discarding command '/%s' from pending queue — "
                             "commands must not be passed as agent input", _pending_cmd_word,
                         )
+                        from gateway.shutdown_flush import retire_queue_checkpoint
+                        retire_queue_checkpoint(pending_event, reason="discarded_pending_command")
                         pending_event = None
                         pending = None
 
@@ -4253,10 +4243,17 @@ class GatewayTurnMixin:
                     metadata=dict(turn_ctx.event_metadata or {}),
                 )
                 if adapter and hasattr(adapter, "_pending_messages"):
-                    existing = adapter._pending_messages.get(session_key)
-                    if existing is not None:
-                        self._session_state(session_key).conversation.queued_events.insert(0, existing)
-                    adapter._pending_messages[session_key] = deferred
+                    from gateway.shutdown_flush import checkpoint_queued_event
+                    if checkpoint_queued_event(str(session_key), deferred):
+                        existing = adapter._pending_messages.get(session_key)
+                        if existing is not None and existing is not deferred:
+                            self._session_state(session_key).conversation.queued_events.insert(0, existing)
+                        adapter._pending_messages[session_key] = deferred
+                    else:
+                        # The follow-up was already drained from its prior owner. Keep it
+                        # unacknowledged in the native FIFO until storage can accept it.
+                        self._session_state(session_key).conversation.queued_events.insert(0, deferred)
+                        logger.warning("Could not checkpoint deferred follow-up for %s", session_key)
                 logger.warning("Queued follow-up deferred after failed first delivery for %s", session_key)
                 return result or {"final_response": response, "messages": history}
 
@@ -4321,6 +4318,9 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                # Preparation consumed or refused the follow-up; it will not run as a turn.
+                from gateway.shutdown_flush import retire_queue_checkpoint
+                retire_queue_checkpoint(pending_event, reason="followup_not_prepared")
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -4389,6 +4389,7 @@ class GatewayTurnMixin:
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                queued_event=pending_event,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
                 _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_adapter", None) or adapter,
@@ -4766,18 +4767,24 @@ class GatewayTurnMixin:
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         title_user_message: Optional[str] = None,
         _silence_retry: bool = False,
+        queued_event: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
             # Local-only recovery: the proxy API requires a new non-empty conversation row,
-            # not the empty internal continuation. Preserve its existing human silence fallback.
-            return await self._run_agent_via_proxy(
+            # not the empty internal continuation. The remote owns admission, and only an explicit
+            # handled acknowledgement retires the durable queued-input checkpoint.
+            from gateway.shutdown_flush import retire_queue_checkpoint
+            result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            if result.get("_proxy_input_handled") is True:
+                retire_queue_checkpoint(queued_event, reason="proxy_input_handled")
+            return result
 
         from run_agent import AIAgent
 
@@ -4810,7 +4817,7 @@ class GatewayTurnMixin:
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             silence_retry=_silence_retry,
-            _post_delivery_adapter=_post_delivery_adapter,
+            _post_delivery_adapter=_post_delivery_adapter, queued_event=queued_event,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
         turn_ctx.mute_notification_reply |= cron_review
