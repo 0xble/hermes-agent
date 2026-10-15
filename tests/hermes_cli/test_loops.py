@@ -948,6 +948,19 @@ class TestSelfPacedBackoff:
         fresh._save()
         assert wake_loop_for_external_event("external-wake") is True
 
+    def test_external_wake_state_survives_reload(self, hermes_home):
+        from hermes_cli.loops import LoopManager, load_loop, wake_loop_for_external_event
+
+        mgr = LoopManager(session_id="external-wake-reload")
+        state = mgr.set("watch the queue")
+        state.next_due_at = time.time() + 3600
+        mgr._save()
+        assert wake_loop_for_external_event("external-wake-reload") is True
+        saved = load_loop("external-wake-reload")
+        assert saved is not None
+        assert saved.last_external_wake_tick == saved.ticks_fired == 0
+        assert saved.backoff_level == 0
+
     def test_external_event_resets_blocked_until_ladder_for_interval_loops(self, hermes_home):
         from hermes_cli.loops import LoopManager, wake_loop_for_external_event
 
