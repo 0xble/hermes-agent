@@ -1245,6 +1245,9 @@ class LoopManager(LoopRevisionsMixin):
         if state.mode == "self_paced":
             delay = min(max(self_paced_floor_seconds(), delay), self_paced_ceiling_seconds())
             state.current_delay = float(delay)
+        else:
+            delay = max(delay, state.interval_seconds)
+            state.current_delay = state.interval_seconds
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         state.next_due_at = now + delay
 

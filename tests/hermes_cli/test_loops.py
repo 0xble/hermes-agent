@@ -811,7 +811,7 @@ class TestTickLifecycle:
         assert decision["status"] == "active"
         assert mgr.state is not None
         assert mgr.state.status == "active"
-        assert mgr.state.next_due_at >= time.time() + _NO_PROGRESS_BACKOFF_S[0] - 1
+        assert mgr.state.next_due_at >= time.time() + max(300, _NO_PROGRESS_BACKOFF_S[0]) - 1
         assert "unachievable" in decision["message"]
 
     def test_until_judge_blocked_honors_times_cap(self, hermes_home):

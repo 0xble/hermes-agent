@@ -691,7 +691,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
             )
             external_event = (
-                metadata.get("notification_origin") == "process_registry_synthetic"
+                metadata.get("notification_origin") in {
+                    "process_registry_synthetic", "delegation_result", "cron_delivery", "relay_delivery",
+                }
                 or (
                     is_internal
                     and event is not None
