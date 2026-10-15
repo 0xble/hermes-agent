@@ -119,7 +119,7 @@ _GOAL_AUTHORING_END_STATE = r"\b(?:is|are|be|been|gets?)\s+(?:\w+ly\s+)?"
 _GOAL_AUTHORING_EMBEDDED_RE = re.compile(
     r"(?i)\b(?:whether|if|which|why|how|what|that|when|where|who|whose)\b"
 )
-_GOAL_AUTHORING_END_STATE_BOUNDARY_RE = re.compile(r"(?i),|\b(?:and|then)\b")
+_GOAL_AUTHORING_END_STATE_BOUNDARY_RE = re.compile(r"(?i),|\bthen\b")
 _GOAL_AUTHORING_SCOPED_EFFECTS = {
     "relay": {"relay"}, "send": {"send"}, "delete": {"delete", "remove"},
     "deploy": {"deploy"}, "merge": {"merge"},
