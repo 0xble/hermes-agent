@@ -84,6 +84,25 @@ def _title(text: str) -> Optional[str]:
     return None
 
 
+_DATED_TITLE = re.compile(
+    r" — (?:January|February|March|April|May|June|July|August|September|"
+    r"October|November|December) \d{1,2}, \d{4}(?: at \d{1,2}:\d{2} [AP]M)?"
+)
+
+
+def _title_matches(actual: Optional[str], expected: str) -> bool:
+    """Accept the exact title, or the report archetype's dated form of it.
+
+    Reports are titled ``<Title> — <Month D, YYYY>`` (optionally ``at h:mm AM``),
+    so only that suffix is tolerated; anything else after the title still fails.
+    """
+    if actual is None:
+        return False
+    if actual == expected:
+        return True
+    return actual.startswith(expected) and bool(_DATED_TITLE.fullmatch(actual[len(expected):]))
+
+
 def _word_count(text: str) -> int:
     return len(re.findall(r"\S+", text))
 
@@ -98,7 +117,7 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
 
     violations: list[str] = []
     expected_title = str(contract.get("title") or "").strip()
-    if expected_title and _title(text) != expected_title:
+    if expected_title and not _title_matches(_title(text), expected_title):
         violations.append(f"title must be {expected_title!r}")
     # The title is the only top-level heading a contract allows; a second H1
     # would let a rewrite smuggle an undeclared section past the H2 checks.
