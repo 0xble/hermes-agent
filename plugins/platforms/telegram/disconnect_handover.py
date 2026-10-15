@@ -3,13 +3,58 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Awaitable, Callable, Optional
 
 from gateway.config import is_zero_cut_handover_enabled
 
+logger = logging.getLogger(__name__)
+
 # The loop holds tasks weakly: a teardown detached by the gateway's disconnect budget must stay
 # rooted until it finishes, or GC can drop it before updater.stop() and the lock release run.
 _DETACHED_TEARDOWNS: set[asyncio.Future] = set()
+
+
+async def handover_stop_polling(adapter) -> dict[str, object]:
+    """Stop Telegram polling and settle PTB dispatch without tearing down the Bot."""
+    app = getattr(adapter, "_app", None)
+    if app is None:
+        return {"settled": True}
+    from plugins.platforms.telegram.adapter import _UPDATER_STOP_TIMEOUT, _await_with_thread_deadline
+
+    deadline = asyncio.get_running_loop().time() + _UPDATER_STOP_TIMEOUT
+    updater = getattr(app, "updater", None)
+    try:
+        if updater is not None and (not hasattr(updater, "running") or updater.running):
+            await _await_with_thread_deadline(
+                updater.stop(), timeout=_UPDATER_STOP_TIMEOUT,
+                label="telegram handover updater.stop()")
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        await asyncio.wait_for(_wait_for_dispatch_settle(adapter, app), timeout=remaining)
+    except asyncio.TimeoutError:
+        return {"settled": False, "reason": "telegram updates did not settle before updater stop deadline"}
+    except Exception as exc:
+        logger.warning("Telegram handover polling stop failed: %s", exc, exc_info=True)
+        return {"settled": False, "reason": type(exc).__name__}
+    return {"settled": True}
+
+
+async def _wait_for_dispatch_settle(adapter, app) -> None:
+    while True:
+        queue = getattr(app, "update_queue", None)
+        queue_empty = queue is None or bool(getattr(queue, "empty", lambda: True)())
+        processor = getattr(app, "update_processor", None)
+        current = getattr(processor, "current_concurrent_updates", None)
+        if current is None:
+            semaphore = getattr(processor, "_semaphore", None)
+            maximum = getattr(processor, "max_concurrent_updates", None)
+            available = getattr(semaphore, "current_value", None)
+            current = None if maximum is None or available is None else maximum - available
+        processor_idle = current in (None, 0)
+        inflight = getattr(adapter, "_inflight_update_ids", {})
+        if queue_empty and processor_idle and not inflight:
+            return
+        await asyncio.sleep(0.01)
 
 
 def _lock_owner_nonce(adapter) -> Optional[str]:
@@ -21,6 +66,16 @@ def _lock_owner_nonce(adapter) -> Optional[str]:
     from gateway.status import _get_scope_lock_path, _read_json_file
     record = _read_json_file(_get_scope_lock_path(scope, identity)) or {}
     return (record.get("metadata") or {}).get("nonce")
+
+
+def release_handover_lock(adapter) -> None:
+    """Release only the lock acquired by this adapter, preserving successor ownership."""
+    own = getattr(adapter, "_platform_lock_nonce", None)
+    current = _lock_owner_nonce(adapter)
+    if own is None or current == own:
+        adapter._release_platform_lock()
+    elif current is not None and getattr(adapter, "_platform_lock_nonce", None) == own:
+        adapter._platform_lock_identity = None
 
 
 async def run_disconnect(adapter, disconnect: Callable[..., Awaitable[None]]) -> None:
