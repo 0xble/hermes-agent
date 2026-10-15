@@ -83,6 +83,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Copilot ACP usage-less compaction | ACP responses report unknown usage, never fabricated zeros, so estimate-driven compaction still fires | Copilot ACP client response or usage accounting changes | [Copilot ACP usage](maintenance/copilot-acp-usage.md) |
 | Nightly concurrency and compaction regressions | Preserve early process output, tolerate concurrent DB quarantine, and exercise actual ACP summarization | Process heartbeat, state DB preflight/quarantine, or ACP compaction E2E changes | [Nightly regression repairs](maintenance/nightly-regression-0926b.md) |
 | Foreground command exit cleanup | Fence graceful exit against spawning foreground commands so no child outlives its host | Foreground spawn publication, terminal environment process-exit cleanup, or live foreground killing changes | [Foreground exit cleanup](maintenance/foreground-exit-cleanup.md) |
+| Agent wait ergonomics | Bound default process waits and keep unchanged delegation lists from consuming turns | Process wait defaults, timeout guidance, or delegation list observations; load async delegation capacity for queued-state changes | [Agent wait ergonomics](maintenance/agent-wait-ergonomics.md) |
 | Terminal heavy-slot | Heavy terminal launchers share machine-wide slots; test, workspace, and PM workers default to four per job | Terminal execution/classification or test, workspace-check, PM build/install/bytecode parallelism changes | [Terminal heavy-slot](maintenance/terminal-heavy-slot.md) |
 | Snapshot keeps shell functions | Functions and aliases survive every command of a terminal session, not just the first | Terminal session snapshot bootstrap or per-command re-dump changes | [Snapshot functions](maintenance/snapshot-keep-functions.md) |
 | Explicit topic title receipts | Report the stored alias and actual Bot API rename result | `/title` Telegram topic changes and upstream title sync | [Explicit title receipts](maintenance/telegram-title-receipts.md) |
@@ -353,6 +354,25 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Verification:** The new regression files fail on the frozen base (5 failed, 8 passed) and pass on the candidate (13 passed). The final eight-file run, including all four wider-regression failures, passes on native macOS (172 passed, 12 platform skips), using the private test environment and CI-style isolated Git configuration. The two positive handoff fixtures use a real parent instead of a child stand-in; the runtime-host ancestry guard is unchanged. Source-only fork validation reports 0 problems.
 - **Retirement:** Remove once upstream ships a precise macOS shell producer and strict own-PID validation, and these regressions pass there without the fork patch.
 - **Rollback:** Revert the commits carrying `Fork-Patch: updater-pid-incarnation`. Revert all of them together: restoring the strict rule without the precise producer would break macOS hand-offs.
+
+## Additional maintenance units
+
+The following units are part of the enrolled maintenance surface. Load the row's
+contract before acting on its trigger; a full maintenance run accounts for every
+row:
+
+| Unit | Required behavior | Load when | Contract |
+|---|---|---|---|
+| CI slow-file timeouts | Keep known-slow hosted test files within measured per-file bounds without changing the default for other files | Hosted shard timeout evidence, `FILE_TIMEOUTS`, or slow-file selection changes; also load Portable CI | [CI slow-file timeouts](maintenance/ci-slow-file-timeouts.md) |
+| Fallback mid-turn restore | Restore an eligible primary or earlier fallback between model requests while preserving cooldown and route invariants | Provider fallback recovery, mid-turn retry, or fallback stay-limit changes | [Fallback mid-turn restore](maintenance/fallback-mid-turn-restore.md) |
+| Gate flake quarantine | Keep the PR gate blocking while isolating only reproduced host/process flakes with nightly evidence | Gate quarantine lists, exact-SHA flake evidence, or shard disposition changes; also load Portable CI and Repository CI contract | [Gate flake quarantine](maintenance/gate-flake-quarantine.md) |
+| Goal continuation quiet | Deduplicate unchanged continuation notices across waits and preserve meaningful goal outcomes | Goal wait, continuation notice, automatic silence, or lifecycle deduplication changes | [Goal continuation quiet](maintenance/goal-continuation-quiet.md) |
+| Install and scratch GC | Reclaim orphaned installs and scratch data only under ownership, age, lock, lease, and deletion-window safeguards | PM install cleanup, scratch pruning, housekeeping, worktree pruning, or deletion-window changes; also load runtime ownership | [Install and scratch GC](maintenance/install-and-scratch-gc.md) |
+| One-shot task governing skill loading | Load task-governing procedural skills in one-shot sessions without restoring omitted maintenance tooling | One-shot footprint, prompt skill admission, or governing-skill loading changes | [One-shot task governing skill loading](maintenance/oneshot-task-governing-skill-loading.md) |
+| Portable CI | Keep local and hosted source gates reproducible, isolated, and aligned across supported lanes | `bin/ci`, `scripts/ci/portable.py`, toolchain pins, workflow lanes, or source-gate isolation changes | [Portable CI](maintenance/portable-ci.md) |
+| Repository CI contract | Preserve exact-SHA admission, gate aggregation, workflow dispositions, and the boundary between local evidence and qualification | Repository CI commands, workflow graph, required statuses, or gate/nightly policy changes | [Repository CI contract](maintenance/repository-ci-contract.md) |
+| Shared primary cooldown | Share provider outage cooldowns across agents while preventing fallback replies from clearing them | Fallback classification, cooldown state, outage/recovery notices, or cross-process route adoption changes | [Shared primary cooldown](maintenance/shared-primary-cooldown.md) |
+| Updater external supervisor sweep | Protect newly spawned supervised gateways while draining pre-existing processes for supervisor hand-back | Update restart sweeps, gateway PID snapshots, launchd or external-supervisor ownership changes; also load runtime ownership | [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md) |
 
 ## Update
 
