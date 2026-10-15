@@ -29,6 +29,15 @@ _SPLIT_PREVIEW_PREFIX = "\x00hermes-split-preview:"
 _cleanup_tasks: set = set()
 
 
+def _finish_foreign_cleanup(future, label: str) -> None:
+    """Release and log cleanup that was submitted to the owning loop from another loop."""
+    _cleanup_tasks.discard(future)
+    if future.cancelled():
+        logger.debug("%s: cross-loop cleanup cancelled", label)
+    elif future.exception() is not None:
+        logger.warning("%s: cross-loop cleanup failed: %s", label, future.exception())
+
+
 def _delete_recovered_previews(ctx, delete, message_ids, *, label: str) -> None:
     """Run adapter cleanup on the gateway loop that owns its async transport."""
     loop = getattr(ctx, "_loop_for_step", None)
@@ -36,13 +45,23 @@ def _delete_recovered_previews(ctx, delete, message_ids, *, label: str) -> None:
         current = asyncio.get_running_loop()
     except RuntimeError:
         current = None
-    if current is not None:
-        # Already on a running loop (normally the gateway loop itself): blocking here
-        # would deadlock it and asyncio.run would raise, so schedule best-effort cleanup.
+    if current is not None and (loop is None or current is loop):
+        # On the owning loop itself: blocking here would deadlock it and asyncio.run
+        # would raise, so schedule best-effort cleanup.
         logger.debug("%s: scheduling cleanup on the running loop", label)
         task = current.create_task(delete(message_ids, label=label, skip_sentinel=False))
         _cleanup_tasks.add(task)
         task.add_done_callback(_cleanup_tasks.discard)
+        return
+    if current is not None and loop is not None:
+        # On a foreign running loop: the transport belongs to ``loop``, so submit there
+        # without blocking (``.result()`` on a running loop can deadlock).
+        logger.debug("%s: submitting cleanup to the owning loop", label)
+        future = asyncio.run_coroutine_threadsafe(
+            delete(message_ids, label=label, skip_sentinel=False), loop,
+        )
+        _cleanup_tasks.add(future)
+        future.add_done_callback(lambda f: _finish_foreign_cleanup(f, label))
         return
     if loop is not None and loop.is_running():
         asyncio.run_coroutine_threadsafe(

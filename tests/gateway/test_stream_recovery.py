@@ -345,6 +345,36 @@ async def test_recovered_cleanup_on_running_loop_schedules_instead_of_asyncio_ru
     assert calls == [(["head-id"], gateway_loop)]
 
 
+@pytest.mark.asyncio
+async def test_recovered_cleanup_from_foreign_loop_runs_on_owning_loop():
+    """Called on a different running loop, cleanup is submitted to the adapter's owning loop."""
+    owning_loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=owning_loop.run_forever, daemon=True)
+    thread.start()
+    ran = threading.Event()
+    calls = []
+
+    async def delete(message_ids, *, label, skip_sentinel):
+        calls.append((list(message_ids), asyncio.get_running_loop()))
+        ran.set()
+
+    try:
+        foreign_loop = asyncio.get_running_loop()
+        assert foreign_loop is not owning_loop
+        recovery._delete_recovered_previews(
+            SimpleNamespace(_loop_for_step=owning_loop), delete, ["head-id"], label="test",
+        )
+        for _ in range(200):
+            if ran.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert calls == [(["head-id"], owning_loop)]
+    finally:
+        owning_loop.call_soon_threadsafe(owning_loop.stop)
+        thread.join(timeout=5)
+        owning_loop.close()
+
+
 def test_schema_and_purge_run_once_per_process(monkeypatch):
     calls = []
     real = recovery._prepare_journal
