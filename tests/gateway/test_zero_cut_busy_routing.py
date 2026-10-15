@@ -140,6 +140,36 @@ async def test_dead_owner_clears_without_resume_and_drains_once(tmp_path, monkey
     assert token
 
 
+@pytest.mark.asyncio
+async def test_waiting_key_keeps_queueing_after_marker_clears_so_order_holds(tmp_path, monkeypatch):
+    a, b = _stores(tmp_path)
+    entry = a.get_or_create_session(_source())
+    token = a.mark_turn_active(entry.session_key)
+    adapter = _Adapter()
+    runner = _Runner(b, b.config, adapter)
+    monkeypatch.setattr("gateway.zero_cut_busy.os.getpid", lambda: 9002)
+    monkeypatch.setattr("gateway.zero_cut_busy.os.kill", lambda pid, sig: None)
+    first = MessageEvent("first", source=_source(), message_id="m-2")
+    assert await queue_foreign_owner(runner, first, entry.session_key)
+    assert a.clear_turn_active(entry.session_key, token)  # A finished; watcher has not drained yet
+    second = MessageEvent("second", source=_source(), message_id="m-3")
+    assert await queue_foreign_owner(runner, second, entry.session_key)  # must not start ahead of m-2
+    assert adapter._pending_messages[entry.session_key] is first
+    assert adapter._overflow[entry.session_key] == [second]
+
+
+@pytest.mark.asyncio
+async def test_unqueued_session_with_cleared_marker_is_not_routed(tmp_path, monkeypatch):
+    a, b = _stores(tmp_path)
+    entry = a.get_or_create_session(_source())
+    token = a.mark_turn_active(entry.session_key)
+    assert a.clear_turn_active(entry.session_key, token)
+    runner = _Runner(b, b.config, _Adapter())
+    monkeypatch.setattr("gateway.zero_cut_busy.os.getpid", lambda: 9002)
+    event = MessageEvent("new", source=_source(), message_id="m-9")
+    assert await queue_foreign_owner(runner, event, entry.session_key) is False
+
+
 async def _wait_for(predicate):
     while not predicate():
         await asyncio.sleep(0.02)
