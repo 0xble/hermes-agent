@@ -166,3 +166,48 @@ def test_bare_human_interrupt_is_rebuilt_as_a_reply_expected_human_event():
     assert event.internal is False
     assert event.reply_expected is True
     assert "_cron_review_capture" not in event.metadata
+
+
+@pytest.mark.asyncio
+async def test_waited_review_is_refused_once_the_gateway_starts_draining(monkeypatch):
+    import gateway.cron_review as cron_review
+    monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    adapter = SimpleNamespace(_active_sessions={"key": object()}, _pending_messages={})
+    entry = SimpleNamespace(origin=source, session_id="sid")
+    accepting = [True]
+    admit = AsyncMock()
+    monkeypatch.setattr("gateway.wake.admit_internal_event", admit)
+    runner = SimpleNamespace(
+        _plugin_injection_accepting=lambda: accepting[0],
+        async_session_store=SimpleNamespace(lookup_by_session_key=AsyncMock(return_value=entry)),
+        _restored_source=lambda entry: source,
+        _plugin_injection_authorized=lambda *a, **kw: True,
+        _delivery_adapter_for=lambda source: adapter)
+
+    def drain():  # a drain is what idles the busy topic
+        accepting[0] = False
+        adapter._active_sessions.clear()
+
+    asyncio.get_running_loop().call_later(0.05, drain)
+    with pytest.raises(RuntimeError, match="not accepting"):
+        await CronReviewControl(runner)._review("key", "sid", "review", 5)
+    admit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_review_queued_behind_a_human_turn_never_runs():
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.sent = []
+    adapter.send_typing = AsyncMock()
+    adapter.set_message_handler(AsyncMock(return_value="PRESENT"))
+    capture = Future()
+    capture.cancel()  # the caller's deadline already passed
+    event = MessageEvent(text="review", source=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="139328"),
+        internal=True, reply_expected=False, allow_gateway_control=False,
+        metadata={"_cron_review_capture": capture})
+    await adapter._process_message_background(event, "key")
+    adapter._message_handler.assert_not_awaited()
+    assert adapter.sent == []

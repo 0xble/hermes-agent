@@ -239,6 +239,13 @@ def _json_safe(value: Any) -> bool:
 
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
+    metadata = getattr(value, "metadata", None)
+    if (getattr(value, "internal", False) is True and isinstance(metadata, dict)
+            and metadata.get("_cron_review_capture") is not None):
+        # A cron review's capture cannot cross a restart; replayed without it the
+        # hidden prompt would run as an ordinary turn and post its reply. The
+        # delivery queue already sends the original report on review failure.
+        return None
     if hasattr(value, "text"):  # MessageEvent-like object
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
         for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",

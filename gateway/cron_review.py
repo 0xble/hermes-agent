@@ -139,10 +139,22 @@ class CronReviewControl:
             waited = True
             await asyncio.sleep(_IDLE_POLL_SECONDS)
         if waited:
-            # The conversation that kept the topic busy may have rotated its session.
+            # Anything resolved before the wait may be stale: the gateway may now be
+            # draining (a drain is what idles a busy topic), the conversation may have
+            # rotated its session, the adapter may have reconnected, or a grant changed.
+            if not runner._plugin_injection_accepting():
+                raise RuntimeError("gateway not accepting review turns")
             entry = await runner.async_session_store.lookup_by_session_key(key)
             if entry is None or entry.origin is None or entry.session_id != session_id:
                 raise RuntimeError("review subject session changed while waiting")
+            source = replace_source(runner._restored_source(entry))
+            if not runner._plugin_injection_authorized(source, plugin_id="cron-review", target=key):
+                raise RuntimeError("review subject is not authorized")
+            adapter = runner._delivery_adapter_for(source)
+            if adapter is None:
+                raise RuntimeError("review subject adapter unavailable")
+            if key in getattr(adapter, "_active_sessions", {}) or key in getattr(adapter, "_pending_messages", {}):
+                raise RuntimeError("review subject is busy; use original report")
         seconds = end - loop.time()
         capture = concurrent.futures.Future()
         event = MessageEvent(
