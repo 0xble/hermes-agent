@@ -6064,9 +6064,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
         raise
-    if success:
-        from gateway.zero_cut_standby import mark_ready
-        mark_ready()
     if not success:
         await _settle_and_shutdown_mcp(runner)
         _shutdown_gateway_health_export(runner)
@@ -6095,8 +6092,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
-
-    # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
+    from gateway.zero_cut_standby import mark_ready
+    mark_ready()  # READY only once adapters, cron and housekeeping run; missing systemd state disables watchdog.
     runner._start_systemd_watchdog()
 
     await runner.wait_for_shutdown()
