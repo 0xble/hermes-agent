@@ -33,26 +33,33 @@ def _wait_for(pred, timeout: float = 3.0) -> bool:
     return pred()
 
 
-def _serialize_polls(server, monkeypatch) -> None:
+def _serialize_polls(server, monkeypatch) -> threading.Lock:
     """Serialize manual and background watcher passes so an event claimed by the watcher is
-    broadcast before the manual poll returns."""
+    broadcast before the manual poll returns. Returns the lock so a test can also hold it across
+    a multi-file write that the real runtime performs as one transition."""
     lock = threading.Lock()
     for name in ("_poll_lease_files", "_poll_runtime_files"):
         def locked(real=getattr(server, name)) -> None:
             with lock:
                 real()
         monkeypatch.setattr(server, name, locked)
+    return lock
 
 
-def _watching(server, home: Path, monkeypatch) -> list:
+def _watching_with_lock(server, home: Path, monkeypatch) -> tuple[list, threading.Lock]:
+    """Start the real watcher with serialized polls; return its events and the poll lock."""
     from hermes_constants import hermes_home_key
     events: list = []
-    _serialize_polls(server, monkeypatch)
+    lock = _serialize_polls(server, monkeypatch)
     monkeypatch.setattr(server, "_broadcast_global_event", lambda ev, payload=None: events.append((ev, payload)))
     monkeypatch.setattr(server, "_hermes_home", str(home))
     server._ensure_lease_watcher()
     assert _wait_for(lambda: hermes_home_key(home) in server._lease_epochs), "watcher never seeded the home"
-    return events
+    return events, lock
+
+
+def _watching(server, home: Path, monkeypatch) -> list:
+    return _watching_with_lock(server, home, monkeypatch)[0]
 
 
 def _lease_events(events, **want):
@@ -117,13 +124,16 @@ def test_screen_started_or_stopped_by_another_process_is_broadcast_as_status(tmp
 
     home = tmp_path / "home"
     (home / "bot-desktop").mkdir(parents=True)
-    events = _watching(server, home, monkeypatch)
+    events, poll_lock = _watching_with_lock(server, home, monkeypatch)
     server._poll_runtime_files()  # seed
     assert not [e for e in events if e[0] == "display.status"]
 
-    # what runtime.start() publishes from another process: launcher.pid then env
-    (home / "bot-desktop" / "launcher.pid").write_text("424242 1.5", encoding="utf-8")
-    (home / "bot-desktop" / "env").write_text("DISPLAY=:77\n", encoding="utf-8")
+    # what runtime.start() publishes from another process: launcher.pid then env. Hold the poll lock
+    # across both writes so a background pass cannot observe the half-written start as its own
+    # transition (one start must broadcast exactly one display.status).
+    with poll_lock:
+        (home / "bot-desktop" / "launcher.pid").write_text("424242 1.5", encoding="utf-8")
+        (home / "bot-desktop" / "env").write_text("DISPLAY=:77\n", encoding="utf-8")
     server._poll_runtime_files()
     statuses = [p for e, p in events if e == "display.status"]
     assert statuses and statuses[-1]["profile_key"] == str(home)

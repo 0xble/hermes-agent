@@ -203,7 +203,9 @@ invoke the same pass directly. Under hosted load, the background pass could clai
 liveness transition and update `_runtime_marks`, then spend time building the snapshot; the manual
 pass returned before that broadcast, so the test saw no `display.status` event. The test helper now
 serializes lease/runtime polls with one lock, preserving the real watcher and exact one-event
-assertion while making the observation wait for the claimed broadcast. The runtime already treats
+assertion while making the observation wait for the claimed broadcast. The external-start test also
+holds that lock across its two start writes (`launcher.pid`, then `env`), so a background pass
+cannot broadcast the half-written start as a separate transition. The runtime already treats
 zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this is test-only
 synchronization, not a production liveness correction. Retire when the watcher exposes an owned
 synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
