@@ -810,9 +810,10 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
-    "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
-    "return BLOCKED with the reason describing the block.\n"
+    "- If the response explains the work is genuinely unachievable, or a "
+    "constraint was breached, return BLOCKED with the reason describing it. "
+    "If it hits the stated Stop condition and only needs user input, return "
+    "WAIT with ``wait_on_user_message`` naming the decision.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
@@ -1649,10 +1650,13 @@ def _truthy(value: Any) -> bool:
 
 # BLOCKED reasons that are a real stop rather than a wait for the user's answer.
 _BLOCKED_PAUSE_RE = re.compile(
-    r"\b(?:breach\w*|violat\w*|irreversibl\w*|constraints?|forbid\w*|prohibit\w*|impossible|"
-    r"unachievable|must not|must never|should not have|cannot be (?:achieved|done|completed|satisfied|undone)|"
+    r"\b(?:breach\w*|violat\w*|irreversibl\w*|impossible|"
+    r"unachievable|must never|should not have|cannot be (?:achieved|done|completed|satisfied|undone)|"
     r"no longer (?:exists|possible)|already (?:sent|deleted|merged|published|posted|paid|pushed|removed)|"
-    r"nothing (?:left|more) to try|no remaining (?:options|approaches))\b",
+    r"nothing (?:left|more) to try|no remaining (?:options|approaches))\b"
+    # A completed action next to a prohibition is a breach; the prohibition alone is not.
+    r"|\b(?:merged|sent|deleted|published|posted|paid|pushed|removed|dropped|wiped)\b[^.;]{0,80}"
+    r"\b(?:forbid\w*|prohibit\w*|constraints?|must not)\b",
     re.I,
 )
 # BLOCKED reasons that only need the user's answer, approval or decision.

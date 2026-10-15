@@ -9,8 +9,8 @@ never saw verdicts. This test locks in the fix.
 
 from __future__ import annotations
 
-import uuid
 import asyncio
+import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch

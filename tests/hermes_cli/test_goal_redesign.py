@@ -402,3 +402,19 @@ def test_slice_5_breach_naming_the_user_still_pauses(hermes_home, reason):
         decision = mgr.evaluate_after_turn("done", user_initiated=True)
     assert decision["status"] == "paused"
     assert goals.load_goal(sid).waiting_on_user_message is False
+
+
+@pytest.mark.parametrize("reason", [
+    "The goal's constraints require Brian's sign-off before merging; awaiting his approval.",
+    "The agent must not send the DM until Brian approves the wording.",
+])
+def test_slice_5_constraint_requiring_approval_is_a_user_wait(hermes_home, reason):
+    from hermes_cli import goals
+
+    sid = "slice-5-approval"
+    mgr = _manager(sid)
+    with patch("agent.auxiliary_client.call_llm",
+               return_value=_judge_reply({"verdict": "blocked", "reason": reason})):
+        decision = mgr.evaluate_after_turn("ready", user_initiated=True)
+    assert decision["status"] == "active"
+    assert goals.load_goal(sid).waiting_on_user_message is True

@@ -17,8 +17,8 @@ silently stalling goal loops on messaging gateways.
 
 from __future__ import annotations
 
-import uuid
 import asyncio
+import uuid
 
 import pytest
 
