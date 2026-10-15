@@ -50,7 +50,7 @@ def test_bare_goal_replaces_paused_in_place_without_kickoff(state):
     manager = GoalManager("target")
     manager.set("old objective")
     assert manager.state is not None
-    manager.state.turns_used = 0
+    manager.state.turns_used = 3
     manager.state.status = "paused"
     manager.state.paused_reason = "user-paused"
     manager._save()
@@ -63,7 +63,7 @@ def test_bare_goal_replaces_paused_in_place_without_kickoff(state):
     assert result.clear_pending == "replace"
     assert stored.goal == "new objective"
     assert stored.status == "paused"
-    assert stored.turns_used == 0
+    assert stored.turns_used == 3
     assert len(stored.revisions) == 1
     assert stored.revisions[0]["kind"] == "replace"
 
@@ -78,6 +78,24 @@ def test_bare_goal_replaces_active_without_kickoff(state):
     assert not result.error
     assert result.prompt is None and result.kickoff is False
     assert stored.goal == "new objective" and stored.status == "active"
+
+
+def test_bare_goal_lifts_blocked_pause_without_kickoff(state):
+    manager = GoalManager("target")
+    manager.set("old objective")
+    manager.state.turns_used = 3
+    manager.state.status = "paused"
+    _blocked(manager)
+    manager._save()
+
+    result = _dispatch(GoalManager("target"), "new objective")
+
+    stored = load_goal("target")
+    assert not result.error
+    assert result.prompt is None and result.kickoff is False
+    assert stored.goal == "new objective"
+    assert stored.status == "active" and stored.paused_reason is None
+    assert stored.turns_used == 3
 
 
 
