@@ -942,6 +942,11 @@ class TestSelfPacedBackoff:
         assert fresh.state is not None and fresh.state.backoff_level == 0
         assert fresh.fire_tick() is not None
         assert fresh.fire_tick() is None
+        assert wake_loop_for_external_event("external-wake") is False
+        fresh.complete_tick("changed evidence")
+        fresh.state.next_due_at = time.time() + 60 * 60
+        fresh._save()
+        assert wake_loop_for_external_event("external-wake") is True
 
     def test_external_event_resets_blocked_until_ladder_for_interval_loops(self, hermes_home):
         from hermes_cli.loops import LoopManager, wake_loop_for_external_event

@@ -347,6 +347,8 @@ class LoopState:
     # while the turn runs supersedes that turn's stop verdict even for a freshly loaded manager.
     fired_version: int = 0
     last_response_digest: str = ""    # self-paced change detection
+    # Last fired tick count that consumed a trusted external wake; at most one early wake per settled tick.
+    last_external_wake_tick: int = -1
     # Non-blocking overlap guidance returned by loop_set results when a goal already owns this session.
     goal_warning: Optional[str] = None
     # Shared no-progress ladder index. It advances on unchanged self-paced replies and one-shot
@@ -901,9 +903,10 @@ class LoopManager(LoopRevisionsMixin):
             if state is None or state.status != "active" or state.awaiting_response:
                 return False
             now = time.time()
-            if state.next_due_at <= now:
+            if state.next_due_at <= now or state.ticks_fired <= state.last_external_wake_tick:
                 return False
             state.next_due_at = now
+            state.last_external_wake_tick = state.ticks_fired
             state.backoff_level = 0
             state.last_response_digest = ""
             if state.mode == "self_paced":
