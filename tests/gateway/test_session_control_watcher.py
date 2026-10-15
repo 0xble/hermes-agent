@@ -357,7 +357,9 @@ async def test_watcher_retries_wake_not_accepted_and_processes_next_record(state
 
 
 @pytest.mark.asyncio
-async def test_watcher_enqueues_replaced_goal_continuation(state):
+async def test_watcher_admits_no_continuation_for_replaced_goal(state):
+    """Slice 6: replacing a paused goal keeps it paused and starts no turn. The drain settles the
+    continuation step (``continuation_enqueued`` means settled) without admitting a wake."""
     from hermes_cli.goals import GoalManager
     from hermes_cli.session_controls import apply_control, pending_outbox
 
@@ -376,7 +378,7 @@ async def test_watcher_enqueues_replaced_goal_continuation(state):
 
     with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=admit_event)) as admit:
         await runner._drain_session_controls()
-    admit.assert_awaited_once()
+    admit.assert_not_awaited()
     assert pending_outbox() == []
 
 
@@ -419,8 +421,9 @@ async def test_watcher_discards_superseded_control_continuation(state, authority
     admit.assert_not_awaited()
     persisted = session_controls._load_record(record["id"])
     if action == "replace":
-        assert persisted["continuation_enqueued"] is False
-        assert persisted["continuation_discarded"] is None
+        # No prompt to deliver: the step settles without a discard receipt.
+        assert persisted["continuation_enqueued"] is True
+        assert persisted.get("continuation_discarded") is None
     else:
         assert persisted["continuation_enqueued"] is True
         assert persisted["continuation_discarded"] == "target_changed"
