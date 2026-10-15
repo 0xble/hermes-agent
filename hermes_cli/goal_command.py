@@ -149,8 +149,12 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
     else:
         headline, contract = goals.parse_contract(arg)
         contract = contract if not contract.is_empty() else None
+    goal_text = headline or arg
+    authoring_findings = goals.goal_authoring_findings(
+        goal_text, contract,
+    )
     previous = mgr.state.goal if mgr.has_goal() else ""
-    state = mgr.set(headline or arg, contract=contract)
+    state = mgr.set(goal_text, contract=contract)
     budget = "∞" if state.max_turns == 0 else str(state.max_turns)
     output = render("gateway.goal.set", "⊙ Goal set ({budget}-turn budget): {goal}",
                     budget=budget, goal=state.goal)
@@ -170,6 +174,8 @@ def _set(mgr, arg, *, drafting, last_user_message, render, progress):
         output += (f"\nAfter each turn, a judge model checks if the goal is done{against}. "
                    "Hermes keeps working until it is, you pause/clear it, or the budget is "
                    "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear.")
+    if authoring_findings:
+        output += "\n" + goals.format_goal_authoring_warning(authoring_findings)
     return GoalCommandResult(output, goals.goal_kick_prompt(state.goal, last_user_message), kickoff=True)
 
 

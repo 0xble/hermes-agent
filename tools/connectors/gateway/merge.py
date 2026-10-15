@@ -5,6 +5,7 @@ Correlate all remote results by original call position, never wire ``index``.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -16,6 +17,7 @@ __all__ = [
     "Partition",
     "PlannedCall",
     "assemble_results",
+    "batch_entry_error",
     "fill_remote_failure",
     "partition_calls",
     "render_remote_entry",
@@ -175,6 +177,24 @@ def assemble_results(
         "error_count": error_count,
         "total_count": len(merged),
     }
+
+
+def batch_entry_error(value: Any) -> Optional[dict[str, Any]]:
+    """The one failure predicate for per-entry batch results (local and connector).
+
+    A result fails only when it carries a truthy ``error`` and does not claim
+    ``success: true``; successful payloads such as ``{"success": true, "error": null}``
+    pass through unchanged. Returns the error normalized to ``{code, message}``, else None.
+    """
+    if not isinstance(value, Mapping) or value.get("success") is True:
+        return None
+    error = value.get("error")
+    if not error:
+        return None
+    if isinstance(error, Mapping) and {"code", "message"} <= error.keys():
+        return dict(error)
+    return {"code": "TOOL_ERROR",
+            "message": error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)}
 
 
 def _error_entry(position: int, name: str, *, code: str, message: str) -> dict[str, Any]:

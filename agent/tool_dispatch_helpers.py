@@ -134,6 +134,7 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
     try:
         from tools.tool_search import (
             CONNECTOR_BATCH_SENTINEL,
+            LOCAL_BATCH_SENTINEL,
             TOOL_CALL_NAME,
             is_connector_name,
             resolve_underlying_call,
@@ -142,6 +143,11 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
             return tool_name, function_args
         underlying, underlying_args, err = resolve_underlying_call(function_args)
         if err is not None or not underlying:
+            return tool_name, function_args
+        if underlying == LOCAL_BATCH_SENTINEL:
+            # Direct callers are handled losslessly by model_tools; the planner must
+            # keep this wrapper as a sequential barrier because it cannot split the
+            # entries into independently admitted tool calls here.
             return tool_name, function_args
         if underlying == CONNECTOR_BATCH_SENTINEL:
             # Only a PURE connector batch is parallel-safe (network-bound,

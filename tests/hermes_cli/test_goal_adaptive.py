@@ -307,52 +307,7 @@ def test_judge_sees_the_closing_evidence_of_a_long_response(monkeypatch):
 DISPUTED = ("continue", "tests missing", False, {"disputed": True}, False)
 
 
-def test_disputes_with_new_evidence_do_not_pause(hermes_home):
-    mgr = GoalManager(session_id="dispute-progress")
-    mgr.set("ship", max_turns=100)
-    fingerprints = iter([{"cited": [], "unresolved": [], "evidence_ids": [str(i)]} for i in range(5)])
-    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
-            patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(fingerprints)):
-        decisions = [mgr.evaluate_after_turn("done") for _ in range(5)]
-    assert all(d["should_continue"] for d in decisions)
-    assert mgr.state.consecutive_disputes == 1
-
-
-def test_disputes_without_new_evidence_pause_at_the_limit(hermes_home):
-    mgr = GoalManager(session_id="dispute-stuck")
-    mgr.set("ship", max_turns=100)
-    same = {"cited": [], "unresolved": [], "evidence_ids": ["41"]}
-    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
-            patch.object(goals, "resolve_cited_evidence", return_value=same):
-        decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
-    assert all(d["should_continue"] for d in decisions[:-1])
-    assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]
-    assert "without new evidence" in decisions[-1]["message"]
-    assert load_goal("dispute-stuck").paused_reason.startswith(goals._DISPUTED_PAUSE_PREFIX)
-
-
-def test_transport_pause_reports_the_configured_judge_route(hermes_home):
-    mgr = GoalManager(session_id="transport-route")
-    mgr.set("ship", max_turns=100)
-    transport_failure = ("continue", "judge unavailable", False, None, True)
-    with patch.object(goals, "judge_goal", return_value=transport_failure), \
-            patch("hermes_cli.config.load_config", return_value={
-                "auxiliary": {"goal_judge": {
-                    "provider": "custom:claude-proxy",
-                    "model": "claude-opus-5-5",
-                }}
-            }):
-        decisions = [mgr.evaluate_after_turn("still working")
-                     for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES)]
-
-    assert decisions[-1]["verdict"] == "continue"
-    assert not decisions[-1]["should_continue"]
-    assert "custom:claude-proxy" in decisions[-1]["message"]
-    assert "claude-opus-5-5" in decisions[-1]["message"]
-    assert "deepseek" not in decisions[-1]["message"].lower()
-
-
-# ── revisions ─────────────────────────────────────────────────────────────
+# ── revisions ─────────────────────────────────────────────────────────
 
 
 def test_agent_may_restructure_verification_without_user_authority(hermes_home, monkeypatch):
@@ -422,12 +377,10 @@ def test_revision_validation(hermes_home):
     assert mgr.revise(reason="r", contract={"bogus": "v"})["error_code"] == "unknown_field"
 
 
-def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
+def test_revision_round_trips(hermes_home):
     mgr = GoalManager(session_id="rev-roundtrip")
     mgr.set("Ship X", max_turns=100)
-    mgr.state.consecutive_disputes = 2
     mgr.revise(reason="clarify", contract={"outcome": "X live"}, user_messages=[])
-    assert mgr.state.consecutive_disputes == 0
     state = load_goal("rev-roundtrip")
     assert goals.GoalState.from_json(state.to_json()).revisions == state.revisions
 
@@ -435,7 +388,7 @@ def test_revision_resets_the_dispute_streak_and_round_trips(hermes_home):
 def test_legacy_state_without_revisions_loads():
     legacy = json.dumps({"goal": "g", "status": "active", "turns_used": 3})
     state = goals.GoalState.from_json(legacy)
-    assert state.revisions == [] and state.last_dispute_evidence == "" and state.render_revisions_block() == ""
+    assert state.revisions == [] and state.render_revisions_block() == ""
 
 
 # ── review regressions ────────────────────────────────────────────────
@@ -509,19 +462,6 @@ def test_citations_far_apart_in_one_result_each_get_an_excerpt(hermes_home):
     excerpted = [c["excerpt"] for c in result["cited"] if not c["excerpt"].startswith("(inside")]
     assert any("proof_start=aaaa1111" in e for e in excerpted)
     assert any("proof_end=bbbb2222" in e for e in excerpted)
-
-
-def test_rewording_or_dropping_citations_is_not_new_evidence(hermes_home):
-    mgr = GoalManager(session_id="dispute-reword")
-    mgr.set("ship", max_turns=100)
-    # Alternate: cite result 7, cite nothing, cite result 7 through other wording.
-    # The fingerprint key carries each turn's differing citation wording.
-    seq = iter([{"cited": [], "unresolved": [], "evidence_ids": ids, "fingerprint": fp}
-                for ids, fp in ((["7"], "7:proof a"), ([], ""), (["7"], "7:proof b"))])
-    with patch.object(goals, "judge_goal", side_effect=lambda *a, **k: DISPUTED), \
-            patch.object(goals, "resolve_cited_evidence", side_effect=lambda *a, **k: next(seq)):
-        decisions = [mgr.evaluate_after_turn("done") for _ in range(goals.DEFAULT_MAX_CONSECUTIVE_DISPUTES)]
-    assert decisions[-1]["verdict"] == "disputed" and not decisions[-1]["should_continue"]
 
 
 def test_excluded_bookkeeping_matches_do_not_crowd_out_real_evidence(hermes_home):

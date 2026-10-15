@@ -1103,6 +1103,9 @@ class TestPruneSweepsTmpPackDebris:
         import tools.checkpoint_manager as cm
         monkeypatch.setattr(cm, "CHECKPOINT_BASE", checkpoint_base)
         monkeypatch.setattr("hermes_cli.gitlock._git_proc_running", lambda: False)
+        # This regression exercises the legacy global-guard fallback. Linux
+        # holder-scoped behavior has dedicated process-scope tests.
+        monkeypatch.setattr("hermes_cli._git_process_scope._linux_process_scope", False)
         work = tmp_path / "proj"
         work.mkdir()
         (work / "f").write_text("f")
