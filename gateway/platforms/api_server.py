@@ -33,6 +33,7 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
+_UNREAD_SESSION_OVERRIDE = object()  # ``_create_agent``: caller did not pre-read the /model override
 
 
 def _prefix_names_served_profile(profile: str) -> bool:
@@ -1194,7 +1195,10 @@ def _run_route_delegate(name: str):
     return _handler
 
 
-class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+from gateway.platforms.api_server_model_routes import SessionModelRoutesMixin
+
+
+class APIServerAdapter(SessionModelRoutesMixin, OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
     # Stateless request/response (``send()`` is a stub): async-delivery tools must not promise
@@ -2183,51 +2187,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return "api_server"
         return "hermes_browser" if text == "browser" else text
 
-    def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The gateway's per-session ``/model`` override for *session_key*, if any — a
-        user-issued ``/model`` always wins over static route config."""
-        if not session_key:
-            return None
-        try:
-            from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            if runner is None:
-                return None
-            try:
-                rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
-                if callable(rehydrate):
-                    rehydrate(session_key)
-            except Exception:
-                logger.debug(
-                    "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
-            override = runner._session_model_overrides.get(session_key)
-            return dict(override) if isinstance(override, dict) else None
-        except Exception:
-            return None
-
-    def _request_route_conflict_error(
-        self, *, session_id: Optional[str], gateway_session_key: Optional[str], requested_model: Optional[str],
-        requested_provider: Optional[str], route: Optional[Dict[str, Any]]) -> Optional[str]:
-        """Return a 400-worthy conflict string for ambiguous route/provider mixes."""
-        request_provider = _clean_request_string(requested_provider)
-        if not request_provider or not isinstance(route, dict):
-            return None
-        if self._session_model_override_for(gateway_session_key or session_id):
-            return None  # session /model wins over both, so nothing is ambiguous
-        route_provider = _clean_request_string(route.get("provider"))
-        route_api_key = _clean_request_string(route.get("api_key"))
-        route_base_url = _clean_request_string(route.get("base_url"))
-        route_alias = _clean_request_string(requested_model) or "requested model"
-        if route_provider and request_provider != route_provider:
-            return (
-                f"Model route '{route_alias}' is pinned to provider '{route_provider}'. "
-                f"Remove 'provider' or use '{route_provider}'.")
-        if not route_provider and (route_api_key or route_base_url):
-            return (
-                f"Model route '{route_alias}' pins route credentials/base_url. "
-                "Do not combine it with an explicit 'provider'.")
-        return None
-
     @staticmethod
     def _resolve_provider_runtime(
         provider: Optional[str], *, target_model: Optional[str], required: bool,
@@ -2293,7 +2252,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _select_agent_runtime(
         self, runtime_kwargs: Dict[str, Any], model: str, *, requested_model: Optional[str],
         requested_provider: Optional[str], route: Optional[Dict[str, Any]], session_model: Optional[str],
-        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str]) -> tuple:
+        confirmed_runtime_lock: bool, gateway_session_key: Optional[str], session_id: Optional[str],
+        session_override_snapshot: Any = _UNREAD_SESSION_OVERRIDE) -> tuple:
         """Apply the model/provider precedence chain for one agent (mutates ``runtime_kwargs``):
         confirmed Browser lock > session ``/model`` override > session-persisted model >
         model_routes alias > per-request provider/model > global defaults. A confirmed lock
@@ -2307,7 +2267,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
         current_provider = _clean_request_string(runtime_kwargs.get("provider"))
-        session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
+        if confirmed_runtime_lock:
+            session_override = None
+        elif session_override_snapshot is not _UNREAD_SESSION_OVERRIDE:
+            session_override = session_override_snapshot  # read off-loop by an async caller
+        else:
+            session_override = self._session_model_override_for(session_key)
         # Model-string precedence (override > session-persisted > global) is owned by
         # hermes_cli.model_switch.resolve_effective_model.
         from hermes_cli.model_switch import resolve_effective_model
@@ -2368,8 +2333,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        session_override_snapshot: Any = _UNREAD_SESSION_OVERRIDE) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
+        Loop callers pass ``session_override_snapshot`` (read in a worker) so no store read
+        happens on the loop.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
@@ -2394,7 +2362,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_kwargs, model,
             requested_model=requested_model, requested_provider=requested_provider, route=route,
             session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
-            gateway_session_key=gateway_session_key, session_id=session_id)
+            gateway_session_key=gateway_session_key, session_id=session_id,
+            session_override_snapshot=session_override_snapshot)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
@@ -3419,7 +3388,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
             agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
-            selection_error = self._request_route_conflict_error(
+            await self._prepare_request_route_validation(gateway_session_key or session_id)
+            selection_error = await asyncio.to_thread(
+                self._request_route_conflict_error,
                 session_id=session_id, gateway_session_key=gateway_session_key,
                 requested_model=agent_overrides.get("requested_model"),
                 requested_provider=agent_overrides.get("requested_provider"), route=route)

@@ -299,6 +299,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
 
         return model, runtime_kwargs, notice, cache_model
 
+    async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
+        """Hydrate a persisted override without taking the session-store lock on the loop."""
+        if not session_key or self._session_model_override(session_key) is not None:
+            return
+        async with self._session_model_override_lock(session_key):
+            if self._session_model_override(session_key) is not None:
+                return
+            epoch = self._session_model_override_epoch(session_key)
+            loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+            self._commit_session_model_override(session_key, loaded, epoch)
+
     async def _resolve_session_agent_runtime_async(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
@@ -307,11 +318,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         skey = self._resolve_session_key_or_none(source, session_key)
         self._pre_agent_fallback_notice = None
         if skey:
-            async with self._session_model_override_lock(skey):
-                if self._session_model_override(skey) is None:
-                    epoch = self._session_model_override_epoch(skey)
-                    hydrated = await asyncio.to_thread(self._load_session_model_override, skey)
-                    self._commit_session_model_override(skey, hydrated, epoch)
+            await self._rehydrate_session_model_override_async(skey)
         while True:
             override, last_model, epoch = self._snapshot_session_runtime_state(skey)
             resolved = await asyncio.to_thread(
@@ -2554,7 +2561,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
-            if not heartbeat_owner_is_current(self, event, session_key):
+            if not await asyncio.to_thread(heartbeat_owner_is_current, self, event, session_key):
                 return
             if self._is_user_turn_event(event):
                 # The user is back: release completions held since their /stop.

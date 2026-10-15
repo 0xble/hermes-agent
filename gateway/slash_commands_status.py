@@ -259,7 +259,7 @@ class GatewayStatusCommandsMixin:
         # to an active /model override, then SessionDB metadata + last_prompt_tokens so /status
         # stays useful between turns. Rehydrate first so this precedence survives gateway restarts.
         status_agent = agent if is_running else self._cached_agent_for(session_key)
-        self._rehydrate_session_model_override(session_key)
+        await self._rehydrate_session_model_override_async(session_key)
         active_override = self._session_model_override(session_key) or {}
         model_name, provider_name, context_used, context_total, route = _status_model_route(
             status_agent, active_override, persisted_route, session_row, session_entry

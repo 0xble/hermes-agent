@@ -167,7 +167,8 @@ class GatewayAgentCacheMixin:
         """Caller holds the route lock; publish memory only after successful persistence."""
         self._bump_session_model_override_epoch(session_key)
         epoch = self._session_model_override_epoch(session_key)
-        write = asyncio.create_task(self.async_session_store.set_model_override(session_key, override))
+        from gateway.event_loop import create_teardown_write
+        write = create_teardown_write(self.async_session_store.set_model_override(session_key, override))
         cancelled = None
         try:
             while not write.done():

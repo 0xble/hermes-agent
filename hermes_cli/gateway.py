@@ -71,6 +71,13 @@ from hermes_cli.setup import (  # noqa: F401 — resolved lazily by siblings thr
 from hermes_cli.colors import Colors, color
 logger = logging.getLogger(__name__)
 
+
+def _run_gateway_until_teardown(coro):
+    """Run graceful teardown without ``asyncio.run`` joining the default executor."""
+    from gateway.event_loop import run_until_teardown
+    return run_until_teardown(coro)
+
+
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
 _CAPTURE_TEXT = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
 
@@ -4892,20 +4899,20 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False,
 
     success = False
     try:
-        success = asyncio.run(_run_with_release_ack())
-        _exit_diag("asyncio.run.returned", success=success)
+        success = _run_gateway_until_teardown(_run_with_release_ack())
+        _exit_diag("gateway.loop.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
-        _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())
+        _exit_diag("gateway.loop.KeyboardInterrupt", traceback=_traceback.format_exc())
         print("\nGateway stopped.")
         _hard_exit_after_gateway_teardown(0)
         return  # unreachable in production (os._exit); guard for test stubs
     except SystemExit as e:
-        _exit_diag("asyncio.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
+        _exit_diag("gateway.loop.SystemExit", code=e.code, traceback=_traceback.format_exc())
         _hard_exit_after_gateway_teardown(0 if e.code is None else e.code if isinstance(e.code, int) else 1)
     except BaseException as e:
         # Everything else (CancelledError, exotic BaseExceptions): log the cause, then re-raise.
-        _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
+        _exit_diag("gateway.loop.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
         raise
     if not success:
         _exit_diag("gateway.exit_nonzero")

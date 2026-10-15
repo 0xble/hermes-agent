@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,6 +14,13 @@ class _ExitCalled(Exception):
 
 
 def _raise_exit(code: int) -> None:
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        pass
+    else:
+        loop.close()
+        asyncio.set_event_loop(None)
     raise _ExitCalled(code)
 
 

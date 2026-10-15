@@ -33,6 +33,22 @@ _FAST_SELECTIONS = {
 }
 
 
+_UNRESOLVED_ROUTE = object()
+
+
+def _fast_route_ignored_note_for(route: Optional[tuple], tier: Optional[str]) -> str:
+    """A warning when the route never receives fast-mode params (a proxy): /fast is accepted but
+    changes nothing, so the reply must not imply it applied. Pure: never resolves the route."""
+    if not tier or route is None:
+        return ""
+    from hermes_cli.models import fast_mode_route_ignored
+
+    model, runtime = route
+    if not fast_mode_route_ignored(model, runtime.get("provider"), runtime.get("base_url")):
+        return ""
+    return "\n" + t("gateway.fast.route_ignored")
+
+
 def _fast_route_supports(model: str, runtime: dict, tier: Optional[str] = None) -> bool:
     """The turn's own gate (``run_turn.py::_resolve_turn_agent_config``): a tier /fast accepts must be
     one the session's next request actually carries, so proxies and other providers are refused."""
@@ -443,18 +459,15 @@ class GatewayModelCommandsMixin:
         self, source, session_key: str, *, profile_home=None, **fields,
     ) -> _ModelSwitchContext:
         """Context for a model switch on ``session_key``: current route from the owning profile's
-        config, with any session override applied (one builder for every switch entry point). The
-        persisted override is rehydrated first: after a gateway restart the in-memory map is empty
-        until the session's next turn, and resolving against the global route would let a
-        model-only switch silently change the session's provider."""
+        config, with any session override applied (one builder for every switch entry point).
+        Async callers hydrate the persisted override off-loop before building this context,
+        preserving the owning profile's provider after a gateway restart."""
         from gateway.run import _hermes_home
         ctx = _ModelSwitchContext(
             session_key=session_key, source=source,
             config_path=(profile_home or _hermes_home) / "config.yaml", **fields,
         )
         ctx.read_config()
-        if session_key:
-            self._rehydrate_session_model_override(session_key)
         ctx.apply_override(self._session_model_overrides.get(session_key, {}))
         return ctx
 
@@ -472,6 +485,7 @@ class GatewayModelCommandsMixin:
         profile_home = None
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             profile_home = self._resolve_profile_home_for_source(source)
+        await self._rehydrate_session_model_override_async(session_key)
         ctx = self._model_switch_context(source, session_key, profile_home=profile_home, persist_global=False)
         result, error = await self._perform_model_switch(ctx, model, provider, source)
         if error is not None:
@@ -641,6 +655,7 @@ class GatewayModelCommandsMixin:
         # Check for session override. See #30479.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        await self._rehydrate_session_model_override_async(session_key)
         ctx = self._model_switch_context(
             source, session_key, profile_home=profile_home,
             persist_global=resolve_persist_behavior(
@@ -933,37 +948,51 @@ class GatewayModelCommandsMixin:
         agent._fast_until = (time.monotonic() + getattr(agent, "fast_auto_seconds", DEFAULT_WINDOW_SECONDS)
                              if tier == "auto" else 0.0)
 
-    def _apply_fast_selection(self, session_key: str, value: str, persist: bool = False) -> str:
-        """Apply a /fast argument (typed or picked) and return the reply."""
+    def _apply_fast_selection(
+        self, session_key: str, value: str, persist: bool = False, *,
+        route: tuple[str, dict] | None | object = _UNRESOLVED_ROUTE,
+    ) -> str:
+        """Apply a /fast argument (typed or picked) and return the reply.
+
+        Async callers resolve ``route`` on the loop and pass it (``None`` = no usable route), so
+        a worker running this never resolves or commits session route state."""
         selection = _FAST_SELECTIONS.get(value)
         if selection is None:
             return t("gateway.fast.unknown_arg", arg=value)
         tier, saved_value, label_key = selection
         label = t(label_key) if label_key else value.upper()
+        if route is _UNRESOLVED_ROUTE:
+            note = self._fast_route_ignored_note(session_key, tier)
+        else:
+            note = _fast_route_ignored_note_for(route, tier)
         self._service_tier = tier
         if persist and self._save_gateway_config_key("agent.service_tier", saved_value):
             self._set_session_service_tier_override(session_key, None, clear=True)  # global wins
             self._apply_live_service_tier(session_key, tier)
-            return t("gateway.fast.saved", label=label) + self._fast_route_ignored_note(session_key, tier)
+            return t("gateway.fast.saved", label=label) + note
         # Session override — also the fallback after a failed config write (as /reasoning --global).
         self._set_session_service_tier_override(session_key, tier)
         self._apply_live_service_tier(session_key, tier)
-        return t("gateway.fast.session_only", label=label) + self._fast_route_ignored_note(session_key, tier)
+        return t("gateway.fast.session_only", label=label) + note
 
     def _fast_route_ignored_note(self, session_key: str, tier: str | None) -> str:
-        """A warning when the session's route never receives fast-mode params (a proxy): /fast is
-        accepted but changes nothing, so the reply must not imply it applied."""
+        """Synchronous on-loop callers only: resolving the route commits session route state."""
         if not tier:
             return ""
-        from hermes_cli.models import fast_mode_route_ignored
-
         try:
-            model, runtime = self._resolve_session_agent_runtime(session_key=session_key)
+            route = self._resolve_session_agent_runtime(session_key=session_key)
         except Exception:
-            return ""
-        if not fast_mode_route_ignored(model, runtime.get("provider"), runtime.get("base_url")):
-            return ""
-        return "\n" + t("gateway.fast.route_ignored")
+            route = None
+        return _fast_route_ignored_note_for(route, tier)
+
+    async def _resolve_fast_route(self, source, session_key: str, user_config: dict):
+        """On-loop route resolution for /fast; ``None`` when no usable route exists."""
+        try:
+            # Off the loop: credential resolution can refresh an OAuth token, as the turn does.
+            return await self._resolve_session_agent_runtime_async(
+                source=source, session_key=session_key, user_config=user_config)
+        except Exception:
+            return None
 
     async def _handle_fast_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /fast — the CLI Priority Processing toggle; session-scoped unless ``--global``
@@ -977,6 +1006,7 @@ class GatewayModelCommandsMixin:
         # the next turn reads, and the eligibility check must see that turn's route.
         source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
         session_key = self._session_key_for_source(source)
+        self._session_state(session_key)  # worker appliers must not create loop-owned state
         transition = self._resolve_session_service_tier(
             session_key=session_key, report_transition=True,
         )
@@ -985,13 +1015,9 @@ class GatewayModelCommandsMixin:
         else:
             self._service_tier, expiry_notice = transition, None
         user_config = _load_gateway_config()
-        try:
-            # Off the loop: credential resolution can refresh an OAuth token, as the turn does.
-            model, runtime = await asyncio.to_thread(
-                self._resolve_session_agent_runtime, source=source, session_key=session_key, user_config=user_config)
-        except Exception:
-            # No usable route at all (the turn fails too): judge the configured model alone.
-            model, runtime = _resolve_gateway_model(user_config), {}
+        route = await self._resolve_fast_route(source, session_key, user_config)
+        # No usable route at all (the turn fails too): judge the configured model alone.
+        model, runtime = route if route is not None else (_resolve_gateway_model(user_config), {})
         if not _fast_route_supports(model, runtime):
             reply = t("gateway.fast.not_supported")
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
@@ -1000,7 +1026,8 @@ class GatewayModelCommandsMixin:
             reply = t("gateway.fast.ultrafast_not_supported", model=model)
             return reply + ("\n\n" + expiry_notice if expiry_notice else "")
         if args and args != "status":
-            reply = self._apply_fast_selection(session_key, args, persist=persist_global)
+            reply = await asyncio.to_thread(
+                self._apply_fast_selection, session_key, args, persist=persist_global, route=route)
             return (expiry_notice + "\n\n" + reply) if expiry_notice else reply
         mode = service_tier_word(self._service_tier)
         status = {"fast": t("gateway.fast.status_fast"), "normal": t("gateway.fast.status_normal")}.get(mode, mode)
@@ -1015,7 +1042,11 @@ class GatewayModelCommandsMixin:
             status += "\n\n" + expiry_notice
 
         async def _on_fast_choice(_chat_id: str, value: str) -> str:
-            return self._apply_fast_selection(session_key, value, persist=persist_global)
+            # The route may change while the picker is visible: re-resolve it here, on the loop.
+            choice_route = await self._resolve_fast_route(source, session_key, _load_gateway_config())
+            self._session_state(session_key)
+            return await asyncio.to_thread(
+                self._apply_fast_selection, session_key, value, persist=persist_global, route=choice_route)
 
         picker_sent = await self._try_send_choice_picker(
             event,

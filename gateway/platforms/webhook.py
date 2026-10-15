@@ -754,7 +754,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return
         try:
             session_key = key_fn(event.source)
-            session_id = _peek_session_id(store, session_key)
+            session_id = await asyncio.to_thread(_peek_session_id, store, session_key)
             if not session_id:
                 logger.debug("[webhook] No session_id to close for %s (key=%s)", session_chat_id, session_key)
                 return
