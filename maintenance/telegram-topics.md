@@ -86,6 +86,10 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
   `Fork-Patch:` trailer slices above. This unit is the owner of those identities;
   `scripts/check_fork_patches.py` verifies the trailer on every commit after the floor.
+  The published squash commit for PR #638 omitted its trailer; the stable patch-id backfill
+  below repairs classification without rewriting `main`.
+
+Fork-Patch-Backfill: b91a64164821e8c1a3669a3b5e153f871370e86c; telegram-topic-owner-routing
 
 ## Update
 
