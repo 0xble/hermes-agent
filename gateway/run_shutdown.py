@@ -2466,13 +2466,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                     self._s2_note_session_keys.add(_session_key)
             except Exception:
                 continue
-        # Best-effort sends must not eat launchd's stop leash: detach on deadline (transports may swallow
-        # cancellation). A completed handover (successor serving, last turn done) sends no notice.
+        # Best-effort sends must not eat launchd's stop leash. A completed handover sends no notice.
         from gateway.run import GatewayRunner
         notice_started = time.monotonic()
         _handover = getattr(self, "_zero_cut_handover_state", None) or {}
-        _quiet = _handover.get("token_lock_released") and not _handover.get("failed")
-        notice_task = asyncio.create_task(asyncio.sleep(0) if _quiet else self._notify_active_sessions_of_shutdown())
+        notice_task = asyncio.create_task(asyncio.sleep(0) if _handover.get("token_lock_released") and not _handover.get("failed") else self._notify_active_sessions_of_shutdown())
         if not await GatewayRunner._wait_or_detach(notice_task, 3.0):
             logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
         else:
