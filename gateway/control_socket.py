@@ -106,6 +106,8 @@ def build_identify_payload() -> dict[str, Any]:
         **{k: record.get(k) for k in ("kind", "pid", "start_time", "hermes_home")},
         "profile": _profile_label_for_home(record.get("hermes_home") or ""),
         "supervisor": _detect_supervisor(), **_get_code_identity_fields()}
+    from gateway import zero_cut_standby as zcs
+    payload.update({"slot": zcs.readiness()["slot"], "standby": zcs.readiness()["standby"]})
     with contextlib.suppress(Exception):
         # served_profiles (multiplex mode) is stamped into runtime status by the runner.
         served = (read_runtime_status() or {}).get("served_profiles")
@@ -117,7 +119,8 @@ def build_identify_payload() -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     """Default ``status`` answer — current runtime status, answered live."""
     from gateway.status import read_runtime_status
-    return {**(read_runtime_status() or {}), "protocol": CONTROL_PROTOCOL_VERSION,
+    from gateway import zero_cut_standby as zcs
+    return {**(read_runtime_status() or {}), **zcs.readiness(), "protocol": CONTROL_PROTOCOL_VERSION,
             "answered_at": time.time(), "answering_pid": os.getpid()}
 
 
@@ -282,12 +285,15 @@ class _PipeControlProtocol(asyncio.Protocol):
 def query_gateway_control(
     home: Path, verb: str, *, params: Optional[dict[str, Any]] = None,
                           timeout: float = _DEFAULT_CLIENT_TIMEOUT, payload: Optional[dict[str, Any]] = None,
-    slot: str = SLOT_ACTIVE,
+    slot: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Ask the gateway serving ``home`` a control verb; returns its ``result`` payload. Any failure (no/stale
     socket, timeout, malformed answer, ``ok: false``) returns None so callers fall back to the scan layer.
-    ``params`` carries verb arguments (e.g. ``{"old": ..., "new": ...}``); ``slot="b"`` targets the standby
-    handover slot instead of the home's active gateway. Never raises."""
+    ``params`` carries verb arguments (e.g. ``{"old": ..., "new": ...}``); ``slot`` pins a handover slot,
+    else the slot serving ``home`` (``a``, or a promoted ``b`` once ``a`` is gone). Never raises."""
+    if slot is None:
+        from gateway.gateway_slot import serving_slot
+        slot = serving_slot(home)
     request_data: dict[str, Any] = {"verb": verb, "id": 1, "protocol": CONTROL_PROTOCOL_VERSION}
     if payload is not None:
         request_data["payload"] = payload
@@ -363,8 +369,8 @@ def _windows_pipe_exchange(home: Path, request: bytes, timeout: float, slot: str
 
 
 def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
-                     slot: str = SLOT_ACTIVE) -> Optional[dict[str, Any]]:
-    """Convenience wrapper: ``identify`` the gateway serving ``home`` (its active slot unless asked)."""
+                     slot: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Convenience wrapper: ``identify`` the gateway serving ``home`` (its serving slot unless asked)."""
     return query_gateway_control(home, "identify", timeout=timeout, slot=slot)
 
 

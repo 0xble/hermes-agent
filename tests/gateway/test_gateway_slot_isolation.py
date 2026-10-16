@@ -12,12 +12,24 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from gateway import gateway_slot
-from gateway.control_socket import GatewayControlServer, identify_gateway, resolve_server_socket_path
+from gateway import zero_cut_standby
+from gateway.control_socket import GatewayControlServer, identify_gateway, query_gateway_control, resolve_server_socket_path
+
+
+@pytest.fixture(autouse=True)
+def _reset_slot_state():
+    gateway_slot.reset_gateway_slot_for_tests()
+    zero_cut_standby.reset_for_tests()
+    yield
+    gateway_slot.reset_gateway_slot_for_tests()
+    zero_cut_standby.reset_for_tests()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FLAG_ON = "gateway:\n  zero_cut_handover:\n    enabled: true\n"
@@ -84,6 +96,27 @@ def test_slot_defaults_to_a_and_reads_env_at_call_time(monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_SLOT", raw)
         assert gateway_slot.get_gateway_slot() == expected
 
+
+def test_slot_pin_is_stable(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    config = {"gateway": {"zero_cut_handover": {"enabled": True}}}
+    assert gateway_slot.pin_gateway_slot(config) == "b"
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT")
+    assert gateway_slot.effective_gateway_slot() == "b"
+    gateway_slot.reset_gateway_slot_for_tests()
+
+
+def test_standby_readiness_is_local(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    zero_cut_standby.reset_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    assert zero_cut_standby.readiness() == {"slot": "b", "standby": True, "ready": False, "deferred": []}
+    zero_cut_standby.mark_ready()
+    assert zero_cut_standby.readiness()["ready"] is True
+    zero_cut_standby.reset_for_tests()
+    gateway_slot.reset_gateway_slot_for_tests()
 
 def test_slot_filenames():
     assert gateway_slot.slot_filename("gateway.pid", "a") == "gateway.pid"
@@ -208,3 +241,276 @@ def test_launchd_plist_slots(home):
     assert standby_body["EnvironmentVariables"] == expected_env
     assert {k: v for k, v in standby_body.items() if k not in ("Label", "EnvironmentVariables")} == {
         k: v for k, v in active_body.items() if k not in ("Label", "EnvironmentVariables")}
+
+
+def _pin_standby(monkeypatch, home: Path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+
+
+def test_real_standby_control_socket_reports_readiness(home, monkeypatch):
+    (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
+    _pin_standby(monkeypatch, home)
+
+    async def scenario():
+        server = GatewayControlServer(home)
+        assert await server.start()
+        try:
+            before = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: identify_gateway(home, slot="b"))
+            status_before = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: query_gateway_control(home, "status", slot="b"))
+            zero_cut_standby.mark_ready()
+            after = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: query_gateway_control(home, "status", slot="b"))
+            await server.stop()
+
+            monkeypatch.delenv("HERMES_GATEWAY_SLOT")
+            gateway_slot.reset_gateway_slot_for_tests()
+            active_server = GatewayControlServer(home)
+            assert await active_server.start()
+            try:
+                active = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: identify_gateway(home))
+            finally:
+                await active_server.stop()
+            return before, status_before, after, active
+        finally:
+            await server.stop()
+
+    identify, status_before, status_after, active = asyncio.run(scenario())
+    assert identify["slot"] == "b" and identify["standby"] is True
+    assert status_before["slot"] == "b" and status_before["standby"] is True
+    assert status_before["ready"] is False and status_before["deferred"] == []
+    assert status_after["ready"] is True and status_after["deferred"] == []
+
+    assert active["slot"] == "a" and active["standby"] is False
+
+
+def test_runtime_status_isolation_preserves_active_file(home, monkeypatch):
+    from gateway import status
+
+    (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
+    active = home / "gateway_state.json"
+    active.write_bytes(b'{"gateway_state":"active","sentinel":"keep"}\n')
+    original = active.read_bytes()
+    _pin_standby(monkeypatch, home)
+
+    assert status.write_runtime_status(gateway_state="starting", wait_timeout=2.0)
+    assert status.flush_runtime_status(timeout=2.0)
+    assert active.read_bytes() == original
+    assert (home / "gateway_state.b.json").exists()
+    assert status.read_runtime_status()["gateway_state"] == "starting"
+
+
+def test_standby_paths_and_stop_marker_follows_the_target_pid(home, monkeypatch):
+    from gateway import run_startup, status
+
+    (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
+    _pin_standby(monkeypatch, home)
+    transient = run_startup.GatewayStartupMixin._transient_exit_streak_path()
+    assert transient == home / ".b.transient_startup_exits"
+    assert status._get_planned_stop_marker_path() == home / ".b.gateway-planned-stop.json"
+    assert status._get_planned_restart_marker_path() == home / ".b.gateway-planned-restart.json"
+
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: None)
+    (home / "gateway.pid").write_text("4242", encoding="utf-8")
+    (home / "gateway.b.pid").write_text("4343", encoding="utf-8")
+    # An explicit slot still wins.
+    assert status.write_planned_stop_marker(os.getpid(), slot="a")
+    assert (home / ".gateway-planned-stop.json").exists()
+    (home / ".gateway-planned-stop.json").unlink()
+    # Without one, the marker lands beside the gateway that PID belongs to, not the caller's slot.
+    assert status.write_planned_stop_marker(4242)
+    assert (home / ".gateway-planned-stop.json").exists()
+    assert status.write_planned_stop_marker(4343)
+    assert (home / ".b.gateway-planned-stop.json").exists()
+    assert status.write_planned_restart_marker(4343)
+    assert (home / ".b.gateway-planned-restart.json").exists()
+
+
+def test_cli_stop_of_standby_from_an_unpinned_process_targets_slot_b(home, monkeypatch):
+    """`hermes gateway stop`, s6, systemd and Windows callers run as slot a; stopping B must still mark B."""
+    from gateway import status
+
+    (home / "config.yaml").write_text(FLAG_ON, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT", raising=False)
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    assert gateway_slot.effective_gateway_slot() == "a"
+    monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: None)
+    (home / "gateway.b.pid").write_text("4343", encoding="utf-8")
+    assert status.write_planned_stop_marker(4343)
+    assert (home / ".b.gateway-planned-stop.json").exists()
+    assert not (home / ".gateway-planned-stop.json").exists()
+
+
+def test_flag_off_slot_b_preserves_all_historical_paths(home, monkeypatch):
+    from gateway import run_startup, status
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": False}}})
+    assert gateway_slot.effective_gateway_slot() == "a"
+    assert zero_cut_standby.is_standby() is False
+    assert status._get_runtime_status_path() == home / "gateway_state.json"
+    assert status._get_planned_stop_marker_path() == home / ".gateway-planned-stop.json"
+    assert status._get_planned_restart_marker_path() == home / ".gateway-planned-restart.json"
+    assert run_startup.GatewayStartupMixin._transient_exit_streak_path() == home / ".transient_startup_exits"
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+    from gateway.config import GatewayConfig
+
+    calls = []
+    mode = {"exit_cleanly": True, "ready_at_cron": None}
+
+    class FakeRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = mode["exit_cleanly"]
+            self.exit_reason = None
+            self.exit_code = None
+            self._running = True
+
+        async def start(self):
+            calls.append("runner.start")
+            return True
+
+        async def wait_for_shutdown(self):
+            calls.append("wait_for_shutdown")
+
+        def _start_systemd_watchdog(self):
+            pass
+
+    class NoopThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    async def host_attach(*args, **kwargs):
+        calls.append("host_attach")
+        return True if os.environ.get("HERMES_GATEWAY_SLOT") != "b" else None
+
+    async def settle(*args, **kwargs):
+        pass
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "GatewayRunner", FakeRunner)
+    monkeypatch.setattr(gateway_run, "_host_attach_or_none", host_attach)
+    monkeypatch.setattr(gateway_run, "_claim_host_gateway_role", lambda *a, **k: calls.append("claim"))
+    monkeypatch.setattr(gateway_run, "_start_gateway_claim_pid_file", lambda **kwargs: True)
+    monkeypatch.setattr(gateway_run, "_start_gateway_start_control_socket", lambda runner: settle())
+    monkeypatch.setattr(gateway_run, "_start_gateway_configure_logging", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_run, "_run_requested_state_db_compaction", lambda: calls.append("compact"))
+    monkeypatch.setattr(gateway_run, "_refresh_host_gateway_record", lambda *a: calls.append("refresh"))
+    monkeypatch.setattr(gateway_run, "_log_standalone_profiles_at_boot", lambda *a: None)
+    monkeypatch.setattr(gateway_run, "_ensure_windows_gateway_venv_imports", lambda: None)
+    monkeypatch.setattr(gateway_run, "_enable_multiplex_log_routing", lambda *a: None)
+    monkeypatch.setattr(gateway_run, "_start_gateway_make_shutdown_signal_handler", lambda *a: None)
+    monkeypatch.setattr(gateway_run, "_start_gateway_make_restart_signal_handler", lambda *a: None)
+    monkeypatch.setattr(gateway_run, "_start_gateway_replace_existing_instance", lambda *a: True)
+    monkeypatch.setattr(gateway_run, "_shutdown_gateway_health_export", lambda *a: None)
+    monkeypatch.setattr(gateway_run, "_settle_and_shutdown_mcp", settle)
+    monkeypatch.setattr(gateway_run, "_best_effort", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(gateway_run.threading, "Thread", NoopThread)
+    # Not the main thread (so no signal handlers), but still a valid thread for logging records.
+    monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: threading.Thread(name="not-main"))
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.code_skew.record_boot_fingerprint", lambda: None)
+    monkeypatch.setattr("gateway.lifecycle_ledger.record_startup", lambda: calls.append("record_startup"))
+    monkeypatch.setattr("hermes_cli.nous_auth_keepalive.start_nous_auth_keepalive", lambda: None)
+    monkeypatch.setattr("hermes_cli.resource_limits.apply_nofile_soft_limit", lambda: None)
+
+    config = GatewayConfig(zero_cut_handover_enabled=True)
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
+    assert "host_attach" not in calls and "claim" not in calls
+    assert "record_startup" not in calls
+    assert "compact" not in calls  # only the authoritative gateway rewrites state.db
+
+    calls.clear()
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT")
+    assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
+    assert "host_attach" in calls
+    assert zero_cut_standby.readiness()["ready"] is False  # a clean early exit never reports ready
+
+    # A serving standby reports ready only after cron and housekeeping have started.
+    def start_cron(runner):
+        mode["ready_at_cron"] = zero_cut_standby.readiness()["ready"]
+        return (None, None, None, None)
+
+    async def shutdown_tail(*args, **kwargs):
+        return True
+
+    mode["exit_cleanly"] = False
+    gateway_slot.reset_gateway_slot_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_run, "_start_gateway_start_cron_and_housekeeping", start_cron)
+    monkeypatch.setattr(gateway_run, "_start_gateway_shutdown_tail", shutdown_tail)
+    assert await gateway_run.start_gateway(config=config, replace=False, verbosity=None)
+    assert mode["ready_at_cron"] is False
+    assert zero_cut_standby.readiness()["ready"] is True
+    assert "compact" not in calls
+
+
+@pytest.mark.asyncio
+async def test_standby_shutdown_skips_markers(monkeypatch, tmp_path):
+    from gateway import run as gateway_run
+    from gateway import status
+    from gateway.config import GatewayConfig
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    gateway_slot.pin_gateway_slot(GatewayConfig(zero_cut_handover_enabled=True))
+    runner = object.__new__(GatewayShutdownMixin)
+    runner._restart_requested = True
+    runner._restart_command_source = None
+    runner._restart_via_service = False
+    runner._restart_detached = False
+    runner._draining = True
+    runner._exit_code = None
+    runner._exit_reason = None
+    runner._signal_initiated_shutdown = False
+    runner._stop_requested_by_signal = False
+    runner._update_runtime_status = lambda *args: None
+    runner._STUCK_LOOP_FILE = ".restart_failure_counts"
+    active_counts = tmp_path / ".restart_failure_counts"
+    active_counts.write_text('{"agent:main:telegram:dm:1": 2}', encoding="utf-8")
+    ctx = GatewayShutdownMixin._StopContext(
+        deferred_count=lambda: 0, active_agents={"agent:main:telegram:dm:1": object()},
+        timed_out=False, started_at=time.monotonic())
+    monkeypatch.setattr(status, "remove_pid_file", lambda: None)
+    monkeypatch.setattr(status, "release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr(status, "flush_runtime_status_async", lambda **kwargs: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(gateway_run, "_shutdown_gateway_health_export", lambda *args: None)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr("gateway.restart_loop_guard.record_planned_exit", lambda: pytest.fail("standby recorded planned exit"))
+
+    await runner._stop_persist_exit_state(ctx)
+    assert not (tmp_path / ".clean_shutdown").exists()
+    assert not (tmp_path / ".gateway-planned-restart.json").exists()
+    # The stuck-loop counter is per slot: the active slot's counts stay byte-identical.
+    assert active_counts.read_text(encoding="utf-8") == '{"agent:main:telegram:dm:1": 2}'
+    standby_counts = tmp_path / gateway_slot.slot_filename(".restart_failure_counts", "b")
+    assert json.loads(standby_counts.read_text(encoding="utf-8")) == {"agent:main:telegram:dm:1": 1}
+
+
+def test_backup_and_cleanup_skip_standby_runtime_names(tmp_path):
+    from hermes_cli import backup, data_cleanup
+
+    assert "gateway.b.pid" in backup._EXCLUDED_NAMES
+    assert {"gateway_state.b.json", "gateway.b.pid", "gateway.b.lock"} <= backup._IMPORT_SKIP_NAMES
+    project = tmp_path / "project"
+    project.mkdir()
+    lock = tmp_path / "gateway.b.lock"
+    lock.write_text("runtime", encoding="utf-8")
+    plan = data_cleanup.plan_data_removal(tmp_path, project)
+    assert lock in plan.keep

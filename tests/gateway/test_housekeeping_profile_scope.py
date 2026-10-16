@@ -146,6 +146,7 @@ def test_multiplexed_maintenance_tick_prunes_every_served_profile_store(two_home
     from hermes_state import SessionDB
 
     homes = two_homes
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     for home in homes:
         (home / "config.yaml").write_text(
             "model:\n  provider: nous\n"
@@ -239,7 +240,7 @@ def test_profile_scope_setup_failure_restores_the_callers_home(two_homes, monkey
     assert current_secret_scope() == scope_before
 
 
-def test_prune_unlinks_transcripts_under_the_configured_sessions_dir(two_homes, tmp_path):
+def test_prune_unlinks_transcripts_under_the_configured_sessions_dir(two_homes, tmp_path, monkeypatch):
     """``gateway.sessions_dir`` governs the LAUNCH profile's transcripts; others use their own home.
 
     Hardcoding ``<home>/sessions`` made the prune unlink under a directory nothing writes to, so an
@@ -249,6 +250,7 @@ def test_prune_unlinks_transcripts_under_the_configured_sessions_dir(two_homes, 
     from hermes_state import SessionDB
 
     a, b = two_homes
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     override = tmp_path / "custom-transcripts"
     override.mkdir()
     for home, transcripts in ((a, override), (b, b / "sessions")):
