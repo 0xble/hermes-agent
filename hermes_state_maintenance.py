@@ -139,6 +139,15 @@ class SessionMaintenanceMixin:
         parents are closed, not live, so they are not guarded (prune and delete share this)."""
         return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
 
+    def _holds_guard_readonly(self, conn, sid: str) -> bool:
+        """True when ``sid`` has a compression lock or turn lease whose holder is not provably dead.
+        Never deletes: expiry alone is not proof the holder is gone (a starved refresher renews it)."""
+        from hermes_state import _compression_lock_holder_process_is_dead
+        rows = [conn.execute("SELECT holder FROM compression_locks WHERE session_id = ?", (sid,)).fetchone(),
+                conn.execute("SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
+                             (self._session_turn_lease_key_on_conn(conn, sid),)).fetchone()]
+        return any(row is not None and not _compression_lock_holder_process_is_dead(row["holder"]) for row in rows)
+
     def _write_guards_reject(self, conn, sid: str, **kwargs) -> bool:
         """True when a live turn lease / compression lock protects ``sid``; expired or
         dead-holder guards are reclaimed and fenced as a side effect."""
@@ -366,8 +375,14 @@ class SessionMaintenanceMixin:
                         f"SELECT root, id FROM lineage",
                         requested,
                     ).fetchall()
-                    lineage_ids = [str(row["id"]) for row in lineage_rows]
-                    guarded = self._guarded_ids(conn, lineage_ids)
+                    # Reclaim stale guards only on rows this transaction may delete (the victims, as
+                    # before batching). Descendants outside the batch are probed read-only: an expired
+                    # lease can still belong to a live holder whose refresher was starved.
+                    victims = set(session_ids)
+                    guarded = self._guarded_ids(conn, victims) | {
+                        str(row["id"]) for row in lineage_rows
+                        if str(row["id"]) not in victims and self._holds_guard_readonly(conn, str(row["id"]))
+                    }
                     guarded_roots = {
                         str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
                     }
