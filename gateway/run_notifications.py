@@ -1184,9 +1184,14 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if not claim.settled:
                 operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
                 operations.append((operation, claim.delegation_id, claim.claim_id))
-            operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
+            # A primary that never proceeds past pre-flight with no result (its claim was lost, or it
+            # was dropped) makes the batching caller requeue every sibling unattempted: refund their
+            # attempts. Siblings of an attempted delivery keep the ordinary failed-delivery release.
+            sibling_operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
+            if not accepted and not claim.proceed and claim.early_result is None:
+                sibling_operation = "defer"
             operations.extend(
-                (operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
+                (sibling_operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
             )
             if not ack_claims:
                 await self._settle_durable_claims(operations)

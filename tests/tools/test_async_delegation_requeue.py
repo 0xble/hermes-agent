@@ -41,6 +41,8 @@ def test_requeue_returns_an_acknowledged_completion_to_pending_and_offers_it():
     _persisted("requeue-ok")
     offered: queue.Queue = queue.Queue()
 
+    # Requeue is also used after a prior replay already marked this row offered.
+    ad._offered.add((hermes_home_key(get_hermes_home()), "requeue-ok"))
     assert ad.requeue_admitted_completion("requeue-ok", offered) is True
 
     assert _column("requeue-ok", "delivery_state") == "pending"

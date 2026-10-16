@@ -587,6 +587,8 @@ def requeue_admitted_completion(delegation_id: str, target_queue, claim_id: str 
             return False
         rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchall()
+        with _orphan_lock:
+            _offered.difference_update({key for key in _offered if key[1] == delegation_id})
         return _replay_pending(conn, rows, target_queue, now) == 1
 
 

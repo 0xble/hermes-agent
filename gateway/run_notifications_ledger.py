@@ -18,6 +18,13 @@ from agent.memory_provider import spawn_context_thread
 logger = logging.getLogger("gateway.run")
 _T = TypeVar("_T")
 
+
+class _PartialClaimsError(RuntimeError):
+    def __init__(self, cause: BaseException, claimed: list) -> None:
+        super().__init__(str(cause))
+        self.claimed = claimed
+        self.__cause__ = cause
+
 # kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -52,7 +59,9 @@ async def settle_durable_claims(
 
     ``on_settled`` runs exactly once, after every settle has actually finished (or raised): in the
     worker thread itself, so neither cancellation of the awaiting task nor loop teardown can run it
-    early or skip it. It runs inline when nothing needs settling or the worker cannot be started.
+    early or skip it. It runs inline when nothing needs settling. If the default executor is gone,
+    the batch settles on a dedicated thread and the callback follows it there; when no worker can
+    start at all nothing settled, so the callback does not run and the error propagates.
     """
     pending = [op for op in operations if op[2]]
 
@@ -78,9 +87,14 @@ async def settle_durable_claims(
     settle_ctx = contextvars.copy_context()
     try:
         future = loop.run_in_executor(None, settle_ctx.run, _settle_all)
-    except BaseException:
-        _finish()  # No worker will run: nothing is left in flight.
-        raise
+    except RuntimeError:
+        # The default executor is gone (loop teardown). Settle on a dedicated non-daemon thread so
+        # the claims are still durably settled; ``on_settled`` runs there only after they are. If
+        # even that thread cannot start, nothing settled, so the callback must not run either.
+        spawn_context_thread(
+            settle_ctx.run, args=(_settle_all,), name="completion-claim-settle", daemon=False,
+        ).start()
+        return
     await asyncio.shield(future)
 
 
@@ -121,6 +135,13 @@ async def claim_off_loop(claim: Callable[[], _T], release: Callable[[_T], None])
                 release_ctx.run, args=(release, handed_over[0]), name="completion-claim-refund", daemon=False,
             ).start()
         raise
+    except BaseException as exc:
+        partial = getattr(exc, "claimed", None)
+        if partial:
+            spawn_context_thread(
+                release_ctx.run, args=(release, partial), name="completion-claim-refund", daemon=False,
+            ).start()
+        raise
 
 
 async def claim_siblings_off_loop(entries, consumer: str) -> list:
@@ -129,7 +150,15 @@ async def claim_siblings_off_loop(entries, consumer: str) -> list:
     from tools.async_delegation import claim_event_delivery, defer_completion_delivery
 
     def _claim() -> list:
-        return [(evt, text, claim_event_delivery(evt, consumer)) for evt, text in entries]
+        claimed = []
+        try:
+            for evt, text in entries:
+                claim_id = claim_event_delivery(evt, consumer)
+                claimed.append((evt, text, claim_id))
+            return claimed
+        except BaseException as exc:
+            # Let claim_off_loop refund every claim taken before the later claim failed.
+            raise _PartialClaimsError(exc, claimed) from exc
 
     def _defer(claimed) -> None:
         for evt, _text, claim_id in claimed:
