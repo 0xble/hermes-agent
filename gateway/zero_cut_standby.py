@@ -1,4 +1,4 @@
-"""Local readiness and promotion state for a slot-b zero-cut standby gateway."""
+"""Local readiness and promotion state for a zero-cut standby gateway slot."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
-from gateway.gateway_slot import SLOT_STANDBY, effective_gateway_slot
+from gateway.gateway_slot import effective_gateway_standby, effective_gateway_slot
 
 logger = logging.getLogger("gateway.zero_cut_standby")
 _ready = False
@@ -16,7 +16,7 @@ _runner = None
 
 def is_standby() -> bool:
     """Return whether this process is still the pinned, opt-in standby slot."""
-    return effective_gateway_slot() == SLOT_STANDBY and not _promoted
+    return effective_gateway_standby() and not _promoted
 
 
 def mark_ready() -> None:

@@ -307,6 +307,43 @@ class SessionGatewayMixin:
             (scope, session_key, entry_json, time.time()),
         )
 
+    def load_gateway_routing_entry(self, session_key: str, *, scope: str = "") -> Optional[str]:
+        """Read one routing row without touching a gateway SessionStore cache."""
+        row = self._read_one(
+            "SELECT entry_json FROM gateway_routing WHERE scope = ? AND session_key = ? LIMIT 1",
+            (scope, session_key),
+        )
+        return row["entry_json"] if row is not None else None
+
+    def clear_gateway_routing_active_turn(
+        self, session_key: str, token: str, *, scope: str = ""
+    ) -> bool:
+        """CAS-clear one active-turn marker directly in the routing row."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing WHERE scope = ? AND session_key = ? LIMIT 1",
+                (scope, session_key),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or payload.get("active_turn_token") != token:
+                return False
+            payload["active_turn_token"] = None
+            payload["active_turn_started_at"] = None
+            payload.pop("active_turn_owner_pid", None)
+            payload.pop("active_turn_owner_slot", None)
+            conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ?",
+                (json.dumps(payload), time.time(), scope, session_key),
+            )
+            return True
+        return bool(self._execute_write(_do))
+
     def replace_gateway_routing_entries(self, entries: dict[str, str], *, scope: str = "") -> None:
         """Atomically replace the routing index for *scope* (keys absent from *entries*
         are removed); other scopes untouched.

@@ -127,6 +127,15 @@ class SessionLifecycleMixin:
         candidate["active_turn_token"] = token
         candidate["active_turn_started_at"] = _iso(started_at)
         candidate["active_turn_human"] = bool(human)
+        if token:
+            from gateway.config import is_zero_cut_handover_enabled
+            if is_zero_cut_handover_enabled(getattr(self, "config", None)):
+                from gateway.gateway_slot import effective_gateway_slot
+                candidate["active_turn_owner_pid"] = os.getpid()
+                candidate["active_turn_owner_slot"] = effective_gateway_slot(getattr(self, "config", None))
+        else:
+            candidate.pop("active_turn_owner_pid", None)
+            candidate.pop("active_turn_owner_slot", None)
         touched = _now() if started_at is not None else None
         if touched is not None:
             # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
@@ -136,6 +145,8 @@ class SessionLifecycleMixin:
         entry.active_turn_token = token
         entry.active_turn_started_at = started_at
         entry.active_turn_human = bool(human)
+        entry.active_turn_owner_pid = candidate.get("active_turn_owner_pid")
+        entry.active_turn_owner_slot = candidate.get("active_turn_owner_slot")
         if touched is not None:
             entry.updated_at = touched
 
@@ -214,6 +225,8 @@ class SessionLifecycleMixin:
                     promoted += 1
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_owner_pid = None
+            entry.active_turn_owner_slot = None
             return True
 
         self._update_all_entries_locked(_promote)
@@ -226,6 +239,8 @@ class SessionLifecycleMixin:
                 return False
             entry.active_turn_token = None
             entry.active_turn_started_at = None
+            entry.active_turn_owner_pid = None
+            entry.active_turn_owner_slot = None
             return True
         return self._update_all_entries_locked(_discard)
 

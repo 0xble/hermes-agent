@@ -1648,15 +1648,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
-        # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
-        # not on the adapter's raw inbound: profile routing, the ignored-channel
-        # guard, plugin hooks and user authorization all reject events above,
-        # and a rejected event must not be able to clear a refusal belonging to
-        # an active turn. This is also the single entry point every lane shares
-        # — Discord interaction passthrough builds its own MessageEvent and
-        # calls handle_message directly, so a teardown on the relay's inbound
-        # handler left those turns muted.
-
         _paused_notice = self._hm_estop_gate(event, source, is_internal)
         if _paused_notice is not None:
             return _paused_notice
@@ -1666,12 +1657,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _reply is not None:
             return _reply
 
-        # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
-        self._hm_evict_idle_stale_agent(_quick_key)
-        if self._is_session_running(_quick_key):
-            await self._hm_evict_reaped_agent(_quick_key)
-        if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
+        from gateway.zero_cut_busy import handle_local_busy, queue_foreign_owner, _NOT_HANDLED
+        if await queue_foreign_owner(self, event, _quick_key):
+            return None
+        _busy_result = await handle_local_busy(self, event, source, _quick_key)
+        if _busy_result is not _NOT_HANDLED:
+            return _busy_result
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

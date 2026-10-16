@@ -18,6 +18,8 @@ from gateway.run import _start_gateway_shutdown_tail
 def _reset(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False} if slot == "a" else None)
     gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
     zcs.reset_for_tests()
     from tools.process_registry import process_registry
@@ -52,6 +54,45 @@ async def test_standby_boot_leaves_delegation_ledger_and_promotion_replays_it(mo
     zcs.mark_ready()
     assert (await zcs.promote(promoted))["promoted"] is True
     assert replays == ["launch"]
+
+
+@pytest.mark.asyncio
+async def test_slot_a_can_defer_and_promote(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    zcs.reset_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "a")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False} if slot == "b" else None)
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    platform = Platform.TELEGRAM
+    adapter = object()
+    runner = SimpleNamespace(
+        adapters={}, _standby_deferred={}, _failed_platforms={},
+        _create_adapter=lambda p, c: adapter,
+        _wire_adapter_handlers=lambda a: None,
+        _connect_initial_adapter_with_timeout=lambda a, p: asyncio.sleep(0, result=True),
+        _publish_primary_adapter=lambda p, a: runner.adapters.__setitem__(p, a),
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    assert zcs.defer_platform(runner, platform, object())
+    assert zcs.readiness()["slot"] == "a"
+    zcs.mark_ready()
+    assert (await zcs.promote(runner))["promoted"] is True
+
+
+def test_slot_b_crash_restart_with_slot_a_down_is_active_and_does_not_defer_telegram(monkeypatch):
+    gateway_slot.reset_gateway_slot_for_tests()
+    zcs.reset_for_tests()
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot", lambda home, slot, timeout: None)
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+    runner = SimpleNamespace(_standby_deferred={})
+    assert zcs.is_standby() is False
+    assert zcs.defer_platform(runner, Platform.TELEGRAM, object()) is False
+    assert runner._standby_deferred == {}
 
 
 @pytest.mark.asyncio

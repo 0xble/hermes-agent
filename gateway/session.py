@@ -552,6 +552,9 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
     active_turn_human: bool = True
+    # Zero-cut handover ownership; omitted from legacy JSON when unset so flag-off routing stays byte-identical.
+    active_turn_owner_pid: Optional[int] = None
+    active_turn_owner_slot: Optional[str] = None
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
@@ -610,6 +613,9 @@ class SessionEntry:
         result["last_resume_marked_at"] = _iso(self.last_resume_marked_at)
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
+        if self.active_turn_token and self.active_turn_owner_pid and self.active_turn_owner_slot:
+            result["active_turn_owner_pid"] = self.active_turn_owner_pid
+            result["active_turn_owner_slot"] = self.active_turn_owner_slot
         result.update((name, getattr(self, name)) for name in self._RESET_FIELDS)
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
@@ -673,6 +679,12 @@ class SessionEntry:
                 "message_id": data.get("restart_note_message_id"),
             }]
         transport_profile = data.get("transport_profile")
+        owner_pid = data.get("active_turn_owner_pid")
+        if not isinstance(owner_pid, int) or owner_pid <= 0:
+            owner_pid = None
+        owner_slot = data.get("active_turn_owner_slot")
+        if not isinstance(owner_slot, str) or not owner_slot:
+            owner_slot = None
         return cls(
             session_key=session_key, session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
@@ -682,6 +694,7 @@ class SessionEntry:
             restart_note_marked_at=_parse_iso(data.get("restart_note_marked_at")),
             last_resume_marked_at=_parse_iso(data.get("last_resume_marked_at")),
             active_turn_token=token, active_turn_started_at=started_at,
+            active_turn_owner_pid=owner_pid, active_turn_owner_slot=owner_slot,
             model_override=sanitize_model_override(data.get("model_override")),
             reasoning_override=sanitize_reasoning_override(data.get("reasoning_override")),
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
