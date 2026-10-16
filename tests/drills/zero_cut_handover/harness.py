@@ -123,9 +123,12 @@ def _telegram_json(argv: Sequence[str]) -> Any:
                                 text=True, encoding="utf-8")
         data = _json_or_text(result.stdout)
         if data == "" and result.returncode != 0:
-            # Keep the failure evidence: an empty stdout alone hides why the observer CLI failed.
-            data = {"error": {"code": "cli_failed", "returncode": result.returncode,
-                              "stderr": (result.stderr or "")[-400:]}}
+            # The CLI reports errors (FLOOD_WAIT included) as JSON on stderr; keep that evidence and
+            # let a rate limit reach the retry below instead of reading as a failed send.
+            data = _json_or_text((result.stderr or "").strip())
+            if not isinstance(data, Mapping):
+                data = {"error": {"code": "cli_failed", "returncode": result.returncode,
+                                  "stderr": (result.stderr or "")[-400:]}}
         error = data.get("error") if isinstance(data, Mapping) else None
         if not (isinstance(error, Mapping) and error.get("code") == "rate_limited"):
             return data

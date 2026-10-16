@@ -281,3 +281,21 @@ def test_final_matches_several_acks_on_one_line():
 
 def test_observer_instruction_text_never_counts_as_a_final():
     assert not harness._final_re("t-1").search("ZC x-1 run terminal sleep 45 then reply exactly DONE t-1")
+
+
+def test_observer_retries_a_flood_wait_reported_on_stderr(monkeypatch):
+    """Real drill: FLOOD_WAIT came back as JSON on stderr with empty stdout and exit 6, so it was
+    never retried and the peer check refused the whole run."""
+    import subprocess
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 6, "", '{"error":{"code":"rate_limited","retry_after_seconds":0}}\n')
+        return subprocess.CompletedProcess(argv, 0, '[{"id": 8899335561}]', "")
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.setattr(harness.time, "sleep", lambda _s: None)
+    assert harness._telegram_json(["--agent", "chats"]) == [{"id": 8899335561}]
+    assert len(calls) == 2
