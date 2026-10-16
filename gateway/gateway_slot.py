@@ -77,8 +77,37 @@ def slot_filename(filename: str, slot: str = SLOT_ACTIVE) -> str:
 
 
 def process_slot_filename(filename: str) -> str:
-    """``filename`` as this process names it (see ``effective_gateway_slot``)."""
-    return slot_filename(filename, effective_gateway_slot())
+    """``filename`` as this process names it: a gateway's own slot, or for a client the serving slot."""
+    return slot_filename(filename, serving_slot())
+
+
+def serving_slot(home: Any = None) -> str:
+    """The slot a caller means when it names none. For this process's own files inside a gateway: its
+    pinned slot. Otherwise ``a``, unless only ``b`` holds its runtime lock (a promoted ``b`` after
+    ``a`` exited), so status and control clients follow the gateway that serves the home."""
+    if home is None and (_PINNED_GATEWAY_SLOT is not None or get_gateway_slot() == SLOT_STANDBY):
+        return effective_gateway_slot()
+    from pathlib import Path
+
+    from gateway.status import _get_process_hermes_home
+    root = Path(home) if home is not None else _get_process_hermes_home()
+    # Probe b first: with the flag off ``gateway.b.lock`` never exists, so this costs one stat.
+    if slot_lock_held(root, SLOT_STANDBY) and not slot_lock_held(root, SLOT_ACTIVE):
+        return SLOT_STANDBY
+    return SLOT_ACTIVE
+
+
+def slot_lock_held(home: Any, slot: str) -> bool:
+    """True while some live process holds ``slot``'s runtime lock in ``home`` (a direct flock probe;
+    the status helpers resolve paths through this module and would recurse)."""
+    from pathlib import Path
+
+    from gateway.status import _probe_lock_file
+    path = Path(home) / slot_filename("gateway.lock", slot)
+    try:
+        return path.exists() and _probe_lock_file(open(path, "a+", encoding="utf-8"))
+    except OSError:
+        return False
 
 
 def sibling_lock_name(pid_filename: str, lock_filename: str) -> str:

@@ -22,6 +22,8 @@ def _reset(monkeypatch, tmp_path):
     zcs.reset_for_tests()
     from tools.process_registry import process_registry
     monkeypatch.setattr(process_registry, "restore_completions", lambda: 0)
+    adopted = []
+    monkeypatch.setattr(zcs, "_start_adopting", adopted.append)  # covered by its own tests below
     yield
     zcs.reset_for_tests()
     gateway_slot.reset_gateway_slot_for_tests()
@@ -436,3 +438,76 @@ async def test_promote_secondary_connect_raise_is_queued_for_reconnect(monkeypat
     assert result == {"promoted": True, "already": False, "failed": ["work:telegram"]}
     assert reconnects == [("work", Platform.TELEGRAM)]
     assert zcs.is_standby() is False
+
+
+def _hold_lock(path):
+    import fcntl
+    handle = open(path, "a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_promoted_slot_adopts_host_role_and_replays_outbox_only_after_predecessor_exits(
+        monkeypatch, tmp_path):
+    """Review: promotion never took the host gateway role nor replayed the durable outbox, both skipped
+    at standby boot. They wait for the predecessor, which holds the role and may still be sending."""
+    calls = []
+    monkeypatch.setattr(zcs, "_PREDECESSOR_POLL_S", 0.01)
+    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.run._claim_host_gateway_role", lambda force=False: calls.append("claim"))
+    monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
+
+    async def recover(runner):
+        calls.append("outbox")
+
+    monkeypatch.setattr("gateway.outbox.recover_gateway_destinations", recover)
+    predecessor = _hold_lock(tmp_path / "gateway.lock")  # slot a still alive, finishing its turns
+    runner = SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=True))
+    task = asyncio.create_task(zcs._adopt_predecessor_duties(runner))
+    await asyncio.sleep(0.1)
+    assert calls == []
+    predecessor.close()  # slot a exits
+    await asyncio.wait_for(task, 2)
+    assert calls == ["claim", "record", "outbox"]
+
+
+@pytest.mark.asyncio
+async def test_adopt_skips_outbox_replay_when_durable_outbox_is_off(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("gateway.run._claim_host_gateway_role", lambda force=False: calls.append("claim"))
+    monkeypatch.setattr("gateway.run._refresh_host_gateway_record", lambda r: calls.append("record"))
+    monkeypatch.setattr("gateway.outbox.recover_gateway_destinations",
+                        lambda r: asyncio.sleep(0, result=calls.append("outbox")))
+    await zcs._adopt_predecessor_duties(SimpleNamespace(config=SimpleNamespace(durable_outbox_enabled=False)))
+    assert calls == ["claim", "record"]
+
+
+def test_clients_follow_a_promoted_b_once_a_is_gone(monkeypatch, tmp_path):
+    """Review: after a->b handover every unslotted reader still looked at slot a's (gone) files."""
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT", raising=False)
+    gateway_slot.reset_gateway_slot_for_tests()
+    assert gateway_slot.serving_slot(tmp_path) == "a"  # flag-off shape: no b lock at all
+    b = _hold_lock(tmp_path / "gateway.b.lock")
+    a = _hold_lock(tmp_path / "gateway.lock")
+    assert gateway_slot.serving_slot(tmp_path) == "a"  # both alive: a is still the home's gateway
+    a.close()
+    assert gateway_slot.serving_slot(tmp_path) == "b"
+    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
+    assert gateway_slot.process_slot_filename("gateway.pid") == "gateway.b.pid"
+    b.close()
+    assert gateway_slot.serving_slot(tmp_path) == "a"
+
+
+def test_a_pinned_gateway_keeps_its_own_slot_files(monkeypatch, tmp_path):
+    monkeypatch.setattr("gateway.status._get_process_hermes_home", lambda: tmp_path)
+    b = _hold_lock(tmp_path / "gateway.b.lock")
+    try:
+        # _reset pinned this process to slot b; pin it to a and its own files never follow b.
+        gateway_slot.reset_gateway_slot_for_tests()
+        monkeypatch.delenv("HERMES_GATEWAY_SLOT", raising=False)
+        gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": False}}})
+        assert gateway_slot.process_slot_filename("gateway.pid") == "gateway.pid"
+    finally:
+        b.close()

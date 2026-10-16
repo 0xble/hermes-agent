@@ -2091,21 +2091,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         if not is_standby():  # a standby opens no shared store until promotion
             await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
-        if getattr(self.config, "durable_outbox_enabled", False):
-            from gateway.outbox import open_outbox, recover
-            from gateway.run import _multiplex_profile_homes
-            from hermes_constants import get_hermes_home
-
-            destinations = [(get_hermes_home(), self.adapters.get(Platform.TELEGRAM))]
-            for profile_name, profile_home in _multiplex_profile_homes(self.config):
-                if profile_name != "default":
-                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(profile_name, {})
-                    destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
-            for home, adapter in destinations:
-                if adapter is not None:
-                    sent, held = await recover(await open_outbox(home), adapter)
-                    if sent or held:
-                        logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
+        if getattr(self.config, "durable_outbox_enabled", False) and not is_standby():
+            from gateway.outbox import recover_gateway_destinations
+            await recover_gateway_destinations(self)  # a standby replays after promotion
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()

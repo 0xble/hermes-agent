@@ -179,7 +179,38 @@ async def _promote(runner) -> dict[str, Any]:
     runner._start_spawn_background_watchers()
     from gateway.run import _start_gateway_start_cron_and_housekeeping
     runner._zero_cut_cron_handles = _start_gateway_start_cron_and_housekeeping(runner)
+    _start_adopting(runner)
     return {"promoted": True, "already": False, "failed": failed}
+
+
+_PREDECESSOR_POLL_S = 1.0
+
+
+def _start_adopting(runner) -> None:
+    runner._retain_background_task(asyncio.create_task(
+        _adopt_predecessor_duties(runner), name="zero-cut-adopt-predecessor-duties"))
+
+
+async def _adopt_predecessor_duties(runner) -> None:
+    """Once the predecessor slot has exited: take the host gateway role it held and replay the durable
+    outbox it may have left pending. Both wait for the exit, because the predecessor keeps the host lock
+    and may still be sending its last finals until then (the outbox CAS keeps a replay from doubling)."""
+    from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, effective_gateway_slot, slot_lock_held
+    from gateway.status import _get_process_hermes_home
+    other = SLOT_ACTIVE if effective_gateway_slot() == SLOT_STANDBY else SLOT_STANDBY
+    home = _get_process_hermes_home()
+    while await asyncio.to_thread(slot_lock_held, home, other):
+        await asyncio.sleep(_PREDECESSOR_POLL_S)
+    from gateway.run import _claim_host_gateway_role, _refresh_host_gateway_record
+    try:
+        _claim_host_gateway_role()  # on the loop thread, so its SIGTERM cleanup handler installs
+    except SystemExit:
+        logger.error("Promoted gateway could not take the host gateway role (another gateway owns this host)")
+    else:
+        _refresh_host_gateway_record(runner)
+    if getattr(runner.config, "durable_outbox_enabled", False):
+        from gateway.outbox import recover_gateway_destinations
+        await recover_gateway_destinations(runner)
 
 
 def reset_for_tests() -> None:
