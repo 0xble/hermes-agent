@@ -6,6 +6,8 @@ Load this unit when changing auxiliary provider error classification or configur
 
 Status-less provider overload responses, including overload messages from custom proxies, are classified through the shared API error taxonomy and treated as auxiliary capacity failures. Sync and async auxiliary calls must continue through the configured fallback chain, while timeout and connection failures retain their distinct labels and behavior.
 
+An HTTP 503 whose body names `auth_unavailable` or "no auth available" is a relay-wrapped credential or quota failure, not an overload. It falls back as `auth unavailable`. Any other 408 or 5xx that survives the same-provider transient retry falls back as `provider unavailable`.
+
 ## Provenance and patches
 
 Fork patch identity: `auxiliary-overload-fallback`.

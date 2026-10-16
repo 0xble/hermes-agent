@@ -3358,6 +3358,26 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
+def _is_auth_unavailable_error(exc: Exception) -> bool:
+    """A relay-wrapped auth/quota failure can arrive as HTTP 503 instead of 401/429."""
+    status = _exc_http_status(exc)
+    if status != 503:
+        return False
+    text = str(exc).lower()
+    return "auth_unavailable" in text or "no auth available" in text
+
+
+def _is_server_error(exc: Exception) -> bool:
+    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback.
+
+    A 408 that reports a timeout stays with the timeout rung, which names it as one.
+    """
+    status = _exc_http_status(exc)
+    if status == 408 and _is_timeout_error(exc):
+        return False
+    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+
+
 _DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
 
@@ -7581,6 +7601,8 @@ _FALLBACK_REASONS: Tuple[Tuple[Callable[[Exception], bool], str], ...] = (
     (_is_invalid_aux_response_error, "invalid provider response"),
     # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
     (_is_statusless_structured_provider_error, "structured provider error"),
+    (_is_auth_unavailable_error, "auth unavailable"),
+    (_is_server_error, "provider unavailable"),
     # Before the connection-error rung (its superset): a full-budget timeout must be named as one, or
     # a slow local model reads as an unreachable endpoint (#89445).
     (_is_timeout_error, "request timed out"), (_is_connection_error, "connection error"),
