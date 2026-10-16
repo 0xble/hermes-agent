@@ -333,19 +333,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         except Exception:
             return True
 
+    def _hm_has_orphaned_fifo(self, session_key: str, source: SessionSource) -> bool:
+        """Passive FYIs must yield to the FIFO orphan rescue so arrival order stays intact."""
+        try:
+            adapter = self._delivery_adapter_for(source)
+            overflow = self._overflow_queue(session_key)
+            pending = getattr(adapter, "_pending_messages", {}) if adapter is not None else {}
+            return bool(overflow) or session_key in pending
+        except Exception:
+            # A failed queue inspection is fail-closed for passive admission: normal turn handling
+            # owns the event and can still perform the rescue.
+            return True
+
     async def _hm_try_passive_fyi_relay(
         self, event: "MessageEvent", source: SessionSource, session_key: str,
     ) -> bool:
         """Persist one unaddressed Telegram FYI relay without creating an agent turn."""
-        from gateway.response_filters import is_fyi_relay_text
-        if (
-            source.platform != Platform.TELEGRAM
-            or getattr(event, "message_type", None) != MessageType.TEXT
-            or getattr(event, "internal", False)
-            or getattr(event, "_gateway_human_text_merged", False)
-            or getattr(event, "reply_expected", None) is True
-            or not is_fyi_relay_text(getattr(event, "text", None))
-            or not self._relay_fyi_passive_enabled()
+        from gateway.response_filters import is_passive_fyi_relay_event
+        if not is_passive_fyi_relay_event(
+            event, source, enabled=self._relay_fyi_passive_enabled(),
         ):
             return False
         session_store = self.async_session_store
@@ -381,6 +387,21 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return False
         if self._is_session_running(session_key):
             return False
+
+        if getattr(event, "message_id", None):
+            try:
+                if await session_store.has_platform_message_id(
+                    session_entry.session_id, str(event.message_id),
+                ):
+                    logger.info(
+                        "Skipping duplicate passive FYI relay (message_id=%s) in session %s",
+                        event.message_id, session_entry.session_id,
+                    )
+                    setattr(event, "_agent_turn_succeeded", True)
+                    return True
+            except Exception:
+                logger.debug("FYI relay duplicate lookup failed; falling back to a turn", exc_info=True)
+                return False
 
         timestamp = getattr(event, "timestamp", None)
         try:
@@ -1641,10 +1662,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return _result
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
-        if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
-            return None
-        if self._is_session_running(_quick_key):
-            return await self._hm_handle_running_session_message(event, source, _quick_key)
 
         # Pending exec approvals go through /approve and /deny only — no bare-text matching, or a
         # conversational "yes" would execute a dangerous command.
@@ -1654,6 +1671,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
+            # Passive admission is after the Telegram topic-root guard and yields to any queued FIFO
+            # event so the #28503 orphan rescue sees the oldest arrival first.
+            if not self._hm_has_orphaned_fifo(_quick_key, source):
+                if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
+                    return None
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.

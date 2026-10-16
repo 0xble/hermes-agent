@@ -19,7 +19,11 @@ from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text, is_fyi_relay_text
+from gateway.response_filters import (
+    apply_agent_origin_reply_expectation,
+    is_agent_origin_text,
+    is_passive_fyi_relay_event,
+)
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -915,7 +919,11 @@ class GatewayBusySessionMixin:
             self._preserve_drain_event(session_key, event)
             return True
         effective_mode = self._effective_busy_input_mode(event.source)
-        if is_fyi_relay_text(getattr(event, "text", None)):
+        if is_passive_fyi_relay_event(
+            event,
+            event.source,
+            enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda: True)()),
+        ):
             # Passive FYIs are transcript notifications, never an interruption of active work.
             effective_mode = "queue"
         if self._draining:

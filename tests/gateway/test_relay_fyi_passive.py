@@ -19,6 +19,8 @@ from gateway.session import SessionSource
 FYI = (
     "📨 Relay title\n\n"
     "A status update.\n"
+    "A second detail line.\n"
+    "\n"
     "From: Source Agent · FYI, no action requested\n"
     "[relay from=hermes:default/source receipt=receipt-1]"
 )
@@ -26,8 +28,9 @@ TASK = FYI.replace("receipt=receipt-1", "receipt=receipt-1 task=task-1")
 
 
 class _Store:
-    def __init__(self, entry=None):
+    def __init__(self, entry=None, *, duplicate=False):
         self.entry = entry
+        self.duplicate = duplicate
         self.rows = []
 
     async def lookup_by_session_key(self, _key):
@@ -37,7 +40,7 @@ class _Store:
         self.rows.append((session_id, row))
 
     async def has_platform_message_id(self, _session_id, _message_id):
-        return False
+        return self.duplicate
 
 
 @pytest.fixture
@@ -55,6 +58,8 @@ def runner(monkeypatch):
     runner._sessions = {}
     runner._is_session_running = MagicMock(return_value=False)
     runner._refresh_agent_cache_message_count = AsyncMock()
+    runner._delivery_adapter_for = MagicMock(return_value=None)
+    runner._overflow_queue = MagicMock(return_value=[])
 
     async def run_in_executor(fn, *args, **kwargs):
         return fn(*args, **kwargs)
@@ -100,12 +105,57 @@ async def test_fyi_is_persisted_unchanged_without_a_turn(runner):
 
 
 @pytest.mark.asyncio
+async def test_replayed_fyi_message_id_is_not_appended_again(runner):
+    runner._test_store.duplicate = True
+    event = _event(FYI)
+
+    assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key") is True
+
+    assert runner._test_store.rows == []
+    runner._refresh_agent_cache_message_count.assert_not_awaited()
+    assert event._agent_turn_succeeded is True
+
+
+@pytest.mark.asyncio
 async def test_idle_fyi_rechecks_session_before_persisting(runner):
     runner._is_session_running = MagicMock(side_effect=[True])
     event = _event(FYI)
 
     assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key") is False
     assert runner._test_store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_topic_root_lobby_guard_precedes_passive_admission(runner):
+    event = _event(FYI)
+    runner._hm_admit_event = AsyncMock(return_value=(event, event.source, False))
+    runner._draining = False
+    runner._hm_is_registered_command = MagicMock(return_value=False)
+    runner._quick_command_alias_text = MagicMock(return_value=None)
+    runner._hm_estop_gate = MagicMock(return_value=None)
+    runner._session_key_for_source = MagicMock(return_value="session-key")
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+    runner._hm_evict_idle_stale_agent = MagicMock()
+    runner._is_session_running = MagicMock(return_value=False)
+    runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+    runner._is_telegram_topic_root_lobby = MagicMock(return_value=True)
+    runner._should_send_telegram_lobby_reminder = MagicMock(return_value=False)
+    runner._hm_try_passive_fyi_relay = AsyncMock(side_effect=AssertionError("lobby must win"))
+
+    assert await runner._handle_admitted_message(event) is None
+    runner._hm_try_passive_fyi_relay.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_passive_admission_yields_to_orphaned_fifo(runner):
+    adapter = SimpleNamespace(_pending_messages={})
+    runner._delivery_adapter_for.return_value = adapter
+    runner._overflow_queue.return_value = [_event("old queued event")]
+
+    assert runner._hm_has_orphaned_fifo("session-key", _event(FYI).source) is True
+
+    runner._overflow_queue.return_value = []
+    assert runner._hm_has_orphaned_fifo("session-key", _event(FYI).source) is False
 
 
 @pytest.mark.asyncio

@@ -31,7 +31,11 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
-    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
+    display_kind_for_event,
+    is_machinery_display_kind,
+    is_passive_fyi_relay_event,
+    reply_expected_metadata,
+    silence_allowed,
     strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -4114,21 +4118,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            from gateway.response_filters import is_fyi_relay_text
-
             passive_events = []
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            while pending_event and (
-                pending_event.source.platform == Platform.TELEGRAM
-                and getattr(pending_event, "message_type", None) == MessageType.TEXT
-                and not getattr(pending_event, "internal", False)
-                and not getattr(pending_event, "_gateway_human_text_merged", False)
-                and getattr(pending_event, "reply_expected", None) is not True
-                and is_fyi_relay_text(getattr(pending_event, "text", None))
-                and self._relay_fyi_passive_enabled()
+            while pending_event and is_passive_fyi_relay_event(
+                pending_event,
+                getattr(pending_event, "source", source),
+                enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda: True)()),
             ):
                 if self._draining:
                     self._preserve_drain_event(session_key, pending_event)

@@ -20,18 +20,114 @@ _RELAY_HEADER_RE = re.compile(
     r"\[relay from=[^\s\]]+ receipt=[^\s\]]+(?P<task> task=[^\s\]]+)?\]"
 )
 _RELAY_FYI_FOOTER_RE = re.compile(r"From: .+ · FYI, no action requested")
-_RELAY_TITLE_RE = re.compile(r"^(?P<emoji>\S+) (?P<title>\S.*)$")
+
+# Relay uses gomoji + Unicode's Emoji_Presentation property over uniseg graphemes. Keep the
+# equivalent small, dependency-free classifier here: the gateway cannot import relay's Go package,
+# and accepting a bare text-default pictograph would turn ordinary prose into a relay title.
+_TEXT_DEFAULT_EMOJI_BASES = frozenset(
+    {
+        *range(0x00A9, 0x00AA), *range(0x00AE, 0x00AF), 0x203C, 0x2049, 0x2122, 0x2139,
+        *range(0x2194, 0x219A), 0x21A9, 0x21AA, 0x231A, 0x231B, 0x2328, 0x23CF,
+        *range(0x23E9, 0x23F4), *range(0x23F8, 0x23FB), 0x24C2, 0x25AA, 0x25AB,
+        0x25B6, 0x25C0, *range(0x25FB, 0x25FF), *range(0x2600, 0x27C0),
+        0x2934, 0x2935, *range(0x2B05, 0x2B08), 0x2B1B, 0x2B1C, 0x2B50, 0x2B55,
+        0x3030, 0x303D, 0x3297, 0x3299,
+    }
+)
+_STATUS_DOTS = frozenset("🔴🟠🟡🟢🔵🟣⚫⚪🟤")
+
+
+def _is_regional_indicator(char: str) -> bool:
+    return 0x1F1E6 <= ord(char) <= 0x1F1FF
+
+
+def _is_emoji_presentation(char: str) -> bool:
+    codepoint = ord(char)
+    return 0x1F000 <= codepoint <= 0x1FAFF
+
+
+def _is_keycap_cluster(cluster: str) -> bool:
+    codepoints = [ord(char) for char in cluster]
+    if len(codepoints) == 2:
+        return (48 <= codepoints[0] <= 57 or codepoints[0] in {35, 42}) and codepoints[1] == 0x20E3
+    return (
+        len(codepoints) == 3
+        and (48 <= codepoints[0] <= 57 or codepoints[0] in {35, 42})
+        and codepoints[1] == 0xFE0F
+        and codepoints[2] == 0x20E3
+    )
+
+
+def _grapheme_clusters(text: str) -> list[str]:
+    """Segment the emoji/title subset of Unicode graphemes used by relay's title validator."""
+    clusters: list[str] = []
+    index = 0
+    while index < len(text):
+        start = index
+        codepoint = ord(text[index])
+        index += 1
+        if _is_regional_indicator(text[start]) and index < len(text) and _is_regional_indicator(text[index]):
+            index += 1
+        elif (48 <= codepoint <= 57 or codepoint in {35, 42}) and index < len(text):
+            if text[index] == "\ufe0f":
+                index += 1
+            if index < len(text) and text[index] == "\u20e3":
+                index += 1
+        while index < len(text):
+            category = unicodedata.category(text[index])
+            if text[index] in {"\ufe0e", "\ufe0f"} or category in {"Mn", "Mc", "Sk"}:
+                index += 1
+                continue
+            if text[index] != "\u200d":
+                break
+            # ZWJ + next base + its variation/modifier marks form one relay grapheme.
+            if index + 1 >= len(text):
+                break
+            index += 2
+            while index < len(text):
+                category = unicodedata.category(text[index])
+                if text[index] in {"\ufe0e", "\ufe0f"} or category in {"Mn", "Mc", "Sk"}:
+                    index += 1
+                else:
+                    break
+        clusters.append(text[start:index])
+    return clusters
+
+
+def _gomoji_contains_emoji(cluster: str) -> bool:
+    codepoints = [ord(char) for char in cluster]
+    if _is_keycap_cluster(cluster):
+        return True
+    if len(codepoints) == 2 and all(0x1F1E6 <= codepoint <= 0x1F1FF for codepoint in codepoints):
+        return True
+    return any(_is_emoji_presentation(char) or ord(char) in _TEXT_DEFAULT_EMOJI_BASES for char in cluster)
 
 
 def _is_single_emoji(token: str) -> bool:
-    """Accept the single-symbol emoji prefix emitted by relay titles."""
-    if not token:
+    """Mirror relay's titleEmoji for one complete emoji grapheme."""
+    if not token or _grapheme_clusters(token) != [token] or not _gomoji_contains_emoji(token):
         return False
-    base = token[0]
-    if unicodedata.category(base) not in {"So", "Sk"}:
+    if token in _STATUS_DOTS:
         return False
-    return all(char in {"\ufe0f", "\u200d"} or unicodedata.category(char) in {"Mn", "Sk"}
-               for char in token[1:])
+    codepoints = [ord(char) for char in token]
+    if len(codepoints) == 1 and _is_regional_indicator(token):
+        return False
+    if "\ufe0f" in token or "\u200d" in token or _is_keycap_cluster(token):
+        return True
+    if len(codepoints) == 2 and all(0x1F1E6 <= codepoint <= 0x1F1FF for codepoint in codepoints):
+        return True
+    return any(not _is_regional_indicator(char) and _is_emoji_presentation(char) for char in token)
+
+
+def _is_relay_title(line: str) -> bool:
+    clusters = _grapheme_clusters(line)
+    if not clusters or not _is_single_emoji(clusters[0]):
+        return False
+    emoji = clusters[0]
+    rest = line[len(emoji):]
+    if not rest.startswith(" ") or not rest[1:].strip():
+        return False
+    return not any(_is_single_emoji(cluster) for cluster in _grapheme_clusters(rest[1:]))
 
 
 def is_agent_origin_text(text: Any) -> bool:
@@ -51,27 +147,42 @@ def is_agent_origin_text(text: Any) -> bool:
 
 def is_fyi_relay_text(text: Any) -> bool:
     """True only for one complete, unaddressed relay FYI envelope."""
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text:
         return False
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < 4:
+    raw_lines = text.splitlines()
+    while raw_lines and not raw_lines[-1].strip():
+        raw_lines.pop()
+    if not raw_lines or not raw_lines[0].strip():
+        return False
+    lines = [line.strip() for line in raw_lines]
+    header_indices = [index for index, line in enumerate(lines) if _RELAY_HEADER_RE.fullmatch(line)]
+    if len(header_indices) != 1 or header_indices[0] != len(lines) - 1:
         return False
     header = _RELAY_HEADER_RE.fullmatch(lines[-1])
     if header is None or header.group("task"):
         return False
-    if sum(bool(_RELAY_HEADER_RE.fullmatch(line)) for line in lines) != 1:
+    footer_indices = [index for index, line in enumerate(lines) if _RELAY_FYI_FOOTER_RE.fullmatch(line)]
+    if len(footer_indices) != 1 or footer_indices[0] != len(lines) - 2:
         return False
-    if not _RELAY_FYI_FOOTER_RE.fullmatch(lines[-2]):
+    if not _is_relay_title(lines[0]):
         return False
-    title = _RELAY_TITLE_RE.fullmatch(lines[0])
-    if title is None or not _is_single_emoji(title.group("emoji")):
-        return False
-    if lines[1] in {"---", "From:"}:
-        return False
-    details = lines[2:-2]
-    if details and (details[0] != "---" or len(details) == 1):
-        return False
-    return True
+    body = lines[1:-2]
+    # Relay's plainMessage emits the parsed brief/details with blank separators, but never emits
+    # its input `---` separator. Require content, while intentionally accepting any rendered shape.
+    return any(line for line in body)
+
+
+def is_passive_fyi_relay_event(event: Any, source: Any, *, enabled: bool) -> bool:
+    """Shared passive-admission predicate for idle, busy, and post-turn drain paths."""
+    return bool(
+        enabled
+        and getattr(getattr(source, "platform", None), "value", None) == "telegram"
+        and getattr(getattr(event, "message_type", None), "value", None) == "text"
+        and not getattr(event, "internal", False)
+        and not getattr(event, "_gateway_human_text_merged", False)
+        and getattr(event, "reply_expected", None) is not True
+        and is_fyi_relay_text(getattr(event, "text", None))
+    )
 
 
 def apply_agent_origin_reply_expectation(event: Any) -> Any:
