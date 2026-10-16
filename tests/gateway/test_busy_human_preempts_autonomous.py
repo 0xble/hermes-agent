@@ -106,7 +106,7 @@ def _relay(text: str = "📈 Build webinar scorecard") -> MessageEvent:
     return MessageEvent(text=f"{text}\n{_RELAY}", source=_SOURCE, message_id="m-relay")
 
 
-def _passive_relay() -> MessageEvent:
+def _fyi_relay() -> MessageEvent:
     return MessageEvent(
         text=(
             "📨 Relay title\nBrief\n\nDetails\n"
@@ -174,19 +174,6 @@ async def test_turn_the_user_already_joined_keeps_queue_semantics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_flag_off_busy_fyi_uses_normal_busy_input_mode() -> None:
-    runner = _runner()
-    runner._busy_input_mode = "interrupt"
-    runner._busy_text_mode = "interrupt"
-    runner._relay_fyi_passive_enabled = lambda source=None: False
-    agent = _agent()
-    key = _start_turn(runner, _goal_tick(), agent)
-
-    assert await runner._handle_active_session_busy_message(_passive_relay(), key) is True
-    agent.redirect.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_relay_does_not_preempt_autonomous_turn() -> None:
     runner = _runner()
     agent = _agent()
@@ -195,3 +182,19 @@ async def test_relay_does_not_preempt_autonomous_turn() -> None:
     assert await runner._handle_active_session_busy_message(_relay("🔄 LPG weekly review failed"), key) is False
     agent.redirect.assert_not_called()
     agent.steer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fyi_relay_queues_without_interrupting_in_interrupt_mode() -> None:
+    runner = _runner()
+    runner._busy_input_mode = runner._busy_text_mode = "interrupt"
+    runner._relay_fyi_passive_enabled = lambda source=None: True
+    agent = _agent()
+    key = _start_turn(runner, _goal_tick(), agent)
+    fyi = _fyi_relay()
+
+    assert await runner._handle_active_session_busy_message(fyi, key) is True
+    agent.interrupt.assert_not_called()
+    agent.redirect.assert_not_called()
+    agent.steer.assert_not_called()
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[key] is fyi

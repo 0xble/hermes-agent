@@ -346,34 +346,6 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         except Exception:
             return True
 
-    def _hm_has_orphaned_fifo(self, session_key: str, source: SessionSource) -> bool:
-        """Return whether ordinary queued work requires the FIFO orphan rescue.
-
-        A FIFO containing only passive FYIs is deliberately not an orphan for passive admission:
-        each FYI can be persisted by the normal idle path in arrival order, without a model turn.
-        """
-        try:
-            from gateway.response_filters import is_passive_fyi_relay_event
-            adapter = self._delivery_adapter_for(source)
-            overflow = self._overflow_queue(session_key)
-            pending = getattr(adapter, "_pending_messages", {}) if adapter is not None else {}
-            queued = []
-            if isinstance(pending, dict) and session_key in pending:
-                queued.append(pending[session_key])
-            queued.extend(overflow or ())
-            return any(
-                not is_passive_fyi_relay_event(
-                    event,
-                    getattr(event, "source", source),
-                    enabled=self._relay_fyi_passive_enabled(getattr(event, "source", source)),
-                )
-                for event in queued
-            )
-        except Exception:
-            # A failed queue inspection is fail-closed for passive admission: normal turn handling
-            # owns the event and can still perform the rescue.
-            return True
-
     async def _hm_try_passive_fyi_relay(
         self, event: "MessageEvent", source: SessionSource, session_key: str,
     ) -> bool:
@@ -1710,11 +1682,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 if self._should_send_telegram_lobby_reminder(source):
                     return self._telegram_topic_root_lobby_message()
                 return None
-            # Passive admission is after the Telegram topic-root guard and yields to any queued FIFO
-            # event so the #28503 orphan rescue sees the oldest arrival first.
-            if not self._hm_has_orphaned_fifo(_quick_key, source):
-                if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
-                    return None
+            if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
+                return None
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.

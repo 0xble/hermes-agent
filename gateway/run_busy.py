@@ -919,13 +919,12 @@ class GatewayBusySessionMixin:
             self._preserve_drain_event(session_key, event)
             return True
         passive_fyi = is_passive_fyi_relay_event(
-            event,
-            event.source,
-            enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: True)(event.source)),
+            event, event.source,
+            enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: False)(event.source)),
         )
         effective_mode = self._effective_busy_input_mode(event.source)
-        if passive_fyi:
-            # Passive FYIs are transcript notifications, never an interruption of active work.
+        if passive_fyi and effective_mode == "interrupt":
+            # An FYI never redirects or interrupts a running turn; it queues exactly like queue mode.
             effective_mode = "queue"
         if self._draining:
             # A command not bypassed by the adapter still uses the ordinary busy
@@ -948,11 +947,7 @@ class GatewayBusySessionMixin:
             self._queue_or_replace_pending_event(session_key, event)
             return True
         _busy_state = self._peek_session_state(session_key)
-        preempt = (
-            not passive_fyi
-            and effective_mode == "queue"
-            and self._human_preempts_autonomous_turn(event, _busy_state)
-        )
+        preempt = effective_mode == "queue" and self._human_preempts_autonomous_turn(event, _busy_state)
         if preempt:
             logger.info("Typed message preempts autonomous turn for session %s", session_key)
             effective_mode = "steer"
@@ -991,11 +986,6 @@ class GatewayBusySessionMixin:
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
             await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
-
-        if passive_fyi:
-            # Passive FYIs are queued silently; they are transcript notifications, not user-facing
-            # busy-input acknowledgments.
-            return True
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.

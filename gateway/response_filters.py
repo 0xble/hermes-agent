@@ -173,13 +173,12 @@ def is_fyi_relay_text(text: Any) -> bool:
 
 
 def is_passive_fyi_relay_event(event: Any, source: Any, *, enabled: bool) -> bool:
-    """Shared passive-admission predicate for idle, busy, and post-turn drain paths."""
+    """Shared passive-admission predicate for idle sessions."""
     return bool(
         enabled
         and getattr(getattr(source, "platform", None), "value", None) == "telegram"
         and getattr(getattr(event, "message_type", None), "value", None) == "text"
         and not getattr(event, "internal", False)
-        and not getattr(event, "_gateway_human_text_merged", False)
         and getattr(event, "reply_expected", None) is not True
         and is_fyi_relay_text(getattr(event, "text", None))
     )

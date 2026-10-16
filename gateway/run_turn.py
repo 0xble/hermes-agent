@@ -27,15 +27,11 @@ from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.response_filters import (
-    display_kind_for_event,
-    is_machinery_display_kind,
-    is_passive_fyi_relay_event,
-    reply_expected_metadata,
-    silence_allowed,
+    display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
     strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
@@ -4118,42 +4114,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            passive_events = []
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            while pending_event and is_passive_fyi_relay_event(
-                pending_event,
-                getattr(pending_event, "source", source),
-                enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: True)(
-                    getattr(pending_event, "source", source))),
-            ):
-                if self._draining:
-                    self._preserve_drain_event(session_key, pending_event)
-                else:
-                    passive_events.append(pending_event)
-                pending_event = _dequeue_pending_event(adapter, session_key)
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-
-            if passive_events:
-                # Keep ordinary queued work ahead of passive FYIs. The current ordinary event runs
-                # in-band; the FYIs then re-enter the adapter's normal idle admission after the
-                # complete turn (including any recursive queued turns) is persisted.
-                overflow = self._overflow_queue(session_key)
-                queued = []
-                next_slot = getattr(adapter, "_pending_messages", {}).pop(session_key, None)
-                if next_slot is not None:
-                    queued.append(next_slot)
-                if overflow is not None:
-                    queued.extend(overflow)
-                    overflow.clear()
-                queued.extend(passive_events)
-                if queued:
-                    getattr(adapter, "_pending_messages", {})[session_key] = queued.pop(0)
-                    if overflow is not None:
-                        overflow.extend(queued)
-
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if result.get("interrupt_source") or _is_control_interrupt_message(interrupt_message):

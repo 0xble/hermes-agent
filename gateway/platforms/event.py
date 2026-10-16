@@ -120,9 +120,6 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
-    # Set when a text event is merged with another text event; prevents a human prefix/suffix from
-    # being reclassified as a standalone passive FYI relay after the busy queue drains.
-    _gateway_human_text_merged: bool = field(default=False, init=False, repr=False, compare=False)
     # The local inbox placeholder belongs to this event until native admission succeeds.
     _owned_local_pending: Optional[int] = field(default=None, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.

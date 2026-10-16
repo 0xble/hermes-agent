@@ -93,17 +93,3 @@ async def test_enqueue_then_flush_delivers_merged_text_once():
     await asyncio.gather(*adapter._pending_text_batch_tasks.values())
     assert [e.text for e in adapter.dispatched] == ["part one\npart two"]
     assert adapter._pending_text_batches == {} and adapter._pending_text_batch_tasks == {}
-
-
-@pytest.mark.asyncio
-async def test_enqueue_text_batch_marks_human_merge():
-    adapter = _Adapter()
-    adapter.release.set()
-    adapter._enqueue_text_event(_event("human question"))
-    adapter._enqueue_text_event(_event("relay fragment"))
-
-    pending = next(iter(adapter._pending_text_batches.values()))
-    assert pending._gateway_human_text_merged is True
-    for task in adapter._pending_text_batch_tasks.values():
-        task.cancel()
-    await asyncio.gather(*adapter._pending_text_batch_tasks.values(), return_exceptions=True)

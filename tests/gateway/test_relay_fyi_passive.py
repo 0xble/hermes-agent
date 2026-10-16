@@ -9,13 +9,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
-from gateway.platforms.base import merge_pending_message_event
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import is_fyi_relay_text
 from gateway.run import GatewayRunner
-from gateway.run_busy import GatewayBusySessionMixin
 from gateway.session import SessionSource
+from plugins.platforms.telegram.adapter import TelegramAdapter
+from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
 FYI = (
@@ -111,6 +111,35 @@ async def test_fyi_is_persisted_unchanged_without_a_turn(runner):
 
 
 @pytest.mark.asyncio
+async def test_real_adapter_background_fyi_uses_idle_admission(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    runner, _ = make_restart_runner(adapter)
+    source = make_restart_source(chat_id="real-fyi-chat")
+    event = MessageEvent(text=FYI, message_type=MessageType.TEXT, source=source, message_id="fyi-e2e")
+    entry = SimpleNamespace(session_id="sid", session_key=runner._session_key_for_source(source))
+    runner.session_store.lookup_by_session_key = AsyncMock(return_value=entry)
+    runner.session_store.has_platform_message_id = AsyncMock(return_value=False)
+    runner.session_store.append_to_transcript = AsyncMock()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        lookup_by_session_key=runner.session_store.lookup_by_session_key,
+        has_platform_message_id=runner.session_store.has_platform_message_id,
+        append_to_transcript=runner.session_store.append_to_transcript,
+    )
+    runner._handle_message = GatewayRunner._handle_message.__get__(runner, GatewayRunner)
+    adapter.set_message_handler(runner._handle_message)
+    runner._relay_fyi_passive_enabled = lambda source=None: True
+    runner._handle_message_with_agent = AsyncMock(side_effect=AssertionError("FYI started a turn"))
+    monkeypatch.setattr("hermes_cli.goals._get_session_db", lambda: object())
+    monkeypatch.setattr("hermes_cli.goals.load_goal", lambda _sid: None)
+    monkeypatch.setattr("hermes_cli.loops.load_loop", lambda _sid: None)
+    adapter.gateway_runner = runner
+    await adapter._process_message_background(event, runner._session_key_for_source(source))
+    runner.session_store.append_to_transcript.assert_awaited_once()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_replayed_fyi_message_id_is_not_appended_again(runner):
     runner._test_store.duplicate = True
     event = _event(FYI)
@@ -153,60 +182,6 @@ async def test_topic_root_lobby_guard_precedes_passive_admission(runner):
 
 
 @pytest.mark.asyncio
-async def test_passive_admission_yields_to_orphaned_fifo(runner):
-    adapter = SimpleNamespace(_pending_messages={})
-    runner._delivery_adapter_for.return_value = adapter
-    runner._overflow_queue.return_value = [_event("old queued event")]
-
-    assert runner._hm_has_orphaned_fifo("session-key", _event(FYI).source) is True
-
-    runner._overflow_queue.return_value = []
-    assert runner._hm_has_orphaned_fifo("session-key", _event(FYI).source) is False
-
-
-@pytest.mark.asyncio
-async def test_two_queued_fyis_use_real_fifo_and_persist_in_order(runner):
-    first, second = _event(FYI), _event(FYI.replace("receipt-1", "receipt-2"))
-    adapter = _DrainAdapter(first)
-    runner._overflow_queue = MagicMock(return_value=[second])
-
-    pending_event, pending = await runner._run_agent_drain_pending(
-        {"final_response": "completed"}, adapter, first.source, "session-key",
-    )
-
-    assert pending_event is None and pending is None
-    first = adapter.get_pending_message("session-key")
-    assert first is not None
-    assert runner._hm_has_orphaned_fifo("session-key", first.source) is False
-    assert await runner._hm_try_passive_fyi_relay(first, first.source, "session-key") is True
-
-    second = runner._promote_queued_event("session-key", adapter, None)
-    assert second is not None
-    assert await runner._hm_try_passive_fyi_relay(second, second.source, "session-key") is True
-    assert [row[1]["content"] for row in runner._test_store.rows] == [FYI, second.text]
-    assert not hasattr(getattr(runner, "_handle_message_with_agent", None), "call_count") or runner._handle_message_with_agent.call_count == 0
-
-
-@pytest.mark.asyncio
-async def test_mixed_fifo_keeps_ordinary_work_ahead_of_passive_fyis(runner):
-    first = _event(FYI)
-    ordinary = _event("Please continue.")
-    second = _event(FYI.replace("receipt-1", "receipt-2"))
-    adapter = _DrainAdapter(first)
-    runner._overflow_queue = MagicMock(return_value=[ordinary, second])
-
-    pending_event, pending = await runner._run_agent_drain_pending(
-        {"final_response": "completed"}, adapter, first.source, "session-key",
-    )
-
-    assert pending_event is ordinary
-    assert pending == ordinary.text
-    assert adapter._pending_messages["session-key"] is second
-    assert runner._overflow_queue.return_value == [first]
-    assert runner._hm_has_orphaned_fifo("session-key", first.source) is False
-
-
-@pytest.mark.asyncio
 async def test_passive_write_claim_blocks_interleaving_turn(runner):
     runner._is_session_running = GatewayRunner._is_session_running.__get__(runner, GatewayRunner)
     async def no_active_wakes(_fn, *_args, **_kwargs):
@@ -239,32 +214,6 @@ def test_secondary_profile_reads_its_own_passive_flag(runner, monkeypatch):
     source.profile = "secondary"
     monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"relay": {"fyi_passive": True}})
     assert runner._relay_fyi_passive_enabled(source) is False
-
-
-@pytest.mark.asyncio
-async def test_busy_passive_fyi_sends_no_queued_ack(runner):
-    event = _event(FYI)
-    adapter = SimpleNamespace(_pending_messages={})
-    runner._delivery_adapter_for = MagicMock(return_value=adapter)
-    runner._is_user_authorized_for_source = MagicMock(return_value=True)
-    runner._admit_bot_message_for_source = MagicMock(return_value=True)
-    runner._strict_session_pin_holds = AsyncMock(return_value=True)
-    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
-    runner._hm_is_registered_command = MagicMock(return_value=False)
-    runner._queue_or_replace_pending_event = MagicMock()
-    runner._resolve_busy_steer_or_redirect = AsyncMock(
-        return_value=SimpleNamespace(steered=False, redirected=False, effective_mode="queue",
-                                      demoted_for_subagents=False, demoted_for_compression=False)
-    )
-    runner._send_busy_ack_reply = AsyncMock()
-    runner._peek_session_state = MagicMock(return_value=SimpleNamespace(turn=SimpleNamespace(agent=object())))
-    runner._draining = False
-
-    assert await GatewayBusySessionMixin._handle_active_session_busy_message(
-        runner, event, "session-key",
-    ) is True
-    runner._queue_or_replace_pending_event.assert_called_once_with("session-key", event)
-    runner._send_busy_ack_reply.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -325,19 +274,6 @@ async def test_passive_admission_marks_restart_recovery_as_succeeded(runner):
 
 
 @pytest.mark.asyncio
-async def test_task_and_two_fyi_merges_fail_closed(runner):
-    for first, second in ((TASK, FYI), (FYI, FYI)):
-        pending = {}
-        merge_pending_message_event(pending, "session-key", _event(first), merge_text=True)
-        merge_pending_message_event(pending, "session-key", _event(second), merge_text=True)
-        merged = pending["session-key"]
-
-        assert merged._gateway_human_text_merged is True
-        assert await runner._hm_try_passive_fyi_relay(merged, merged.source, "session-key") is False
-        assert runner._test_store.rows == []
-
-
-@pytest.mark.asyncio
 async def test_fyi_with_typed_tail_runs(runner):
     event = _event(FYI + "\n\nPlease summarize this.")
 
@@ -389,81 +325,19 @@ async def test_unbound_session_keeps_turn_path(runner):
     assert runner._test_store.rows == []
 
 
-class _DrainAdapter:
-    def __init__(self, *events):
-        self._pending_messages = {"session-key": events[0]} if events else {}
-        self._overflow = list(events[1:])
-
-    def get_pending_message(self, session_key):
-        return self._pending_messages.pop(session_key, None)
-
-
 @pytest.mark.asyncio
-async def test_post_turn_drain_requeues_fyi_for_idle_admission(runner):
-    event = _event(FYI)
-    adapter = _DrainAdapter(event)
+async def test_busy_fyi_drains_as_normal_turn_in_order(runner):
+    fyi, human = _event(FYI), _event("Please continue.")
+    adapter = SimpleNamespace(_pending_messages={"session-key": fyi})
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    overflow = [human]
+    runner._overflow_queue = MagicMock(return_value=overflow)
     runner._draining = False
-    runner._overflow_queue = MagicMock(return_value=[])
-    runner._promote_queued_event = MagicMock(side_effect=lambda _key, _adapter, pending: pending)
 
     pending_event, pending = await runner._run_agent_drain_pending(
-        {"final_response": "completed"}, adapter, event.source, "session-key",
+        {"final_response": "done"}, adapter, fyi.source, "session-key",
     )
 
-    assert pending_event is None
-    assert pending is None
-    assert adapter._pending_messages["session-key"] is event
+    assert pending_event is fyi and pending == FYI
+    assert adapter._pending_messages["session-key"] is human and overflow == []
     assert runner._test_store.rows == []
-
-
-@pytest.mark.asyncio
-async def test_shutdown_drain_preserves_busy_fyi(runner):
-    event = _event(FYI)
-    adapter = _DrainAdapter(event)
-    runner._draining = True
-    runner._overflow_queue = MagicMock(return_value=[])
-    runner._promote_queued_event = MagicMock(side_effect=lambda _key, _adapter, pending: pending)
-    runner._preserve_drain_event = MagicMock(return_value=True)
-
-    pending_event, pending = await runner._run_agent_drain_pending(
-        {"final_response": "completed"}, adapter, event.source, "session-key",
-    )
-
-    assert pending_event is None
-    assert pending is None
-    runner._preserve_drain_event.assert_called_once_with("session-key", event)
-    assert runner._test_store.rows == []
-
-
-@pytest.mark.asyncio
-async def test_human_text_merged_before_fyi_keeps_turn_path(runner):
-    pending = {}
-    human = _event("Please review this.")
-    relay = _event(FYI)
-    merge_pending_message_event(pending, "session-key", human, merge_text=True)
-    merge_pending_message_event(pending, "session-key", relay, merge_text=True)
-
-    merged = pending["session-key"]
-    assert merged._gateway_human_text_merged is True
-    assert await runner._hm_try_passive_fyi_relay(merged, merged.source, "session-key") is False
-    assert runner._test_store.rows == []
-
-
-
-
-@pytest.mark.asyncio
-async def test_drain_skips_fyi_and_runs_next_ordinary_event(runner):
-    fyi = _event(FYI)
-    ordinary = _event("Please continue.")
-    adapter = _DrainAdapter(fyi)
-    runner._draining = False
-    runner._overflow_queue = MagicMock(return_value=[])
-    runner._promote_queued_event = MagicMock(side_effect=[fyi, ordinary])
-
-    pending_event, pending = await runner._run_agent_drain_pending(
-        {"final_response": "completed"}, adapter, ordinary.source, "session-key",
-    )
-
-    assert pending_event is ordinary
-    assert pending == "Please continue."
-    assert adapter._pending_messages["session-key"] is fyi
