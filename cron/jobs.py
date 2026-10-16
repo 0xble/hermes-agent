@@ -1594,14 +1594,27 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
-    """Serialize the store payload to a fsynced temp file beside the resolved *jobs_file*; return its path."""
+def _stage_jobs_payload(
+    jobs_file: Path, jobs: List[Dict[str, Any]], *, document: Optional[Any] = None,
+) -> str:
+    """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
+
+    Normal saves use the canonical wrapper with a fresh ``updated_at``. Recovery callers may pass
+    an existing document to preserve its top-level metadata exactly while replacing only its jobs.
+    """
+    if document is None:
+        payload: Any = {"jobs": jobs, "updated_at": _hermes_now().isoformat()}
+    elif isinstance(document, dict):
+        payload = dict(document)
+        payload["jobs"] = jobs
+    elif isinstance(document, list):
+        payload = jobs
+    else:
+        raise ValueError("Cron jobs document must be a dict or list")
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(
-                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
-                f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -1610,17 +1623,118 @@ def _stage_jobs_payload(jobs_file: Path, jobs: List[Dict[str, Any]]) -> str:
     return tmp_path
 
 
+_REMOVED_JOBS_RETENTION = timedelta(days=7)
+
+
+def _removed_jobs_file() -> Path:
+    """Return the durable intentional-delete journal for the active cron store."""
+    return _current_cron_store().cron_dir / "removed_jobs.jsonl"
+
+
+def _parse_removed_at(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _read_removed_jobs_lines(path: Path) -> List[str]:
+    """Read the delete journal while preserving every decodable line."""
+    return path.read_bytes().decode("utf-8-sig", errors="replace").splitlines()
+
+
+def get_removed_job_ids(since: Optional[datetime] = None) -> Set[str]:
+    """Return intentionally removed job ids, optionally limited to a time window.
+
+    This is a best-effort read of the small per-profile journal used by the
+    update restore safety net. Invalid lines are ignored so a damaged journal
+    cannot block normal cron operation.
+    """
+    path = _removed_jobs_file()
+    try:
+        lines = _read_removed_jobs_lines(path)
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read intentional cron job delete journal %s; "
+            "treating deletes as unknown and restoring missing jobs: %s",
+            path, exc)
+        return set()
+    boundary = since
+    if boundary is not None:
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=timezone.utc)
+        boundary = boundary.astimezone(timezone.utc)
+    removed: Set[str] = set()
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        removed_at = _parse_removed_at(record.get("removed_at"))
+        if removed_at is None or boundary is None or removed_at >= boundary:
+            removed.add(str(record["id"]))
+    return removed
+
+
+def _record_removed_jobs_unlocked(removed_ids: Collection[str]) -> None:
+    """Append intentional deletes while pruning journal entries older than seven days."""
+    ids = {str(job_id) for job_id in removed_ids if job_id}
+    if not ids:
+        return
+    removed_file = _removed_jobs_file()
+    now = _hermes_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_utc = now.astimezone(timezone.utc)
+    cutoff = now_utc - _REMOVED_JOBS_RETENTION
+    retained: List[Dict[str, str]] = []
+    try:
+        existing = _read_removed_jobs_lines(removed_file)
+    except FileNotFoundError:
+        existing = []
+    for line in existing:
+        try:
+            record = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict) or not record.get("id"):
+            continue
+        removed_at = _parse_removed_at(record.get("removed_at"))
+        if removed_at is not None and removed_at >= cutoff:
+            retained.append({"id": str(record["id"]), "removed_at": removed_at.isoformat()})
+    retained.extend({"id": job_id, "removed_at": now_utc.isoformat()} for job_id in sorted(ids))
+    atomic_write_text(
+        removed_file,
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in retained),
+        tmp_prefix=".removed_jobs_",
+        mode=0o600,
+    )
+    _secure_file(removed_file)
+
+
 _SAVE_JOBS_MERGE_ATTEMPTS = 5
 
 
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
-    replace: bool = False,
+    replace: bool = False, document: Optional[Any] = None,
 ):
     """Save all jobs; caller must hold _jobs_lock(). ``removed_ids`` = intentional deletes;
     ``replace=True`` skips the shrink-merge guard and the corrupt-store refusal (wholesale
-    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes)."""
+    rewrite for tests, disaster recovery and load_jobs' auto-repair of unmergeable shapes).
+    ``document`` preserves an existing dict/list wrapper for exact recovery writes.
+    """
     jobs_file = _current_cron_store().jobs_file
+    removed_ids = tuple(str(job_id) for job_id in (removed_ids or ()) if job_id)
     ensure_dirs()
     # Owner snapshot BEFORE replace so a root writer can hand the file back to the gateway user.
     _stat_before = None
@@ -1635,7 +1749,7 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs)
+            tmp_path = _stage_jobs_payload(jobs_file, jobs, document=document)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -1655,6 +1769,15 @@ def _save_jobs_unlocked(
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)
             store_health.note_writable(jobs_file.parent)
+            if removed_ids:
+                try:
+                    _record_removed_jobs_unlocked(removed_ids)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not record intentional cron job delete(s) in %s; "
+                        "the deletion remains applied: %s",
+                        _removed_jobs_file(), exc,
+                    )
             return
     except BaseException:
         _unlink_quiet(tmp_path)
@@ -1668,6 +1791,26 @@ def save_jobs(
     """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
+
+
+def save_jobs_document(document: Any) -> None:
+    """Persist an existing cron document without adding or rewriting wrapper metadata.
+
+    This is for recovery paths that merge jobs from a snapshot while preserving the document's
+    original top-level keys. Normal callers should use :func:`save_jobs`.
+    """
+    if isinstance(document, dict):
+        jobs = document.get("jobs")
+    elif isinstance(document, list):
+        jobs = document
+    else:
+        raise ValueError("Cron jobs document must be a dict or list")
+    if not isinstance(jobs, list):
+        raise ValueError("Cron jobs document must contain a jobs list")
+    with _jobs_lock():
+        # Keep the shrink-merge guard: under the degraded (in-process only) lock a sibling's
+        # create may have landed after the caller read the document.
+        _save_jobs_unlocked(jobs, document=document)
 
 
 _MISSING = object()

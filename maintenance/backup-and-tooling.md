@@ -72,6 +72,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
   `full-zip-failure-accounting`, `config-backup-content`, `sqlite-backup-wal-snapshot`,
   `sqlite-close-guard-upstream`, `update-backup-outcome`,
+  `cron-restore-respects-deletes`,
   `evidence` (records, not patches), `candidate-tooling` (candidate sync/check scripts and
   their review fallback), `slice-14-request-update` (the parent-only native update request).
   `maintenance-contract` is owned by the root contract.
