@@ -4203,8 +4203,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                         pending = None
 
         if self._draining and (pending_event or pending) and not handover_runs_followups(self):
-            # The adapter slot was already dequeued; the shutdown snapshot cannot see it now.
-            # Spool before dropping the local reference so startup recovery can replay it.
+            # The adapter slot was already dequeued; spool it so startup recovery can replay it.
             from gateway.shutdown_flush import flush_pending_to_file
             # Media-only events can have no text even after transcription; persist the resolved
             # user-turn placeholder instead of writing an unrecoverable empty-text event.  A
