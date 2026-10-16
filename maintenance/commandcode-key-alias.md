@@ -13,9 +13,16 @@ credential name remains available to the model picker and runtime resolver.
 
 ## Provenance And Verification
 
-This fork overlay preserves the upstream CommandCode plugin contract while
-bridging the catalog's legacy key name. Verify with
-`tests/plugins/model_providers/test_commandcode_profile.py` and the repository
+models.dev currently advertises the provider with `CMD_API_KEY`, while the
+CommandCode plugin and user-facing configuration use `COMMANDCODE_API_KEY`.
+No released upstream equivalent was identified for this fork-specific
+catalog-to-plugin mismatch. The fork delivery is the `commandcode` entry in
+`hermes_cli/providers.py`, which appends the plugin key without dropping the
+catalog key and keeps the CommandCode endpoint and base-URL override.
+
+Verify with
+`tests/plugins/model_providers/test_commandcode_profile.py`, including the
+synthetic models.dev catalog-hit merge test, and the repository
 provider-resolution checks.
 
 Retire this unit when models.dev and the provider plugin use the same canonical
