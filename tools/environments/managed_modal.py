@@ -52,7 +52,7 @@ class ManagedModalEnvironment(BaseEnvironment):
     _CANCEL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS", 5.0)
 
     def __init__(self, image: str, cwd: str = "/root", timeout: int = 60,
-                 modal_sandbox_kwargs: Optional[Dict[str, Any]] = None,
+                 modal_sandbox_kwargs: Optional[dict[str, Any]] = None,
                  persistent_filesystem: bool = True, task_id: str = "default"):
         super().__init__(cwd=cwd, timeout=timeout)
         # Managed Modal does not sync or mount host credential files.
@@ -93,7 +93,7 @@ class ManagedModalEnvironment(BaseEnvironment):
             exec_command = f"{relay_parent_export_line(relay_parent)}\n{exec_command}"
         timeout = timeout or self.timeout
         exec_id = str(uuid.uuid4())
-        payload: Dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,
+        payload: dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,
                                    "timeoutMs": int(timeout * 1000)}
         if stdin_data is not None:
             payload["stdinData"] = stdin_data
@@ -189,8 +189,8 @@ class ManagedModalEnvironment(BaseEnvironment):
             raise RuntimeError("Managed Modal create did not return a sandbox id")
         return sandbox_id
 
-    def _request(self, method: str, path: str, *, json: Dict[str, Any] | None = None, timeout: int = 30,
-                 extra_headers: Dict[str, str] | None = None) -> requests.Response:
+    def _request(self, method: str, path: str, *, json: dict[str, Any] | None = None, timeout: int = 30,
+                 extra_headers: dict[str, str] | None = None) -> requests.Response:
         headers = {"Authorization": f"Bearer {self._nous_user_token}", "Content-Type": "application/json",
                    **(extra_headers or {})}
         return requests.request(method, f"{self._gateway_origin}{path}", headers=headers, json=json, timeout=timeout)

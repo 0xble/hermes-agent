@@ -105,7 +105,7 @@ class TestLaunchdGatewayLabelsForInstall:
         ]
 
     def test_no_profiles_means_no_fleet(self, monkeypatch):
-        monkeypatch.setattr(hermes_cli.profiles, "list_profiles", lambda: [])
+        monkeypatch.setattr(hermes_cli.profiles, "list_profiles", list)
         assert launchd_gateway_labels_for_install() == []
 
 
@@ -758,7 +758,7 @@ class TestGuardianRestartScope:
         assert restarted == ["ai.hermes.gateway", "ai.hermes.gateway-after"]
 
     def test_sibling_that_never_comes_back_is_failed(self, monkeypatch, tmp_path):
-        rec = _fleet(
+        _fleet(
             monkeypatch,
             tmp_path,
             current="ai.hermes.gateway",

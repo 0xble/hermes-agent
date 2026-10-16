@@ -514,7 +514,11 @@ def static(env: dict[str, str]) -> None:
     py = python(env)
     commands = [
         [py, '-m', 'unittest', 'discover', '-s', 'scripts/ci/tests', '-p', 'test_*.py'],
-        [py, '-m', 'ruff', 'check', '.'],
+        # ``ruff.toml`` is the contributor/pre-commit ratchet and intentionally retains a
+        # large legacy backlog. The blocking gate must judge the release's CI scope instead:
+        # pyproject.toml carries the maintained rules, while evals/ is research code outside
+        # the shipped package and has its own probes.
+        [py, '-m', 'ruff', '--config', 'pyproject.toml', 'check', '.', '--exclude', 'evals'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
         [py, 'scripts/check_no_tmp_literals.py'],
         [py, 'scripts/ci/check_os_marker_fakes.py'],

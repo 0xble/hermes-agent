@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger("tools.skill_manager_tool")
 
 
-def _refusal(message: str, **extra: Any) -> Dict[str, Any]:
+def _refusal(message: str, **extra: Any) -> dict[str, Any]:
     return {"success": False, "error": message, **extra}
 
 
@@ -48,7 +48,7 @@ class _BackgroundReviewReadMarks:
             return path in self._paths
 
 
-_background_review_read_paths: "_ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]]" = (
+_background_review_read_paths: _ctxvars.ContextVar[Optional[_BackgroundReviewReadMarks]] = (
     _ctxvars.ContextVar("background_review_read_paths", default=None))
 
 
@@ -161,7 +161,7 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
-def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[Dict[str, Any]]:
+def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[dict[str, Any]]:
     """Refuse autonomous deletes of anything but curator-owned sediment. Content writes are not
     gated by ownership: the review fork exists to improve every skill it learns from, and every
     write is ledgered and reversible, while an archive removes a skill the user relies on."""
@@ -210,7 +210,7 @@ def _background_review_delete_guard(name: str, skill_dir: Path) -> Optional[Dict
 
 
 def _background_review_read_before_write_guard(
-    name: str, target: Path, action: str, file_label: str) -> Optional[Dict[str, Any]]:
+    name: str, target: Path, action: str, file_label: str) -> Optional[dict[str, Any]]:
     """Require review forks to load the exact target before mutating it."""
     if not _is_background_review() or _background_review_has_read(target):
         return None
@@ -243,7 +243,7 @@ def _background_review_external_write_guard(name: str, skill_dir: Path) -> Optio
         f"curation. Change it at its source in the owning repository.")
 
 
-def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
+def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     from tools import skill_manager_tool as _smt
@@ -256,7 +256,7 @@ def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, A
 
 
 def _curator_consolidation_delete_guard(
-    name: str, absorbed_into: Optional[str]) -> Optional[Dict[str, Any]]:
+    name: str, absorbed_into: Optional[str]) -> Optional[dict[str, Any]]:
     """Fail closed on unverified deletes during the curator consolidation pass. The fork's only
     legitimate delete is a consolidation declared via ``absorbed_into=<umbrella>`` (existence
     validated in ``_delete_skill``); the deterministic inactivity prune never calls skill_manage,

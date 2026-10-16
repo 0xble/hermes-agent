@@ -58,7 +58,7 @@ def test_lock_timeout_reader_skips_activation_without_lease(generations, monkeyp
 def test_release_removes_the_lease_file(generations):
     from hermes_cli.runtime_state import lease_generation
 
-    _, state, select = generations
+    _, _state, select = generations
     environment = select("first")
     release = lease_generation(environment)
     assert list((environment.parent / ".leases").iterdir())

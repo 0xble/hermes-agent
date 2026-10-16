@@ -122,7 +122,7 @@ def test_os_killpg_blocks_foreign_pgid():
 
 def test_subprocess_run_systemctl_restart_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["systemctl", "--user", "restart", "hermes-gateway"], check=False)
 
 
 @pytest.mark.parametrize(
@@ -311,32 +311,32 @@ def test_npm_refresh_allowance_is_only_the_direct_temporary_fixture(tmp_path, mo
 def test_subprocess_run_full_path_systemctl_blocked():
     """``/usr/bin/systemctl`` (full path) must be blocked too."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"])
+        subprocess.run(["/usr/bin/systemctl", "--user", "stop", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_sudo_systemctl_blocked():
     """``sudo systemctl ...`` defeated the old head==systemctl check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"])
+        subprocess.run(["sudo", "systemctl", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_env_systemctl_blocked():
     """``env systemctl ...`` similarly defeated the old head check."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"])
+        subprocess.run(["env", "systemctl", "--user", "restart", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_bash_c_systemctl_blocked():
     """``bash -c "systemctl ..."`` must also be caught."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"])
+        subprocess.run(["bash", "-c", "systemctl --user restart hermes-gateway"], check=False)
 
 
 
 
 def test_subprocess_run_setsid_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"])
+        subprocess.run(["setsid", "systemctl", "kill", "hermes-gateway"], check=False)
 
 
 def test_subprocess_run_string_shell_true_blocked():
@@ -344,6 +344,7 @@ def test_subprocess_run_string_shell_true_blocked():
         subprocess.run(
             "systemctl --user restart hermes-gateway",
             shell=True,
+            check=False,
         )
 
 
@@ -432,7 +433,7 @@ def test_asyncio_create_subprocess_shell_systemctl_blocked():
 
 def test_subprocess_pkill_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "hermes"])
+        subprocess.run(["pkill", "-f", "hermes"], check=False)
 
 
 
@@ -440,12 +441,12 @@ def test_subprocess_pkill_hermes_blocked():
 def test_subprocess_pkill_python_dash_f_blocked():
     """``pkill -f python`` matches the gateway's "python -m hermes_cli.main"."""
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["pkill", "-f", "python"])
+        subprocess.run(["pkill", "-f", "python"], check=False)
 
 
 def test_subprocess_killall_hermes_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
-        subprocess.run(["killall", "hermes"])
+        subprocess.run(["killall", "hermes"], check=False)
 
 
 # ──────────────────── pass-through cases (must NOT raise) ──────
@@ -500,6 +501,7 @@ def test_subprocess_run_gateway_status_passes_through():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; print(sys.argv[1:])", "-m", "hermes_cli.main", "gateway", "status"],
         capture_output=True, text=True,
+        check=False,
     )
     assert result.returncode == 0
 

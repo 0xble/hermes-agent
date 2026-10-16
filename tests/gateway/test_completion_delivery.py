@@ -1288,11 +1288,11 @@ def test_cancelled_primary_claim_is_refunded_not_released(monkeypatch, isolated_
     assert row["delivery_attempts"] == 1, f"cancellation spent an attempt: {row['delivery_attempts']}"
 
 
-@pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "release")])
-def test_cancelled_preflight_settle_is_not_released_again(
+@pytest.mark.parametrize(("verdict", "expected_operation"), [("terminal", "drop"), ("retry", "defer")])
+def test_cancelled_preflight_settle_is_not_duplicated(
     monkeypatch, isolated_registry, verdict, expected_operation,
 ):
-    """Cancellation during a pre-flight settle must not race a second finally settle."""
+    """Cancellation during terminal or deferred pre-flight handling must settle only once."""
     import threading
 
     from gateway import run_notifications
@@ -1313,7 +1313,7 @@ def test_cancelled_preflight_settle_is_not_released_again(
 
     runner = _runner(SimpleNamespace(handle_message=AdmittingHandler()))
     runner._completion_delivery_ready = AsyncMock(return_value=True)
-    runner._classify_completion_target = AsyncMock(return_value=verdict)
+    runner._classify_completion_owner = AsyncMock(return_value=(verdict, "owner-session", "proven-session"))
     runner._settle_durable_claims = _settle
     monkeypatch.setattr(run_notifications, "claim_off_loop", AsyncMock(return_value=True))
     event = _async_event("deleg_terminal_drop_race")
@@ -1324,6 +1324,9 @@ def test_cancelled_preflight_settle_is_not_released_again(
             runner._deliver_completion_notification_scoped("completion", event)
         )
         while not entered.is_set():
+            if task.done():
+                await task
+                raise AssertionError(f"expected {expected_operation} settle, got {operations!r}")
             await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

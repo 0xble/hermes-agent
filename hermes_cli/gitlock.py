@@ -52,7 +52,7 @@ def _git_proc_running() -> bool:
         argv = (["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"]
                 if os.name == "nt" else ["pgrep", "-x", "git"])
         proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                               timeout=10, creationflags=windows_hide_flags())
+                               timeout=10, creationflags=windows_hide_flags(), check=False)
         if os.name == "nt":
             return "git.exe" in proc.stdout.lower()
         return proc.returncode == 0
@@ -63,7 +63,7 @@ def _git_proc_running() -> bool:
 
 def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, repo_root: Path,
                  min_age_seconds: Optional[int], default_age: int, skip_msg: str,
-                 log_removed: Callable[[Path, int], None], packs: bool = False) -> List[str]:
+                 log_removed: Callable[[Path, int], None], packs: bool = False) -> list[str]:
     """Shared age-floor sweep; packs use holder-scoped Linux liveness, locks stay global."""
     if not directory.is_dir():
         return []
@@ -77,7 +77,7 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
         logger.debug(skip_msg)
         return []
     cutoff = time.time() - (min_age_seconds if min_age_seconds is not None else default_age)
-    removed: List[str] = []
+    removed: list[str] = []
     for entry in candidates():
         try:
             if entry.is_file() and (st := entry.stat()).st_mtime < cutoff:
@@ -106,7 +106,7 @@ def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, r
     return removed
 
 
-def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
+def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
     """Remove abandoned ``.git`` lock files under ``repo_root``; returns the removed paths.
 
     Removes only when older than the age floor AND no git process is running. Never raises: a lock we cannot
@@ -210,7 +210,7 @@ def _killed_update_owns(lock: Path) -> bool:
     return last.get("outcome") in ("running", "interrupted") and not update_receipt._owner_alive(last)
 
 
-def _windows_git_in_checkout(root: Path) -> "bool | None":
+def _windows_git_in_checkout(root: Path) -> bool | None:
     """Whether any git (``git.exe``, a dashed ``git-<sub>.exe``) works in ``root``; None when unknowable.
 
     Works in: its cwd, a path argument or a ``GIT_DIR``-style variable is inside the checkout or
@@ -347,7 +347,7 @@ def _migrate_earlier_maintenance_keys(repo_root: Path) -> None:
         logger.warning("Could not migrate earlier maintenance keys in %s", repo_root)
 
 
-def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
+def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> list[str]:
     """Remove aged aborted-transfer pack files with conservative liveness checks.
 
     Non-Linux keeps the system-wide Git-process guard. Linux scopes Git ownership
@@ -371,7 +371,7 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
     )
 
 
-def _git_stdout_lines(repo_root: Path, args: List[str]) -> List[str]:
+def _git_stdout_lines(repo_root: Path, args: list[str]) -> list[str]:
     """Run a read-only git query in ``repo_root``; [] on any failure."""
     try:
         result = run_git(
@@ -387,7 +387,7 @@ def _git_stdout_lines(repo_root: Path, args: List[str]) -> List[str]:
         return []
 
 
-def _batch_missing_parents(repo_root: Path, candidates: List[str]) -> set[str]:
+def _batch_missing_parents(repo_root: Path, candidates: list[str]) -> set[str]:
     """Return local commit objects whose parent objects are missing.
 
     Parents are read from the commit *header* only (lines before the first blank
@@ -479,7 +479,7 @@ class _ShallowLock:
         self._path = shallow_path
         self._lock_path = shallow_path.with_name(shallow_path.name + ".lock")
 
-    def __enter__(self) -> "_ShallowLock":
+    def __enter__(self) -> _ShallowLock:
         try:
             fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -640,7 +640,7 @@ def prune_stale_shallow_grafts(repo_root: Path) -> int:
         return 0
 
 
-def _partial_clone_filter(repo_root: Path, **run_kwargs) -> "str | None":
+def _partial_clone_filter(repo_root: Path, **run_kwargs) -> str | None:
     """The checkout's own ``remote.origin.partialclonefilter``, or None for a non-partial clone."""
     result = run_git(
         ["git"], ["config", "--get", "remote.origin.promisor"],
@@ -735,7 +735,7 @@ def is_partial_clone_pack_objects_crash(stderr: str) -> bool:
 
 
 def fetch_with_partial_clone_recovery(runner: Callable[..., subprocess.CompletedProcess],
-                                      git_cmd: List[str], fetch_args: List[str],
+                                      git_cmd: list[str], fetch_args: list[str],
                                       repo_root: Path) -> subprocess.CompletedProcess:
     """Run a fetch; on the pack-objects BUG, mark the unmarked packs and retry it once.
 
@@ -778,7 +778,7 @@ def convert_treeless_checkout(repo_root: Path, **run_kwargs) -> bool:
                "--filter=blob:none", "origin"]
     fetch_kwargs = dict(cwd=str(repo_root), capture_output=True, text=True,
                         encoding="utf-8", errors="replace", timeout=900, **run_kwargs)
-    subprocess.run([*refetch, "--tags"], check=False, **fetch_kwargs)
+    subprocess.run([*refetch, "--tags"], **fetch_kwargs)  # noqa: PLW1510 -- forwarding wrapper: callers pass subprocess kwargs via **run_kwargs; an explicit check=False would raise TypeError
     if not _history_trees_complete(repo_root, **run_kwargs):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_root), check=True,
                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
@@ -817,7 +817,7 @@ def convert_treeless_checkout_first(repo_root: Path) -> None:
 
 
 def _git_version(**run_kwargs) -> tuple:
-    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8",
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, encoding="utf-8",  # noqa: PLW1510 -- forwarding wrapper: **run_kwargs may carry check
                          errors="replace", timeout=30, **run_kwargs).stdout
     match = re.search(r"(\d+)\.(\d+)", out)
     return (int(match[1]), int(match[2])) if match else (0, 0)
@@ -826,7 +826,7 @@ def _git_version(**run_kwargs) -> tuple:
 def _history_trees_complete(repo_root: Path, **run_kwargs) -> bool:
     """Whether every tree in HEAD's history is local, checked without fetching (~3 s for this repo)."""
     env = dict(run_kwargs.pop("env", None) or noninteractive_git_env(), GIT_NO_LAZY_FETCH="1")
-    walk = subprocess.run(
+    walk = subprocess.run(  # noqa: PLW1510 -- forwarding wrapper: **run_kwargs may carry check
         ["git", "rev-list", "--objects", "--filter=blob:none", "--missing=print", "HEAD"],
         cwd=str(repo_root), capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=300, env=env, **run_kwargs,

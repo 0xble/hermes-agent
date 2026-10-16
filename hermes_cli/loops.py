@@ -222,14 +222,14 @@ def parse_interval_token(token: str) -> Optional[int]:
     return total if total > 0 else None
 
 
-def parse_loop_args(text: str) -> Dict[str, Any]:
+def parse_loop_args(text: str) -> dict[str, Any]:
     """Parse ``/loop [interval] <prompt> [--times N] [--until ...]``.
 
     Returns ``{"interval_seconds": int|None, "prompt", "times", "until", "error"}``;
     ``interval_seconds`` None means self-paced, ``error`` is set for unusable input.
     """
     raw = (text or "").strip()
-    result: Dict[str, Any] = {"interval_seconds": None, "prompt": "", "times": 0, "until": "", "error": None}
+    result: dict[str, Any] = {"interval_seconds": None, "prompt": "", "times": 0, "until": "", "error": None}
     if not raw:
         return {**result, "error": "empty"}
 
@@ -278,7 +278,7 @@ def format_interval(seconds: float) -> str:
     return "".join(parts)
 
 
-def _loops_config() -> Dict[str, Any]:
+def _loops_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config
 
@@ -358,7 +358,7 @@ class LoopState:
     last_stop_reason: Optional[str] = None
     # Gateway routing (platform / chat_id / chat_type / thread_id) captured at creation so the
     # idle watcher can inject ticks into the right chat. Empty for CLI/TUI (own schedulers).
-    route: Dict[str, str] = field(default_factory=dict)
+    route: dict[str, str] = field(default_factory=dict)
     # Versioned agent-authored changes; old rows omit this field and load as an empty list.
     revisions: List[Dict[str, Any]] = field(default_factory=list)
     mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
@@ -372,11 +372,11 @@ class LoopState:
         return json.dumps(asdict(self), ensure_ascii=False)
 
     @classmethod
-    def from_json(cls, raw: str) -> "LoopState":
+    def from_json(cls, raw: str) -> LoopState:
         data = json.loads(raw)
         route = data.get("route")
         revisions = data.get("revisions", [])
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "prompt": data.get("prompt", ""),
             "status": data.get("status", "active"),
             "mode": data.get("mode", "interval"),
@@ -581,7 +581,7 @@ def clear_loop(session_id: str) -> None:
     LoopManager(session_id).clear()
 
 
-def list_active_loops() -> List[Tuple[str, LoopState]]:
+def list_active_loops() -> list[tuple[str, LoopState]]:
     """``[(session_id, LoopState), ...]`` for every ACTIVE loop; ``[]`` on any DB error.
 
     Used by the gateway's idle wakeup watcher, which scans for due loops on a coarse tick.
@@ -589,7 +589,7 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     db = _get_session_db()
     if db is None:
         return []
-    out: List[Tuple[str, LoopState]] = []
+    out: list[tuple[str, LoopState]] = []
     for key, raw in _db_op("list_meta_prefix", lambda: db.list_meta_prefix(_META_PREFIX), []):
         session_id = key[len(_META_PREFIX):]
         state = _parse_state(raw) if session_id and raw else None
@@ -819,7 +819,7 @@ class LoopManager(LoopRevisionsMixin):
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
-        route: Optional[Dict[str, str]] = None,
+        route: Optional[dict[str, str]] = None,
     ) -> LoopState:
         """Start a new loop (replaces any existing one for the session)."""
         prompt = (prompt or "").strip()
@@ -1160,7 +1160,7 @@ class LoopManager(LoopRevisionsMixin):
         ) else ""
 
     @staticmethod
-    def _cap_stop(state: LoopState) -> Optional[Tuple[str, str, str]]:
+    def _cap_stop(state: LoopState) -> Optional[tuple[str, str, str]]:
         """The run-count or backstop cap the stored definition has reached, if any.
 
         Caps count ticks, not response content, so a revise cannot excuse them: they are always
@@ -1175,7 +1175,7 @@ class LoopManager(LoopRevisionsMixin):
         return None
 
     def _stop(self, status: str, reason: str, message: str, *, judged_version: int,
-              digest: str = "") -> Dict[str, Any]:
+              digest: str = "") -> dict[str, Any]:
         """Persist a terminal (``done``) or recoverable (``paused``) stop and build the result.
 
         The verdict was reached against definition ``judged_version``. If a revise changed the
@@ -1267,7 +1267,7 @@ class LoopManager(LoopRevisionsMixin):
         from hermes_cli.loops_snapshot import mutate_loop_snapshot
         return mutate_loop_snapshot(self, "_complete_tick", last_response, tick=tick)
 
-    def _complete_tick(self, last_response: str, *, tick: Optional[Tuple[Any, Any]] = None) -> Dict[str, Any]:
+    def _complete_tick(self, last_response: str, *, tick: Optional[tuple[Any, Any]] = None) -> dict[str, Any]:
         """Evaluate the finished wakeup turn and schedule what's next.
 
         ``tick`` is the ``(loop instance, ticks_fired)`` the completed turn's wake carried. A fresh
@@ -1424,12 +1424,12 @@ LOOP_HELP = (
 )
 
 
-def _pause_output(mgr: "LoopManager") -> str:
+def _pause_output(mgr: LoopManager) -> str:
     state = mgr.pause(reason="user-paused")
     return "No loop set." if state is None else f"⏸ Loop paused: {state.prompt}\nUse /loop resume to continue."
 
 
-def _resume_output(mgr: "LoopManager") -> str:
+def _resume_output(mgr: LoopManager) -> str:
     state = mgr.resume()
     return "No loop to resume." if state is None else f"▶ Loop resumed ({state.cadence_label()}): {state.prompt}"
 
@@ -1445,11 +1445,11 @@ _CONTROL_COMMANDS = {
 
 
 def dispatch_loop_command(
-    mgr: "LoopManager",
+    mgr: LoopManager,
     args: str,
     *,
-    route: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
+    route: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Surface-agnostic handler for ``/loop <args>`` → ``{"output": str, "created": bool}``.
 
     ``output`` is printed/sent verbatim by each surface. ``route`` is stored on new loops so the

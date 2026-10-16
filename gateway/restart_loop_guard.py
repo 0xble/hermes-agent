@@ -96,7 +96,7 @@ def _load_boots() -> List[float]:
     return _load_state()[0]
 
 
-def _save_state(boots: List[float], planned: List[float]) -> None:
+def _save_state(boots: list[float], planned: List[float]) -> None:
     with contextlib.suppress(OSError):
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -112,12 +112,12 @@ def _chain_gap(window_seconds: int, max_gap_seconds: int) -> float:
     return float(max(1, window_seconds, max_gap_seconds))
 
 
-def _chain_ending_at(boots: List[float], ts: float, gap: float) -> List[float]:
+def _chain_ending_at(boots: list[float], ts: float, gap: float) -> list[float]:
     """Unbroken chain of boots leading up to ``ts`` (oldest first): walks backwards
     while each gap stays within ``gap``; the first wider gap ends the chain (older
     boots are a resolved episode).  Empty when nothing is recent — how a healthy
     gateway forgets a loop."""
-    chain: List[float] = []
+    chain: list[float] = []
     prev = ts
     for t in sorted(boots, reverse=True):
         if t > ts:  # clock moved backwards (NTP step, restored file): future entry is adjacent, not a break
@@ -163,7 +163,7 @@ def planned_marker_is_recent(
 def record_restart_interrupted_boot(
     window_seconds: int = DEFAULT_WINDOW_SECONDS, *, now: Optional[float] = None,
     max_gap_seconds: int = DEFAULT_MAX_GAP_SECONDS,
-) -> List[float]:
+) -> list[float]:
     """Record a counted restart-interrupted boot; return the chain's counted boots + now (most
     recent last).  A persistence failure returns the in-memory list without raising."""
     ts = time.time() if now is None else now

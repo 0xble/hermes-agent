@@ -18,7 +18,7 @@ class ProcessCheckpointMixin:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
@@ -72,7 +72,7 @@ class ProcessCheckpointMixin:
         except Exception:
             return 0
         recovered = 0
-        unresolved_scope_entries: List[Dict[str, Any]] = []
+        unresolved_scope_entries: list[dict[str, Any]] = []
         for entry in entries:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
             # A file-backed job (survive_restart, or a local persist_on_release job) has a

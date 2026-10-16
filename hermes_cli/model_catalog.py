@@ -352,7 +352,7 @@ def get_default_model_from_cache(provider: str) -> str | None:
     return _default_model_from_block(_block_of(disk_data, provider)) if disk_data is not None else None
 
 
-def seed_cache_from_checkout(project_root: "Path | str", *, raise_errors: bool = False) -> bool:
+def seed_cache_from_checkout(project_root: Path | str, *, raise_errors: bool = False) -> bool:
     """Overwrite the disk cache with the checkout's ``website/static/api/model-catalog.json``.
     After ``hermes update`` that file IS the newest catalog, so the picker stays current even when
     the remote fetch is bot-gated. Validated, then written via the same atomic writer.

@@ -23,7 +23,7 @@ def recorded_dispatch(monkeypatch):
         registry.register(
             name, _TOOLSET, {"name": name, "description": name, "parameters": schema},
             lambda args, _name=name, **kw: (invoked.append((_name, args)) or json.dumps({"ran": _name, "n": args["n"]})))
-    monkeypatch.setattr(bridge, "_default_client_factory", lambda: invoked.append("gateway"))
+    monkeypatch.setattr(bridge, "_default_client_factory", lambda call=None: invoked.append("gateway"))
     invalidate_check_fn_cache()
     try:
         yield invoked
@@ -254,7 +254,6 @@ def test_single_local_unwrap_keeps_session_db_todo_store_and_setup_callback(tmp_
                 operation.settle(SettleReason.all_resolved)
 
         threading.Timer(0.02, respond).start()
-        return None
 
     agent = SimpleNamespace(
         enabled_toolsets=["todo", "session_search", "connections"], disabled_toolsets=[],

@@ -33,6 +33,7 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
+from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
@@ -185,7 +186,7 @@ def _persist_shutdown_pending_messages(runner):
     return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
 
 
-class GatewayShutdownMixin(InterruptionNotesMixin):
+class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -391,7 +392,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             user_cfg = _load_gateway_config()
             gw = user_cfg.get("gateway") if isinstance(user_cfg, dict) else None
             section = gw.get(name) if isinstance(gw, dict) else None
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
         return section if isinstance(section, dict) else None
 
@@ -454,7 +455,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             for profile_pending in (getattr(self, "_profile_failed_platforms", {}) or {}).values():
                 for platform in profile_pending or {}:
                     add_platform(platform)
-        except Exception:  # noqa: BLE001 - unreadable state must keep the gateway awake
+        except Exception:
             logger.debug(
                 "scale-to-zero: active messaging platforms unreadable — staying awake",
                 exc_info=True,
@@ -467,7 +468,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         from gateway.relay import relay_wake_url
         try:
             return relay_wake_url()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return None
 
     def _scale_to_zero_should_arm(self) -> bool:
@@ -492,7 +493,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 messaging_is_relay_only_or_absent(active), active or "none",
                 "set" if self._relay_wake_url_or_none() else "MISSING",
             )
-        except Exception:  # noqa: BLE001 - diagnostics must never block startup
+        except Exception:
             logger.debug("scale-to-zero: not-armed reason logging failed", exc_info=True)
 
     def _scale_to_zero_is_idle(self) -> bool:
@@ -503,7 +504,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         def _read_or_awake(label: str, fn: Callable[[], Any], busy_sentinel: Any) -> Any:
             try:
                 return fn()
-            except Exception:  # noqa: BLE001 - unreadable source => assume busy
+            except Exception:
                 logger.debug("scale-to-zero: %s unreadable — staying awake", label, exc_info=True)
                 return busy_sentinel
 
@@ -538,7 +539,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         """Best-effort runtime status write; failures are debug-logged with ``fail_msg``."""
         try:
             self._update_runtime_status(state)
-        except Exception:  # noqa: BLE001 - status is best-effort
+        except Exception:
             logger.debug(fail_msg, exc_info=True)
 
     def _relay_adapter_for_dormancy(self):
@@ -622,7 +623,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                             "scale-to-zero: connector did not ack going_idle — staying awake "
                             "rather than freezing a live destination"
                         )
-                except Exception:  # noqa: BLE001 - dormancy is best-effort
+                except Exception:
                     dormant_ok = False
                     logger.debug("scale-to-zero: go_dormant failed", exc_info=True)
                 # After a wake the drained inbound updates _last_inbound_at; give it a window so we
@@ -640,7 +641,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 await self._scale_to_zero_self_suspend()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - the watcher must never crash the gateway
+            except Exception:
                 logger.debug("scale-to-zero watcher iteration error", exc_info=True)
 
     async def _scale_to_zero_self_suspend(self) -> None:
@@ -684,7 +685,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                     "scale-to-zero: %s not accepted — machine stays awake (fail-awake); will "
                     "retry on the next idle window", lever,
                 )
-        except Exception:  # noqa: BLE001 - suspend is best-effort, never crash
+        except Exception:
             logger.debug("scale-to-zero: self-suspend failed", exc_info=True)
             self._scale_to_zero_abandon_suspend()
 
@@ -737,7 +738,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             # Trust the adapter's answer rather than the absence of an exception: it deliberately
             # never raises, so "did not throw" proves nothing.
             return method() is True
-        except Exception:  # noqa: BLE001 - never blocks the suspend it precedes
+        except Exception:
             logger.debug("scale-to-zero: redial hold toggle failed", exc_info=True)
             return False
 
@@ -798,7 +799,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         needs_attention: Optional[bool] = None, retrying_since: Any = _UNSET,
     ) -> None:
         from gateway.run import _write_runtime_status_quiet
-        extra: Dict[str, Any] = {}
+        extra: dict[str, Any] = {}
         if needs_attention is not None:
             extra["needs_attention"] = needs_attention
         if retrying_since is not _UNSET:
@@ -850,7 +851,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
     async def _drain_active_agents(
         self, timeout: float, cron_timeout: Optional[float] = None
-    ) -> tuple[Dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
         loop = asyncio.get_running_loop()
         last_counts = self._drain_work_counts()
@@ -1575,7 +1576,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             self._flush_agent_transcript_at_shutdown(agent)
 
     async def _finalize_shutdown_agents(
-        self, active_agents: Dict[str, Any], *, interrupted: bool = False,
+        self, active_agents: dict[str, Any], *, interrupted: bool = False,
         stop_event: Optional[threading.Event] = None,
         deadline: Optional[float] = None,
     ) -> None:
@@ -1604,10 +1605,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 if deadline is not None and time.monotonic() >= deadline:
                     return
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-                await self._finalize_session_off_loop(
+                messages = await self._finalize_session_off_loop(
                     session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                     session_key=session_key, timeout=remaining,
                 )
+                await self._deliver_session_end_messages(messages, session_key=session_key)
                 if stop_event is not None and stop_event.is_set():
                     return
                 if deadline is not None and time.monotonic() >= deadline:
@@ -1617,10 +1619,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 continue
             # Off-loop + bounded: plugin on_session_finalize hooks can do arbitrary synchronous work
             # (e.g. a full-session trace export) — same hang class as the memory provider below.
-            await self._finalize_session_off_loop(
+            messages = await self._finalize_session_off_loop(
                 session_id=getattr(agent, "session_id", None), platform="gateway", reason="shutdown",
                 session_key=session_key,
             )
+            await self._deliver_session_end_messages(messages, session_key=session_key)
             if stop_event is not None and stop_event.is_set():
                 return
             # Off-loop + bounded: a wedged memory provider here used to hang the whole shutdown so
@@ -1707,33 +1710,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         except Exception as flush_exc:
             logger.debug("Interrupted-agent memory flush failed: %s", flush_exc)
 
-    async def _finalize_session_off_loop(
-        self, *, session_id: Any, platform: str, reason: str, session_key: Optional[str] = None,
-        timeout: Optional[float] = None, **extra: Any,
-    ) -> None:
-        """Run hermes_cli.lifecycle.finalize_session off-loop, bounded; on timeout the worker is left alone.
-        ``session_key`` lets an unscoped caller (shutdown) enter the owning profile's scope: plugin
-        ``on_session_finalize`` observers and the Relay coordinator (``current_profile_key``) resolve
-        profile state at call time."""
-
-        def _call() -> None:
-            from hermes_cli.lifecycle import finalize_session
-            finalize_session(session_id=session_id, platform=platform, reason=reason, **extra)
-
-        try:
-            await asyncio.wait_for(
-                self._run_housekeeping_in_executor(self._run_release_in_profile_scope, _call, (), session_key),
-                timeout=self._FINALIZE_TIMEOUT_S if timeout is None else max(0.0, timeout),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Session finalize hooks (%s, reason=%s) exceeded %ss; proceeding without blocking the event loop "
-                "(the worker thread is left to finish on its own).", session_id, reason,
-                self._FINALIZE_TIMEOUT_S if timeout is None else timeout,
-            )
-        except Exception as finalize_exc:
-            logger.debug("Session finalize hooks (%s, reason=%s) failed: %s", session_id, reason, finalize_exc)
-
     async def _cleanup_agent_resources_off_loop(
         self, agent: Any, *, context: str = "", session_key: Optional[str] = None,
     ) -> None:
@@ -1758,7 +1734,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 ),
                 timeout=self._CLEANUP_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Agent resource cleanup%s exceeded %ss; proceeding without blocking the event loop (the worker "
                 "thread is left to finish on its own). (#53175)", ctx_label, self._CLEANUP_TIMEOUT_S,
@@ -2001,7 +1977,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         )
         setsid_bin = shutil.which("setsid")
         argv = [setsid_bin, "bash", "-lc", shell_cmd] if setsid_bin else ["bash", "-lc", shell_cmd]
-        subprocess.Popen(
+        subprocess.Popen(  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
             argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=GatewayShutdownMixin._restart_watcher_env(), start_new_session=True,
         )
@@ -2421,7 +2397,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         logger.warning("Shutdown phase: %s exceeded %.1fs; detaching cooperative cleanup", phase, timeout)
         return []
 
-    async def _stop_begin_teardown(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
@@ -2478,7 +2454,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         ctx.notice_elapsed = time.monotonic() - notice_started
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
-    async def _stop_drain_active_work(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_drain_active_work(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Pre-mark resume_pending, drain agents/cron/API work into ``ctx``."""
         from gateway.run import GatewayRunner
         # Pre-mark resume_pending BEFORE the drain so a mid-drain SIGKILL still leaves a durable marker.
@@ -2527,7 +2503,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
                 except Exception as _e:
                     logger.debug("clear_resume_pending after drain failed for %s: %s", _sk, _e)
 
-    async def _stop_interrupt_remaining_work(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_interrupt_remaining_work(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Drain timed out: mark resume_pending, interrupt, settle, kill tool subprocesses, notify cron."""
         from gateway.run import GatewayRunner
         logger.warning(
@@ -2914,7 +2890,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         _profile_adapters.clear()
         logger.info("Shutdown phase: adapter teardown phase ended at +%.2fs", ctx.elapsed())
 
-    async def _stop_release_runtime_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_release_runtime_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Cancel background tasks, flush pending messages, clear per-session state, final tool kill."""
         from gateway.run import GatewayRunner
         for _task in list(self._background_tasks):
@@ -2978,7 +2954,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
 
         GatewayShutdownMixin._quiet_step("shutdown_cached_clients error", _reap_aux_clients)
 
-    def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""
         from gateway.run import GatewayRunner, _EXECUTOR_QUIESCE_TIMEOUT
         # Quiesce the thread pool BEFORE closing session DBs: a late executor write after
@@ -3057,7 +3033,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         _step("Shared SessionDB close error", _close_shared)
         logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
 
-    async def _stop_persist_exit_state(self, ctx: "GatewayShutdownMixin._StopContext") -> None:
+    async def _stop_persist_exit_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """PID/lock release, clean-shutdown marker, restart markers, terminal runtime status."""
         from gateway.run import _hermes_home, _planned_restart_notification_path, _shutdown_gateway_health_export
         from utils import atomic_json_write
@@ -3128,7 +3104,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         _shutdown_gateway_health_export(self)
         logger.info("Gateway stopped (total teardown %.2fs)", ctx.elapsed())
 
-    def _shutdown_watchdog_snapshot(self, ctx: "GatewayShutdownMixin._StopContext") -> dict:
+    def _shutdown_watchdog_snapshot(self, ctx: GatewayShutdownMixin._StopContext) -> dict:
         """State dumped by the thread-based shutdown watchdog when teardown hangs."""
         return {
             "restart_requested": bool(self._restart_requested),
