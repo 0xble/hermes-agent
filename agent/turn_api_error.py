@@ -160,6 +160,14 @@ def handle_api_error(
             interrupt_text=f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))}).",
         ))
 
+    # Unattended sessions hold a transient outage on the same route for a bounded window before
+    # fallback. Decided once per error (it stamps the outage start) and shared by every gate below.
+    from agent.fallback_cooldown import hold_noninteractive_transient_retry, provider_declared_wait_seconds
+    hold_noninteractive_transient = hold_noninteractive_transient_retry(
+        agent, classified, error_message=error_msg,
+        declared_wait=provider_declared_wait_seconds(api_error, error_context),
+    )
+
     _ce = route_classified_error(
         agent, api_error, classified, _retry, error_msg=error_msg, error_context=error_context,
         recovered_with_pool=recovered_with_pool, base_url=_base, model=_model, messages=messages,
@@ -168,6 +176,7 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, compression_attempts=compression_attempts,
         max_compression_attempts=max_compression_attempts, api_call_count=api_call_count,
         effective_task_id=effective_task_id,
+        hold_noninteractive_transient=hold_noninteractive_transient,
     )
     status_code = _ce.status_code
     messages = _ce.messages
@@ -214,9 +223,11 @@ def handle_api_error(
         conversation_history=conversation_history, approx_tokens=approx_tokens,
         retry_count=retry_count, max_retries=max_retries, compression_attempts=compression_attempts,
         api_call_count=api_call_count, current_turn_user_idx=current_turn_user_idx,
+        hold_noninteractive_transient=hold_noninteractive_transient,
     )
     active_system_prompt = _ue.active_system_prompt
     retry_count = _ue.retry_count
+    max_retries = _ue.max_retries
     compression_attempts = _ue.compression_attempts
     return _verdict(_ue.action, _ue.result)
 
@@ -253,13 +264,15 @@ def _is_local_validation_error(api_error: Any) -> bool:
 class UnrecoveredErrorVerdict:
     """``action``: ``"continue"`` (retry), ``"break"`` (fallback armed / redirect pending) or
     ``"return"`` (``result`` is the terminal result dict). Rebinds ``active_system_prompt``,
-    ``retry_count`` and ``compression_attempts``."""
+    ``retry_count``, ``max_retries`` (an unattended transient hold extends it so the retry loop
+    keeps running until the window ends) and ``compression_attempts``."""
 
     action: str
     active_system_prompt: Any
     retry_count: Any
     compression_attempts: Any
     result: Optional[Dict[str, Any]] = None
+    max_retries: Any = None
 
 
 def settle_unrecovered_error(
@@ -268,23 +281,34 @@ def settle_unrecovered_error(
     _provider: Any, _base: Any, _model: Any, messages: Any, api_messages: Any, api_kwargs: Any,
     active_system_prompt: Any, conversation_history: Any, approx_tokens: Any, retry_count: Any,
     max_retries: Any, compression_attempts: Any, api_call_count: Any, error_context: Any = None,
-    current_turn_user_idx: Any = None,
+    current_turn_user_idx: Any = None, hold_noninteractive_transient: Optional[bool] = None,
 ) -> UnrecoveredErrorVerdict:
     """Decide the fate of an API error that every recovery chain declined: local validation /
     non-retryable client errors (Copilot stale-credential self-heal first, then fallback, then a
     terminal result), max-retries exhaustion (primary transport recovery -> fallback -> terminal
     result), else the interruptible error backoff. ``FailoverReason.billing`` (402) is deliberately
-    treated as non-retryable (#31273)."""
+    treated as non-retryable (#31273).
+
+    ``hold_noninteractive_transient`` is the caller's once-per-error window decision; ``None``
+    (direct callers) computes it here."""
     from agent.conversation_loop import (
         _arm_fallback_restart, _is_copilot_provider, _is_stale_copilot_credential_error
+    )
+    from agent.fallback_cooldown import (
+        hold_noninteractive_transient_retry, noninteractive_transient_retry_remaining,
+        settle_noninteractive_retry_budget,
     )
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
         return UnrecoveredErrorVerdict(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
-            compression_attempts=compression_attempts, result=result,
+            compression_attempts=compression_attempts, result=result, max_retries=max_retries,
         )
 
+    if hold_noninteractive_transient is None:
+        hold_noninteractive_transient = hold_noninteractive_transient_retry(
+            agent, classified, error_message=error_msg,
+        )
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
     # balance. Mirrors 401/403.
@@ -309,7 +333,8 @@ def settle_unrecovered_error(
         or shrink_spent
         or reasoning_spent
         or (
-            not classified.retryable
+            not hold_noninteractive_transient
+            and not classified.retryable
             and not classified.should_compress
             and classified.reason not in RETRYABLE_CLIENT_REASONS
         )
@@ -372,9 +397,10 @@ def settle_unrecovered_error(
     if over_wait_cap:
         # The route owner would rather move on than sit out this cooldown: settle now as an
         # exhausted attempt so its own fallback runs in seconds instead of after the wait. The
-        # transport rebuild and the auto-recovery ladder below would each restart or park the
-        # attempt, so both are skipped too.
+        # transport rebuild, the auto-recovery ladder and the unattended same-provider hold
+        # below would each restart or park the attempt, so all three are skipped too.
         max_retries = retry_count
+        hold_noninteractive_transient = False
 
     # An attended session on the free model does not sit through a long cooldown: end the attempt
     # cycle now (fallback, else the reset time and the ways forward); the copy counts attempts made.
@@ -384,11 +410,19 @@ def settle_unrecovered_error(
                     agent.log_prefix, retry_count)
         retry_count = max_retries
 
+    # Unattended transient hold / spent window: extend or restore the retry budget (see helper).
+    max_retries, skip_to_fallback = settle_noninteractive_retry_budget(
+        agent, classified, _retry, retry_count=retry_count, max_retries=max_retries,
+        hold=hold_noninteractive_transient, over_wait_cap=over_wait_cap, error_message=error_msg,
+    )
+
     if retry_count >= max_retries:
         # Before fallback, rebuild the primary client once per API call block for
-        # transient transport errors (stale pool, TCP reset).
-        if not over_wait_cap and not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
-            api_error, retry_count=retry_count, max_retries=max_retries,
+        # transient transport errors (stale pool, TCP reset). Not after a spent unattended
+        # window with a fallback pending: the route already had its recovery time.
+        if (
+            not over_wait_cap and not skip_to_fallback and not _retry.primary_recovery_attempted
+            and agent._try_recover_primary_transport(api_error, retry_count=retry_count, max_retries=max_retries)
         ):
             _retry.primary_recovery_attempted = True
             retry_count = 0
@@ -437,6 +471,9 @@ def settle_unrecovered_error(
         is_rate_limited=is_rate_limited, is_zai_coding_overload=_is_zai_coding_overload,
         base_url=_base, model=_model,
     )
+    if hold_noninteractive_transient:
+        # Never back off past the window: the attempt after it ends must be the one that falls back.
+        wait_time = min(wait_time, noninteractive_transient_retry_remaining(agent))
     # Same preserve-redirect rule as the invalid-response wait: a steering correction
     # must survive backoff, not die as "Operation interrupted".
     _interrupted = interruptible_backoff_sleep(

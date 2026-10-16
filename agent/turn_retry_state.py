@@ -4,6 +4,7 @@ Dependency-free so it imports without a cycle."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -51,6 +52,8 @@ class TurnRetryState:
     shared_cooldown_arm_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
+    # ``max_retries`` before an unattended transient hold extended it; restored when the hold ends.
+    noninteractive_hold_base_retries: Optional[int] = None
 
     # Restart signals (read by the outer loop after the attempt)
     restart_with_compressed_messages: bool = False

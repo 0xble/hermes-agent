@@ -3003,6 +3003,8 @@ delegation:
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
+  fallback:
+    transient_retry_window_seconds: 180     # Subagent/cron/side-agent runs retry transient provider errors on the same provider this long before falling back; 0 = fail over immediately
 ```
 
 **Subagent provider:model override:** By default, subagents inherit the parent agent's provider and model. Set `delegation.provider` and `delegation.model` to route subagents to a different provider:model pair — e.g., use a cheap/fast model for narrowly-scoped subtasks while your primary agent runs an expensive reasoning model.
@@ -3010,6 +3012,8 @@ delegation:
 **Subagent reasoning and Fast mode:** `delegation.reasoning_effort` sets the children's default thinking level (empty = the parent's level). An explicit session pick on the parent (`/reasoning <level>`, `--reasoning`, `/model … --reasoning`) wins over it, so raising the effort for a hard task also raises it for the subagents that task spawns; a `--global` save is a configured default, not a pick. The level is clamped to what each child's route supports. With `delegation.inherit_service_tier: true`, children also inherit the parent's `/fast` mode (`fast`, `auto` or `cold`), including under a pinned `delegation.provider`: the Fast request field is derived for the child's own route, and a route without a fast mode receives none. An explicit `service_tier`/`speed` in `delegation.request_overrides` wins.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
+
+**Unattended retry window:** `delegation.fallback.transient_retry_window_seconds` (default `180`) makes subagent, cron and side-agent runs keep retrying the same provider through transient errors (rate limits, overloads, 5xx, timeouts) for that long before taking the fallback chain. `0` restores immediate failover. Interactive sessions and billing errors fail over immediately regardless. See [Fallback Providers](./features/fallback-providers.md#when-fallback-triggers).
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only. When `delegation.provider` is set alongside `delegation.base_url`, the explicit endpoint and key still win, but that provider's request settings (`extra_body` overrides and max output tokens from your `custom_providers` entry) are carried into the subagent.
 
