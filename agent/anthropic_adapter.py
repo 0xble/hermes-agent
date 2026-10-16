@@ -625,6 +625,52 @@ def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max
     }
 
 
+def _clamped_anthropic_max_tokens(max_tokens, model: str, context_length: Optional[int]) -> int:
+    """Base ``max_tokens`` the builder sends: requested or native ceiling, clamped below the window."""
+    effective = _resolve_anthropic_messages_max_tokens(max_tokens, model, context_length=context_length)
+    if context_length and effective > context_length:
+        effective = max(context_length - 1, 1)
+    return effective
+
+
+def anthropic_wire_output_cap(
+    model: str, max_tokens: Optional[int], reasoning_config: Optional[Dict[str, Any]], *,
+    context_length: Optional[int] = None, base_url: str | None = None, preserve_dots: bool = False,
+    output_ceiling: Optional[int] = None,
+) -> int:
+    """``max_tokens`` :func:`build_anthropic_kwargs` puts on the wire for these inputs."""
+    if not _is_nous_portal_endpoint(base_url):
+        model = normalize_model_name(model, preserve_dots=preserve_dots)
+    cap = _clamped_anthropic_max_tokens(max_tokens, model, context_length)
+    if output_ceiling is not None:
+        cap = min(cap, output_ceiling)
+    if reasoning_config and isinstance(reasoning_config, dict):
+        cap = _thinking_kwargs(reasoning_config, model, cap).get("max_tokens", cap)
+    return cap
+
+
+_CLAUDE_VERSION_RE = re.compile(r"claude-(?:opus|sonnet|haiku)-(\d+)(?:[-.](\d{1,2}))?(?!\d)")
+
+
+def anthropic_validates_output_against_window(model: str) -> bool:
+    """Whether the endpoint is documented to reject ``input + max_tokens > window`` up front.
+
+    Anthropic documents that Claude 4.5 and newer accept such a request and stop generation at
+    the window (``stop_reason: model_context_window_exceeded``), while earlier Claude models
+    return a validation error. Unversioned Claude names are treated as current. Non-Claude
+    Anthropic-compatible endpoints document no such rule, so their native default ceiling is not
+    reserved (an explicitly selected cap still is, by the caller)."""
+    m = (model or "").lower()
+    if not _is_claude_model(m):
+        return False
+    if any(old in m for old in ("claude-3", "claude-2", "claude-instant")):
+        return True
+    match = _CLAUDE_VERSION_RE.search(m)
+    if not match:
+        return False
+    return (int(match.group(1)), int(match.group(2) or 0)) < (4, 5)
+
+
 # OpenAI tool_choice -> Anthropic; any other string is a forced tool name.
 _TOOL_CHOICE_MAP = {None: {"type": "auto"}, "auto": {"type": "auto"}, "required": {"type": "any"}}
 
@@ -634,7 +680,7 @@ def build_anthropic_kwargs(
     reasoning_config: Optional[Dict[str, Any]], tool_choice: Optional[str] = None,
     is_oauth: bool = False, preserve_dots: bool = False, context_length: Optional[int] = None,
     base_url: str | None = None, fast_mode: bool = False, drop_context_1m_beta: bool = False,
-    fast_route_supported: bool | None = None,
+    fast_route_supported: bool | None = None, output_ceiling: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create(). ``max_tokens`` is the OUTPUT cap for one
     response; ``context_length`` is the TOTAL window (input + output). ``max_tokens=None`` uses the
@@ -655,9 +701,10 @@ def build_anthropic_kwargs(
     if not _is_nous_portal_endpoint(base_url):
         model = normalize_model_name(model, preserve_dots=preserve_dots)
     # Non-positive/non-finite values fail locally instead of 400-ing upstream.
-    effective_max_tokens = _resolve_anthropic_messages_max_tokens(max_tokens, model, context_length=context_length)
-    if context_length and effective_max_tokens > context_length:
-        effective_max_tokens = max(context_length - 1, 1)
+    effective_max_tokens = _clamped_anthropic_max_tokens(max_tokens, model, context_length)
+    if output_ceiling is not None:
+        # Apply the turn ceiling before provider protocol floors such as manual-thinking budget.
+        effective_max_tokens = min(effective_max_tokens, output_ceiling)
     to_wire = _oauth_wire_namer(anthropic_tools) if is_oauth else None
     if to_wire:
         system = _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_wire)

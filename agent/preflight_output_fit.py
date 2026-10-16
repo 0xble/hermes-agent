@@ -1,0 +1,68 @@
+"""Provider-accurate request fit helpers for the preflight gate.
+
+This is deliberately a small compatibility layer: same-session recovery owns its
+future projection API, while this PR only needs the shared wire-fit calculation.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+
+_MIN_SHRUNK_OUTPUT_TOKENS = 4096
+
+
+def _reserve(window: int) -> int:
+    """Estimator/transport framing headroom."""
+    return max(1024, int(window * 0.05))
+
+
+def _request_input_tokens(agent: Any, messages: list, prompt: str, *, wire: bool, tools) -> int:
+    effective_prompt = (prompt or "") + ("" if wire else (getattr(agent, "ephemeral_system_prompt", "") or ""))
+    request_tools = tools if (wire or tools is not None) else getattr(agent, "tools", None)
+    native_prompt = effective_prompt
+    if wire and not native_prompt:
+        from agent.message_content import flatten_message_text
+
+        native_prompt = "\n".join(
+            flatten_message_text(row.get("content"))
+            for row in messages
+            if isinstance(row, dict) and row.get("role") == "system"
+        )
+    try:
+        from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
+
+        native = estimate_native_responses_preflight_tokens(
+            agent, messages, system_prompt=native_prompt, tools=request_tools,
+        )
+    except Exception:
+        native = None
+    if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
+        return native
+    from agent.model_metadata import estimate_request_tokens_rough
+
+    return estimate_request_tokens_rough(
+        messages, system_prompt=effective_prompt, tools=request_tools,
+    )
+
+
+def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False, tools=None) -> bool:
+    """Whether the assembled request plus its effective provider output cap fits."""
+    window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        return False
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens, selected_max_output_tokens
+
+    cap, enforced = effective_wire_max_output_tokens(agent)
+    if not enforced:
+        cap = selected_max_output_tokens(agent)
+    output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
+    return _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools) + output + _reserve(window) < window
+
+
+def affordable_output_cap(agent: Any, messages: list, *, tools=None) -> Optional[int]:
+    """Largest useful output cap that fits beside the assembled wire request."""
+    window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
+        return None
+    room = window - _reserve(window) - _request_input_tokens(agent, messages, "", wire=True, tools=tools) - 1
+    return room if room >= _MIN_SHRUNK_OUTPUT_TOKENS else None
