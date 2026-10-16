@@ -660,6 +660,39 @@ def _prior_tool_keys(prior_snapshot: List[Dict]) -> Tuple[set, set]:
     return ids, contents
 
 
+_OBSERVATION_RESULT_MARKER = "HERMES_SOURCE_GUARD_OBSERVATION_RECORDED_V1:"
+
+
+def _observation_action_lines(data: Dict, detail: Dict) -> List[str]:
+    """Convert the source-guard's structured block trailer into user-facing action lines."""
+    if detail.get("tool") != "skill_manage":
+        return []
+    raw_error = data.get("error")
+    if not isinstance(raw_error, str):
+        return []
+    marker_payload = next(
+        (line[len(_OBSERVATION_RESULT_MARKER):]
+         for line in raw_error.splitlines()
+         if line.startswith(_OBSERVATION_RESULT_MARKER)),
+        None,
+    )
+    if marker_payload is None:
+        return []
+    try:
+        payload = json.loads(marker_payload)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("count"), int) or payload["count"] < 1:
+        return []
+    skills = payload.get("skills")
+    if not isinstance(skills, list) or not skills or any(not isinstance(skill, str) or not skill for skill in skills):
+        return []
+    # The source guard emits one name per distinct refused skill; preserve that
+    # bounded list while ignoring an inconsistent count rather than inventing a
+    # notification for an observation that was not named.
+    return [f"Skill observation recorded: {skill}" for skill in skills]
+
+
 def _action_lines(data: Dict, detail: Dict, verbose: bool) -> List[str]:
     """Summary line(s) for one successful notify-tool result (``[]`` when nothing to report)."""
     if data.get("staged"):
@@ -731,8 +764,12 @@ def summarize_background_review_actions(
         except (json.JSONDecodeError, TypeError):
             continue
         # Wrapper MCP servers may return a top-level list/scalar; only dict payloads carry
-        # ``success``/``_change``.
-        if not isinstance(data, dict) or not data.get("success"):
+        # ``success``/``_change``. A source-guard block is intentionally unsuccessful, but its
+        # structured trailer proves that an observation was recorded and must remain visible.
+        if not isinstance(data, dict):
+            continue
+        if not data.get("success"):
+            actions.extend(_observation_action_lines(data, call_details.get(tcid) or {}))
             continue
         actions.extend(_action_lines(data, call_details.get(tcid) or {}, verbose))
     return actions

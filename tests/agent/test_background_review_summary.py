@@ -81,3 +81,27 @@ def test_handles_non_json_tool_content_gracefully():
 def test_empty_inputs():
     assert _summarize([], []) == []
     assert _summarize(None, None) == []
+
+
+def test_surfaces_source_guard_observation_recording_from_blocked_result():
+    """A blocked skill_manage call still notifies when the source guard wrote an observation."""
+    marker = "HERMES_SOURCE_GUARD_OBSERVATION_RECORDED_V1:{\"count\":1,\"skills\":[\"demo\"]}"
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"id": "call_skill", "function": {
+                "name": "skill_manage", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_skill", "content": json.dumps({
+            "error": "Installed skills are read-only copies.\n" + marker,
+        })},
+    ]
+
+    assert _summarize(messages, []) == ["Skill observation recorded: demo"]
+
+
+def test_ignores_malformed_observation_marker():
+    messages = [{"role": "tool", "tool_call_id": "blocked", "content": json.dumps({
+        "error": "HERMES_SOURCE_GUARD_OBSERVATION_RECORDED_V1:not-json",
+    })}]
+    assert _summarize(messages, []) == []
