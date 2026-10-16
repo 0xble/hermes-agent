@@ -2154,7 +2154,7 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "4"
         db.close()
 
     def test_telegram_topic_claim_if_unbound_keeps_the_existing_owner(self, tmp_path):
