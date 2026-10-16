@@ -208,7 +208,9 @@ def test_subject_must_still_be_live_and_same_at_final_send(delivery, monkeypatch
 
 @pytest.mark.parametrize("report, passed", [
     ("# Stripe Priorities — October 14, 2026\n", True),
+    ("# Stripe Priorities — Wednesday, October 14, 2026\n", True),
     ("# Stripe Priorities — October 14, 2026 at 8:01 AM\n", True),
+    ("# Stripe Priorities — Wednesday, October 14, 2026 at 8:01 AM\n", True),
     ("# Stripe Priorities\n", True),
     ("# Daily Brief — October 14, 2026\n", False),
     ("# Stripe Priorities (draft)\n", False),
