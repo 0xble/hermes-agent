@@ -75,9 +75,69 @@ def test_anthropic_transport_reapplies_turn_ceiling_on_retries():
     first = _build_anthropic_kwargs(agent, [{"role": "user", "content": "one"}], [], None, {})
     retry = _build_anthropic_kwargs(agent, [{"role": "user", "content": "two"}], [], None, {})
     agent._ephemeral_max_output_tokens = 12_000
+    agent._ephemeral_output_cap_is_retry_boost = True
     boosted_retry = _build_anthropic_kwargs(agent, [{"role": "user", "content": "three"}], [], None, {})
 
-    assert [first["max_tokens"], retry["max_tokens"], boosted_retry["max_tokens"]] == [5_000] * 3
+    assert [first["max_tokens"], retry["max_tokens"]] == [5_000] * 2
+    assert boosted_retry["max_tokens"] == 12_000
+
+
+def test_length_retry_boost_reaches_chat_wire_builder():
+    from agent.chat_completion_helpers import _build_chat_completions_kwargs
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    from agent.turn_truncation import boosted_output_cap
+
+    agent = SimpleNamespace(
+        api_mode="chat_completions", provider="openrouter", model="test/model",
+        base_url="https://openrouter.ai/api/v1", _base_url_lower="https://openrouter.ai/api/v1",
+        _base_url_hostname="openrouter.ai", max_tokens=4_000, _preflight_output_ceiling=5_000,
+        _ephemeral_max_output_tokens=None, _ephemeral_output_cap_is_retry_boost=False,
+        providers_allowed=None, providers_ignored=None, providers_order=None,
+        provider_sort=None, provider_require_parameters=False, provider_data_collection=None,
+        openrouter_min_coding_score=None, session_id=None, _ollama_num_ctx=None,
+    )
+    agent._ephemeral_max_output_tokens = boosted_output_cap(agent, 5_000, 1)
+    agent._get_transport = lambda: ChatCompletionsTransport()
+    agent._is_qwen_portal = lambda: False
+    agent._is_openrouter_url = lambda: True
+    agent._prepare_messages_for_non_vision_model = lambda messages: messages
+    agent._resolved_api_call_timeout = lambda: None
+    agent._max_tokens_param = lambda value: {"max_tokens": value}
+    agent._supports_reasoning_extra_body = lambda: False
+    agent._lmstudio_reasoning_options_cached = lambda: None
+
+    kwargs = _build_chat_completions_kwargs(
+        agent, [{"role": "user", "content": "continue"}], [], None, {}, None,
+    )
+
+    assert kwargs["max_tokens"] == 8_000
+
+
+def test_length_retry_boost_reaches_codex_wire_builder():
+    from agent.chat_completion_helpers import _build_codex_kwargs
+    from agent.transports.codex import ResponsesApiTransport
+    from agent.turn_truncation import boosted_output_cap
+
+    agent = SimpleNamespace(
+        provider="xai", model="grok-4", base_url="https://api.x.ai/v1",
+        _base_url_hostname="api.x.ai", max_tokens=4_000, _preflight_output_ceiling=5_000,
+        _ephemeral_max_output_tokens=None, _ephemeral_output_cap_is_retry_boost=False,
+        _codex_reasoning_replay_enabled=True, text_verbosity=None, session_id=None,
+        runtime_capabilities=None, codex_responses_native_compaction=False,
+        compression_enabled=True, compression_checkpoint_required=False,
+        tools=[],
+    )
+    agent._ephemeral_max_output_tokens = boosted_output_cap(agent, 5_000, 1)
+    agent._get_transport = lambda: ResponsesApiTransport()
+    agent._prepare_messages_for_non_vision_model = lambda messages: messages
+    agent._resolved_api_call_timeout = lambda: None
+    agent._github_models_reasoning_extra_body = lambda: None
+
+    kwargs = _build_codex_kwargs(
+        agent, [{"role": "user", "content": "continue"}], [], None, {}, None,
+    )
+
+    assert kwargs["max_output_tokens"] == 8_000
 
 
 def test_request_fit_prices_tools_and_wire_native_checkpoint():
