@@ -136,6 +136,13 @@ def _scrub(text: str, home: Path) -> str:
     )
     text = re.sub(r"/home/(?!\.hermes(?:[/\s]|$))[^/\s]+(?=[/\s])", "<HOME>", text)
     text = re.sub(r"/(?:[^/\s]+/)+home(?=[/\s])", "<HOME>", text)
+    # Linux resolves the configured Hermes home through HERMES_HOME, while macOS
+    # commonly resolves the same default through the user's home directory
+    # (display_hermes_home() falls back to the absolute path when home is not
+    # under Path.home()). Keep both renders byte-identical: the prompt exposes
+    # the conventional path, not which lookup supplied it. A bare <HERMES_HOME>
+    # token is the profile root itself and must stay distinct.
+    text = text.replace("<HERMES_HOME>/", "<HOME>/.hermes/")
     return re.sub(r"/(?:[^/\s]+/)*prompt-surface-[^/\s]+", "/<PROMPT_SURFACE_TMP>", text)
 
 

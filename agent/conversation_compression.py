@@ -1085,7 +1085,15 @@ def _await_worker_within_budget(
             # and settle before the host gets here. Preserve that result so the stall ladder can
             # return the adopted snapshot when no fallback route recovers it.
             if future.done():
-                return True, future.result()
+                try:
+                    return True, future.result()
+                except concurrent.futures.TimeoutError as exc:
+                    # The fence-gated worker raises this when the deadline already
+                    # passed before it started (and a worker may die with one at the
+                    # deadline generally, #63892): that is a stall, not a result, so
+                    # take the host stall/fallback path like the wait-slice branch below.
+                    logger.info("Context compression worker exited with %r — taking the stall path", exc)
+                    return False, None
             return False, None
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
