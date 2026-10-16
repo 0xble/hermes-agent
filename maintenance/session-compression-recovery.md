@@ -1,9 +1,11 @@
 # Same-session compression recovery
 
+**Status:** design only. The current gateway still resets the conversation after compression exhaustion. This record describes a proposed lossless recovery boundary and is not proof that the named runtime behavior or verification files exist on `main`.
+
 Load this unit when changing hard-window recovery, preflight input admission,
 archive-backed request projection or the gateway exhaustion boundary.
 
-## Required behavior
+## Proposed behavior
 
 Compression failure is not `/new`: never clear the conversation scope, replace
 the durable session, rebind the Telegram topic, or copy a title onto a blank
@@ -168,13 +170,14 @@ Upstream main checked: `63d0b94120027d487c9a5235b9ec64b696af1b26`.
 Open [#137566](https://github.com/NousResearch/hermes-agent/pull/137566) bounds
 safe input replay but still resets onto a fresh identity; it is not this contract.
 Open [#113028](https://github.com/NousResearch/hermes-agent/pull/113028) bounds
-protected tails while preserving tool groups. Closed, unmerged
-[#103088](https://github.com/NousResearch/hermes-agent/pull/103088) covers hard
+protected tails while preserving tool groups. Open [#103088](https://github.com/NousResearch/hermes-agent/pull/103088) covers hard
 ceiling fallback independently of scheduling. Open
 [#125141](https://github.com/NousResearch/hermes-agent/pull/125141) provides bounded
 MCP excerpts. None is proof of released equivalent behavior.
 
 ## Verification
+
+This is a design-only record. The focused tests below are acceptance targets for a future implementation, not current proof of same-session recovery. Until that implementation lands, source checks must verify only the current-runtime note above; do not claim these files or mechanisms exist on `main`.
 
 Use `bash scripts/run_tests.sh`; no direct pytest or machine-slot bypass.
 Focused tests: `tests/agent/test_same_session_recovery.py`,
