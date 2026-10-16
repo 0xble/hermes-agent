@@ -1232,6 +1232,7 @@ class GatewayAdapterLifecycleMixin:
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
+        getattr(self, "_relay_fyi_passive_by_profile", {}).setdefault(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "

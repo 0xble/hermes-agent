@@ -4126,7 +4126,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             while pending_event and is_passive_fyi_relay_event(
                 pending_event,
                 getattr(pending_event, "source", source),
-                enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda: True)()),
+                enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: True)(
+                    getattr(pending_event, "source", source))),
             ):
                 if self._draining:
                     self._preserve_drain_event(session_key, pending_event)

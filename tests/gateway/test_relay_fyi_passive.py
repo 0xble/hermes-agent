@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,6 +14,7 @@ from gateway.platforms.base import merge_pending_message_event
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import is_fyi_relay_text
 from gateway.run import GatewayRunner
+from gateway.run_busy import GatewayBusySessionMixin
 from gateway.session import SessionSource
 
 
@@ -57,6 +59,10 @@ def runner(monkeypatch):
     runner._test_store = store
     runner._sessions = {}
     runner._is_session_running = MagicMock(return_value=False)
+    runner._session_state = GatewayRunner._session_state.__get__(runner, GatewayRunner)
+    runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+    runner._persist_active_agents = MagicMock()
+    runner._release_running_agent_state = GatewayRunner._release_running_agent_state.__get__(runner, GatewayRunner)
     runner._refresh_agent_cache_message_count = AsyncMock()
     runner._delivery_adapter_for = MagicMock(return_value=None)
     runner._overflow_queue = MagicMock(return_value=[])
@@ -118,7 +124,7 @@ async def test_replayed_fyi_message_id_is_not_appended_again(runner):
 
 @pytest.mark.asyncio
 async def test_idle_fyi_rechecks_session_before_persisting(runner):
-    runner._is_session_running = MagicMock(side_effect=[True])
+    runner._is_session_running = MagicMock(return_value=True)
     event = _event(FYI)
 
     assert await runner._hm_try_passive_fyi_relay(event, event.source, "session-key") is False
@@ -159,6 +165,109 @@ async def test_passive_admission_yields_to_orphaned_fifo(runner):
 
 
 @pytest.mark.asyncio
+async def test_two_queued_fyis_use_real_fifo_and_persist_in_order(runner):
+    first, second = _event(FYI), _event(FYI.replace("receipt-1", "receipt-2"))
+    adapter = _DrainAdapter(first)
+    runner._overflow_queue = MagicMock(return_value=[second])
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {"final_response": "completed"}, adapter, first.source, "session-key",
+    )
+
+    assert pending_event is None and pending is None
+    first = adapter.get_pending_message("session-key")
+    assert first is not None
+    assert runner._hm_has_orphaned_fifo("session-key", first.source) is False
+    assert await runner._hm_try_passive_fyi_relay(first, first.source, "session-key") is True
+
+    second = runner._promote_queued_event("session-key", adapter, None)
+    assert second is not None
+    assert await runner._hm_try_passive_fyi_relay(second, second.source, "session-key") is True
+    assert [row[1]["content"] for row in runner._test_store.rows] == [FYI, second.text]
+    assert not hasattr(getattr(runner, "_handle_message_with_agent", None), "call_count") or runner._handle_message_with_agent.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mixed_fifo_keeps_ordinary_work_ahead_of_passive_fyis(runner):
+    first = _event(FYI)
+    ordinary = _event("Please continue.")
+    second = _event(FYI.replace("receipt-1", "receipt-2"))
+    adapter = _DrainAdapter(first)
+    runner._overflow_queue = MagicMock(return_value=[ordinary, second])
+
+    pending_event, pending = await runner._run_agent_drain_pending(
+        {"final_response": "completed"}, adapter, first.source, "session-key",
+    )
+
+    assert pending_event is ordinary
+    assert pending == ordinary.text
+    assert adapter._pending_messages["session-key"] is second
+    assert runner._overflow_queue.return_value == [first]
+    assert runner._hm_has_orphaned_fifo("session-key", first.source) is False
+
+
+@pytest.mark.asyncio
+async def test_passive_write_claim_blocks_interleaving_turn(runner):
+    runner._is_session_running = GatewayRunner._is_session_running.__get__(runner, GatewayRunner)
+    async def no_active_wakes(_fn, *_args, **_kwargs):
+        return None, None
+    runner._run_in_executor_with_context = no_active_wakes
+    entered_duplicate = asyncio.Event()
+    release_duplicate = asyncio.Event()
+
+    async def has_message(*_args):
+        entered_duplicate.set()
+        await release_duplicate.wait()
+        return False
+
+    runner._test_store.has_platform_message_id = has_message
+    runner.async_session_store.has_platform_message_id = has_message
+    first, second = _event(FYI), _event(FYI.replace("receipt-1", "receipt-2"))
+    first_task = asyncio.create_task(runner._hm_try_passive_fyi_relay(first, first.source, "session-key"))
+    await entered_duplicate.wait()
+    assert await runner._hm_try_passive_fyi_relay(second, second.source, "session-key") is False
+    release_duplicate.set()
+    assert await first_task is True
+    assert len(runner._test_store.rows) == 1
+
+
+def test_secondary_profile_reads_its_own_passive_flag(runner, monkeypatch):
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._primary_profile_name = "default"
+    runner._relay_fyi_passive_by_profile = {"secondary": {"relay": {"fyi_passive": False}}}
+    source = _event(FYI).source
+    source.profile = "secondary"
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"relay": {"fyi_passive": True}})
+    assert runner._relay_fyi_passive_enabled(source) is False
+
+
+@pytest.mark.asyncio
+async def test_busy_passive_fyi_sends_no_queued_ack(runner):
+    event = _event(FYI)
+    adapter = SimpleNamespace(_pending_messages={})
+    runner._delivery_adapter_for = MagicMock(return_value=adapter)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+    runner._admit_bot_message_for_source = MagicMock(return_value=True)
+    runner._strict_session_pin_holds = AsyncMock(return_value=True)
+    runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
+    runner._hm_is_registered_command = MagicMock(return_value=False)
+    runner._queue_or_replace_pending_event = MagicMock()
+    runner._resolve_busy_steer_or_redirect = AsyncMock(
+        return_value=SimpleNamespace(steered=False, redirected=False, effective_mode="queue",
+                                      demoted_for_subagents=False, demoted_for_compression=False)
+    )
+    runner._send_busy_ack_reply = AsyncMock()
+    runner._peek_session_state = MagicMock(return_value=SimpleNamespace(turn=SimpleNamespace(agent=object())))
+    runner._draining = False
+
+    assert await GatewayBusySessionMixin._handle_active_session_busy_message(
+        runner, event, "session-key",
+    ) is True
+    runner._queue_or_replace_pending_event.assert_called_once_with("session-key", event)
+    runner._send_busy_ack_reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_idle_dispatch_persists_fyi_without_claiming_a_turn(runner):
     event = _event(FYI)
     runner._hm_admit_event = AsyncMock(return_value=(event, event.source, False))
@@ -171,11 +280,10 @@ async def test_idle_dispatch_persists_fyi_without_claiming_a_turn(runner):
     runner._hm_evict_idle_stale_agent = MagicMock()
     runner._is_session_running = MagicMock(return_value=False)
     runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
-    runner._claim_active_session_slot = MagicMock(side_effect=AssertionError("FYI started a turn"))
     runner._handle_message_with_agent = AsyncMock(side_effect=AssertionError("FYI started a model call"))
 
     assert await runner._handle_admitted_message(event) is None
-    assert runner._claim_active_session_slot.call_count == 0
+    assert runner._claim_active_session_slot.call_count == 1
     assert runner._handle_message_with_agent.call_count == 0
     assert runner._test_store.rows[0][1]["content"] == FYI
 

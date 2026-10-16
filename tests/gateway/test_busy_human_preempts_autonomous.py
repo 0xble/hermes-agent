@@ -178,7 +178,7 @@ async def test_flag_off_busy_fyi_uses_normal_busy_input_mode() -> None:
     runner = _runner()
     runner._busy_input_mode = "interrupt"
     runner._busy_text_mode = "interrupt"
-    runner._relay_fyi_passive_enabled = lambda: False
+    runner._relay_fyi_passive_enabled = lambda source=None: False
     agent = _agent()
     key = _start_turn(runner, _goal_tick(), agent)
 

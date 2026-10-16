@@ -316,12 +316,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         await _admit_outbox_event(self, event, source)
         return event, source, False
 
-    @staticmethod
-    def _relay_fyi_passive_enabled() -> bool:
-        """Read the rollback flag from the effective gateway config; absent means enabled."""
+    def _relay_fyi_passive_enabled(self, source: Optional[SessionSource] = None) -> bool:
+        """Read the rollback flag from the routed profile's effective config; absent means enabled."""
         try:
             from gateway.run import _load_gateway_config
-            raw = ((_load_gateway_config().get("relay") or {}).get("fyi_passive", True))
+            config = None
+            if source is not None and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_name = str(getattr(source, "profile", "") or "").strip()
+                if not profile_name:
+                    with suppress(Exception):
+                        profile_name = str(self._profile_name_for_source(source) or "").strip()
+                primary = getattr(self, "_primary_profile_name", None) or "default"
+                if profile_name and profile_name != primary:
+                    config = (getattr(self, "_relay_fyi_passive_by_profile", None) or {}).get(profile_name)
+                    if config is None:
+                        home = self._resolve_profile_home_for_source(source)
+                        config = _load_gateway_config(home / "config.yaml")
+            if config is None:
+                config = _load_gateway_config()
+            raw = ((config.get("relay") or {}).get("fyi_passive", True))
             if isinstance(raw, str):
                 token = raw.strip().lower()
                 if token in {"0", "false", "no", "off"}:
@@ -334,12 +347,28 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return True
 
     def _hm_has_orphaned_fifo(self, session_key: str, source: SessionSource) -> bool:
-        """Passive FYIs must yield to the FIFO orphan rescue so arrival order stays intact."""
+        """Return whether ordinary queued work requires the FIFO orphan rescue.
+
+        A FIFO containing only passive FYIs is deliberately not an orphan for passive admission:
+        each FYI can be persisted by the normal idle path in arrival order, without a model turn.
+        """
         try:
+            from gateway.response_filters import is_passive_fyi_relay_event
             adapter = self._delivery_adapter_for(source)
             overflow = self._overflow_queue(session_key)
             pending = getattr(adapter, "_pending_messages", {}) if adapter is not None else {}
-            return bool(overflow) or session_key in pending
+            queued = []
+            if isinstance(pending, dict) and session_key in pending:
+                queued.append(pending[session_key])
+            queued.extend(overflow or ())
+            return any(
+                not is_passive_fyi_relay_event(
+                    event,
+                    getattr(event, "source", source),
+                    enabled=self._relay_fyi_passive_enabled(getattr(event, "source", source)),
+                )
+                for event in queued
+            )
         except Exception:
             # A failed queue inspection is fail-closed for passive admission: normal turn handling
             # owns the event and can still perform the rescue.
@@ -351,7 +380,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         """Persist one unaddressed Telegram FYI relay without creating an agent turn."""
         from gateway.response_filters import is_passive_fyi_relay_event
         if not is_passive_fyi_relay_event(
-            event, source, enabled=self._relay_fyi_passive_enabled(),
+            event, source, enabled=self._relay_fyi_passive_enabled(source),
         ):
             return False
         session_store = self.async_session_store
@@ -362,11 +391,21 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return False
         if session_entry is None or not getattr(session_entry, "session_id", None):
             return False
-        # The idle admission path has several awaits between its first running check and this point.
-        # Re-check the same sentinel-backed guard before doing any transcript write; a turn that began
-        # meanwhile must own the FYI through the ordinary busy path instead.
+        # Claim the same running-session sentinel/lease used by real turns before any further await.
+        # The dedupe check and append must be one exclusive interval: otherwise a turn can start between
+        # the last idle check and the append and interleave its transcript rows with this FYI.
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        passive_lease, _limit_message = self._claim_active_session_slot(session_key, source)
+        if _limit_message is not None:
+            return False
         if self._is_session_running(session_key):
             return False
+        state = self._session_state(session_key)
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.event = event
+        state.turn.lease = passive_lease
+        state.turn.started_ts = time.time()
+        self._persist_active_agents()
 
         def _active_wakes():
             from hermes_cli.goals import _get_session_db, load_goal
@@ -376,54 +415,54 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return load_goal(session_entry.session_id), load_loop(session_entry.session_id)
 
         try:
-            goal_state, loop_state = await self._run_in_executor_with_context(_active_wakes)
-        except Exception:
-            logger.debug("FYI relay goal/loop lookup failed; falling back to a turn", exc_info=True)
-            return False
-        if (
-            getattr(goal_state, "status", None) == "active"
-            or getattr(loop_state, "status", None) == "active"
-        ):
-            return False
-        if self._is_session_running(session_key):
-            return False
-
-        if getattr(event, "message_id", None):
             try:
-                if await session_store.has_platform_message_id(
-                    session_entry.session_id, str(event.message_id),
-                ):
-                    logger.info(
-                        "Skipping duplicate passive FYI relay (message_id=%s) in session %s",
-                        event.message_id, session_entry.session_id,
-                    )
-                    setattr(event, "_agent_turn_succeeded", True)
-                    return True
+                goal_state, loop_state = await self._run_in_executor_with_context(_active_wakes)
             except Exception:
-                logger.debug("FYI relay duplicate lookup failed; falling back to a turn", exc_info=True)
+                logger.debug("FYI relay goal/loop lookup failed; falling back to a turn", exc_info=True)
+                return False
+            if (
+                getattr(goal_state, "status", None) == "active"
+                or getattr(loop_state, "status", None) == "active"
+            ):
                 return False
 
-        timestamp = getattr(event, "timestamp", None)
-        try:
-            timestamp = timestamp.timestamp()
-        except (AttributeError, TypeError, ValueError):
-            timestamp = time.time()
-        row = {"role": "user", "content": event.text, "timestamp": timestamp}
-        if getattr(event, "message_id", None):
-            row["message_id"] = str(event.message_id)
-        try:
-            await session_store.append_to_transcript(session_entry.session_id, row)
-        except Exception:
-            logger.warning("FYI relay transcript append failed; falling back to a turn", exc_info=True)
-            return False
-        try:
-            await self._refresh_agent_cache_message_count(session_key, session_entry.session_id)
-        except Exception:
-            # The transcript row is already durable; cache continuity is best effort and must not
-            # turn a successful passive admission into a model turn.
-            logger.debug("FYI relay agent-cache rebaseline failed", exc_info=True)
-        setattr(event, "_agent_turn_succeeded", True)
-        return True
+            if getattr(event, "message_id", None):
+                try:
+                    if await session_store.has_platform_message_id(
+                        session_entry.session_id, str(event.message_id),
+                    ):
+                        logger.info(
+                            "Skipping duplicate passive FYI relay (message_id=%s) in session %s",
+                            event.message_id, session_entry.session_id,
+                        )
+                        setattr(event, "_agent_turn_succeeded", True)
+                        return True
+                except Exception:
+                    logger.debug("FYI relay duplicate lookup failed; falling back to a turn", exc_info=True)
+                    return False
+
+            timestamp = getattr(event, "timestamp", None)
+            try:
+                timestamp = timestamp.timestamp()
+            except (AttributeError, TypeError, ValueError):
+                timestamp = time.time()
+            row = {"role": "user", "content": event.text, "timestamp": timestamp}
+            if getattr(event, "message_id", None):
+                row["message_id"] = str(event.message_id)
+            try:
+                await session_store.append_to_transcript(session_entry.session_id, row)
+            except Exception:
+                logger.warning("FYI relay transcript append failed; falling back to a turn", exc_info=True)
+                return False
+            try:
+                await self._refresh_agent_cache_message_count(session_key, session_entry.session_id)
+            except Exception:
+                logger.debug("FYI relay agent-cache rebaseline failed", exc_info=True)
+            setattr(event, "_agent_turn_succeeded", True)
+            return True
+        finally:
+            if state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is event:
+                self._release_running_agent_state(session_key)
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
