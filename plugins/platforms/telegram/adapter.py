@@ -3123,8 +3123,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         thread_id = await self._create_dm_topic(chat_id_int, name=name)
         return str(thread_id) if thread_id else None
 
-    async def ensure_dm_topic(self, chat_id: str, topic_name: str, force_create: bool = False) -> Optional[str]:
-        """Return a private DM topic thread id, creating and persisting it if needed."""
+    async def ensure_dm_topic(
+        self, chat_id: str, topic_name: str, force_create: bool = False, *,
+        owner_key: Optional[str] = None, allow_parallel: bool = False,
+    ) -> Optional[str]:
+        """Resolve one named DM topic, using a durable owner for automation.
+
+        Automation callers must provide ``owner_key``. The owner registry is the authority,
+        exact-title live bindings are only a migration backstop, and a lost/ambiguous lookup
+        fails closed instead of creating a duplicate. ``allow_parallel`` is reserved for an
+        explicitly requested parallel automation lane.
+        """
         name = str(topic_name or "").strip()
         if not name:
             return None
@@ -3132,6 +3141,126 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             chat_id_int = int(chat_id)
         except (TypeError, ValueError):
             return None
+        chat_id_str = str(chat_id_int)
+        profile_name = str(getattr(self, "_owner_profile", None) or "default")
+        owner_key = str(owner_key or "").strip() or None
+        parallel_lane = bool(owner_key and allow_parallel)
+        if parallel_lane:
+            # A requested parallel lane must not reuse or overwrite the ordinary
+            # same-name cache/config entry. Its returned thread is intentionally
+            # ephemeral unless the caller supplies its own separate owner key.
+            force_create = True
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+
+        if allow_parallel and not owner_key:
+            raise RuntimeError("explicit parallel Telegram topic requires a distinct owner key")
+        if owner_key and allow_parallel:
+            if db is None or not hasattr(db, "get_telegram_topic_owner"):
+                raise RuntimeError("Telegram automation topic owner registry unavailable")
+            existing = db.get_telegram_topic_owner(
+                chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name)
+            if existing:
+                if str(existing.get("topic_name") or "") != name:
+                    raise RuntimeError(f"Telegram parallel owner {owner_key} title changed; refusing reroute")
+                if existing.get("status") != "active" or not existing.get("thread_id"):
+                    raise RuntimeError(
+                        f"Telegram parallel owner {owner_key} is {existing.get('status') or 'unresolved'}; refusing duplicate")
+                return str(existing["thread_id"])
+            reserved = db.reserve_telegram_topic_owner(
+                chat_id=chat_id_str, owner_key=owner_key, topic_name=name, profile_name=profile_name)
+            if not reserved.get("_reserved"):
+                raise RuntimeError(f"Telegram parallel owner {owner_key} creation is already in progress")
+
+        if owner_key and not allow_parallel:
+            if db is None or not hasattr(db, "get_telegram_topic_owner"):
+                raise RuntimeError("Telegram automation topic owner registry unavailable")
+            existing = db.get_telegram_topic_owner(
+                chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name)
+            if existing:
+                status = str(existing.get("status") or "")
+                if status != "active" or not existing.get("thread_id"):
+                    raise RuntimeError(
+                        f"Telegram topic owner {owner_key} is {status or 'unresolved'}; refusing duplicate fallback")
+                if str(existing.get("topic_name") or "") != name:
+                    raise RuntimeError(f"Telegram topic owner {owner_key} title changed; refusing reroute")
+                thread_id = str(existing["thread_id"])
+                binding = db.get_telegram_topic_binding(
+                    chat_id=chat_id_str, thread_id=thread_id, profile_name=profile_name)
+                session = db.get_session(str(binding.get("session_id"))) if binding else None
+                session_profile = str((session or {}).get("profile_name") or "default")
+                if (
+                    not binding
+                    or not session
+                    or session_profile != profile_name
+                    or session.get("ended_at") is not None
+                    or session.get("archived")
+                    or session.get("hidden")
+                ):
+                    db.set_telegram_topic_owner_state(
+                        chat_id=chat_id_str, owner_key=owner_key, status="unresolved", profile_name=profile_name)
+                    raise RuntimeError(f"Telegram topic owner {owner_key} has no live Hermes binding")
+                logger.info(
+                    "[%s] Telegram topic owner reuse owner_key=%s thread_id=%s decision=reuse",
+                    self.name, owner_key, thread_id)
+                return thread_id
+
+            all_candidates = db.list_telegram_topic_title_bindings(
+                chat_id=chat_id_str, topic_name=name, profile_name=profile_name)
+            candidates = db.list_live_telegram_topic_title_candidates(
+                chat_id=chat_id_str, topic_name=name, profile_name=profile_name)
+            if len(all_candidates) > 0:
+                automation_candidates = [
+                    c for c in candidates if str(c.get("managed_mode") or "") == "automation"
+                ]
+                if len(all_candidates) != 1 or len(automation_candidates) != 1:
+                    reserved = db.reserve_telegram_topic_owner(
+                        chat_id=chat_id_str, owner_key=owner_key, topic_name=name, profile_name=profile_name)
+                    if reserved.get("_reserved"):
+                        db.set_telegram_topic_owner_state(
+                            chat_id=chat_id_str, owner_key=owner_key, status="conflict", profile_name=profile_name)
+                    raise RuntimeError(
+                        f"Telegram topic owner {owner_key} has ambiguous or user-owned exact-title bindings")
+                candidate = automation_candidates[0]
+                reserved = db.reserve_telegram_topic_owner(
+                    chat_id=chat_id_str, owner_key=owner_key, topic_name=name, profile_name=profile_name)
+                if reserved.get("_reserved"):
+                    active = db.set_telegram_topic_owner_active(
+                        chat_id=chat_id_str, owner_key=owner_key,
+                        thread_id=str(candidate["thread_id"]), topic_name=name, profile_name=profile_name)
+                else:
+                    active = db.get_telegram_topic_owner(
+                        chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name) or {}
+                if str(active.get("status")) != "active" or not active.get("thread_id"):
+                    raise RuntimeError(f"Telegram topic owner {owner_key} lost its claim")
+                logger.info(
+                    "[%s] Telegram topic owner reuse owner_key=%s thread_id=%s decision=title-backstop binding_readback=ok",
+                    self.name, owner_key, active["thread_id"])
+                return str(active["thread_id"])
+
+            cache_key = f"{chat_id_int}:{name}"
+            cached = self._dm_topics.get(cache_key)
+            configured_thread = None
+            for entry in self._dm_topics_config:
+                if str(entry.get("chat_id")) != chat_id_str:
+                    continue
+                configured = next((c for c in entry.get("topics", []) if c.get("name") == name), None)
+                configured_thread = configured.get("thread_id") if configured else None
+                break
+            if cached or configured_thread:
+                raise RuntimeError(
+                    f"Telegram topic owner {owner_key} lookup is stale or unbound; refusing duplicate fallback")
+
+            reserved = db.reserve_telegram_topic_owner(
+                chat_id=chat_id_str, owner_key=owner_key, topic_name=name, profile_name=profile_name)
+            if not reserved.get("_reserved"):
+                winner = db.get_telegram_topic_owner(
+                    chat_id=chat_id_str, owner_key=owner_key, profile_name=profile_name) or {}
+                if winner.get("status") == "active" and winner.get("thread_id"):
+                    return str(winner["thread_id"])
+                raise RuntimeError(f"Telegram topic owner {owner_key} creation is already in progress")
+            logger.info(
+                "[%s] Telegram topic owner reserve owner_key=%s decision=create", self.name, owner_key)
+
         cache_key = f"{chat_id_int}:{name}"
         cached = self._dm_topics.get(cache_key)
         if cached and not force_create:
@@ -3139,7 +3268,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         topic_conf: Optional[Dict[str, Any]] = None
         chat_entry: Optional[Dict[str, Any]] = None
         for entry in self._dm_topics_config:
-            if str(entry.get("chat_id")) != str(chat_id_int):
+            if str(entry.get("chat_id")) != chat_id_str:
                 continue
             chat_entry = entry
             topic_conf = next((c for c in entry.get("topics", []) if c.get("name") == name), None)
@@ -3154,14 +3283,106 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         if topic_conf is None:
             topic_conf = {"name": name}
             chat_entry.setdefault("topics", []).append(topic_conf)
-        thread_id = await self._create_dm_topic(
-            chat_id_int, name=name, icon_color=topic_conf.get("icon_color"), icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"))
+        try:
+            thread_id = await self._create_dm_topic(
+                chat_id_int, name=name, icon_color=topic_conf.get("icon_color"),
+                icon_custom_emoji_id=topic_conf.get("icon_custom_emoji_id"))
+        except Exception:
+            # A timeout or transport error may have happened after Telegram accepted the
+            # create. Keep the durable reservation unresolved so a retry reconciles rather
+            # than creating a second topic.
+            if owner_key and db is not None:
+                db.set_telegram_topic_owner_state(
+                    chat_id=chat_id_str, owner_key=owner_key, status="unresolved", profile_name=profile_name)
+            raise
         if not thread_id:
-            return None
-        topic_conf["thread_id"] = thread_id
-        self._dm_topics[cache_key] = int(thread_id)
-        self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
+            if owner_key and db is not None:
+                db.set_telegram_topic_owner_state(
+                    chat_id=chat_id_str, owner_key=owner_key, status="unresolved", profile_name=profile_name)
+            raise RuntimeError(f"Telegram topic owner {owner_key or name} creation returned no thread")
+        try:
+            if not parallel_lane:
+                topic_conf["thread_id"] = thread_id
+                self._dm_topics[cache_key] = int(thread_id)
+                self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
+            if owner_key and db is not None and hasattr(db, "set_telegram_topic_owner_active"):
+                db.set_telegram_topic_owner_active(
+                    chat_id=chat_id_str, owner_key=owner_key, thread_id=str(thread_id),
+                    topic_name=name, profile_name=profile_name)
+                logger.info(
+                    "[%s] Telegram topic owner active owner_key=%s thread_id=%s readback=remote-create",
+                    self.name, owner_key, thread_id)
+        except Exception:
+            # The remote topic exists, but local readback/persistence did not complete.
+            # Preserve the unresolved reservation and never retry blindly.
+            if owner_key and db is not None:
+                db.set_telegram_topic_owner_state(
+                    chat_id=chat_id_str, owner_key=owner_key, status="unresolved", profile_name=profile_name)
+            raise
         return str(thread_id)
+
+    def ensure_existing_telegram_topic_owner(
+        self, chat_id: str, thread_id: str, owner_key: str,
+    ) -> None:
+        """Claim/validate a numeric Telegram topic for recurring automation delivery."""
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        if db is None or not hasattr(db, "get_telegram_topic_owner"):
+            raise RuntimeError("Telegram automation topic owner registry unavailable")
+        profile_name = str(getattr(self, "_owner_profile", None) or "default")
+        owner = db.get_telegram_topic_owner(
+            chat_id=str(chat_id), owner_key=str(owner_key), profile_name=profile_name)
+        if owner:
+            if owner.get("status") != "active" or str(owner.get("thread_id")) != str(thread_id):
+                raise RuntimeError(
+                    f"Telegram topic owner {owner_key} does not own thread {thread_id}; refusing reroute")
+            return
+        binding = db.get_telegram_topic_binding(
+            chat_id=str(chat_id), thread_id=str(thread_id), profile_name=profile_name)
+        if not binding:
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} has no live Hermes binding; refusing duplicate fallback")
+        session = db.get_session(str(binding.get("session_id")))
+        session_profile = str((session or {}).get("profile_name") or "default")
+        if (
+            not session
+            or session_profile != profile_name
+            or session.get("ended_at") is not None
+            or session.get("archived")
+            or session.get("hidden")
+        ):
+            raise RuntimeError(
+                f"Telegram topic thread {thread_id} has no live Hermes owner; refusing duplicate fallback")
+        mark_automation = getattr(db, "set_telegram_topic_binding_managed_mode", None)
+        if callable(mark_automation):
+            mark_automation(
+                chat_id=str(chat_id), thread_id=str(thread_id),
+                managed_mode="automation", profile_name=profile_name)
+        reserved = db.reserve_telegram_topic_owner(
+            chat_id=str(chat_id), owner_key=str(owner_key),
+            topic_name=str(session.get("title") or ""), profile_name=profile_name)
+        if reserved.get("_reserved"):
+            db.set_telegram_topic_owner_active(
+                chat_id=str(chat_id), owner_key=str(owner_key), thread_id=str(thread_id),
+                topic_name=str(session.get("title") or ""), profile_name=profile_name)
+        elif str(reserved.get("thread_id")) != str(thread_id) or reserved.get("status") != "active":
+            raise RuntimeError(f"Telegram topic owner {owner_key} lost its claim")
+        logger.info(
+            "[%s] Telegram topic owner claim owner_key=%s thread_id=%s decision=existing-numeric",
+            self.name, owner_key, thread_id)
+
+    def mark_telegram_topic_owner_unresolved(
+        self, chat_id: str, owner_key: str, *, reason: str = "remote_topic_unavailable",
+    ) -> None:
+        """Fail closed after Telegram rejects an owner thread as unavailable."""
+        db = getattr(getattr(self, "_session_store", None), "_db", None)
+        if db is None or not hasattr(db, "set_telegram_topic_owner_state"):
+            return
+        profile_name = str(getattr(self, "_owner_profile", None) or "default")
+        db.set_telegram_topic_owner_state(
+            chat_id=str(chat_id), owner_key=str(owner_key), status="unresolved", profile_name=profile_name)
+        logger.warning(
+            "[%s] Telegram topic owner unresolved owner_key=%s reason=%s; no recreate",
+            self.name, owner_key, reason)
 
     async def get_forum_topic_icon_options(self) -> List[Dict[str, Any]]:
         """Return Bot API custom emoji options, cached for this adapter lifetime."""

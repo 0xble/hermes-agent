@@ -453,3 +453,44 @@ async def test_relay_fronted_telegram_target_receives_payload_above_its_own_limi
     saved_files = list(tmp_path.glob("cron/output/cron-2_*.txt"))
     assert len(saved_files) == 1
     assert saved_files[0].read_text(encoding="utf-8") == content
+
+
+class OwnedStaleTopicAdapter:
+    def __init__(self):
+        self.calls = []
+        self.ensure_calls = []
+        self.unresolved = []
+
+    async def ensure_dm_topic(self, chat_id, topic_name, force_create=False, **kwargs):
+        self.ensure_calls.append((chat_id, topic_name, force_create, kwargs))
+        return "324637"
+
+    def mark_telegram_topic_owner_unresolved(self, chat_id, owner_key, *, reason):
+        self.unresolved.append((chat_id, owner_key, reason))
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append(dict(metadata or {}))
+        return SendResult(success=False, error="Bad Request: message thread not found")
+
+
+@pytest.mark.asyncio
+async def test_owned_topic_lost_readback_fails_closed_without_recreate(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = OwnedStaleTopicAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+
+    with pytest.raises(RuntimeError, match="message thread not found"):
+        await router._deliver_to_platform(
+            DeliveryTarget.parse("telegram:722341991:Meridian Gmail Watcher"),
+            "watcher result",
+            metadata={"job_id": "meridian-watcher"},
+        )
+
+    assert adapter.ensure_calls == [
+        ("722341991", "Meridian Gmail Watcher", False,
+         {"owner_key": "cron:meridian-watcher", "allow_parallel": False})
+    ]
+    assert len(adapter.calls) == 1
+    assert adapter.unresolved == [
+        ("722341991", "cron:meridian-watcher", "remote_topic_unavailable")
+    ]
