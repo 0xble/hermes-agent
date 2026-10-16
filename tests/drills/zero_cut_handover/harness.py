@@ -30,8 +30,9 @@ ACK = "reply exactly ACK"
 
 
 def _final_re(tag: str, kinds: str = "ACK|DONE") -> "re.Pattern[str]":
-    """One answer line for ``tag``; a reply may carry several such lines (folded mid-turn inbound)."""
-    return re.compile(rf"(?im)^\s*(?:{kinds})\s+{re.escape(tag)}\s*$")
+    """One answer for ``tag``; a reply may carry several (folded mid-turn inbound), on one line or many.
+    Anchored to a line of answers, so the observer's own "... reply exactly DONE <tag>" never counts."""
+    return re.compile(rf"(?im)^\s*(?:(?:ACK|DONE)\s+\S+\s+)*(?:{kinds})\s+{re.escape(tag)}(?=\s|$)")
 
 
 @dataclass(frozen=True)
@@ -250,10 +251,19 @@ def _send(effects: Effects, peer: str, drill: str, number: int, instruction: str
                        "in this chat you have not acknowledged yet, nothing else")
     text = f"ZC {drill}-{number} {instruction} {tag}"
     response = effects.send_as_user(peer, text)
+    message_id = _message_id(response)
+    if message_id is None:
+        # The observer's own send failed (no id): nothing reached the bot, so this is a harness
+        # error, never "lost inbound". Not retried: an errored send may still have been delivered.
+        raise DrillObserverError(f"observer send for {tag} returned no message id: {str(response)[:200]}")
     if message_ids is not None:
-        message_ids.append(_message_id(response))
+        message_ids.append(message_id)
     tags.append(tag)
     return tag
+
+
+class DrillObserverError(RuntimeError):
+    """The test account's Telegram client failed; the drill result says nothing about the gateway."""
 
 
 def _message_id(value: Any) -> Any:
@@ -816,7 +826,11 @@ def run_suite(*, home: Path, peer: str, drills: str, repeat: int, effects: Effec
     results: list[dict[str, Any]] = []
     for _ in range(max(1, repeat)):
         for name in names:
-            results.append(run_drill(home=home, peer=peer, drill=name, effects=effects, live=live))
+            try:
+                results.append(run_drill(home=home, peer=peer, drill=name, effects=effects, live=live))
+            except DrillObserverError as exc:
+                # Not a gateway verdict: record it as unproven so the run still fails, and go on.
+                results.append({"drill": name, "passed": False, "observer_error": str(exc)})
     return results
 
 

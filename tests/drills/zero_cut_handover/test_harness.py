@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -261,3 +262,22 @@ def test_peer_resolver_requires_the_drill_bot_id_in_the_real_chat_list_shape(mon
     chats.pop(0)
     harness._PEER_VERIFIED.clear()
     assert harness._peer_username(effects, "8899335561") is None  # id must exist in the account
+
+
+def test_observer_send_failure_is_a_harness_error_not_lost_inbound(tmp_path):
+    """Real drill: the test account's send errored (no message id) and the drill reported the tag lost."""
+    effects = dataclasses.replace(FakeWorld(tmp_path).effects(), send_as_user=lambda peer, text: {"error": "x"})
+    with pytest.raises(harness.DrillObserverError):
+        harness._send(effects, "bot", "promotion-burst", 1, harness.ACK, [], [])
+
+
+def test_final_matches_several_acks_on_one_line():
+    line = "ACK promotion-burst-1-4 ACK promotion-burst-1-5"
+    assert harness._final_re("promotion-burst-1-4").search(line)
+    assert harness._final_re("promotion-burst-1-5").search(line)
+    assert not harness._final_re("promotion-burst-1-").search(line)
+    assert not harness._final_re("promotion-burst-1-4", "DONE").search(line)
+
+
+def test_observer_instruction_text_never_counts_as_a_final():
+    assert not harness._final_re("t-1").search("ZC x-1 run terminal sleep 45 then reply exactly DONE t-1")

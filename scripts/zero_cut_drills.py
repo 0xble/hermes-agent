@@ -40,11 +40,11 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for result in results:
         status = "PASS" if result["passed"] else "FAIL"
-        if result.get("xfail_reason") and result["sequence_ok"]:
+        if result.get("xfail_reason") and result.get("sequence_ok"):
             status = "XFAIL"
         if not result["passed"]:
             failed += 1
-        print(f"{status} {result['drill']} tags={len(result['tags'])}")
+        print(f"{status} {result['drill']} tags={len(result.get('tags', []))}" + (f" observer_error={result['observer_error']}" if result.get('observer_error') else ''))
     return 1 if failed else 0
 
 

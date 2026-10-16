@@ -33,6 +33,15 @@ def _queued_followups(runner) -> int:
         if isinstance(values, dict):
             total += len(values)
             total += sum(len(value) for value in values.values() if isinstance(value, (list, tuple)))
+    # The adapter owns the per-chat session guard and the follow-up merged in mid-turn; the runner's
+    # turn count drops before the adapter finishes delivering the final and starting that follow-up.
+    # Exiting in that gap flushed the follow-up to disk and left the final unconfirmed, so the
+    # successor re-sent it as a "may be a duplicate" recovery (found in a real drill).
+    for adapter in (getattr(runner, "adapters", {}) or {}).values():
+        for name in ("_active_sessions", "_pending_messages"):
+            values = getattr(adapter, name, None)
+            if isinstance(values, dict):
+                total += len(values)
     return total
 
 

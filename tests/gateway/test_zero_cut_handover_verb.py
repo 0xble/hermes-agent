@@ -187,3 +187,20 @@ async def test_completed_handover_stop_sends_no_shutting_down_notice(monkeypatch
                                            started_at=0.0)
     await runner._stop_begin_teardown(ctx)
     assert (calls == ["notice"]) is notified
+
+
+@pytest.mark.parametrize("attr", ["_active_sessions", "_pending_messages"])
+def test_handover_is_not_idle_while_the_adapter_still_owns_a_chat(attr):
+    """Real drill: the runner's turn count hit 0 while the adapter was still delivering the final and
+    held the follow-up merged in mid-turn; exiting then re-sent the final as a recovered duplicate."""
+    from gateway import zero_cut_handover_drain as drain
+
+    runner = _Runner(active=0)
+    adapter = SimpleNamespace(platform=SimpleNamespace(value="telegram"), _active_sessions={}, _pending_messages={})
+    runner.adapters = {"telegram": adapter}
+    runner._zero_cut_handover_state = {
+        "accepted": True, "updates_settled": True, "token_lock_released": True,
+        "active_turns": 0, "idle": False, "failed": None}
+    assert drain.status(runner)["idle"] is True
+    getattr(adapter, attr)["agent:main:telegram:dm:1"] = object()
+    assert drain.status(runner)["idle"] is False
