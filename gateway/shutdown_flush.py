@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+outcome_logger = logging.getLogger("gateway.run")
 
 # Reason tag for transcript messages dropped by the in-memory pending cap during live
 # operation. Payloads carry the full transcript message dict for verbatim replay.
@@ -64,15 +65,16 @@ def _fsync_directory(flush_dir: Path) -> None:
         os.close(directory_fd)
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any], *, path: Optional[Path] = None,
-                   require_durable: bool = False) -> Path:
+def _write_payload(flush_dir: Path, payload: Dict[str, Any], file_id: Optional[str] = None, *,
+                   path: Optional[Path] = None, require_durable: bool = False) -> Path:
     """Atomically write one private, uniquely named recovery payload; return its path.
 
-    Durable queue admission stages the payload under a non-eligible name. A directory-fsync failure
-    therefore cannot leave a new replayable file behind or replace an already accepted checkpoint.
+    ``file_id`` reuses a caller-selected uuid for id-less recovery records. Durable queue admission
+    stages the payload under a non-eligible name, so a directory-fsync failure cannot leave a new
+    replayable file behind or replace an already accepted checkpoint.
     """
     from utils import atomic_json_write
-    final_path = path if path is not None else flush_dir / f"pending-{uuid.uuid4().hex}.json"
+    final_path = path if path is not None else flush_dir / f"pending-{file_id or uuid.uuid4().hex}.json"
     if not require_durable:
         atomic_json_write(final_path, payload, mode=0o600, default=str)
         if os.name == "posix":
@@ -153,7 +155,15 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
             return True
         if serialised is None or not has_user_content(serialised):
             return False
-        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
+        # Any id-less follow-up needs a stable recovery-only dedupe key. This includes ordinary
+        # MessageEvents flushed from a non-internal queue: leaving those on the legacy content
+        # fallback lets a later identical message destroy the only recovery copy. The key reuses
+        # the spool file's own uuid (one uuid4 per payload, so file names keep their draw order),
+        # and is stamped on a copy: dict values are serialised by identity and belong to the caller.
+        file_id = uuid.uuid4().hex
+        if not serialised.get("message_id") and not serialised.get("recovery_id"):
+            serialised = {**serialised, "recovery_id": f"hermes-recovery-{file_id}"}
+        _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised}, file_id)
         return True
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
@@ -430,6 +440,9 @@ def _serialise_value(value: Any) -> Optional[dict]:
             val = getattr(value, attr, None)
             if val is not None:
                 result[attr] = val if _json_safe(val) else str(val)
+        recovery_id = getattr(value, "_hermes_recovery_id", None)
+        if recovery_id is not None and _json_safe(recovery_id):
+            result["recovery_id"] = recovery_id
         for attr in ("user_id", "user_name", "media_urls", "media_types", "media_text_inlined",
                      "reply_to_message_id", "reply_to_text", "reply_to_author_id", "reply_to_author_name"):
             val = getattr(value, attr, None)
@@ -518,6 +531,18 @@ def _remove_replayed(path: Path, session_id: str) -> None:
         _REPLAYED_UNREMOVABLE.add(path)
         logger.error("Spooled transcript row for %s was written, but %s could not be deleted (%s); "
                      "delete it by hand, or the next start writes that row again", session_id, path, exc)
+
+
+def quarantine_pending_spool(path: Path, why: str) -> bool:
+    """Move a pending spool out of every replay glob, keeping it on disk for manual recovery."""
+    target = path.with_name(path.name + QUARANTINE_SUFFIX)
+    try:
+        path.replace(target)
+    except OSError as exc:
+        logger.error("Could not quarantine pending message %s (%s): %s", path, why, exc)
+        return False
+    logger.warning("Quarantined pending message %s to %s (%s); it will not be replayed", path, target, why)
+    return True
 
 
 def _quarantine_spool_file(path: Path, session_id: str, exc: BaseException) -> None:
@@ -667,6 +692,17 @@ def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_fo
 OTHER_PLATFORM_PENDING = object()  # retained for a different adapter's reconnect, not a failure
 CLAIMED_FOLLOWUP = object()  # queued in memory, disk copy retained until adapter accepts replay
 DROP_PENDING = object()  # obsolete or unsafe drain arrival; delete without transcript append
+# A stale (>24h) shutdown follow-up waits for its decline note's delivery path only this long.
+# Its session may be pruned, suspended, or never reconnect; without a bound the spool is kept
+# and re-scanned on every boot with no recorded outcome.
+_STALE_FOLLOWUP_RETENTION_SECS = 7 * 24 * 60 * 60
+
+
+def _drop_stale_followup(session_key: str) -> object:
+    """Record the one visible decision for a stale follow-up whose note cannot be sent."""
+    outcome_logger.info("Restart recovery outcome: session=%s outcome=%s",
+                        session_key, "skipped:stale:note-unavailable")
+    return DROP_PENDING
 
 
 def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
@@ -678,17 +714,30 @@ def _upgrade_shutdown_follow_up(payload: Dict[str, Any], data: Dict[str, Any]) -
     return data
 
 
-def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any]) -> bool:
-    """Drop or quarantine an expired drain arrival, or discard a spooled built-in control command."""
+def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any], *, keep_expired: bool = False) -> bool:
+    """Drop or quarantine an expired drain arrival, retaining stale shutdown follow-ups for notice.
+
+    Queue checkpoints use the bounded quarantine policy. A shutdown follow-up instead remains
+    replay-visible until its owner can deliver a stale/abandoned outcome.
+    """
     age = time.time() - path.stat().st_mtime
-    limit = QUEUE_CHECKPOINT_MAX_AGE_SECONDS if data.get("queue_accepted") is True else 24 * 60 * 60
-    if age > limit:
-        # Age never deletes the only durable copy (maintenance/session-compression-recovery.md):
-        # every expired drain arrival, accepted or legacy, moves to the *.bad quarantine intact.
-        # A failed quarantine raises so the per-file boundary keeps the spool in place.
-        if not quarantine_pending_spool(path, "expired drain-deferred input"):
-            raise OSError(f"could not quarantine expired drain-deferred input {path}")
-        return True
+    if data.get("queue_accepted") is True:
+        if age > QUEUE_CHECKPOINT_MAX_AGE_SECONDS:
+            # Age never deletes the only durable copy: retain it in quarantine for manual recovery.
+            if not quarantine_pending_spool(path, "expired drain-deferred input"):
+                raise OSError(f"could not quarantine expired drain-deferred input {path}")
+            return True
+    elif age > 24 * 60 * 60:
+        if keep_expired:
+            data["_recovery_stale"] = True
+            if age > _STALE_FOLLOWUP_RETENTION_SECS:
+                data["_recovery_abandoned"] = True
+        else:
+            # Legacy drain arrivals are also quarantined rather than silently deleting their only
+            # durable copy; only shutdown follow-ups take the visible stale-decision path.
+            if not quarantine_pending_spool(path, "expired drain-deferred input"):
+                raise OSError(f"could not quarantine expired drain-deferred input {path}")
+            return True
     from gateway.platforms.event import MessageEvent
     from hermes_cli.commands import resolve_command
     command = MessageEvent(
@@ -733,8 +782,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     data = _upgrade_shutdown_follow_up(payload, data)
+    data = {**data, "_recovery_spool_ts": payload.get("ts")}
     text = data.get("text", "")
-    if data.get("drain_deferred") is True and _drop_drain_deferred(path, text, data):
+    if data.get("drain_deferred") is True and _drop_drain_deferred(
+            path, text, data,
+            keep_expired=data.get("shutdown_follow_up") is True and deferred_followup is not None):
         return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "
@@ -755,6 +807,8 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         if resolved and resolved[1] is not None:
             session_id, target_db = resolved
     if not session_id:
+        if data.get("_recovery_abandoned") is True:
+            return _drop_stale_followup(session_key)  # pruned session: no note route will return
         logger.warning("Cannot recover pending message for %s: no session_id in flush file and "
                        "session_key-to-id resolution failed. "
                        "The message text is preserved in %s", session_key, path)
@@ -782,9 +836,15 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         claim = deferred_followup(session_key, session_id, data, path)
         if claim is DROP_PENDING:
             return DROP_PENDING
+        if data.get("_recovery_stale") is True and claim is False:
+            return _drop_stale_followup(session_key)
         if claim is OTHER_PLATFORM_PENDING:
             logger.debug("Pending message for %s retained until its platform reconnects", session_key)
             return False
+        if claim is None and data.get("_recovery_abandoned") is True:
+            # Whatever blocks the note (offline adapter, pruned/suspended/mismatched entry, running
+            # session, failed auth check) has outlived the retention bound; decide once and stop.
+            return _drop_stale_followup(session_key)
         if claim is None:  # resume deferred until its delivery path is ready
             logger.warning("Pending message for %s retained in %s: delivery adapter offline or "
                            "resume awaiting platform reconnect", session_key, path)

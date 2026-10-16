@@ -100,6 +100,8 @@ class TurnContext:
     # The queued MessageEvent this turn consumes; its accepted-queue checkpoint is retired once
     # the agent durably admits the input (see agent.compression_recovery.notify_input_admitted).
     queued_event: Any = None
+    # Recovery-only dedupe key; never use this as a transport/reply identity.
+    recovery_id: Optional[str] = None
     moa_config: Optional[dict] = None
     title_user_message: Optional[str] = None
     persist_user_message: Optional[Any] = None

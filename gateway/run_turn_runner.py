@@ -1846,8 +1846,12 @@ class TurnRunner:
             from gateway.shutdown_flush import prepare_queued_turn_checkpoint
             platform_id = prepare_queued_turn_checkpoint(
                 agent, ctx.queued_event, session_key, ctx.session_id, ctx.inbound_message_id)
-            if platform_id is not None:
-                kwargs["persist_user_platform_id"] = platform_id
+            # The raw inbound id (not event_message_id, the reply anchor) rides the persisted user
+            # turn. Recovered internal follow-ups use a dedicated recovery key here; it must never
+            # become event.message_id/source.message_id or reach transport routing.
+            persist_id = platform_id or ctx.recovery_id
+            if persist_id is not None:
+                kwargs["persist_user_platform_id"] = str(persist_id)
             from agent.notification_presentation import notification_turn
             with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""), silence_retry_prompt(agent, ctx):
                 return agent.run_conversation(api_message, **kwargs)

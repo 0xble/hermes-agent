@@ -107,8 +107,10 @@ loops:
   min_interval_seconds: 30       # floor for fixed intervals
   max_ticks: 100                 # backstop budget (0 = unlimited)
   self_paced_floor_seconds: 60   # self-paced starting cadence
-  self_paced_ceiling_seconds: 900  # self-paced max backoff
+  self_paced_ceiling_seconds: 86400  # self-paced max backoff (default: 24h; overrides still apply)
 ```
+
+Self-paced unchanged replies use the same quiet backoff ladder as goals: 15m, 1h, 4h, then 24h. A changed reply or trusted external event resets the loop to its configured floor.
 
 The `--until` judge routes through the `goal_judge` auxiliary task, so `auxiliary.goal_judge.*` routing overrides (provider, model) apply to loop conditions too.
 

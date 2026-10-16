@@ -1466,7 +1466,7 @@ DEFAULT_CONFIG = {
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
         "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
-        "self_paced_ceiling_seconds": 900,
+        "self_paced_ceiling_seconds": 24 * 60 * 60,
     },
     # Mixture of Agents — named presets used by /moa. A preset is an execution mode around the main
     # model, not a model itself: references + aggregator synthesize private guidance before each

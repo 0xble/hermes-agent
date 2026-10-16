@@ -527,6 +527,17 @@ class SessionTranscriptMixin:
             logger.debug("platform message lookup failed", exc_info=True)
             return False
 
+    def has_user_message_content(self, session_id: str, content: str, *, min_timestamp=None) -> bool:
+        """Whether a user row with exact content is persisted (False without a DB)."""
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return False
+        try:
+            return db.has_user_message_content(session_id, content, min_timestamp=min_timestamp)
+        except Exception:
+            logger.debug("has_user_message_content lookup failed", exc_info=True)
+            return False
+
     def transcript_tail_role(self, session_id: str) -> Optional[str]:
         """Role of the newest live conversation row on the route ``load_transcript`` reads (``None``
         when empty, no DB, or the read fails — the boundary write would fail the same way)."""

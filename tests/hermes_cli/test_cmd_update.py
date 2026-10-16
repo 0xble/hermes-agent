@@ -44,8 +44,6 @@ class TestGitTrampolineSelfHeal:
 
     @pytest.mark.platforms("windows")
     def test_healthy_git_command_unchanged(self):
-        from hermes_cli import update_cmd
-
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         with (
             patch(
@@ -61,8 +59,6 @@ class TestGitTrampolineSelfHeal:
     @pytest.mark.platforms("windows")
     def test_trampoline_swaps_to_real_git(self, capsys):
         from pathlib import Path
-
-        from hermes_cli import update_cmd
 
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         real = Path(r"C:\Program Files\Git\mingw64\libexec\git-core\git.exe")
@@ -82,8 +78,6 @@ class TestGitTrampolineSelfHeal:
 
     @pytest.mark.platforms("windows")
     def test_trampoline_no_real_git_keeps_command(self, capsys):
-        from hermes_cli import update_cmd
-
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
         with (
             patch(
@@ -99,8 +93,6 @@ class TestGitTrampolineSelfHeal:
 
     @pytest.mark.platforms("not windows")
     def test_off_windows_noop(self):
-        from hermes_cli import update_cmd
-
         git_cmd = ["git"]
         with patch("hermes_cli.update_cmd.subprocess.run") as run:
             result = update_cmd._ensure_non_trampoline_git(git_cmd)

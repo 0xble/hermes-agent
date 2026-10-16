@@ -909,7 +909,9 @@ class GatewayBusySessionMixin:
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
-                return bool(self._queue_or_replace_pending_event(session_key, event))
+                admitted = self._queue_or_replace_pending_event(session_key, event)
+                event._gateway_accepted = bool(admitted)
+                return bool(admitted)
             return False  # base adapter queues silently behind the active turn
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads

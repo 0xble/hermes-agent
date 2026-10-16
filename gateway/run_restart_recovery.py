@@ -29,6 +29,16 @@ class RestartRecoveryMixin:
             recorded.add(session_key)
             logger.info("Restart recovery outcome: session=%s outcome=%s", session_key, outcome)
 
+    def _record_recovered_followup_outcome(self, event, session_key: str, outcome: str) -> None:
+        """Record one terminal outcome per recovered follow-up spool, not per session."""
+        decided = getattr(self, "_recovered_followup_outcomes", None)
+        if decided is None:
+            decided = self._recovered_followup_outcomes = set()
+        marker = str(getattr(event, "_hermes_recovery_spool", None) or id(event))
+        if marker not in decided:
+            decided.add(marker)
+            logger.info("Restart recovery outcome: session=%s outcome=%s", session_key, outcome)
+
     def _release_restart_followup_key(self, session_key: str) -> None:
         """Allow a later reconnect scan to handle a recovered follow-up after it settles."""
         keys = getattr(self, "_restart_followup_keys", None)
@@ -41,22 +51,66 @@ class RestartRecoveryMixin:
         if spool is not None:
             spool.unlink(missing_ok=True)
 
+    @staticmethod
+    def _recovery_probe_events(event):
+        """Yield the recovered event and any merged successor/absorbed events once each."""
+        pending = [event]
+        seen = set()
+        while pending:
+            candidate = pending.pop()
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            yield candidate
+            successor = getattr(candidate, "_hermes_absorbed_into", None)
+            if successor is not None:
+                pending.append(successor)
+            pending.extend(getattr(candidate, "_hermes_absorbed_events", ()) or ())
+
     async def _recovered_input_durable(self, event) -> bool:
-        """Whether the turn has written this replayed input's own transcript row."""
-        from gateway.run_pending_recovery import input_already_durable
-        return await asyncio.to_thread(
-            input_already_durable, getattr(self, "session_store", None),
-            getattr(event, "_hermes_recovery_session_id", None), getattr(event, "message_id", None))
+        """Whether this replayed input or its merged successor has written a durable user row."""
+        from gateway.run_pending_recovery import input_already_durable, recovered_input_candidate_ids
+        recovery_session_id = getattr(event, "_hermes_recovery_session_id", None)
+        recovery_spool_ts = getattr(event, "_hermes_recovery_spool_ts", None)
+        recovery_id = getattr(event, "_hermes_recovery_id", None)
+        for candidate in self._recovery_probe_events(event):
+            session_id = getattr(candidate, "_hermes_recovery_session_id", None)
+            if session_id is None:
+                session_id = recovery_session_id
+            spool_ts = getattr(candidate, "_hermes_recovery_spool_ts", None)
+            if spool_ts is None:
+                spool_ts = recovery_spool_ts
+            candidate_ids = recovered_input_candidate_ids(
+                getattr(candidate, "_hermes_recovery_id", None),
+                getattr(candidate, "message_id", None),
+            )
+            if not candidate_ids and recovery_id is not None:
+                candidate_ids = recovered_input_candidate_ids(recovery_id)
+            if candidate_ids:
+                for candidate_id in candidate_ids:
+                    if await asyncio.to_thread(
+                        input_already_durable, getattr(self, "session_store", None), session_id,
+                        candidate_id, getattr(candidate, "text", None), spool_ts,
+                    ):
+                        return True
+            elif await asyncio.to_thread(
+                input_already_durable, getattr(self, "session_store", None), session_id,
+                None, getattr(candidate, "text", None), spool_ts,
+            ):
+                return True
+        return False
 
     async def _retire_spool_once_input_durable(self, event) -> None:
         """Retire the replay copy at the turn's durable start, not at adapter admission.
 
         ``handle_message`` returns once the session task exists, before the turn has leased the
         session or persisted anything, so the spool is the only copy until the turn writes its
-        input row (``_persist_turn_start`` stamps the inbound id before the first model call).
-        After that row exists, a restart falls to the turn's ``resume_pending`` marker and boot
-        recovery drops the spool instead of replaying a prompt that may have had effects. An input
-        without a platform id is retired when its turn reports a result.
+        input row (``_persist_turn_start`` stamps the inbound or recovery id before the first model call). After
+        that row exists, a restart falls to the turn's ``resume_pending`` marker and boot recovery
+        drops the spool instead of replaying a prompt that may have had effects. Legacy payloads
+        without a recovery id use the content/timestamp fallback and retire when their turn reports
+        a result.
         """
         while not await self._recovered_input_durable(event):
             await asyncio.sleep(_INPUT_DURABLE_POLL_S)
@@ -75,13 +129,29 @@ class RestartRecoveryMixin:
     @staticmethod
     async def _follow_startup_resume_turn(adapter, event, session_key: str, task, *, on_task_done=None) -> None:
         """Await the task that runs *event*. A busy or bounced event is parked and run by a
-        successor session task, so follow ``_session_tasks`` until the event reports a result."""
+        successor session task, so follow ``_session_tasks`` until the event reports a result.
+
+        The adapter may consume a recovered event by merging it into an already pending slot. In
+        that case the successor owns the result and the parked recovery event is not the object on
+        which ``run_turn`` writes ``_agent_turn_succeeded``. Session tasks are tagged with their
+        event by the shared background runner; copy a terminal result only when that task consumed
+        this event directly or recorded it as an absorbed pending event. Never borrow a result from
+        an unrelated predecessor that happened to own the session while this event was parked."""
         seen = set()
         while isinstance(task, asyncio.Task) and task not in seen:
             seen.add(task)
             await asyncio.shield(task)
             if on_task_done is not None:
                 on_task_done(task)
+            task_event = getattr(task, "_hermes_event", None)
+            task_result = getattr(task_event, "_agent_turn_succeeded", None)
+            from gateway.platforms.base import _task_event_covers_recovered_event
+            if (
+                _task_event_covers_recovered_event(task_event, event)
+                and isinstance(task_result, bool)
+                and not isinstance(getattr(event, "_agent_turn_succeeded", None), bool)
+            ):
+                event._agent_turn_succeeded = task_result
             if isinstance(getattr(event, "_agent_turn_succeeded", None), bool):
                 return
             task = getattr(adapter, "_session_tasks", {}).get(session_key)
@@ -148,28 +218,56 @@ class RestartRecoveryMixin:
             else:
                 await self._finish_restart_recovery(session_key, outcome.removeprefix("skipped:"))
 
+    async def _deliver_recovered_followup_note(self, event, session_key: str, *,
+                                               notice_key: str | None = None, text: str | None = None) -> bool:
+        """Send one recovered-follow-up notice inside the event's own profile scope.
+
+        Pass an i18n ``notice_key`` rather than translated text: ``t()`` must run inside the
+        scope, or a multiplexed secondary profile's notice resolves the launch profile's locale.
+        """
+        from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
+        try:
+            # Restore observers run outside any profile scope; a multiplexed secondary
+            # profile's notice must resolve its own locale, metadata and config.
+            home = self._resolve_profile_home_for_source(event.source)
+            async with _async_profile_runtime_scope(home) if home else nullcontext():
+                content = t(notice_key) if notice_key is not None else text
+                send = self._deliver_platform_notice(event.source, content)
+                timeout = _startup_restore_drain_timeout_secs()
+                return bool(await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None))
+        except Exception:
+            logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
+            return False
+
     async def _finish_recovered_followup(self, event, session_key: str, reason: str) -> None:
         """A future turn can outlive its predecessor's marker; its refusal still needs a note."""
-        from gateway.run import _async_profile_runtime_scope, _startup_restore_drain_timeout_secs
 
-        noted = self._interruption_note_delivered(session_key)
+        declined = getattr(event, "_hermes_recovered_declined", False) is True
+        # A declined input never ran, so the predecessor's interruption note does not cover it.
+        noted = False if declined else self._interruption_note_delivered(session_key)
         if not noted:
-            try:
-                # Restore observers run outside any profile scope; a multiplexed secondary
-                # profile's notice must resolve its own locale, metadata and config.
-                home = self._resolve_profile_home_for_source(event.source)
-                async with _async_profile_runtime_scope(home) if home else nullcontext():
-                    send = self._deliver_platform_notice(
-                        event.source,
-                        t("gateway.restart.followup_recovery_notice"),
-                    )
-                    timeout = _startup_restore_drain_timeout_secs()
-                    noted = await asyncio.wait_for(send, timeout=timeout if timeout > 0 else None)
-            except Exception:
-                logger.warning("Restored follow-up recovery note failed for %s", session_key, exc_info=True)
+            if not declined:
+                key = "gateway.restart.followup_recovery_notice"
+            elif reason == "possibly-duplicate":
+                # Its content may already have run; never tell the user it was not run.
+                key = "gateway.restart.followup_possible_duplicate_notice"
+            else:
+                key = "gateway.restart.followup_declined_notice"
+            noted = await self._deliver_recovered_followup_note(event, session_key, notice_key=key)
         suffix = ":noted" if noted else ":note-unavailable"
+        if declined and noted:
+            # The user now knows to resend it: keep the bytes for manual recovery, but never
+            # replay or re-announce this input on a later boot.
+            from gateway.shutdown_flush import quarantine_pending_spool
+            spool = getattr(event, "_hermes_recovery_spool", None)
+            if spool is not None:
+                quarantine_pending_spool(spool, f"declined shutdown follow-up: {reason}")
+        if declined:
+            self._record_recovered_followup_outcome(
+                event, session_key, f"skipped:{reason}{suffix}")
+            return
         self._release_restart_followup_key(session_key)
-        self._record_restart_resume_outcome(session_key, f"skipped:{reason}{suffix}")
+        self._record_recovered_followup_outcome(event, session_key, f"skipped:{reason}{suffix}")
 
     async def _observe_recovered_followup(self, adapter, event, session_key: str, *, task=None) -> None:
         """Observe the actual turn, following a busy adapter's successor rather than its receipt."""
@@ -185,8 +283,8 @@ class RestartRecoveryMixin:
                 # A real turn replied or reported its own failure; the "still preserved"
                 # notice would be false once the spool is gone, so neither path sends it.
                 self._release_restart_followup_key(session_key)
-                self._record_restart_resume_outcome(
-                    session_key, "resumed" if succeeded else "skipped:turn-failed")
+                outcome = "resumed" if succeeded else "skipped:turn-failed"
+                self._record_recovered_followup_outcome(event, session_key, outcome)
                 return
         except asyncio.CancelledError:
             self._release_restart_followup_key(session_key)
@@ -195,6 +293,23 @@ class RestartRecoveryMixin:
         except Exception:
             reason = "turn-failed"
             logger.warning("Restored follow-up failed for %s", session_key, exc_info=True)
+            # The input row is durable before the model call, so the watcher may already have
+            # retired the spool. The input is then no longer preserved and nothing replays an
+            # in-process failure: send the failed-turn note, never the false preserved notice.
+            if await self._recovered_input_durable(event):
+                from agent.turn_failure_copy import PARTIAL_FAILED_TURN_NOTICE
+                self._retire_recovered_followup_spool(event)
+                noted = False
+                try:
+                    noted = await self._deliver_recovered_followup_note(
+                        event, session_key, text=PARTIAL_FAILED_TURN_NOTICE)
+                finally:
+                    # The input is durable, so there is no spool to retain; log the note's real
+                    # fate even when shutdown cancels the send.
+                    self._release_restart_followup_key(session_key)
+                    self._record_recovered_followup_outcome(
+                        event, session_key, f"skipped:turn-failed{':noted' if noted else ':note-unavailable'}")
+                return
         finally:
             watcher.cancel()
         await self._finish_recovered_followup(event, session_key, reason)
@@ -243,6 +358,12 @@ class RestartRecoveryMixin:
         """Separate adapter admission from a recovered follow-up's actual turn completion."""
         recovered = getattr(event, "_hermes_recovery_session_key", None) is not None
         try:
+            if getattr(event, "_hermes_recovered_declined", False) is True:
+                # Never auto-run an input recovery could not attribute or still trust: send the
+                # visible note (retaining the spool if no adapter can carry it yet).
+                await self._finish_recovered_followup(
+                    event, recovery_key, getattr(event, "_hermes_recovery_decline_reason", "declined"))
+                return False
             source = getattr(event, "source", None)
             adapter = self._intake_adapter_for(source)
             if adapter is None and getattr(event, "_hermes_recovered_followup", False):
