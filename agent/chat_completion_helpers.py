@@ -1304,13 +1304,20 @@ def _reasoning_config_for_wire(agent):
     session: the request goes out without a reasoning config and the route
     applies its own default.
     """
+    cfg = _resolve_reasoning_config_for_wire(agent, _consume_ephemeral_reasoning_off(agent))
+    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
+    # disable (drop the disable) from a rejected level (drop the reasoning fields).
+    agent._wire_reasoning_config = cfg
+    return cfg
+
+
+def _resolve_reasoning_config_for_wire(agent, ephemeral_off: bool):
+    """Side-effect-free core of :func:`_reasoning_config_for_wire` (fit checks peek through it)."""
     cfg = agent.reasoning_config
-    ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
         # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
         # the route default — as the auxiliary ladder does; resending would 400 identically.
-        agent._wire_reasoning_config = None
         return None
     if cfg is None:
         # Unset effort: the profile's default (custom/OpenAI-compatible: medium) rather than the
@@ -1332,17 +1339,11 @@ def _reasoning_config_for_wire(agent):
             if getattr(agent, "_reasoning_floor_required", False):
                 from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
                 floored = {**cfg, "enabled": True, "effort": REASONING_FLOOR_EFFORT}
-                agent._wire_reasoning_config = floored
                 return floored
-            agent._wire_reasoning_config = None
             return None
-        agent._wire_reasoning_config = cfg
         return cfg
     if ephemeral_off:
         cfg = {**(cfg or {}), "enabled": False, "effort": "none"}
-    # What actually went out: the reasoning-rejection rung reads it to tell a rejected
-    # disable (drop the disable) from a rejected level (drop the reasoning fields).
-    agent._wire_reasoning_config = cfg
     return cfg
 
 
@@ -1372,12 +1373,53 @@ def _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api):
     return tools_for_api
 
 
+def selected_max_output_tokens(agent):
+    """Peek at the request cap without consuming its one-shot override."""
+    configured = getattr(agent, "max_tokens", None)
+    # Bedrock's builder does not consume the ephemeral retry cap.
+    if getattr(agent, "api_mode", None) == "bedrock_converse":
+        return configured
+    ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
+    return ephemeral if ephemeral is not None else configured
+
+
 def _consume_ephemeral_max_output(agent):
     """Pop the one-shot ephemeral output cap; whichever path builds the request consumes it."""
     ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
     if ephemeral_out is not None:
         agent._ephemeral_max_output_tokens = None
     return ephemeral_out
+
+
+def effective_wire_max_output_tokens(agent):
+    """``(cap, enforced)`` for the next request without consuming one-shot state.
+
+    ``cap`` is the output cap the active builder would put on the wire (None when the request
+    omits it and the server applies its own default), resolved by the same helpers the builders
+    call: Anthropic's native ceiling, window clamp and manual-thinking floor; a provider profile's
+    default and the Gemini thinking raise on chat completions. ``enforced`` is whether the endpoint
+    rejects ``input + cap > window`` up front rather than stopping generation at the window."""
+    selected = selected_max_output_tokens(agent)
+    api_mode = getattr(agent, "api_mode", None)
+    window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    if api_mode == "anthropic_messages":
+        from agent.anthropic_adapter import anthropic_validates_output_against_window, anthropic_wire_output_cap
+        reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
+        cap = anthropic_wire_output_cap(
+            agent.model, selected, reasoning, context_length=window,
+            base_url=getattr(agent, "_anthropic_base_url", None), preserve_dots=agent._anthropic_preserve_dots())
+        return cap, anthropic_validates_output_against_window(agent.model)
+    if api_mode == "chat_completions":
+        from agent.transports.chat_completions import resolve_chat_max_tokens
+        profile_max = None
+        with contextlib.suppress(Exception):
+            from providers import get_provider_profile
+            profile = get_provider_profile(agent.provider)
+            profile_max = profile.get_max_tokens(agent.model) if profile else None
+        reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
+        cap = resolve_chat_max_tokens(agent.model, reasoning, None, selected, profile_max)
+        return (cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else None), True
+    return (selected if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0 else None), True
 
 
 def _anthropic_fast_route_supported(agent) -> bool:
@@ -1394,10 +1436,11 @@ def _anthropic_fast_route_supported(agent) -> bool:
 
 def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
     ctx_len = getattr(agent, "context_compressor", None)
-    ephemeral_out = _consume_ephemeral_max_output(agent)
+    output_cap = selected_max_output_tokens(agent)
+    _consume_ephemeral_max_output(agent)
     anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
-        max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
+        max_tokens=output_cap,
         reasoning_config=reasoning_config, is_oauth=agent._is_anthropic_oauth,
         preserve_dots=agent._anthropic_preserve_dots(),
         context_length=ctx_len.context_length if ctx_len else None,
@@ -1438,12 +1481,13 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
             tools_for_api, _ = strip_slash_enum(tools_for_api)
         except Exception as exc:
             logger.warning("%s⚠️ Failed to sanitize tool schemas for xAI: %s", getattr(agent, "log_prefix", ""), exc)
-    ephemeral_out = _consume_ephemeral_max_output(agent)
+    output_cap = selected_max_output_tokens(agent)
+    _consume_ephemeral_max_output(agent)
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
         cache_scope_id=cache_scope_id, base_url=agent.base_url,
-        max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
+        max_tokens=output_cap,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
@@ -1480,6 +1524,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         from providers import get_provider_profile
         _profile = get_provider_profile(agent.provider)
 
+    output_cap = selected_max_output_tokens(agent)
     _ephemeral_out = _consume_ephemeral_max_output(agent)
     from agent.reasoning_carriers import shape_wire_carriers
     api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url)
@@ -1487,7 +1532,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
         tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
-        max_tokens=agent.max_tokens, ephemeral_max_output_tokens=_ephemeral_out,
+        max_tokens=output_cap, ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
         cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,

@@ -1260,6 +1260,7 @@ def run_compress_context_with_progress_timeout(
         # Saturation refusals must hit the same telemetry stream as other failures, or
         # a wedged pool looks like compression simply stopped being attempted.
         if telemetry_agent is not None:
+            telemetry_agent._compression_blocked_transient = "pool_saturated"
             _emit_compression_attempt_telemetry(
                 telemetry_agent, started_at=time.monotonic(), commit_status="aborted", split_status="aborted",
                 failure_class="pool_saturated", include_last_telemetry=False,
@@ -3036,6 +3037,12 @@ def _resolve_compress_call(
     bypass_cooldown: bool,
 ) -> tuple[Callable[..., Any], dict[str, Any]]:
     """Bind ``compress()`` and only the kwargs its signature accepts."""
+    from agent.compression_recovery import recovery_active, resolve_compress_call
+    if recovery_active(agent):
+        return resolve_compress_call(
+            agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force,
+            memory_context=memory_context, bypass_cooldown=bypass_cooldown,
+        )
     compress_fn = agent.context_compressor.compress
     compress_kwargs = _supported_compression_kwargs(
         compress_fn, current_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
@@ -4232,6 +4239,8 @@ def compress_context(
     overflow_reason: The error classifier's reason for the provider rejection an ``"overflow"`` attempt
     recovers from (``"context_overflow"``, ``"payload_too_large"``, ``"long_context_tier"``). Telemetry only.
     """
+    from agent.compression_recovery import recovery_active
+    recovering = recovery_active(agent)
     attempt = _begin_compression_attempt(
         agent, force=force, defer_notification=defer_context_engine_notification, trigger=trigger,
         approx_tokens=approx_tokens, overflow_reason=overflow_reason,
@@ -4258,7 +4267,7 @@ def compress_context(
 
     # All automatic entrypoints honor compressor cooldown/breaker state; hygiene's
     # fresh AIAgent loads the persisted streak via bind_session_state() first.
-    if not force and (block_reason := _automatic_compression_gate_blocks(agent, bypass_cooldown)):
+    if not recovering and not force and (block_reason := _automatic_compression_gate_blocks(agent, bypass_cooldown)):
         _emit_blocked_attempt_telemetry(agent, attempt.started_at, approx_tokens, attempt.seed, block_reason)
         return messages, _existing_system_prompt(agent, system_message)
 
@@ -4273,12 +4282,13 @@ def compress_context(
         agent, message_count=_pre_msg_count, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force
     )
     # After the announce: an expired token's refresh is a blocking network call. Before the probe and summary call.
-    _refresh_main_credential(agent)
+    if not recovering:
+        _refresh_main_credential(agent)
     # Lazy feasibility probe (~400ms cold) on first attempt, not __init__; it sets
     # _compression_warning so status replay still surfaces the warning. Marked checked
     # only after the probe completes (transient failures are swallowed inside). A hard
     # rejection propagates; retire the announced phase first so the client is not left compacting.
-    if not getattr(agent, "_compression_feasibility_checked", False):
+    if not recovering and not getattr(agent, "_compression_feasibility_checked", False):
         try:
             check_compression_model_feasibility(agent)
         except Exception:
@@ -4327,7 +4337,7 @@ def compress_context(
 
     # Another path may have compacted this session in place since construction;
     # re-read breaker state under the lock, not the bind_session_state() snapshot.
-    block_reason = None if force else _automatic_compression_gate_blocks(agent, bypass_cooldown, include_cooldown=False)
+    block_reason = None if force or recovering else _automatic_compression_gate_blocks(agent, bypass_cooldown, include_cooldown=False)
     if block_reason:
         lease.release()
         _emit_blocked_attempt_telemetry(agent, attempt.started_at, approx_tokens, attempt.seed, block_reason)

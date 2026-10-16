@@ -303,6 +303,11 @@ class CompressionFacadeMixin:
                 )
             _mirror_result_onto_live_lists(self, result, messages, direct_path=direct_path)
             _rebind_caller_session_context(self)
+            from agent.compression_recovery import try_hard_window_recovery
+            if not force and not defer_context_engine_notification and verbatim_tail is None:
+                result = try_hard_window_recovery(
+                    self, result[0], system_message, result[1], task_id=task_id,
+                )
             return result
         finally:
             # Remove only THIS attempt's registration. Completion order is not registration

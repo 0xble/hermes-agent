@@ -5,6 +5,7 @@ from pathlib import Path
 from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
+from agent.turn_context import _same_trigger_content
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
     DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
@@ -70,6 +71,13 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     if any(getattr(event, "_hermes_recovery_spool", None) == path
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
+    if data.get("queue_accepted") is True and data.get("message_id") and any(
+        str(event.message_id) == str(data["message_id"])
+        and _same_trigger_content(event.text, data.get("text", ""), data.get("text", ""))
+        and runner._session_key_for_source(event.source) == key
+        for event in getattr(runner, "_startup_restore_queue", ())
+    ):
+        return OTHER_PLATFORM_PENDING  # same logical input, distinct crash/retry spool
     store = runner.session_store
     with store._lock:  # noqa: SLF001 — inspect the same snapshot as the breaker
         store._ensure_loaded_locked()  # noqa: SLF001
@@ -113,12 +121,14 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         if drain_deferred:
             if authorization is None:
                 return None  # transient check failure: keep the only copy for retry
-            logger.warning("Dropping unauthorized drain-deferred message from %s", path)
+            # Legacy drain arrivals are also future input whose only copy may be this spool.
+            from gateway.shutdown_flush import quarantine_pending_spool
+            quarantine_pending_spool(path, "resume owner not authorized")
             if followup:
                 # Never message an origin that is no longer authorized, but still decide visibly.
                 logger.info("Restart recovery outcome: session=%s outcome=%s",
                             key, "skipped:unauthorized:note-unavailable")
-            return DROP_PENDING
+            return False
         return False
     ready = ((runner._delivery_adapter_for(source), source) if drain_deferred else
              runner._auto_resume_ready(entry, require_adapter=False))
@@ -148,7 +158,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
 def _claim_recovered_followup(runner, key, session_id, data, path, source, author_id, recovered_events):
     """Queue the rebuilt follow-up for replay, unless an earlier boot's turn already owns it."""
     followup = data.get("shutdown_follow_up") is True
-    event = _recovered_followup_event(data, source, author_id)
+    event = _recovered_followup_event(data, source, author_id, key=key, session_id=session_id)
     setattr(event, "_hermes_recovered_followup", True)
     setattr(event, "_hermes_recovery_spool", path)
     if followup:
@@ -205,7 +215,7 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
         return False
 
 
-def _recovered_followup_event(data, source, author_id):
+def _recovered_followup_event(data, source, author_id, *, key=None, session_id=None):
     """Rebuild the spooled inbound as a MessageEvent bound to its restored source."""
     from gateway.platforms.event import MessageEvent
     from gateway.session_identity import replace_source
@@ -238,12 +248,20 @@ def _recovered_followup_event(data, source, author_id):
         reply_to_is_own_message=data.get("reply_to_is_own_message") is True,
         internal=bool(data.get("internal", False)),
         allow_gateway_control=bool(data.get("allow_gateway_control", True)),
-        metadata=data.get("metadata") or {},
+        metadata={**(data.get("metadata") or {}), **(
+            {"gateway_session_key": key, "gateway_session_id": session_id,
+             "gateway_session_strict": True} if key and session_id else {}
+        )},
         reply_expected=data["reply_expected"] if isinstance(data.get("reply_expected"), bool) else None,
     )
     if recovery_id is not None:
         setattr(event, "_hermes_recovery_id", recovery_id)
+    setattr(event, "_hermes_queue_checkpoint", data.get("queue_accepted") is True)
+    event._outbox_admission_id = data.get("_outbox_admission_id")
+    event.session_id = data.get("session_id") or session_id
     return event
+
+
 
 
 def recover_pending_shutdown_flush(runner, *, candidates=_NOT_SUPPLIED, platform=None, recovered_events=None) -> int:

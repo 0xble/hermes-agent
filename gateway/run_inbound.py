@@ -26,7 +26,7 @@ from gateway.config import Platform
 from gateway.cron_review import is_review_event
 from gateway.platforms.base import OUTBOUND_FINAL, EphemeralReply, as_command_reply, outbound_class
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run_busy import approval_input_words
+from gateway.run_busy import QUEUE_ADMISSION_FAILURE, approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
@@ -40,7 +40,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -771,12 +771,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     def _hm_merge_pending_for_source(
         self, source: SessionSource, _quick_key: str, event: MessageEvent, *, merge_text: bool = False
-    ) -> None:
-        """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
-        from gateway.platforms.base import merge_pending_message_event
+    ) -> bool:
+        """Merge *event* into the source adapter's pending slot through durable admission."""
+        from gateway.platforms.base import checkpointed_merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
-        if adapter:
-            merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+        return bool(
+            adapter and checkpointed_merge_pending_message_event(
+                adapter._pending_messages, _quick_key, event, merge_text=merge_text,
+            )
+        )
 
     async def _hm_busy_slash_or_photo(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
@@ -807,13 +810,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         # photo-only follow-up; adapter-level batching absorbs them.
         if event.message_type == MessageType.PHOTO:
             logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-            self._hm_merge_pending_for_source(source, _quick_key, event)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event):
+                return True, QUEUE_ADMISSION_FAILURE
             return True, None
         return False, None
 
     def _hm_busy_telegram_grace_queue(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
-    ) -> bool:
+    ) -> Union[bool, str, None]:
         """Queue a Telegram text follow-up that lands within the post-start grace window."""
         _grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
         _grace_state = self._peek_session_state(_quick_key)
@@ -828,18 +832,22 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             time.time() - _started_at, _quick_key,
         )
         if effective_busy_input_mode != "queue":
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):
+                return QUEUE_ADMISSION_FAILURE
         else:
             adapter = self._delivery_adapter_for(source)
             if adapter:
-                self._enqueue_fifo(_quick_key, event, adapter)
+                if self._enqueue_fifo(_quick_key, event, adapter):
+                    return True
+                return QUEUE_ADMISSION_FAILURE
+            return False
         return True
 
     @staticmethod
     def _hm_text_only(event: MessageEvent) -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> None:
+    def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> Optional[str]:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
@@ -853,7 +861,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("PRIORITY steer for session %s", _quick_key)
             return
         logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        if not self._queue_or_replace_pending_event(_quick_key, event):
+            return QUEUE_ADMISSION_FAILURE
+        return None
 
     async def _hm_busy_interrupt(
         self, event: MessageEvent, source: SessionSource, running_agent: Any, _quick_key: str
@@ -894,7 +904,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if self._draining and not self._hm_is_registered_command(event):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
-            self._preserve_drain_event(_quick_key, event)
+            if not self._preserve_drain_event(_quick_key, event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
@@ -907,8 +918,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         ):
             # Same rule as the adapter busy path: an FYI never redirects or interrupts a running turn.
             effective_busy_input_mode = "queue"
-        if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
+        _grace_result = self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode)
+        if _grace_result is True:
             return None
+        if isinstance(_grace_result, str):
+            return _grace_result
 
         _ra_state = self._peek_session_state(_quick_key)
         running_agent = _ra_state.turn.agent if _ra_state else None
@@ -919,15 +933,22 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 await self._pause_goal_for_stop(_quick_key, source)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))
-            self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
+            if event.internal and (
+                getattr(event, "_startup_resume_claim", False)
+                or str(getattr(event, "_outbox_admission_id", "")).startswith("resume:")
+            ):
+                logger.warning("Rejecting duplicate startup-resume admission for session %s", _quick_key)
+                return QUEUE_ADMISSION_FAILURE
+            if not self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True):  # picked up after start
+                return QUEUE_ADMISSION_FAILURE
             return None
         if effective_busy_input_mode == "queue":
             logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
-            self._queue_or_replace_pending_event(_quick_key, event)
+            if not self._queue_or_replace_pending_event(_quick_key, event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         if effective_busy_input_mode == "steer":
-            self._hm_busy_steer(event, running_agent, _quick_key)
-            return None
+            return self._hm_busy_steer(event, running_agent, _quick_key)
         # Subagent protection: an interrupt cascades through ``_active_children`` and aborts
         # in-flight delegate_task work (/stop reached its handler above — still an escape hatch).
         # Compression protection: an interrupt would start a new turn on the pre-rotation parent
@@ -940,7 +961,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             await self._hm_busy_interrupt(event, source, running_agent, _quick_key)
             return None
         logger.info("PRIORITY interrupt demoted to queue for session %s %s", _quick_key, _demote)
-        self._queue_or_replace_pending_event(_quick_key, event)
+        if not self._queue_or_replace_pending_event(_quick_key, event):
+            return QUEUE_ADMISSION_FAILURE
         return None
 
     def _hm_quick_commands(self) -> dict:
@@ -1323,7 +1345,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            if not self._preserve_drain_event(self._session_key_for_source(source), event):
+                return True, QUEUE_ADMISSION_FAILURE, command
             return True, None, command
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -1593,12 +1616,25 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             _orphan_adapter = self._delivery_adapter_for(source)
             if _orphan_adapter is None or getattr(event, "internal", False) or event.get_command():
                 return event, source, is_internal
+            _orphan_queue = self._overflow_queue(_quick_key)
+            _orphan_snapshot = list(_orphan_queue or ())
             _rescued = self._rescue_orphaned_overflow(_quick_key, _orphan_adapter)
             if _rescued is None:
                 return event, source, is_internal
             # Into the slot when the chain was a single orphan (post-turn drain picks it up),
             # otherwise into overflow behind the already-staged next orphan.
-            self._enqueue_fifo(_quick_key, event, _orphan_adapter)
+            _admitted = False
+            try:
+                _admitted = self._enqueue_fifo(_quick_key, event, _orphan_adapter)
+            finally:
+                if not _admitted:
+                    # Rescue is synchronous: restore the exact pre-rescue FIFO and empty slot.
+                    # The current arrival stays this turn, so storage failure cannot lose it.
+                    _orphan_adapter._pending_messages.pop(_quick_key, None)
+                    _orphan_queue[:] = _orphan_snapshot
+            if not _admitted:
+                logger.warning("FIFO orphan rescue deferred for %s: incoming checkpoint failed", _quick_key)
+                return event, source, is_internal
             # Same session key by construction; carry the orphan's own source so reply anchors /
             # thread metadata point at the message actually being answered.
             _rescued_source = getattr(_rescued, "source", None)
@@ -1638,7 +1674,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # here would send it a second time.
             return None
         if self._draining and not self._hm_is_registered_command(event):
-            self._preserve_drain_event(self._session_key_for_source(source), event)
+            if not self._preserve_drain_event(self._session_key_for_source(source), event):
+                return QUEUE_ADMISSION_FAILURE
             return None
         # Expand alias quick commands before the running-session split (fork patch: the idle
         # path re-expands harmlessly since the target is then a resolvable built-in).
@@ -1657,12 +1694,36 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         if _reply is not None:
             return _reply
 
-        from gateway.zero_cut_busy import handle_local_busy, queue_foreign_owner, _NOT_HANDLED
-        if await queue_foreign_owner(self, event, _quick_key):
-            return None
-        _busy_result = await handle_local_busy(self, event, source, _quick_key)
-        if _busy_result is not _NOT_HANDLED:
-            return _busy_result
+        # Evict a leaked/reaped ``_running_agents`` slot before the busy-session fast-path.
+        self._hm_evict_idle_stale_agent(_quick_key)
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        pending_state = self._peek_session_state(_quick_key)
+        if is_internal and id(event) in getattr(self, "_startup_resume_event_ids", set()):
+            logger.warning("Rejecting duplicate startup-resume event for session %s", _quick_key)
+            return QUEUE_ADMISSION_FAILURE
+        owns_startup_claim = (
+            is_internal and getattr(event, "_startup_resume_claim", False) is True
+            and (
+                (
+                    pending_state is not None
+                    and pending_state.turn.event is event
+                    and pending_state.turn.agent is _AGENT_PENDING_SENTINEL
+                )
+                or getattr(self, "_running_agents", {}).get(_quick_key) is _AGENT_PENDING_SENTINEL
+                or _quick_key in getattr(self, "_startup_resume_claimed", set())
+            )
+        )
+        if owns_startup_claim:
+            event._startup_resume_claim = False
+            event._startup_resume_dispatched = True
+        if not owns_startup_claim:
+            from gateway.zero_cut_busy import handle_local_busy, queue_foreign_owner, _NOT_HANDLED
+            if await queue_foreign_owner(self, event, _quick_key):
+                return None
+            _busy_result = await handle_local_busy(self, event, source, _quick_key)
+            if _busy_result is not _NOT_HANDLED:
+                return _busy_result
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:
@@ -1703,7 +1764,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             await self._release_unsettled_loop_tick(event, ran=False)
             return _limit_message
 
+        _startup_resume_dispatched = getattr(event, "_startup_resume_dispatched", False)
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
+        if _startup_resume_dispatched:
+            event._startup_resume_dispatched = True
 
         # A rewrite continues the wake's admission generation. No await may separate this
         # check from sentinel installation, and no rejected wake inherits a successor token.
@@ -1733,6 +1797,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 if _consumed:
                     return _consumer_reply
             try:
+                if getattr(event, "_startup_resume_dispatched", False):
+                    event_ids = getattr(self, "_startup_resume_event_ids", None)
+                    if event_ids is None:
+                        event_ids = self._startup_resume_event_ids = set()
+                    event_ids.add(id(event))
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
@@ -1767,6 +1836,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             # sentinel/agent and lease. Reset/stop release their stale slot before installing a
             # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
             self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+            getattr(self, "_startup_resume_event_ids", set()).discard(id(event))
             # Turn lease is keyed by (routing key, run generation) so this unwind can only free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)

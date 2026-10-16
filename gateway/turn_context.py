@@ -99,6 +99,9 @@ class TurnContext:
     inbound_message_id: Optional[str] = None
     # Recovery-only dedupe key; never use this as a transport/reply identity.
     recovery_id: Optional[str] = None
+    # The queued MessageEvent this turn consumes; its accepted-queue checkpoint is retired once
+    # the agent durably admits the input.
+    queued_event: Any = None
     moa_config: Optional[dict] = None
     title_user_message: Optional[str] = None
     persist_user_message: Optional[Any] = None

@@ -1538,6 +1538,17 @@ class TestIsRateLimitError:
         exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
         assert _is_auth_unavailable_error(exc) is True
 
+    def test_persistent_5xx_is_a_fallback_reason(self):
+        class ServerError(Exception):
+            status_code = 503
+        assert _is_server_error(ServerError("upstream internal error")) is True
+
+    def test_wrapped_auth_unavailable_503_is_a_fallback_reason(self):
+        class RelayAuthUnavailable(Exception):
+            status_code = 503
+        exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
+        assert _is_auth_unavailable_error(exc) is True
+
 
 class TestTryPaymentFallback:
     """_try_payment_fallback skips the failed provider and tries alternatives."""

@@ -109,6 +109,7 @@ class GatewayProbe(GatewayGoalCommandsMixin):
         return object(), 'probe-key'
     def _enqueue_fifo(self, key, event, adapter):
         self.events.append(event)
+        return True
 gw = GatewayProbe()
 event = MessageEvent(text='/goal '+original, message_type=MessageType.TEXT,
                      source=SessionSource(platform=Platform.DISCORD, chat_id='probe', chat_type='dm', user_id='probe'), message_id='goal-probe')

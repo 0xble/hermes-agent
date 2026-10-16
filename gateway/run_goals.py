@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
 from gateway.run_loop_wake import GatewayLoopWakeMixin
+from gateway.run_busy import QUEUE_ADMISSION_FAILURE
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
@@ -633,14 +634,18 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             _quick_key = self._session_key_for_source(source)
             if adapter and _quick_key:
                 # A goal continuation is gateway-authored: a no-change tick may answer NO_REPLY.
-                self._enqueue_fifo(
+                admitted = self._enqueue_fifo(
                     _quick_key, self._synthetic_prompt_event(
                         source, prompt, reply_expected=False, goal_continuation=True,
                         goal_session_id=mgr.session_id, goal_state=mgr.state,
                     ), adapter,
                 )
+                if not admitted:
+                    logger.warning("goal continuation: turn was not admitted to FIFO")
+                    await self._defer_goal_status_notice_after_delivery(source, QUEUE_ADMISSION_FAILURE)
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            logger.warning("goal continuation: enqueue failed: %s", exc)
+            await self._defer_goal_status_notice_after_delivery(source, QUEUE_ADMISSION_FAILURE)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,

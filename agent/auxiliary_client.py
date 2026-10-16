@@ -3381,6 +3381,21 @@ def _is_server_error(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
+def _is_auth_unavailable_error(exc: Exception) -> bool:
+    """A relay-wrapped auth/quota failure can arrive as HTTP 503 instead of 401/429."""
+    status = _exc_http_status(exc)
+    if status != 503:
+        return False
+    text = str(exc).lower()
+    return "auth_unavailable" in text or "no auth available" in text
+
+
+def _is_server_error(exc: Exception) -> bool:
+    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback."""
+    status = _exc_http_status(exc)
+    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
+
+
 _DEFAULT_TRANSIENT_RETRIES = 2
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0  # Backoff base (seconds); overridable so tests can zero it out.
 

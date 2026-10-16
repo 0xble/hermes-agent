@@ -586,8 +586,16 @@ class RecallGuardMiddleware(InboundMiddleware):
         )
         # Set pending + signal directly (bypass handle_message to avoid busy-ack).
         # May overwrite a user message pending in the same ~200ms window — acceptable.
-        adapter._pending_messages[session_key] = MessageEvent(
-            text=recall_text, message_type=MessageType.TEXT, source=cls._build_source(adapter, group_code, from_account), internal=True)
+        from gateway.platforms.base import checkpointed_merge_pending_message_event
+        recall_event = MessageEvent(
+            text=recall_text, message_type=MessageType.TEXT,
+            source=cls._build_source(adapter, group_code, from_account), internal=True,
+        )
+        if not checkpointed_merge_pending_message_event(
+            adapter._pending_messages, session_key, recall_event, replace=True,
+        ):
+            logger.warning("Recall interrupt checkpoint failed for session %s", session_key)
+            return
         active_event = adapter._active_sessions.get(session_key)
         if active_event is not None:
             active_event.set()

@@ -661,6 +661,9 @@ _STREAM_STATE: dict[str, Any] = {
     "_stream_options_unsupported": False,
     # API-facing user message override when it differs from the persisted transcript (voice).
     "_persist_user_message_idx": None,
+    # One-shot, turn-scoped: fired once this turn's input is durably admitted (the gateway
+    # retires the consumed queue checkpoint). See agent.compression_recovery.notify_input_admitted.
+    "_input_admitted_callback": None,
     "_persist_user_message_override": None,
     "_persist_user_message_timestamp": None,
     # Image-to-text fallbacks cached per payload/URL so one tool loop doesn't re-run vision.
