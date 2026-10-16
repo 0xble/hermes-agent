@@ -1081,6 +1081,11 @@ def _await_worker_within_budget(
         # The fence deadline moves: prompt reading on llama-server pushes it back.
         remaining_ceiling = (fence.deadline_monotonic or wait_started + ceiling) - time.monotonic()
         if remaining_ceiling <= 0:
+            # A cooperative worker can observe the deadline, adopt a concurrent transcript tail,
+            # and settle before the host gets here. Preserve that result so the stall ladder can
+            # return the adopted snapshot when no fallback route recovers it.
+            if future.done():
+                return True, future.result()
             return False, None
         # Charge idle budget from LAST PROGRESS, not slice start, or silence could approach 2x the budget.
         since_progress = fence.seconds_since_progress()
