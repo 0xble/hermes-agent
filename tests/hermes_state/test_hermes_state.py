@@ -1425,6 +1425,48 @@ class TestPruneSessions:
         assert db.get_session(child) is not None
 
 
+    def test_prune_guard_walk_terminates_on_parent_cycle(self, db):
+        for sid in ("cycle-a", "cycle-b"):
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        db._conn.execute("UPDATE sessions SET parent_session_id = 'cycle-b' WHERE id = 'cycle-a'")
+        db._conn.execute("UPDATE sessions SET parent_session_id = 'cycle-a' WHERE id = 'cycle-b'")
+        db._conn.execute("UPDATE sessions SET started_at = ?", (time.time() - 200 * 86400,))
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 2
+        assert db.get_session("cycle-a") is None
+        assert db.get_session("cycle-b") is None
+
+    def test_prune_deletes_continuation_before_its_ancestor(self, db, monkeypatch):
+        root, child = "order-root", "order-child"
+        db.create_session(root, source="cli")
+        db.end_session(root, end_reason="compression")
+        for index in range(25):
+            sid = f"order-filler-{index}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+        db.create_session(child, source="cli", parent_session_id=root)
+        db.end_session(child, end_reason="done")
+        base = time.time() - 200 * 86400
+        db._conn.execute("UPDATE sessions SET started_at = ?", (base,))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (base - 10, root))
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (base + 10, child))
+        db._conn.commit()
+
+        deleted_order = []
+        original = db._execute_write
+
+        def recording(fn, *args, **kwargs):
+            result = original(fn, *args, **kwargs)
+            if isinstance(result, list):
+                deleted_order.extend(result)
+            return result
+
+        monkeypatch.setattr(db, "_execute_write", recording)
+        assert db.prune_sessions(older_than_days=90, exclude_active_write_guards=True) == 27
+        assert deleted_order.index(child) < deleted_order.index(root)
+
     def test_prune_skips_active_sessions(self, db):
         db.create_session(session_id="active", source="cli")
         # Backdate but don't end

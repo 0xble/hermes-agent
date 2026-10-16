@@ -335,8 +335,10 @@ class SessionMaintenanceMixin:
         # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
         # a concurrent change therefore turns into a harmless no-op, and the callback remains
         # idempotent under _execute_write's whole-callback retry contract.
+        # Newest first: a continuation starts after its compression ancestor, so it is deleted in an
+        # earlier (or the same) batch and a later recheck can never strand it without its start.
         candidate_rows = self._read_all(
-            f"SELECT s.id FROM sessions s WHERE {where}", where_params)
+            f"SELECT s.id FROM sessions s WHERE {where} ORDER BY s.started_at DESC", where_params)
         candidate_ids = [str(row["id"]) for row in candidate_rows]
         removed_count = 0
 
@@ -354,10 +356,12 @@ class SessionMaintenanceMixin:
                 ).fetchall()
                 session_ids = [str(row["id"]) for row in rows]
                 if exclude_active_write_guards:
+                    # UNION, not UNION ALL: a parent_session_id cycle would otherwise recurse
+                    # forever while this transaction holds the write lock.
                     lineage_rows = conn.execute(
                         f"WITH RECURSIVE lineage(root, id) AS ("
                         f"SELECT id, id FROM sessions WHERE id IN ({ph}) "
-                        f"UNION ALL SELECT lineage.root, child.id FROM sessions child "
+                        f"UNION SELECT lineage.root, child.id FROM sessions child "
                         f"JOIN lineage ON child.parent_session_id = lineage.id) "
                         f"SELECT root, id FROM lineage",
                         requested,
