@@ -251,3 +251,16 @@ def test_drill_home_gets_its_own_slot_labels_not_the_live_ones(tmp_path, monkeyp
     active, standby = get_launchd_slot_labels()
     assert active.startswith("ai.hermes.gateway-") and active != "ai.hermes.gateway"
     assert standby == f"{active}.b"
+
+
+def test_cli_budget_does_not_follow_a_zero_restart_drain_timeout(monkeypatch):
+    """restart_drain_timeout 0 is a valid live setting; it must not abort every handover instantly."""
+    from hermes_cli import gateway_handover
+
+    seen = {}
+    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "0")
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
+                        lambda: {"gateway": {"zero_cut_handover": {"enabled": True}}})
+    monkeypatch.setattr(gateway_handover, "run_handover", lambda **kw: seen.update(kw) or 0)
+    assert gateway_handover.cmd_handover(None) == 0
+    assert seen["timeout"] == gateway_handover.STANDBY_READY_BUDGET_S > 0

@@ -26,6 +26,12 @@ BOT_USERNAME = "brianle_hermes_handover_bot"
 BOT_USER_ID = 8899335561  # @brianle_hermes_handover_bot; the CLI chat list carries id, not username
 TELEGRAM = os.path.expanduser("~/.local/bin/telegram")
 _CHAT_POLL_S = 2.0  # MTProto chat reads are FLOOD_WAIT-limited; poll the observer gently
+ACK = "reply exactly ACK"
+
+
+def _final_re(tag: str, kinds: str = "ACK|DONE") -> "re.Pattern[str]":
+    """One answer line for ``tag``; a reply may carry several such lines (folded mid-turn inbound)."""
+    return re.compile(rf"(?im)^\s*(?:{kinds})\s+{re.escape(tag)}\s*$")
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,11 @@ def _tag(drill: str, number: int, now: float) -> str:
 def _send(effects: Effects, peer: str, drill: str, number: int, instruction: str,
           tags: list[str], message_ids: list[Any] | None = None) -> str:
     tag = _tag(drill, number, effects.clock())
+    if instruction == ACK:
+        # Hermes folds a message that lands mid-turn into that turn and the model then answers the
+        # newest one; asking for one ACK line per tag keeps every admitted inbound visibly answered.
+        instruction = ("reply with one line 'ACK <tag>' for this tag and for every earlier ZC tag "
+                       "in this chat you have not acknowledged yet, nothing else")
     text = f"ZC {drill}-{number} {instruction} {tag}"
     response = effects.send_as_user(peer, text)
     if message_ids is not None:
@@ -635,9 +646,9 @@ def _state_message_evidence(state: Mapping[str, Any], tags: Sequence[str]) -> tu
                 continue
             if role == "user":
                 users[tag] += 1
-            if role == "assistant" and re.search(rf"(?is)\b(?:ACK|DONE)\s+{re.escape(tag)}\b", content):
+            if role == "assistant" and _final_re(tag).search(content):
                 finals[tag] += 1
-            if role == "assistant" and re.search(rf"(?is)^\s*DONE\s+{re.escape(tag)}\s*$", content):
+            if role == "assistant" and _final_re(tag, "DONE").search(content):
                 done[tag] += 1
     return users, finals, done
 
@@ -647,8 +658,7 @@ def assert_evidence(tags: Sequence[str], chat: Any, state: Mapping[str, Any], lo
     """Assert observer replies plus durable state.db rows; logs are never evidence."""
     del logs
     texts = [_message_text(message) for message in _walk_messages(chat)]
-    finals = {tag: [text for text in texts if re.search(
-        rf"(?is)^\s*(?:ACK|DONE)\s+{re.escape(tag)}\s*$", text)] for tag in tags}
+    finals = {tag: [text for text in texts if _final_re(tag).search(text)] for tag in tags}
     users, state_finals, done = _state_message_evidence(state, tags)
     lost = [tag for tag, matches in finals.items() if planned and not matches]
     duplicates = {tag: len(matches) for tag, matches in finals.items() if len(matches) > 1}
@@ -710,8 +720,7 @@ def _wait_chat_finals(effects: Effects, peer: str, tags: Sequence[str], *, timeo
     while attempts < 2400:
         chat = effects.read_chat(peer, max(50, len(tags) * 10))
         texts = [_message_text(message) for message in _walk_messages(chat)]
-        if all(any(re.fullmatch(rf"(?:ACK|DONE) {re.escape(tag)}", text.strip()) for text in texts)
-               for tag in tags):
+        if all(any(_final_re(tag).search(text) for text in texts) for tag in tags):
             return True
         if effects.clock() >= deadline:
             return False
@@ -730,8 +739,7 @@ def _wait_planned_quiescence(effects: Effects, home: Path, peer: str, tags: Sequ
         chat = effects.read_chat(peer, max(50, len(tags) * 10))
         state = dict(effects.read_state_db(home))
         texts = [_message_text(message) for message in _walk_messages(chat)]
-        finals_present = all(any(re.fullmatch(rf"(?:ACK|DONE) {re.escape(tag)}", text.strip())
-                                 for text in texts) for tag in tags)
+        finals_present = all(any(_final_re(tag).search(text) for text in texts) for tag in tags)
         outbox_pending = any(row.get("state", row.get("status", "")).lower() in {"pending", "sending"}
                              for row in (state.get("tables", {}).get("outbox", [])
                                          if isinstance(state.get("tables", {}), Mapping) else [])

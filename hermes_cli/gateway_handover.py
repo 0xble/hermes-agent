@@ -18,6 +18,10 @@ from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY
 from gateway.config import is_zero_cut_handover_enabled
 from hermes_constants import get_hermes_home
 
+# Standby boot-to-ready, A's updater stop (_UPDATER_STOP_TIMEOUT 15s) and promotion. A keeps serving
+# for all of it and is never cut, so this bounds only how long a stuck handover waits before aborting.
+STANDBY_READY_BUDGET_S = 180.0
+
 
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
@@ -246,5 +250,6 @@ def cmd_handover(args) -> int:
     config = load_config_readonly()
     if not is_zero_cut_handover_enabled(config):
         return run_handover(enabled=False, timeout=0)
-    from hermes_cli.gateway import _get_restart_drain_timeout
-    return run_handover(timeout=_get_restart_drain_timeout())
+    # Budget for the standby to boot and for A's updater stop; A serves throughout, so this is not a
+    # drain timeout (restart_drain_timeout can be 0, which aborted every handover instantly).
+    return run_handover(timeout=STANDBY_READY_BUDGET_S)
