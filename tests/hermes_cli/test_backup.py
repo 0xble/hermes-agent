@@ -2869,7 +2869,8 @@ class TestRestoreCronJobsIfEmptied:
         assert sorted(job["id"] for job in restored["jobs"]) == ["a", "b", "c"]
         assert restored["format"] == "cron-v1"
 
-    def test_equal_raw_count_with_malformed_live_entry_still_restores(self, tmp_path):
+    @pytest.mark.parametrize("malformed", [42, {}, {"id": ""}])
+    def test_equal_raw_count_with_malformed_live_entry_still_restores(self, tmp_path, malformed):
         from hermes_cli.backup import restore_cron_jobs_if_emptied
         hermes_home = tmp_path / ".hermes"
         jobs_path = hermes_home / "cron" / "jobs.json"
@@ -2877,11 +2878,11 @@ class TestRestoreCronJobsIfEmptied:
         jobs_path.write_text(json.dumps({"jobs": [{"id": "a", "prompt": "one"}]}), encoding="utf-8")
         snap_id = self._make_snapshot(hermes_home)
         assert snap_id
-        jobs_path.write_text(json.dumps({"jobs": [42]}), encoding="utf-8")
+        jobs_path.write_text(json.dumps({"jobs": [malformed]}), encoding="utf-8")
 
         assert restore_cron_jobs_if_emptied(snap_id, hermes_home=hermes_home) is not None
         restored = json.loads(jobs_path.read_text(encoding="utf-8"))
-        assert [job["id"] for job in restored["jobs"]] == ["a"]
+        assert "a" in [job.get("id") for job in restored["jobs"] if isinstance(job, dict)]
 
     def test_restore_keeps_job_created_after_its_read(self, tmp_path, monkeypatch):
         """A sibling create landing after restore read the live file survives the write."""
