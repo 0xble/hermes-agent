@@ -139,6 +139,15 @@ class SessionMaintenanceMixin:
         parents are closed, not live, so they are not guarded (prune and delete share this)."""
         return {sid for sid in ids if self._write_guards_reject(conn, sid, allow_closed_compression_parent=True)}
 
+    def _holds_guard_readonly(self, conn, sid: str) -> bool:
+        """True when ``sid`` has a compression lock or turn lease whose holder is not provably dead.
+        Never deletes: expiry alone is not proof the holder is gone (a starved refresher renews it)."""
+        from hermes_state import _compression_lock_holder_process_is_dead
+        rows = [conn.execute("SELECT holder FROM compression_locks WHERE session_id = ?", (sid,)).fetchone(),
+                conn.execute("SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
+                             (self._session_turn_lease_key_on_conn(conn, sid),)).fetchone()]
+        return any(row is not None and not _compression_lock_holder_process_is_dead(row["holder"]) for row in rows)
+
     def _write_guards_reject(self, conn, sid: str, **kwargs) -> bool:
         """True when a live turn lease / compression lock protects ``sid``; expired or
         dead-holder guards are reclaimed and fenced as a side effect."""
@@ -330,27 +339,78 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``)."""
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
-        removed_ids: list[str] = []
-        def _do(conn):
-            cursor = conn.execute(f"SELECT s.id FROM sessions s WHERE {where}", where_params)
-            session_ids = {row["id"] for row in cursor.fetchall()}
-            if exclude_active_write_guards:
-                session_ids -= self._guarded_ids(conn, session_ids)
-            if not session_ids:
-                return 0
-            # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
-            for chunk in _id_chunks(session_ids):
-                ph = _placeholders(chunk)
-                conn.execute(f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", chunk)
-                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", chunk)
-                removed_ids.extend(chunk)
-            self._delete_unreferenced_system_prompts(conn)
-            return len(session_ids)
-        count = self._execute_write(_do)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
-        return count
+        # Select outside the write transaction.  The old implementation selected and deleted every
+        # victim inside one BEGIN IMMEDIATE, so a large FTS cascade could hold every foreground writer
+        # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
+        # a concurrent change therefore turns into a harmless no-op, and the callback remains
+        # idempotent under _execute_write's whole-callback retry contract.
+        # Newest first: a continuation starts after its compression ancestor, so it is deleted in an
+        # earlier (or the same) batch and a later recheck can never strand it without its start.
+        candidate_rows = self._read_all(
+            f"SELECT s.id FROM sessions s WHERE {where} ORDER BY s.started_at DESC", where_params)
+        candidate_ids = [str(row["id"]) for row in candidate_rows]
+        removed_count = 0
+
+        # Keep each transaction small enough that message/FTS triggers release the WAL write lock
+        # promptly.  The pause is intentional: without yielding between transactions, a maintenance
+        # loop can reacquire the lock often enough to starve a live turn.
+        batch_size = 25
+        batches = list(_id_chunks(candidate_ids, size=batch_size))
+        for batch_index, requested in enumerate(batches):
+            def _do(conn, requested=requested):
+                ph = _placeholders(requested)
+                rows = conn.execute(
+                    f"SELECT s.id FROM sessions s WHERE {where} AND s.id IN ({ph})",
+                    (*where_params, *requested),
+                ).fetchall()
+                session_ids = [str(row["id"]) for row in rows]
+                if exclude_active_write_guards:
+                    # UNION, not UNION ALL: a parent_session_id cycle would otherwise recurse
+                    # forever while this transaction holds the write lock.
+                    lineage_rows = conn.execute(
+                        f"WITH RECURSIVE lineage(root, id) AS ("
+                        f"SELECT id, id FROM sessions WHERE id IN ({ph}) "
+                        f"UNION SELECT lineage.root, child.id FROM sessions child "
+                        f"JOIN lineage ON child.parent_session_id = lineage.id) "
+                        f"SELECT root, id FROM lineage",
+                        requested,
+                    ).fetchall()
+                    # Reclaim stale guards only on rows this transaction may delete (the victims, as
+                    # before batching). Descendants outside the batch are probed read-only: an expired
+                    # lease can still belong to a live holder whose refresher was starved.
+                    victims = set(session_ids)
+                    guarded = self._guarded_ids(conn, victims) | {
+                        str(row["id"]) for row in lineage_rows
+                        if str(row["id"]) not in victims and self._holds_guard_readonly(conn, str(row["id"]))
+                    }
+                    guarded_roots = {
+                        str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
+                    }
+                    session_ids = [sid for sid in session_ids if sid not in guarded_roots]
+                if not session_ids:
+                    return []
+                ph = _placeholders(session_ids)
+                conn.execute(
+                    f"UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id IN ({ph})",
+                    session_ids)
+                conn.execute(f"DELETE FROM messages WHERE session_id IN ({ph})", session_ids)
+                conn.execute(f"DELETE FROM sessions WHERE id IN ({ph})", session_ids)
+                return session_ids
+
+            batch_removed = self._execute_write(_do) or []
+            removed_count += len(batch_removed)
+            for sid in batch_removed:
+                self._remove_session_files(sessions_dir, sid)
+            if batch_index + 1 < len(batches):
+                time.sleep(0.01)
+
+        if removed_count:
+            while True:
+                deleted_prompts = self._execute_write(
+                    lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100))
+                if not deleted_prompts or deleted_prompts < 100:
+                    break
+        return removed_count
 
     def _page_pragmas(self, names: Tuple[str, ...], fail_msg: str) -> Optional[list]:
         """Integer PRAGMAs over the existing connection (never a byte probe); None + debug log on failure."""

@@ -50,6 +50,33 @@ def test_holder_skipped_by_one_proc_locks_pass_is_still_named(tmp_path, monkeypa
     assert len(lines) == 1 and f"PID {os.getpid()} " in lines[0] and "RESERVED" in lines[0], lines
 
 
+@pytest.mark.platforms("macos")
+def test_non_linux_lock_diagnostic_does_not_claim_holder_released(monkeypatch, tmp_path, caplog):
+    import hermes_state_lockowners
+
+    monkeypatch.setattr(hermes_state_lockowners.sys, "platform", "darwin")
+    monkeypatch.setattr(hermes_state_lockowners, "state_db_write_lock_holders", lambda _path: [])
+    with caplog.at_level("WARNING", logger="hermes_state_lockowners"):
+        hermes_state_lockowners.log_write_lock_holders(tmp_path / "state.db", 60)
+    assert "holder identification unavailable on darwin" in caplog.records[-1].message
+
+
+def test_long_transaction_warning_names_callback_and_pid(tmp_path, monkeypatch, caplog):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        monkeypatch.setattr(SessionDB, "_WRITE_LOCK_WARN_S", 0.0)
+        with caplog.at_level("WARNING", logger="hermes_state"):
+            db._execute_write(lambda conn: None)
+        warning = next(record.message for record in caplog.records
+                       if "held the write lock" in record.message)
+        assert "callback=" in warning
+        assert f"pid={os.getpid()}" in warning
+    finally:
+        db.close()
+
+
 @pytest.mark.platforms("linux")
 def test_live_writer_in_another_process_is_named_by_pid(tmp_path):
     db = tmp_path / "state.db"

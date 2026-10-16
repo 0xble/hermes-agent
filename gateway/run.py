@@ -4704,6 +4704,10 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
     _sess_cfg = (_load_full_config().get("sessions") or {})
     if not (_sess_cfg.get("auto_archive", False) or _sess_cfg.get("auto_prune", False)):
         return
+    if _sess_cfg.get("auto_prune", False) and not _sess_cfg.get("auto_archive", False):
+        from hermes_cli.maintenance_window import deletion_window_open
+        if not deletion_window_open():
+            return
     _adb = acquire()
     try:
         if _sess_cfg.get("auto_archive", False):
@@ -4711,6 +4715,11 @@ def _housekeeping_state_db_maintenance(launch: Optional[Tuple[Path, Path]] = Non
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
         if _sess_cfg.get("auto_prune", False):
+            # Keep the 24-hour throttle unspent until the configured low-I/O window.  This
+            # maintenance path can delete a large FTS cascade and must never do so during the day.
+            from hermes_cli.maintenance_window import deletion_window_open
+            if not deletion_window_open():
+                return
             _adb.maybe_auto_prune_and_vacuum(
                 retention_days=int(_sess_cfg.get("retention_days", 90)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),

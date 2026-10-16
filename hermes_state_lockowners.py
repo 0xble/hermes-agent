@@ -117,6 +117,8 @@ def log_write_lock_holders(db_path, patience_s: float) -> None:
     holders = state_db_write_lock_holders(db_path)
     if holders:
         detail = " | ".join(holders)
+    elif not sys.platform.startswith("linux"):
+        detail = f"write-lock holder identification unavailable on {sys.platform} (requires /proc/locks)"
     else:
         detail = "no write-class lock held at the deadline (the holder released just before it)"
     logger.warning(
