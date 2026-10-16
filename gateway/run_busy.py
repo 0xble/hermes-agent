@@ -19,7 +19,11 @@ from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.response_filters import apply_agent_origin_reply_expectation, is_agent_origin_text
+from gateway.response_filters import (
+    apply_agent_origin_reply_expectation,
+    is_agent_origin_text,
+    is_passive_fyi_relay_event,
+)
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -914,7 +918,14 @@ class GatewayBusySessionMixin:
         if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
             return True
+        passive_fyi = is_passive_fyi_relay_event(
+            event, event.source,
+            enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: False)(event.source)),
+        )
         effective_mode = self._effective_busy_input_mode(event.source)
+        if passive_fyi and effective_mode == "interrupt":
+            # An FYI never redirects or interrupts a running turn; it queues exactly like queue mode.
+            effective_mode = "queue"
         if self._draining:
             # A command not bypassed by the adapter still uses the ordinary busy
             # dispatch path, never the busy-input interrupt/queue lane.

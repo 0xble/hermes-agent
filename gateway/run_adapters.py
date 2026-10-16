@@ -1232,6 +1232,8 @@ class GatewayAdapterLifecycleMixin:
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
+        # Assign (not setdefault) so a profile reload picks up a changed relay.fyi_passive rollback flag.
+        getattr(self, "_relay_fyi_passive_by_profile", {})[profile_name] = profile_runtime_cfg
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "

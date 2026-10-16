@@ -106,6 +106,18 @@ def _relay(text: str = "📈 Build webinar scorecard") -> MessageEvent:
     return MessageEvent(text=f"{text}\n{_RELAY}", source=_SOURCE, message_id="m-relay")
 
 
+def _fyi_relay() -> MessageEvent:
+    return MessageEvent(
+        text=(
+            "📨 Relay title\nBrief\n\nDetails\n"
+            "From: Source Agent · FYI, no action requested\n"
+            "[relay from=hermes:default/source receipt=fyi-1]"
+        ),
+        source=_SOURCE,
+        message_id="m-fyi",
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("opener", [_goal_tick, _boot_resume, _relay], ids=["goal", "resume", "relay"])
 async def test_typed_message_redirects_autonomous_turn(opener) -> None:
@@ -170,3 +182,19 @@ async def test_relay_does_not_preempt_autonomous_turn() -> None:
     assert await runner._handle_active_session_busy_message(_relay("🔄 LPG weekly review failed"), key) is False
     agent.redirect.assert_not_called()
     agent.steer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fyi_relay_queues_without_interrupting_in_interrupt_mode() -> None:
+    runner = _runner()
+    runner._busy_input_mode = runner._busy_text_mode = "interrupt"
+    runner._relay_fyi_passive_enabled = lambda source=None: True
+    agent = _agent()
+    key = _start_turn(runner, _goal_tick(), agent)
+    fyi = _fyi_relay()
+
+    assert await runner._handle_active_session_busy_message(fyi, key) is True
+    agent.interrupt.assert_not_called()
+    agent.redirect.assert_not_called()
+    agent.steer.assert_not_called()
+    assert runner.adapters[Platform.TELEGRAM]._pending_messages[key] is fyi

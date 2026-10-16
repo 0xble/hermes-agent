@@ -3536,6 +3536,7 @@ class GatewayRunner(
         # Secondary-profile busy modes snapshotted at multiplex startup; handlers never reread config.
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
+        self._relay_fyi_passive_by_profile: Dict[str, dict] = {}
         self._busy_text_timing = self._busy_text_timing_from_config(_load_gateway_config())
         self._busy_text_timing_by_profile: Dict[str, tuple[float, float]] = {}
         self._human_delay = self._human_delay_from_config(_load_gateway_config())
