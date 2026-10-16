@@ -2356,13 +2356,6 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
             api_msg.pop("name", None)
         # api_content holds the exact bytes the main loop sent; substituting (not popping)
         # keeps the summary's prefix identical instead of re-prefilling the largest context.
-        # Strict OpenAI-compatible gateways (Fireworks-backed OpenCode Go, Mistral, Moonshot/Kimi) reject
-        # any message key outside the Chat Completions schema. The main loop drops these via
-        # ChatCompletionsTransport.convert_messages(), but the summary path hand-builds messages and calls
-        # chat.completions.create() directly, bypassing the transport — so mirror that sanitization here:
-        # tool_name (SQLite FTS bookkeeping), the codex_* reasoning carriers, timestamp (preserved on
-        # gateway user replay entries for the stale-confirmation expiry check — #47868 rejection class), and
-        # every Hermes-internal underscore-prefixed scaffolding key.
         substitute_api_content(api_msg)
         if needs_sanitize:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
@@ -2484,14 +2477,12 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
 _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthropic_messages": _anthropic_summary_attempt}
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+def handle_max_iterations(agent, messages: list, api_call_count: int, *, tool_cap=None) -> str:
+    """Bounded final-answer completion after an iteration budget or per-turn tool cap."""
+    warning = (f"⚠️  Reached per-turn {tool_cap.tool_name} limit. Requesting final answer..." if tool_cap
+               else f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
     if getattr(agent, "suppress_status_output", False):
-        # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
-        # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this.
-        # Strict machine-readable mode (hermes chat -Q, oneshot, background review): keep diagnostics out of
-        # stdout so wrappers receive only the final assistant content (#93220 class).
+        # Strict machine-readable modes keep diagnostics off stdout, independent of quiet_mode.
         logger.warning(warning)
     else:
         agent._safe_print(warning, diagnostic=True)
@@ -2499,19 +2490,22 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
-    # Shared constant so compaction recognizers can identify this runtime nudge by its stable
-    # content after SessionDB projection strips metadata flags.
+    # Iteration-budget nudges use the stable constant recognized by compaction.
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
-    nudge = append_message(messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
+    request = (tool_cap.message + " Do not call any more tools. Answer the original request from the collected results; "
+               "state any remaining gaps honestly." if tool_cap else MAX_ITERATIONS_SUMMARY_REQUEST)
+    nudge = append_message(messages, {"role": "user", "content": request})
 
+    empty_response = (f"I reached the per-turn limit for {tool_cap.tool_name} and could not generate a final answer "
+                      "from the collected results." if tool_cap else _EMPTY_SUMMARY_RESPONSE)
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
         build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
         attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
-        # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
-        final_response = _EMPTY_SUMMARY_RESPONSE
-        for retry_count in (0, 1):
+        # Iteration summaries retry once if empty; caps allow only one completion.
+        final_response = empty_response
+        for retry_count in ((0,) if tool_cap else (0, 1)):
             text = attempt(retry_count)
             if not text:
                 continue
@@ -2533,10 +2527,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        final_response = empty_response if tool_cap else site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        if tool_cap:
+            messages[:] = [m for m in messages if m is not nudge]  # Request-only, never a persisted human turn.
 
     return final_response
 
