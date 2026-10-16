@@ -7,7 +7,6 @@ without touching a live gateway or launchctl.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import subprocess
 import time
@@ -26,17 +25,8 @@ PROMOTE_TIMEOUT_S = 120.0
 
 
 def _pid_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    from gateway.status import _pid_exists as status_pid_exists
+    return bool(status_pid_exists(pid))
 
 
 @dataclass(frozen=True)

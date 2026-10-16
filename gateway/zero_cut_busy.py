@@ -66,17 +66,8 @@ def clear_stale_active_turn_marker(store: Any, session_key: str, token: str) -> 
 
 
 def _owner_live(pid: int) -> bool:
-    if pid == os.getpid():
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    from gateway.status import _pid_exists
+    return bool(_pid_exists(pid))
 
 
 def _event_id(event: Any) -> Any:
