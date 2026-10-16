@@ -965,8 +965,11 @@ class GatewayAgentCacheMixin:
                 evicted = _cache.pop(session_key, None)
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
+        # Not covered yet: fallback drift and mid-turn /model evict a running agent and return here (leak).
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
+        # No on_session_end here: /model, fallback drift and similar callers continue the SAME session,
+        # and true boundaries (/new, /reset) already ran shutdown_memory_provider() before evicting.
         self._spawn_release_thread(
             self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,
@@ -985,8 +988,10 @@ class GatewayAgentCacheMixin:
         except Exception:
             if not inline_fallback:
                 raise
-            with suppress(Exception):
+            try:
                 ctx.run(self._run_release_in_profile_scope, target, args, session_key)
+            except Exception:
+                logger.warning("Inline release %s failed for %s", name, session_key, exc_info=True)
 
     def _run_release_in_profile_scope(self, target, args: tuple, session_key: Optional[str]) -> None:
         """Call ``target(*args)`` under the profile that OWNS ``session_key``.
@@ -1019,8 +1024,11 @@ class GatewayAgentCacheMixin:
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Commit the live transcript to memory providers before resource-only eviction."""
-        # No external memory provider (``_memory_manager`` None) — nothing to commit.
+        # No external memory provider (``_memory_manager`` None) — nothing to commit. An agent whose
+        # shutdown_memory_provider() already ran (/new cleanup) has fired on_session_end once already.
         if agent is None or not hasattr(agent, "commit_memory_session") or getattr(agent, "_memory_manager", None) is None:
+            return
+        if getattr(agent, "_memory_provider_shutdown", False) is True:
             return
         try:
             messages = getattr(agent, "_session_messages", None)
@@ -1032,17 +1040,55 @@ class GatewayAgentCacheMixin:
         except Exception as _e:
             logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
-    def _commit_then_release_soft(self, agent: Any, key: str) -> None:
+    def _commit_then_release_soft(self, agent: Any, key: str, *, retired: Optional[list] = None) -> None:
         """Commit end-of-session memory (if warranted), then soft-release — on the daemon eviction
         thread. Order matters: commit needs the live memory manager before ``release_clients``."""
         self._commit_memory_before_soft_evict(agent, key)
-        self._release_evicted_agent_soft(agent)
+        self._release_evicted_agent_soft(agent, retired=retired)
 
-    def _release_evicted_agent_soft(self, agent: Any) -> None:
+    @staticmethod
+    def _detach_memory_manager(agent: Any) -> Any:
+        """Detach an evicted agent's memory manager; return it when it still needs ``shutdown_all()``.
+
+        Already removed from the cache, so the next turn builds its own manager. Detaching first means a
+        later soft release or close() cannot retire providers twice, and an agent whose
+        shutdown_memory_provider() already started (``_memory_provider_shutdown``) is left to it: that call holds
+        the manager locally and always finishes with ``shutdown_all()``, even when a timed-out /new cleanup is
+        still inside ``on_session_end``. Shutting it down here instead would retire providers mid-session-end.
+        The read, flag check and detach share shutdown_memory_provider()'s handoff lock, so exactly one side
+        calls ``shutdown_all()``."""
+        from agent.memory_manager import memory_handoff_lock
+        try:
+            lock = memory_handoff_lock(agent)
+        except Exception:  # no instance __dict__ (slotted test double): nothing can race the claim
+            lock = nullcontext()
+        with lock:
+            manager = getattr(agent, "_memory_manager", None)
+            if manager is None:
+                return None
+            with suppress(Exception):
+                agent._memory_manager = None
+            return None if getattr(agent, "_memory_provider_shutdown", False) is True else manager
+
+    @staticmethod
+    def _shutdown_memory_manager(manager: Any) -> None:
+        try:
+            manager.shutdown_all()
+        except Exception:
+            logger.warning("Evicted agent memory shutdown failed", exc_info=True)
+
+    def _release_evicted_agent_soft(self, agent: Any, *, retired: Optional[list] = None) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
-        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance."""
+        resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance.
+        With ``retired``, the detached memory manager is appended for the caller to shut down."""
         if agent is None:
             return
+        manager = self._detach_memory_manager(agent)
+        if manager is not None:
+            if retired is not None:
+                retired.append(manager)
+            else:
+                self._shutdown_memory_manager(manager)
         with suppress(Exception):
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
@@ -1166,15 +1212,26 @@ class GatewayAgentCacheMixin:
     def _release_pressure_batch(self, plan: List[tuple]) -> None:
         """Release a pressure-evicted batch sequentially on one daemon thread, then ``malloc_trim`` so
         RSS actually falls. The plan is drained (``pop`` + ``del``), not iterated, so no local
-        reference pins evicted agents during ``gc.collect`` + trim (else the valve over-evicts)."""
+        reference pins evicted agents during ``gc.collect`` + trim (else the valve over-evicts).
+        Memory managers are detached here but shut down on parallel daemon threads: each bounded
+        ``shutdown_all()`` can join workers for ~20s, which would hold the trim behind the joins."""
         while plan:
             key, agent = plan.pop(0)  # FIFO — evict LRU-first order preserved
+            retired: list = []
             try:
                 # Pressure sweeps run from the unscoped housekeeping watcher: enter each owner's scope.
-                self._run_release_in_profile_scope(self._commit_then_release_soft, (agent, key), key)
-            except Exception as _e:
-                logger.debug("Pressure release failed for %s: %s", key, _e)
+                self._run_release_in_profile_scope(
+                    lambda a, k: self._commit_then_release_soft(a, k, retired=retired), (agent, key), key,
+                )
+            except Exception:
+                logger.warning("Pressure release failed for %s", key, exc_info=True)
             del agent
+            for manager in retired:
+                with suppress(Exception):
+                    self._spawn_release_thread(self._shutdown_memory_manager, (manager,),
+                                               f"agent-pressure-mem-{str(key)[:24]}", inline_fallback=True,
+                                               session_key=key)
+            del retired
         with suppress(Exception):
             from hermes_cli.mem_trim import trim_memory
             trim_memory(force=True, reason="agent_cache_pressure")
