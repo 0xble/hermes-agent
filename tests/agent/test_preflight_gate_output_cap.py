@@ -105,6 +105,8 @@ def test_recovery_compacts_then_continues(monkeypatch):
     assert v.action == "continue"
     assert v.messages == small
     assert v.compression_attempts == 1
+    assert agent._preflight_output_ceiling is None
+    assert agent._ephemeral_max_output_tokens is None
     agent._compress_context.assert_called_once()
 
 
@@ -188,12 +190,32 @@ def test_wire_accurate_tokens_require_anchor_or_native(monkeypatch):
     assert fit.wire_accurate_input_tokens(rough, _BIG, request_pressure_tokens=9_000) == 7_000
 
 
-def test_codex_responses_does_not_price_unsent_output_cap():
+@pytest.mark.parametrize(
+    "provider,base_url,expected",
+    [
+        ("openai-codex", "https://chatgpt.com/backend-api/codex", (None, True)),
+        ("xai", "https://api.x.ai/v1", (32_000, True)),
+        ("github-copilot", "https://models.github.ai/inference", (32_000, True)),
+    ],
+)
+def test_codex_responses_prices_only_caps_sent_by_transport(provider, base_url, expected):
     from agent.chat_completion_helpers import effective_wire_max_output_tokens
 
     agent = SimpleNamespace(api_mode="codex_responses", max_tokens=32_000,
-                            _ephemeral_max_output_tokens=None, _preflight_output_ceiling=None)
-    assert effective_wire_max_output_tokens(agent) == (None, True)
+                            _ephemeral_max_output_tokens=None, _preflight_output_ceiling=None,
+                            provider=provider, base_url=base_url)
+    assert effective_wire_max_output_tokens(agent) == expected
+
+
+def test_length_retry_boost_is_not_reclamped_by_stale_ceiling():
+    from agent.chat_completion_helpers import _consume_ephemeral_max_output
+    from agent.turn_truncation import boosted_output_cap
+
+    agent = SimpleNamespace(api_mode="chat_completions", max_tokens=4_000,
+                            _ephemeral_max_output_tokens=None, _preflight_output_ceiling=5_000)
+    agent._ephemeral_max_output_tokens = boosted_output_cap(agent, 5_000, 1)
+    assert agent._ephemeral_max_output_tokens == 8_000
+    assert _consume_ephemeral_max_output(agent) == 8_000
 
 
 # ---- turn-scoped ceiling on a cached (gateway-reused) agent -------------------------------
@@ -298,6 +320,14 @@ def test_input_retained_is_a_typed_gateway_layer_code():
     surface = build_error_surface_from_result(result)
     assert surface["code"] == "input_retained"
     assert surface["layer"] == "gateway"
+
+
+def test_input_retained_copy_does_not_offer_disabled_compression():
+    from agent.turn_failure_copy import retained_input_result
+
+    result = retained_input_result([], 0, compression_enabled=False)
+    assert "/compress" not in result["final_response"]
+    assert "/new" in result["final_response"]
 
 
 def test_gateway_keeps_session_on_input_retained():

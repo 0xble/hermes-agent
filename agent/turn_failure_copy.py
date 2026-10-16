@@ -22,7 +22,7 @@ SITE_FAILURE_CODES = frozenset({
 })
 
 
-def retained_input_message(*, provider_calls_made: bool) -> str:
+def retained_input_message(*, provider_calls_made: bool, compression_enabled: bool = True) -> str:
     """Explain a retained-input pause without implying that earlier actions were undone."""
     if provider_calls_made:
         lead = (
@@ -31,10 +31,11 @@ def retained_input_message(*, provider_calls_made: bool) -> str:
         )
     else:
         lead = "The complete request cannot safely fit the model window. No provider call was sent."
-    return (
-        f"{lead} This session, its history and accepted input are retained; retry /compress "
-        "when the summary route is available."
-    )
+    if compression_enabled:
+        next_step = "retry /compress when the summary route is available."
+    else:
+        next_step = "automatic compression is disabled; use /new or choose a model with a larger context window."
+    return f"{lead} This session, its history and accepted input are retained; {next_step}"
 
 
 def retained_input_result(
@@ -42,12 +43,15 @@ def retained_input_result(
     api_call_count: int,
     *,
     provider_calls_made: Optional[bool] = None,
+    compression_enabled: bool = True,
     final_response: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the typed result for a preflight pause that retains the accepted input."""
     if provider_calls_made is None:
         provider_calls_made = api_call_count > 0
-    response = final_response or retained_input_message(provider_calls_made=provider_calls_made)
+    response = final_response or retained_input_message(
+        provider_calls_made=provider_calls_made, compression_enabled=compression_enabled,
+    )
     return {
         "final_response": response,
         "messages": messages,

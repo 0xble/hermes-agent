@@ -1426,8 +1426,15 @@ def selected_max_output_tokens(agent):
 def _consume_ephemeral_max_output(agent):
     """Pop the one-shot ephemeral output cap; whichever path builds the request consumes it."""
     ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+    is_retry_boost = bool(getattr(agent, "_ephemeral_output_cap_is_retry_boost", False))
     if ephemeral_out is not None:
         agent._ephemeral_max_output_tokens = None
+    agent._ephemeral_output_cap_is_retry_boost = False
+    if is_retry_boost:
+        # A truncation continuation is deliberately larger than the previous
+        # request. It is already bounded by boosted_output_cap's provider limit;
+        # an older preflight ceiling must not turn it into the same request again.
+        return ephemeral_out
     return _apply_preflight_output_ceiling(agent, ephemeral_out)
 
 
@@ -1440,9 +1447,13 @@ def effective_wire_max_output_tokens(agent):
     default and the Gemini thinking raise on chat completions. ``enforced`` is whether the endpoint
     rejects ``input + cap > window`` up front rather than stopping generation at the window."""
     api_mode = getattr(agent, "api_mode", None)
-    # Codex Responses never sends max_output_tokens/max_tokens on the wire; pricing
-    # a selected local cap would falsely reject a request that the backend accepts.
-    selected = None if api_mode == "codex_responses" else selected_max_output_tokens(agent)
+    # The first-party Codex backend omits max_output_tokens; other Responses routes
+    # (xAI, GitHub) send it through the transport and must be priced accurately.
+    is_codex_backend = False
+    if api_mode == "codex_responses":
+        from agent.codex_responses_adapter import classify_responses_route
+        is_codex_backend = classify_responses_route(agent).is_codex_backend
+    selected = None if is_codex_backend else selected_max_output_tokens(agent)
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import anthropic_validates_output_against_window, anthropic_wire_output_cap

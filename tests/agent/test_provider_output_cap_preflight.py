@@ -57,6 +57,29 @@ def test_anthropic_wire_cap_preserves_manual_thinking_floor():
     assert not anthropic_validates_output_against_window("claude-sonnet-4-5")
 
 
+def test_anthropic_transport_reapplies_turn_ceiling_on_retries():
+    from agent.chat_completion_helpers import _build_anthropic_kwargs
+    from agent.transports.anthropic import AnthropicTransport
+
+    agent = SimpleNamespace(
+        model="claude-3-7-sonnet-20250219", max_tokens=None,
+        _ephemeral_max_output_tokens=None, _preflight_output_ceiling=5_000,
+        _ephemeral_output_cap_is_retry_boost=False, _is_anthropic_oauth=False,
+        context_compressor=SimpleNamespace(context_length=200_000),
+        _get_transport=lambda: AnthropicTransport(),
+        _prepare_anthropic_messages_for_api=lambda messages: messages,
+        _anthropic_preserve_dots=lambda: False,
+        _anthropic_base_url=None,
+    )
+
+    first = _build_anthropic_kwargs(agent, [{"role": "user", "content": "one"}], [], None, {})
+    retry = _build_anthropic_kwargs(agent, [{"role": "user", "content": "two"}], [], None, {})
+    agent._ephemeral_max_output_tokens = 12_000
+    boosted_retry = _build_anthropic_kwargs(agent, [{"role": "user", "content": "three"}], [], None, {})
+
+    assert [first["max_tokens"], retry["max_tokens"], boosted_retry["max_tokens"]] == [5_000] * 3
+
+
 def test_request_fit_prices_tools_and_wire_native_checkpoint():
     tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
     agent = _agent(

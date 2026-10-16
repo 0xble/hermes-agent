@@ -1138,6 +1138,7 @@ def _preflight_hard_window_result(
 
     result = retained_input_result(
         messages, api_call_count, provider_calls_made=api_call_count > 0,
+        compression_enabled=bool(getattr(agent, "compression_enabled", True)),
     )
     agent._persist_session(messages, conversation_history)
     return result

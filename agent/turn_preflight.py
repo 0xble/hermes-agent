@@ -188,6 +188,11 @@ def run_preflight_compression(
                 ))
         else:
             _reset_retry_state_after_compaction(agent)
+            # The old cap was sized for the pre-compaction request. Let the next
+            # preflight pass measure the freed room and arm a fresh ceiling.
+            agent._preflight_output_ceiling = None
+            if not getattr(agent, "_ephemeral_output_cap_is_retry_boost", False):
+                agent._ephemeral_max_output_tokens = None
             # Re-baseline the flush cursor: rotation returns None (child flushes
             # whole); in-place returns list(messages) — None would re-append
             # persisted rows. See conversation_history_after_compression().

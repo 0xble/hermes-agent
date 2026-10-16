@@ -21,6 +21,7 @@ def _clear_preflight_output_state(agent: Any) -> None:
     """Do not carry a failed turn's preflight cap into the cached agent's next turn."""
     agent._preflight_output_ceiling = None
     agent._ephemeral_max_output_tokens = None
+    agent._ephemeral_output_cap_is_retry_boost = False
 
 
 def _arm_output_ceiling(agent: Any, shrunk: int) -> bool:
