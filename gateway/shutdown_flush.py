@@ -824,10 +824,12 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
         # the native transcript/resume owner retains continuation.
         message_id = data.get("message_id") or data.get("_outbox_admission_id")
         if target_db is not None and message_id:
-            from agent.turn_context import _same_trigger_content
+            from agent.message_metadata import raw_input_digest, row_carries_raw_input
             prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
-            if any(not data.get("message_id") or
-                   _same_trigger_content(row.get("content"), data.get("text", ""), data.get("text", ""))
+            # An admission id is a private per-occurrence receipt; a transport id can be reused,
+            # so it also needs the row's raw-input digest (rows hold prepared text, never raw).
+            digest = raw_input_digest(data.get("text", ""))
+            if any(not data.get("message_id") or row_carries_raw_input(row, digest)
                    for row in prior_rows):
                 return True
         if deferred_followup is None:

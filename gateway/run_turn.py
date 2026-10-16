@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.message_metadata import RAW_INPUT_DIGEST, raw_input_digest
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -1997,6 +1998,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
+        _user_entry.setdefault("display_metadata", {})[RAW_INPUT_DIGEST] = raw_input_digest(
+            getattr(event, "_hermes_raw_input_text", getattr(event, "text", "")))
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         elif getattr(event, "_hermes_recovery_id", None):
@@ -2035,13 +2038,19 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             row["display_kind"] = persist_user_display_kind
         if isinstance(persist_user_display_metadata, dict):
             row["display_metadata"] = dict(persist_user_display_metadata)
+        # Recovery identity rides the row as the RAW input digest the caller stamped from the
+        # event; ``message``/content are prepared text and never a recovery identity. Without a
+        # stamp the probe keeps the legacy id-only contract.
+        digest = (row.get("display_metadata") or {}).get(RAW_INPUT_DIGEST)
         if platform_message_id is not None:
             probe = getattr(store, "has_platform_message_id", None)
             if callable(probe):
-                already_present = probe(
-                    session_id, str(platform_message_id),
-                    row["content"], row["content"],
-                )
+                if digest is None:
+                    # No digest means a legacy row: platform/recovery id alone is the
+                    # compatibility identity. Never compare prepared content here.
+                    already_present = probe(session_id, str(platform_message_id))
+                else:
+                    already_present = probe(session_id, str(platform_message_id), raw_input_digest=digest)
                 if inspect.isawaitable(already_present):
                     already_present = await already_present
                 if already_present:
@@ -2118,7 +2127,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 elif (
                     event.message_id
                     and await store.has_platform_message_id(
-                        sid, str(event.message_id), _user_row.get("content"), _user_row.get("content")
+                        sid, str(event.message_id),
+                        raw_input_digest=_user_row["display_metadata"][RAW_INPUT_DIGEST],
                     )
                 ):
                     logger.info(
@@ -2641,6 +2651,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
+                    RAW_INPUT_DIGEST: raw_input_digest(
+                        getattr(event, "_hermes_raw_input_text", event.text)),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -4546,6 +4558,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
+                    **({RAW_INPUT_DIGEST: raw_input_digest(
+                        getattr(pending_event, "_hermes_raw_input_text", pending_event.text))}
+                       if pending_event is not None else {}),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )
         except asyncio.CancelledError:

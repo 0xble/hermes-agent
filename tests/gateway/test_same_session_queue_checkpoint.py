@@ -6,6 +6,7 @@ from gateway import shutdown_flush
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import build_session_key
 from hermes_state import SessionDB
+from agent.message_metadata import RAW_INPUT_DIGEST, raw_input_digest
 from tests.gateway.test_steer_command import _make_runner, _make_source, _session_entry
 
 
@@ -105,7 +106,8 @@ def test_restart_dedup_requires_matching_platform_id_and_content(tmp_path, monke
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("same", "telegram")
-    db.append_message("same", "user", "first version", platform_message_id="101")
+    db.append_message("same", "user", "first version", platform_message_id="101",
+                      display_metadata={RAW_INPUT_DIGEST: raw_input_digest("first version")})
     event = _event("different accepted instruction", "101")
     assert shutdown_flush.checkpoint_queued_event("key", event)
     claimed = []

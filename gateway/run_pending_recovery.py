@@ -5,7 +5,7 @@ from pathlib import Path
 from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
-from agent.turn_context import _same_trigger_content
+from agent.message_metadata import raw_input_digest
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
     DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
@@ -73,7 +73,7 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
         return OTHER_PLATFORM_PENDING  # claimed by this process already
     if data.get("queue_accepted") is True and data.get("message_id") and any(
         str(event.message_id) == str(data["message_id"])
-        and _same_trigger_content(event.text, data.get("text", ""), data.get("text", ""))
+        and raw_input_digest(getattr(event, "_hermes_raw_input_text", event.text)) == raw_input_digest(data.get("text", ""))
         and runner._session_key_for_source(event.source) == key
         for event in getattr(runner, "_startup_restore_queue", ())
     ):
@@ -184,6 +184,8 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
     ``message_id`` is the recovery id for new internal spools, or the real platform id for
     platform-backed events. A missing id means a legacy internal spool, so use its content and
     timestamp only as a compatibility fallback; new spools never take this path.
+    ``content`` is the spool's RAW event text. Durable rows hold gateway-prepared text, so
+    identity is the raw-input digest stamped on the row, never a content comparison.
     """
     if not session_id:
         return False
@@ -203,18 +205,17 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
         except Exception:
             logger.debug("Recovered id-less follow-up durability probe failed for %s", session_id, exc_info=True)
             return False
+    from agent.message_metadata import raw_input_digest
     probe = getattr(store, "has_platform_message_id", None)
     if not callable(probe):
         return False
+    digest = raw_input_digest(content)
     try:
         tip_for = getattr(store, "_compression_tip_for_session_id", None)
         tip = tip_for(session_id) if callable(tip_for) else session_id
         return any(
-            bool(probe(
-                sid, str(message_id),
-                content if content is not None else None,
-                content if content is not None else None,
-            ))
+            bool(probe(sid, str(message_id), raw_input_digest=digest)
+                 if digest is not None else probe(sid, str(message_id), content, content))
             for sid in dict.fromkeys((session_id, tip)) if sid
         )
     except Exception:

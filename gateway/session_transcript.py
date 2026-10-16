@@ -510,12 +510,22 @@ class SessionTranscriptMixin:
             self._transcript_append_failures.pop(session_id, None)
 
     def has_platform_message_id(self, session_id: str, platform_message_id: str,
-                                user_message: Any = None, persist_user_message: Any = None) -> bool:
-        """Whether a persisted user row carries this id, optionally matching logical content."""
+                                user_message: Any = None, persist_user_message: Any = None,
+                                *, raw_input_digest: Optional[str] = None) -> bool:
+        """Whether a persisted user row carries this id.
+
+        With ``raw_input_digest`` (recovery dedupe), a row stamped with a different raw-input
+        digest is a reused id carrying new input; unstamped legacy rows match by id alone.
+        The content arguments are a turn-anchor comparison kept for prepared-vs-prepared callers.
+        """
         db = self._db_for_session_id(session_id)
         if not db:
             return False
         try:
+            if raw_input_digest is not None:
+                from agent.message_metadata import row_carries_raw_input
+                return any(row_carries_raw_input(row, raw_input_digest)
+                           for row in db.get_messages_by_platform_message_id(session_id, platform_message_id))
             if user_message is None and persist_user_message is None:
                 return db.has_platform_message_id(session_id, platform_message_id)
             from agent.turn_context import _same_trigger_content

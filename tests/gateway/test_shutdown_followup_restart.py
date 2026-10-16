@@ -18,6 +18,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_pending_recovery import (
     _defer_followup, _recovered_followup_event, input_already_durable,
 )
+from agent.message_metadata import RAW_INPUT_DIGEST, raw_input_digest
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -213,6 +214,7 @@ def test_restart_recovery_dedupe_requires_matching_trigger_content(tmp_path, mon
     _runner, _adapter, entry, _source = _setup(tmp_path, monkeypatch)
     _runner.session_store.append_to_transcript(entry.session_id, {
         "role": "user", "content": "old trigger", "platform_message_id": "transport-1",
+        "display_metadata": {RAW_INPUT_DIGEST: raw_input_digest("old trigger")},
     })
 
     assert not input_already_durable(
@@ -220,6 +222,12 @@ def test_restart_recovery_dedupe_requires_matching_trigger_content(tmp_path, mon
     )
     assert input_already_durable(
         _runner.session_store, entry.session_id, "transport-1", "old trigger",
+    )
+    _runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "legacy prepared row", "platform_message_id": "legacy-1",
+    })
+    assert input_already_durable(
+        _runner.session_store, entry.session_id, "legacy-1", "new trigger",
     )
 
 

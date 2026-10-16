@@ -10,6 +10,47 @@ from typing import Any, List, Mapping, MutableMapping, Optional, TypeVar
 from agent.conversation_compression_archive import MERGED_DURABLE_ROWS, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS
 
 
+# Recovery identity of a gateway user row: SHA-256 of the stripped RAW inbound event text,
+# stamped into the row's existing ``display_metadata`` (a provider-invisible persisted JSON
+# column, so no schema change). The row's content is gateway-PREPARED text (sender prefix,
+# reply context, media/document notes, @file expansion) and can never equal a spool's raw
+# text, so restart/proxy recovery dedupes on (platform id, raw digest) instead of content.
+RAW_INPUT_DIGEST = "gateway_raw_input_sha256"
+
+
+def raw_input_digest(text: Any) -> Optional[str]:
+    """SHA-256 hex of stripped raw inbound text (``None`` counts as ``""``); ``None`` for non-text."""
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        return None
+    from hashlib import sha256
+    return sha256(text.strip().encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def stored_raw_input_digest(row: Mapping[str, Any]) -> Optional[str]:
+    """The raw-input digest stamped on a persisted row, or ``None`` for a legacy/unstamped row."""
+    metadata = row.get("display_metadata")
+    if isinstance(metadata, str):
+        import json
+        try:
+            metadata = json.loads(metadata)
+        except ValueError:
+            return None
+    digest = metadata.get(RAW_INPUT_DIGEST) if isinstance(metadata, Mapping) else None
+    return digest if isinstance(digest, str) and digest else None
+
+
+def row_carries_raw_input(row: Mapping[str, Any], digest: Optional[str]) -> bool:
+    """Whether a row already matched by platform/recovery id holds this raw input.
+
+    A stamped row must carry the same digest (a reused id with new text is new input). An
+    unstamped legacy row falls back to id-only identity, the pre-digest contract.
+    """
+    stored = stored_raw_input_digest(row)
+    return stored is None or digest is None or stored == digest
+
+
 # These fields describe Hermes' durable record and timeline display, not
 # provider-visible message content. The request builder strips them from every
 # outgoing copy and the token estimator ignores them: one set, so an estimate
