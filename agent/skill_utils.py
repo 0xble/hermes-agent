@@ -2,6 +2,8 @@
 Import-light by design: no tool registry, CLI config, or provider resolution."""
 
 import ast
+import contextlib
+import contextvars
 import hashlib
 import logging
 import os
@@ -620,6 +622,20 @@ def get_untrusted_project_skills_root() -> Optional[Tuple[Path, int]]:
 # write artifacts into the user's checkout).
 _PROJECT_SCAN_SOURCE = "project-local"
 _PROJECT_QUARANTINE_CACHE: Dict[str, bool] = {}  # skill_dir -> quarantined
+# Read-only diagnostics (``hermes cron doctor``) still enforce quarantine but must not persist scan
+# attestations under HERMES_HOME, so they scan uncached inside ``project_skill_scans_read_only()``.
+_PROJECT_SCAN_READ_ONLY: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "project_skill_scan_read_only", default=False)
+
+
+@contextlib.contextmanager
+def project_skill_scans_read_only():
+    """Scope project-skill quarantine checks to uncached, non-persisting scans."""
+    token = _PROJECT_SCAN_READ_ONLY.set(True)
+    try:
+        yield
+    finally:
+        _PROJECT_SCAN_READ_ONLY.reset(token)
 
 
 def is_quarantined_project_skill(skill_md) -> bool:
@@ -633,6 +649,12 @@ def is_quarantined_project_skill(skill_md) -> bool:
         key = str(skill_dir)
     if key in _PROJECT_QUARANTINE_CACHE:
         return _PROJECT_QUARANTINE_CACHE[key]
+    if _PROJECT_SCAN_READ_ONLY.get():
+        try:
+            from tools.skills_guard import scan_skill
+            return scan_skill(skill_dir, source=_PROJECT_SCAN_SOURCE).verdict == "dangerous"
+        except Exception:
+            return True
     try:
         from tools.skills_guard import scan_skill_cached
         from hermes_constants import get_hermes_home

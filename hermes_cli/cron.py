@@ -6,7 +6,7 @@ import re
 import sys
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, cast
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -705,7 +705,7 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
 
 
-def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
+def _cron_doctor_issues_for_job(job: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     issues: List[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
@@ -731,6 +731,8 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
             issues.append(issue)
+    from cron.tool_requirements import job_tool_requirement_issues
+    issues.extend(job_tool_requirement_issues(job, cfg=cfg))
     script = str(job.get("script") or "").strip()
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
@@ -745,8 +747,15 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
 def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
+    try:
+        from hermes_cli.config import _expand_env_vars, _merge_managed_overlay, read_raw_config_readonly
+        raw_cfg = read_raw_config_readonly()
+        expanded_cfg = _expand_env_vars(raw_cfg) if isinstance(raw_cfg, dict) else {}
+        cfg, _ = _merge_managed_overlay(cast(Dict[str, Any], expanded_cfg))
+    except Exception:
+        cfg = {}
     jobs = list_jobs(include_disabled=False)
-    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
+    findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job, cfg))]
     if not findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
         note = f"  Checked {len(jobs)} active job(s)." if jobs else "  No active jobs configured."

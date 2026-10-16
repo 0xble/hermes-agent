@@ -556,7 +556,19 @@ Checks per active job:
   gateway down, or a wedged fire-claim),
 - script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
 - `no_agent` job with no script,
-- configured `workdir` that no longer exists.
+- configured `workdir` that no longer exists,
+- a non-empty `enabled_toolsets` allowlist that cannot perform explicit shell or
+  relay-routing steps in the prompt or an attached on-disk skill. This includes
+  Daily Brief `finding add` commands, shell code blocks, and relay's
+  `Pick the Destination` route. Shell steps need terminal access (including
+  composite toolsets that provide it); relay routing can use terminal CLI
+  access or a relay toolset.
+
+The prompt/tool check is an advisory static scan, not proof that every command
+will work. It leaves unrestricted and script-only jobs alone, never widens a
+job's allowlist, and reads attached skills without executing their templates or
+installing dependencies. After changing operational steps, run doctor and
+reconcile the allowlist or remove the incompatible step.
 
 Doctor never mutates jobs or state — it only reports. Pair it with
 `hermes cron incidents` (durable failure records) and `hermes cron runs`
