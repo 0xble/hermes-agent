@@ -92,6 +92,15 @@ def _fail(runner, reason: str) -> None:
     logger.error("Zero-cut handover refused to release Telegram lock: %s", reason)
 
 
+def handover_runs_followups(runner) -> bool:
+    """True while a released handover owner finishes its chats: unlike a restart drain, the process is
+    not stopping, so a follow-up that landed mid-turn runs here instead of spooling to disk for a
+    successor that only replays the spool at a later restart (found in a real drill)."""
+    state = getattr(runner, "_zero_cut_handover_state", None) or {}
+    stopping = getattr(runner, "_zero_cut_stop_task", None) is not None  # the real stop spools as today
+    return bool(state.get("token_lock_released") and not state.get("failed") and not stopping)
+
+
 def request_handover(runner, main_loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     """Accept once from the control-socket worker and marshal drain work to the loop."""
     if not is_zero_cut_handover_enabled(getattr(runner, "config", None)):

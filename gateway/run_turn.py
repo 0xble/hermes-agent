@@ -35,6 +35,7 @@ from gateway.response_filters import (
     strip_edge_silence_markers,
 )
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
+from gateway.zero_cut_handover_drain import handover_runs_followups
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -4201,7 +4202,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                         pending_event = None
                         pending = None
 
-        if self._draining and (pending_event or pending):
+        if self._draining and (pending_event or pending) and not handover_runs_followups(self):
             # The adapter slot was already dequeued; the shutdown snapshot cannot see it now.
             # Spool before dropping the local reference so startup recovery can replay it.
             from gateway.shutdown_flush import flush_pending_to_file

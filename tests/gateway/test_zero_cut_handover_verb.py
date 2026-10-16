@@ -204,3 +204,37 @@ def test_handover_is_not_idle_while_the_adapter_still_owns_a_chat(attr):
     assert drain.status(runner)["idle"] is True
     getattr(adapter, attr)["agent:main:telegram:dm:1"] = object()
     assert drain.status(runner)["idle"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state, stopping, runs_here", [
+    ({"token_lock_released": True, "failed": None}, False, True),   # released owner finishing its chats
+    ({"token_lock_released": True, "failed": None}, True, False),   # its real stop spools as today
+    ({"token_lock_released": False, "failed": None}, False, False),
+    ({"token_lock_released": True, "failed": "boom"}, False, False),
+    (None, False, False),                                            # ordinary restart drain
+])
+async def test_handover_owner_runs_a_mid_turn_followup_instead_of_spooling_it(monkeypatch, state, stopping, runs_here):
+    """Real drill: a follow-up sent during A's last turn was spooled to disk because handover sets
+    _draining; the successor only replays that spool at its next restart, 4+ minutes later."""
+    from gateway.config import Platform, PlatformConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource, build_session_key
+    from tests.gateway.test_pending_steer_drain import Adapter
+
+    runner = object.__new__(GatewayRunner)
+    runner._draining = True
+    runner._zero_cut_handover_state = state
+    if stopping:
+        runner._zero_cut_stop_task = object()
+    spooled = []
+    monkeypatch.setattr("gateway.shutdown_flush.flush_pending_to_file",
+                        lambda pending, reason: spooled.append(reason) or True)
+    adapter = Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c", user_id="u", chat_type="dm")
+    key = build_session_key(source)
+    runner._enqueue_fifo(key, MessageEvent(text="follow-up", source=source, message_id="m2"), adapter)
+    event, text = await runner._run_agent_drain_pending({"final_response": "done"}, adapter, source, key)
+    assert (text == "follow-up") is runs_here
+    assert (spooled == []) is runs_here
