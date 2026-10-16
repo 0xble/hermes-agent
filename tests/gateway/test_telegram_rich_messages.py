@@ -1239,3 +1239,18 @@ def test_rich_limit_counts_currency_protected_payload():
     assert len(content) <= adapter.RICH_MESSAGE_MAX_CHARS
     assert len(adapter._rich_message_payload(content)["markdown"]) > adapter.RICH_MESSAGE_MAX_CHARS
     assert not adapter._content_fits_rich_limits(content)
+
+
+def test_ptb_bot_wrappers_keep_inline_images_on_rich_path():
+    """A PTB transport wrapper may hide coroutine metadata while still exposing the raw API."""
+    class WrappedPTBBot:
+        __module__ = "telegram.ext"
+
+        def do_api_request(self, method, *, api_kwargs):
+            raise AssertionError(f"not called in capability probe: {method} {api_kwargs}")
+
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    adapter._bot = WrappedPTBBot()
+    content = "Text before.\n\n![Backpack](https://example.com/backpack.jpg)\n\nText after."
+    assert adapter._bot_supports_rich()
+    assert adapter.should_preserve_inline_images(content)

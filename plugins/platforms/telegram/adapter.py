@@ -1744,9 +1744,22 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return len(self._rich_message_payload(content)["markdown"]) <= self.RICH_MESSAGE_MAX_CHARS
 
     def _bot_supports_rich(self) -> bool:
-        """True when ``do_api_request`` is an *async* callable (real Bot or AsyncMock); plain MagicMock
-        and SimpleNamespace bots resolve False → legacy path."""
-        return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
+        """True when the configured bot exposes the raw Bot API request path.
+
+        PTB's real ``Bot`` and ``ExtBot`` expose an async ``do_api_request`` method,
+        but a transport wrapper can bind that method in a way that makes
+        ``inspect.iscoroutinefunction`` return false. Recognize PTB subclasses by
+        their MRO as well, while keeping plain test doubles on the legacy path.
+        """
+        api_request = getattr(self._bot, "do_api_request", None)
+        if inspect.iscoroutinefunction(api_request):
+            return True
+        bot_type = type(self._bot) if self._bot is not None else None
+        return bool(
+            callable(api_request)
+            and bot_type is not None
+            and any(cls.__module__.startswith("telegram.") for cls in bot_type.__mro__)
+        )
 
     _RICH_DETAILS_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
     _RICH_MATH_IN_DETAILS_RE = re.compile(
