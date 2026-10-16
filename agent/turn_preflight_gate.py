@@ -148,22 +148,16 @@ def run_preflight_gate(
             input_tokens=_native_wire_tokens,
         )
     )
-    _anchored_input_leaves_no_room = (
-        getattr(agent, "_request_pressure_anchored", False) is True
-        and _native_wire_tokens is not None and isinstance(window, int) and window > 0
-        and _native_wire_tokens + int(window * 0.05) >= window
-    )
-    # A provider-confirmed input can exceed the configured output cap while still
-    # leaving ample context room. Only anchored input that consumes the window's
-    # framing reserve is a hard-window breach; retain the native/unanchored route's
-    # existing fail-closed behavior.
+    # Once the provider-grounded figure has been measured again after any attempted
+    # output-cap shrink, a remaining fit rejection is a proven wire overflow. The
+    # shared request_fits() check already prices the framing reserve and provider
+    # floors; do not replace that decision with a raw five-percent input heuristic.
+    # Native checkpoint estimates are equally authoritative when the latch is armed:
+    # wire_accurate_input_tokens() has already replaced any stale usage anchor with
+    # the pruned payload figure, so a rejected native request must not fall through.
     _hard_window_preflight = (
-        (_anchored_input_leaves_no_room or (
-            _request_exceeds_window
-            and getattr(agent, "_request_pressure_anchored", False) is not True
-        ))
+        _request_exceeds_window
         and getattr(agent, "api_mode", None) != "codex_app_server"
-        and not _awaiting_checkpoint_usage
     )
     if _hard_window_preflight:
         # Route the proven wire overflow through the same guarded compression path as

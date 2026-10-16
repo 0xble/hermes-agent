@@ -225,12 +225,14 @@ def test_checkpoint_latch_prefers_native_wire_over_stale_anchor(monkeypatch):
 def test_checkpoint_latch_does_not_fail_closed_on_stale_anchor(monkeypatch):
     agent = _agent(
         api_mode="codex_responses",
+        compression_enabled=False,
         context_compressor=_compressor(awaiting_real_usage_after_compression=True),
     )
     agent._compress_context = MagicMock()
     _fits_when(monkeypatch, lambda *_: False, wire_tokens=180_000)
     v = _gate(agent, pressure=180_000)
-    assert v.action == "fallthrough"
+    assert v.action == "return"
+    assert v.result["failure_reason"] == "input_retained"
     agent._compress_context.assert_not_called()
 
 
@@ -263,6 +265,70 @@ def test_anchored_overflow_fails_closed_without_mocking_wire_count(monkeypatch):
     assert result["turn_exit_reason"] == "input_retained"
     assert "compression_exhausted" not in result
     assert agent._preflight_output_ceiling is None
+    agent._compress_context.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("context_length", "input_tokens", "max_tokens"),
+    [(8_000, 5_000, 4_096), (16_000, 13_000, 8_192), (200_000, 188_000, 8_192)],
+)
+def test_anchored_fit_rejection_uses_framing_reserve_not_raw_five_percent(
+    monkeypatch, context_length, input_tokens, max_tokens
+):
+    """Any remaining provider-grounded fit rejection retains the input.
+
+    The first two cases leave less than the useful 4096-token runway. The large-window
+    case is the same class with an 8192-token cap and is the regression for a request
+    that is above the window only after framing reserve and output are priced together.
+    """
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        max_tokens=max_tokens,
+        reasoning_config=None,
+        compression_enabled=False,
+        context_compressor=_compressor(
+            context_length=context_length,
+            threshold_tokens=max(1, context_length // 2),
+        ),
+    )
+    agent._compress_context = MagicMock()
+    messages = [{"role": "user", "content": "short"}]
+    assert fit.wire_accurate_input_tokens(
+        agent, messages, request_pressure_tokens=input_tokens
+    ) == input_tokens
+    assert not fit.request_fits(agent, messages, "", wire=True, input_tokens=input_tokens)
+    v = _gate(agent, messages=messages, pressure=input_tokens)
+    assert v.action == "return"
+    assert v.result["failure_reason"] == "input_retained"
+    agent._compress_context.assert_not_called()
+
+
+def test_anchored_small_window_below_threshold_still_fails_closed_when_attempt_capped(
+    monkeypatch,
+):
+    """Hard fit evidence wins even when automatic compression would stay below threshold."""
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        max_tokens=4_096,
+        reasoning_config=None,
+        compression_enabled=True,
+        context_compressor=_compressor(
+            context_length=8_000,
+            threshold_tokens=7_000,
+            should_compress=lambda _tokens: False,
+        ),
+    )
+    agent._compress_context = MagicMock()
+    messages = [{"role": "user", "content": "short"}]
+    v = _gate(agent, messages=messages, pressure=5_000, attempts=3, max_attempts=3)
+
+    assert v.action == "return"
+    assert v.result is not None
+    assert v.result["failure_reason"] == "input_retained"
     agent._compress_context.assert_not_called()
 
 
@@ -331,6 +397,87 @@ def test_real_checkpoint_latch_still_prefers_native_over_anchor(monkeypatch):
         context_compressor=compressor,
     )
     assert fit.wire_accurate_input_tokens(agent, _BIG, request_pressure_tokens=180_000) == 7_000
+
+
+def test_native_checkpoint_overflow_fails_closed_with_real_wire_estimate():
+    """An armed checkpoint latch does not permit a rejected pruned payload to fall through.
+
+    The native estimator runs against the actual checkpoint conversion and a large retained
+    tail; only the stale usage anchor is omitted. This exercises the production wire figure
+    rather than replacing it with a mocked ``wire_accurate_input_tokens`` result.
+    """
+    agent = _agent(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        model="gpt-5.6",
+        base_url="https://chatgpt.com/backend-api/codex",
+        _base_url_hostname="chatgpt.com",
+        _base_url_lower="https://chatgpt.com/backend-api/codex",
+        codex_responses_native_compaction=True,
+        _codex_reasoning_replay_enabled=True,
+        compression_enabled=True,
+        _request_pressure_anchored=False,
+        context_compressor=_compressor(
+            context_length=200_000,
+            threshold_tokens=100_000,
+            awaiting_real_usage_after_compression=True,
+        ),
+    )
+    agent._compress_context = MagicMock()
+    messages = [
+        {
+            "role": "assistant",
+            "content": "checkpointed",
+            "codex_reasoning_items": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": "blob",
+                    "_issuer_kind": "codex_backend",
+                }
+            ],
+        },
+        {"role": "user", "content": "x" * 760_000},
+    ]
+    native_tokens = fit.wire_accurate_input_tokens(
+        agent, messages, request_pressure_tokens=190_000
+    )
+    assert native_tokens is not None
+    assert 189_000 <= native_tokens <= 191_000
+    assert not fit.request_fits(agent, messages, "", wire=True, input_tokens=native_tokens)
+
+    v = _gate(agent, messages=messages, pressure=190_000, attempts=3, max_attempts=3)
+
+    assert v.action == "return"
+    assert v.result is not None
+    assert v.result["failure_reason"] == "input_retained"
+    assert v.result["turn_exit_reason"] == "input_retained"
+    agent._compress_context.assert_not_called()
+
+
+def test_provider_thinking_floor_blocks_unsafe_shrink(monkeypatch):
+    """A preflight cap never undercuts Anthropic's manual-thinking floor."""
+    agent = _agent(
+        api_mode="anthropic_messages",
+        provider="anthropic",
+        model="claude-3-7-sonnet-20250219",
+        max_tokens=4_096,
+        reasoning_config={"enabled": True, "effort": "medium"},
+        _anthropic_preserve_dots=lambda: False,
+        compression_enabled=False,
+        context_compressor=_compressor(context_length=16_000, threshold_tokens=8_000),
+    )
+    agent._compress_context = MagicMock()
+    messages = [{"role": "user", "content": "short"}]
+    input_tokens = 4_000
+    assert not fit.request_fits(agent, messages, "", wire=True, input_tokens=input_tokens)
+    v = _gate(agent, messages=messages, pressure=input_tokens)
+
+    assert v.action == "return"
+    assert v.result is not None
+    assert v.result["failure_reason"] == "input_retained"
+    assert agent._preflight_output_ceiling is None
+    assert agent._ephemeral_max_output_tokens is None
+    agent._compress_context.assert_not_called()
 
 
 def test_anchored_shrink_uses_wire_tokens_not_rough_estimate(monkeypatch):
