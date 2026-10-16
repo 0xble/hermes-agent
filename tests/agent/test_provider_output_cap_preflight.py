@@ -57,6 +57,32 @@ def test_anthropic_wire_cap_preserves_manual_thinking_floor():
     assert not anthropic_validates_output_against_window("claude-sonnet-4-5")
 
 
+def test_request_fit_does_not_reserve_manual_thinking_floor_on_nonvalidating_claude():
+    agent = _agent(
+        api_mode="anthropic_messages", provider="anthropic", model="claude-sonnet-4-5",
+        max_tokens=4_096, reasoning_config={"enabled": True, "effort": "high"},
+        context_compressor=SimpleNamespace(context_length=200_000),
+        _anthropic_base_url=None, _anthropic_preserve_dots=lambda: False,
+    )
+    messages = [{"role": "user", "content": "near-window request"}]
+
+    assert effective_wire_max_output_tokens(agent) == (20_096, False)
+    assert request_fits(agent, messages, "", wire=True, input_tokens=180_000)
+
+
+def test_request_fit_does_not_reserve_native_default_on_nonvalidating_claude():
+    agent = _agent(
+        api_mode="anthropic_messages", provider="anthropic", model="claude-sonnet-4-6",
+        max_tokens=None, reasoning_config=None,
+        context_compressor=SimpleNamespace(context_length=200_000),
+        _anthropic_base_url=None, _anthropic_preserve_dots=lambda: False,
+    )
+    messages = [{"role": "user", "content": "near-window request"}]
+
+    assert effective_wire_max_output_tokens(agent) == (64_000, False)
+    assert request_fits(agent, messages, "", wire=True, input_tokens=186_000)
+
+
 def test_anthropic_transport_reapplies_turn_ceiling_on_retries():
     from agent.chat_completion_helpers import _build_anthropic_kwargs
     from agent.transports.anthropic import AnthropicTransport

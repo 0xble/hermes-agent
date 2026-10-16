@@ -45,7 +45,7 @@ class NamespaceHost:
             H.sandbox_argv([sys.executable, "-u", str(_AGENT)], writable=[root]),
             env={**env, "HERMES_E2E_NAMESPACE_MODE": "pid" if self._isolated else "home"},
             cwd=str(root), text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=open(root / "ns-agent.stderr", "w"),  # noqa: SIM115 - lives as long as the sandbox
+            stderr=open(root / "ns-agent.stderr", "w"),
             start_new_session=True,
         )
         self._reader = threading.Thread(target=self._read, daemon=True)

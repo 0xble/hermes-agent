@@ -249,7 +249,7 @@ def test_protected_birth_date_refuses_externally_launched_cdp_browser(browser, m
             raise AssertionError('external browser must not resolve a protected field')
 
     monkeypatch.setattr('agent.vault_backends.backend_for_handle', lambda _handle: Backend())
-    result = json.loads(registry.dispatch('browser_vault_fill', {'handle': meta.id}, task_id=task))
+    result = json.loads(registry.dispatch('browser_vault', {'action': 'fill', 'handle': meta.id}, task_id=task))
     assert result['error_type'] == 'private_browser_required'
     assert evaluate(sup, "document.querySelector('[name=dob]').value") == ''
 
@@ -276,7 +276,7 @@ def test_vault_fill_finds_shadow_login_not_unrelated_first_tab(browser, aliased_
     item = get_vault_store().add_item('login', 'synthetic login',
                                     {'identifier': 'test', 'identifier_type': 'username',
                                      'password': 'dummy-live-value'}, origin=login_origin)
-    raw = registry.dispatch('browser_vault_fill', {'handle': item.id}, task_id=task)
+    raw = registry.dispatch('browser_vault', {'action': 'fill', 'handle': item.id}, task_id=task)
     result = json.loads(raw)
     assert result['success'], result
     assert result['filled_fields'] == 1 and result['origin'] == login_origin
@@ -294,7 +294,7 @@ def test_vault_fill_finds_shadow_login_not_unrelated_first_tab(browser, aliased_
     other = get_vault_store().add_item('login', 'absent origin',
                                      {'identifier': 'test', 'identifier_type': 'username',
                                       'password': 'another-dummy'}, origin='https://absent.invalid')
-    refusal = json.loads(registry.dispatch('browser_vault_fill', {'handle': other.id}, task_id=task))
+    refusal = json.loads(registry.dispatch('browser_vault', {'action': 'fill', 'handle': other.id}, task_id=task))
     assert refusal['error_type'] == 'origin_mismatch'
 
 
@@ -320,7 +320,7 @@ def test_card_fill_asks_only_when_a_real_page_can_take_the_card(browser, monkeyp
     monkeypatch.setattr(vault, '_confirm_payment_fill', confirm)
 
     def fill():
-        raw = registry.dispatch('browser_vault_fill', {'handle': card.id}, task_id=task)
+        raw = registry.dispatch('browser_vault', {'action': 'fill', 'handle': card.id}, task_id=task)
         assert '4111111111111111' not in raw and '"123"' not in raw
         return json.loads(raw)
 

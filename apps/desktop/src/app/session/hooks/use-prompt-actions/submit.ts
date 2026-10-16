@@ -778,7 +778,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(bubbleText, undefined, {
+          sessionId = await createBackendSessionForSend(bubbleText, {
             onComposerScopeAssigned: options?.onComposerScopeAssigned
           })
         } catch (err) {

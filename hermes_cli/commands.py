@@ -167,8 +167,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                argument_mode="mixed", busy_policy="dispatch", busy_handler="loop"),
     CommandDef("plan", "Write a markdown implementation plan to .hermes/plans/ without executing anything", "Session",
                args_hint="[task]"),
-    CommandDef("initiate-setup", "Run the first-run setup: learn about you and set Hermes up around you", "Session",
-               aliases=("initiate_setup",)),
     CommandDef("moa", "Run one prompt through the default Mixture of Agents preset, then restore your model", "Session",
                args_hint="<prompt>", busy_policy="defer_until_idle"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",

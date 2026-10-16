@@ -108,6 +108,8 @@ def request_fits(
 
     cap, enforced = effective_wire_max_output_tokens(agent)
     if not enforced:
+        # Non-validating endpoints accept a native/default cap larger than the remaining window
+        # and stop generation at the window. Reserve only an explicitly selected cap there.
         cap = selected_max_output_tokens(agent)
     output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
     if input_tokens is None:

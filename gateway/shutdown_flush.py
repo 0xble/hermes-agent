@@ -55,7 +55,7 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any], file_id: Optional[str] = None) -> Path:
+def _write_payload(flush_dir: Path, payload: dict[str, Any], file_id: Optional[str] = None) -> Path:
     """Atomically write one private, uniquely named recovery payload; return its path.
 
     ``file_id`` lets a caller that already drew the file's uuid reuse it (see ``_flush_value``).
@@ -110,7 +110,7 @@ def _pending_arrival_ts(value: Any, fallback: int) -> int | float:
     return fallback
 
 
-def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
+def flush_pending_to_file(pending: dict[str, Any], *, reason: str = "shutdown") -> int:
     """Serialise non-empty ``_pending_messages`` slots (``MessageEvent`` or str); return count."""
     if not pending:
         return 0
@@ -124,7 +124,7 @@ def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") 
     return flushed
 
 
-def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown") -> int:
+def flush_overflow_to_file(overflow_by_session: dict[str, Any], *, reason: str = "shutdown") -> int:
     """Serialise the FIFO overflow tails (``queued_events``) to disk; return events flushed.
 
     The adapter slot holds the queue head and ``SessionState.conversation.queued_events`` the
@@ -147,7 +147,7 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
     return flushed
 
 
-def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -> Optional[Path]:
+def spool_dropped_transcript_message(session_id: str, message: dict[str, Any]) -> Optional[Path]:
     """Spool a cap-evicted transcript message; ``None`` on failure (callers degrade to drop+log).
 
     Uses the same on-disk pending spool as :func:`flush_pending_to_file` (one atomic JSON payload per
@@ -258,7 +258,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
         # delivery queue already sends the original report on review failure.
         return None
     if hasattr(value, "text"):  # MessageEvent-like object
-        result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        result: dict[str, Any] = {"text": getattr(value, "text", "")}
         for attr in ("message_id", "session_id", "platform", "sender_id", "sender_name", "reply_to", "media",
                      "raw_event"):
             val = getattr(value, attr, None)
@@ -323,7 +323,7 @@ def _sort_number(value: Any) -> float:
     return number if math.isfinite(number) else 0.0
 
 
-def _spool_sort_key(payload: Dict[str, Any], name: str) -> tuple:
+def _spool_sort_key(payload: dict[str, Any], name: str) -> tuple:
     """Drop-order key ``(ts, seq, filename)`` for one spool payload. The live drain and the restart
     pass both sort on it, so they replay a session's files in the same order."""
     # seq is per process (_TRANSCRIPT_SPOOL_SEQ) and ts has one-second resolution, so files two
@@ -468,7 +468,7 @@ def recover_pending_spool(session_db=None, *, session_resolver=None, deferred_fo
     recovered = 0
     # Sessions whose spool replay already failed this pass -> files held back for them. Ordering is a
     # per-session property, so one unhealthy session must not hold back the others.
-    blocked_sessions: Dict[str, int] = {}
+    blocked_sessions: dict[str, int] = {}
     try:
         for path, retained in flush_files:
             if path in _REPLAYED_UNREMOVABLE:
@@ -565,9 +565,9 @@ def _drop_drain_deferred(path: Path, text: str, data: Dict[str, Any], *, keep_ex
     return False
 
 
-def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
+def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
                          session_resolver=None, deferred_followup=None,
-                         blocked_sessions: Dict[str, int]) -> bool | object:
+                         blocked_sessions: dict[str, int]) -> bool | object:
     """Append a flush payload or retain a claimed follow-up until adapter admission."""
     # Cap-dropped transcript payloads carry the full message dict keyed by session_id — replay directly
     # (#78182). This handles spool files that were never drained before a restart.
