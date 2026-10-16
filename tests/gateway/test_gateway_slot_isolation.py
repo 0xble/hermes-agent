@@ -24,9 +24,11 @@ from gateway.control_socket import GatewayControlServer, identify_gateway, query
 
 
 @pytest.fixture(autouse=True)
-def _reset_slot_state():
+def _reset_slot_state(monkeypatch):
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False} if slot == "a" else None)
     yield
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
@@ -97,20 +99,51 @@ def test_slot_defaults_to_a_and_reads_env_at_call_time(monkeypatch):
         assert gateway_slot.get_gateway_slot() == expected
 
 
-def test_slot_pin_is_stable(monkeypatch):
-    gateway_slot.reset_gateway_slot_for_tests()
+def test_role_is_resolved_from_the_other_slot(monkeypatch):
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
-    config = {"gateway": {"zero_cut_handover": {"enabled": True}}}
-    assert gateway_slot.pin_gateway_slot(config) == "b"
-    monkeypatch.delenv("HERMES_GATEWAY_SLOT")
-    assert gateway_slot.effective_gateway_slot() == "b"
-    gateway_slot.reset_gateway_slot_for_tests()
+    queries = []
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: queries.append(slot) or {"standby": False})
+    assert gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}}) == "b"
+    assert zero_cut_standby.is_standby()
+    assert queries == ["a"]
+
+
+def test_start_gateway_pin_without_config_reads_the_home_flag_for_the_role(monkeypatch, tmp_path):
+    """start_gateway pins with config=None; the role must read config.yaml like the slot does, or a
+    slot-b process boots active and fights the live slot for the bot token (found in a real drill)."""
+    (tmp_path / "config.yaml").write_text("gateway:\n  zero_cut_handover:\n    enabled: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot", lambda home, slot, timeout: {"standby": False})
+    assert gateway_slot.pin_gateway_slot(None) == "b"
+    assert zero_cut_standby.is_standby()
+
+
+def test_role_falls_back_to_active_when_other_slot_is_down_or_standby(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "a")
+    for other_status in (None, {"standby": True}):
+        gateway_slot.reset_gateway_slot_for_tests()
+        monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                            lambda home, slot, timeout, result=other_status: result)
+        gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
+        assert not zero_cut_standby.is_standby()
+
+
+def test_flag_off_role_is_active_without_query(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda *args: pytest.fail("flag-off startup must not query the other slot"))
+    gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": False}}})
+    assert not zero_cut_standby.is_standby()
 
 
 def test_standby_readiness_is_local(monkeypatch):
     gateway_slot.reset_gateway_slot_for_tests()
     zero_cut_standby.reset_for_tests()
     monkeypatch.setenv("HERMES_GATEWAY_SLOT", "b")
+    monkeypatch.setattr(gateway_slot, "_query_other_slot",
+                        lambda home, slot, timeout: {"standby": False})
     gateway_slot.pin_gateway_slot({"gateway": {"zero_cut_handover": {"enabled": True}}})
     assert zero_cut_standby.readiness() == {"slot": "b", "standby": True, "ready": False, "deferred": []}
     zero_cut_standby.mark_ready()
@@ -401,6 +434,7 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
         pass
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _not_main = threading.Thread(name="not-main")  # real Thread, created before Thread is faked
     monkeypatch.setattr(gateway_run, "GatewayRunner", FakeRunner)
     monkeypatch.setattr(gateway_run, "_host_attach_or_none", host_attach)
     monkeypatch.setattr(gateway_run, "_claim_host_gateway_role", lambda *a, **k: calls.append("claim"))
@@ -419,8 +453,8 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.setattr(gateway_run, "_settle_and_shutdown_mcp", settle)
     monkeypatch.setattr(gateway_run, "_best_effort", lambda fn, *a, **k: fn())
     monkeypatch.setattr(gateway_run.threading, "Thread", NoopThread)
-    # Not the main thread (so no signal handlers), but still a valid thread for logging records.
-    monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: threading.Thread(name="not-main"))
+    # Not the main thread (so no signal handlers), but a real thread so logging records still build.
+    monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: _not_main)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr("gateway.code_skew.record_boot_fingerprint", lambda: None)
     monkeypatch.setattr("gateway.lifecycle_ledger.record_startup", lambda: calls.append("record_startup"))

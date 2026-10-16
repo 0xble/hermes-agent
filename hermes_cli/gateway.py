@@ -6023,7 +6023,7 @@ def _cmd_guardian(args):
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
-    "status": _cmd_status, "list": _cmd_list, "update": _cmd_update, "guardian": _cmd_guardian, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "status": _cmd_status, "list": _cmd_list, "update": _cmd_update, "guardian": _cmd_guardian, "handover": lambda args: __import__("hermes_cli.gateway_handover", fromlist=["cmd_handover"]).cmd_handover(args), "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
 }
 
 

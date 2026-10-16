@@ -1111,3 +1111,24 @@ def launchd_status(deep: bool = False):
             print()
             print("Recent logs:")
             subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+
+
+# Explicit-label primitives used by zero-cut handover. The command runner is
+# injectable so tests never execute launchctl.
+def _default_launchd_gui_domain() -> str:
+    uid = getattr(os, "getuid", None)
+    if uid is None:
+        raise RuntimeError("launchd is unavailable on this platform")
+    return f"gui/{uid()}"
+
+
+def bootstrap_launchd_label(label: str, plist_path: Path, *, domain: str | None = None, runner=None) -> None:
+    """Bootstrap exactly ``label`` from ``plist_path`` into one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootstrap", domain or _default_launchd_gui_domain(), str(plist_path)])
+
+
+def bootout_launchd_label(label: str, *, domain: str | None = None, runner=None) -> None:
+    """Boot out exactly ``label`` from one launchd domain."""
+    runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
+    runner(["bootout", f"{domain or _default_launchd_gui_domain()}/{label}"])

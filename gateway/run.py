@@ -2209,6 +2209,7 @@ from gateway.run_topics import GatewayTopicThreadsMixin
 from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_result
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
+from gateway.zero_cut_busy import ZeroCutBusyRoutingMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
@@ -3392,7 +3393,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 class GatewayRunner(
     GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
-    GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
+    GatewayShutdownMixin, ZeroCutBusyRoutingMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
     GatewaySessionControlsMixin, GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
@@ -3720,7 +3721,6 @@ class GatewayRunner(
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
         # Per-(bot, guild, text channel, user) transcript dedup: voice/STT can emit one utterance twice.
         self._recent_voice_transcripts: Dict[tuple, List[tuple[float, str]]] = {}
-        # Background tasks kept referenced so they are not garbage-collected mid-execution.
         self._background_tasks: set = set()
         # Event-loop liveness heartbeat: rewritten every 30s while the loop dispatches; supervisors use
         # the file mtime / updated_at to tell "process alive" from "loop frozen".
@@ -5718,12 +5718,7 @@ async def _start_gateway_start_control_socket(runner):
             unserve_profile_verb, serve_profile_verb,
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
-        # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
-        # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
-        # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
-        # cleanly — releasing every venv file handle — instead of being tree-killed mid-turn. Same drain
-        # path as SIGUSR1/service restarts (request_restart(via_service=True)); the updater (or the service
-        # manager) relaunches after the code swap.
+        # pause-for-update asks the updater to drain and exit cleanly; marshal socket-thread calls onto the loop.
         _main_loop = asyncio.get_running_loop()
 
         def _pause_for_update_handler() -> dict:
@@ -5771,6 +5766,7 @@ async def _start_gateway_start_control_socket(runner):
 
         from gateway.cron_review import CronReviewControl
         from gateway import zero_cut_standby as zcs
+        from gateway.zero_cut_handover_drain import request_handover, status as handover_status
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5784,7 +5780,9 @@ async def _start_gateway_start_control_socket(runner):
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
-                           "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result()})
+                           "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
+                           "handover": lambda: request_handover(runner, _main_loop),
+                           "handover-status": lambda: handover_status(runner)})
         if not await _control_server.start():
             _control_server = None
         else:
