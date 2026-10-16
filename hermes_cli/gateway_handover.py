@@ -181,19 +181,23 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
 
     accepted = _query(fx, home, "handover", active_slot)
     if not accepted or accepted.get("accepted") is not True:
-        return _failure(fx, idle_label, f"active gateway refused handover: {accepted or 'no response'}")
+        # A lost answer may still have been accepted, and an accepted handover is not cancellable: the
+        # old slot will release Telegram and exit once idle. Boot the standby out only when the old slot
+        # proves it did not accept; otherwise carry on as accepted.
+        status = _query(fx, home, "handover-status", active_slot)
+        if not (status or {}).get("accepted"):
+            return _failure(fx, idle_label, f"active gateway refused handover: {accepted or 'no response'}")
 
     old_identity, old_status = snapshots[active_slot]
     old_pid = ((old_identity or {}).get("pid") or (old_status or {}).get("pid"))
     state_holder: list[dict[str, Any] | None] = [None]
-    if not _poll(fx, budget_deadline,
-                 lambda: _handover_released(fx, home, state_holder, active_slot, old_pid)):
-        state = state_holder[0]
-        reason = (state or {}).get("failed") or (state or {}).get("reason") or "active gateway failed to release the token lock"
-        return _failure(fx, idle_label, str(reason))
+    # Accepted: the old slot settles and releases with no budget of ours (it is never cut), so wait for
+    # it without a deadline. Only its own reported failure may boot the standby out.
+    _poll(fx, float("inf"), lambda: _handover_released(fx, home, state_holder, active_slot, old_pid))
     handover_state = state_holder[0]
     if (handover_state or {}).get("failed") or (handover_state or {}).get("status") == "failed":
         return _failure(fx, idle_label, str((handover_state or {}).get("failed") or "handover failed"))
+    budget_deadline = _deadline(fx, timeout)  # fresh budget for promotion, after the release
 
     # Promote connects Telegram and opens the shared store, which outlasts a 2s query. A promote whose
     # answer is lost may still have taken effect, so never boot the standby out on silence: ask its

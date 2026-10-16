@@ -37,8 +37,17 @@ def _stores(tmp_path, enabled=True):
 
 
 class _Adapter:
+    """Only the adapter starts session processing (the runner has no such method), so the fake keeps
+    that receiver: a fake runner method once hid a production AttributeError that lost the follow-up."""
+
     def __init__(self):
         self._pending_messages = {}
+        self._active_sessions = {}
+        self.drained = []
+
+    def _start_session_processing(self, event, key):
+        self.drained.append((key, event.message_id))
+        return True
 
 
 class _Runner:
@@ -47,7 +56,6 @@ class _Runner:
         self.config = config
         self.adapters = {"discord": adapter}
         self._zero_cut_busy_keys = set()
-        self.drained = []
         self.agent_admissions = 0
 
     def _queue_or_replace_pending_event(self, key, event):
@@ -60,9 +68,9 @@ class _Runner:
         adapter._overflow = overflow
         return True
 
-    def _spawn_drain_task(self, event, key):
-        self.drained.append((key, event.message_id))
-        return True
+    @property
+    def drained(self):
+        return self.adapters["discord"].drained
 
 
 def test_two_store_direct_marker_read_sees_owner_and_clear(tmp_path):
@@ -225,3 +233,27 @@ def test_flag_off_does_not_read_marker_or_start_watcher(tmp_path, monkeypatch):
             raise AssertionError("watcher started")
 
     StartupProbe()._start_zero_cut_busy_watcher()
+
+
+def test_runner_has_no_drain_method_the_watcher_could_call_by_mistake():
+    from gateway.run import GatewayRunner
+    assert not hasattr(GatewayRunner, "_spawn_drain_task")
+
+
+@pytest.mark.asyncio
+async def test_watcher_leaves_a_follow_up_to_a_live_local_turn(tmp_path):
+    a, b = _stores(tmp_path)
+    entry = a.get_or_create_session(_source())
+    adapter = _Adapter()
+    runner = _Runner(b, b.config, adapter)
+    event = MessageEvent("follow-up", source=_source(), message_id="m-2")
+    adapter._pending_messages[entry.session_key] = event
+    adapter._active_sessions[entry.session_key] = asyncio.Event()  # B's own turn owns the chat
+    runner._zero_cut_busy_keys.add(entry.session_key)
+    task = asyncio.create_task(watch_foreign_queues(runner))
+    await asyncio.wait_for(_wait_for(lambda: not runner._zero_cut_busy_keys), timeout=3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runner.drained == []
+    assert adapter._pending_messages[entry.session_key] is event  # the local turn drains it

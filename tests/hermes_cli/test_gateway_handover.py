@@ -319,3 +319,52 @@ def test_stale_loaded_idle_label_is_booted_out_and_bootstrapped_again(tmp_path):
     kinds = [event[0] for event in events]
     assert kinds[:3] == ["plist", "bootout", "bootstrap"] and len(tries) == 2
     assert events[1][1] == tries[0]  # only the idle label was booted out before the retry
+
+
+def test_slow_release_after_acceptance_never_boots_out_the_standby(tmp_path):
+    """Review: release shared the standby-ready budget, so a slow boot plus a ~15 s updater stop timed
+    out and booted out B while A, having accepted, still released Telegram and exited."""
+    fake, events = FakeGateway(), []
+    clock = [0.0]
+    states = iter([{"accepted": True, "token_lock_released": False}] * 50 +
+                  [{"accepted": True, "token_lock_released": True}])
+    fake.handover_states = states
+    base = _effects(fake, events)
+
+    def sleep(seconds):
+        clock[0] += 1.0  # each poll costs a second: release lands long after the 5 s budget
+        fake.standby_ready = True
+
+    effects = dataclasses.replace(base, monotonic=lambda: clock[0], sleep=sleep)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    assert not any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)
+
+
+def test_lost_handover_answer_that_was_accepted_carries_on(tmp_path):
+    fake, events = FakeGateway(), []
+    real_query = fake.query
+
+    def lossy(home, verb, *, slot, timeout=2.0):
+        answer = real_query(home, verb, slot=slot, timeout=timeout)
+        return None if verb == "handover" else answer  # accepted, but the answer never arrives
+
+    fake.handover_states = iter([{"accepted": True, "token_lock_released": True}] * 5)
+    effects = dataclasses.replace(_effects(fake, events), query=lossy)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    assert not any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)
+
+
+def test_handover_that_was_never_accepted_boots_out_the_standby(tmp_path):
+    fake, events = FakeGateway(), []
+    real_query = fake.query
+
+    def refused(home, verb, *, slot, timeout=2.0):
+        if verb == "handover":
+            return {"accepted": False, "refused": "disabled"}
+        if verb == "handover-status":
+            return {"accepted": False}
+        return real_query(home, verb, slot=slot, timeout=timeout)
+
+    effects = dataclasses.replace(_effects(fake, events), query=refused)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 1
+    assert any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)

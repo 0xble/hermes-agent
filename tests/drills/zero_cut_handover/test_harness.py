@@ -319,3 +319,13 @@ def test_standby_kill_retries_a_pid_still_owned_by_launchd_exec(tmp_path):
                                effects=dataclasses.replace(effects, kill=kill))
     assert result["passed"] is True
     assert attempts == [4343, 4343] and world.killed == [4343]
+
+
+def test_live_suite_refuses_a_wrong_home_before_installing_anything(monkeypatch, tmp_path):
+    """Review: run_suite ran `gateway install` against the supplied home before any guard ran."""
+    monkeypatch.setattr(harness, "LIVE_HOME", tmp_path / "isolated")
+    world = FakeWorld(tmp_path)
+    with pytest.raises(ValueError, match="outside"):
+        harness.run_suite(home=tmp_path / "other", peer="bot", drills="planned", repeat=1,
+                          effects=world.effects(), live=True)
+    assert not any("install" in argv for argv, _bg, _env in world.commands)

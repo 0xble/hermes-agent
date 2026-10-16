@@ -169,13 +169,21 @@ async def watch_foreign_queues(runner: Any) -> None:
                 marker = await asyncio.to_thread(_marker, runner.async_session_store, session_key)
             if marker is not None:
                 continue
+            # No local turn may own the chat: a live local guard drains its own pending slot when its
+            # turn ends, so leave it there. Otherwise start the follow-up exactly like a fresh inbound
+            # (guard + background task) on the adapter that holds it.
+            if session_key in (getattr(adapter, "_active_sessions", None) or {}):
+                keys.discard(session_key)
+                continue
             pending = adapter._pending_messages.pop(session_key, None)
             if pending is None:
                 keys.discard(session_key)
                 continue
-            if runner._spawn_drain_task(pending, session_key):
+            if adapter._start_session_processing(pending, session_key):
                 keys.discard(session_key)
                 _log_route(session_key=session_key, event=pending, marker=None, action="drained")
+            else:
+                adapter._pending_messages.setdefault(session_key, pending)  # keep it for the next poll
 
 
 class ZeroCutBusyRoutingMixin:

@@ -831,6 +831,9 @@ def run_suite(*, home: Path, peer: str, drills: str, repeat: int, effects: Effec
         "crash": ("kill-a-during-drain", "kill-b-after-promotion", "standby-fails-to-boot"),
     }
     names = groups[drills] if drills in groups else groups["planned"] + groups["crash"]
+    home = home.expanduser().resolve()
+    if live or home == LIVE_HOME:
+        safety_guard(home, peer, effects)  # before the install below, the suite's first mutation
     install = _install(effects, home)
     if install.returncode != 0:
         raise RuntimeError(f"gateway install failed: {install.stderr or install.stdout}")
