@@ -2,6 +2,8 @@
 
 Patch identity: `zero-cut-handover`.
 
+Fork-Patch-Backfill: adf8f9ace4f2f1c05c2230edef450a41edf71d06; zero-cut-handover
+
 **Status:** design only. The flag remains disabled; this document does not start or
 migrate a gateway.
 
