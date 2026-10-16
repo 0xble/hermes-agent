@@ -617,6 +617,8 @@ def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_pat
         scheduler._running_job_ids.add(key)
         scheduler._running_registration_owners[key] = owner
         scheduler._external_worker_modes[key] = "scoped"
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
     process = Mock()
     process.poll.return_value = 0
     process.wait.return_value = 0
@@ -632,8 +634,15 @@ def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_pat
             job_id=job_id,
         ) is True
         assert scheduler.try_register_running_job(job_id, owner=object())
+        # The successor is not classified restart-safe by the exited worker's flags.
+        with scheduler._running_lock:
+            assert key not in scheduler._restart_safe_waiter_job_ids
+            assert key not in scheduler._restart_safe_external_worker_job_ids
     finally:
         scheduler.release_running_job(job_id, home=tmp_path)
+        with scheduler._running_lock:
+            scheduler._restart_safe_waiter_job_ids.discard(key)
+            scheduler._restart_safe_external_worker_job_ids.discard(key)
 
 
 def test_live_detached_worker_keeps_claim_until_process_exit(monkeypatch, tmp_path):

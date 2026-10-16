@@ -894,6 +894,9 @@ def release_running_job(
         _external_worker_claims.pop(key, None)
         _scope_isolated_job_ids.discard(key)
         _external_worker_modes.pop(key, None)
+        # A later registration of this key must not inherit restart-safe classification.
+        _restart_safe_waiter_job_ids.discard(key)
+        _restart_safe_external_worker_job_ids.discard(key)
 
 
 def _inflight_min_allowance_minutes() -> float:
