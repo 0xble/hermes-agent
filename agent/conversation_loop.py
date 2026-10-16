@@ -1126,6 +1126,24 @@ def _compression_deferred_result(agent, messages: list[dict], api_call_count: in
     )
 
 
+def _preflight_hard_window_result(
+    agent, messages: List[Dict], conversation_history, api_call_count: int,
+) -> Dict[str, Any]:
+    """Typed fail-closed result for a wire-sized request that still cannot fit.
+
+    This is distinct from compression timeout/exhaustion: the accepted input and
+    session remain retryable, and the gateway must not rotate the session.
+    """
+    from agent.turn_failure_copy import retained_input_result
+
+    result = retained_input_result(
+        messages, api_call_count, provider_calls_made=api_call_count > 0,
+        compression_enabled=bool(getattr(agent, "compression_enabled", True)),
+    )
+    agent._persist_session(messages, conversation_history)
+    return result
+
+
 def _provider_overflow_exhausted_result(
     agent, messages: list[dict], conversation_history, api_call_count: int,
     request_pressure_tokens: int, max_compression_attempts: int,
@@ -1195,6 +1213,12 @@ def _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry):
         agent, api_messages, active_system_prompt)
     _retry.primary_recovery_attempted = False
     _retry.restart_with_rebuilt_messages = True
+    # The previous route's usage no longer describes the rebuilt request. A
+    # compaction latch armed before the switch must not defer the new route's
+    # first preflight; its first usage reading rearms the latch if needed.
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None:
+        compressor.awaiting_real_usage_after_compression = False
     return active_system_prompt
 
 
@@ -1582,7 +1606,11 @@ def _run_conversation_turn(
         )
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
-    # in-place boundary would make a later uncompressed result look compacted.
+    # in-place boundary would make a later uncompressed result look compacted. A shrink
+    # arms the one-shot ephemeral cap beside the ceiling; an exception before the request
+    # builder consumes it must not silently cap the next turn.
+    from agent.turn_preflight_gate import _clear_preflight_output_state
+    _clear_preflight_output_state(agent)
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
@@ -1764,6 +1792,8 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            from agent.turn_preflight_gate import _clear_preflight_output_state
+            _clear_preflight_output_state(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

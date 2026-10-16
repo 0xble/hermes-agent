@@ -87,6 +87,7 @@ _NON_OVERFLOW_REASONS = frozenset({
     FailoverReason.upstream_blocked.value,
     FailoverReason.model_entitlement.value,
     FailoverReason.model_not_found.value,
+    "input_retained",
 })
 
 

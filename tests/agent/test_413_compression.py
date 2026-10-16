@@ -1384,7 +1384,7 @@ class TestPreflightCompression:
         with (
             patch(
                 "agent.codex_responses_adapter.estimate_native_responses_preflight_tokens",
-                return_value=1_300_000,
+                return_value=1_300,
             ),
             patch.object(agent, "_run_codex_stream", return_value=response) as provider,
             patch.object(agent, "_compress_context") as local_compress,

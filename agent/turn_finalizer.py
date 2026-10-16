@@ -811,4 +811,6 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+    from agent.turn_preflight_gate import _clear_preflight_output_state
+    _clear_preflight_output_state(agent)
     return result
