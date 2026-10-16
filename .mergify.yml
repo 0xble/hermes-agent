@@ -1,0 +1,54 @@
+# Merge queue for main.
+#
+# Admission is explicit. After the reviewed head passes its exact local gate,
+# the lander verifies an approving review receipt and posts the commit status
+# `landing/reviewed-gated` on that exact SHA before marking the PR ready and
+# commenting `@mergifyio queue`. Later pushes carry no such status. There is no
+# `autoqueue` and no `merge_protections_settings.auto_merge_conditions`, so a
+# green check never queues a PR by itself, and a dequeued PR never rejoins on
+# its own.
+#
+# A ready PR's bounded `pr-checks` (./bin/ci preflight on its exact head) only
+# admits it. Mergify folds queued PRs onto current main as a draft batch PR from
+# a mergify/merge-queue/ branch. The gate workflow runs the full gate on that
+# exact batch head, and main fast-forwards to the tested commit only after
+# `qualification` passes. `qualification` stays the only required check, and
+# branch protection keeps "require up to date".
+#
+# Bootstrap: Mergify reads this file from main. Until it is on main there is no
+# queue, and the gate runs the full gate on PRs so this PR can land through the
+# strict non-queue path on its own exact-head `qualification`.
+queue_rules:
+  # `@mergifyio queue` with no name picks the first rule whose queue_conditions
+  # match, so upstream-sync PRs must stay first. They never share a batch.
+  - name: upstream-sync
+    batch_size: 1
+    merge_method: fast-forward
+    branch_protection_injection_mode: merge
+    queue_conditions:
+      - base = main
+      - -draft
+      - head ~= ^(sync|candidate)/
+      # Admission only. Merging still needs the full gate below.
+      - check-success = pr-checks
+      # Commit statuses and check runs both use check-success in Mergify.
+      - check-success = landing/reviewed-gated
+    merge_conditions:
+      - check-success = qualification
+  - name: default
+    batch_size: 5
+    batch_max_wait_time: 1 min
+    merge_method: fast-forward
+    branch_protection_injection_mode: merge
+    queue_conditions:
+      - base = main
+      - -draft
+      - check-success = pr-checks
+      # Commit statuses and check runs both use check-success in Mergify.
+      - check-success = landing/reviewed-gated
+    merge_conditions:
+      - check-success = qualification
+
+merge_queue:
+  # Fast-forward requires serial checking of one batch at a time.
+  max_parallel_checks: 1
