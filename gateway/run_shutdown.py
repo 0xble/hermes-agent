@@ -2470,7 +2470,13 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         # Detach-on-deadline rather than wait_for: a transport may swallow cancellation.
         from gateway.run import GatewayRunner
         notice_started = time.monotonic()
-        notice_task = asyncio.create_task(self._notify_active_sessions_of_shutdown())
+        # A completed zero-cut handover stops only after its last turn, with the successor serving:
+        # nothing is interrupted, so a "shutting down" notice would be a false alarm.
+        _handover = getattr(self, "_zero_cut_handover_state", None) or {}
+        if _handover.get("token_lock_released") and not _handover.get("failed"):
+            notice_task = asyncio.create_task(asyncio.sleep(0))
+        else:
+            notice_task = asyncio.create_task(self._notify_active_sessions_of_shutdown())
         if not await GatewayRunner._wait_or_detach(notice_task, 3.0):
             logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
         else:

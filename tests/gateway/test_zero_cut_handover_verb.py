@@ -1,6 +1,8 @@
 """Focused tests for the active-side zero-cut handover verb."""
 
 import asyncio
+
+import pytest
 from types import SimpleNamespace
 
 from gateway.config import GatewayConfig
@@ -149,3 +151,39 @@ def test_handover_verb_refuses_disabled_and_standby(monkeypatch):
         assert request_handover(standby, loop) == {"accepted": False, "refused": "standby"}
     finally:
         loop.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state, notified", [
+    ({"token_lock_released": True, "failed": None}, False),   # completed handover: nothing is cut
+    ({"token_lock_released": False, "failed": None}, True),   # ordinary stop keeps today's notice
+    ({"token_lock_released": True, "failed": "boom"}, True),
+    (None, True),
+])
+async def test_completed_handover_stop_sends_no_shutting_down_notice(monkeypatch, state, notified):
+    """Found in a real drill: the old slot exited after its last turn and still told the chat
+    'Hermes is shutting down — your current task will be interrupted', a false alarm."""
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    runner = object.__new__(GatewayShutdownMixin)
+    runner._restart_requested = False
+    runner._running = True
+    runner._draining = False
+    runner._zero_cut_handover_state = state
+    runner._running_agents = {}
+    runner._clear_plugin_message_injector = lambda: None
+    runner._mark_api_runs_shutdown_requested = lambda: None
+    runner._cancel_secondary_profile_reconnect_tasks = lambda: asyncio.sleep(0)
+    runner._stop_systemd_watchdog = lambda: asyncio.sleep(0)
+    runner._stop_hosted_room_worker = lambda timeout: asyncio.sleep(0, result=True)
+    calls = []
+
+    async def notify(*args, **kwargs):
+        calls.append("notice")
+
+    runner._notify_active_sessions_of_shutdown = notify
+    monkeypatch.setattr("cron.scheduler_review.stop_reviews", lambda: None)
+    ctx = GatewayShutdownMixin._StopContext(deferred_count=lambda: 0, active_agents={}, timed_out=False,
+                                           started_at=0.0)
+    await runner._stop_begin_teardown(ctx)
+    assert (calls == ["notice"]) is notified
