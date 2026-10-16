@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from cron.review import check_contract, parse_decision
+from cron.scheduler_review import _review_wake_text
 
 
 CONTRACT = {
@@ -13,6 +14,10 @@ CONTRACT = {
     "word_cap": 20,
     "silence_markers": ["[SILENT]"],
 }
+
+FIXED = "# Stripe Priorities\n**Focus:** fixed\n## Priorities\n- Correct the plan"
+RERUN = "# Stripe Priorities\n**Focus:** rerun\n## Priorities\n- New provider evidence"
+INVALID = "# Wrong\n## Unknown\n- Invalid correction"
 
 GOOD = """# Stripe Priorities
 **Focus:** billing
@@ -63,10 +68,37 @@ def test_parse_decision(reply, expected):
     assert parse_decision(reply) == expected
 
 
-@pytest.mark.parametrize("reply", ["", "PRESENT\nextra", "FIX", "RERUN", "RERUN\ntwo\nlines"])
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        ("Decision: **PRESENT**", ("PRESENT", "")),
+        ("Here is the verdict:\n```\nPRESENT\n```", ("PRESENT", "")),
+        ("Here is the corrected report:\nFIX:\n" + FIXED, ("FIX", FIXED)),
+        ("RERUN:\nprovider timeout", ("RERUN", "provider timeout")),
+    ],
+)
+def test_parse_decision_accepts_harmless_presentation_wrappers(reply, expected):
+    assert parse_decision(reply) == expected
+
+
+@pytest.mark.parametrize("reply", [
+    "",
+    "PRESENT\\nextra",
+    "PRESENT\\nFIX\\nreport",
+    "FIX",
+    "RERUN",
+    "RERUN\\ntwo\\nlines",
+    "I think PRESENT is correct",
+])
 def test_parse_decision_rejects_unparseable(reply):
     with pytest.raises(ValueError):
         parse_decision(reply)
+
+
+def test_review_prompt_requires_bare_protocol_output():
+    prompt = _review_wake_text("report", CONTRACT)
+    assert "no explanation, label, Markdown fence, bullets, or quotation marks" in prompt
+    assert "RERUN\n<one non-empty reason line>" in prompt
 
 
 @pytest.fixture
@@ -89,11 +121,6 @@ def delivery(monkeypatch):
         sent.append(text)
     monkeypatch.setattr("cron.scheduler_delivery._deliver_result", send)
     return sr, sent, receipts, incidents, reruns
-
-
-FIXED = "# Stripe Priorities\n**Focus:** fixed\n## Priorities\n- Correct the plan"
-RERUN = "# Stripe Priorities\n**Focus:** rerun\n## Priorities\n- New provider evidence"
-INVALID = "# Wrong\n## Unknown\n- Invalid correction"
 
 
 @pytest.mark.parametrize("reply, rerun, maximum, expected, decision", [
