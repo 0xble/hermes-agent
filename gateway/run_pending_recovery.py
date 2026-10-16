@@ -5,7 +5,7 @@ from pathlib import Path
 from functools import partial
 
 from hermes_constants import get_routing_process_hermes_home
-from agent.message_metadata import raw_input_digest
+from agent.message_metadata import event_raw_input_digest, raw_input_digest
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.shutdown_flush import (
     DROP_PENDING, OTHER_PLATFORM_PENDING, payload_media_urls, recover_pending_spool,
@@ -71,9 +71,17 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
     if any(getattr(event, "_hermes_recovery_spool", None) == path
            for event in getattr(runner, "_startup_restore_queue", ())):
         return OTHER_PLATFORM_PENDING  # claimed by this process already
+    spool_metadata = data.get("metadata") or {}
+    spool_digest = (
+        spool_metadata.get("gateway_raw_input_sha256")
+        if isinstance(spool_metadata, dict) else None
+    )
+    if not isinstance(spool_digest, str) or not spool_digest:
+        # Legacy spools have no captured digest; hash only their stored raw text.
+        spool_digest = raw_input_digest(data.get("text", ""))
     if data.get("queue_accepted") is True and data.get("message_id") and any(
         str(event.message_id) == str(data["message_id"])
-        and raw_input_digest(getattr(event, "_hermes_raw_input_text", event.text)) == raw_input_digest(data.get("text", ""))
+        and event_raw_input_digest(event) == spool_digest
         and runner._session_key_for_source(event.source) == key
         for event in getattr(runner, "_startup_restore_queue", ())
     ):
@@ -93,14 +101,19 @@ def _defer_followup(runner, eligible, platform, key, session_id, data, path, *,
 
     followup = data.get("shutdown_follow_up") is True
     candidate_ids = recovered_input_candidate_ids(data.get("recovery_id"), data.get("message_id"))
+    spool_metadata = data.get("metadata") or {}
+    spool_digest = (
+        spool_metadata.get("gateway_raw_input_sha256")
+        if isinstance(spool_metadata, dict) else None
+    )
     durable = followup and (
         any(input_already_durable(
             runner.session_store, session_id, candidate_id,
-            data.get("text"), data.get("_recovery_spool_ts"),
+            data.get("text"), data.get("_recovery_spool_ts"), spool_digest,
         ) for candidate_id in candidate_ids)
         if candidate_ids else input_already_durable(
             runner.session_store, session_id, None,
-            data.get("text"), data.get("_recovery_spool_ts"),
+            data.get("text"), data.get("_recovery_spool_ts"), spool_digest,
         )
     )
     from gateway.run import (
@@ -178,7 +191,7 @@ def recovered_input_candidate_ids(recovery_id=None, message_id=None) -> set:
     return {candidate_id for candidate_id in (recovery_id, message_id) if candidate_id is not None}
 
 
-def input_already_durable(store, session_id, message_id, content=None, spool_ts=None) -> bool:
+def input_already_durable(store, session_id, message_id, content=None, spool_ts=None, raw_digest=None) -> bool:
     """True when a turn already wrote this replayed input as a user row of *session_id*.
 
     ``message_id`` is the recovery id for new internal spools, or the real platform id for
@@ -205,11 +218,13 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
         except Exception:
             logger.debug("Recovered id-less follow-up durability probe failed for %s", session_id, exc_info=True)
             return False
-    from agent.message_metadata import raw_input_digest
     probe = getattr(store, "has_platform_message_id", None)
     if not callable(probe):
         return False
-    digest = raw_input_digest(content)
+    digest = raw_digest
+    if not isinstance(digest, str) or not digest:
+        # Legacy spools predate the captured digest; only those hash their stored raw text.
+        digest = raw_input_digest(content)
     try:
         tip_for = getattr(store, "_compression_tip_for_session_id", None)
         tip = tip_for(session_id) if callable(tip_for) else session_id

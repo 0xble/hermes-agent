@@ -51,6 +51,42 @@ def row_carries_raw_input(row: Mapping[str, Any], digest: Optional[str]) -> bool
     return stored is None or digest is None or stored == digest
 
 
+def event_raw_input_digest(event: Any) -> Optional[str]:
+    """Return the digest captured before gateway preprocessing changed ``event.text``.
+
+    New ingress events carry the digest in metadata. The private raw-text attribute is retained
+    for compatibility with callers that predate the metadata stamp; only legacy events without
+    either marker fall back to their current text.
+    """
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping):
+        digest = metadata.get(RAW_INPUT_DIGEST)
+        if isinstance(digest, str) and digest:
+            return digest
+    raw_text = getattr(event, "_hermes_raw_input_text", None)
+    if raw_text is not None:
+        return raw_input_digest(raw_text)
+    return raw_input_digest(getattr(event, "text", ""))
+
+
+def stamp_event_raw_input_digest(event: Any) -> Optional[str]:
+    """Capture raw ingress identity once, before any routing/media preparation mutates text."""
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, MutableMapping):
+        metadata = {}
+        event.metadata = metadata
+    digest = metadata.get(RAW_INPUT_DIGEST)
+    if not isinstance(digest, str) or not digest:
+        raw_text = getattr(event, "_hermes_raw_input_text", None)
+        if raw_text is None:
+            raw_text = getattr(event, "text", "") or ""
+            event._hermes_raw_input_text = raw_text
+        digest = raw_input_digest(raw_text)
+        if digest is not None:
+            metadata[RAW_INPUT_DIGEST] = digest
+    return digest
+
+
 # These fields describe Hermes' durable record and timeline display, not
 # provider-visible message content. The request builder strips them from every
 # outgoing copy and the token estimator ignores them: one set, so an estimate

@@ -828,7 +828,11 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any], *,
             prior_rows = target_db.get_messages_by_platform_message_id(session_id, str(message_id))
             # An admission id is a private per-occurrence receipt; a transport id can be reused,
             # so it also needs the row's raw-input digest (rows hold prepared text, never raw).
-            digest = raw_input_digest(data.get("text", ""))
+            metadata = data.get("metadata") or {}
+            digest = metadata.get("gateway_raw_input_sha256") if isinstance(metadata, dict) else None
+            if not isinstance(digest, str) or not digest:
+                # Legacy spools predate the captured digest; only those may hash their stored text.
+                digest = raw_input_digest(data.get("text", ""))
             if any(not data.get("message_id") or row_carries_raw_input(row, digest)
                    for row in prior_rows):
                 return True

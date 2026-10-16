@@ -2051,6 +2051,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         model supports native vision; the caller consumes that buffer at ``run_conversation``."""
         if not hasattr(event, "_hermes_raw_input_text"):
             event._hermes_raw_input_text = event.text or ""
+        from agent.message_metadata import stamp_event_raw_input_digest
+        stamp_event_raw_input_digest(event)
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""

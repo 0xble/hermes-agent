@@ -13,6 +13,7 @@ import asyncio
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,6 +187,57 @@ async def test_rapid_text_followups_accumulate_instead_of_replacing():
     pending = adapter._pending_messages[session_key]
     assert pending.text == "part two\npart three"
     assert not adapter._active_sessions[session_key].is_set()
+
+
+@pytest.mark.asyncio
+async def test_debounce_checkpoint_failure_notifies_and_retains_input(monkeypatch):
+    adapter = _make_adapter()
+    event = _make_event("durable burst")
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    ack = AsyncMock()
+    setattr(adapter, "gateway_runner", SimpleNamespace(_send_busy_ack_reply=ack))
+
+    def _fail_checkpoint(*args, **kwargs):
+        raise OSError("injected queue checkpoint failure")
+
+    monkeypatch.setattr("gateway.shutdown_flush._write_payload", _fail_checkpoint)
+    await adapter.handle_message(event)
+    await adapter._flush_text_debounce_now(session_key)
+
+    from gateway.run_busy import QUEUE_ADMISSION_FAILURE
+    ack.assert_awaited_once_with(event, adapter, QUEUE_ADMISSION_FAILURE)
+    assert session_key in adapter._text_debounce
+    assert not event._gateway_accepted
+
+
+@pytest.mark.asyncio
+async def test_debounce_storage_failure_admits_different_sender_independently(monkeypatch):
+    adapter = _make_adapter()
+    first = _make_event("first sender", user_id="sender-a")
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    ack = AsyncMock()
+    enqueue = MagicMock(return_value=True)
+    setattr(
+        adapter,
+        "gateway_runner",
+        SimpleNamespace(_send_busy_ack_reply=ack, _queue_or_replace_pending_event=enqueue),
+    )
+
+    def _fail_checkpoint(*args, **kwargs):
+        raise OSError("injected queue checkpoint failure")
+
+    monkeypatch.setattr("gateway.shutdown_flush._write_payload", _fail_checkpoint)
+    await adapter.handle_message(first)
+    second = _make_event("second sender", user_id="sender-b")
+    await adapter.handle_message(second)
+
+    from gateway.run_busy import QUEUE_ADMISSION_FAILURE
+    ack.assert_awaited_once_with(first, adapter, QUEUE_ADMISSION_FAILURE)
+    enqueue.assert_called_once_with(session_key, second)
+    assert second._gateway_accepted
+    assert session_key in adapter._text_debounce
 
 
 @pytest.mark.asyncio

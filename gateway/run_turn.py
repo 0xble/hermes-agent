@@ -18,7 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
-from agent.message_metadata import RAW_INPUT_DIGEST, raw_input_digest
+from agent.message_metadata import RAW_INPUT_DIGEST, event_raw_input_digest
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -1998,8 +1998,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             _user_entry["display_kind"] = prepared.persist_user_display_kind
         if prepared.persistence_owner:
             _user_entry["display_metadata"] = {"gateway_input_owner": prepared.persistence_owner}
-        _user_entry.setdefault("display_metadata", {})[RAW_INPUT_DIGEST] = raw_input_digest(
-            getattr(event, "_hermes_raw_input_text", getattr(event, "text", "")))
+        _user_entry.setdefault("display_metadata", {})[RAW_INPUT_DIGEST] = event_raw_input_digest(event)
         if getattr(event, "message_id", None):
             _user_entry["message_id"] = str(event.message_id)
         elif getattr(event, "_hermes_recovery_id", None):
@@ -2651,8 +2650,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 reply_expected=event.reply_expected,
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
-                    RAW_INPUT_DIGEST: raw_input_digest(
-                        getattr(event, "_hermes_raw_input_text", event.text)),
+                    RAW_INPUT_DIGEST: event_raw_input_digest(event),
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
@@ -4406,14 +4404,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                             self._session_state(session_key).conversation.queued_events.insert(0, existing)
                         adapter._pending_messages[session_key] = deferred
                     else:
-                        # The follow-up was already drained from its prior owner. Restore the same
-                        # FIFO shape as the successful checkpoint path: the older deferred event
-                        # occupies the pending slot and the already-promoted successor goes at the
-                        # overflow head, so the successor cannot run first.
-                        existing = adapter._pending_messages.get(session_key)
-                        if existing is not None and existing is not deferred:
-                            self._session_state(session_key).conversation.queued_events.insert(0, existing)
-                        adapter._pending_messages[session_key] = deferred
+                        # The new event was not durably admitted. Leave the already-admitted head
+                        # in its slot and retain the synthesized follow-up behind it in native FIFO
+                        # overflow; never publish an undurable replacement ahead of the head.
+                        self._session_state(session_key).conversation.queued_events.append(deferred)
                         logger.warning("Could not checkpoint deferred follow-up for %s", session_key)
                 logger.warning("Queued follow-up deferred after failed first delivery for %s", session_key)
                 return result or {"final_response": response, "messages": history}
@@ -4558,8 +4552,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
                 persist_user_display_kind=next_display_kind,
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
-                    **({RAW_INPUT_DIGEST: raw_input_digest(
-                        getattr(pending_event, "_hermes_raw_input_text", pending_event.text))}
+                    **({RAW_INPUT_DIGEST: event_raw_input_digest(pending_event)}
                        if pending_event is not None else {}),
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
             )

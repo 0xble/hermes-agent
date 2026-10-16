@@ -316,12 +316,13 @@ async def test_failed_first_delivery_checkpoints_eventless_followup(tmp_path, mo
         ctx, adapter, "eventless follow-up", None, "not delivered", result, None,
     ) is result
     if reject:
-        # Failed checkpoint restores the same FIFO shape as success: the drained older
-        # follow-up is pending and the promoted successor is at the overflow head.
-        deferred = adapter._pending_messages[key]
-        assert deferred.text == "eventless follow-up"
+        # Failed checkpoint leaves the already-admitted head in the slot and retains the
+        # synthesized follow-up behind it in native FIFO overflow.
+        assert adapter._pending_messages[key] is existing
         retained = runner._overflow_queue(key)
-        assert retained == [existing]
+        assert retained is not None and len(retained) == 1
+        deferred = retained[0]
+        assert deferred.text == "eventless follow-up"
         assert not getattr(deferred, "_gateway_accepted", False)
         assert not getattr(deferred, "_hermes_recovery_spool", None)
     else:

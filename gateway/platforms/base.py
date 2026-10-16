@@ -1646,6 +1646,7 @@ class TextDebounceState:
     task: asyncio.Task | None
     first_ts: float
     last_ts: float
+    admission_failure_notified: bool = False
 
     def cancel_timer(self, *, unless: "asyncio.Task | None" = None) -> None:
         """Cancel the pending flush timer (if live and not ``unless``)."""
@@ -4280,24 +4281,54 @@ class BasePlatformAdapter(ABC):
                        state.first_ts + self._busy_text_hard_cap_seconds)
         return max(0.0, deadline - time.monotonic())
 
-    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
+    async def _send_text_debounce_admission_failure(self, event: MessageEvent) -> None:
+        """Tell the sender when a debounced queue admission could not be checkpointed."""
+        from gateway.run_busy import QUEUE_ADMISSION_FAILURE
+        runner = getattr(self, "gateway_runner", None)
+        sender = getattr(runner, "_send_busy_ack_reply", None)
+        if callable(sender):
+            try:
+                result = sender(event, self, QUEUE_ADMISSION_FAILURE)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("Failed to send text-debounce admission failure", exc_info=True)
+
+    def _reschedule_text_debounce(self, session_key: str, state: TextDebounceState) -> None:
+        """Retry a failed debounce flush without dropping its only in-memory copy."""
+        state.last_ts = time.monotonic()
+        state.cancel_timer(unless=asyncio.current_task())
+        state.task = asyncio.create_task(
+            self._flush_text_debounce(session_key, max(self._busy_text_debounce_seconds, 0.1))
+        )
+
+    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> bool:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         store = self._text_debounce_store()
         state = store.get(session_key)
         if state is not None and not self._can_merge_text_debounce_events(state.event, event):
             # Preserve sender attribution: flush the buffer as the next turn, new sender starts
-            # fresh.
-            await self._flush_text_debounce_now(session_key)
+            # fresh. If storage rejects the old burst, report it and still admit this sender's
+            # message through its own FIFO path rather than silently consuming it.
+            flushed = await self._flush_text_debounce_now(session_key)
             state = store.get(session_key)
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-                existing_pending = self._pending_messages.get(session_key)
-                if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
+                if not flushed:
+                    # Keep the failed burst in the debounce store so a later retry can admit it;
+                    # the different sender is admitted on the native pending/overflow path below.
+                    state.last_ts = time.monotonic()
+                runner = getattr(self, "gateway_runner", None)
+                enqueue = getattr(runner, "_queue_or_replace_pending_event", None)
+                admitted = bool(enqueue(session_key, event)) if callable(enqueue) else False
+                if not callable(enqueue):
                     from gateway.platforms.base import checkpointed_merge_pending_message_event
-                    if not checkpointed_merge_pending_message_event(
+                    admitted = checkpointed_merge_pending_message_event(
                         self._pending_messages, session_key, event, merge_text=True,
-                    ):
-                        return
-                return
+                    )
+                event._gateway_accepted = admitted
+                if not admitted:
+                    await self._send_text_debounce_admission_failure(event)
+                return admitted
         now = time.monotonic()
         if state is None:
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
@@ -4316,6 +4347,7 @@ class BasePlatformAdapter(ABC):
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
+        return False
 
     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
         """Timer task that flushes the debounced text buffer."""
@@ -4340,11 +4372,19 @@ class BasePlatformAdapter(ABC):
         state.task = None
         pending = self._pending_messages.get(session_key)
         if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
+            # A different sender already owns the native slot. Keep the burst and retry after that
+            # event drains; returning without a timer would strand the only in-memory copy forever.
+            self._reschedule_text_debounce(session_key, state)
             return False
         if not checkpointed_merge_pending_message_event(
             self._pending_messages, session_key, state.event, merge_text=True,
         ):
+            if not state.admission_failure_notified:
+                state.admission_failure_notified = True
+                await self._send_text_debounce_admission_failure(state.event)
+            self._reschedule_text_debounce(session_key, state)
             return False
+        state.event._gateway_accepted = True
         store.pop(session_key, None)
         return True
 
@@ -4485,6 +4525,11 @@ class BasePlatformAdapter(ABC):
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
+        # Capture raw identity before topic routing, media rehoming, sender prefixes, or reply
+        # context can rewrite ``event.text``. The digest is carried in the event metadata and
+        # survives every queue/checkpoint refresh.
+        from agent.message_metadata import stamp_event_raw_input_digest
+        stamp_event_raw_input_digest(event)
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
             # say so once per adapter (#102260).
