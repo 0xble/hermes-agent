@@ -113,10 +113,32 @@ def request_fits(
     return input_tokens + output + _reserve(window) < window
 
 
-def affordable_output_cap(agent: Any, messages: list, *, tools=None) -> Optional[int]:
-    """Largest useful output cap that fits beside the assembled wire request."""
+def affordable_output_cap(
+    agent: Any, messages: list, *, tools=None, input_tokens: Optional[int] = None,
+) -> Optional[int]:
+    """Largest useful output cap that fits beside the assembled wire request.
+
+    ``input_tokens`` is the figure the caller already used to decide the request does not
+    fit. Recomputing via the chars/4 estimator can undercount that figure and arm a cap
+    that still overflows the anchored measurement. The result is never larger than the
+    currently selected cap (configured, provider-clamped, or an already-armed ephemeral),
+    so a shrink cannot raise ``max_tokens`` or replace a provider-reported floor with a
+    larger local estimate. A selected cap below the useful-runway floor means there is
+    nothing to arm.
+    """
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return None
-    room = window - _reserve(window) - _request_input_tokens(agent, messages, "", wire=True, tools=tools) - 1
+    if input_tokens is None:
+        input_tokens = _request_input_tokens(agent, messages, "", wire=True, tools=tools)
+    if not isinstance(input_tokens, int) or isinstance(input_tokens, bool) or input_tokens < 0:
+        return None
+    room = window - _reserve(window) - input_tokens - 1
+    if room < _MIN_SHRUNK_OUTPUT_TOKENS:
+        return None
+    from agent.chat_completion_helpers import selected_max_output_tokens
+
+    selected = selected_max_output_tokens(agent)
+    if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0:
+        room = min(room, selected)
     return room if room >= _MIN_SHRUNK_OUTPUT_TOKENS else None

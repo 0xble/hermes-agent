@@ -147,7 +147,7 @@ def test_request_fit_prices_tools_and_wire_native_checkpoint():
         base_url="https://chatgpt.com/backend-api/codex", _base_url_hostname="chatgpt.com",
         _base_url_lower="https://chatgpt.com/backend-api/codex", codex_responses_native_compaction=True,
         compression_enabled=True, _codex_reasoning_replay_enabled=True, tools=tools,
-        context_compressor=SimpleNamespace(context_length=8_192), max_tokens=2_000,
+        context_compressor=SimpleNamespace(context_length=8_192), max_tokens=8_000,
     )
     messages = [{"role": "user", "content": "follow-up"}]
     assert request_fits(agent, messages, "", wire=True, tools=tools)

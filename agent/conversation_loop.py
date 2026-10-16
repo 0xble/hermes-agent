@@ -1606,8 +1606,11 @@ def _run_conversation_turn(
         )
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
-    # in-place boundary would make a later uncompressed result look compacted.
-    agent._preflight_output_ceiling = None
+    # in-place boundary would make a later uncompressed result look compacted. A shrink
+    # arms the one-shot ephemeral cap beside the ceiling; an exception before the request
+    # builder consumes it must not silently cap the next turn.
+    from agent.turn_preflight_gate import _clear_preflight_output_state
+    _clear_preflight_output_state(agent)
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
@@ -1789,7 +1792,8 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
-            agent._preflight_output_ceiling = None
+            from agent.turn_preflight_gate import _clear_preflight_output_state
+            _clear_preflight_output_state(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

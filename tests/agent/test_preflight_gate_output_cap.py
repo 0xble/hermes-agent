@@ -234,6 +234,50 @@ def test_checkpoint_latch_does_not_fail_closed_on_stale_anchor(monkeypatch):
     agent._compress_context.assert_not_called()
 
 
+def test_anchored_shrink_uses_wire_tokens_not_rough_estimate(monkeypatch):
+    """Review repro: anchored 185k in a 200k window must not arm a 189k cap from chars/4.
+
+    Does not mock ``affordable_output_cap``. The rough estimator sees a short message and
+    would leave room for ~190k output; the anchored figure is what the gate decided on.
+    """
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        max_tokens=32_000,
+        _ephemeral_max_output_tokens=8_000,
+        reasoning_config=None,
+        context_compressor=_compressor(context_length=200_000, threshold_tokens=100_000),
+    )
+    messages = [{"role": "user", "content": "short"}]
+    shrunk = fit.affordable_output_cap(agent, messages, input_tokens=185_000)
+    assert shrunk == 4_999
+    assert shrunk < 32_000
+    v = _gate(agent, messages=messages, pressure=185_000)
+    assert v.action == "fallthrough"
+    assert agent._preflight_output_ceiling == 4_999
+    assert agent._ephemeral_max_output_tokens == 4_999
+    assert fit.request_fits(agent, messages, "", wire=True, input_tokens=185_000)
+
+
+def test_anchored_shrink_keeps_smaller_provider_ephemeral(monkeypatch):
+    """A provider-reported overflow floor is not replaced by a larger local room."""
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        max_tokens=32_000,
+        _ephemeral_max_output_tokens=4_500,
+        reasoning_config=None,
+        context_compressor=_compressor(context_length=200_000, threshold_tokens=100_000),
+    )
+    messages = [{"role": "user", "content": "short"}]
+    assert fit.affordable_output_cap(agent, messages, input_tokens=185_000) == 4_500
+    v = _gate(agent, messages=messages, pressure=185_000)
+    assert v.action == "fallthrough"
+    assert agent._ephemeral_max_output_tokens == 4_500
+
+
 def test_rough_pressure_does_not_fail_closed_without_wire_measurement(monkeypatch):
     """A chars/4 pressure figure can trigger ordinary compression, not a hard abort."""
     agent = _agent(
@@ -340,12 +384,35 @@ def test_ceiling_cleared_when_turn_raises(cached_agent, monkeypatch):
 
     def _boom(agent, *_a, **_k):
         agent._preflight_output_ceiling = 2_048
+        agent._ephemeral_max_output_tokens = 2_048
+        agent._ephemeral_output_cap_is_retry_boost = True
         raise RuntimeError("boom")
 
     monkeypatch.setattr(loop, "_run_conversation_turn", _boom)
     with pytest.raises(RuntimeError):
         cached_agent.run_conversation("hello")
     assert cached_agent._preflight_output_ceiling is None
+    assert cached_agent._ephemeral_max_output_tokens is None
+    assert cached_agent._ephemeral_output_cap_is_retry_boost is False
+
+
+def test_stale_ephemeral_cleared_at_turn_start(cached_agent):
+    from unittest.mock import patch
+
+    cached_agent._preflight_output_ceiling = 2_048
+    cached_agent._ephemeral_max_output_tokens = 2_048
+    cached_agent._ephemeral_output_cap_is_retry_boost = True
+    cached_agent.client.chat.completions.create.side_effect = lambda **_k: _stop_response()
+    with (
+        patch.object(cached_agent, "_persist_session"),
+        patch.object(cached_agent, "_save_trajectory"),
+        patch.object(cached_agent, "_cleanup_task_resources"),
+    ):
+        result = cached_agent.run_conversation("hello")
+    assert result["completed"] is True
+    assert cached_agent._preflight_output_ceiling is None
+    assert cached_agent._ephemeral_max_output_tokens is None
+    assert cached_agent._ephemeral_output_cap_is_retry_boost is False
 
 
 # ---- input_retained result contract ------------------------------------------------------

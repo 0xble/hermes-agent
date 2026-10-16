@@ -135,7 +135,9 @@ def run_preflight_gate(
             )):
         # Input that fits with a useful answer runway only needs a smaller output cap, the
         # same remedy the provider's "max_tokens too large" clamp applies after a rejection.
-        shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
+        shrunk = affordable_output_cap(
+            agent, api_messages, tools=tools_for_api, input_tokens=_wire_input_tokens,
+        )
         if shrunk is not None and _arm_output_ceiling(agent, shrunk):
             logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
     _hard_window_preflight = (
