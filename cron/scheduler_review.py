@@ -80,10 +80,11 @@ def _review_wake_text(original: str, contract: dict) -> str:
     return (
         "You are the invisible presentation reviewer for a cron report. Do not send any message, "
         "call relay, or speak in the user's voice. Inspect the original report mechanically against "
-        "the supplied contract. Reply with exactly one protocol form and nothing else:\n"
+        "the supplied contract. Return only one protocol decision, with no explanation, label, "
+        "Markdown fence, bullets, or quotation marks. The decision must be one of these exact forms:\n"
         "PRESENT\n"
         "FIX\n<the full corrected report>\n"
-        "RERUN\n<one-line reason>\n\n"
+        "RERUN\n<one non-empty reason line>\n\n"
         f"CONTRACT:\n{json.dumps({k: v for k, v in contract.items() if not k.startswith('_')}, sort_keys=True)}\n\n"
         f"ORIGINAL REPORT:\n{original}"
     )

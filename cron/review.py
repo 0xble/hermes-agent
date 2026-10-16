@@ -154,15 +154,57 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
             "sections": sections, "silent": False}
 
 
+def _review_decision_line(line: str) -> Optional[str]:
+    """Return a protocol token from a lightly formatted decision line."""
+    value = str(line or "").strip()
+    value = re.sub(r"^(?:[-*]|\d+[.)])\s+", "", value)
+    value = re.sub(r"^(?:decision\s*[:\-]\s*)", "", value, flags=re.IGNORECASE)
+    value = value.strip().strip("`*_ ").strip()
+    match = re.fullmatch(r"(PRESENT|FIX|RERUN)\s*[:\-]?", value, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+
 def parse_decision(reply: str) -> tuple[str, str]:
-    """Parse the strict invisible-review protocol."""
-    lines = str(reply or "").strip().splitlines()
-    if lines == ["PRESENT"]:
+    """Parse the review protocol while tolerating harmless presentation wrappers.
+
+    The decision remains deterministic: only an explicit protocol token is
+    recognized, ``FIX`` still carries the complete candidate report, and
+    ``RERUN`` still carries exactly one non-empty reason line.
+    """
+    text = str(reply or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = text.splitlines() if text else []
+    if lines and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        lines = lines[1:-1]
+
+    decision_index = next(
+        (index for index, line in enumerate(lines) if _review_decision_line(line)),
+        None,
+    )
+    decision = (_review_decision_line(lines[decision_index])
+                if decision_index is not None else None)
+    payload_lines = lines[decision_index + 1:] if decision_index is not None else []
+    if decision == "PRESENT" and any(
+            _review_decision_line(line) in {"FIX", "RERUN"} for line in payload_lines):
+        decision = None
+    while payload_lines and not payload_lines[-1].strip():
+        payload_lines.pop()
+    if payload_lines and payload_lines[0].strip().startswith("```"):
+        payload_lines.pop(0)
+        while payload_lines and not payload_lines[-1].strip():
+            payload_lines.pop()
+    if payload_lines and payload_lines[-1].strip() == "```":
+        payload_lines.pop()
+        while payload_lines and not payload_lines[-1].strip():
+            payload_lines.pop()
+
+    if decision == "PRESENT":
+        if any(line.strip() for line in payload_lines):
+            raise ValueError("review reply must be exactly PRESENT, FIX + report, or RERUN + one-line reason")
         return "PRESENT", ""
-    if lines and lines[0] == "FIX" and len(lines) > 1 and "\n".join(lines[1:]).strip():
-        return "FIX", "\n".join(lines[1:]).strip()
-    if len(lines) == 2 and lines[0] == "RERUN" and lines[1].strip():
-        return "RERUN", lines[1].strip()
+    if decision == "FIX" and "\n".join(payload_lines).strip():
+        return "FIX", "\n".join(payload_lines).strip()
+    if decision == "RERUN" and len([line for line in payload_lines if line.strip()]) == 1:
+        return "RERUN", next(line.strip() for line in payload_lines if line.strip())
     raise ValueError("review reply must be exactly PRESENT, FIX + report, or RERUN + one-line reason")
 
 
