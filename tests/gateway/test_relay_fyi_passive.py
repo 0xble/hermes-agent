@@ -341,3 +341,23 @@ async def test_busy_fyi_drains_as_normal_turn_in_order(runner):
     assert pending_event is fyi and pending == FYI
     assert adapter._pending_messages["session-key"] is human and overflow == []
     assert runner._test_store.rows == []
+
+
+@pytest.mark.asyncio
+async def test_running_session_path_queues_fyi_instead_of_interrupting(monkeypatch):
+    runner, adapter = make_restart_runner()
+    source = make_restart_source()
+    key = runner._session_key_for_source(source)
+    runner._hm_busy_slash_or_photo = AsyncMock(return_value=(False, None))
+    runner._hm_busy_telegram_grace_queue = lambda *_args: False
+    runner._effective_busy_input_mode = lambda _source: "interrupt"
+    runner._relay_fyi_passive_enabled = lambda _source=None: True
+    runner._hm_busy_interrupt = AsyncMock(side_effect=AssertionError("an FYI must not interrupt"))
+    runner._peek_session_state = lambda _key: SimpleNamespace(
+        turn=SimpleNamespace(agent=object()), conversation=SimpleNamespace(queued_events=[]),
+    )
+    event = MessageEvent(text=FYI, source=source, user_id="u1", message_type=MessageType.TEXT)
+
+    assert await runner._hm_handle_running_session_message(event, source, key) is None
+    runner._hm_busy_interrupt.assert_not_awaited()
+    assert adapter._pending_messages[key].text == FYI

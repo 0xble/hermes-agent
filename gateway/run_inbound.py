@@ -902,6 +902,12 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return _result
 
         effective_busy_input_mode = self._effective_busy_input_mode(source)
+        from gateway.response_filters import is_passive_fyi_relay_event
+        if effective_busy_input_mode == "interrupt" and is_passive_fyi_relay_event(
+            event, source, enabled=bool(self._relay_fyi_passive_enabled(source)),
+        ):
+            # Same rule as the adapter busy path: an FYI never redirects or interrupts a running turn.
+            effective_busy_input_mode = "queue"
         if self._hm_busy_telegram_grace_queue(event, source, _quick_key, effective_busy_input_mode):
             return None
 

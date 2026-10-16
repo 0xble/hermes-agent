@@ -85,10 +85,11 @@ def test_real_relay_plain_renderings_are_fyi_envelopes():
 def test_fyi_relay_title_matches_relay_emoji_graphemes():
     footer = "From: Source Agent · FYI, no action requested"
     header = "[relay from=hermes:default/source receipt=r1]"
-    for emoji in ("ℹ️", "1️⃣", "🇺🇸", "👨‍💻", "❤️"):
+    for emoji in ("ℹ️", "1️⃣", "🇺🇸", "👨‍💻", "❤️", "✅", "⛔", "❓", "⏳", "⚡", "☕"):
         assert is_fyi_relay_text(f"{emoji} Title\nBrief\n\nDetails\n\n{footer}\n{header}")
     assert not is_fyi_relay_text(f"🇺 Title\nBrief\n\nDetails\n\n{footer}\n{header}")
     assert not is_fyi_relay_text(f"ℹ Title\nBrief\n\nDetails\n\n{footer}\n{header}")
+    assert not is_fyi_relay_text(f"™ Title\nBrief\n\nDetails\n\n{footer}\n{header}")
 
 
 def test_exact_silence_tokens_are_intentional_silence():
