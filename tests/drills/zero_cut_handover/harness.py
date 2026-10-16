@@ -679,7 +679,8 @@ def assert_evidence(tags: Sequence[str], chat: Any, state: Mapping[str, Any], lo
     bad_users = {tag: count for tag, count in users.items() if count != 1}
     bad_state_finals = {tag: count for tag, count in state_finals.items()
                         if (count != 1 if planned else count > 1)}
-    missing_done = [tag for tag in tags if require_done and done[tag] < 1]
+    # Only the long (sleep 45) turns owe a DONE: an ACK follow-up answers with ACK by design.
+    missing_done = [tag for tag in tags if require_done and tag.endswith("-1") and done[tag] < 1]
     parked_rows = _parked_rows(state)
     queue_status, queue_values = _queue_observation(state)
     queued = [item for item in queue_values if any(value not in (0, None, False, "", [])
