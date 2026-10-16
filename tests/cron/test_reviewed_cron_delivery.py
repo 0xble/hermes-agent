@@ -68,37 +68,30 @@ def test_parse_decision(reply, expected):
     assert parse_decision(reply) == expected
 
 
-@pytest.mark.parametrize(
-    "reply, expected",
-    [
-        ("Decision: **PRESENT**", ("PRESENT", "")),
-        ("Here is the verdict:\n```\nPRESENT\n```", ("PRESENT", "")),
-        ("Here is the corrected report:\nFIX:\n" + FIXED, ("FIX", FIXED)),
-        ("RERUN:\nprovider timeout", ("RERUN", "provider timeout")),
-    ],
-)
-def test_parse_decision_accepts_harmless_presentation_wrappers(reply, expected):
-    assert parse_decision(reply) == expected
-
-
 @pytest.mark.parametrize("reply", [
     "",
-    "PRESENT\\nextra",
-    "PRESENT\\nFIX\\nreport",
+    "Decision: PRESENT",
+    "PRESENT:",
+    "PRESENT\nextra",
+    "PRESENT\nFIX\nreport",
+    "```\nPRESENT\n```",
+    "- PRESENT",
     "FIX",
     "RERUN",
-    "RERUN\\ntwo\\nlines",
+    "RERUN\ntwo\nlines",
     "I think PRESENT is correct",
 ])
-def test_parse_decision_rejects_unparseable(reply):
+def test_parse_decision_rejects_wrapped_or_unparseable(reply):
     with pytest.raises(ValueError):
         parse_decision(reply)
 
 
 def test_review_prompt_requires_bare_protocol_output():
     prompt = _review_wake_text("report", CONTRACT)
+    assert "REPORT_BEGIN" in prompt and "REPORT_END" in prompt
+    assert "CONTRACT_BEGIN" in prompt and "CONTRACT_END" in prompt
     assert "no explanation, label, Markdown fence, bullets, or quotation marks" in prompt
-    assert "RERUN\n<one non-empty reason line>" in prompt
+    assert "Do not return a decision plus extra text." in prompt
 
 
 @pytest.fixture
@@ -121,6 +114,28 @@ def delivery(monkeypatch):
         sent.append(text)
     monkeypatch.setattr("cron.scheduler_delivery._deliver_result", send)
     return sr, sent, receipts, incidents, reruns
+
+
+def test_malformed_review_gets_one_persisted_retry_before_fallback(delivery, monkeypatch):
+    sr, sent, receipts, incidents, _ = delivery
+    replies = iter(["Decision: PRESENT", "PRESENT"])
+    calls = []
+    job = {"id": "j", "deliver": "local", "_review_run_id": "run", "review": {
+        "contract": "x", "subject": "Stripe Priorities", "max_reruns": 1}}
+
+    def hop(*args):
+        calls.append(True)
+        if len(calls) == 2:
+            assert job["_review_parse_retry_attempted"] is True
+        return next(replies)
+
+    monkeypatch.setattr(sr, "_run_review_hop", hop)
+    assert sr._deliver_reviewed_result(job, GOOD, {}, None) is None
+    assert len(calls) == 2
+    assert sent == [GOOD]
+    assert receipts[0]["decision"] == "PRESENT"
+    assert receipts[0]["review_parse_retry"] is True
+    assert not incidents
 
 
 @pytest.mark.parametrize("reply, rerun, maximum, expected, decision", [
