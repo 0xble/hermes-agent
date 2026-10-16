@@ -194,5 +194,21 @@ class TestPerProfileCronRestore:
             snaps, invoking_home=profiles["default"]
         ) == []
 
+    def test_removed_job_in_profile_is_not_resurrected(self, profiles):
+        from cron.jobs import remove_job, use_cron_store
+
+        snaps = backup.create_pre_update_snapshots_all_profiles(
+            invoking_home=profiles["default"], keep=1
+        )
+        jobs_path = profiles["work"] / "cron" / "jobs.json"
+        with use_cron_store(profiles["work"]):
+            assert remove_job("j0") is True
+
+        assert backup.restore_cron_jobs_all_profiles(
+            snaps, invoking_home=profiles["default"]
+        ) == []
+        live = json.loads(jobs_path.read_text(encoding="utf-8"))
+        assert {job["id"] for job in live["jobs"]} == {"j1", "j2", "j3", "j4"}
+
     def test_empty_map_is_noop(self, profiles):
         assert backup.restore_cron_jobs_all_profiles({}) == []

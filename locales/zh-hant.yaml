@@ -327,6 +327,8 @@ gateway:
     tip: "\n✦ 提示：{tip}"
   restart:
     followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
+    followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ 閘道重新啟動已在進行中……"
     restarting: "♻ 正在重新啟動閘道。如果 60 秒內未收到通知，請在主控台執行 `hermes gateway restart` 重新啟動。"
   resume:

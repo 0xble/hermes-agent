@@ -937,11 +937,6 @@ def _cmd_loop(rid, params, session, name, arg):
         return err
     result = loops.dispatch_loop_command(loops.LoopManager(session_id=sid_key), arg)
     output = result.get("output") or ""
-    if result.get("created"):
-        with contextlib.suppress(Exception):
-            if loops.goal_blocks_loop_tick(sid_key):
-                output += ("\nNote: an active /goal is driving this session — loop "
-                           "wakeups defer until the goal finishes, pauses, or parks.")
     return _exec_out(rid, output)
 
 

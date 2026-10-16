@@ -154,11 +154,39 @@ def test_watch_info_and_non_watch_build_classification(command, label, helper):
         assert f"hermes {label}" in wrapped
 
 
+def test_foreground_dispatcher_passes_bounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=30)
+    dispatcher, body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT=30" in dispatcher
+    assert body == "_hermes_heavy_slot 'hermes pytest' pytest -q tests"
+
+
 def test_routes_only_the_heavy_simple_command(helper):
     wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
     dispatcher, body = wrapped.split("\n", 1)
     assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
     assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
+
+
+def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
+    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=None)
+    dispatcher, _body = wrapped.split("\n", 1)
+    assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
+
+
+@pytest.mark.parametrize(("background", "env_type", "timeout", "expected"), [
+    (False, "local", 180, 60),
+    (False, "local", 600, 120),
+    (False, "local", 6, 10),
+    (True, "local", 180, None),
+    (False, "docker", 180, None),
+])
+def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected):
+    from tools.terminal_tool import _heavy_slot_max_wait_for
+
+    assert _heavy_slot_max_wait_for(
+        background=background, env_type=env_type, effective_timeout=timeout,
+    ) == expected
 
 
 @pytest.mark.parametrize(("command", "expected"), [

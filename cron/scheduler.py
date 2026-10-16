@@ -624,6 +624,10 @@ _external_worker_modes: dict[tuple, str] = {}
 # in-flight key -> pid of the external worker executing it (absent for in-process
 # runs), so a drain observer can name the process holding the gateway open.
 _running_worker_pids: dict[tuple, int] = {}
+# in-flight key -> detached worker claim owner/process retained when the waiter errors while the
+# restart-safe worker is still alive. The outer pool callback must not release this claim early.
+_external_worker_claims: dict[tuple, tuple[object, subprocess.Popen]] = {}
+_external_worker_reapers: set[tuple[tuple, int]] = set()
 # In-flight keys whose external worker runs in its OWN transient systemd scope
 # (``GatewayChildDispatch.mode == "scoped"``). Only that worker outlives a gateway restart: a
 # systemd stop kills the service cgroup, so a ``degraded`` direct subprocess (no reachable user
@@ -808,7 +812,8 @@ def _record_external_cron_worker(job_id: str, pid: Any, *, scope_isolated: bool)
     (``GatewayChildDispatch``) puts the worker in its own transient systemd scope, outside the
     gateway cgroup. A ``degraded`` worker is still external but shares the cgroup and dies with a
     systemd stop, so it must NOT be listed as restart-safe. Called once per accepted handoff;
-    both maps are cleared by ``release_running_job`` and by the worker waiter's ``finally``.
+    both maps are cleared by ``release_running_job`` after the worker exits and by the worker waiter's
+    ``finally`` when no live external worker claim remains.
     """
     key = _inflight_key(job_id)
     with _running_lock:
@@ -851,7 +856,7 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
 
 
 def release_running_job(
-    job_id: str, home: Optional[Path | str] = None, *, owner=None,
+    job_id: str, home: Optional[Path | str] = None, *, owner=None, force: bool = False,
 ) -> None:
     """Remove the registration unless an explicit ``owner`` has been replaced.
 
@@ -859,11 +864,26 @@ def release_running_job(
     was registered under. The scope is a ContextVar the ticker binds per profile: a pool worker
     releasing in a ``finally`` outside ``ctx.run`` resolves the default (launch) home instead, so
     the discard misses the real key and every secondary profile's claim leaks.
+
+    A live detached worker claim fences ordinary cleanup, including cleanup from a waiter or pool
+    callback that errored after handoff. ``force`` is reserved for the worker reaper (and other
+    owner-authorized forced-release paths) after it has established that the worker is gone.
     """
     key = _inflight_key(job_id, home)
     with _running_lock:
         if owner is not None and _running_registration_owners.get(key) is not owner:
             return
+        external_claim = _external_worker_claims.get(key)
+        if external_claim is not None:
+            if owner is not external_claim[0]:
+                return
+            if not force:
+                try:
+                    if external_claim[1].poll() is None:
+                        return
+                except Exception:
+                    # Unknown liveness remains fenced; the reaper owns the forced path.
+                    return
         _running_registration_owners.pop(key, None)
         _running_job_ids.discard(key)
         _running_since.pop(key, None)
@@ -871,8 +891,12 @@ def release_running_job(
         _running_futures.pop(key, None)
         _running_cancel_events.pop(key, None)
         _running_worker_pids.pop(key, None)
+        _external_worker_claims.pop(key, None)
         _scope_isolated_job_ids.discard(key)
         _external_worker_modes.pop(key, None)
+        # A later registration of this key must not inherit restart-safe classification.
+        _restart_safe_waiter_job_ids.discard(key)
+        _restart_safe_external_worker_job_ids.discard(key)
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1096,6 +1120,13 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             if interval_minutes:
                 allowance = max(allowance, 2.0 * interval_minutes * 60.0)
             fut = _running_futures.get(key)
+            external_claim = _external_worker_claims.get(key)
+            if external_claim is not None:
+                try:
+                    if external_claim[1].poll() is None:
+                        continue  # the detached worker still owns this claim
+                except Exception:
+                    continue  # the reaper remains authoritative when liveness is uncertain
             if fut is _FUTURE_PENDING:
                 # Submit path hung before ``pool.submit`` returned — the wedge class; release it.
                 pass
@@ -1121,6 +1152,16 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
             _running_allowance_s.pop(key, None)
             _running_futures.pop(key, None)
             _running_cancel_events.pop(key, None)
+            # The worker behind any external claim has exited (checked above). Drop all of its
+            # worker metadata so a successor neither stays blocked by the dead claim's owner nor
+            # inherits its restart-safe mode, scope or PID.
+            if external_claim is not None:
+                _external_worker_claims.pop(key, None)
+                _external_worker_modes.pop(key, None)
+                _scope_isolated_job_ids.discard(key)
+                _restart_safe_waiter_job_ids.discard(key)
+                _restart_safe_external_worker_job_ids.discard(key)
+                _running_worker_pids.pop(key, None)
             _forced_release_count += 1
             stale.append((job_id, age, allowance, fut, reason))
 
@@ -3630,6 +3671,7 @@ def _wait_for_external_cron_worker_body(
     *,
     execution_id: str,
     stderr_path: Optional[Path] = None,
+    wait_for_process_exit: bool = False,
 ) -> bool:
     """Preserve ``run_one_job``'s synchronous contract after handoff.
 
@@ -3637,7 +3679,8 @@ def _wait_for_external_cron_worker_body(
     The caller nevertheless waits while it remains alive so manual/background
     callers do not release their in-process guard or report stale job state.
     A gateway replacement may kill this waiter; it does not kill the scoped
-    worker or change its ledger ownership.
+    worker or change its ledger ownership. The legacy early-return mode is kept
+    for diagnostic callers that only need to observe a terminal ledger row.
     """
     def _is_terminal() -> bool:
         current = get_execution(execution_id)
@@ -3657,11 +3700,24 @@ def _wait_for_external_cron_worker_body(
             # the worker has since exited, consume its diagnostics below before
             # cleanup; only a still-live terminal worker needs background reaping.
             returncode = process.poll()
-            if returncode is None:
-                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-                reap_terminal_worker_in_background(process)
+            if returncode is not None and wait_for_process_exit:
                 return True
+            if returncode is None:
+                if not wait_for_process_exit:
+                    from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+                    reap_terminal_worker_in_background(process)
+                    return True
+                # A scheduler-owned claim must outlive a terminal ledger row while the
+                # detached process is still alive.  The worker can still be finishing
+                # delivery/teardown, and releasing here would permit a concurrent fire.
+                while returncode is None:
+                    try:
+                        returncode = process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        returncode = process.poll()
+                if wait_for_process_exit:
+                    return True
         # The worker can commit its terminal row and exit between the first
         # read and wait(). Re-read the exact attempt before declaring that
         # it died without terminalizing.
@@ -3698,6 +3754,65 @@ def _wait_for_external_cron_worker_body(
         raise RuntimeError(f"{reason}{stderr_tail}")
 
 
+def _cleanup_external_worker_state(
+    job_id: str, *, owner=None, process=None, worker_exited: bool = False,
+) -> bool:
+    """Clear waiter metadata only while the registration owner is still current."""
+    key = _inflight_key(job_id)
+    with _running_lock:
+        if owner is not None and _running_registration_owners.get(key) is not owner:
+            return False
+        _external_worker_claims.pop(key, None)
+        _restart_safe_waiter_job_ids.discard(key)
+        _restart_safe_external_worker_job_ids.discard(key)
+        _scope_isolated_job_ids.discard(key)
+        _external_worker_modes.pop(key, None)
+        if worker_exited:
+            _running_worker_pids.pop(key, None)
+        elif process is not None:
+            with contextlib.suppress(Exception):
+                if process.poll() is not None:
+                    _running_worker_pids.pop(key, None)
+        return True
+
+
+def _defer_external_worker_claim_release(
+    job_id: str, home: Path, owner, process: subprocess.Popen,
+) -> None:
+    """Reap a live restart-safe worker and release its fenced gateway claim."""
+    key = _inflight_key(job_id, home)
+    token = (key, id(owner))
+    with _running_lock:
+        if _running_registration_owners.get(key) is not owner:
+            return
+        _external_worker_claims[key] = (owner, process)
+        if token in _external_worker_reapers:
+            return
+        _external_worker_reapers.add(token)
+
+    def reap() -> None:
+        try:
+            while process.poll() is None:
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    continue
+                except Exception:
+                    time.sleep(1.0)
+        finally:
+            release_running_job(job_id, home=home, owner=owner, force=True)
+            with _running_lock:
+                _external_worker_reapers.discard(token)
+                if _external_worker_claims.get(key) == (owner, process):
+                    _external_worker_claims.pop(key, None)
+
+    threading.Thread(
+        target=reap,
+        name=f"cron-worker-reaper-{job_id}",
+        daemon=True,
+    ).start()
+
+
 class _ExternalWorkerPostHandoffError(RuntimeError):
     """The waiter failed after the worker was spawned and may own the execution."""
 
@@ -3710,27 +3825,48 @@ def _wait_for_external_cron_worker(
     handoff_files: tuple[Path, ...] = (),
     stderr_path: Optional[Path] = None,
 ) -> bool:
+    claim_key = _inflight_key(job_id) if job_id is not None else None
+    claim_owner = None
+    claim_home = None
+    wait_for_process_exit = False
+    if claim_key is not None:
+        with _running_lock:
+            claim_owner = _running_registration_owners.get(claim_key)
+            wait_for_process_exit = _external_worker_modes.get(claim_key) in {"scoped", "detached"}
+        claim_home = _inflight_home_path(claim_key[0])
     try:
         return _wait_for_external_cron_worker_body(
-            process, execution_id=execution_id, stderr_path=stderr_path
+            process,
+            execution_id=execution_id,
+            stderr_path=stderr_path,
+            # A scheduler-owned claim is released by the waiter only after the
+            # detached process exits, not when its durable row becomes terminal.
+            wait_for_process_exit=wait_for_process_exit,
         )
     except Exception as wait_error:
         raise _ExternalWorkerPostHandoffError(str(wait_error)) from wait_error
     finally:
+        worker_exited = False
+        with contextlib.suppress(Exception):
+            worker_exited = process.poll() is not None
         if job_id is not None:
-            with _running_lock:
-                key = _inflight_key(job_id)
-                _restart_safe_waiter_job_ids.discard(key)
-                _restart_safe_external_worker_job_ids.discard(key)
-                _scope_isolated_job_ids.discard(key)
-                _external_worker_modes.pop(key, None)
-                # If the waiter observed a dead worker before the outer run released
-                # its claim, do not attribute that dead PID to the still-visible job.
-                # A terminal worker that is still reaping may keep its PID until the
-                # normal release path clears it.
-                with contextlib.suppress(Exception):
-                    if process.poll() is not None:
-                        _running_worker_pids.pop(key, None)
+            if worker_exited and claim_owner is not None:
+                release_running_job(job_id, home=claim_home, owner=claim_owner)
+            if (
+                not worker_exited
+                and wait_for_process_exit
+                and claim_owner is not None
+                and claim_home is not None
+            ):
+                _defer_external_worker_claim_release(
+                    job_id, claim_home, claim_owner, process)
+            else:
+                _cleanup_external_worker_state(
+                    job_id,
+                    owner=claim_owner,
+                    process=process,
+                    worker_exited=worker_exited,
+                )
         # The execution is terminal or its worker is dead: nobody will read a
         # payload or acknowledgement left behind by a late/unread handoff.
         for stale in handoff_files:

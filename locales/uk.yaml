@@ -327,6 +327,8 @@ gateway:
     tip: "\n✦ Порада: {tip}"
   restart:
     followup_recovery_notice: "A follow-up saved during the restart could not start or finish its turn. It is still preserved; please send a message to resume it."
+    followup_declined_notice: "A message you sent just before the restart could not be safely recovered, so it was not run. Please send it again."
+    followup_possible_duplicate_notice: "A message you sent just before the restart may already have been handled. Please resend it only if it wasn't."
     in_progress: "⏳ Перезапуск гейтвея вже виконується..."
     restarting: "♻ Перезапуск гейтвея. Якщо ви не отримаєте сповіщення протягом 60 секунд, перезапустіть із консолі командою `hermes gateway restart`."
   resume:

@@ -1878,6 +1878,33 @@ class EphemeralReply(CommandReply):
         return str.__str__(self)
 
 
+def _task_event_covers_recovered_event(task_event, event) -> bool:
+    """Return whether a completed session task actually consumed the recovered event."""
+    return task_event is event or any(
+        absorbed is event for absorbed in getattr(task_event, "_hermes_absorbed_events", ())
+    )
+
+
+def _record_absorbed_pending_event(existing: MessageEvent, event: MessageEvent) -> None:
+    """Keep a transitive identity trail when a pending slot merges another event."""
+    absorbed = getattr(existing, "_hermes_absorbed_events", None)
+    if not isinstance(absorbed, list):
+        absorbed = []
+        setattr(existing, "_hermes_absorbed_events", absorbed)
+    for candidate in (event, *getattr(event, "_hermes_absorbed_events", ())):
+        if candidate is not existing and not any(item is candidate for item in absorbed):
+            absorbed.append(candidate)
+        if candidate is not existing:
+            # Recovery may be watching an absorbed event while the successor persists the
+            # merged slot. Keep the live successor reachable for its durability probe.
+            setattr(candidate, "_hermes_absorbed_into", existing)
+    recovery_id = getattr(event, "_hermes_recovery_id", None)
+    if recovery_id is not None and getattr(existing, "_hermes_recovery_id", None) is None:
+        # A recovered event may be consumed by this pending successor. Carry only the
+        # persistence/durability key; event.message_id and source.message_id remain transport ids.
+        setattr(existing, "_hermes_recovery_id", recovery_id)
+
+
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
                                 event: MessageEvent, *, merge_text: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
@@ -1908,6 +1935,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _record_absorbed_pending_event(existing, event)
             if existing_is_photo or incoming_is_photo:
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
@@ -1923,6 +1951,7 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_reply_expected(event)
+            _record_absorbed_pending_event(existing, event)
             return
     pending_messages[session_key] = event
 
@@ -5177,6 +5206,12 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            # Restart recovery follows session-task successors. Keep the event that each shared
+            # background task actually consumes so a merged pending-slot event can report its
+            # terminal result back to the parked recovery observer.
+            setattr(current_task, "_hermes_event", event)
         deferred_session = getattr(event, "_deferred_session_key", None)
         if deferred_session is not None:
             current_generation = self._session_generations.get(session_key, 0)

@@ -11,6 +11,7 @@ into the calling agent's activity tracker — otherwise the gateway inactivity
 watchdog kills the parent turn at ~1800s.
 """
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -347,6 +348,59 @@ class TestCronjobRunExecutesImmediately:
             assert len(calls) >= 2, calls
         finally:
             set_activity_callback(None)
+
+def test_manual_run_keeps_live_detached_claim_after_waiter_error(tmp_path, monkeypatch):
+    """A post-handoff waiter error must not release a live worker's manual claim."""
+    import cron.scheduler as scheduler
+
+    job_id = "manual-live-detached-worker"
+    process = SimpleNamespace(alive=True)
+
+    def poll():
+        return None if process.alive else 0
+
+    def wait(timeout=None):
+        if process.alive:
+            raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+        return 0
+
+    process.poll = poll
+    process.wait = wait
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.cronjob_tools.mark_job_run", lambda *args, **kwargs: None)
+
+    owner_holder = {}
+
+    def waiter_error(job, **_kwargs):
+        key = scheduler._inflight_key(job["id"], tmp_path)
+        with scheduler._running_lock:
+            owner = scheduler._running_registration_owners[key]
+        owner_holder["owner"] = owner
+        scheduler._defer_external_worker_claim_release(job["id"], tmp_path, owner, process)
+        raise RuntimeError("post-handoff waiter error")
+
+    try:
+        claimed = {"id": job_id, "name": "manual live worker", "fire_claim": {"by": "manual-owner"}}
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
+             patch("cron.scheduler.run_one_job", side_effect=waiter_error):
+            result = _execute_job_now({"id": job_id, "name": "manual live worker"})
+
+        key = scheduler._inflight_key(job_id, tmp_path)
+        assert result["success"] is False
+        assert result["error"] == "post-handoff waiter error"
+        assert scheduler.is_job_running(job_id, home=tmp_path)
+        assert scheduler._external_worker_claims[key] == (owner_holder["owner"], process)
+
+        process.alive = False
+        deadline = time.monotonic() + 2.0
+        while scheduler.is_job_running(job_id, home=tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+    finally:
+        process.alive = False
+        if owner_holder:
+            scheduler.release_running_job(job_id, home=tmp_path, owner=owner_holder["owner"], force=True)
+
 
 class TestManualRunReportsDeliveryFailure:
     """#83993: a manual run whose agent succeeded but whose delivery failed

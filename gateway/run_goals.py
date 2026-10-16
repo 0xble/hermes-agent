@@ -691,9 +691,27 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 or str(getattr(event, "_outbox_admission_id", "") or "").startswith("resume:")
             )
             external_event = (
-                metadata.get("notification_origin") == "process_registry_synthetic"
-                or (is_internal and event is not None and not own_pacing_wake)
+                metadata.get("notification_origin") in {
+                    "process_registry_synthetic", "delegation_result", "cron_delivery", "relay_delivery",
+                }
+                or (
+                    is_internal
+                    and event is not None
+                    and not own_pacing_wake
+                    and metadata.get("notification_category") in {"result", "diagnostic"}
+                )
             )
+            if external_event and event is not None:
+                # Trusted outside evidence pierces a long loop delay once. The durable mutation is
+                # idempotent and refuses to move a tick that is already in flight, so duplicate
+                # delivery notifications cannot create duplicate loop ticks.
+                try:
+                    from hermes_cli.loops import wake_loop_for_external_event
+                    await self._run_in_executor_with_context(
+                        wake_loop_for_external_event, str(session_entry.session_id)
+                    )
+                except Exception:
+                    logger.debug("external event loop wake failed", exc_info=True)
             # A queued chain is judged once, on its terminal turn's response (identity above).
             goal_kwargs = {"user_initiated": bool(identity.get("user_turn")), "external_event": external_event}
             # A stamped continuation turn is judged only against the goal instance it served.
@@ -962,6 +980,9 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             # never enter that path as a fabricated human answer while another turn owns it.
             return
         def _due_manager():
+            from agent.estop import check_paused
+            if check_paused("loop", logger):
+                return None
             if goal_blocks_loop_tick(sid):
                 return None
             mgr = LoopManager(session_id=sid)
@@ -970,11 +991,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         mgr = await self._run_in_executor_with_context(_due_manager)
         if mgr is None:
             return
-        from agent.estop import check_paused
 
         # Loop wakeups are injected as internal events, which bypass the inbound estop gate; without
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
-        if check_paused("loop", logger) or _turn_owner_exists():
+        if _turn_owner_exists():
             return
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog

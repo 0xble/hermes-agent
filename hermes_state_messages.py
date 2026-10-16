@@ -2204,6 +2204,14 @@ class SessionMessagesMixin:
             "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
             (session_id, platform_message_id)) is not None
 
+    def has_user_message_content(self, session_id: str, content: str, *, min_timestamp=None) -> bool:
+        """True when a user row already carries the id-less inbound content."""
+        timestamp_clause = " AND timestamp >= ?" if min_timestamp is not None else ""
+        params = (session_id, content) if min_timestamp is None else (session_id, content, min_timestamp)
+        return self._read_one(
+            "SELECT 1 FROM messages WHERE session_id = ? AND role = 'user' AND content = ?"
+            + timestamp_clause + " LIMIT 1", params) is not None
+
     def _is_explicit_fork_child_row(self, session: dict[str, Any], *, include_reset: bool = False) -> bool:
         """True when *session* is a branch, delegate, or tool child of its parent (``include_reset``: also a
         reset fork). Markers only count when they point at ``parent_session_id``: compression copies

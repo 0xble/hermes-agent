@@ -887,7 +887,7 @@ class GatewayBusySessionMixin:
         if event.internal and event.allow_gateway_control:
             adapter = self._delivery_adapter_for(event.source)
             if adapter and session_key in getattr(adapter, "_pending_messages", {}):
-                self._queue_or_replace_pending_event(session_key, event)
+                event._gateway_accepted = self._queue_or_replace_pending_event(session_key, event)
                 return True
             return False  # base adapter queues silently behind the active turn
 
