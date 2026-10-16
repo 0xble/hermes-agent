@@ -511,3 +511,19 @@ def test_a_pinned_gateway_keeps_its_own_slot_files(monkeypatch, tmp_path):
         assert gateway_slot.process_slot_filename("gateway.pid") == "gateway.pid"
     finally:
         b.close()
+
+
+def test_serving_slot_opens_no_file_when_slot_b_has_no_lock(monkeypatch, tmp_path):
+    """Hosted CI caught it: an adapter test patches ``Path.exists`` to True and ``open`` to a mock, so
+    the probe opened (and closed) that mock for a b lock that does not exist, and the adapter's own
+    log-file ``close()`` count came out 2."""
+    import builtins
+    from pathlib import Path
+    monkeypatch.delenv("HERMES_GATEWAY_SLOT", raising=False)
+    gateway_slot.reset_gateway_slot_for_tests()
+    opened = []
+    real_open = builtins.open
+    monkeypatch.setattr(Path, "exists", lambda self: True)
+    monkeypatch.setattr(builtins, "open", lambda *a, **k: opened.append(a[0]) or real_open(*a, **k))
+    assert gateway_slot.serving_slot(tmp_path) == "a"
+    assert opened == []

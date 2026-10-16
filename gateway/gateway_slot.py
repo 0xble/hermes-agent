@@ -99,13 +99,17 @@ def serving_slot(home: Any = None) -> str:
 
 def slot_lock_held(home: Any, slot: str) -> bool:
     """True while some live process holds ``slot``'s runtime lock in ``home`` (a direct flock probe;
-    the status helpers resolve paths through this module and would recurse)."""
+    the status helpers resolve paths through this module and would recurse). A missing lock file is
+    one ``stat`` and opens nothing, so flag-off readers pay no file handle for it."""
+    import os
     from pathlib import Path
 
     from gateway.status import _probe_lock_file
     path = Path(home) / slot_filename("gateway.lock", slot)
+    if not os.path.exists(path):
+        return False
     try:
-        return path.exists() and _probe_lock_file(open(path, "a+", encoding="utf-8"))
+        return _probe_lock_file(open(path, "a+", encoding="utf-8"))
     except OSError:
         return False
 
