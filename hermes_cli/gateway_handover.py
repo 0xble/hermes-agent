@@ -162,8 +162,16 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         try:
             fx.bootstrap(idle_label, plist_path)
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            print(f"✗ could not bootstrap standby {idle_label}: {exc}")
-            return 1
+            # A slot that exited cleanly stays loaded (KeepAlive restarts only failures), and bootstrap
+            # of a loaded label fails with EIO. Nothing answers on that slot (reused is False), so
+            # booting the stale label out and bootstrapping once more is safe (found in a real drill).
+            try:
+                assert fx.bootout is not None
+                fx.bootout(idle_label)
+                fx.bootstrap(idle_label, plist_path)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as retry_exc:
+                print(f"✗ could not bootstrap standby {idle_label}: {exc}; retry after bootout: {retry_exc}")
+                return 1
 
     budget_deadline = _deadline(fx, timeout)
     if not _poll(fx, budget_deadline, lambda: bool(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import subprocess
 from pathlib import Path
 import socket
 import tempfile
@@ -299,3 +300,22 @@ def test_refused_promotion_after_release_leaves_standby_running(tmp_path):
     effects = dataclasses.replace(_effects(fake, events), query=refuse)
     assert run_handover(home=tmp_path, timeout=5, effects=effects) == 1
     assert not any(kind == "bootout" for kind, *_ in events)
+
+
+def test_stale_loaded_idle_label_is_booted_out_and_bootstrapped_again(tmp_path):
+    """Real drill: slot a exited 0 after handing over and stayed loaded, so the reverse handover's
+    bootstrap failed with EIO and every crash drill aborted before starting the standby."""
+    fake, events = FakeGateway(), []
+    base = _effects(fake, events)
+    tries = []
+
+    def bootstrap(label, path):
+        tries.append(label)
+        if len(tries) == 1:
+            raise subprocess.CalledProcessError(5, ["launchctl", "bootstrap"])
+        base.bootstrap(label, path)
+
+    assert run_handover(home=tmp_path, timeout=5, effects=dataclasses.replace(base, bootstrap=bootstrap)) == 0
+    kinds = [event[0] for event in events]
+    assert kinds[:3] == ["plist", "bootout", "bootstrap"] and len(tries) == 2
+    assert events[1][1] == tries[0]  # only the idle label was booted out before the retry
