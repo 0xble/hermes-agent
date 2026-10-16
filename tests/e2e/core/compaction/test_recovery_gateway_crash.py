@@ -37,8 +37,11 @@ def _rows(path, session_id):
 def test_committed_recovery_crash_keeps_queue_identity_settings_and_effects(tmp_path):
     effect_file = tmp_path / "effect-count.txt"
     effect_receipt = "COMPLETED-EFFECT-17"
+    effect_command_body = (
+        f"from pathlib import Path; Path({str(effect_file)!r}).open('a').write('effect-17\\n')"
+    )
     effect_command = (
-        f"python -c {shlex.quote(f'from pathlib import Path; Path({str(effect_file)!r}).open(\"a\").write(\"effect-17\\n\")')}; "
+        f"python -c {shlex.quote(effect_command_body)}; "
         f"printf '{effect_receipt}\\n'"
     )
     trigger = "RECOVERY-TRIGGER-91"

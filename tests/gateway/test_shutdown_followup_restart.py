@@ -15,7 +15,9 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import _reply_anchor_for_event, merge_pending_message_event
 from gateway.platforms.event import MessageEvent, MessageType
-from gateway.run_pending_recovery import _defer_followup, _recovered_followup_event
+from gateway.run_pending_recovery import (
+    _defer_followup, _recovered_followup_event, input_already_durable,
+)
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
@@ -205,6 +207,22 @@ async def test_recovered_followup_resumed_logs_after_predecessor_resumed(
     ]
 
 
+
+
+def test_restart_recovery_dedupe_requires_matching_trigger_content(tmp_path, monkeypatch):
+    _runner, _adapter, entry, _source = _setup(tmp_path, monkeypatch)
+    _runner.session_store.append_to_transcript(entry.session_id, {
+        "role": "user", "content": "old trigger", "platform_message_id": "transport-1",
+    })
+
+    assert not input_already_durable(
+        _runner.session_store, entry.session_id, "transport-1", "new trigger",
+    )
+    assert input_already_durable(
+        _runner.session_store, entry.session_id, "transport-1", "old trigger",
+    )
+
+
 @pytest.mark.asyncio
 async def test_recovered_followup_with_both_ids_probes_transport_id_before_replay(
         tmp_path, monkeypatch, caplog):
@@ -233,6 +251,7 @@ async def test_recovered_followup_with_both_ids_probes_transport_id_before_repla
     assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
     assert _outcome_lines(caplog) == [
         f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
+
 
 
 @pytest.mark.asyncio

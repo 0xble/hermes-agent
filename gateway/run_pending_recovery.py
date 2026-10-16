@@ -209,7 +209,14 @@ def input_already_durable(store, session_id, message_id, content=None, spool_ts=
     try:
         tip_for = getattr(store, "_compression_tip_for_session_id", None)
         tip = tip_for(session_id) if callable(tip_for) else session_id
-        return any(bool(probe(sid, str(message_id))) for sid in dict.fromkeys((session_id, tip)) if sid)
+        return any(
+            bool(probe(
+                sid, str(message_id),
+                content if content is not None else None,
+                content if content is not None else None,
+            ))
+            for sid in dict.fromkeys((session_id, tip)) if sid
+        )
     except Exception:
         logger.debug("Recovered follow-up durability probe failed for %s", session_id, exc_info=True)
         return False

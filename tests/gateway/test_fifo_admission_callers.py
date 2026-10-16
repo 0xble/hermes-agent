@@ -316,12 +316,14 @@ async def test_failed_first_delivery_checkpoints_eventless_followup(tmp_path, mo
         ctx, adapter, "eventless follow-up", None, "not delivered", result, None,
     ) is result
     if reject:
-        assert adapter._pending_messages[key] is existing
+        # Failed checkpoint restores the same FIFO shape as success: the drained older
+        # follow-up is pending and the promoted successor is at the overflow head.
+        deferred = adapter._pending_messages[key]
+        assert deferred.text == "eventless follow-up"
         retained = runner._overflow_queue(key)
-        assert len(retained) == 1
-        assert retained[0].text == "eventless follow-up"
-        assert not getattr(retained[0], "_gateway_accepted", False)
-        assert not getattr(retained[0], "_hermes_recovery_spool", None)
+        assert retained == [existing]
+        assert not getattr(deferred, "_gateway_accepted", False)
+        assert not getattr(deferred, "_hermes_recovery_spool", None)
     else:
         deferred = adapter._pending_messages[key]
         assert deferred.text == "eventless follow-up"
