@@ -45,7 +45,47 @@ def _request_input_tokens(agent: Any, messages: list, prompt: str, *, wire: bool
     )
 
 
-def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False, tools=None) -> bool:
+def _native_wire_tokens(agent: Any, messages: list, tools) -> Optional[int]:
+    from agent.message_content import flatten_message_text
+
+    prompt = "\n".join(
+        flatten_message_text(row.get("content"))
+        for row in messages
+        if isinstance(row, dict) and row.get("role") == "system"
+    )
+    try:
+        from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
+
+        native = estimate_native_responses_preflight_tokens(
+            agent, messages, system_prompt=prompt, tools=tools,
+        )
+    except Exception:
+        return None
+    if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
+        return native
+    return None
+
+
+def wire_accurate_input_tokens(
+    agent: Any, messages: list, *, tools=None, request_pressure_tokens: Any = None,
+) -> Optional[int]:
+    """Input size from a provider-grounded source, else None.
+
+    A fresh usage anchor (real ``prompt_tokens`` plus delta) or the checkpoint-pruned
+    native payload estimate is accurate enough to fail closed on. The generic
+    chars/4 heuristic is not: it may only lower the output cap or wait for real usage.
+    """
+    if getattr(agent, "_request_pressure_anchored", False) is True and isinstance(
+        request_pressure_tokens, int
+    ) and not isinstance(request_pressure_tokens, bool) and request_pressure_tokens >= 0:
+        return request_pressure_tokens
+    return _native_wire_tokens(agent, messages, tools)
+
+
+def request_fits(
+    agent: Any, messages: list, prompt: str, *, wire: bool = False, tools=None,
+    input_tokens: Optional[int] = None,
+) -> bool:
     """Whether the assembled request plus its effective provider output cap fits."""
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
@@ -56,7 +96,9 @@ def request_fits(agent: Any, messages: list, prompt: str, *, wire: bool = False,
     if not enforced:
         cap = selected_max_output_tokens(agent)
     output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
-    return _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools) + output + _reserve(window) < window
+    if input_tokens is None:
+        input_tokens = _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools)
+    return input_tokens + output + _reserve(window) < window
 
 
 def affordable_output_cap(agent: Any, messages: list, *, tools=None) -> Optional[int]:

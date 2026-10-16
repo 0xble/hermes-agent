@@ -69,6 +69,7 @@ def run_preflight_gate(
         _preflight_compression_blocked=_preflight_compression_blocked,
         _provider_overflow_recovery_pending=_provider_overflow_recovery_pending,
         _last_preflight_pressure=None,
+        _preflight_api_call_refunded=False,
     )
 
     _runtime_context_error = _ollama_context_limit_error(agent, request_pressure_tokens)
@@ -88,8 +89,9 @@ def run_preflight_gate(
 
     # A known hard-window breach cannot defer to real usage: some servers truncate
     # instead of rejecting. Measure the final request, not a stale usage anchor.
-    from agent.preflight_output_fit import affordable_output_cap, request_fits
-    window = getattr(agent.context_compressor, "context_length", None)
+    from agent.preflight_output_fit import affordable_output_cap, request_fits, wire_accurate_input_tokens
+    _compressor = agent.context_compressor
+    window = getattr(_compressor, "context_length", None)
     can_shrink_output = getattr(agent, "api_mode", None) not in {"codex_app_server", "bedrock_converse"}
     if (api_messages is not None and isinstance(window, int) and window > 0
             and can_shrink_output
@@ -99,51 +101,39 @@ def run_preflight_gate(
         shrunk = affordable_output_cap(agent, api_messages, tools=tools_for_api)
         if shrunk is not None and _arm_output_ceiling(agent, shrunk):
             logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
-    if (api_messages is not None and isinstance(window, int) and window > 0
-            and getattr(agent, "api_mode", None) != "codex_app_server"
-            and not request_fits(agent, api_messages, "", wire=True, tools=tools_for_api)):
-        from agent.conversation_compression import conversation_history_after_compression
-        from agent.turn_context_compaction import _refund_api_call
-        v.api_call_count = _refund_api_call(agent, v.api_call_count)
-        before = list(messages)
-        recovered, prompt = messages, active_system_prompt
-        if getattr(agent, "compression_enabled", True):
-            try:
-                recovered, prompt = agent._compress_context(
-                    messages, system_message, task_id=effective_task_id,
-                    approx_tokens=request_pressure_tokens,
-                )
-            except Exception:
-                logger.warning("Hard-window recovery failed; retaining the same session", exc_info=True)
-        if recovered != before:
-            v.messages = recovered
-            v.active_system_prompt = prompt
-            v.conversation_history = conversation_history_after_compression(agent, recovered)
-            if can_shrink_output and not request_fits(agent, recovered, prompt, tools=tools_for_api):
-                shrunk = affordable_output_cap(agent, recovered, tools=tools_for_api)
-                if shrunk is not None and _arm_output_ceiling(agent, shrunk):
-                    logger.info("Post-recovery fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
-            if request_fits(agent, recovered, prompt, tools=tools_for_api):
-                v._preflight_compression_blocked = False
-                v._last_preflight_pressure = request_pressure_tokens
-                v.action = "continue"
-                return v
-        v.final_response = (
-            "The complete request cannot safely fit the model window. No provider call was sent. "
-            "This session, its history and accepted input are retained; retry /compress "
-            "when the summary route is available."
+    _wire_input_tokens = (
+        wire_accurate_input_tokens(
+            agent, api_messages, tools=tools_for_api,
+            request_pressure_tokens=request_pressure_tokens,
         )
-        v.failed = True
-        v._turn_exit_reason = "context_compression_timeout"
-        v._compression_timeout_exhausted = True
-        v.action = "break"
-        _clear_preflight_output_state(agent)
-        return v
+        if api_messages is not None else None
+    )
+    _hard_window_preflight = (
+        _wire_input_tokens is not None and isinstance(window, int) and window > 0
+        and getattr(agent, "api_mode", None) != "codex_app_server"
+        and not request_fits(
+            agent, api_messages, "", wire=True, tools=tools_for_api,
+            input_tokens=_wire_input_tokens,
+        )
+    )
+    if _hard_window_preflight:
+        # Route the proven wire overflow through the same guarded compression path as
+        # ordinary preflight: attempt caps, cooldown/lock defers, timeout handling,
+        # retry-state reset, MoA cleanup and reference-handoff checks all apply here.
+        result = run_preflight_compression(
+            agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
+            provider_overflow_preflight=True, hard_window_preflight=True,
+            defer_preflight=lambda _t: False, moa_prepared_request=_moa_prepared_request,
+            system_message=system_message, user_message=user_message,
+            max_compression_attempts=max_compression_attempts, effective_task_id=effective_task_id,
+        )
+        if result.action in {"break", "return"}:
+            _clear_preflight_output_state(agent)
+        return result
 
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
     # failure cooldown, then should_compress().
-    _compressor = agent.context_compressor
     _preflight_threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0)
     _provider_overflow_preflight = _provider_overflow_recovery_pending and (
         _preflight_threshold <= 0 or request_pressure_tokens >= _preflight_threshold
@@ -183,6 +173,6 @@ def run_preflight_gate(
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
-    if result.action == "break":
+    if result.action in {"break", "return"}:
         _clear_preflight_output_state(agent)
     return result

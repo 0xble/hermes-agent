@@ -808,4 +808,5 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+    agent._preflight_output_ceiling = None
     return result

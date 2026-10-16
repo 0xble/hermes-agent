@@ -1126,6 +1126,23 @@ def _compression_deferred_result(agent, messages: List[Dict], api_call_count: in
     )
 
 
+def _preflight_hard_window_result(
+    agent, messages: List[Dict], conversation_history, api_call_count: int,
+) -> Dict[str, Any]:
+    """Typed fail-closed result for a wire-sized request that still cannot fit.
+
+    This is distinct from compression timeout/exhaustion: the accepted input and
+    session remain retryable, and the gateway must not rotate the session.
+    """
+    from agent.turn_failure_copy import retained_input_result
+
+    result = retained_input_result(
+        messages, api_call_count, provider_calls_made=api_call_count > 0,
+    )
+    agent._persist_session(messages, conversation_history)
+    return result
+
+
 def _provider_overflow_exhausted_result(
     agent, messages: List[Dict], conversation_history, api_call_count: int,
     request_pressure_tokens: int, max_compression_attempts: int,
@@ -1583,6 +1600,7 @@ def _run_conversation_turn(
 
     # The gateway caches agents across turns; compression state is per-turn, or a stale
     # in-place boundary would make a later uncompressed result look compacted.
+    agent._preflight_output_ceiling = None
     agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
     begin_fast_mode_turn(agent, conversation_history)
@@ -1764,6 +1782,7 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            agent._preflight_output_ceiling = None
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

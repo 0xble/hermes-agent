@@ -1439,8 +1439,10 @@ def effective_wire_max_output_tokens(agent):
     call: Anthropic's native ceiling, window clamp and manual-thinking floor; a provider profile's
     default and the Gemini thinking raise on chat completions. ``enforced`` is whether the endpoint
     rejects ``input + cap > window`` up front rather than stopping generation at the window."""
-    selected = selected_max_output_tokens(agent)
     api_mode = getattr(agent, "api_mode", None)
+    # Codex Responses never sends max_output_tokens/max_tokens on the wire; pricing
+    # a selected local cap would falsely reject a request that the backend accepts.
+    selected = None if api_mode == "codex_responses" else selected_max_output_tokens(agent)
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import anthropic_validates_output_against_window, anthropic_wire_output_cap
