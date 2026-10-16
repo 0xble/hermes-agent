@@ -300,6 +300,52 @@ async def test_plain_markdown_stays_on_legacy_path():
 
 
 @pytest.mark.asyncio
+async def test_rich_image_blocks_stay_interleaved_in_one_message():
+    """Image markdown must reach sendRichMessage unchanged, not become split photo sends."""
+    adapter = _make_adapter()
+    content = (
+        "Before the first image.\n\n"
+        "![First view](https://example.com/first.jpg)\n\n"
+        "Between the images.\n\n"
+        "![Second view](https://example.com/second.jpg)\n\n"
+        "After the second image."
+    )
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    rich = _rich_api_kwargs(adapter)["rich_message"]
+    markdown = rich["markdown"]
+    assert "![First view](https://example.com/first.jpg)" in markdown
+    assert "![Second view](https://example.com/second.jpg)" in markdown
+    assert markdown.index("Before the first image.") < markdown.index("![First view]")
+    assert markdown.index("![First view]") < markdown.index("Between the images.")
+    assert markdown.index("Between the images.") < markdown.index("![Second view]")
+    assert markdown.index("![Second view]") < markdown.index("After the second image.")
+    bot.send_message.assert_not_called()
+
+
+def test_rich_image_preservation_works_in_auto_mode():
+    adapter = _make_adapter({"rich_messages": "auto"})
+    content = "Intro\n\n![Photo](https://example.com/photo.jpg)\n\nOutro"
+
+    assert adapter.should_preserve_inline_images(content) is True
+
+
+def test_non_rich_image_extraction_still_uses_legacy_attachment_path():
+    adapter = _make_adapter({"rich_messages": False})
+    content = "![Photo](https://example.com/photo.jpg)"
+
+    assert adapter.should_preserve_inline_images(content) is False
+    images, remaining = adapter.extract_images(content)
+
+    assert images == [("https://example.com/photo.jpg", "Photo")]
+    assert remaining == ""
+
+
+@pytest.mark.asyncio
 async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
     adapter = _make_adapter()
 

@@ -1774,12 +1774,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
         return bool(content and self._RICH_CJK_RE.search(content))
 
     def _needs_rich_rendering(self, content: str) -> bool:
-        """True for constructs MarkdownV2 degrades: pipe tables, task lists, <details>, block math.
+        """True for constructs MarkdownV2 degrades: pipe tables, task lists, <details>, block math,
+        and rich-message media blocks.
         In auto mode, ordinary replies stay on MarkdownV2 for consistent font weight/spacing.
 
         The rich endpoint is reserved for constructs where raw markdown materially improves output: pipe
         tables (MarkdownV2 has no table syntax and rewrites them into bullet lists), GFM task lists,
-        collapsible ``<details>`` blocks, and block math. Adapted from #45995 (@YonganZhang).
+        collapsible ``<details>`` blocks, block math, and media blocks. Adapted from #45995 (@YonganZhang).
         """
         if not content:
             return False
@@ -1791,7 +1792,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, BasePlat
             return True
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return True
+        if re.search(r"!\[[^\]]*\]\(https?://[^\s)]+(?:\s+\"[^\"]*\")?\)", content):
+            return True
         return "$$" in content
+
+    def should_preserve_inline_images(self, content: str) -> bool:
+        """Keep rich-message image blocks in the text delivery path."""
+        return self._rich_eligible(content)
 
     def _rich_delivery_enabled(self) -> bool:
         """Whether rich delivery is allowed (``rich_messages`` opt-in)."""

@@ -3288,6 +3288,10 @@ class BasePlatformAdapter(ABC):
         """Check if a URL points to an animated GIF (vs a static image)."""
         return url.lower().split('?')[0].endswith('.gif')
 
+    def should_preserve_inline_images(self, content: str) -> bool:
+        """Whether image markup remains in text for a platform-native rich renderer."""
+        return False
+
     @staticmethod
     def extract_images(content: str) -> tuple[list[tuple[str, str]], str]:
         """Extract ``![alt](url)`` and ``<img src=...>`` image URLs from a response;
@@ -5106,7 +5110,10 @@ class BasePlatformAdapter(ABC):
         with self._media_delivery_scope(event.source):
             media_files, response = self.extract_media(response)
             media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
-            images, text_content = self.extract_images(response)
+            if isinstance(self, BasePlatformAdapter) and self.should_preserve_inline_images(response):
+                images, text_content = [], response
+            else:
+                images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
             # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
             # the body for extract_local_files below to pick up rather than silently dropped (#34517).
