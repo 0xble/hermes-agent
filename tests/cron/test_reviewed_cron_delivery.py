@@ -86,6 +86,8 @@ def test_parse_decision(reply, expected):
         "Decision: PRESENT",
         "PRESENT:",
         "PRESENT\nextra",
+        "analysis\nPRESENT",
+        "analysis\nFIX\nreport",
         "PRESENT\nFIX\nreport",
         "```\nPRESENT\n```",
         "- PRESENT",
