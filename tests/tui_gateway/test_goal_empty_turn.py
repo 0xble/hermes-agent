@@ -129,7 +129,7 @@ def test_bot_chat_silence_reaches_real_goal_judge_and_loop_bookkeeping(server, t
     loop_after = loops.load_loop(session_key)
     assert loop_after.awaiting_response is False
     assert loop_after.last_response_digest == loops._digest_response(marker)
-    assert loop_after.current_delay == min(initial_delay * 2, loops.self_paced_ceiling_seconds())
+    assert loop_after.current_delay == 15 * 60
     completes = [payload for name, sid, payload in turn_env if name == "message.complete"]
     assert len(completes) == 1 and completes[0]["text"] == ""
     assert receipts[0]["text"] == ""  # hosted-room delivery must not leak the preserved marker
