@@ -104,9 +104,13 @@ def request_fits(
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
         return False
-    from agent.chat_completion_helpers import effective_wire_max_output_tokens
+    from agent.chat_completion_helpers import effective_wire_max_output_tokens, selected_max_output_tokens
 
-    cap, _enforced = effective_wire_max_output_tokens(agent)
+    cap, enforced = effective_wire_max_output_tokens(agent)
+    if not enforced:
+        # Non-validating endpoints accept a native/default cap larger than the remaining window
+        # and stop generation at the window. Reserve only an explicitly selected cap there.
+        cap = selected_max_output_tokens(agent)
     output = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
     if input_tokens is None:
         input_tokens = _request_input_tokens(agent, messages, prompt, wire=wire, tools=tools)
