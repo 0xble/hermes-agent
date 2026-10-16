@@ -330,14 +330,15 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "
-                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry ({n}/4)...", diagnostic=True,
+                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting continuation ({n}/4)...", diagnostic=True,
             )
         elif st.is_stub:
             agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/4)...", diagnostic=True)
         else:
             agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...", diagnostic=True)
         append_message(messages, {
-            "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
+            "role": "user", "content": _get_continuation_prompt(
+                st.is_stub, _dropped_tools, getattr(st.response, "_dropped_tool_argument_chars", 0) or 0),
             "_length_continuation_nudge": True,
         })
         agent._session_messages = messages
