@@ -89,7 +89,9 @@ async def test_goal_kickoff_checkpoint_failure_reports_no_started_turn(failed_st
 
     runner, adapter = _make_runner(_session_entry())
     event = _event("/goal inspect this", "goal1")
-    runner._get_goal_manager_for_event = AsyncMock(return_value=(SimpleNamespace(session_id="sid"), None))
+    runner._get_goal_manager_for_event = AsyncMock(
+        return_value=(SimpleNamespace(session_id="sid", state=SimpleNamespace(to_json=lambda: "{}")), None)
+    )
     runner._run_in_executor_with_context = AsyncMock(side_effect=lambda fn, *args: fn(*args))
     result = SimpleNamespace(prompt="inspect this", kickoff=True, clear_pending=None, output="Goal set and starting.")
     monkeypatch.setattr(goal_command, "dispatch_goal_command", lambda *a, **kw: result)
@@ -364,6 +366,8 @@ def test_yuanbao_recall_replacement_requires_checkpoint(tmp_path, monkeypatch, r
 async def test_goal_continuation_rejection_reports_failed_dispatch():
     runner, adapter = _make_runner(_session_entry())
     mgr = SimpleNamespace(
+        session_id="sid",
+        state=SimpleNamespace(to_json=lambda: "{}"),
         is_active=lambda: True,
         evaluate_after_turn=lambda *a, **kw: {"should_continue": True, "continuation_prompt": "continue"},
     )

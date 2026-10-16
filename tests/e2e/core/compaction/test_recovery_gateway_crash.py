@@ -38,7 +38,7 @@ def test_committed_recovery_crash_keeps_queue_identity_settings_and_effects(tmp_
     effect_file = tmp_path / "effect-count.txt"
     effect_receipt = "COMPLETED-EFFECT-17"
     effect_command = (
-        f"printf 'effect-17\\n' >> {shlex.quote(str(effect_file))}; "
+        f"python -c {shlex.quote(f'from pathlib import Path; Path({str(effect_file)!r}).open(\"a\").write(\"effect-17\\n\")')}; "
         f"printf '{effect_receipt}\\n'"
     )
     trigger = "RECOVERY-TRIGGER-91"
@@ -65,6 +65,7 @@ def test_committed_recovery_crash_keeps_queue_identity_settings_and_effects(tmp_
     gateway = GatewayProcess(
         tmp_path / "gateway", platforms={"fk_tg": "discord"}, llm_base_url=server.base_url,
         extra_config=(
+            "approvals:\n  mode: off\n"
             "compression:\n  threshold_tokens: 110000\n  protect_last_n: 4\n"
             "auxiliary:\n  compression:\n    timeout: 2\n  title_generation:\n    enabled: false\n"
             "display:\n  platforms:\n    fk_tg:\n      streaming: false\n"

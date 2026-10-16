@@ -447,7 +447,12 @@ class RestartRecoveryMixin:
         return (adapter, source), None
 
     def _startup_interrupted_note_candidates(self, candidates) -> list[str]:
-        """Admit current-version interruption notes even when the breaker vetoes model work."""
+        """Return fresh, eligible feature-version rows that may receive a startup note.
+
+        ``resume_pending`` predates S2 and is not sufficient evidence for a note: legacy rows have no
+        ``resume_turn_id``. Keep the note admission identical to auto-resume so stale or unavailable
+        sessions remain recoverable without producing an orphan notice.
+        """
         return [
             entry.session_key for entry in (candidates or [])
             if getattr(entry, "resume_turn_id", None) and self._auto_resume_ready(entry) is not None
@@ -455,7 +460,10 @@ class RestartRecoveryMixin:
 
     def _schedule_resume_pending_sessions(self, platform=None, *, restore_tasks=None, restore_keys=None,
                                           candidates=_NOT_SUPPLIED, allow_resume=True) -> int:
-        """Claim eligible interrupted sessions before spawning; record every terminal decision."""
+        """Auto-continue fresh restart-interrupted sessions: synthesize an empty-text turn (the
+        ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
+        ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
+        sessions with a running agent are skipped so none is resumed twice."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         candidates = self._resume_pending_candidates(platform) if candidates is _NOT_SUPPLIED else candidates
         if candidates is None:
@@ -465,12 +473,8 @@ class RestartRecoveryMixin:
                         and not getattr(self, "_restart_resume_breaker_tripped", False))
         for entry in candidates:
             if entry.session_key in getattr(self, "_restart_followup_keys", ()):
-                # The restored prompt owns this recovery. Do not admit an empty synthetic turn
-                # against it or log the predecessor's decision before its real follow-up finishes.
                 continue
             if entry.session_key in getattr(self, "_startup_resume_inflight", ()):
-                # Its resume already runs; the pre-claim was handed to the adapter guard, so the
-                # running-session check below cannot see it.
                 continue
             if platform is not None and getattr(entry.origin, "platform", None) != platform:
                 continue
@@ -491,12 +495,21 @@ class RestartRecoveryMixin:
             if inflight is None:
                 inflight = self._startup_resume_inflight = set()
             inflight.add(entry.session_key)
+            # Claim the slot *before* spawning so an inbound message arriving before the task's first
+            # await queues instead of building a duplicate AIAgent.
             state = self._session_state(entry.session_key)
             state.turn.agent = _AGENT_PENDING_SENTINEL
             state.turn.started_ts = time.time()
             self._persist_active_agents()
             resume_marker = getattr(entry, "resume_turn_id", None) or getattr(entry, "resume_marker_token", None)
-            event = self._build_startup_resume_event(source, resume_marker)
+            # This event owns the sentinel claimed above. Other input must still queue, but the
+            # resume itself must enter the turn instead of bouncing into its own pending slot.
+            state.turn.event = event = self._build_startup_resume_event(source, resume_marker)
+            event._startup_resume_claim = True
+            claimed = getattr(self, "_startup_resume_claimed", None)
+            if claimed is None:
+                claimed = self._startup_resume_claimed = set()
+            claimed.add(entry.session_key)
             logger.debug(
                 "startup resume event constructed: session=%s marker=%r admission=%r internal=%r",
                 entry.session_key, resume_marker, getattr(event, "_outbox_admission_id", None),
@@ -518,3 +531,14 @@ class RestartRecoveryMixin:
         if scheduled:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
+
+    @staticmethod
+    def _build_startup_resume_event(source, resume_marker):
+        """Build the exact internal event used to auto-continue one restart marker."""
+        event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
+                             message_id=getattr(source, "message_id", None), internal=True)
+        if resume_marker:
+            # Keep the transport reply anchor for threading, but admit each interruption marker
+            # under its own outbox identity so one marker resumes at most once.
+            setattr(event, "_outbox_admission_id", f"resume:{resume_marker}")
+        return event
