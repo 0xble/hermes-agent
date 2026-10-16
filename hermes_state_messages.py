@@ -2205,6 +2205,19 @@ class SessionMessagesMixin:
             "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
             (session_id, platform_message_id)) is not None
 
+    def get_messages_by_platform_message_id(self, session_id: str, platform_message_id: str) -> List[Dict[str, Any]]:
+        """Return user rows carrying *platform_message_id*, including inactive history.
+
+        Callers that decide whether an input is the same logical trigger must compare the returned
+        content as well as this transport identity; the id alone is not a durable admission key.
+        """
+        rows = self._read_all(
+            "SELECT * FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND platform_message_id = ? ORDER BY id ASC",
+            (session_id, platform_message_id))
+        return [self._row_to_message_dict(row, warn_context="platform message lookup", summary_flag=True)
+                for row in rows]
+
     def has_user_message_content(self, session_id: str, content: str, *, min_timestamp=None) -> bool:
         """True when a user row already carries the id-less inbound content."""
         timestamp_clause = " AND timestamp >= ?" if min_timestamp is not None else ""

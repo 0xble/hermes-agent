@@ -154,6 +154,7 @@ def test_compress_context_preserves_ambient_context(monkeypatch):
         set_conversation_context,
     )
     from run_agent import AIAgent
+    from types import SimpleNamespace
 
     seen = {}
 
@@ -164,6 +165,8 @@ def test_compress_context_preserves_ambient_context(monkeypatch):
     monkeypatch.setattr(cc, "compress_context", _fake_compress)
 
     class _Agent:
+        context_compressor = SimpleNamespace(context_length=None)
+
         def _conversation_root_id(self):
             # A rotated segment id must never win over the ambient root.
             return "segment-after-compaction"

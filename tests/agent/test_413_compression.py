@@ -1383,7 +1383,7 @@ class TestPreflightCompression:
 
         with (
             patch(
-                "agent.codex_responses_adapter.estimate_native_responses_preflight_tokens",
+                "agent.turn_context._preflight_request_tokens",
                 return_value=1_300,
             ),
             patch.object(agent, "_run_codex_stream", return_value=response) as provider,
@@ -1448,6 +1448,7 @@ class TestToolResultPreflightCompression:
     def test_mid_turn_retry_compares_fully_assembled_requests(self, agent):
         """API-only context must not make marginal compression look effective."""
         agent.compression_enabled = True
+        agent.max_tokens = 1024
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
 
@@ -1477,6 +1478,7 @@ class TestToolResultPreflightCompression:
         )
 
         with (
+            patch("agent.compression_recovery.estimate_request_tokens_rough", return_value=150_000),
             patch(
                 "agent.model_metadata.estimate_messages_tokens_rough",
                 side_effect=lambda *_a, **_k: next(assembled_estimates),

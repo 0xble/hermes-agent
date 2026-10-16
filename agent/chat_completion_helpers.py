@@ -1345,7 +1345,7 @@ def _reasoning_config_for_wire(agent):
 
 def _resolve_reasoning_config_for_wire(agent, ephemeral_off: bool):
     """Side-effect-free core of :func:`_reasoning_config_for_wire` (fit checks peek through it)."""
-    cfg = agent.reasoning_config
+    cfg = getattr(agent, "reasoning_config", None)
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
         # max`` on an enabled config). Omit the reasoning fields for the rest of the session —

@@ -97,6 +97,9 @@ class TurnContext:
     event_message_id: Optional[str] = None
     # Raw inbound platform id (not the event_message_id reply anchor); stamped on the user turn.
     inbound_message_id: Optional[str] = None
+    # The queued MessageEvent this turn consumes; its accepted-queue checkpoint is retired once
+    # the agent durably admits the input (see agent.compression_recovery.notify_input_admitted).
+    queued_event: Any = None
     # Recovery-only dedupe key; never use this as a transport/reply identity.
     recovery_id: Optional[str] = None
     moa_config: Optional[dict] = None

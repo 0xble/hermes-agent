@@ -1646,6 +1646,7 @@ class TextDebounceState:
     task: asyncio.Task | None
     first_ts: float
     last_ts: float
+    admission_failure_notified: bool = False
 
     def cancel_timer(self, *, unless: "asyncio.Task | None" = None) -> None:
         """Cancel the pending flush timer (if live and not ``unless``)."""
@@ -1957,6 +1958,47 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             _record_absorbed_pending_event(existing, event)
             return
     pending_messages[session_key] = event
+
+
+def checkpointed_merge_pending_message_event(
+    pending_messages: Dict[str, MessageEvent], session_key: str, event: MessageEvent,
+    *, merge_text: bool = False, replace: bool = False,
+) -> bool:
+    """Commit one pending-slot mutation only after its native recovery checkpoint succeeds.
+
+    Merges happen on a shallow event copy so a failed refresh leaves the live slot unchanged. Every
+    production path that accepts or merges pending content uses this single admission boundary.
+    """
+    import copy
+
+    from gateway.shutdown_flush import checkpoint_queued_event, retire_queue_checkpoint
+
+    existing = pending_messages.get(session_key)
+    if existing is event:
+        return checkpoint_queued_event(session_key, event, refresh=True)
+    if existing is None or replace:
+        candidate = event
+        refresh = False
+    else:
+        candidate = copy.copy(existing)
+        for name in ("media_urls", "media_types", "media_text_inlined"):
+            if hasattr(existing, name):
+                setattr(candidate, name, list(getattr(existing, name, None) or []))
+        if hasattr(existing, "metadata"):
+            candidate.metadata = dict(getattr(existing, "metadata", None) or {})
+        temp = {session_key: candidate}
+        merge_pending_message_event(temp, session_key, event, merge_text=merge_text)
+        candidate = temp[session_key]
+        refresh = candidate is not event and getattr(existing, "_hermes_recovery_spool", None) is not None
+
+    if not checkpoint_queued_event(session_key, candidate, refresh=refresh):
+        return False
+    pending_messages[session_key] = candidate
+    if existing is not None and candidate is not event:
+        retire_queue_checkpoint(event, reason="merged_into_head")
+    elif existing is not None:
+        retire_queue_checkpoint(existing, reason="replaced_pending_event")
+    return True
 
 
 # Transient *connection* failures worth retrying. Plain/read/write "timeout" excluded on purpose:
@@ -4239,20 +4281,54 @@ class BasePlatformAdapter(ABC):
                        state.first_ts + self._busy_text_hard_cap_seconds)
         return max(0.0, deadline - time.monotonic())
 
-    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
+    async def _send_text_debounce_admission_failure(self, event: MessageEvent) -> None:
+        """Tell the sender when a debounced queue admission could not be checkpointed."""
+        from gateway.run_busy import QUEUE_ADMISSION_FAILURE
+        runner = getattr(self, "gateway_runner", None)
+        sender = getattr(runner, "_send_busy_ack_reply", None)
+        if callable(sender):
+            try:
+                result = sender(event, self, QUEUE_ADMISSION_FAILURE)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug("Failed to send text-debounce admission failure", exc_info=True)
+
+    def _reschedule_text_debounce(self, session_key: str, state: TextDebounceState) -> None:
+        """Retry a failed debounce flush without dropping its only in-memory copy."""
+        state.last_ts = time.monotonic()
+        state.cancel_timer(unless=asyncio.current_task())
+        state.task = asyncio.create_task(
+            self._flush_text_debounce(session_key, max(self._busy_text_debounce_seconds, 0.1))
+        )
+
+    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> bool:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         store = self._text_debounce_store()
         state = store.get(session_key)
         if state is not None and not self._can_merge_text_debounce_events(state.event, event):
             # Preserve sender attribution: flush the buffer as the next turn, new sender starts
-            # fresh.
-            await self._flush_text_debounce_now(session_key)
+            # fresh. If storage rejects the old burst, report it and still admit this sender's
+            # message through its own FIFO path rather than silently consuming it.
+            flushed = await self._flush_text_debounce_now(session_key)
             state = store.get(session_key)
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-                existing_pending = self._pending_messages.get(session_key)
-                if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                return
+                if not flushed:
+                    # Keep the failed burst in the debounce store so a later retry can admit it;
+                    # the different sender is admitted on the native pending/overflow path below.
+                    state.last_ts = time.monotonic()
+                runner = getattr(self, "gateway_runner", None)
+                enqueue = getattr(runner, "_queue_or_replace_pending_event", None)
+                admitted = bool(enqueue(session_key, event)) if callable(enqueue) else False
+                if not callable(enqueue):
+                    from gateway.platforms.base import checkpointed_merge_pending_message_event
+                    admitted = checkpointed_merge_pending_message_event(
+                        self._pending_messages, session_key, event, merge_text=True,
+                    )
+                event._gateway_accepted = admitted
+                if not admitted:
+                    await self._send_text_debounce_admission_failure(event)
+                return admitted
         now = time.monotonic()
         if state is None:
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
@@ -4271,6 +4347,7 @@ class BasePlatformAdapter(ABC):
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
+        return False
 
     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
         """Timer task that flushes the debounced text buffer."""
@@ -4295,9 +4372,20 @@ class BasePlatformAdapter(ABC):
         state.task = None
         pending = self._pending_messages.get(session_key)
         if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
+            # A different sender already owns the native slot. Keep the burst and retry after that
+            # event drains; returning without a timer would strand the only in-memory copy forever.
+            self._reschedule_text_debounce(session_key, state)
             return False
+        if not checkpointed_merge_pending_message_event(
+            self._pending_messages, session_key, state.event, merge_text=True,
+        ):
+            if not state.admission_failure_notified:
+                state.admission_failure_notified = True
+                await self._send_text_debounce_admission_failure(state.event)
+            self._reschedule_text_debounce(session_key, state)
+            return False
+        state.event._gateway_accepted = True
         store.pop(session_key, None)
-        merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -4331,7 +4419,7 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        self._discard_pending_message(session_key, reason="stale_lock_heal")
         self._invalidate_deferred_commands(session_key)
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
@@ -4395,7 +4483,7 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            self._discard_pending_message(session_key, reason="cancel_session_processing")
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -4437,6 +4525,11 @@ class BasePlatformAdapter(ABC):
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
         event._gateway_accepted = False
+        # Capture raw identity before topic routing, media rehoming, sender prefixes, or reply
+        # context can rewrite ``event.text``. The digest is carried in the event metadata and
+        # survives every queue/checkpoint refresh.
+        from agent.message_metadata import stamp_event_raw_input_digest
+        stamp_event_raw_input_digest(event)
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
             # say so once per adapter (#102260).
@@ -4615,8 +4708,10 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
-            event._gateway_accepted = True
+            from gateway.platforms.base import checkpointed_merge_pending_message_event
+            event._gateway_accepted = checkpointed_merge_pending_message_event(
+                self._pending_messages, session_key, event,
+            )
             return
         if self._is_queue_text_debounce_candidate(event):
             logger.debug("[%s] New text message while session %s is active — "
@@ -4626,9 +4721,11 @@ class BasePlatformAdapter(ABC):
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
-            event._gateway_accepted = True
+            from gateway.platforms.base import checkpointed_merge_pending_message_event
+            event._gateway_accepted = checkpointed_merge_pending_message_event(
+                self._pending_messages, session_key, event,
+                merge_text=event.message_type == MessageType.TEXT,
+            )
 
     def _get_human_delay(self) -> float:
         """Random human-like pacing delay (s) from this adapter's ``human_delay`` config range
@@ -5520,6 +5617,15 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
+
+    def _discard_pending_message(self, session_key: str, *, reason: str) -> Optional[MessageEvent]:
+        """Drop the pending slot as user-visible discarded work; its queue checkpoint goes too,
+        or a restart would replay input the user (or a heal) deliberately threw away."""
+        dropped = self._pending_messages.pop(session_key, None)
+        if dropped is not None:
+            from gateway.shutdown_flush import retire_queue_checkpoint
+            retire_queue_checkpoint(dropped, reason=reason)
+        return dropped
 
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",

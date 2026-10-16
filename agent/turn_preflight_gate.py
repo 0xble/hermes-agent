@@ -97,7 +97,6 @@ def run_preflight_gate(
         with suppress(Exception):
             agent.iteration_budget.refund()
         v.action = "break"
-        _clear_preflight_output_state(agent)
         return v
 
     # A known hard-window breach cannot defer to real usage: some servers truncate

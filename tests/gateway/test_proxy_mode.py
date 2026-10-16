@@ -241,8 +241,12 @@ class TestRunAgentProxyDispatch:
             def __init__(self):
                 self.rows = []
 
-            async def has_platform_message_id(self, session_id, platform_message_id):
-                return any(row.get("platform_message_id") == platform_message_id for row in self.rows)
+            async def has_platform_message_id(self, session_id, platform_message_id, user_message=None, persist_user_message=None):
+                return any(
+                    row.get("platform_message_id") == platform_message_id
+                    and (user_message is None or row.get("content") in (user_message, persist_user_message))
+                    for row in self.rows
+                )
 
             async def append_to_transcript(self, session_id, row, **kwargs):
                 self.rows.append(dict(row))
@@ -329,8 +333,12 @@ class TestRunAgentProxyDispatch:
             def __init__(self):
                 self.db_rows = []
 
-            async def has_platform_message_id(self, session_id, platform_message_id):
-                return any(row.get("platform_message_id") == platform_message_id for row in self.db_rows)
+            async def has_platform_message_id(self, session_id, platform_message_id, user_message=None, persist_user_message=None):
+                return any(
+                    row.get("platform_message_id") == platform_message_id
+                    and (user_message is None or row.get("content") in (user_message, persist_user_message))
+                    for row in self.db_rows
+                )
 
             async def append_to_transcript(self, session_id, row, skip_db=False):
                 if not skip_db:
@@ -393,8 +401,12 @@ class TestRunAgentProxyDispatch:
         rows = []
 
         class _Store:
-            async def has_platform_message_id(self, session_id, platform_message_id):
-                return any(row.get("platform_message_id") == platform_message_id for row in rows)
+            async def has_platform_message_id(self, session_id, platform_message_id, user_message=None, persist_user_message=None):
+                return any(
+                    row.get("platform_message_id") == platform_message_id
+                    and (user_message is None or row.get("content") in (user_message, persist_user_message))
+                    for row in rows
+                )
 
             async def append_to_transcript(self, session_id, row, **kwargs):
                 rows.append(dict(row))
@@ -408,6 +420,42 @@ class TestRunAgentProxyDispatch:
             ) is True
         assert [row["content"] for row in rows] == ["first legacy follow-up", "second legacy follow-up"]
         assert all("platform_message_id" not in row for row in rows)
+
+    @pytest.mark.asyncio
+    async def test_recovery_proxy_legacy_row_dedupes_by_platform_id(self, monkeypatch):
+        runner = _make_runner()
+        rows = [{
+            "role": "user", "content": "first payload", "platform_message_id": "reused-id",
+        }]
+
+        class _Store:
+            async def has_platform_message_id(self, session_id, platform_message_id, user_message=None, persist_user_message=None):
+                return any(
+                    row.get("platform_message_id") == platform_message_id
+                    and (user_message is None and persist_user_message is None
+                         or row.get("content") in (user_message, persist_user_message))
+                    for row in rows
+                )
+
+            async def append_to_transcript(self, session_id, row, **kwargs):
+                rows.append(dict(row))
+
+        monkeypatch.setattr(GatewayRunner, "async_session_store", property(lambda _self: _Store()))
+        assert await runner._hmwa_persist_proxy_recovery_user_row(
+            session_id="s", message="second payload", inbound_message_id="reused-id",
+            recovery_id=None, recovery_session_key="key", persist_user_message=None,
+            persist_user_timestamp=1.0, persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+        ) is True
+        assert len(rows) == 1
+        assert await runner._hmwa_persist_proxy_recovery_user_row(
+            session_id="s", message="second payload", inbound_message_id="reused-id",
+            recovery_id=None, recovery_session_key="key", persist_user_message=None,
+            persist_user_timestamp=1.0, persist_user_display_kind=None,
+            persist_user_display_metadata=None,
+        ) is True
+        assert len(rows) == 1
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""

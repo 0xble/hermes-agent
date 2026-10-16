@@ -1222,11 +1222,10 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     turn's own ``_handle_message`` sees the sentinel it pre-claimed at
     the early running-agent guard, queues the event into
     ``_pending_messages`` and returns ``None`` without running the
-    agent.  The adapter's late-arrival drain (in
-    ``_process_message_background``'s ``finally``) re-dispatches the
-    queued event, and because the guard wrapper's ``finally`` releases
-    the pre-claim before the spawned drain task starts, the agent runs
-    exactly once.  This test locks that invariant in: the resume agent
+    agent. The synthetic event must own its pre-claimed slot while
+    unrelated input still sees it as busy. Depending on a late-arrival
+    drain loses this empty wake at durable queue admission.
+    This test locks that invariant in: the resume agent
     must run once — never zero (regression) and never twice (the bug
     the fix targets).
     """
@@ -1264,13 +1263,19 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._active_session_leases = {}
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
-    runner.session_store.get_or_create_session.return_value = None
+    runner.session_store.get_or_create_session.return_value = pending_entry
 
     # Count how many times an actual agent run is started for this session.
     agent_runs: list[str] = []
+    agent_events: list[MessageEvent] = []
+    agent_started = asyncio.Event()
+    release_agent = asyncio.Event()
 
     async def _fake_run(event, source, _quick_key, run_generation):
         agent_runs.append(_quick_key)
+        agent_events.append(event)
+        agent_started.set()
+        await release_agent.wait()
         return "RESUMED OK"
 
     runner._handle_message_with_agent = _fake_run
@@ -1291,9 +1296,21 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # Pre-claim must be visible immediately.
     assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
 
-    # Let the guarded task, the background task, and the late-arrival
-    # drain task all settle.
-    for _ in range(20):
+    await asyncio.wait_for(agent_started.wait(), timeout=5.0)
+    try:
+        from gateway.run_busy import QUEUE_ADMISSION_FAILURE
+
+        # Re-dispatching the same synthetic event must not re-use its startup
+        # ownership to enter a second agent turn while the first is pending.
+        duplicate_reply = await asyncio.wait_for(runner._handle_message(agent_events[0]), timeout=5.0)
+        assert duplicate_reply == QUEUE_ADMISSION_FAILURE
+        assert agent_runs == [session_key]
+    finally:
+        release_agent.set()
+    # Settle the guarded task and its adapter drain before checking duplicates.
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while runner._background_tasks or adapter._active_sessions:
+        assert asyncio.get_running_loop().time() < deadline
         await asyncio.sleep(0.02)
 
     # Exactly one agent run for the resumed session — not zero (the

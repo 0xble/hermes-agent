@@ -8,6 +8,7 @@ from typing import Any
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run_busy import QUEUE_ADMISSION_FAILURE
 
 # Log-record parity with gateway/run.py and the origin module.
 logger = logging.getLogger("gateway.run")
@@ -57,10 +58,11 @@ class GatewayGoalCommandsMixin:
         if result.clear_pending:
             self._clear_goal_continuations(event, result.clear_pending)
         if result.prompt:
-            self._enqueue_goal_turn(
+            if not self._enqueue_goal_turn(
                 event, result.prompt, label="command enqueue", kickoff=result.kickoff,
                 goal_session_id=mgr.session_id, goal_state=mgr.state,
-            )
+            ):
+                return QUEUE_ADMISSION_FAILURE
         return result.output
 
     def _clear_goal_continuations(self, event: MessageEvent, verb: str) -> None:
@@ -74,13 +76,14 @@ class GatewayGoalCommandsMixin:
     def _enqueue_goal_turn(
         self, event: MessageEvent, text: str, *, label: str, kickoff: bool,
         goal_session_id: str = "", goal_state: Any = None,
-    ) -> None:
+    ) -> bool:
         """Enqueue *text* as the next turn through the adapter FIFO (the post-turn judge's path).
 
         A kickoff answers the user's own ``/goal`` message, so it keeps that message's id, channel
         prompt and reply contract. A resumed or refreshed continuation is gateway-authored like
         every other goal continuation: it is built by the shared synthetic-prompt constructor so
-        a no-change tick may end on the silence marker. Best-effort: failures only logged.
+        a no-change tick may end on the silence marker. Return actual admission so command
+        output cannot claim success for a dropped kickoff.
         """
         try:
             adapter, quick_key = self._adapter_and_key_for(event)
@@ -99,9 +102,12 @@ class GatewayGoalCommandsMixin:
                         event.source, text, reply_expected=False, goal_continuation=True,
                         goal_session_id=goal_session_id, goal_state=goal_state,
                     )
-                self._enqueue_fifo(quick_key, turn, adapter)
+                if self._enqueue_fifo(quick_key, turn, adapter):
+                    return True
+            logger.warning("goal %s failed: turn was not admitted to FIFO", label)
         except Exception as exc:
-            logger.debug("goal %s failed: %s", label, exc)
+            logger.warning("goal %s failed: %s", label, exc)
+        return False
 
     async def _handle_heartbeat_command(self, event: MessageEvent) -> str:
         """Handle /heartbeat (mirror of the CLI handler): the session's one recurring re-entry

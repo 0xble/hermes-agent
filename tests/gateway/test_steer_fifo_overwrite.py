@@ -46,8 +46,8 @@ def _prequeue(runner, adapter, sk):
         message_type=MessageType.TEXT,
     )
     # Q1 -> pending slot (head), Q2 -> overflow tail
-    runner._enqueue_fifo(sk, q1, adapter)
-    runner._enqueue_fifo(sk, q2, adapter)
+    assert runner._enqueue_fifo(sk, q1, adapter)
+    assert runner._enqueue_fifo(sk, q2, adapter)
     assert adapter._pending_messages[sk].text == "Q1"
     assert runner._queued_events[sk][0].text == "Q2"
 
