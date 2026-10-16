@@ -3368,8 +3368,13 @@ def _is_auth_unavailable_error(exc: Exception) -> bool:
 
 
 def _is_server_error(exc: Exception) -> bool:
-    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback."""
+    """HTTP 5xx/408 failures may retry once, then must move to a configured fallback.
+
+    A 408 that reports a timeout stays with the timeout rung, which names it as one.
+    """
     status = _exc_http_status(exc)
+    if status == 408 and _is_timeout_error(exc):
+        return False
     return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 

@@ -522,6 +522,8 @@ class SessionDB(
     _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.020, 0.150  # fast jitter for the first _SLOW_AFTER_S
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S, _WRITE_RETRY_SLOW_MAX_S = 0.250, 1.000
+    # Warn with callback and pid when one transaction holds the WAL write lock unusually long.
+    _WRITE_LOCK_WARN_S = 3.0
     # PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
@@ -545,12 +547,26 @@ class SessionDB(
         return prompt_hash
 
     @staticmethod
-    def _delete_unreferenced_system_prompts(conn) -> None:
-        conn.execute(
-            "DELETE FROM system_prompts WHERE NOT EXISTS ("
+    def _delete_unreferenced_system_prompts(conn, limit: Optional[int] = None) -> int:
+        if limit is None:
+            cursor = conn.execute(
+                "DELETE FROM system_prompts WHERE NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash) AND NOT EXISTS ("
+                "SELECT 1 FROM sessions WHERE sessions.tool_names = system_prompts.hash)"
+            )
+            return max(cursor.rowcount, 0)
+        rows = conn.execute(
+            "SELECT hash FROM system_prompts WHERE NOT EXISTS ("
             "SELECT 1 FROM sessions WHERE sessions.system_prompt_hash = system_prompts.hash) AND NOT EXISTS ("
-            "SELECT 1 FROM sessions WHERE sessions.tool_names = system_prompts.hash)"
-        )
+            "SELECT 1 FROM sessions WHERE sessions.tool_names = system_prompts.hash) LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        if not rows:
+            return 0
+        hashes = [row[0] for row in rows]
+        placeholders = ",".join("?" for _ in hashes)
+        conn.execute(f"DELETE FROM system_prompts WHERE hash IN ({placeholders})", hashes)
+        return len(hashes)
 
     @staticmethod
     def _session_row_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1073,6 +1089,7 @@ class SessionDB(
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
+                    transaction_started = time.monotonic()
                     try:
                         fn_started = True
                         result = fn(self._conn)
@@ -1083,6 +1100,13 @@ class SessionDB(
                         except Exception:
                             pass
                         raise
+                    finally:
+                        held_s = time.monotonic() - transaction_started
+                        if held_s >= self._WRITE_LOCK_WARN_S:
+                            callback_name = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+                            logger.warning(
+                                "state.db write transaction held the write lock for %.1fs: callback=%s pid=%d",
+                                held_s, callback_name, os.getpid())
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:

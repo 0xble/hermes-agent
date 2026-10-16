@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import logging
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -340,6 +341,82 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
     return tmp_path
+
+
+def test_removed_job_journal_prunes_entries_older_than_seven_days(tmp_cron_dir, monkeypatch):
+    import json
+    from cron import jobs
+
+    fixed_now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    removed_file.write_text(json.dumps({
+        "id": "old", "removed_at": (fixed_now - timedelta(days=8)).isoformat(),
+    }) + "\n")
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: fixed_now)
+    jobs._record_removed_jobs_unlocked({"new"})
+    records = [json.loads(line) for line in removed_file.read_text().splitlines()]
+    assert {record["id"] for record in records} == {"new"}
+
+
+def test_removed_job_journal_append_recovers_from_non_utf8_contents(tmp_cron_dir):
+    from cron import jobs
+
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    removed_file.write_bytes(b"{\xff\n")
+
+    jobs._record_removed_jobs_unlocked({"deleted"})
+
+    assert jobs.get_removed_job_ids() == {"deleted"}
+
+
+def test_removed_job_journal_salvages_valid_records_around_corruption(tmp_cron_dir):
+    import json
+    from cron import jobs
+
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    valid = json.dumps({
+        "id": "already-deleted",
+        "removed_at": datetime.now(timezone.utc).isoformat(),
+    }).encode()
+    removed_file.write_bytes(valid + b"\n{\xff\n")
+
+    jobs._record_removed_jobs_unlocked({"deleted"})
+
+    assert jobs.get_removed_job_ids() == {"already-deleted", "deleted"}
+
+
+def test_removed_job_journal_permission_error_does_not_rewrite(tmp_cron_dir, monkeypatch):
+    from cron import jobs
+
+    jobs.ensure_dirs()
+    removed_file = jobs._removed_jobs_file()
+    original = b'{"id":"already-deleted","removed_at":"2026-01-01T00:00:00+00:00"}\n'
+    removed_file.write_bytes(original)
+    original_read_bytes = type(removed_file).read_bytes
+
+    def deny_read(path):
+        if path == removed_file:
+            raise PermissionError("journal is not readable")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(type(removed_file), "read_bytes", deny_read)
+
+    with pytest.raises(PermissionError):
+        jobs._record_removed_jobs_unlocked({"deleted"})
+
+    assert removed_file.read_text(encoding="utf-8") == original.decode()
+
+
+def test_removed_job_journal_missing_is_quiet(tmp_cron_dir, caplog):
+    from cron import jobs
+
+    caplog.set_level(logging.WARNING, logger="cron.jobs")
+
+    assert jobs.get_removed_job_ids() == set()
+    assert not caplog.records
 
 
 class TestJobCRUD:

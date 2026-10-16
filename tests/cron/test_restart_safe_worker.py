@@ -296,6 +296,7 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
 
     spawned = []
     payloads = []
+    processes = []
 
     def popen(command, **kwargs):
         spawned.append((command, kwargs))
@@ -306,7 +307,9 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
             json.dumps({"pid": 4321, "execution_id": "exec-1"}),
             encoding="utf-8",
         )
-        return FakeProcess()
+        worker = FakeProcess()
+        processes.append(worker)
+        return worker
 
     handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
@@ -317,7 +320,15 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
             {"id": "exec-1", "status": "completed"},
         ]
     )
-    get = Mock(side_effect=lambda _execution_id: next(observed_statuses))
+    def read_execution(_execution_id):
+        # The terminal row stays terminal: post-completion re-reads (claim release, cleanup)
+        # must keep seeing it rather than exhaust the sequence.
+        row = next(observed_statuses, {"id": "exec-1", "status": "completed"})
+        if row["status"] == "completed":
+            processes[-1].returncode = 0
+        return row
+
+    get = Mock(side_effect=read_execution)
     monkeypatch.setattr(scheduler, "get_execution", get)
     return spawned, payloads, handoff, get
 
@@ -458,7 +469,10 @@ def test_degraded_worker_remains_active_and_is_marked_interrupted(tmp_path, monk
         "tools.process_registry.restart_safe_gateway_child_argv",
         lambda command, **_kw: GatewayChildDispatch("degraded", command),
     )
-    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    import cron.scheduler_detached_worker as detached_worker
+    monkeypatch.setattr(detached_worker, "reap_terminal_worker_in_background", lambda _process: None)
     prior_worker_pids = dict(scheduler._running_worker_pids)
     with scheduler._running_lock:
         scheduler._running_job_ids.add(key)
@@ -531,22 +545,24 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
 
+    process = FakeProcess()
+
     monkeypatch.setattr(
-        scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+        scheduler.subprocess, "Popen", lambda *_args, **_kwargs: process
     )
-    monkeypatch.setattr(
-        scheduler,
-        "get_execution",
-        lambda _execution_id: {"id": "exec-cold", "status": "completed"},
-    )
+    def read_execution(_execution_id):
+        process.returncode = 0
+        return {"id": "exec-cold", "status": "completed"}
+
+    monkeypatch.setattr(scheduler, "get_execution", read_execution)
     monkeypatch.setattr(scheduler.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(scheduler.time, "sleep", clock.sleep)
     monkeypatch.setattr(scheduler, "_running_worker_pids", {})
 
     assert scheduler._launch_external_cron_worker(job) is True
-    # The acknowledged path records the worker pid; the ownership-uncertain
-    # timeout path never does.
-    assert scheduler._running_worker_pids == {scheduler._inflight_key("job-cold"): 4321}
+    # The worker has exited, so the waiter has already reaped and released
+    # its in-process claim; only a live worker remains in this map.
+    assert scheduler._running_worker_pids == {}
 
 
 def test_worker_dying_before_ack_names_its_stderr_cause(tmp_path, monkeypatch):
@@ -590,6 +606,368 @@ def test_external_worker_exit_rechecks_exact_execution_before_failure(monkeypatc
         process, execution_id="exec-1"
     ) is True
     assert get.call_count == 2
+
+
+def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-detached"
+    key = scheduler._inflight_key(job_id)
+    owner = object()
+    with scheduler._running_lock:
+        scheduler._running_job_ids.add(key)
+        scheduler._running_registration_owners[key] = owner
+        scheduler._external_worker_modes[key] = "scoped"
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
+    process = Mock()
+    process.poll.return_value = 0
+    process.wait.return_value = 0
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-detached", "status": "completed"},
+    )
+    try:
+        assert scheduler._wait_for_external_cron_worker(
+            process,
+            execution_id="exec-detached",
+            job_id=job_id,
+        ) is True
+        assert scheduler.try_register_running_job(job_id, owner=object())
+        # The successor is not classified restart-safe by the exited worker's flags.
+        with scheduler._running_lock:
+            assert key not in scheduler._restart_safe_waiter_job_ids
+            assert key not in scheduler._restart_safe_external_worker_job_ids
+    finally:
+        scheduler.release_running_job(job_id, home=tmp_path)
+        with scheduler._running_lock:
+            scheduler._restart_safe_waiter_job_ids.discard(key)
+            scheduler._restart_safe_external_worker_job_ids.discard(key)
+
+
+def test_live_detached_worker_keeps_claim_until_process_exit(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-live-detached"
+    key = scheduler._inflight_key(job_id)
+    owner = object()
+    with scheduler._running_lock:
+        scheduler._running_job_ids.add(key)
+        scheduler._running_registration_owners[key] = owner
+        scheduler._external_worker_modes[key] = "scoped"
+
+    exited = threading.Event()
+    process = Mock()
+    process.returncode = None
+
+    def poll():
+        return 0 if exited.is_set() else None
+
+    def wait(timeout=None):
+        if exited.wait(timeout):
+            process.returncode = 0
+            return 0
+        raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+
+    process.poll.side_effect = poll
+    process.wait.side_effect = wait
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-live-detached", "status": "completed"},
+    )
+    errors = []
+
+    def wait_for_worker():
+        try:
+            scheduler._wait_for_external_cron_worker(
+                process,
+                execution_id="exec-live-detached",
+                job_id=job_id,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=wait_for_worker)
+    thread.start()
+    try:
+        assert thread.is_alive()
+        assert not scheduler.try_register_running_job(job_id, owner=object())
+        exited.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not errors
+        assert scheduler.try_register_running_job(job_id, owner=object())
+    finally:
+        exited.set()
+        thread.join(timeout=2)
+        scheduler.release_running_job(job_id, home=tmp_path)
+
+
+def test_post_handoff_waiter_error_keeps_claim_until_worker_exit(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+    from concurrent.futures import Future
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-post-handoff"},
+    )
+    monkeypatch.setattr(scheduler, "note_cron_execution", lambda _job: None)
+    exited = threading.Event()
+    process = Mock()
+    process.pid = 4321
+
+    def poll():
+        return 0 if exited.is_set() else None
+
+    def wait(timeout=None):
+        if exited.wait(timeout):
+            return 0
+        raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+
+    process.poll.side_effect = poll
+    process.wait.side_effect = wait
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        Mock(side_effect=RuntimeError("transient ledger read")),
+    )
+
+    def launch(_job):
+        key = scheduler._inflight_key("job-post-handoff")
+        with scheduler._running_lock:
+            scheduler._external_worker_modes[key] = "detached"
+        return scheduler._wait_for_external_cron_worker(
+            process,
+            execution_id="exec-post-handoff",
+            job_id="job-post-handoff",
+        )
+
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", launch)
+
+    class Pool:
+        def submit(self, callback):
+            future = Future()
+            try:
+                future.set_result(callback())
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    job = {
+        "id": "job-post-handoff",
+        "schedule": {"kind": "interval", "minutes": 1},
+        "_scheduled_instant": None,
+    }
+    future = scheduler._submit_with_guard(
+        job, Pool(), lambda item: scheduler._launch_external_cron_worker(item))
+    with pytest.raises(scheduler._ExternalWorkerPostHandoffError):
+        future.result()
+    try:
+        # The worker is still live even though the waiter reported a transient error.
+        assert scheduler.is_job_running(job["id"], home=tmp_path)
+        exited.set()
+        deadline = time.monotonic() + 2
+        while scheduler.is_job_running(job["id"], home=tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler.is_job_running(job["id"], home=tmp_path)
+    finally:
+        exited.set()
+        scheduler.release_running_job(job["id"], home=tmp_path)
+
+
+def test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error(
+    monkeypatch, tmp_path, execution_ledger
+):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-live-detached-terminal"
+    job = {
+        "id": job_id,
+        "schedule": {"kind": "interval", "minutes": 1},
+    }
+    owner = object()
+    process = Mock()
+    exited = threading.Event()
+    errors = []
+
+    process.poll.side_effect = lambda: 0 if exited.is_set() else None
+    process.wait.side_effect = lambda timeout=None: (
+        0 if exited.wait(timeout) else (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd="worker", timeout=timeout)))
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        Mock(side_effect=RuntimeError("transient ledger read")),
+    )
+    assert scheduler.try_register_running_job(job_id, owner=owner)
+    key = scheduler._inflight_key(job_id, tmp_path)
+    execution = execution_ledger.create_execution(job_id, source="builtin")
+    terminal = execution_ledger.finish_execution(execution["id"], success=True)
+    assert terminal and terminal["status"] == "completed"
+    with scheduler._running_lock:
+        scheduler._external_worker_modes[key] = "detached"
+
+    def wait_for_worker():
+        try:
+            scheduler._wait_for_external_cron_worker(
+                process,
+                execution_id="exec-live-detached-terminal",
+                job_id=job_id,
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    waiter = threading.Thread(target=wait_for_worker)
+    waiter.start()
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
+    assert errors and isinstance(errors[0], scheduler._ExternalWorkerPostHandoffError)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_latest_executions_for_releasable_claims",
+        lambda: {job_id: terminal},
+    )
+    try:
+        assert scheduler.sweep_stale_inflight([job]) == []
+        assert scheduler.is_job_running(job_id, home=tmp_path)
+        exited.set()
+        deadline = time.monotonic() + 2
+        while scheduler.is_job_running(job_id, home=tmp_path) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+    finally:
+        exited.set()
+        waiter.join(timeout=2)
+        scheduler.release_running_job(job_id, home=tmp_path, owner=owner)
+
+
+def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_path):
+    """Sweep wins the race with the reaper: the dead claim must not block a successor's release."""
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-exited-detached-swept"
+    job = {"id": job_id, "schedule": {"kind": "interval", "minutes": 1}}
+    old_owner = object()
+    process = Mock()
+    process.poll.return_value = 0  # the worker has exited; the reaper has not run yet
+    assert scheduler.try_register_running_job(job_id, owner=old_owner)
+    key = scheduler._inflight_key(job_id, tmp_path)
+    with scheduler._running_lock:
+        scheduler._external_worker_claims[key] = (old_owner, process)
+        scheduler._external_worker_modes[key] = "detached"
+        scheduler._scope_isolated_job_ids.add(key)
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
+        scheduler._running_worker_pids[key] = 424242
+        scheduler._running_since[key] = time.time() - 10_000
+        scheduler._running_allowance_s[key] = 1.0
+
+    monkeypatch.setattr(scheduler, "_latest_executions_for_releasable_claims", lambda: {})
+    successor = object()
+    try:
+        assert scheduler.sweep_stale_inflight([job]) == [job_id]
+        # The late reaper's owner-fenced release is a no-op for the swept owner.
+        scheduler.release_running_job(job_id, home=tmp_path, owner=old_owner, force=True)
+        assert scheduler.try_register_running_job(job_id, owner=successor)
+        # The successor inherits none of the dead worker's metadata.
+        with scheduler._running_lock:
+            assert key not in scheduler._external_worker_modes
+            assert key not in scheduler._scope_isolated_job_ids
+            assert key not in scheduler._restart_safe_waiter_job_ids
+            assert key not in scheduler._restart_safe_external_worker_job_ids
+            assert key not in scheduler._running_worker_pids
+        scheduler.release_running_job(job_id, home=tmp_path, owner=successor)
+        assert not scheduler.is_job_running(job_id, home=tmp_path)
+        assert key not in scheduler._external_worker_claims
+    finally:
+        scheduler.release_running_job(job_id, home=tmp_path, owner=successor, force=True)
+        with scheduler._running_lock:
+            scheduler._external_worker_claims.pop(key, None)
+            scheduler._external_worker_modes.pop(key, None)
+            scheduler._scope_isolated_job_ids.discard(key)
+            scheduler._restart_safe_waiter_job_ids.discard(key)
+            scheduler._restart_safe_external_worker_job_ids.discard(key)
+            scheduler._running_worker_pids.pop(key, None)
+
+
+def test_stale_waiter_cleanup_does_not_erase_successor_metadata(monkeypatch, tmp_path):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    job_id = "job-successor-metadata"
+    key = scheduler._inflight_key(job_id)
+    old_owner = object()
+    new_owner = object()
+    entered = threading.Event()
+    exited = threading.Event()
+    process = Mock()
+
+    def poll():
+        return 0 if exited.is_set() else None
+
+    def wait(timeout=None):
+        entered.set()
+        if exited.wait(timeout):
+            return 0
+        raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+
+    process.poll.side_effect = poll
+    process.wait.side_effect = wait
+    with scheduler._running_lock:
+        scheduler._running_job_ids.add(key)
+        scheduler._running_registration_owners[key] = old_owner
+        scheduler._external_worker_modes[key] = "detached"
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
+        scheduler._scope_isolated_job_ids.add(key)
+        scheduler._running_worker_pids[key] = 111
+    monkeypatch.setattr(
+        scheduler,
+        "get_execution",
+        lambda _execution_id: {"id": "exec-successor-metadata", "status": "completed"},
+    )
+
+    waiter = threading.Thread(
+        target=scheduler._wait_for_external_cron_worker,
+        kwargs={
+            "process": process,
+            "execution_id": "exec-successor-metadata",
+            "job_id": job_id,
+        },
+    )
+    waiter.start()
+    assert entered.wait(timeout=2)
+    scheduler.release_running_job(job_id, home=tmp_path, owner=old_owner)
+    assert scheduler.try_register_running_job(job_id, owner=new_owner)
+    with scheduler._running_lock:
+        scheduler._external_worker_modes[key] = "successor"
+        scheduler._restart_safe_waiter_job_ids.add(key)
+        scheduler._restart_safe_external_worker_job_ids.add(key)
+        scheduler._scope_isolated_job_ids.add(key)
+        scheduler._running_worker_pids[key] = 222
+    exited.set()
+    waiter.join(timeout=2)
+    try:
+        assert not waiter.is_alive()
+        with scheduler._running_lock:
+            assert scheduler._running_registration_owners[key] is new_owner
+            assert scheduler._external_worker_modes[key] == "successor"
+            assert key in scheduler._restart_safe_waiter_job_ids
+            assert key in scheduler._restart_safe_external_worker_job_ids
+            assert key in scheduler._scope_isolated_job_ids
+            assert scheduler._running_worker_pids[key] == 222
+    finally:
+        exited.set()
+        scheduler.release_running_job(job_id, home=tmp_path, owner=new_owner)
 
 
 def test_external_worker_crash_recovers_uncertain_attempt(monkeypatch):
@@ -716,7 +1094,12 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
         lambda command, **_: GatewayChildDispatch("degraded", command),
     )
     monkeypatch.setenv("PYTHONPATH", str(tmp_path / "user-libs"))
-    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
 
     assert scheduler._launch_external_cron_worker(job) is True
     repo_root = Path(scheduler.__file__).resolve().parent.parent
@@ -737,7 +1120,12 @@ def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeyp
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
                         lambda command, **_: GatewayChildDispatch("degraded", command))
-    spawned, *_ = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
     assert scheduler._launch_external_cron_worker({"id": "job-pin", "execution_id": "exec-pin"})
     _, kwargs = spawned[0]
     assert kwargs["cwd"] == str(loaded)
@@ -768,7 +1156,12 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
         lambda **_: {"PATH": os.environ.get("PATH", ""),
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
-    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    get.side_effect = lambda _execution_id: {"id": "exec-1", "status": "completed"}
+    monkeypatch.setattr(
+        "cron.scheduler_detached_worker.reap_terminal_worker_in_background",
+        lambda _process: None,
+    )
     repo_root = Path(scheduler.__file__).resolve().parent.parent
 
     assert scheduler._launch_external_cron_worker(job) is True

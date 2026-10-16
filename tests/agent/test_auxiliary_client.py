@@ -1530,6 +1530,14 @@ class TestIsRateLimitError:
         exc = RelayAuthUnavailable("auth_unavailable: no auth available; last upstream error: rate_limit_error")
         assert _is_auth_unavailable_error(exc) is True
 
+    def test_timed_out_408_keeps_the_timeout_label(self):
+        class RequestTimeout(Exception):
+            status_code = 408
+        class RequestRejected(Exception):
+            status_code = 408
+        assert _is_server_error(RequestTimeout("request timed out")) is False
+        assert _is_server_error(RequestRejected("request rejected")) is True
+
 
 class TestTryPaymentFallback:
     """_try_payment_fallback skips the failed provider and tries alternatives."""
