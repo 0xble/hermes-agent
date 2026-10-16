@@ -486,3 +486,7 @@ Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the d
 ## Session controls
 
 Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
+
+## TUI prompt test isolation
+
+Fork patch identity: `test-isolation`. TUI prompt-submit row-id resolution tests stub `_run_after_agent_ready` so successful requests do not leave deferred prompt workers running after the request; production behavior is unchanged.
