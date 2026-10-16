@@ -2994,7 +2994,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin):
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-                images, text_content = adapter.extract_images(response)
+                if adapter.should_preserve_inline_images(response):
+                    images, text_content = [], response
+                else:
+                    images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
                 await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)

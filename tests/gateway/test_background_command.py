@@ -135,6 +135,47 @@ class TestRunBackgroundTask:
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_rich_image_blocks_stay_in_background_text_delivery(self):
+        """Background turns must preserve rich image markdown instead of splitting image sends."""
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.send_image = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "Before\n\n![Pack](https://example.com/pack.jpg)\n\nAfter"))
+        mock_adapter.extract_images = MagicMock(return_value=([
+            ("https://example.com/pack.jpg", "Pack"),
+        ], "Before\n\nAfter"))
+        mock_adapter.should_preserve_inline_images = MagicMock(return_value=True)
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+        mock_result = {
+            "final_response": "Before\n\n![Pack](https://example.com/pack.jpg)\n\nAfter",
+            "messages": [],
+        }
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = mock_result
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("show the pack", source, "bg_rich_images")
+
+        mock_adapter.extract_images.assert_not_called()
+        mock_adapter.send_image.assert_not_awaited()
+        sent_content = mock_adapter.send.call_args.kwargs["content"]
+        assert "![Pack](https://example.com/pack.jpg)" in sent_content
+
 # ---------------------------------------------------------------------------
 # /bg in help and known_commands
 # ---------------------------------------------------------------------------
