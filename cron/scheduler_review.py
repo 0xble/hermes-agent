@@ -88,7 +88,9 @@ def _review_wake_text(original: str, contract: dict) -> str:
         "FIX\n<the full corrected report>\n"
         "RERUN\n<one non-empty reason line>\n\n"
         "Do not return a decision plus extra text.\n"
-        f"CONTRACT_BEGIN\n{json.dumps({k: v for k, v in contract.items() if not k.startswith('_')}, sort_keys=True)}\nCONTRACT_END\n\n"
+        f"CONTRACT_BEGIN\n"
+        f"{json.dumps({k: v for k, v in contract.items() if not k.startswith('_')}, sort_keys=True)}\n"
+        "CONTRACT_END\n\n"
         f"REPORT_BEGIN\n{original}\nREPORT_END"
     )
 
