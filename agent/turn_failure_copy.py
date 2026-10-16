@@ -17,9 +17,53 @@ from hermes_constants import display_hermes_home
 
 # Failure codes minted by loop sites that are not provider verdicts (see module docstring).
 SITE_FAILURE_CODES = frozenset({
-    "context_overflow", "truncated", "invalid_response", "empty_response", "loop_error",
+    "context_overflow", "input_retained", "truncated", "invalid_response", "empty_response", "loop_error",
     "interpreter_shutdown", "session_busy",
 })
+
+
+def retained_input_message(*, provider_calls_made: bool, compression_enabled: bool = True) -> str:
+    """Explain a retained-input pause without implying that earlier actions were undone."""
+    if provider_calls_made:
+        lead = (
+            "The complete request cannot safely fit the model window. No further provider call was sent. "
+            "Earlier actions in this turn may already have run."
+        )
+    else:
+        lead = "The complete request cannot safely fit the model window. No provider call was sent."
+    if compression_enabled:
+        next_step = "retry /compress when the summary route is available."
+    else:
+        next_step = "automatic compression is disabled; use /new or choose a model with a larger context window."
+    return f"{lead} This session, its history and accepted input are retained; {next_step}"
+
+
+def retained_input_result(
+    messages: Any,
+    api_call_count: int,
+    *,
+    provider_calls_made: Optional[bool] = None,
+    compression_enabled: bool = True,
+    final_response: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the typed result for a preflight pause that retains the accepted input."""
+    if provider_calls_made is None:
+        provider_calls_made = api_call_count > 0
+    response = final_response or retained_input_message(
+        provider_calls_made=provider_calls_made, compression_enabled=compression_enabled,
+    )
+    return {
+        "final_response": response,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": response,
+        "partial": True,
+        "failed": True,
+        "turn_exit_reason": "input_retained",
+        "failure_reason": "input_retained",
+        "failure_retryable": True,
+    }
 
 
 def stamp_failure(result: Dict[str, Any], reason: str, retryable: bool) -> Dict[str, Any]:
@@ -103,6 +147,7 @@ _EXIT_REASON_FAILURES: Tuple[Tuple[str, str, bool, bool], ...] = (
     ("repeated_outer_errors", "loop_error", True, True),
     ("error_near_max_iterations", "loop_error", True, True),
     ("context_compression_timeout", "context_overflow", False, True),
+    ("input_retained", "input_retained", True, True),
     ("context_compression_exhausted", "context_overflow", False, True),
     ("ollama_runtime_context_too_small", "context_overflow", False, True),
     # Advisory: the loop ends these as an incomplete (not failed) turn with an explainer.
@@ -274,6 +319,10 @@ _FAILURE_CODE_COPY: Dict[str, str] = {
         "This conversation has grown too long for {model} to read, and Hermes couldn't shrink "
         "it enough automatically. Start a new session with /new (your history is kept), or try "
         "/compress once more. Switching to a model with a bigger context window also works."
+    ),
+    "input_retained": (
+        "The request could not safely fit the model window. Your session, history and accepted "
+        "input are retained; retry /compress when the summary route is available."
     ),
     "truncated": (
         "The model's reply was cut off before it finished (it hit its output length limit), so "

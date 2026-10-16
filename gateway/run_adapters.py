@@ -847,9 +847,8 @@ class GatewayAdapterLifecycleMixin:
             return  # not time yet
         platform_config = info["config"]
         attempt = info["attempts"] + 1
-        # Empty-token primary configs can never reconnect; drop them so multiplex setups
-        # where a secondary profile owns the bot do not spin forever.
-        # See #64674.
+        # Empty-token primary configs can never reconnect; drop them so multiplex setups where a
+        # secondary profile owns the bot do not spin forever (#64674).
         if not _platform_has_bot_credential(platform, platform_config):
             self._drop_from_reconnect_queue(platform, "no bot credential on queued config")
             return
@@ -1156,15 +1155,16 @@ class GatewayAdapterLifecycleMixin:
         # would park a transiently-failed profile before the first watcher tick can retry it.
         for profile_name in transient_failed:
             self._served_profile_signatures.pop(profile_name, None)
-        # Cached configs follow the served set: a profile that failed to start (or stopped being
-        # served) keeps no home channel in the host-wide notice fan-out, where it would be owed a
-        # notice no transport can deliver and ``.restart_pending.json`` would never be unlinked.
+        # Cached configs follow the served set: a failed/unserved profile keeps no home channel in the
+        # host-wide notice fan-out (it would be owed an undeliverable notice; .restart_pending.json stays).
         configs = getattr(self, "_profile_configs", None)
         if configs is not None:
             for profile_name in [p for p in configs if p not in self._served_profile_signatures]:
                 configs.pop(profile_name, None)
-        # Off the loop: each replay writes a profile's state.db (the scope travels with the context).
-        await asyncio.to_thread(self._restore_secondary_completion_ledgers, profile_homes)
+        # Off the loop: each replay writes a profile's state.db; a standby leaves that to promotion.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await asyncio.to_thread(self._restore_secondary_completion_ledgers, profile_homes)
         return connected
 
     def _primary_resource_claims(self, active: str) -> Dict[tuple, str]:
@@ -1232,6 +1232,8 @@ class GatewayAdapterLifecycleMixin:
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
+        # Assign (not setdefault) so a profile reload picks up a changed relay.fyi_passive rollback flag.
+        getattr(self, "_relay_fyi_passive_by_profile", {})[profile_name] = profile_runtime_cfg
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "
@@ -1407,12 +1409,9 @@ class GatewayAdapterLifecycleMixin:
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Runtime re-scan of a served profile (config/.env changed): only platforms that are not
-            # already live or queued for reconnect are built — never a second poller on the same bot.
             if platform in profile_map or platform in (
                     (getattr(self, "_profile_failed_platforms", None) or {}).get(profile_name) or {}):
                 continue
-            # No credential in THIS profile's scope: an adapter would fan inbound across every such profile.
             with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                 has_credential = _platform_has_bot_credential(platform, platform_config)
             if multiplex and not has_credential:
@@ -1422,6 +1421,9 @@ class GatewayAdapterLifecycleMixin:
                     "[MULTIPLEX] Profile '%s': skipping %s - no bot credential "
                     "in this profile's secrets", profile_name, platform.value,
                 )
+                continue
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config, profile=profile_name):
                 continue
             # Relay still uses process-level shared ingress; WhatsApp owns a session per profile.
             if multiplex and platform is Platform.RELAY:

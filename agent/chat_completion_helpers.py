@@ -1345,7 +1345,7 @@ def _reasoning_config_for_wire(agent):
 
 def _resolve_reasoning_config_for_wire(agent, ephemeral_off: bool):
     """Side-effect-free core of :func:`_reasoning_config_for_wire` (fit checks peek through it)."""
-    cfg = agent.reasoning_config
+    cfg = getattr(agent, "reasoning_config", None)
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
         # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
@@ -1405,6 +1405,24 @@ def _alias_tool_search_bridge_for_xai(agent, transport, tools_for_api):
     return tools_for_api
 
 
+def _preflight_output_ceiling_for_request(agent):
+    """Return the ceiling for this request, excluding a stale ceiling from a length retry boost."""
+    ceiling = getattr(agent, "_preflight_output_ceiling", None)
+    if getattr(agent, "_ephemeral_output_cap_is_retry_boost", False) and getattr(
+        agent, "_ephemeral_max_output_tokens", None
+    ) is not None:
+        return None
+    return ceiling
+
+
+def _apply_preflight_output_ceiling(agent, value):
+    """Apply the current turn's preflight ceiling without consuming one-shot state."""
+    ceiling = _preflight_output_ceiling_for_request(agent)
+    if ceiling is not None and value is not None:
+        return min(value, ceiling)
+    return value
+
+
 def selected_max_output_tokens(agent):
     """Peek at the request cap without consuming its one-shot override."""
     configured = getattr(agent, "max_tokens", None)
@@ -1412,15 +1430,22 @@ def selected_max_output_tokens(agent):
     if getattr(agent, "api_mode", None) == "bedrock_converse":
         return configured
     ephemeral = getattr(agent, "_ephemeral_max_output_tokens", None)
-    return ephemeral if ephemeral is not None else configured
+    return _apply_preflight_output_ceiling(agent, ephemeral if ephemeral is not None else configured)
 
 
 def _consume_ephemeral_max_output(agent):
     """Pop the one-shot ephemeral output cap; whichever path builds the request consumes it."""
     ephemeral_out = getattr(agent, "_ephemeral_max_output_tokens", None)
+    is_retry_boost = bool(getattr(agent, "_ephemeral_output_cap_is_retry_boost", False))
     if ephemeral_out is not None:
         agent._ephemeral_max_output_tokens = None
-    return ephemeral_out
+    agent._ephemeral_output_cap_is_retry_boost = False
+    if is_retry_boost:
+        # A truncation continuation is deliberately larger than the previous
+        # request. It is already bounded by boosted_output_cap's provider limit;
+        # an older preflight ceiling must not turn it into the same request again.
+        return ephemeral_out
+    return _apply_preflight_output_ceiling(agent, ephemeral_out)
 
 
 def effective_wire_max_output_tokens(agent):
@@ -1431,15 +1456,23 @@ def effective_wire_max_output_tokens(agent):
     call: Anthropic's native ceiling, window clamp and manual-thinking floor; a provider profile's
     default and the Gemini thinking raise on chat completions. ``enforced`` is whether the endpoint
     rejects ``input + cap > window`` up front rather than stopping generation at the window."""
-    selected = selected_max_output_tokens(agent)
     api_mode = getattr(agent, "api_mode", None)
+    # The first-party Codex backend omits max_output_tokens; other Responses routes
+    # (xAI, GitHub) send it through the transport and must be priced accurately.
+    is_codex_backend = False
+    if api_mode == "codex_responses":
+        from agent.codex_responses_adapter import classify_responses_route
+        is_codex_backend = classify_responses_route(agent).is_codex_backend
+    selected = None if is_codex_backend else selected_max_output_tokens(agent)
+    output_ceiling = _preflight_output_ceiling_for_request(agent)
     window = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     if api_mode == "anthropic_messages":
         from agent.anthropic_adapter import anthropic_validates_output_against_window, anthropic_wire_output_cap
         reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
         cap = anthropic_wire_output_cap(
             agent.model, selected, reasoning, context_length=window,
-            base_url=getattr(agent, "_anthropic_base_url", None), preserve_dots=agent._anthropic_preserve_dots())
+            base_url=getattr(agent, "_anthropic_base_url", None), preserve_dots=agent._anthropic_preserve_dots(),
+            output_ceiling=output_ceiling)
         return cap, anthropic_validates_output_against_window(agent.model)
     if api_mode == "chat_completions":
         from agent.transports.chat_completions import resolve_chat_max_tokens
@@ -1449,7 +1482,8 @@ def effective_wire_max_output_tokens(agent):
             profile = get_provider_profile(agent.provider)
             profile_max = profile.get_max_tokens(agent.model) if profile else None
         reasoning = _resolve_reasoning_config_for_wire(agent, bool(getattr(agent, "_ephemeral_reasoning_off", False)))
-        cap = resolve_chat_max_tokens(agent.model, reasoning, None, selected, profile_max)
+        cap = resolve_chat_max_tokens(agent.model, reasoning, None, selected, profile_max,
+                                  output_ceiling)
         return (cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else None), True
     return (selected if isinstance(selected, int) and not isinstance(selected, bool) and selected > 0 else None), True
 
@@ -1468,8 +1502,11 @@ def _anthropic_fast_route_supported(agent) -> bool:
 
 def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides):
     ctx_len = getattr(agent, "context_compressor", None)
+    output_ceiling = _preflight_output_ceiling_for_request(agent)
     output_cap = selected_max_output_tokens(agent)
-    _consume_ephemeral_max_output(agent)
+    ephemeral_out = _consume_ephemeral_max_output(agent)
+    if ephemeral_out is not None:
+        output_cap = ephemeral_out
     anthropic_kwargs = agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_anthropic_messages_for_api(api_messages), tools=tools_for_api,
         max_tokens=output_cap,
@@ -1480,6 +1517,7 @@ def _build_anthropic_kwargs(agent, api_messages, tools_for_api, reasoning_config
         fast_mode=request_overrides.get("speed") == "fast",
         fast_route_supported=(_anthropic_fast_route_supported(agent)
                               if request_overrides.get("speed") == "fast" else None),
+        output_ceiling=output_ceiling,
         drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)))
     # Portal reads ``tags`` / ``session_id`` on its Messages route too, but the profile hook
     # is only consulted by the OpenAI-wire transport — merge here to keep sticky routing.
@@ -1514,7 +1552,9 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         except Exception as exc:
             logger.warning("%s⚠️ Failed to sanitize tool schemas for xAI: %s", getattr(agent, "log_prefix", ""), exc)
     output_cap = selected_max_output_tokens(agent)
-    _consume_ephemeral_max_output(agent)
+    ephemeral_out = _consume_ephemeral_max_output(agent)
+    if ephemeral_out is not None:
+        output_cap = ephemeral_out
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
@@ -1556,6 +1596,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         from providers import get_provider_profile
         _profile = get_provider_profile(agent.provider)
 
+    output_ceiling = _preflight_output_ceiling_for_request(agent)
     output_cap = selected_max_output_tokens(agent)
     _ephemeral_out = _consume_ephemeral_max_output(agent)
     # Strip image parts for non-vision models on BOTH paths (registered
@@ -1563,6 +1604,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
         tools=tools_for_api, base_url=agent.base_url, timeout=agent._resolved_api_call_timeout(),
         max_tokens=output_cap, ephemeral_max_output_tokens=_ephemeral_out,
+        output_ceiling=output_ceiling,
         max_tokens_param_fn=agent._max_tokens_param, reasoning_config=reasoning_config,
         request_overrides=request_overrides, session_id=getattr(agent, "session_id", None),
         cache_scope_id=cache_scope_id, ollama_num_ctx=agent._ollama_num_ctx,
