@@ -71,7 +71,7 @@ def _validation_error(message: str, *, path: str, constraint: str, parameters: A
         hint="Retry tool_call with 'arguments' matching the parameters schema above.")
 
 
-def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
+def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str]:
     """Validate ``tool_call`` arguments against the deferred tool's schema. Models invoke
     deferred tools "blind" (schema unseen) and omit required args; without this, the opaque
     downstream failure makes cheap models loop. Required-field probe first, then the same
@@ -136,7 +136,7 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
 
     Accepts the advertised batch shape ``{"calls": [{"name", "arguments"}, ...]}``
@@ -163,7 +163,7 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
     if not isinstance(raw_calls, list) or not raw_calls:
         return [], "tool_call 'calls' must be a non-empty array of {name, arguments}"
 
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     for position, raw in enumerate(raw_calls):
         if not isinstance(raw, dict):
             return [], f"tool_call calls[{position}] must be an object with 'name' and 'arguments'"
@@ -193,7 +193,7 @@ def normalize_tool_call_entries(args: Dict[str, Any]) -> Tuple[List[Dict[str, An
 _ECHO_ARGS_MAX_CHARS = 1500
 
 
-def local_batch_error(entries: List[Dict[str, Any]]) -> str:
+def local_batch_error(entries: list[dict[str, Any]]) -> str:
     """Rejection when local entries reach the connector-only dispatcher. Local and
     connectors__ entries batch separately (see ``tool_search.mixed_batch_error``), so
     restate a valid shape with the caller's OWN first entry: small models re-send an
@@ -205,7 +205,7 @@ def local_batch_error(entries: List[Dict[str, Any]]) -> str:
     args = json.dumps(first.get("arguments", {}), ensure_ascii=False, separators=(",", ":"))
     if len(args) > _ECHO_ARGS_MAX_CHARS:
         args = "{...}"  # keep the correction readable; the model still has its own arguments
-    retry = '{"calls":[{"name":%s,"arguments":%s}]}' % (json.dumps(first["name"], ensure_ascii=False), args)
+    retry = '{{"calls":[{{"name":{},"arguments":{}}}]}}'.format(json.dumps(first["name"], ensure_ascii=False), args)
     remaining = (f" then issue the remaining {len(entries) - 1} call(s) in a separate tool_call batch"
                  if len(entries) > 1 else "")
     return (

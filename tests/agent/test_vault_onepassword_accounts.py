@@ -159,8 +159,8 @@ def test_browser_account_pin_refuses_other_browser_before_resolving(env):
     home, op, calls = env
     _write_config(home, op, [_BUSINESS])
     with patch("tools.browser_camofox.get_session_account", return_value="personal"):
-        fill = json.loads(registry.dispatch("browser_vault_fill", {"handle": "op@business:item-b"}, task_id="t1"))
-        code = json.loads(registry.dispatch("browser_vault_enter_code", {"handle": "op@business:item-b"},
+        fill = json.loads(registry.dispatch("browser_vault", {"action": "fill", "handle": "op@business:item-b"}, task_id="t1"))
+        code = json.loads(registry.dispatch("browser_vault", {"action": "enter_code", "handle": "op@business:item-b"},
                                             task_id="t1"))
     assert fill["error_type"] == code["error_type"] == "browser_account_mismatch"
     assert "dummy-business-password" not in json.dumps([fill, code])
@@ -245,7 +245,7 @@ def test_fill_authorization_sees_a_website_change_the_display_cache_has_not(env)
 
 
 def test_failed_listing_is_not_reused(env, monkeypatch):
-    home, op, calls = env
+    home, op, _calls = env
     _write_config(home, op, [_BUSINESS])
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "rejected-token")
     with pytest.raises(RuntimeError):

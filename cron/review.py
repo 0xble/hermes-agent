@@ -87,15 +87,16 @@ def _title(text: str) -> Optional[str]:
 _DATED_TITLE = re.compile(
     r" — (?:(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), )?"
     r"(?:January|February|March|April|May|June|July|August|September|"
-    r"October|November|December) \d{1,2}, \d{4}(?: at \d{1,2}:\d{2} [AP]M)?"
+    r"October|November|December) \d{1,2}(?:, \d{4})?(?: at \d{1,2}:\d{2} [AP]M)?$"
 )
 
 
 def _title_matches(actual: Optional[str], expected: str) -> bool:
     """Accept the exact title, or the report archetype's dated form of it.
 
-    Reports are titled ``<Title> — <Month D, YYYY>`` (optionally ``at h:mm AM``),
-    so only that suffix is tolerated; anything else after the title still fails.
+    Reports are titled ``<Title> — [Weekday, ]<Month D[, YYYY]>`` (optionally
+    ``at h:mm AM``), so only that suffix is tolerated; anything else after the
+    title still fails.
     """
     if actual is None:
         return False

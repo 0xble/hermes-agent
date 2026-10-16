@@ -91,9 +91,14 @@ jobs:
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}' --shard '${{ matrix.shard }}/10'
+  prompt-surface:
+    name: Prompt surface diff
+    uses: ./.github/workflows/prompt-surface-diff.yml
+    permissions:
+      contents: read
   qualification:
     if: always()
-    needs: [linux, python-shard]
+    needs: [linux, python-shard, prompt-surface]
     runs-on: ubuntu-latest
     steps:
       - name: Require every gate job

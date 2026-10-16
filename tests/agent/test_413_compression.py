@@ -936,7 +936,7 @@ class TestPreflightCompression:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            result = agent.run_conversation("hello", conversation_history=big_history)
+            agent.run_conversation("hello", conversation_history=big_history)
 
         mock_compress.assert_not_called()
 
@@ -1384,7 +1384,7 @@ class TestPreflightCompression:
         with (
             patch(
                 "agent.codex_responses_adapter.estimate_native_responses_preflight_tokens",
-                return_value=1_300_000,
+                return_value=1_300,
             ),
             patch.object(agent, "_run_codex_stream", return_value=response) as provider,
             patch.object(agent, "_compress_context") as local_compress,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import asyncio
-import concurrent.futures  # noqa: F401 -- kept public after the plugin-injection move
+import concurrent.futures
 import json
 import os
 import re
@@ -43,8 +43,8 @@ from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
-    from gateway.run import GatewayRunner  # noqa: F401
-    from gateway.run_turn_runner import TurnRunner  # noqa: F401
+    from gateway.run import GatewayRunner
+    from gateway.run_turn_runner import TurnRunner
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -67,7 +67,7 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
     if not message_id or not isinstance(message_text, str):
         return message_text
     prefix = f"{discord_triggering_note(message_id)}\n\n"
-    return message_text[len(prefix):] if message_text.startswith(prefix) else message_text
+    return message_text.removeprefix(prefix)
 
 
 async def _admit_outbox_event(runner, event, source):
@@ -203,8 +203,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             await notifier.notify(self, source, hint)
 
     async def _hm_admit_event(
-        self, event: "MessageEvent"
-    ) -> Optional[Tuple["MessageEvent", SessionSource, bool]]:
+        self, event: MessageEvent
+    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
         from gateway.run import _is_slack_ignored_channel
@@ -435,7 +435,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if state.turn.agent is _AGENT_PENDING_SENTINEL and state.turn.event is event:
                 self._release_running_agent_state(session_key)
 
-    def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:
+    def _hm_estop_turn_allowed(self, event: MessageEvent, source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
@@ -463,7 +463,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return False
 
     def _hm_estop_gate(
-        self, event: "MessageEvent", source: SessionSource, is_internal: bool
+        self, event: MessageEvent, source: SessionSource, is_internal: bool
     ) -> Optional[str]:
         """Global emergency-stop (`hermes pause`) notice when this turn must be blocked, else None.
         Placed after auth so unauthorized senders can't probe pause state. A synthetic heartbeat that
@@ -502,7 +502,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return str(e)
         return None
 
-    def _hm_update_prompt_reply(self, event: "MessageEvent", _quick_key: str) -> Optional[str]:
+    def _hm_update_prompt_reply(self, event: MessageEvent, _quick_key: str) -> Optional[str]:
         """Consume a reply to a pending ``/update`` prompt (routed to the detached update process via
         ``.update_response``); None when nothing was consumed. Recognized slash commands must bypass
         this or /new, /help etc. get silently consumed as update answers."""
@@ -548,7 +548,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return None
 
     async def _hm_clarify_reply(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
+        self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Intercept a reply to a pending clarify prompt; None when the message falls through.
         Free text answers open-ended/"Other" prompts; "2" answers a multi-choice one. Resolved/retained
@@ -636,14 +636,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     # Free-text spellings: ``approval.inputs.confirm_*`` comma-lists (English ∪ active language).
     _SLASH_CONFIRM_TEXT_INPUT_KEYS = (("confirm_once", "once"), ("confirm_always", "always"), ("confirm_cancel", "cancel"))
 
-    def _slash_confirm_text_choices(self) -> Dict[str, str]:
-        choices: Dict[str, str] = {}
+    def _slash_confirm_text_choices(self) -> dict[str, str]:
+        choices: dict[str, str] = {}
         for input_key, choice in self._SLASH_CONFIRM_TEXT_INPUT_KEYS:
             for word in approval_input_words(input_key):
                 choices.setdefault(word, choice)
         return choices
 
-    async def _hm_slash_confirm_reply(self, event: "MessageEvent", _quick_key: str) -> Optional[str]:
+    async def _hm_slash_confirm_reply(self, event: MessageEvent, _quick_key: str) -> Optional[str]:
         """Resolve a reply (/approve, /always, /cancel + aliases) to a pending slash-confirm prompt;
         None when it falls through — a stale pending confirm does NOT block other commands. A pending
         dangerous-command approval takes precedence: /approve there unblocks the waiting tool thread."""
@@ -770,7 +770,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         self._drop_turn_slot(_quick_key, run_generation=_generation_at_interrupt)
 
     def _hm_merge_pending_for_source(
-        self, source: SessionSource, _quick_key: str, event: "MessageEvent", *, merge_text: bool = False
+        self, source: SessionSource, _quick_key: str, event: MessageEvent, *, merge_text: bool = False
     ) -> None:
         """Merge *event* into the source adapter's pending slot (no-op without an adapter)."""
         from gateway.platforms.base import merge_pending_message_event
@@ -779,8 +779,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
 
     async def _hm_busy_slash_or_photo(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
-    ) -> Tuple[bool, Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, _quick_key: str
+    ) -> tuple[bool, Optional[str]]:
         """Slash-command / photo-burst handling on the busy fast-path → ``(handled, result)``. Each
         command's mid-run behavior is declared on its CommandDef (busy_policy / busy_handler)."""
         from hermes_cli.commands import resolve_command as _resolve_cmd_inner
@@ -812,7 +812,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return False, None
 
     def _hm_busy_telegram_grace_queue(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str, effective_busy_input_mode: str
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
     ) -> bool:
         """Queue a Telegram text follow-up that lands within the post-start grace window."""
         _grace = float(os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0"))
@@ -836,10 +836,10 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return True
 
     @staticmethod
-    def _hm_text_only(event: "MessageEvent") -> bool:
+    def _hm_text_only(event: MessageEvent) -> bool:
         return event.message_type == MessageType.TEXT and not event.media_urls and not event.media_types
 
-    def _hm_busy_steer(self, event: "MessageEvent", running_agent: Any, _quick_key: str) -> None:
+    def _hm_busy_steer(self, event: MessageEvent, running_agent: Any, _quick_key: str) -> None:
         """Steer mode: inject text mid-run via ``agent.steer()``, else fall back to queue semantics."""
         steer_text = (event.text or "").strip()
         steered = False
@@ -856,7 +856,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         self._queue_or_replace_pending_event(_quick_key, event)
 
     async def _hm_busy_interrupt(
-        self, event: "MessageEvent", source: SessionSource, running_agent: Any, _quick_key: str
+        self, event: MessageEvent, source: SessionSource, running_agent: Any, _quick_key: str
     ) -> None:
         """Interrupt path: redirect text-only corrections when supported, else ``agent.interrupt()``."""
         from gateway.run import _build_media_placeholder
@@ -881,7 +881,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         running_agent.interrupt(_interrupt_text)
 
     async def _hm_handle_running_session_message(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
+        self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
@@ -1013,8 +1013,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return target.lstrip("/").split()[0]
 
     async def _hm_command_hooks(  # health: allow CC -- ordered hook dispatch is the control-command fence and preserves observer/interceptor semantics.
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str,
-    ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, command: str, canonical: str,
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Fire ``pre_command`` (observer) and ``command:<canonical>`` (interceptor) hooks →
         ``(handled, result, new_command)`` (``new_command`` set when a handler rewrote the command).
         The running-agent path deliberately does NOT fire these — a slow or hostile plugin must not
@@ -1065,8 +1065,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return False, None, None
 
     async def _hm_resolve_command(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str,
-    ) -> Tuple[_CommandHandled, Optional[str], Optional[str], Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, _quick_key: str,
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str], Optional[str]]:
         """Resolve the slash command (aliases, access gate, hooks) → ``(handled, result, command,
         canonical)``; when ``handled`` the caller returns ``result`` as-is (may be None)."""
         from hermes_cli.commands import is_gateway_known_command, resolve_command as _resolve_cmd
@@ -1110,7 +1110,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             _cmd_def, canonical = _canon(command)
         return False, None, command, canonical
 
-    async def _hm_confirm_destructive(self, event, command: str, detail: str, handler) -> Tuple[bool, Optional[str]]:
+    async def _hm_confirm_destructive(self, event, command: str, detail: str, handler) -> tuple[bool, Optional[str]]:
         async def _execute():
             return await handler(event)
         return True, await self._maybe_confirm_destructive_slash(
@@ -1133,7 +1133,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         from hermes_cli.proxy_cli import format_status_text
         return True, format_status_text()
 
-    async def _hm_rewrite_turn_to_prompt(self, event, source, name: str, ack: str, build) -> Tuple[bool, Optional[str]]:
+    async def _hm_rewrite_turn_to_prompt(self, event, source, name: str, ack: str, build) -> tuple[bool, Optional[str]]:
         """Ack, then rewrite the turn to ``build()`` and fall through to the agent (keeps role
         alternation; works on any backend). A failing builder replies with a retry hint."""
         if self._loop_wake_command_identity(event) is None:
@@ -1221,7 +1221,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return self._hm_send_payload_as_turn(event, t("gateway.steer.usage_idle"))
 
     @staticmethod
-    def _hm_send_payload_as_turn(event, usage: str) -> Tuple[bool, Optional[str]]:
+    def _hm_send_payload_as_turn(event, usage: str) -> tuple[bool, Optional[str]]:
         payload = event.get_command_args().strip()
         if not payload:
             return True, usage
@@ -1264,13 +1264,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     # Idle-path built-ins with bespoke flow (confirmations, prompt rewrites, one-shot MoA), each
     # handled by ``_hm_cmd_<name>`` → ``(handled, result)``; ``(False, None)`` falls through to the agent.
     _HM_CANONICAL_COMMANDS = frozenset({
-        "new", "start", "egress", "learn", "plan", "initiate-setup", "init", "blueprint", "undo", "queue", "steer", "moa",
+        "new", "start", "egress", "learn", "plan", "init", "blueprint", "undo", "queue", "steer", "moa",
     })
 
     async def _hm_dispatch_canonical_command(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str,
+        self, event: MessageEvent, source: SessionSource, _quick_key: str,
         canonical: Optional[str],
-    ) -> Tuple[_CommandHandled, Optional[str]]:
+    ) -> tuple[_CommandHandled, Optional[str]]:
         """Dispatch built-in idle-path commands → ``(handled, result)``; prompt-rewriting commands
         mutate ``event.text`` and return ``(False, None)`` to fall through to the agent."""
         plain_handler = (
@@ -1282,7 +1282,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 _started, result = await self._invoke_loop_wake_effect(event, plain_handler, event)
                 return (True, result) if _started else (_CommandDispatch.SUPPRESSED, None)
         if canonical in self._HM_CANONICAL_COMMANDS:
-            handler = getattr(self, f"_hm_cmd_{canonical.replace('-', '_')}")
+            handler = getattr(self, f"_hm_cmd_{canonical}")
             started, result = await self._invoke_loop_wake_effect(
                 event, handler, event, source, _quick_key,
             )
@@ -1304,7 +1304,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 from agent.redact import redact_sensitive_text
                 output = redact_sensitive_text(output)
             return output or t("gateway.quick_command.no_output")
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return t("gateway.quick_command.timed_out")
         except Exception as e:  # health: allow BLE001 -- quick-command subprocess failures are user-visible and must not abort the gateway.
             return t("gateway.quick_command.error", error=e)
@@ -1318,8 +1318,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return resolve_command(command) is not None
 
     async def _hm_dispatch_quick_and_plugin_commands(  # health: allow NESTING -- ordered command routing retains the drain, alias, plugin, and built-in fences.
-        self, event: "MessageEvent", source: SessionSource, command: Optional[str]
-    ) -> Tuple[_CommandHandled, Optional[str], Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, command: Optional[str]
+    ) -> tuple[_CommandHandled, Optional[str], Optional[str]]:
         """Drain gate, user-defined quick commands (exec/alias) and plugin slash commands →
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if self._draining and not self._hm_is_registered_command(event):
@@ -1395,7 +1395,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return False, None, command
 
     def _hm_bundle_slash_rewrite(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, command: str
     ) -> bool:
         """Rewrite ``/<bundle>`` to the bundle invocation message; True when handled.
         Skill bundles take precedence over individual skill commands (mirrors CLI dispatch)."""
@@ -1446,7 +1446,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return t("gateway.unknown_command", command=command)
 
     def _hm_skill_slash_rewrite(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: Optional[str]
+        self, event: MessageEvent, source: SessionSource, _quick_key: str, command: Optional[str]
     ) -> Optional[str]:
         """Rewrite ``/<bundle>`` / ``/<skill>`` invocations into the skill prompt on ``event.text``;
         returns a reply string when the command is disabled/unknown/failed, else None.
@@ -1507,7 +1507,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return None
 
     async def _hm_pending_reply_intercepts(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
+        self, event: MessageEvent, source: SessionSource, _quick_key: str
     ) -> Optional[str]:
         """Replies owned by in-flight work: pending /update prompt, clarify, slash-confirm.
         Only events that may control the gateway (``allow_gateway_control``) can answer them, and
@@ -1522,8 +1522,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return _reply
 
     async def _hm_dispatch_idle_commands(
-        self, event: "MessageEvent", source: SessionSource, _quick_key: str
-    ) -> Tuple[bool, Optional[str]]:
+        self, event: MessageEvent, source: SessionSource, _quick_key: str
+    ) -> tuple[bool, Optional[str]]:
         """Idle path: resolve + dispatch slash commands; rewriting commands fall through to the agent."""
         async def _loop_command_current() -> bool:
             if await self._prepare_loop_wake_execution(event, source):
@@ -1576,8 +1576,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return _handled, _result
 
     def _hm_rescue_orphaned_fifo(
-        self, event: "MessageEvent", source: SessionSource, is_internal: bool, _quick_key: str
-    ) -> Tuple["MessageEvent", SessionSource, bool]:
+        self, event: MessageEvent, source: SessionSource, is_internal: bool, _quick_key: str
+    ) -> tuple[MessageEvent, SessionSource, bool]:
         """FIFO orphan rescue: a session that went idle with a populated overflow (post-turn drain
         never promoted, e.g. a compression-demoted follow-up) silently orphaned those events. The
         oldest orphan runs as THIS turn and the incoming event is parked behind the chain. Skipped
@@ -1822,7 +1822,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     @staticmethod
     def _classify_inbound_media(
         event: MessageEvent, pending_stt_prepared: bool
-    ) -> Tuple[list, list, list, list]:
+    ) -> tuple[list, list, list, list]:
         """Split ``event.media_urls`` into (image, STT-voice, audio-file, video) paths. Per-attachment
         MIME wins over the message-level type (a document sent alongside an image must not be routed
         as an image). MessageType.AUDIO / mixed DOCUMENT audio is a file attachment, never STT."""
@@ -1918,7 +1918,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return message_text
 
     @staticmethod
-    def _inbound_attachment_display_name(path: str) -> Tuple[str, str]:
+    def _inbound_attachment_display_name(path: str) -> tuple[str, str]:
         """``(display_name, agent_visible_path)``: cache filename is ``<id>_<id>_<original>``; the
         path is translated to the in-container mount under a Docker backend."""
         from tools.credential_files import to_agent_visible_cache_path
@@ -2098,7 +2098,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return message_text
 
     async def _prepare_inbound_message_text(
-        self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
+        self, *, event: MessageEvent, source: SessionSource, history: list[dict[str, Any]],
         session_key: Optional[str] = None,
     ) -> Optional[str]:
         """Prepare inbound event text for the agent. Shared by the normal inbound and queued
@@ -2131,7 +2131,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return self._prepend_inbound_reply_context(event, source, message_text)
 
     async def _prepare_profile_scoped_inbound_message_text(
-        self, *, event: MessageEvent, source: SessionSource, history: List[Dict[str, Any]],
+        self, *, event: MessageEvent, source: SessionSource, history: list[dict[str, Any]],
         session_key: Optional[str] = None,
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
@@ -2149,14 +2149,14 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         _, successful_transcripts = await self._transcribe_pending_audio_event_once(event, "")
         return "\n\n".join(t.strip() for t in successful_transcripts if t.strip())
 
-    def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
+    def _consume_pending_native_image_paths(self, session_key: str) -> list[str]:
         state = self._peek_session_state(session_key)
         paths = list(state.persistent.native_image_paths or []) if state is not None else []
         if paths:
             state.persistent.native_image_paths = []
         return paths
 
-    async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
+    async def _mark_durable_active_turn(self, event: MessageEvent, session_key: str) -> bool:
         """Persist the exact resolved routing key for this running turn; never a cron review's, which boot would resume."""
         try:
             token = None if is_review_event(event) else await self.async_session_store.mark_turn_active(
@@ -2173,7 +2173,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         event._gateway_active_turn_token = token
         return True
 
-    async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
+    async def _clear_durable_active_turn(self, event: MessageEvent) -> bool:
         """Best-effort CAS clear of the marker owned by *event* (3 attempts; never blocks agent/lease
         release — a stale marker is bounded by the agent timeout and clean-start discard)."""
         session_key = getattr(event, "_gateway_active_turn_session_key", None)
@@ -2246,7 +2246,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
-    async def _enrich_message_with_vision(self, user_text: str, image_paths: List[str]) -> str:
+    async def _enrich_message_with_vision(self, user_text: str, image_paths: list[str]) -> str:
         """Auto-analyze user-attached images with the vision tool and prepend the descriptions.
         Description *and* local cache path are injected so the model understands the image without
         a tool call and can re-examine it with vision_analyze."""
@@ -2308,7 +2308,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         agent_path = to_agent_visible_cache_path(os.path.abspath(path))
         return f"[voice message could not be transcribed automatically; the audio is available at: {agent_path}]"
 
-    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> Tuple[Optional[str], str]:
+    async def _transcribe_one_clip(self, path: str, transcribe_audio, transcribe_audio_local_fallback) -> tuple[Optional[str], str]:
         """``(transcript_or_None, note)`` for one clip via configured STT with local fallback."""
         result = await asyncio.to_thread(transcribe_audio, path, None, "gateway")
         if not result.get("success"):
@@ -2335,8 +2335,8 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         return transcript, f'"{transcript}"'
 
     async def _enrich_message_with_transcription(
-        self, user_text: str, audio_paths: List[str]
-    ) -> tuple[str, List[str]]:
+        self, user_text: str, audio_paths: list[str]
+    ) -> tuple[str, list[str]]:
         """Transcribe voice clips with the configured STT provider and prepend the transcripts →
         ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
         failed or STT is disabled) let callers echo them back before the agent loop."""
@@ -2360,7 +2360,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             return self._prepend_media_prefix("[voice message could not be transcribed]", user_text), []
 
         enriched_parts = []
-        successful_transcripts: List[str] = []
+        successful_transcripts: list[str] = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
@@ -2378,7 +2378,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             user_text = self._prepend_media_prefix("\n\n".join(enriched_parts), user_text)
         return user_text, successful_transcripts
 
-    def _pending_event_audio_paths(self, event) -> List[str]:
+    def _pending_event_audio_paths(self, event) -> list[str]:
         """Return STT-eligible paths from a pending voice message."""
         from gateway.run import _event_media_is_stt_input
         return [
@@ -2388,7 +2388,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     async def _transcribe_pending_audio_event_once(
         self, event, user_text: Optional[str] = None
-    ) -> tuple[str | None, List[str]]:
+    ) -> tuple[str | None, list[str]]:
         """Transcribe a pending audio event once and cache the result on the event: the interrupt
         monitor and the pending-drain path both need it — one STT call and one echo per message."""
         if hasattr(event, "_gateway_pending_stt_text"):
@@ -2472,7 +2472,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
         ))
 
     async def _echo_pending_stt_transcripts_once(
-        self, event, adapter, source, transcripts: List[str], *, metadata=None,
+        self, event, adapter, source, transcripts: list[str], *, metadata=None,
         log_context: str = "Transcript",
     ) -> None:
         """Echo pending-event STT transcripts to the chat at most once. Tracked as a COUNT (not a
@@ -2489,7 +2489,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
 
     async def _transcribe_and_echo_pending_voice(
         self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET
-    ) -> tuple[str, List[str]]:
+    ) -> tuple[str, list[str]]:
         """Transcribe a pending voice event and echo transcripts once → ``(enriched_text,
         transcripts)`` for ``agent.interrupt()`` or the pending-drain flow; ``(text, [])`` when there
         is no STT-eligible media (caller owns the ``_build_media_placeholder`` fallback)."""

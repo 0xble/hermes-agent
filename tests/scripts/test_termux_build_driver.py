@@ -70,6 +70,7 @@ def invoke(build_fixture, *identity, extra=()):
         [sys.executable, str(DRIVER), "--repo", str(repo), "--payload", str(payload),
          "--out", str(out), *identity, *extra],
         cwd=repo.parent, env=env, capture_output=True, text=True, timeout=30,
+        check=False,
     )
 
 
@@ -121,7 +122,7 @@ def test_all_paths_are_explicit(build_fixture, missing):
     args = [value for option, path in paths.items() if option != missing
             for value in (option, str(path))]
     result = subprocess.run([sys.executable, str(DRIVER), *args, "--tag", "v1.2.3"],
-                            cwd=repo.parent, env=env, capture_output=True, text=True, timeout=30)
+                            cwd=repo.parent, env=env, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 2
     assert missing in result.stderr
     assert recorded_calls(log) == []
@@ -144,7 +145,7 @@ def test_missing_prepared_payload_is_rejected_before_frontend_work(build_fixture
     ("build_deb.sh", ["node-deps.mjs", "tui.mjs", "build_deb.sh"]),
 ])
 def test_child_failure_stops_sequence_even_with_stale_product(build_fixture, stage, reached):
-    repo, payload, out, log, env = build_fixture
+    repo, _payload, out, log, env = build_fixture
     stale = repo / ".build/termux/tui/dist/entry.js"
     stale.parent.mkdir(parents=True)
     stale.write_text("stale product")
@@ -197,7 +198,7 @@ def test_builder_image_identity_covers_all_inputs(tmp_path, changed_input):
 
     def image():
         result = subprocess.run(["bash", "-c", command, "fixture", str(scripts / "build_builder_image.sh")],
-                                env=env, capture_output=True, text=True, timeout=30)
+                                env=env, capture_output=True, text=True, timeout=30, check=False)
         assert result.returncode == 0, result.stderr
         return result.stdout.splitlines()[-1]
 

@@ -1150,7 +1150,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
 
   const dashCmd =
     `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
-    `exec env HERMES_DESKTOP=1${opts.guestOnboarding === true ? ' HERMES_GUEST_ONBOARDING=1' : ''} ${hermes} ${profileArgs}${subCmd}`
+    `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
 
   const detachedShell: string = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
   // The inner shell backgrounds Hermes and reports its PID; backgrounding the
@@ -1292,15 +1292,7 @@ async function scrapeReadyPort(ssh, logPath, { timeoutMs = resolveReadyTimeoutMs
 
 async function spawnRemoteDashboard(
   ssh,
-  {
-    hermesPath,
-    profile,
-    token,
-    ownershipId,
-    hermesHome = '~/.hermes',
-    guestOnboarding = false,
-    assertInstallClear = async () => {}
-  }
+  { hermesPath, profile, token, ownershipId, hermesHome = '~/.hermes', assertInstallClear = async () => {} }
 ) {
   if (!(await remoteSupportsSshOwnership(ssh, hermesPath))) {
     const err: any = new Error(
@@ -1370,7 +1362,6 @@ async function spawnRemoteDashboard(
         tokenFilePath,
         logPath,
         hermesHome,
-        guestOnboarding,
         ownershipId,
         reservationNonce: spawnNonce,
         lockMetadata: {
@@ -1520,7 +1511,6 @@ async function connect(deps) {
     adoptServedToken,
     rememberLog = () => {},
     readyTimeoutMs = resolveReadyTimeoutMs(),
-    guestOnboarding = false,
     signal
   } = deps
 
@@ -1681,7 +1671,6 @@ async function connect(deps) {
     token: spawnToken,
     ownershipId,
     hermesHome,
-    guestOnboarding,
     assertInstallClear: () => assertRemoteInstallUpdateClear(ssh, hermesHome, hermesPath)
   })
 

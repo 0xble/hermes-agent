@@ -27,9 +27,9 @@ logger = logging.getLogger("agent.turn_context")
 class CompactionOutcome:
     """Locals rebuilt by turn-start compaction (``build_turn_context`` reads them back)."""
 
-    messages: List[Dict[str, Any]]
+    messages: list[dict[str, Any]]
     active_system_prompt: Optional[str]
-    conversation_history: Optional[List[Dict[str, Any]]]
+    conversation_history: Optional[list[dict[str, Any]]]
     current_turn_user_idx: int
     # A preflight pass (threshold or engine-driven) actually rebuilt ``messages``.
     compressed: bool = False
@@ -113,7 +113,7 @@ def _refund_api_call(agent: Any, api_call_count: int) -> int:
     return api_call_count
 
 
-def _reanchor(agent: Any, messages: List[Any], user_message: Any) -> int:
+def _reanchor(agent: Any, messages: list[Any], user_message: Any) -> int:
     """Compaction rebuilt ``messages``: re-anchor this turn's user index so the
     api_content stamp, injection site and persist-override row hit the same dict."""
     from agent.turn_context import reanchor_current_turn_user_idx
@@ -127,8 +127,8 @@ def _reanchor(agent: Any, messages: List[Any], user_message: Any) -> int:
 
 
 def run_turn_start_compaction(
-    agent: Any, *, messages: List[Dict[str, Any]], system_message: Optional[str],
-    active_system_prompt: Optional[str], conversation_history: Optional[List[Dict[str, Any]]],
+    agent: Any, *, messages: list[dict[str, Any]], system_message: Optional[str],
+    active_system_prompt: Optional[str], conversation_history: Optional[list[dict[str, Any]]],
     current_turn_user_idx: int, user_message: Any, effective_task_id: str,
 ) -> CompactionOutcome:
     """Idle compaction, then preflight compression (or the uncompressed guard)."""
@@ -203,7 +203,7 @@ def _idle_compaction(
     if _idle_status:
         agent._emit_status(_idle_status)
     out.messages, out.active_system_prompt = agent._compress_context(
-        messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id
+        messages, system_message, approx_tokens=_idle_tokens, task_id=effective_task_id, trigger="idle",
     )
     # ``_compress_context`` returns the INPUT list object when it skips; only
     # re-baseline and re-anchor after a real compaction.
@@ -212,6 +212,24 @@ def _idle_compaction(
             agent, out.messages, out.conversation_history
         )
         out.current_turn_user_idx = _reanchor(agent, out.messages, user_message)
+
+
+def _defer_preflight_to_real_usage(compressor: Any, rough_tokens: int) -> bool:
+    """Whether a rough preflight estimate must wait for a real provider reading.
+
+    A missing hook means do not defer. MagicMock and other doubles return a
+    truthy Mock unless the test configured one; only a real bool may skip
+    compression. Production engines return bool.
+    """
+    defer = getattr(compressor, "should_defer_preflight_to_real_usage", None)
+    if not callable(defer):
+        return False
+    try:
+        decision = defer(rough_tokens)
+    except Exception:
+        logger.debug("should_defer_preflight_to_real_usage raised; not deferring", exc_info=True)
+        return False
+    return decision if isinstance(decision, bool) else False
 
 
 def _codex_native_auto_compaction(agent: Any) -> bool:
@@ -259,10 +277,19 @@ def _preflight_compression(
         # snapshot may arm the interrupted-turn rollback.
         if isinstance(_snapshot_val, int) and not isinstance(_snapshot_val, bool):
             agent._turn_preflight_display_snapshot = _snapshot_val
-    # An anchored figure is real usage + delta: never deferred.
-    _preflight_deferred = not getattr(agent, "_request_pressure_anchored", False) and getattr(
-        _compressor, "should_defer_preflight_to_real_usage", lambda _tokens: False
-    )(_preflight_tokens)
+    _awaiting_real_usage = getattr(_compressor, "awaiting_real_usage_after_compression", False)
+    _preflight_deferred = (
+        (
+            _awaiting_real_usage
+            if isinstance(_awaiting_real_usage, bool)
+            else False
+        )
+        and not getattr(agent, "_request_pressure_anchored", False)
+        or (
+            not getattr(agent, "_request_pressure_anchored", False)
+            and _defer_preflight_to_real_usage(_compressor, _preflight_tokens)
+        )
+    )
     _codex_native_auto = _codex_native_auto_compaction(agent)
 
     if not _preflight_deferred:
@@ -279,11 +306,19 @@ def _preflight_compression(
     _should_compress_now = False
     _compress_block_reason = None
     if _preflight_deferred:
+        # MagicMock and plugin engines omit the real-usage ledger; a missing or
+        # non-numeric reading is "none", not a crash in the diagnostic log.
+        _last_real = getattr(_compressor, "last_real_prompt_tokens", 0)
+        _last_real_text = (
+            f"{_last_real:,}"
+            if isinstance(_last_real, int) and not isinstance(_last_real, bool)
+            else "none"
+        )
         logger.info(
             "Skipping preflight compression: rough estimate ~%s >= %s is not anchored on "
             "real usage (last real provider prompt %s); deferring to the next response",
             f"{_preflight_tokens:,}", f"{_compressor.threshold_tokens:,}",
-            f"{_compressor.last_real_prompt_tokens:,}",
+            _last_real_text,
         )
     elif _compression_cooldown:
         logger.info(
@@ -381,7 +416,7 @@ def _run_preflight_passes(
         _orig_tokens = _preflight_tokens
         out.messages, out.active_system_prompt = agent._compress_context(
             _preflight_input, system_message, approx_tokens=_preflight_tokens,
-            task_id=effective_task_id,
+            task_id=effective_task_id, trigger="turn_start_threshold",
         )
         if out.messages is _preflight_input and compression_skipped_due_to_lock(agent):
             # Lock-skip: another path holds the lock, so this is a DEFER, not proof of
@@ -458,7 +493,8 @@ def _engine_preflight_maintenance(
     )
     _engine_input = out.messages
     out.messages, out.active_system_prompt = agent._compress_context(
-        _engine_input, system_message, approx_tokens=_preflight_tokens, task_id=effective_task_id
+        _engine_input, system_message, approx_tokens=_preflight_tokens, task_id=effective_task_id,
+        trigger="engine_preflight",
     )
     # ``_compress_context`` returns the INPUT list on every skip path and an engine
     # may no-op; re-baseline/re-anchor only after a REAL compaction.
@@ -471,7 +507,7 @@ def _engine_preflight_maintenance(
 
 
 def _rearm_uncompressed_overflow_warn(
-    agent: Any, messages: List[Any], active_system_prompt: Optional[str]
+    agent: Any, messages: list[Any], active_system_prompt: Optional[str]
 ) -> None:
     """Uncompressed session guard: the warning fires from the loop's pre-API site;
     here we only RE-ARM the dedup once back under the window."""
