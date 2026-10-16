@@ -361,3 +361,16 @@ async def test_running_session_path_queues_fyi_instead_of_interrupting(monkeypat
     assert await runner._hm_handle_running_session_message(event, source, key) is None
     runner._hm_busy_interrupt.assert_not_awaited()
     assert adapter._pending_messages[key].text == FYI
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (True, True), (False, False), ("on", True), ("off", False), ("disabled", False), ({"x": 1}, False),
+])
+def test_rollback_flag_fails_closed_on_malformed_values(runner, monkeypatch, raw, expected):
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"relay": {"fyi_passive": raw}})
+    assert runner._relay_fyi_passive_enabled() is expected
+
+
+def test_absent_rollback_flag_keeps_passive_delivery(runner, monkeypatch):
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    assert runner._relay_fyi_passive_enabled() is True

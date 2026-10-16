@@ -335,16 +335,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
             if config is None:
                 config = _load_gateway_config()
             raw = ((config.get("relay") or {}).get("fyi_passive", True))
+            if isinstance(raw, bool):
+                return raw
             if isinstance(raw, str):
-                token = raw.strip().lower()
-                if token in {"0", "false", "no", "off"}:
-                    return False
-                if token in {"1", "true", "yes", "on"}:
-                    return True
-                return True
-            return bool(raw)
+                # Only an explicit on value keeps passive delivery; a malformed rollback value
+                # turns it off so the normal turn path stays the safe default.
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+            return False
         except Exception:
-            return True
+            return False
 
     async def _hm_try_passive_fyi_relay(
         self, event: "MessageEvent", source: SessionSource, session_key: str,
@@ -1690,6 +1689,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
                 return None
             if await self._hm_try_passive_fyi_relay(event, source, _quick_key):
                 return None
+            if self._is_session_running(_quick_key):
+                # The passive check awaits; a turn that started meanwhile owns the session now.
+                return await self._hm_handle_running_session_message(event, source, _quick_key)
             # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
             # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
             # only fall to zero. Reversible.
