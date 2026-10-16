@@ -321,7 +321,9 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
         ]
     )
     def read_execution(_execution_id):
-        row = next(observed_statuses)
+        # The terminal row stays terminal: post-completion re-reads (claim release, cleanup)
+        # must keep seeing it rather than exhaust the sequence.
+        row = next(observed_statuses, {"id": "exec-1", "status": "completed"})
         if row["status"] == "completed":
             processes[-1].returncode = 0
         return row
