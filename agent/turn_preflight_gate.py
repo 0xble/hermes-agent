@@ -139,14 +139,31 @@ def run_preflight_gate(
         )
         if shrunk is not None and _arm_output_ceiling(agent, shrunk):
             logger.info("Pre-send fit: lowering this request's output cap to %s tokens", f"{shrunk:,}")
-    _hard_window_preflight = (
-        _native_wire_tokens is not None and isinstance(window, int) and window > 0
-        and getattr(agent, "api_mode", None) != "codex_app_server"
-        and not _awaiting_checkpoint_usage
+    _preflight_threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0)
+    _request_exceeds_window = (
+        api_messages is not None and _native_wire_tokens is not None
+        and isinstance(window, int) and window > 0
         and not request_fits(
             agent, api_messages, "", wire=True, tools=tools_for_api,
             input_tokens=_native_wire_tokens,
         )
+    )
+    _anchored_input_leaves_no_room = (
+        getattr(agent, "_request_pressure_anchored", False) is True
+        and _native_wire_tokens is not None and isinstance(window, int) and window > 0
+        and _native_wire_tokens + int(window * 0.05) >= window
+    )
+    # A provider-confirmed input can exceed the configured output cap while still
+    # leaving ample context room. Only anchored input that consumes the window's
+    # framing reserve is a hard-window breach; retain the native/unanchored route's
+    # existing fail-closed behavior.
+    _hard_window_preflight = (
+        (_anchored_input_leaves_no_room or (
+            _request_exceeds_window
+            and getattr(agent, "_request_pressure_anchored", False) is not True
+        ))
+        and getattr(agent, "api_mode", None) != "codex_app_server"
+        and not _awaiting_checkpoint_usage
     )
     if _hard_window_preflight:
         # Route the proven wire overflow through the same guarded compression path as
@@ -166,7 +183,6 @@ def run_preflight_gate(
     # Pre-API pressure check: tool results grow a turn and last_prompt_tokens lags
     # them. Mirror the turn-prologue guard chain: defer on noisy estimate, skip in
     # failure cooldown, then should_compress().
-    _preflight_threshold = int(getattr(_compressor, "threshold_tokens", 0) or 0)
     _provider_overflow_preflight = _provider_overflow_recovery_pending and (
         _preflight_threshold <= 0 or request_pressure_tokens >= _preflight_threshold
     )
