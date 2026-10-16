@@ -1808,10 +1808,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
             from agent.auxiliary_client import cleanup_stale_async_clients
             cleanup_stale_async_clients()
 
-    # Stuck-loop (restart failure) counters
     def _stuck_loop_counts_path(self) -> Path:
         from gateway.run import _hermes_home
-        return _hermes_home / self._STUCK_LOOP_FILE
+        from gateway.gateway_slot import process_slot_filename
+        return _hermes_home / process_slot_filename(self._STUCK_LOOP_FILE)
 
     @staticmethod
     def _read_json_counts(path: Path) -> Optional[dict]:
@@ -3064,40 +3064,38 @@ class GatewayShutdownMixin(InterruptionNotesMixin):
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
         release_gateway_runtime_lock()
-        # Clean-shutdown marker skips crash-turn recovery next boot; a timed-out drain left
-        # half-finished sessions, so no marker — the next startup recovers their turn markers.
+        # Clean-shutdown marker skips crash recovery; timed-out drains leave no marker.
         if not ctx.timed_out and not getattr(self, "_suppress_clean_shutdown_receipt", False):
-            with suppress(Exception):
-                (_hermes_home / ".clean_shutdown").touch()
+            from gateway.zero_cut_standby import is_standby
+            if not is_standby():
+                with suppress(Exception):
+                    (_hermes_home / ".clean_shutdown").touch()
         elif not ctx.timed_out:
-            logger.info(
-                "Skipping .clean_shutdown marker — startup recovery did not complete; "
-                "the next startup must recover the previous run."
-            )
+            logger.info("Skipping .clean_shutdown marker — startup recovery did not complete")
         else:
-            logger.info(
-                "Skipping .clean_shutdown marker — drain timed out with "
-                "interrupted agents; next startup will recover their interrupted turns."
-            )
+            logger.info("Skipping .clean_shutdown marker — drain timed out with interrupted agents")
         # Stuck-loop counter: sessions active across 3 consecutive restarts are auto-suspended next boot.
         if ctx.active_agents:
             self._increment_restart_failure_counts(set(ctx.active_agents.keys()))
         if self._restart_requested:
-            # Stamp intent after the drain: the chat routing marker can already be older
-            # than the breaker chain gap by the time /restart finishes waiting for work.
-            from gateway.restart_loop_guard import record_planned_exit
-            record_planned_exit()
+            from gateway.zero_cut_standby import is_standby
+            if not is_standby():
+                # Stamp restart intent after the drain.
+                from gateway.restart_loop_guard import record_planned_exit
+                record_planned_exit()
         if self._restart_requested and self._restart_command_source is None:
-            with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
-                atomic_json_write(
-                    _planned_restart_notification_path(),
-                    {
-                        "requested_at": time.time(),
-                        "via_service": bool(self._restart_via_service),
-                        "detached": bool(self._restart_detached),
-                    },
-                    indent=None,
-                )
+            from gateway.zero_cut_standby import is_standby
+            if not is_standby():
+                with _log_suppressed(logging.DEBUG, "Failed to write planned restart notification marker: %s"):
+                    atomic_json_write(
+                        _planned_restart_notification_path(),
+                        {
+                            "requested_at": time.time(),
+                            "via_service": bool(self._restart_via_service),
+                            "detached": bool(self._restart_detached),
+                        },
+                        indent=None,
+                    )
         if self._restart_requested and self._restart_via_service:
             # Exit 75 + ``RestartForceExitStatus=75``: systemd replaces us without a racing helper.
             self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE

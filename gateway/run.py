@@ -5447,7 +5447,9 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
-    _claim_host_gateway_role(force=force)
+    from gateway.zero_cut_standby import is_standby
+    if not is_standby():
+        _claim_host_gateway_role(force=force)
     return True
 
 
@@ -5768,6 +5770,7 @@ async def _start_gateway_start_control_socket(runner):
         )
 
         from gateway.cron_review import CronReviewControl
+        from gateway import zero_cut_standby as zcs
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5780,9 +5783,8 @@ async def _start_gateway_start_control_socket(runner):
                            "serve-profile": serve_profile_verb(runner),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
-                           # A plugin installed/enabled by another process loads now and re-wires the
-                           # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result()})
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5796,14 +5798,14 @@ async def _start_gateway_start_control_socket(runner):
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    from gateway.zero_cut_standby import is_standby
+    if is_standby():
+        return (None, None, None, None)
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
     cron_stop = threading.Event()
-    # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
-    # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
-    # on that flag left every non-launch profile's jobs in a store no ticker visited: they
-    # silently never fired.
+    # ONE process ticks every profile.
     try:
         cron_profile_homes = _cron_tick_profile_homes(runner.config)
     except Exception as exc:
@@ -5815,18 +5817,13 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
 
     if isinstance(cron_provider, InProcessCronScheduler) and cron_profile_homes:
-        # Live enumerator: the ticker re-reads profiles/ every cycle so a profile created while
-        # the gateway runs gets its jobs fired without a restart (hot-serve).
+        # Live enumerator covers profiles created while the gateway runs.
         cron_start_kwargs["profile_homes"] = lambda: _cron_tick_profile_homes(runner.config)
         # Stand down, per tick, for a profile whose OWN gateway process ticks it.
         cron_start_kwargs["profile_gate"] = _cron_profile_gate
-        # Per-profile adapters so each profile's cron output goes via its own bot, not the
-        # default's. Absent (no multiplexed adapters), delivery for a secondary profile falls
-        # back to the primary's routed adapters or fails closed — the job still FIRES.
+        # Per-profile adapters preserve delivery ownership for secondaries.
         cron_start_kwargs["profile_adapters"] = getattr(runner, "_profile_adapters", None)
-        # runner.adapters belongs to the LAUNCH profile (``default``, or the ``--profile``
-        # name); naming it keeps the ticker from routing a secondary's cron through that bot
-        # and lets a named multiplexer's own jobs reuse its live adapters.
+        # Name the launch profile so secondary jobs do not route through its bot.
         cron_start_kwargs["default_profile"] = runner._primary_profile_name
         logger.info(
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
@@ -5836,7 +5833,7 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
             runner._draining or runner._external_drain_active)
-    # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
+    # Supervised ticker respawns.
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
@@ -5860,7 +5857,6 @@ def _start_gateway_start_cron_and_housekeeping(runner):
                 "restart`) so the profile env loads.",
                 getattr(cron_provider, "name", "external"))
 
-    # Gateway-only housekeeping runs independently of the cron provider; shares cron_stop for shutdown.
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping, args=(cron_stop,),
         kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
@@ -5876,8 +5872,7 @@ async def _start_gateway_shutdown_tail(
     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
     _signal_initiated_shutdown: list) -> bool:
     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
-    # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
-    # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
+    # Stop control socket before other teardown so a successor can bind.
     if _control_server is not None:
         try:
             await _control_server.stop()
@@ -5890,16 +5885,16 @@ async def _start_gateway_shutdown_tail(
 
     _best_effort(_stop_keepalive)
 
-    # Never join(): an in-flight cron delivery is a coroutine on THIS loop; a sync join would drop it.
-    # Stop cron scheduler + housekeeping cleanly. These MUST be awaited cooperatively, not join()ed. A cron
-    # delivery in flight when the gateway restarts is a coroutine scheduled onto THIS event loop
-    # (safe_schedule_threadsafe); the ticker thread is blocked on its future.result(). A synchronous
-    # cron_thread.join() would block the loop, so that delivery could never run — it timed out and the
-    # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
-    # finishes before we tear down.
-    cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    # Promotion may have started cron; use its handles.
+    if cron_stop is None:
+        cron_stop, cron_provider, cron_thread, housekeeping_thread = getattr(
+            runner, "_zero_cut_cron_handles", (None, None, None, None))
+    # Stop cron and housekeeping cooperatively; an in-flight delivery runs on this event loop.
+    if cron_stop is not None:
+        cron_stop.set()
+    if cron_provider is not None:
+        _stop_cron_provider(cron_provider)
+    if cron_thread is not None and not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
     await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
@@ -5911,15 +5906,13 @@ async def _start_gateway_shutdown_tail(
     # Settle startup discovery before MCP teardown so a late connect cannot outlive the server shutdown.
     await _settle_mcp_discovery(runner)
 
-    # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
-    # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
+    # MCP shutdown errors are logged but do not block the exit verdict.
     try:
         await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
     except Exception:
         logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
 
-    # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
-    # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
+    # Return the verdict only after cooperative teardown.
     return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
 
 
@@ -5928,10 +5921,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all."""
-    # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
 
-    # Messaging-only defaults belong to startup, not incidental imports by the TUI.
     configured_cwd = os.environ.get("TERMINAL_CWD", "")
     if not configured_cwd or configured_cwd in CWD_PLACEHOLDERS:
         resolved_cwd = resolve_placeholder_terminal_cwd(
@@ -5950,17 +5941,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
     apply_nofile_soft_limit()
 
-    # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
+    from gateway.gateway_slot import pin_gateway_slot
+    pin_gateway_slot(config)
+
     from gateway.code_skew import record_boot_fingerprint
     record_boot_fingerprint()
 
-    # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
-    # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
-    _host_decision = await _host_attach_or_none(replace, force)
+    from gateway.zero_cut_standby import is_standby
+    _host_decision = None if is_standby() else await _host_attach_or_none(replace, force)
     if _host_decision is not None:
         return _host_decision
 
-    # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
     from gateway.status import get_running_pid
     existing_pid = get_running_pid()
     if (existing_pid is not None and existing_pid != os.getpid()
@@ -5970,7 +5961,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _start_gateway_configure_logging(verbosity)
 
     from gateway.run_startup import recover_left_core_at_gateway_start
-    await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
+    if not is_standby():
+        await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
 
     runner = GatewayRunner(config)
     # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
@@ -6037,14 +6029,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file(force=force):
         return False
 
-    # Only the authoritative gateway may rewrite the store, and only before adapters, cron, the
-    # housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
-    _run_requested_state_db_compaction()
-
+    # Only the authoritative gateway (never a standby) may rewrite the store, and only before adapters,
+    # cron, the housekeeping worker or any SessionDB handle of ours exist. Never fails or aborts startup.
+    if not is_standby():
+        _run_requested_state_db_compaction()
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
     # Now the attach channel answers: republish the host record with the settled served set.
-    _refresh_host_gateway_record(runner)
+    if not is_standby():
+        _refresh_host_gateway_record(runner)
     _log_standalone_profiles_at_boot(runner)
 
     def _lifecycle_record_startup() -> None:
@@ -6057,7 +6050,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
         start_nous_auth_keepalive()
 
-    _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+    if not is_standby():
+        _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 
@@ -6098,8 +6092,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
-
-    # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
+    from gateway.zero_cut_standby import mark_ready
+    mark_ready()  # READY only once adapters, cron and housekeeping run; missing systemd state disables watchdog.
     runner._start_systemd_watchdog()
 
     await runner.wait_for_shutdown()
@@ -6237,6 +6231,9 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         release_gateway_runtime_lock()
 
     def _mark_exited() -> None:
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            return
         # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
         # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
         from hermes_cli.observability.shared_metrics_process import stamp_exit

@@ -1439,12 +1439,7 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 return True, enabled_platform_count, _multiplex_skipped_platforms, _pending_connects
             if not platform_config.enabled:
                 continue
-            # Multiplex: a platform enabled in the shared config.yaml may hold its token only in a
-            # secondary profile's .env; an empty primary would queue a reconnect loop that never heals.
-            # Starting that primary adapter with an empty token fails immediately and queues an infinite
-            # reconnect loop that can never heal (#64674). Secondary profiles still start their own adapters
-            # under _profile_runtime_scope with the real token -- skip the empty primary instead of failing
-            # loudly.
+            # Skip empty primary credentials in multiplex mode; secondary profiles may supply the token.
             if _multiplex_on and not _platform_has_bot_credential(platform, platform_config):
                 logger.info(
                     "Skipping %s on default profile: no bot credential in this "
@@ -1452,6 +1447,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                     "provide the token will still connect.", platform.value,
                 )
                 _multiplex_skipped_platforms.append(platform)
+                continue
+            from gateway import zero_cut_standby as zcs  # after credential gating, like active startup
+            if platform is Platform.TELEGRAM and zcs.defer_platform(self, platform, platform_config):
                 continue
             enabled_platform_count += 1
             adapter = self._create_adapter(platform, platform_config)
@@ -1606,7 +1604,8 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
     def _transient_exit_streak_path():
         from hermes_cli.config import get_hermes_home
 
-        return get_hermes_home() / ".transient_startup_exits"
+        from gateway.gateway_slot import process_slot_filename
+        return get_hermes_home() / process_slot_filename(".transient_startup_exits")
 
     def _reset_transient_exit_streak(self) -> None:
         """A platform connected, so the backend recovered; forget the retry budget."""
@@ -1720,7 +1719,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         # The launch profile's durable completions replay here, not at import (#123265); the
         # secondaries' ledgers are replayed by _restore_secondary_completion_ledgers below.
         # Off the loop: the replay writes state.db, and the liveness watchdog is already armed.
-        await asyncio.to_thread(_pr.restore_completions)
+        # A standby must not touch the shared ledger while the active gateway serves; promotion replays it.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await asyncio.to_thread(_pr.restore_completions)
         # Secondary-profile adapters connect under their own home + credential scope.
         try:
             connected_count += await self._start_secondary_profile_adapters()
@@ -1753,15 +1755,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
         self, connected_count: int, enabled_platform_count: int, startup_retryable_errors: list,
         startup_nonretryable_errors: list,
     ) -> bool:
-        """Log/degrade when a configured platform failed to start; return True when startup must exit.
-
-        The SHARED gate for every platform, not the api_server path: a configured platform that never
-        came up must leave a loud, observable trace (ERROR + a ``degraded`` runtime state) even while
-        sibling platforms serve normally. One WARNING next to "Gateway running with N platform(s)" let
-        a gateway with no API server at all look healthy for half an hour (api_server lost the bind
-        race against the gateway it was replacing, and nothing retried).
-        """
+        """Log/degrade when a configured platform failed to start; return True when startup must exit."""
         from gateway.run import _write_runtime_status_quiet
+        from gateway.zero_cut_standby import is_standby
+        if is_standby() and getattr(self, "_standby_deferred", None):
+            logger.info("Standby has deferred platforms; continuing without connections until promotion")
+            return False
         if connected_count != 0:
             self._reset_transient_exit_streak()  # a platform connected: the backend recovered
             if startup_nonretryable_errors:
@@ -1819,19 +1818,12 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             logger.info("Gateway will continue running for cron job execution.")
             return False
         if startup_retryable_errors:
-            # All retryable: stay alive (cron runs, watcher recovers) rather than systemd restart-loop.
             logger.warning(
                 "Gateway started with no connected platforms — %d platform(s) queued for retry: %s",
                 len(startup_retryable_errors), "; ".join(startup_retryable_errors),
             )
             _write_runtime_status_quiet(gateway_state="degraded", exit_reason=None)
-        # No adapter for any enabled platform: fleet nodes share one config.yaml but hold a subset of
-        # credentials, so degrade gracefully.
         logger.warning(
-            # Fall through to the normal "running" state — reconnect watcher takes it from here. In fleet
-            # deployments the same config.yaml is shared across nodes that may only have credentials for a
-            # subset of platforms. Rather than failing hard, degrade gracefully and allow cron jobs to run
-            # (#5196).
             "No adapter could be created for any of the %d configured platform(s). "
             "Check that required dependencies are installed and credentials are set. "
             "Gateway will continue for cron job execution; platforms whose plugin may still register "
@@ -1876,6 +1868,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     async def _start_finish_wiring(self, connected_count: int) -> None:
         """Post-connect wiring: services, boot notifications, startup restore, recovered watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            return
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
         self._restart_resume_outcomes = set()
         await self._start_post_connect_services(connected_count)
@@ -1955,6 +1950,10 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        from gateway.zero_cut_standby import is_standby
+        if is_standby():
+            self._spawn_reconnect_watcher()
+            return
         for method in self._PRE_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:
@@ -1962,9 +1961,9 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
                 "Starting reconnection watcher for %d failed platform(s): %s",
                 len(self._failed_platforms), ", ".join(p.value for p in self._failed_platforms),
             )
-        # Supervised: an escaping exception is restarted with backoff instead of stranding queued
-        # platforms (the ensure hook only runs on a NEW fatal). ``on_spawn`` keeps the handle current.
-        self._spawn_reconnect_watcher()
+        # Supervised reconnect watcher; a standby already spawned it, so promotion must not add a second.
+        if getattr(self, "_reconnect_watcher_task", None) is None or self._reconnect_watcher_task.done():
+            self._spawn_reconnect_watcher()
         for method in self._POST_RECONNECT_WATCHERS:
             self._spawn_supervised(getattr(self, method), method[1:])
         # Scale-to-zero watcher ONLY when opted in, messaging is relay-only/absent, and a wakeUrl exists.
@@ -2085,27 +2084,16 @@ class GatewayStartupMixin(RestartRecoveryMixin, RuntimeDeliveryRecoveryMixin):
             return True
         if await self._abort_startup_if_shutdown_requested():
             return True
-        await self._start_recover_previous_run()
-        # From here on shutdown may write a clean receipt: this boot has made the crash/clean
-        # decision and processed the previous run's recovery state.
+        from gateway.zero_cut_standby import is_standby
+        if not is_standby():
+            await self._start_recover_previous_run()
         self._suppress_clean_shutdown_receipt = False
-        await self._start_prime_session_db_after_ready()
+        if not is_standby():  # a standby opens no shared store until promotion
+            await self._start_prime_session_db_after_ready()
         self.delivery_router.adapters = self.adapters
-        if getattr(self.config, "durable_outbox_enabled", False):
-            from gateway.outbox import open_outbox, recover
-            from gateway.run import _multiplex_profile_homes
-            from hermes_constants import get_hermes_home
-
-            destinations = [(get_hermes_home(), self.adapters.get(Platform.TELEGRAM))]
-            for profile_name, profile_home in _multiplex_profile_homes(self.config):
-                if profile_name != "default":
-                    adapters = (getattr(self, "_profile_adapters", None) or {}).get(profile_name, {})
-                    destinations.append((Path(profile_home), adapters.get(Platform.TELEGRAM)))
-            for home, adapter in destinations:
-                if adapter is not None:
-                    sent, held = await recover(await open_outbox(home), adapter)
-                    if sent or held:
-                        logger.info("Gateway outbox recovery for %s: sent=%s held=%s", home, sent, held)
+        if getattr(self.config, "durable_outbox_enabled", False) and not is_standby():
+            from gateway.outbox import recover_gateway_destinations
+            await recover_gateway_destinations(self)  # a standby replays after promotion
         self._wire_teams_pipeline_runtime()
         self._running = True
         self._install_plugin_message_injector()
