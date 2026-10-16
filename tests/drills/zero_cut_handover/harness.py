@@ -412,8 +412,16 @@ def _kill_label_until_done(effects: Effects, label: str, process: Any, *, timeou
         _domain, result = _launchctl_label(effects, label)
         pid = _pid_from_launchctl(result)
         if pid is not None and pid not in killed:
-            effects.kill(pid)
-            killed.add(pid)
+            try:
+                effects.kill(pid)
+            except PermissionError:
+                # launchd reports the pid while its root-owned xpcproxy is still exec'ing the job; the
+                # same pid becomes our gateway a moment later, so retry it on the next poll.
+                pid = None
+            except ProcessLookupError:
+                pass
+            if pid is not None:
+                killed.add(pid)
         if effects.clock() >= deadline:
             break
         attempts += 1

@@ -299,3 +299,23 @@ def test_observer_retries_a_flood_wait_reported_on_stderr(monkeypatch):
     monkeypatch.setattr(harness.time, "sleep", lambda _s: None)
     assert harness._telegram_json(["--agent", "chats"]) == [{"id": 8899335561}]
     assert len(calls) == 2
+
+
+def test_standby_kill_retries_a_pid_still_owned_by_launchd_exec(tmp_path):
+    """Real drill: launchd lists the job pid while its root xpcproxy still holds it, so the first
+    SIGKILL raised EPERM and aborted the whole crash suite."""
+    world = FakeWorld(tmp_path)
+    world.live_background = True
+    effects = world.effects()
+    attempts = []
+
+    def kill(pid):
+        attempts.append(pid)
+        if len(attempts) == 1:
+            raise PermissionError(1, "Operation not permitted")
+        world.kill(pid)
+
+    result = harness.run_drill(home=tmp_path, peer="bot", drill="standby-fails-to-boot",
+                               effects=dataclasses.replace(effects, kill=kill))
+    assert result["passed"] is True
+    assert attempts == [4343, 4343] and world.killed == [4343]

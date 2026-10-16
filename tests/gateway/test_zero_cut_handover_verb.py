@@ -224,6 +224,7 @@ async def test_handover_owner_runs_a_mid_turn_followup_instead_of_spooling_it(mo
     from tests.gateway.test_pending_steer_drain import Adapter
 
     runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace()
     runner._draining = True
     runner._zero_cut_handover_state = state
     if stopping:
