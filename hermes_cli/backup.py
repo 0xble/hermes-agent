@@ -1487,7 +1487,11 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
         return None
     if isinstance(data, dict):
         data = data.get("jobs", [])
-    return len(data) if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    # Count only object entries, as load_jobs() keeps: a malformed live entry (e.g. ``42``) must
+    # not mask a missing real job by matching the snapshot's raw length.
+    return sum(1 for job in data if isinstance(job, dict))
 
 
 def restore_cron_jobs_if_emptied(snapshot_id: str, hermes_home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
