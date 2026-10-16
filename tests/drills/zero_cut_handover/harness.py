@@ -808,9 +808,11 @@ def run_suite(*, home: Path, peer: str, drills: str, repeat: int, effects: Effec
     install = _install(effects, home)
     if install.returncode != 0:
         raise RuntimeError(f"gateway install failed: {install.stderr or install.stdout}")
-    slot_a_label, _slot_b_label = _slot_labels(home)
-    if not _wait_slot(effects, slot_a_label):
-        raise RuntimeError(f"slot a launchd label is not loaded: {slot_a_label}")
+    slot_a_label, slot_b_label = _slot_labels(home)
+    # Roles are symmetric: after a handover the serving slot may be b, so the suite starts from
+    # whichever label is loaded (run_drill still requires exactly one active slot).
+    if not (_wait_slot(effects, slot_a_label) or _wait_slot(effects, slot_b_label)):
+        raise RuntimeError(f"no drill slot launchd label is loaded: {slot_a_label}, {slot_b_label}")
     results: list[dict[str, Any]] = []
     for _ in range(max(1, repeat)):
         for name in names:
