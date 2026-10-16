@@ -101,7 +101,8 @@ def run_preflight_gate(
         return v
 
     # A known hard-window breach cannot defer to real usage: some servers truncate
-    # instead of rejecting. Measure the final request, not a stale usage anchor.
+    # instead of rejecting. A fresh usage anchor is that measurement for chat and
+    # Anthropic; the native estimator only covers checkpoint-pruned Codex payloads.
     from agent.preflight_output_fit import affordable_output_cap, request_fits, wire_accurate_input_tokens
     _compressor = agent.context_compressor
     window = getattr(_compressor, "context_length", None)
@@ -115,16 +116,14 @@ def run_preflight_gate(
         )
         if api_messages is not None else None
     )
-    # A restored native checkpoint's usage anchor describes the input that
-    # produced the checkpoint, not its pruned replay. The one-response latch
-    # defers that figure until the issuer returns real usage. The adapter's
-    # checkpoint-pruned estimate is the payload actually sent, so it stays.
-    _awaiting_checkpoint_usage = bool(getattr(
-        _compressor, "awaiting_real_usage_after_compression", False
-    ))
-    _native_wire_tokens = (
-        _wire_input_tokens if not getattr(agent, "_request_pressure_anchored", False) else None
+    # A fresh usage anchor is provider-grounded and accurate enough to fail closed
+    # on, including when compression is disabled, exhausted, or attempt-capped.
+    # Only a real armed checkpoint latch withholds that anchor so the native
+    # pruned payload can win. An unstubbed mock latch is not a deferral signal.
+    _awaiting_checkpoint_usage = (
+        getattr(_compressor, "awaiting_real_usage_after_compression", False) is True
     )
+    _native_wire_tokens = _wire_input_tokens
     if (api_messages is not None and isinstance(window, int) and window > 0
             and can_shrink_output
             and _wire_input_tokens is not None

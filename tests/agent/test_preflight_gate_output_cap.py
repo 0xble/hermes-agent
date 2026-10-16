@@ -234,6 +234,105 @@ def test_checkpoint_latch_does_not_fail_closed_on_stale_anchor(monkeypatch):
     agent._compress_context.assert_not_called()
 
 
+def test_anchored_overflow_fails_closed_without_mocking_wire_count(monkeypatch):
+    """Review repro: compression disabled, anchor 190k, window 200k, max_tokens 16k.
+
+    The native estimator returns nothing for chat/Anthropic, so the only wire figure is
+    the usage anchor. That proven overflow must retain the input instead of falling
+    through with no ceiling. Does not mock ``wire_accurate_input_tokens``.
+    """
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        max_tokens=16_000,
+        reasoning_config=None,
+        compression_enabled=False,
+        context_compressor=_compressor(context_length=200_000, threshold_tokens=100_000),
+    )
+    agent._compress_context = MagicMock()
+    messages = [{"role": "user", "content": "short"}]
+    assert fit.wire_accurate_input_tokens(agent, messages, request_pressure_tokens=190_000) == 190_000
+    assert fit.affordable_output_cap(agent, messages, input_tokens=190_000) is None
+    assert not fit.request_fits(agent, messages, "", wire=True, input_tokens=190_000)
+    v = _gate(agent, messages=messages, pressure=190_000)
+    assert v.action == "return"
+    result = v.result
+    assert result is not None
+    assert result["failure_reason"] == "input_retained"
+    assert result["turn_exit_reason"] == "input_retained"
+    assert "compression_exhausted" not in result
+    assert agent._preflight_output_ceiling is None
+    agent._compress_context.assert_not_called()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "anthropic_messages"])
+def test_anchored_overflow_fails_closed_when_compression_exhausted(monkeypatch, api_mode):
+    """An attempt-capped anchored overflow still exits retained, not fallthrough."""
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    agent = _agent(
+        api_mode=api_mode,
+        model="claude-sonnet-4-5",
+        provider="anthropic",
+        max_tokens=16_000,
+        reasoning_config=None,
+        compression_enabled=True,
+        _anthropic_preserve_dots=lambda: False,
+        context_compressor=_compressor(context_length=200_000, threshold_tokens=100_000),
+    )
+    agent._compress_context = MagicMock()
+    messages = [{"role": "user", "content": "short"}]
+    v = _gate(agent, messages=messages, pressure=190_000, attempts=3, max_attempts=3)
+    assert v.action == "return"
+    result = v.result
+    assert result is not None
+    assert result["failure_reason"] == "input_retained"
+    agent._compress_context.assert_not_called()
+
+
+def test_unstubbed_mock_compressor_does_not_defer_anchored_wire(monkeypatch):
+    """An unstubbed MagicMock latch is not a real bool and must not defer fail-closed."""
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: None)
+    compressor = MagicMock()
+    compressor.context_length = 200_000
+    compressor.threshold_tokens = 100_000
+    compressor.protect_first_n = 0
+    compressor.protect_last_n = 0
+    compressor.should_compress.return_value = False
+    compressor.get_active_compression_failure_cooldown.return_value = None
+    agent = _agent(
+        max_tokens=16_000,
+        reasoning_config=None,
+        compression_enabled=False,
+        context_compressor=compressor,
+    )
+    messages = [{"role": "user", "content": "short"}]
+    assert fit.wire_accurate_input_tokens(agent, messages, request_pressure_tokens=190_000) == 190_000
+    v = _gate(agent, messages=messages, pressure=190_000)
+    assert v.action == "return"
+    result = v.result
+    assert result is not None
+    assert result["failure_reason"] == "input_retained"
+
+
+def test_real_checkpoint_latch_still_prefers_native_over_anchor(monkeypatch):
+    """A real armed bool still withholds a stale usage anchor when a native figure exists."""
+    import agent.codex_responses_adapter as adapter
+
+    monkeypatch.setattr(adapter, "estimate_native_responses_preflight_tokens", lambda *_a, **_k: 7_000)
+    compressor = MagicMock()
+    compressor.awaiting_real_usage_after_compression = True
+    agent = SimpleNamespace(
+        _request_pressure_anchored=True,
+        context_compressor=compressor,
+    )
+    assert fit.wire_accurate_input_tokens(agent, _BIG, request_pressure_tokens=180_000) == 7_000
+
+
 def test_anchored_shrink_uses_wire_tokens_not_rough_estimate(monkeypatch):
     """Review repro: anchored 185k in a 200k window must not arm a 189k cap from chars/4.
 

@@ -78,14 +78,16 @@ def wire_accurate_input_tokens(
     A native checkpoint is one exception: the adapter's estimate is the payload the
     next request actually sends, including the current turn. An older usage anchor can
     describe the input that produced the checkpoint rather than its pruned replay, so
-    the native figure wins while the one-response deferral latch is armed.
+    the native figure wins while the one-response deferral latch is a real armed bool.
+    An unstubbed mock latch is not that signal.
     """
     native = _native_wire_tokens(agent, messages, tools)
-    if native is not None and bool(getattr(
+    awaiting = getattr(
         getattr(agent, "context_compressor", None),
         "awaiting_real_usage_after_compression",
         False,
-    )):
+    )
+    if native is not None and awaiting is True:
         return native
     if getattr(agent, "_request_pressure_anchored", False) is True and isinstance(
         request_pressure_tokens, int
