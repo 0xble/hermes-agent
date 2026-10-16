@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 import socket
 import tempfile
@@ -264,3 +265,37 @@ def test_cli_budget_does_not_follow_a_zero_restart_drain_timeout(monkeypatch):
     monkeypatch.setattr(gateway_handover, "run_handover", lambda **kw: seen.update(kw) or 0)
     assert gateway_handover.cmd_handover(None) == 0
     assert seen["timeout"] == gateway_handover.STANDBY_READY_BUDGET_S > 0
+
+
+def test_lost_promote_answer_never_boots_out_the_standby(tmp_path):
+    """Promotion outlasts a short query; once A released Telegram, booting B out leaves nothing serving
+    (found in a real drill: 0 active slots after A exited)."""
+    fake, events = FakeGateway(), []
+    real_query = fake.query
+    timeouts = []
+
+    def slow_promote(home, verb, *, slot, timeout=2.0):
+        if verb == "promote":
+            timeouts.append(timeout)
+            real_query(home, verb, slot=slot, timeout=timeout)  # takes effect...
+            return None                                        # ...but the answer is lost
+        return real_query(home, verb, slot=slot, timeout=timeout)
+
+    effects = dataclasses.replace(_effects(fake, events), query=slow_promote)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 0
+    assert timeouts and timeouts[0] >= 60
+    assert not any(kind == "bootout" and label.endswith(".b") for kind, label, *_ in events)
+
+
+def test_refused_promotion_after_release_leaves_standby_running(tmp_path):
+    fake, events = FakeGateway(), []
+    real_query = fake.query
+
+    def refuse(home, verb, *, slot, timeout=2.0):
+        if verb == "promote":
+            return {"promoted": False, "refused": "not_ready"}
+        return real_query(home, verb, slot=slot, timeout=timeout)
+
+    effects = dataclasses.replace(_effects(fake, events), query=refuse)
+    assert run_handover(home=tmp_path, timeout=5, effects=effects) == 1
+    assert not any(kind == "bootout" for kind, *_ in events)

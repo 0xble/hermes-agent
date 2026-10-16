@@ -21,6 +21,8 @@ from hermes_constants import get_hermes_home
 # Standby boot-to-ready, A's updater stop (_UPDATER_STOP_TIMEOUT 15s) and promotion. A keeps serving
 # for all of it and is never cut, so this bounds only how long a stuck handover waits before aborting.
 STANDBY_READY_BUDGET_S = 180.0
+# Promote opens state.db and connects Telegram (up to the adapter's own connect budget).
+PROMOTE_TIMEOUT_S = 120.0
 
 
 def _pid_exists(pid: int) -> bool:
@@ -80,9 +82,9 @@ def _effects(effects: HandoverEffects | None) -> HandoverEffects:
     )
 
 
-def _query(effects: HandoverEffects, home: Path, verb: str, slot: str) -> dict[str, Any] | None:
+def _query(effects: HandoverEffects, home: Path, verb: str, slot: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
     try:
-        return effects.query(home, verb, slot=slot, timeout=2.0)
+        return effects.query(home, verb, slot=slot, timeout=timeout)
     except TypeError:
         # Keep the seam friendly to tiny test doubles and older local callers.
         return effects.query(home, verb, slot=slot)
@@ -185,12 +187,25 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
     if (handover_state or {}).get("failed") or (handover_state or {}).get("status") == "failed":
         return _failure(fx, idle_label, str((handover_state or {}).get("failed") or "handover failed"))
 
-    promoted = _query(fx, home, "promote", idle_slot)
+    # Promote connects Telegram and opens the shared store, which outlasts a 2s query. A promote whose
+    # answer is lost may still have taken effect, so never boot the standby out on silence: ask its
+    # status, and treat it as promoted once it reports standby:false.
+    promoted = _query(fx, home, "promote", idle_slot, timeout=PROMOTE_TIMEOUT_S)
+    if not promoted:
+        _poll(fx, budget_deadline, lambda: (_query(fx, home, "status", idle_slot) or {}).get("standby") is False)
+        if (_query(fx, home, "status", idle_slot) or {}).get("standby") is False:
+            promoted = {"promoted": True, "failed": [], "recovered_from_lost_answer": True}
+        else:
+            print(f"✗ standby {idle_label} did not answer promotion; leaving it running for inspection")
+            return 1
     failed = (promoted or {}).get("failed") or []
     if failed:
         print(f"⚠ promotion reported failed platforms: {', '.join(map(str, failed))}")
     if not promoted or promoted.get("promoted") is not True:
-        return _failure(fx, idle_label, f"standby promotion failed: {promoted or 'no response'}")
+        # A has already released Telegram and will exit once idle: booting B out here would leave
+        # nothing serving. B stays up (its reconnect queue heals failed platforms); report and stop.
+        print(f"✗ standby promotion failed: {promoted or 'no response'}; leaving {idle_label} running")
+        return 1
     # From here the idle slot owns Telegram: no failure path may boot it out.
     if not _poll(fx, budget_deadline, lambda: bool(
         (_query(fx, home, "status", idle_slot) or {}).get("standby") is False)):
